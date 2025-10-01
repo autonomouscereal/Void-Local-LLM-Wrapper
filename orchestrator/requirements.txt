@@ -1,0 +1,11 @@
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+httpx==0.27.2
+pydantic==2.8.2
+orjson==3.10.7
+tenacity==9.0.0
+python-multipart==0.0.9
+aiofiles==24.1.0
+requests==2.32.3
+starlette-context==0.3.7
+

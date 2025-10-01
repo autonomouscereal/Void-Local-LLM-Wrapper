@@ -1,0 +1,103 @@
+services:
+  ollama_qwen:
+    image: ollama/ollama:latest
+    container_name: ollama_qwen
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    environment:
+      - OLLAMA_HOST=0.0.0.0
+      - NVIDIA_VISIBLE_DEVICES=0
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              device_ids: ["0"]
+    volumes:
+      - ollama_qwen_data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "bash", "-lc", "ollama list >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  ollama_gptoss:
+    image: ollama/ollama:latest
+    container_name: ollama_gptoss
+    restart: unless-stopped
+    ports:
+      - "11435:11434"
+    environment:
+      - OLLAMA_HOST=0.0.0.0
+      - NVIDIA_VISIBLE_DEVICES=1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              device_ids: ["1"]
+    volumes:
+      - ollama_gptoss_data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "bash", "-lc", "ollama list >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  orchestrator:
+    build:
+      context: ./orchestrator
+      dockerfile: Dockerfile
+    container_name: void_orchestrator
+    restart: unless-stopped
+    depends_on:
+      ollama_qwen:
+        condition: service_healthy
+      ollama_gptoss:
+        condition: service_healthy
+      executor:
+        condition: service_started
+    environment:
+      - QWEN_BASE_URL=http://ollama_qwen:11434
+      - QWEN_MODEL_ID=${QWEN_MODEL_ID:-qwen2.5:32b-instruct-q4_K_M}
+      - GPTOSS_BASE_URL=http://ollama_gptoss:11434
+      - GPTOSS_MODEL_ID=${GPTOSS_MODEL_ID:-gpt-oss:20b-q5_K_M}
+      - DEFAULT_NUM_CTX=${DEFAULT_NUM_CTX:-8192}
+      - DEFAULT_TEMPERATURE=${DEFAULT_TEMPERATURE:-0.3}
+      - ENABLE_WEBSEARCH=${ENABLE_WEBSEARCH:-true}
+      - SERPAPI_API_KEY
+      - EXECUTOR_BASE_URL=http://executor:8081
+      - PLANNER_MODEL=${PLANNER_MODEL:-qwen}
+      - ENABLE_DEBATE=${ENABLE_DEBATE:-true}
+      - MAX_DEBATE_TURNS=${MAX_DEBATE_TURNS:-1}
+      - ALLOW_TOOL_EXECUTION=${ALLOW_TOOL_EXECUTION:-true}
+      - MCP_HTTP_BRIDGE_URL
+      - AUTO_EXECUTE_TOOLS=${AUTO_EXECUTE_TOOLS:-true}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./:/workspace
+
+  executor:
+    build:
+      context: ./executor
+      dockerfile: Dockerfile
+    container_name: void_executor
+    restart: unless-stopped
+    environment:
+      - WORKSPACE_DIR=/workspace
+      - EXEC_TIMEOUT_SEC=${EXEC_TIMEOUT_SEC:-30}
+      - EXEC_MEMORY_MB=${EXEC_MEMORY_MB:-2048}
+      - ALLOW_SHELL=${ALLOW_SHELL:-false}
+      - SHELL_WHITELIST=${SHELL_WHITELIST:-}
+    expose:
+      - "8081"
+    volumes:
+      - ./:/workspace
+
+volumes:
+  ollama_qwen_data: {}
+  ollama_gptoss_data: {}
+
+
