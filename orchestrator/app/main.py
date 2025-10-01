@@ -214,21 +214,23 @@ async def rag_search(query: str, k: int = 8) -> List[Dict[str, Any]]:
         return results
 
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=0.5, max=4))
+@retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=0.5, max=2))
 async def call_ollama(base_url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    async with httpx.AsyncClient(timeout=120) as client:
-        resp = await client.post(f"{base_url}/api/generate", json=payload)
-        resp.raise_for_status()
-        data = resp.json()
-        # Capture exact usage counts if provided by Ollama
-        if isinstance(data, dict) and ("prompt_eval_count" in data or "eval_count" in data):
-            usage = {
-                "prompt_tokens": int(data.get("prompt_eval_count", 0) or 0),
-                "completion_tokens": int(data.get("eval_count", 0) or 0),
-            }
-            usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
-            data["_usage"] = usage
-        return data
+    async with httpx.AsyncClient(timeout=45) as client:
+        try:
+            resp = await client.post(f"{base_url}/api/generate", json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+            if isinstance(data, dict) and ("prompt_eval_count" in data or "eval_count" in data):
+                usage = {
+                    "prompt_tokens": int(data.get("prompt_eval_count", 0) or 0),
+                    "completion_tokens": int(data.get("eval_count", 0) or 0),
+                }
+                usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
+                data["_usage"] = usage
+            return data
+        except httpx.HTTPError as e:
+            return {"error": str(e), "_base_url": base_url}
 
 
 async def serpapi_google_search(queries: List[str], max_results: int = 5) -> str:
@@ -506,6 +508,13 @@ async def chat_completions(body: ChatRequest, request: Request):
     qwen_task = asyncio.create_task(call_ollama(QWEN_BASE_URL, qwen_payload))
     gptoss_task = asyncio.create_task(call_ollama(GPTOSS_BASE_URL, gptoss_payload))
     qwen_result, gptoss_result = await asyncio.gather(qwen_task, gptoss_task)
+    # Fast-fail if either backend errored
+    if qwen_result.get("error") or gptoss_result.get("error"):
+        detail = {
+            "qwen": {k: v for k, v in qwen_result.items() if k in ("error", "_base_url")},
+            "gptoss": {k: v for k, v in gptoss_result.items() if k in ("error", "_base_url")},
+        }
+        return JSONResponse(status_code=502, content={"error": "backend_failed", "detail": detail})
 
     qwen_text = qwen_result.get("response", "")
     gptoss_text = gptoss_result.get("response", "")
@@ -581,6 +590,17 @@ async def chat_completions(body: ChatRequest, request: Request):
 @app.get("/healthz")
 async def healthz():
     return {"status": "ok"}
+
+
+@app.get("/debug")
+async def debug():
+    # sanity checks to both backends
+    try:
+        qr = await call_ollama(QWEN_BASE_URL, {"model": QWEN_MODEL_ID, "prompt": "ping", "stream": False})
+        gr = await call_ollama(GPTOSS_BASE_URL, {"model": GPTOSS_MODEL_ID, "prompt": "ping", "stream": False})
+        return {"qwen_ok": "response" in qr and not qr.get("error"), "gptoss_ok": "response" in gr and not gr.get("error"), "qwen_detail": qr.get("error"), "gptoss_detail": gr.get("error")}
+    except Exception as ex:
+        return JSONResponse(status_code=500, content={"error": str(ex)})
 
 
 @app.get("/v1/models")

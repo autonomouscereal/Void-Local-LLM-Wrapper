@@ -20,11 +20,13 @@ services:
     image: ollama/ollama:latest
     container_name: ollama_qwen
     restart: unless-stopped
+    runtime: nvidia
     ports:
       - "11434:11434"
     environment:
       - OLLAMA_HOST=0.0.0.0
       - NVIDIA_VISIBLE_DEVICES=0
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     deploy:
       resources:
         reservations:
@@ -43,11 +45,13 @@ services:
     image: ollama/ollama:latest
     container_name: ollama_gptoss
     restart: unless-stopped
+    runtime: nvidia
     ports:
       - "11435:11434"
     environment:
       - OLLAMA_HOST=0.0.0.0
       - NVIDIA_VISIBLE_DEVICES=1
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     deploy:
       resources:
         reservations:
@@ -83,6 +87,7 @@ services:
       - GPTOSS_BASE_URL=http://ollama_gptoss:11434
       - GPTOSS_MODEL_ID=${GPTOSS_MODEL_ID:-gpt-oss:20b-q5_K_M}
       - DEFAULT_NUM_CTX=${DEFAULT_NUM_CTX:-8192}
+      - DEFAULT_NUM_CTX=${DEFAULT_NUM_CTX:-4096}
       - DEFAULT_TEMPERATURE=${DEFAULT_TEMPERATURE:-0.3}
       - ENABLE_WEBSEARCH=${ENABLE_WEBSEARCH:-true}
       - SERPAPI_API_KEY
