@@ -49,9 +49,9 @@ Quick Start
 OpenAI-Compatible Usage
 -----------------------
 Point your client (e.g., Void or OpenAI SDK) to `http://localhost:8000` and call `/v1/chat/completions`.
-- Tool-calling semantics:
-  - If `AUTO_EXECUTE_TOOLS=false`, the endpoint returns `tool_calls` which Void can execute. Send results back as messages with `role: "tool"`, `name: <tool_name>`, `tool_call_id` if present, and `content` containing the result. The orchestrator will incorporate them in the next turn.
-  - If `AUTO_EXECUTE_TOOLS=true`, the backend executes supported tools automatically.
+- Tool-calling semantics (default: client executes):
+  - `AUTO_EXECUTE_TOOLS=false` (default) → endpoint returns `tool_calls` for Void to execute; send results back as `role: "tool"` messages.
+  - `AUTO_EXECUTE_TOOLS=true` → backend executes supported tools automatically.
 
 
 Example request:
@@ -75,6 +75,7 @@ Notes
 - MCP/tool-calling: Send a `tools` array (OpenAI-style JSON schema). The planner may propose `tool_calls` which the orchestrator executes when supported.
   - Built-in tools: `web_search` (SerpAPI), `run_python`, `write_file`, `read_file` (via Executor service).
   - MCP bridge: set `MCP_HTTP_BRIDGE_URL` to forward unknown tool calls prefixed with `mcp:` to your MCP HTTP server.
+  - RAG tools (pgvector): `rag_index` (index `/workspace` into Postgres+pgvector), `rag_search` (retrieve top-k chunks).
 
 Executor service
 ----------------

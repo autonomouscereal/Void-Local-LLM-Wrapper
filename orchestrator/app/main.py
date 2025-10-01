@@ -4,8 +4,12 @@ import os
 import asyncio
 import json
 from typing import Any, Dict, List, Optional, Tuple
+import time
 
 import httpx
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Engine
+from sentence_transformers import SentenceTransformer
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -27,6 +31,15 @@ ENABLE_DEBATE = os.getenv("ENABLE_DEBATE", "true").lower() == "true"
 MAX_DEBATE_TURNS = int(os.getenv("MAX_DEBATE_TURNS", "1"))
 ALLOW_TOOL_EXECUTION = os.getenv("ALLOW_TOOL_EXECUTION", "true").lower() == "true"
 AUTO_EXECUTE_TOOLS = os.getenv("AUTO_EXECUTE_TOOLS", "true").lower() == "true"
+
+# RAG configuration (pgvector)
+POSTGRES_HOST = os.getenv("POSTGRES_HOST")
+POSTGRES_PORT = int(os.getenv("POSTGRES_PORT", "5432"))
+POSTGRES_DB = os.getenv("POSTGRES_DB")
+POSTGRES_USER = os.getenv("POSTGRES_USER")
+POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD")
+EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2")
+RAG_CACHE_TTL_SEC = int(os.getenv("RAG_CACHE_TTL_SEC", "300"))
 
 
 class ChatMessage(BaseModel):
@@ -61,6 +74,7 @@ class ChatResponse(BaseModel):
     object: str = "chat.completion"
     choices: List[ChatChoice]
     model: str
+    usage: Optional[Dict[str, int]] = None
 
 
 app = FastAPI(title="Void Orchestrator", version="0.1.0")
@@ -87,12 +101,134 @@ def build_ollama_payload(messages: List[ChatMessage], model: str, num_ctx: int, 
     }
 
 
+def estimate_tokens_from_text(text: str) -> int:
+    if not text:
+        return 0
+    # crude approximation: 1 token ~ 4 chars
+    return max(1, (len(text) + 3) // 4)
+
+
+def estimate_usage(messages: List[ChatMessage], completion_text: str) -> Dict[str, int]:
+    prompt_text = "\n".join([(m.content or "") for m in messages])
+    prompt_tokens = estimate_tokens_from_text(prompt_text)
+    completion_tokens = estimate_tokens_from_text(completion_text)
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+    }
+
+
+def merge_usages(usages: List[Optional[Dict[str, int]]]) -> Dict[str, int]:
+    out = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    for u in usages:
+        if not u:
+            continue
+        out["prompt_tokens"] += int(u.get("prompt_tokens", 0))
+        out["completion_tokens"] += int(u.get("completion_tokens", 0))
+    out["total_tokens"] = out["prompt_tokens"] + out["completion_tokens"]
+    return out
+
+
+# ---------- RAG (pgvector) ----------
+_engine: Optional[Engine] = None
+_embedder: Optional[SentenceTransformer] = None
+_rag_cache: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
+
+
+def get_engine() -> Optional[Engine]:
+    global _engine
+    if _engine is not None:
+        return _engine
+    if not (POSTGRES_HOST and POSTGRES_DB and POSTGRES_USER and POSTGRES_PASSWORD):
+        return None
+    url = f"postgresql+psycopg2://{POSTGRES_USER}:{POSTGRES_PASSWORD}@{POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}"
+    _engine = create_engine(url, pool_pre_ping=True)
+    with _engine.begin() as conn:
+        conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+        conn.execute(text(
+            """
+            CREATE TABLE IF NOT EXISTS rag_docs (
+              id BIGSERIAL PRIMARY KEY,
+              path TEXT,
+              chunk TEXT,
+              embedding vector(384)
+            );
+            """
+        ))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS rag_docs_embedding_idx ON rag_docs USING ivfflat (embedding vector_cosine) WITH (lists = 100);"))
+    return _engine
+
+
+def get_embedder() -> SentenceTransformer:
+    global _embedder
+    if _embedder is None:
+        _embedder = SentenceTransformer(EMBEDDING_MODEL_NAME)
+    return _embedder
+
+
+async def rag_index_dir(root: str = "/workspace", glob_exts: Optional[List[str]] = None, chunk_size: int = 1000, chunk_overlap: int = 200) -> Dict[str, Any]:
+    import glob as _glob
+    import os as _os
+    engine = get_engine()
+    if engine is None:
+        return {"error": "pgvector not configured"}
+    exts = glob_exts or ["*.md", "*.py", "*.ts", "*.tsx", "*.js", "*.json", "*.txt"]
+    files: List[str] = []
+    for ext in exts:
+        files.extend(_glob.glob(_os.path.join(root, "**", ext), recursive=True))
+    embedder = get_embedder()
+    total_chunks = 0
+    with engine.begin() as conn:
+        for fp in files[:5000]:
+            try:
+                with open(fp, "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read()
+            except Exception:
+                continue
+            i = 0
+            length = len(content)
+            while i < length:
+                chunk = content[i : i + chunk_size]
+                i += max(1, chunk_size - chunk_overlap)
+                vec = embedder.encode([chunk])[0]
+                conn.execute(text("INSERT INTO rag_docs (path, chunk, embedding) VALUES (:p, :c, :e)"), {"p": fp.replace(root + "/", ""), "c": chunk, "e": list(vec)})
+                total_chunks += 1
+    return {"indexed_files": len(files), "chunks": total_chunks}
+
+
+async def rag_search(query: str, k: int = 8) -> List[Dict[str, Any]]:
+    now = time.time()
+    key = f"{query}::{k}"
+    cached = _rag_cache.get(key)
+    if cached and (now - cached[0] <= RAG_CACHE_TTL_SEC):
+        return cached[1]
+    engine = get_engine()
+    if engine is None:
+        return []
+    vec = get_embedder().encode([query])[0]
+    with engine.begin() as conn:
+        rows = conn.execute(text("SELECT path, chunk FROM rag_docs ORDER BY embedding <=> :q LIMIT :k"), {"q": list(vec), "k": k}).fetchall()
+        results = [{"path": r[0], "chunk": r[1]} for r in rows]
+        _rag_cache[key] = (now, results)
+        return results
+
+
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=0.5, max=4))
 async def call_ollama(base_url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     async with httpx.AsyncClient(timeout=120) as client:
         resp = await client.post(f"{base_url}/api/generate", json=payload)
         resp.raise_for_status()
-        return resp.json()
+        data = resp.json()
+        # Capture exact usage counts if provided by Ollama
+        if isinstance(data, dict) and ("prompt_eval_count" in data or "eval_count" in data):
+            usage = {
+                "prompt_tokens": int(data.get("prompt_eval_count", 0) or 0),
+                "completion_tokens": int(data.get("eval_count", 0) or 0),
+            }
+            usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
+            data["_usage"] = usage
+        return data
 
 
 async def serpapi_google_search(queries: List[str], max_results: int = 5) -> str:
@@ -239,6 +375,16 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             return {"name": name, "error": "missing query"}
         snippets = await serpapi_google_search([query], max_results=int(args.get("k", 5)))
         return {"name": name, "result": snippets}
+    if name == "rag_index":
+        res = await rag_index_dir(root=args.get("root", "/workspace"))
+        return {"name": name, "result": res}
+    if name == "rag_search":
+        query = args.get("query")
+        k = int(args.get("k", 8))
+        if not query:
+            return {"name": name, "error": "missing query"}
+        res = await rag_search(query, k)
+        return {"name": name, "result": res}
     if name == "run_python" and EXECUTOR_BASE_URL and ALLOW_TOOL_EXECUTION:
         async with httpx.AsyncClient(timeout=120) as client:
             r = await client.post(EXECUTOR_BASE_URL.rstrip("/") + "/run_python", json={"code": args.get("code", "")})
@@ -301,6 +447,12 @@ async def chat_completions(body: ChatRequest, request: Request):
 
     # 1) Planner proposes plan + tool calls
     plan_text, tool_calls = await planner_produce_plan(messages, body.tools, body.temperature or DEFAULT_TEMPERATURE)
+    # tool_choice=required compatibility: force at least one tool_call if tools are provided
+    if (body.tool_choice == "required") and (not tool_calls) and body.tools:
+        # choose first declared tool with empty args
+        first = body.tools[0]
+        fn = (first.get("function") or {}).get("name") or first.get("name") or "tool"
+        tool_calls = [{"name": fn, "arguments": {}}]
 
     # If tool semantics are client-driven, return tool_calls instead of executing
     if tool_calls and not AUTO_EXECUTE_TOOLS:
@@ -327,6 +479,8 @@ async def chat_completions(body: ChatRequest, request: Request):
                 yield f"data: {chunk}\n\n"
                 yield "data: [DONE]\n\n"
             return StreamingResponse(_stream_once(), media_type="text/event-stream")
+        # include usage estimate even in tool_calls path (no completion tokens yet)
+        response["usage"] = estimate_usage(messages, "")
         return JSONResponse(content=response)
 
     # 2) Optionally execute tools
@@ -404,12 +558,22 @@ async def chat_completions(body: ChatRequest, request: Request):
             yield "data: [DONE]\n\n"
         return StreamingResponse(_stream_final(final_text), media_type="text/event-stream")
 
+    # Merge exact usages if available, else approximate
+    usage = merge_usages([
+        qwen_result.get("_usage"),
+        gptoss_result.get("_usage"),
+        synth_result.get("_usage"),
+    ])
+    if usage["total_tokens"] == 0:
+        usage = estimate_usage(messages, final_text)
+
     response = ChatResponse(
         id="orc-1",
         model=f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}",
         choices=[
             ChatChoice(index=0, finish_reason="stop", message={"role": "assistant", "content": final_text})
         ],
+        usage=usage,
     )
     return JSONResponse(content=response.model_dump())
 
