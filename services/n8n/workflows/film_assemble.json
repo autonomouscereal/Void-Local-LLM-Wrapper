@@ -1,0 +1,40 @@
+{
+  "name": "Film Assemble",
+  "nodes": [
+    {
+      "parameters": {
+        "path": "film-assemble",
+        "options": {}
+      },
+      "id": "Webhook",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [200, 300]
+    },
+    {
+      "parameters": {
+        "functionCode": "const payload = items[0].json;\nconst scenes = payload.scenes || [];\n// Simple passthrough manifest; in a real flow, download assets and mux into a video.\nreturn scenes.map((s, i) => ({ json: { index: s.index_num, assets: s.assets, note: 'assemble step placeholder' } }));"
+      },
+      "id": "Assemble",
+      "name": "Assemble (Placeholder)",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [420, 300]
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Assemble (Placeholder)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}
+

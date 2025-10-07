@@ -20,6 +20,7 @@ services:
     image: ollama/ollama:latest
     container_name: ollama_qwen
     restart: unless-stopped
+    runtime: nvidia
     gpus: "all"
     ports:
       - "11434:11434"
@@ -35,10 +36,21 @@ services:
       timeout: 5s
       retries: 12
 
+  init_qwen:
+    image: curlimages/curl:8.7.1
+    container_name: init_qwen
+    depends_on:
+      ollama_qwen:
+        condition: service_started
+    environment:
+      - QWEN_MODEL_ID=${QWEN_MODEL_ID:-qwen2.5:32b-instruct-q4_K_M}
+    command: ["sh","-lc","until curl -s http://ollama_qwen:11434/api/tags >/dev/null; do sleep 2; done; curl -s -X POST http://ollama_qwen:11434/api/pull -H 'Content-Type: application/json' -d '{\"name\":\"${QWEN_MODEL_ID}\"}'"]
+
   ollama_gptoss:
     image: ollama/ollama:latest
     container_name: ollama_gptoss
     restart: unless-stopped
+    runtime: nvidia
     gpus: "all"
     ports:
       - "11435:11434"
@@ -53,6 +65,16 @@ services:
       interval: 10s
       timeout: 5s
       retries: 12
+
+  init_gptoss:
+    image: curlimages/curl:8.7.1
+    container_name: init_gptoss
+    depends_on:
+      ollama_gptoss:
+        condition: service_started
+    environment:
+      - GPTOSS_MODEL_ID=${GPTOSS_MODEL_ID:-gpt-oss:20b-q5_K_M}
+    command: ["sh","-lc","until curl -s http://ollama_gptoss:11434/api/tags >/dev/null; do sleep 2; done; curl -s -X POST http://ollama_gptoss:11434/api/pull -H 'Content-Type: application/json' -d '{\"name\":\"${GPTOSS_MODEL_ID}\"}'"]
 
   orchestrator:
     build:
@@ -73,7 +95,7 @@ services:
       - QWEN_BASE_URL=http://ollama_qwen:11434
       - QWEN_MODEL_ID=${QWEN_MODEL_ID:-qwen2.5:32b-instruct-q4_K_M}
       - GPTOSS_BASE_URL=http://ollama_gptoss:11434
-      - GPTOSS_MODEL_ID=${GPTOSS_MODEL_ID:-gpt-oss:20b}
+      - GPTOSS_MODEL_ID=${GPTOSS_MODEL_ID:-gpt-oss:20b-q5_K_M}
       - DEFAULT_NUM_CTX=${DEFAULT_NUM_CTX:-4096}
       - DEFAULT_TEMPERATURE=${DEFAULT_TEMPERATURE:-0.3}
       - ENABLE_WEBSEARCH=${ENABLE_WEBSEARCH:-true}
@@ -84,6 +106,8 @@ services:
       - MAX_DEBATE_TURNS=${MAX_DEBATE_TURNS:-1}
       - ALLOW_TOOL_EXECUTION=${ALLOW_TOOL_EXECUTION:-true}
       - MCP_HTTP_BRIDGE_URL
+      - N8N_WEBHOOK_URL=${N8N_WEBHOOK_URL:-http://n8n:5678/webhook/film-assemble}
+      - ASSEMBLER_API_URL=http://assembler:9095
       - AUTO_EXECUTE_TOOLS=${AUTO_EXECUTE_TOOLS:-false}
       - POSTGRES_HOST=pgvector
       - POSTGRES_PORT=5432
@@ -92,10 +116,147 @@ services:
       - POSTGRES_PASSWORD=ragpass
       - EMBEDDING_MODEL_NAME=${EMBEDDING_MODEL_NAME:-sentence-transformers/all-MiniLM-L6-v2}
       - RAG_CACHE_TTL_SEC=${RAG_CACHE_TTL_SEC:-300}
+      - XTTS_API_URL=http://xtts:8020
+      - WHISPER_API_URL=http://whisper:9090
+      - FACEID_API_URL=http://faceid:7000
+      - MUSIC_API_URL=http://music:7860
+      - COMFYUI_API_URL=http://comfyui:8188
+      - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-}
+      - UPLOAD_DIR=/workspace/uploads
+      - VLM_API_URL=http://vlm:8050
     ports:
       - "8000:8000"
     volumes:
       - ./:/workspace
+
+  xtts:
+    build:
+      context: ./services/xtts
+      dockerfile: Dockerfile
+    container_name: xtts_service
+    restart: unless-stopped
+    environment:
+      - XTTS_MODEL_NAME=tts_models/multilingual/multi-dataset/xtts_v2
+    expose:
+      - "8020"
+
+  whisper:
+    build:
+      context: ./services/whisper
+      dockerfile: Dockerfile
+    container_name: whisper_service
+    restart: unless-stopped
+    environment:
+      - WHISPER_MODEL_NAME=large-v3
+      - WHISPER_CPU_THREADS=8
+    expose:
+      - "9090"
+
+  faceid:
+    build:
+      context: ./services/faceid
+      dockerfile: Dockerfile
+    container_name: faceid_service
+    restart: unless-stopped
+    expose:
+      - "7000"
+
+  comfyui:
+    image: ghcr.io/comfyanonymous/comfyui:latest
+    container_name: comfyui
+    restart: unless-stopped
+    expose:
+      - "8188"
+    volumes:
+      - comfyui_models:/comfyui/models
+      - comfyui_custom_nodes:/comfyui/custom_nodes
+
+  comfyui_init:
+    build:
+      context: ./services/comfyui_init
+      dockerfile: Dockerfile
+    container_name: comfyui_init
+    depends_on:
+      comfyui:
+        condition: service_started
+    environment:
+      - HUGGINGFACE_TOKEN=${HUGGINGFACE_TOKEN:-}
+    volumes:
+      - comfyui_models:/models
+      - comfyui_custom_nodes:/custom_nodes
+    command: ["python", "/app/init_assets.py"]
+
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: n8n
+    restart: unless-stopped
+    environment:
+      - N8N_HOST=n8n
+      - N8N_PROTOCOL=http
+      - N8N_PORT=5678
+      - N8N_USER_MANAGEMENT_DISABLED=true
+      - N8N_DIAGNOSTICS_ENABLED=false
+      - N8N_VERSION_NOTIFICATIONS_ENABLED=false
+      - NODE_ENV=production
+    expose:
+      - "5678"
+    volumes:
+      - n8n_data:/home/node/.n8n
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:5678/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  n8n_init:
+    image: n8nio/n8n:latest
+    container_name: n8n_init
+    depends_on:
+      n8n:
+        condition: service_started
+    environment:
+      - N8N_HOST=n8n
+      - N8N_PROTOCOL=http
+      - N8N_PORT=5678
+      - N8N_USER_MANAGEMENT_DISABLED=true
+      - NODE_ENV=production
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ./services/n8n/workflows:/workflows:ro
+    command: sh -lc "n8n import:workflow --input /workflows/film_assemble.json --separate"
+
+  assembler:
+    build:
+      context: ./services/assembler
+      dockerfile: Dockerfile
+    container_name: film_assembler
+    restart: unless-stopped
+    environment:
+      - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-}
+    expose:
+      - "9095"
+    volumes:
+      - ./:/workspace
+
+  music:
+    build:
+      context: ./services/music
+      dockerfile: Dockerfile
+    container_name: music_service
+    restart: unless-stopped
+    environment:
+      - MUSIC_MODEL_ID=facebook/musicgen-small
+    expose:
+      - "7860"
+
+  vlm:
+    build:
+      context: ./services/vlm
+      dockerfile: Dockerfile
+    container_name: vlm_service
+    restart: unless-stopped
+    expose:
+      - "8050"
 
   executor:
     build:
@@ -114,9 +275,33 @@ services:
     volumes:
       - ./:/workspace
 
+  chatui:
+    build:
+      context: ./services/chatui
+      dockerfile: Dockerfile
+    container_name: chatui
+    restart: unless-stopped
+    environment:
+      - ORCHESTRATOR_URL=http://orchestrator:8000
+      - POSTGRES_HOST=pgvector
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=ragdb
+      - POSTGRES_USER=rag
+      - POSTGRES_PASSWORD=ragpass
+    depends_on:
+      orchestrator:
+        condition: service_started
+      pgvector:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+
 volumes:
   ollama_qwen_data: {}
   ollama_gptoss_data: {}
   pgvector_data: {}
+  comfyui_models: {}
+  comfyui_custom_nodes: {}
+  n8n_data: {}
 
 
