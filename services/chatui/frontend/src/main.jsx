@@ -9,7 +9,7 @@ function App() {
   const [text, setText] = useState('')
   const fileRef = useRef()
   const [jobs, setJobs] = useState([])
-  const [showJobs, setShowJobs] = useState(true)
+  const [showJobs, setShowJobs] = useState(false)
   const [sending, setSending] = useState(false)
 
   async function refreshConvos() {
@@ -133,14 +133,7 @@ function App() {
         await openConversation(list[0].id)
       }
     })()
-    const iv = setInterval(async () => {
-      try {
-        const r = await fetch('/api/jobs')
-        const j = await r.json()
-        setJobs(j.data || [])
-      } catch {}
-    }, 3000)
-    return () => clearInterval(iv)
+    // Jobs polling disabled by default; re-enable if needed
   }, [])
 
   return (
