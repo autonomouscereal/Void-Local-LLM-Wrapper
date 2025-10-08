@@ -11,6 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 from fastapi.middleware.cors import CORSMiddleware
+from .json_parser import JSONParser
 import logging
 
 
@@ -67,7 +68,7 @@ app = FastAPI(title="Chat UI Backend", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -132,6 +133,7 @@ def _build_openai_messages(base: List[Dict[str, Any]], attachments: List[Dict[st
 
 @app.post("/api/conversations/{cid}/chat")
 async def chat(cid: int, body: Dict[str, Any]):
+    logging.info("chat request cid=%s body_keys=%s", cid, list((body or {}).keys()))
     user_content = (body or {}).get("content") or ""
     messages = (body or {}).get("messages") or []
     # Force non-stream proxy for reliability in the UI
@@ -205,6 +207,11 @@ async def orch_diag():
     except Exception as ex:
         out["debug_error"] = str(ex)
     return out
+
+
+@app.get("/favicon.ico")
+async def favicon():
+    return JSONResponse(status_code=204, content=None)
 
 
 @app.get("/api/jobs")
