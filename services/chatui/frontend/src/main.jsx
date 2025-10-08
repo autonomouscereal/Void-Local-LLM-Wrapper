@@ -14,7 +14,9 @@ function App() {
   async function refreshConvos() {
     const r = await fetch('/api/conversations')
     const j = await r.json()
-    setConvos(j.data || [])
+    const list = j.data || []
+    setConvos(list)
+    return list
   }
 
   async function openConversation(id) {
@@ -29,14 +31,24 @@ function App() {
     const j = await r.json()
     await refreshConvos()
     await openConversation(j.id)
+    return j.id
   }
 
   async function send() {
-    if (!cid || !text.trim()) return
-    const r = await fetch(`/api/conversations/${cid}/chat`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ content: text }) })
-    const j = await r.json()
-    setText('')
-    await openConversation(cid)
+    if (!text.trim()) return
+    let conversationId = cid
+    if (!conversationId) {
+      conversationId = await newConversation()
+    }
+    try {
+      const r = await fetch(`/api/conversations/${conversationId}/chat`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ content: text }) })
+      const j = await r.json()
+      setText('')
+      await openConversation(conversationId)
+    } catch (e) {
+      console.error('send failed', e)
+      alert('Send failed: ' + (e?.message || e))
+    }
   }
 
   async function uploadFile(e) {
@@ -51,7 +63,14 @@ function App() {
   }
 
   useEffect(() => {
-    refreshConvos()
+    (async () => {
+      const list = await refreshConvos()
+      if (list.length === 0) {
+        await newConversation()
+      } else {
+        await openConversation(list[0].id)
+      }
+    })()
     const iv = setInterval(async () => {
       try {
         const r = await fetch('/api/jobs')

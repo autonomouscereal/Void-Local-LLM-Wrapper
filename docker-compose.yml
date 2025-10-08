@@ -108,7 +108,7 @@ services:
       - MCP_HTTP_BRIDGE_URL
       - N8N_WEBHOOK_URL=${N8N_WEBHOOK_URL:-http://n8n:5678/webhook/film-assemble}
       - ASSEMBLER_API_URL=http://assembler:9095
-      - AUTO_EXECUTE_TOOLS=${AUTO_EXECUTE_TOOLS:-false}
+      - AUTO_EXECUTE_TOOLS=${AUTO_EXECUTE_TOOLS:-true}
       - POSTGRES_HOST=pgvector
       - POSTGRES_PORT=5432
       - POSTGRES_DB=ragdb

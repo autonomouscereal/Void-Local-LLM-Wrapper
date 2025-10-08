@@ -1229,15 +1229,36 @@ async def chat_completions(body: ChatRequest, request: Request):
     if usage["total_tokens"] == 0:
         usage = estimate_usage(messages, final_text)
 
-    response = ChatResponse(
-        id="orc-1",
-        model=f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}",
-        choices=[
-            ChatChoice(index=0, finish_reason="stop", message={"role": "assistant", "content": final_text})
+    # Ensure clean markdown content: collapse excessive whitespace but keep newlines
+    cleaned = final_text.replace('\r\n', '\n')
+    # If tools/plan/critique exist, wrap them into a hidden metadata block and present a concise final answer
+    meta_sections: List[str] = []
+    if plan_text:
+        meta_sections.append("Plan:\n" + plan_text)
+    if tool_results:
+        try:
+            meta_sections.append("Tool Results:\n" + json.dumps(tool_results, indent=2))
+        except Exception:
+            pass
+    if ENABLE_DEBATE and MAX_DEBATE_TURNS > 0:
+        # Previous critique messages were appended to exec_messages; we don't re-summarize them here to avoid bloat
+        meta_sections.append("Cross-critique: enabled")
+    meta_block = ("\n\n<!--\n" + "\n\n".join(meta_sections) + "\n-->\n\n") if meta_sections else ""
+    display_content = f"{cleaned}\n\n" + meta_block
+    response = {
+        "id": "orc-1",
+        "object": "chat.completion",
+        "model": f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}",
+        "choices": [
+            {
+                "index": 0,
+                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": display_content}
+            }
         ],
-        usage=usage,
-    )
-    return JSONResponse(content=response.model_dump())
+        "usage": usage,
+    }
+    return JSONResponse(content=response)
 
 
 @app.get("/healthz")
