@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import json
 from typing import Any, Dict, List, Optional
+from urllib.parse import parse_qs
 
 import httpx
 from fastapi import FastAPI, UploadFile, File, Form, Request
@@ -75,6 +76,31 @@ app.add_middleware(
 # Mount static AFTER API routes to avoid intercepting /api/* with 404/405
 
 
+@app.middleware("http")
+async def global_cors_middleware(request: Request, call_next):
+    # Preflight short-circuit for any path
+    if request.method == "OPTIONS":
+        return Response(status_code=204, headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
+            "Access-Control-Allow-Credentials": "false",
+            "Access-Control-Expose-Headers": "*",
+            "Access-Control-Max-Age": "86400",
+            "Access-Control-Allow-Private-Network": "true",
+            "Connection": "close",
+        })
+    resp = await call_next(request)
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+    resp.headers["Access-Control-Allow-Headers"] = "*"
+    resp.headers["Access-Control-Allow-Credentials"] = "false"
+    resp.headers["Access-Control-Expose-Headers"] = "*"
+    resp.headers["Access-Control-Max-Age"] = "86400"
+    resp.headers["Access-Control-Allow-Private-Network"] = "true"
+    return resp
+
+
 @app.post("/api/conversations")
 async def create_conversation(body: Dict[str, Any]):
     title = (body or {}).get("title") or "New Conversation"
@@ -142,13 +168,58 @@ def _build_openai_messages(base: List[Dict[str, Any]], attachments: List[Dict[st
 
 @app.post("/api/conversations/{cid}/chat")
 async def chat(cid: int, request: Request):
-    # Raw-body tolerant: accept JSON or raw text
-    raw = await request.body()
-    try:
-        body = json.loads(raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else raw)
-    except Exception:
-        body = {"content": (raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw))}
-    logging.info("chat request cid=%s body_type=%s", cid, type(body).__name__)
+    # Accept JSON, raw text, or x-www-form-urlencoded, and parse via custom JSON parser
+    ct = (request.headers.get("content-type") or "").lower()
+    body: Dict[str, Any] = {}
+    parser = JSONParser()
+    if "application/json" in ct:
+        try:
+            # Try FastAPI JSON first; if that fails, repair with custom parser
+            body = await request.json()
+        except Exception:
+            raw_bytes = await request.body()
+            decoded = raw_bytes.decode("utf-8", errors="replace")
+            try:
+                body = parser.method_json_loads(decoded)
+            except Exception:
+                repaired = parser.attempt_repair(decoded)
+                try:
+                    body = parser.method_json_loads(repaired)
+                except Exception:
+                    body = {"content": decoded}
+    else:
+        raw_bytes = await request.body()
+        raw_text = raw_bytes.decode("utf-8", errors="replace")
+        if "application/x-www-form-urlencoded" in ct:
+            form = parse_qs(raw_text, keep_blank_values=True)
+            if "content" in form and len(form["content"]) > 0:
+                candidate = form["content"][0]
+                try:
+                    body = parser.method_json_loads(candidate)
+                except Exception:
+                    repaired = parser.attempt_repair(candidate)
+                    try:
+                        body = parser.method_json_loads(repaired)
+                    except Exception:
+                        body = {"content": candidate}
+            elif len(form) == 1:
+                first_key = next(iter(form))
+                vals = form.get(first_key) or [raw_text]
+                candidate = vals[0]
+                try:
+                    body = parser.method_json_loads(candidate)
+                except Exception:
+                    repaired = parser.attempt_repair(candidate)
+                    try:
+                        body = parser.method_json_loads(repaired)
+                    except Exception:
+                        body = {"content": candidate}
+            else:
+                body = {"content": raw_text}
+        else:
+            # Treat as raw text
+            body = {"content": raw_text}
+    logging.info("chat request cid=%s ct=%s keys=%s", cid, ct, list(body.keys()))
     user_content = (body or {}).get("content") or ""
     messages = (body or {}).get("messages") or []
     # Force non-stream proxy for reliability in the UI
@@ -176,10 +247,16 @@ async def chat(cid: int, request: Request):
                         body = await r.aread()
                         # ensure JSON text
                         try:
-                            obj = json.loads(body.decode("utf-8"))
+                            decoded = body.decode("utf-8")
+                            obj = parser.method_json_loads(decoded)
                             yield json.dumps(obj)
                         except Exception:
-                            yield body
+                            try:
+                                repaired = parser.attempt_repair(decoded)
+                                obj = parser.method_json_loads(repaired)
+                                yield json.dumps(obj)
+                            except Exception:
+                                yield body
         except Exception as ex:
             yield json.dumps({"error": str(ex)})
 
@@ -194,14 +271,23 @@ async def chat(cid: int, request: Request):
                     return JSONResponse(status_code=rr.status_code, content=rr.json())
                 logging.warning("orchestrator error %s (non-json): %s", rr.status_code, rr.text[:500])
                 return JSONResponse(status_code=rr.status_code, content={"error": rr.text})
-            data = rr.json()
+            try:
+                data = rr.json()
+            except Exception:
+                parser = JSONParser()
+                decoded = rr.text
+                try:
+                    data = parser.method_json_loads(decoded)
+                except Exception:
+                    repaired = parser.attempt_repair(decoded)
+                    data = parser.method_json_loads(repaired)
     except Exception as ex:
         logging.exception("chat proxy failed: %s", ex)
         return JSONResponse(status_code=502, content={"error": str(ex)})
     content = ((data.get("choices") or [{}])[0].get("message") or {}).get("content")
     with engine.begin() as conn:
         conn.execute(text("INSERT INTO messages (conversation_id, role, content) VALUES (:c, 'assistant', :x)"), {"c": cid, "x": json.dumps({"text": content})})
-    # Return raw body with explicit headers to avoid any client-side fetch issues
+    # Return raw JSON body with explicit headers to avoid client-side fetch issues
     body = json.dumps(data)
     headers = {
         "Cache-Control": "no-store",
@@ -209,9 +295,9 @@ async def chat(cid: int, request: Request):
         "Content-Length": str(len(body.encode("utf-8"))),
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Private-Network": "true",
+        "Access-Control-Expose-Headers": "*",
     }
-    # Return as text/plain to bypass any strict JSON handling in intermediaries while keeping the JSON payload intact
-    return Response(content=body, media_type="text/plain", headers=headers)
+    return Response(content=body, media_type="application/json", headers=headers)
 
 
 @app.options("/api/conversations/{cid}/chat")
@@ -230,6 +316,56 @@ async def any_preflight(path: str):
     return Response(status_code=204, headers={
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+        "Access-Control-Allow-Headers": "*",
+        "Access-Control-Allow-Private-Network": "true",
+        "Access-Control-Max-Age": "86400",
+    })
+
+
+# Alternate chat endpoint to avoid any extension/content filters on "/chat" path
+@app.post("/api/chat")
+async def chat_alt(body: Dict[str, Any]):
+    cid = int((body or {}).get("conversation_id") or 0)
+    user_content = (body or {}).get("content") or ""
+    if not cid:
+        return JSONResponse(status_code=400, content={"error": "missing conversation_id"})
+    with engine.begin() as conn:
+        conn.execute(text("INSERT INTO messages (conversation_id, role, content) VALUES (:c, 'user', :x)"), {"c": cid, "x": json.dumps({"text": user_content})})
+        atts = conn.execute(text("SELECT name, url, mime FROM attachments WHERE conversation_id=:id"), {"id": cid}).mappings().all()
+    oa_msgs = _build_openai_messages([{"role": "user", "content": user_content}], [dict(a) for a in atts])
+    payload = {"messages": oa_msgs, "stream": False}
+    async with httpx.AsyncClient(timeout=None) as client:
+        rr = await client.post(ORCH_URL.rstrip("/") + "/v1/chat/completions", json=payload)
+        try:
+            data = rr.json()
+        except Exception:
+            parser = JSONParser()
+            decoded = rr.text
+            try:
+                data = parser.method_json_loads(decoded)
+            except Exception:
+                repaired = parser.attempt_repair(decoded)
+                data = parser.method_json_loads(repaired)
+    assistant = ((data.get("choices") or [{}])[0].get("message") or {}).get("content")
+    with engine.begin() as conn:
+        conn.execute(text("INSERT INTO messages (conversation_id, role, content) VALUES (:c, 'assistant', :x)"), {"c": cid, "x": json.dumps({"text": assistant})})
+    body_text = json.dumps(data)
+    headers = {
+        "Cache-Control": "no-store",
+        "Connection": "close",
+        "Content-Length": str(len(body_text.encode("utf-8"))),
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Private-Network": "true",
+        "Access-Control-Expose-Headers": "*",
+    }
+    return Response(content=body_text, media_type="application/json", headers=headers)
+
+
+@app.options("/api/chat")
+async def chat_alt_preflight():
+    return Response(status_code=204, headers={
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "POST, OPTIONS",
         "Access-Control-Allow-Headers": "*",
         "Access-Control-Allow-Private-Network": "true",
         "Access-Control-Max-Age": "86400",

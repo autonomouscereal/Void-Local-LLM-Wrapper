@@ -43,15 +43,31 @@ function App() {
       conversationId = await newConversation()
     }
     setSending(true)
-    // Use XMLHttpRequest to avoid fetch-specific quirks
     // Persist user message locally
     await fetch(`/api/conversations/${conversationId}/message`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ role: 'user', content: text }) })
-    // Call proxy (same origin) to avoid any CORS
-    const res = await fetch(`/api/conversations/${conversationId}/chat`, { method: 'POST', body: text })
-    const raw = await res.text()
-    const data = JSON.parse(raw)
-    const content = ((data.choices && data.choices[0] && data.choices[0].message) || {}).content || raw
-    // Persist assistant message locally
+    let raw = ''
+    try {
+      // First try text/plain (avoids strict JSON/proxy layers)
+      const r1 = await fetch(`/api/conversations/${conversationId}/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain;charset=UTF-8', 'Accept': 'application/json' },
+        body: text
+      })
+      raw = await r1.text()
+      if (!r1.ok) throw new Error(raw || 'chat proxy error')
+    } catch (e) {
+      // Fallback to alternate endpoint with JSON body
+      const r2 = await fetch(`/api/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+        body: JSON.stringify({ conversation_id: conversationId, content: text })
+      })
+      raw = await r2.text()
+      if (!r2.ok) throw new Error(raw || 'chat alt proxy error')
+    }
+    let data
+    try { data = JSON.parse(raw) } catch { data = { error: raw } }
+    const content = ((data.choices && data.choices[0] && data.choices[0].message) || {}).content || (data.error || raw)
     await fetch(`/api/conversations/${conversationId}/message`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ role: 'assistant', content }) })
     setMsgs(prev => ([...prev, { id: Date.now(), role: 'assistant', content: { text: content } }]))
     setText('')

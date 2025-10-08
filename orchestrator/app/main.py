@@ -60,6 +60,52 @@ N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL")  # optional external workflow orc
 ASSEMBLER_API_URL = os.getenv("ASSEMBLER_API_URL")  # http://assembler:9095
 
 
+def robust_json_loads(json_string: str) -> Any:
+    try:
+        return json.loads(json_string)
+    except Exception:
+        pass
+    s = json_string or ""
+    # strip markdown fences
+    s = s.replace("```json", "").replace("```", "").strip()
+    # common fixes
+    replacements = [
+        ('\\"', '"'),
+        ("\\'", "'"),
+        ('"{', '{'),
+        ('}"', '}'),
+        (",}", "}"),
+        (",]", "]"),
+        ('"False"', 'false'),
+        ('"True"', 'true'),
+    ]
+    for old, new in replacements:
+        s = s.replace(old, new)
+    # fix adjacent objects
+    s = s.replace('}{', '},{')
+    try:
+        return json.loads(s)
+    except Exception:
+        pass
+    # extract first balanced {...}
+    stack = []
+    start = -1
+    for i, ch in enumerate(s):
+        if ch == '{':
+            if not stack:
+                start = i
+            stack.append(ch)
+        elif ch == '}' and stack:
+            stack.pop()
+            if not stack and start != -1:
+                seg = s[start:i+1]
+                try:
+                    return json.loads(seg)
+                except Exception:
+                    break
+    return {}
+
+
 class ChatMessage(BaseModel):
     role: str
     content: Any | None = None
@@ -106,6 +152,29 @@ app.add_middleware(
     max_age=86400,
 )
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
+@app.middleware("http")
+async def global_cors_middleware(request: Request, call_next):
+    if request.method == "OPTIONS":
+        return StreamingResponse(content=iter(()), status_code=204, headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
+            "Access-Control-Allow-Credentials": "false",
+            "Access-Control-Expose-Headers": "*",
+            "Access-Control-Max-Age": "86400",
+            "Access-Control-Allow-Private-Network": "true",
+            "Connection": "close",
+        })
+    resp = await call_next(request)
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+    resp.headers["Access-Control-Allow-Headers"] = "*"
+    resp.headers["Access-Control-Allow-Credentials"] = "false"
+    resp.headers["Access-Control-Expose-Headers"] = "*"
+    resp.headers["Access-Control-Max-Age"] = "86400"
+    resp.headers["Access-Control-Allow-Private-Network"] = "true"
+    return resp
+
 
 # In-memory job cache (DB is source of truth)
 _jobs_store: Dict[str, Dict[str, Any]] = {}
@@ -700,12 +769,11 @@ async def planner_produce_plan(messages: List[ChatMessage], tools: Optional[List
     plan = ""
     tool_calls: List[Dict[str, Any]] = []
     try:
-        parsed = json.loads(json_text)
-        plan = parsed.get("plan", "")
-        tool_calls = parsed.get("tool_calls", []) or []
+        parsed = robust_json_loads(json_text)
     except Exception:
-        plan = text
-        tool_calls = []
+        return text, []
+    plan = parsed.get("plan", "")
+    tool_calls = parsed.get("tool_calls", []) or []
     return plan, tool_calls
 
 
@@ -1577,7 +1645,7 @@ async def stream_job(job_id: str, interval_ms: Optional[int] = None):
             if snapshot != last_snapshot:
                 yield f"data: {snapshot}\n\n"
                 last_snapshot = snapshot
-            state = (json.loads(snapshot) or {}).get("status")
+            state = (robust_json_loads(snapshot) or {}).get("status")
             if state in ("succeeded", "failed", "cancelled"):
                 yield "data: [DONE]\n\n"
                 break
