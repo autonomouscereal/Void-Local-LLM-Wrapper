@@ -208,8 +208,10 @@ async def chat(cid: int, request: Request):
         "Connection": "close",
         "Content-Length": str(len(body.encode("utf-8"))),
         "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Private-Network": "true",
     }
-    return Response(content=body, media_type="application/json", headers=headers)
+    # Return as text/plain to bypass any strict JSON handling in intermediaries while keeping the JSON payload intact
+    return Response(content=body, media_type="text/plain", headers=headers)
 
 
 @app.options("/api/conversations/{cid}/chat")
@@ -218,6 +220,18 @@ async def chat_preflight(cid: int):
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Methods": "POST, OPTIONS",
         "Access-Control-Allow-Headers": "*",
+        "Access-Control-Allow-Private-Network": "true",
+        "Access-Control-Max-Age": "86400",
+    })
+
+
+@app.options("/api/{path:path}")
+async def any_preflight(path: str):
+    return Response(status_code=204, headers={
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+        "Access-Control-Allow-Headers": "*",
+        "Access-Control-Allow-Private-Network": "true",
         "Access-Control-Max-Age": "86400",
     })
 
