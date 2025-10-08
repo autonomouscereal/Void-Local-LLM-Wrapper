@@ -70,7 +70,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-app.mount("/", StaticFiles(directory="/app/frontend_dist", html=True), name="static")
+# Mount static AFTER API routes to avoid intercepting /api/* with 404/405
 
 
 @app.post("/api/conversations")
@@ -202,4 +202,6 @@ async def get_job(job_id: str):
 async def healthz():
     return {"status": "ok"}
 
+
+app.mount("/", StaticFiles(directory="/app/frontend_dist", html=True), name="static")
 
