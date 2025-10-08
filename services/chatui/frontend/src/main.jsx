@@ -46,6 +46,7 @@ function App() {
     // Persist user message locally
     await fetch(`/api/conversations/${conversationId}/message`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ role: 'user', content: text }) })
     let raw = ''
+    let data
     try {
       // First try text/plain (avoids strict JSON/proxy layers)
       const r1 = await fetch(`/api/conversations/${conversationId}/chat`, {
@@ -53,7 +54,12 @@ function App() {
         headers: { 'Content-Type': 'text/plain;charset=UTF-8', 'Accept': 'application/json' },
         body: text
       })
-      raw = await r1.text()
+      try {
+        data = await r1.json()
+        raw = JSON.stringify(data)
+      } catch {
+        raw = await r1.text()
+      }
       if (!r1.ok) throw new Error(raw || 'chat proxy error')
     } catch (e) {
       // Fallback to alternate endpoint with JSON body
@@ -62,10 +68,14 @@ function App() {
         headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
         body: JSON.stringify({ conversation_id: conversationId, content: text })
       })
-      raw = await r2.text()
+      try {
+        data = await r2.json()
+        raw = JSON.stringify(data)
+      } catch {
+        raw = await r2.text()
+      }
       if (!r2.ok) throw new Error(raw || 'chat alt proxy error')
     }
-    let data
     try { data = JSON.parse(raw) } catch { data = { error: raw } }
     const content = ((data.choices && data.choices[0] && data.choices[0].message) || {}).content || (data.error || raw)
     await fetch(`/api/conversations/${conversationId}/message`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ role: 'assistant', content }) })

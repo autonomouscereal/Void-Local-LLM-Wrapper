@@ -287,17 +287,14 @@ async def chat(cid: int, request: Request):
     content = ((data.get("choices") or [{}])[0].get("message") or {}).get("content")
     with engine.begin() as conn:
         conn.execute(text("INSERT INTO messages (conversation_id, role, content) VALUES (:c, 'assistant', :x)"), {"c": cid, "x": json.dumps({"text": content})})
-    # Return raw JSON body with explicit headers to avoid client-side fetch issues
-    body = json.dumps(data)
+    # Return via JSONResponse and let framework manage content-length/transfer
     headers = {
         "Cache-Control": "no-store",
-        "Connection": "close",
-        "Content-Length": str(len(body.encode("utf-8"))),
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Private-Network": "true",
         "Access-Control-Expose-Headers": "*",
     }
-    return Response(content=body, media_type="application/json", headers=headers)
+    return JSONResponse(content=data, headers=headers)
 
 
 @app.options("/api/conversations/{cid}/chat")
@@ -349,16 +346,13 @@ async def chat_alt(body: Dict[str, Any]):
     assistant = ((data.get("choices") or [{}])[0].get("message") or {}).get("content")
     with engine.begin() as conn:
         conn.execute(text("INSERT INTO messages (conversation_id, role, content) VALUES (:c, 'assistant', :x)"), {"c": cid, "x": json.dumps({"text": assistant})})
-    body_text = json.dumps(data)
     headers = {
         "Cache-Control": "no-store",
-        "Connection": "close",
-        "Content-Length": str(len(body_text.encode("utf-8"))),
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Private-Network": "true",
         "Access-Control-Expose-Headers": "*",
     }
-    return Response(content=body_text, media_type="application/json", headers=headers)
+    return JSONResponse(content=data, headers=headers)
 
 
 @app.options("/api/chat")
