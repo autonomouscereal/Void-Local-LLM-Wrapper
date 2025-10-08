@@ -47,36 +47,19 @@ function App() {
     await fetch(`/api/conversations/${conversationId}/message`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ role: 'user', content: text }) })
     let raw = ''
     let data
+    const r = await fetch(`/api/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      body: JSON.stringify({ conversation_id: conversationId, content: text })
+    })
     try {
-      // First try text/plain (avoids strict JSON/proxy layers)
-      const r1 = await fetch(`/api/conversations/${conversationId}/chat`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'text/plain;charset=UTF-8', 'Accept': 'application/json' },
-        body: text
-      })
-      try {
-        data = await r1.json()
-        raw = JSON.stringify(data)
-      } catch {
-        raw = await r1.text()
-      }
-      if (!r1.ok) throw new Error(raw || 'chat proxy error')
-    } catch (e) {
-      // Fallback to alternate endpoint with JSON body
-      const r2 = await fetch(`/api/chat`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-        body: JSON.stringify({ conversation_id: conversationId, content: text })
-      })
-      try {
-        data = await r2.json()
-        raw = JSON.stringify(data)
-      } catch {
-        raw = await r2.text()
-      }
-      if (!r2.ok) throw new Error(raw || 'chat alt proxy error')
+      data = await r.json()
+      raw = JSON.stringify(data)
+    } catch {
+      raw = await r.text()
+      try { data = JSON.parse(raw) } catch { data = { error: raw } }
     }
-    try { data = JSON.parse(raw) } catch { data = { error: raw } }
+    if (!r.ok) throw new Error(raw || 'chat proxy error')
     const content = ((data.choices && data.choices[0] && data.choices[0].message) || {}).content || (data.error || raw)
     await fetch(`/api/conversations/${conversationId}/message`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ role: 'assistant', content }) })
     setMsgs(prev => ([...prev, { id: Date.now(), role: 'assistant', content: { text: content } }]))

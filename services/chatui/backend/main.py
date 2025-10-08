@@ -294,6 +294,7 @@ async def chat(cid: int, request: Request):
         "Access-Control-Allow-Private-Network": "true",
         "Access-Control-Expose-Headers": "*",
     }
+    headers["Connection"] = "close"
     return JSONResponse(content=data, headers=headers)
 
 
@@ -352,6 +353,7 @@ async def chat_alt(body: Dict[str, Any]):
         "Access-Control-Allow-Private-Network": "true",
         "Access-Control-Expose-Headers": "*",
     }
+    headers["Connection"] = "close"
     return JSONResponse(content=data, headers=headers)
 
 
