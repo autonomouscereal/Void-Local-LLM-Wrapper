@@ -186,7 +186,8 @@ async def chat(cid: int, body: Dict[str, Any]):
     content = ((data.get("choices") or [{}])[0].get("message") or {}).get("content")
     with engine.begin() as conn:
         conn.execute(text("INSERT INTO messages (conversation_id, role, content) VALUES (:c, 'assistant', :x)"), {"c": cid, "x": json.dumps({"text": content})})
-    return data
+    # Return raw body (no JSONResponse) to avoid any content-length/middleware issues
+    return Response(content=json.dumps(data), media_type="application/json")
 
 
 @app.get("/api/orchestrator/diagnostics")

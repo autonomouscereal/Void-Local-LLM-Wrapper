@@ -15,6 +15,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from tenacity import retry, stop_after_attempt, wait_exponential
+from fastapi.middleware.cors import CORSMiddleware
 
 
 QWEN_BASE_URL = os.getenv("QWEN_BASE_URL", "http://localhost:11434")
@@ -95,6 +96,15 @@ class ChatResponse(BaseModel):
 
 
 app = FastAPI(title="Void Orchestrator", version="0.1.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["*"],
+    max_age=86400,
+)
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 # In-memory job cache (DB is source of truth)
