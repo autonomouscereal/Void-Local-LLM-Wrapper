@@ -133,7 +133,8 @@ def _build_openai_messages(base: List[Dict[str, Any]], attachments: List[Dict[st
 async def chat(cid: int, body: Dict[str, Any]):
     user_content = (body or {}).get("content") or ""
     messages = (body or {}).get("messages") or []
-    stream = bool((body or {}).get("stream"))
+    # Force non-stream proxy for reliability in the UI
+    stream = False
     # Store user message
     with engine.begin() as conn:
         conn.execute(text("INSERT INTO messages (conversation_id, role, content) VALUES (:c, 'user', :x)"), {"c": cid, "x": json.dumps({"text": user_content})})
@@ -141,7 +142,7 @@ async def chat(cid: int, body: Dict[str, Any]):
 
     # Build messages for orchestrator
     oa_msgs = _build_openai_messages(messages + [{"role": "user", "content": user_content}], [dict(a) for a in atts])
-    payload = {"messages": oa_msgs, "stream": stream}
+    payload = {"messages": oa_msgs, "stream": False}
 
     async def _proxy_stream():
         try:
@@ -164,26 +165,22 @@ async def chat(cid: int, body: Dict[str, Any]):
         except Exception as ex:
             yield json.dumps({"error": str(ex)})
 
-    if stream:
-        return StreamingResponse(_proxy_stream(), media_type="text/event-stream")
-    else:
-        # Non-stream: forward and persist assistant message
-        try:
-            async with httpx.AsyncClient(timeout=300) as client:
-                rr = await client.post(ORCH_URL.rstrip("/") + "/v1/chat/completions", json=payload)
-                if rr.status_code >= 400:
-                    # return orchestrator's error body directly for visibility
-                    content_type = rr.headers.get("content-type", "")
-                    if content_type.startswith("application/json"):
-                        return JSONResponse(status_code=rr.status_code, content=rr.json())
-                    return JSONResponse(status_code=rr.status_code, content={"error": rr.text})
-                data = rr.json()
-        except Exception as ex:
-            return JSONResponse(status_code=502, content={"error": str(ex)})
-        content = ((data.get("choices") or [{}])[0].get("message") or {}).get("content")
-        with engine.begin() as conn:
-            conn.execute(text("INSERT INTO messages (conversation_id, role, content) VALUES (:c, 'assistant', :x)"), {"c": cid, "x": json.dumps({"text": content})})
-        return data
+    # Non-stream: forward and persist assistant message
+    try:
+        async with httpx.AsyncClient(timeout=300) as client:
+            rr = await client.post(ORCH_URL.rstrip("/") + "/v1/chat/completions", json=payload)
+            if rr.status_code >= 400:
+                content_type = rr.headers.get("content-type", "")
+                if content_type.startswith("application/json"):
+                    return JSONResponse(status_code=rr.status_code, content=rr.json())
+                return JSONResponse(status_code=rr.status_code, content={"error": rr.text})
+            data = rr.json()
+    except Exception as ex:
+        return JSONResponse(status_code=502, content={"error": str(ex)})
+    content = ((data.get("choices") or [{}])[0].get("message") or {}).get("content")
+    with engine.begin() as conn:
+        conn.execute(text("INSERT INTO messages (conversation_id, role, content) VALUES (:c, 'assistant', :x)"), {"c": cid, "x": json.dumps({"text": content})})
+    return data
 
 
 @app.get("/api/jobs")
