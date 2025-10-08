@@ -1,4 +1,5 @@
 from __future__ import annotations
+# WARNING: Do NOT add SQLAlchemy here. Use asyncpg with pooling and raw SQL only.
 
 import os
 import asyncio
@@ -7,8 +8,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import time
 
 import httpx
-from sqlalchemy import create_engine, text
-from sqlalchemy.engine import Engine
+import re
+import asyncpg
 from sentence_transformers import SentenceTransformer
 from fastapi import FastAPI, Request, UploadFile, File
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -315,26 +316,29 @@ def extract_attachments_from_messages(messages: List[ChatMessage]) -> Tuple[List
 
 
 # ---------- RAG (pgvector) ----------
-_engine: Optional[Engine] = None
+pg_pool: Optional[asyncpg.pool.Pool] = None
 _embedder: Optional[SentenceTransformer] = None
 _rag_cache: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
 
 
-def get_engine() -> Optional[Engine]:
-    global _engine
-    if _engine is not None:
-        return _engine
+async def get_pg_pool() -> Optional[asyncpg.pool.Pool]:
+    global pg_pool
+    if pg_pool is not None:
+        return pg_pool
     if not (POSTGRES_HOST and POSTGRES_DB and POSTGRES_USER and POSTGRES_PASSWORD):
         return None
-    url = f"postgresql+psycopg2://{POSTGRES_USER}:{POSTGRES_PASSWORD}@{POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}"
-    _engine = create_engine(url, pool_pre_ping=True)
-    with _engine.begin() as conn:
-        try:
-            conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-        except Exception:
-            # Non-fatal: if the user lacks privilege but extension already exists, continue
-            pass
-        conn.execute(text(
+    pg_pool = await asyncpg.create_pool(
+        user=POSTGRES_USER,
+        password=POSTGRES_PASSWORD,
+        database=POSTGRES_DB,
+        host=POSTGRES_HOST,
+        port=POSTGRES_PORT,
+        min_size=1,
+        max_size=10,
+    )
+    async with pg_pool.acquire() as conn:
+        await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
+        await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS rag_docs (
               id BIGSERIAL PRIMARY KEY,
@@ -343,9 +347,9 @@ def get_engine() -> Optional[Engine]:
               embedding vector(384)
             );
             """
-        ))
-        conn.execute(text("CREATE INDEX IF NOT EXISTS rag_docs_embedding_idx ON rag_docs USING ivfflat (embedding vector_cosine) WITH (lists = 100);"))
-        conn.execute(text(
+        )
+        await conn.execute("CREATE INDEX IF NOT EXISTS rag_docs_embedding_idx ON rag_docs USING ivfflat (embedding vector_cosine) WITH (lists = 100);")
+        await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS jobs (
               id TEXT PRIMARY KEY,
@@ -358,9 +362,9 @@ def get_engine() -> Optional[Engine]:
               error TEXT
             );
             """
-        ))
-        conn.execute(text("CREATE INDEX IF NOT EXISTS jobs_status_updated_idx ON jobs (status, updated_at DESC);"))
-        conn.execute(text(
+        )
+        await conn.execute("CREATE INDEX IF NOT EXISTS jobs_status_updated_idx ON jobs (status, updated_at DESC);")
+        await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS job_checkpoints (
               id BIGSERIAL PRIMARY KEY,
@@ -369,8 +373,8 @@ def get_engine() -> Optional[Engine]:
               data JSONB
             );
             """
-        ))
-        conn.execute(text(
+        )
+        await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS films (
               id TEXT PRIMARY KEY,
@@ -381,8 +385,8 @@ def get_engine() -> Optional[Engine]:
               metadata JSONB
             );
             """
-        ))
-        conn.execute(text(
+        )
+        await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS characters (
               id TEXT PRIMARY KEY,
@@ -394,8 +398,8 @@ def get_engine() -> Optional[Engine]:
               updated_at TIMESTAMPTZ DEFAULT NOW()
             );
             """
-        ))
-        conn.execute(text(
+        )
+        await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS scenes (
               id TEXT PRIMARY KEY,
@@ -410,8 +414,8 @@ def get_engine() -> Optional[Engine]:
               updated_at TIMESTAMPTZ DEFAULT NOW()
             );
             """
-        ))
-    return _engine
+        )
+    return pg_pool
 
 
 def get_embedder() -> SentenceTransformer:
@@ -424,8 +428,8 @@ def get_embedder() -> SentenceTransformer:
 async def rag_index_dir(root: str = "/workspace", glob_exts: Optional[List[str]] = None, chunk_size: int = 1000, chunk_overlap: int = 200) -> Dict[str, Any]:
     import glob as _glob
     import os as _os
-    engine = get_engine()
-    if engine is None:
+    pool = await get_pg_pool()
+    if pool is None:
         return {"error": "pgvector not configured"}
     exts = glob_exts or ["*.md", "*.py", "*.ts", "*.tsx", "*.js", "*.json", "*.txt"]
     files: List[str] = []
@@ -433,7 +437,7 @@ async def rag_index_dir(root: str = "/workspace", glob_exts: Optional[List[str]]
         files.extend(_glob.glob(_os.path.join(root, "**", ext), recursive=True))
     embedder = get_embedder()
     total_chunks = 0
-    with engine.begin() as conn:
+    async with pool.acquire() as conn:
         for fp in files[:5000]:
             try:
                 with open(fp, "r", encoding="utf-8", errors="ignore") as f:
@@ -446,7 +450,7 @@ async def rag_index_dir(root: str = "/workspace", glob_exts: Optional[List[str]]
                 chunk = content[i : i + chunk_size]
                 i += max(1, chunk_size - chunk_overlap)
                 vec = embedder.encode([chunk])[0]
-                conn.execute(text("INSERT INTO rag_docs (path, chunk, embedding) VALUES (:p, :c, :e)"), {"p": fp.replace(root + "/", ""), "c": chunk, "e": list(vec)})
+                await conn.execute("INSERT INTO rag_docs (path, chunk, embedding) VALUES ($1, $2, $3)", fp.replace(root + "/", ""), chunk, list(vec))
                 total_chunks += 1
     return {"indexed_files": len(files), "chunks": total_chunks}
 
@@ -457,15 +461,15 @@ async def rag_search(query: str, k: int = 8) -> List[Dict[str, Any]]:
     cached = _rag_cache.get(key)
     if cached and (now - cached[0] <= RAG_CACHE_TTL_SEC):
         return cached[1]
-    engine = get_engine()
-    if engine is None:
+    pool = await get_pg_pool()
+    if pool is None:
         return []
     vec = get_embedder().encode([query])[0]
-    with engine.begin() as conn:
-        rows = conn.execute(text("SELECT path, chunk FROM rag_docs ORDER BY embedding <=> :q LIMIT :k"), {"q": list(vec), "k": k}).fetchall()
-        results = [{"path": r[0], "chunk": r[1]} for r in rows]
-        _rag_cache[key] = (now, results)
-        return results
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT path, chunk FROM rag_docs ORDER BY embedding <=> $1 LIMIT $2", list(vec), k)
+        results = [{"path": r["path"], "chunk": r["chunk"]} for r in rows]
+    _rag_cache[key] = (now, results)
+    return results
 
 
 @retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=0.5, max=2))
@@ -566,7 +570,8 @@ def meta_prompt(messages: List[ChatMessage]) -> List[ChatMessage]:
     system_preface = (
         "You are part of a two-model team with explicit roles: a Planner and Executors. "
         "Planner decomposes the task, chooses tools, and requests relevant evidence. Executors produce solutions and critiques. "
-        "Be precise, show working when non-trivial, and output correct, runnable code when appropriate."
+        "Be precise, show working when non-trivial, and output correct, runnable code when appropriate. "
+        "Absolute rule: Never use SQLAlchemy; use asyncpg with pooling and raw SQL for PostgreSQL."
     )
     out = [ChatMessage(role="system", content=system_preface)]
     # If the request suggests filmmaking, nudge to use the film tools
@@ -749,7 +754,8 @@ async def planner_produce_plan(messages: List[ChatMessage], tools: Optional[List
         "You are the Planner. Produce a short step-by-step plan and, if helpful, propose up to 3 tool invocations.\n"
         "Ask 1-3 clarifying questions ONLY if blocking details are missing (e.g., duration, style, language, target resolution).\n"
         "If not blocked, proceed and choose reasonable defaults: duration<=10s for short clips, 1920x1080, 24fps, language=en, a neutral voice.\n"
-        "Return strict JSON with keys: plan (string), tool_calls (array of {name: string, arguments: object})."
+        "Return strict JSON with keys: plan (string), tool_calls (array of {name: string, arguments: object}).\n"
+        "Absolute rule: Never propose or use SQLAlchemy in code or tools. Use asyncpg with pooled connections and raw SQL for PostgreSQL."
     )
     all_tools = merge_tool_schemas(tools)
     tool_info = build_tools_section(all_tools)
@@ -865,8 +871,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 return {"name": name, "error": r.text}
     # --- Film tools (LLM-driven, simple UI) ---
     if name == "film_create":
-        engine = get_engine()
-        if engine is None:
+        pool = await get_pg_pool()
+        if pool is None:
             return {"name": name, "error": "pg not configured"}
         import uuid as _uuid
         film_id = _uuid.uuid4().hex
@@ -888,13 +894,10 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         }
         # attach preferences back to metadata
         metadata = {**metadata, **{k: v for k, v in prefs.items() if v is not None}}
-        with engine.begin() as conn:
-            conn.execute(text("INSERT INTO films (id, title, synopsis, metadata) VALUES (:id, :t, :s, :m)"), {"id": film_id, "t": title, "s": synopsis, "m": metadata})
+        async with pool.acquire() as conn:
+            await conn.execute("INSERT INTO films (id, title, synopsis, metadata) VALUES ($1, $2, $3, $4)", film_id, title, synopsis, json.dumps(metadata))
         return {"name": name, "result": {"film_id": film_id, "title": title}}
     if name == "film_add_character":
-        engine = get_engine()
-        if engine is None:
-            return {"name": name, "error": "pg not configured"}
         import uuid as _uuid
         char_id = _uuid.uuid4().hex
         film_id = args.get("film_id")
@@ -936,16 +939,16 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             if isinstance(refs, dict):
                 refs = {**refs, "face_embeddings": face_embeddings, "face_embedding_mean": fused}
         # else keep refs as-is
-        with engine.begin() as conn:
-            exists = conn.execute(text("SELECT 1 FROM films WHERE id=:id"), {"id": film_id}).first()
+        pool = await get_pg_pool()
+        if pool is None:
+            return {"name": name, "error": "pg not configured"}
+        async with pool.acquire() as conn:
+            exists = await conn.fetchval("SELECT 1 FROM films WHERE id=$1", film_id)
             if not exists:
                 return {"name": name, "error": "film not found"}
-            conn.execute(text("INSERT INTO characters (id, film_id, name, description, references) VALUES (:id, :f, :n, :d, :r)"), {"id": char_id, "f": film_id, "n": args.get("name") or "Unnamed", "d": args.get("description") or "", "r": refs})
+            await conn.execute("INSERT INTO characters (id, film_id, name, description, references) VALUES ($1, $2, $3, $4, $5)", char_id, film_id, args.get("name") or "Unnamed", args.get("description") or "", json.dumps(refs))
         return {"name": name, "result": {"character_id": char_id}}
     if name == "film_add_scene":
-        engine = get_engine()
-        if engine is None:
-            return {"name": name, "error": "pg not configured"}
         film_id = args.get("film_id")
         if not film_id:
             return {"name": name, "error": "missing film_id"}
@@ -956,12 +959,17 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         workflow = args.get("workflow") or plan
         advanced_used = False
         if not workflow:
-            prefs = _get_film_preferences(engine, film_id)
+            pool = await get_pg_pool()
+            if pool is None:
+                return {"name": name, "error": "pg not configured"}
+            async with pool.acquire() as conn:
+                row = await conn.fetchrow("SELECT metadata FROM films WHERE id=$1", film_id)
+                prefs = (row and row["metadata"]) or {}
             res_w, res_h = _parse_resolution(prefs.get("resolution") or "1024x1024")
             steps = 25
             if isinstance(prefs.get("quality"), str) and prefs.get("quality") == "high":
                 steps = 35
-            chars = _get_film_characters(engine, film_id)
+            chars = await get_film_characters(film_id)
             # derive stable seed from film+scene meta for appearance stability
             seed = _derive_seed(film_id, str(index_num), prompt)
             filename_prefix = f"scene_{index_num:03d}"
@@ -1010,7 +1018,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         submit = await _comfy_submit_workflow(workflow)
         if submit.get("error") and advanced_used:
             # graceful fallback to basic still workflow if advanced nodes unavailable
-            prefs = _get_film_preferences(engine, film_id)
+            prefs = await get_film_preferences(film_id)
             res_w, res_h = _parse_resolution(prefs.get("resolution") or "1024x1024")
             steps = 25
             if isinstance(prefs.get("quality"), str) and prefs.get("quality") == "high":
@@ -1019,7 +1027,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             filename_prefix = f"scene_{index_num:03d}"
             workflow = build_default_scene_workflow(
                 prompt=prompt,
-                characters=_get_film_characters(engine, film_id),
+                characters=await get_film_characters(film_id),
                 style=(args.get("style") or prefs.get("style") or None),
                 width=res_w,
                 height=res_h,
@@ -1037,8 +1045,11 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         # resolve toggles for audio/subtitles
         pref_audio = args.get("audio_enabled")
         pref_subs = args.get("subtitles_enabled")
-        with engine.begin() as conn:
-            conn.execute(text("INSERT INTO jobs (id, prompt_id, status, workflow) VALUES (:id, :pid, 'queued', :wf)"), {"id": job_id, "pid": prompt_id, "wf": workflow})
+        pool = await get_pg_pool()
+        if pool is None:
+            return {"name": name, "error": "pg not configured"}
+        async with pool.acquire() as conn:
+            await conn.execute("INSERT INTO jobs (id, prompt_id, status, workflow) VALUES ($1, $2, 'queued', $3)", job_id, prompt_id, json.dumps(workflow))
             # merge scene-local toggles into preferences
             merged_prefs = dict(prefs) if isinstance(prefs, dict) else {}
             if pref_audio is not None:
@@ -1047,19 +1058,20 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 merged_prefs["subtitles_enabled"] = bool(pref_subs)
             # include character_ids into plan for downstream consistency
             scene_plan = {**plan, "preferences": merged_prefs, "character_ids": character_ids}
-            conn.execute(text("INSERT INTO scenes (id, film_id, index_num, prompt, plan, status, job_id) VALUES (:id, :f, :idx, :p, :pl, 'queued', :jid)"), {"id": scene_id, "f": film_id, "idx": index_num, "p": prompt, "pl": scene_plan, "jid": job_id})
+            await conn.execute("INSERT INTO scenes (id, film_id, index_num, prompt, plan, status, job_id) VALUES ($1, $2, $3, $4, $5, 'queued', $6)", scene_id, film_id, index_num, prompt, json.dumps(scene_plan), job_id)
         _jobs_store[job_id] = {"id": job_id, "prompt_id": prompt_id, "state": "queued", "created_at": time.time(), "updated_at": time.time()}
         asyncio.create_task(_track_comfy_job(job_id, prompt_id))
         return {"name": name, "result": {"scene_id": scene_id, "job_id": job_id}}
     if name == "film_compile":
-        engine = get_engine()
-        if engine is None:
+        pool = await get_pg_pool()
+        if pool is None:
             return {"name": name, "error": "pg not configured"}
         film_id = args.get("film_id")
         if not film_id:
             return {"name": name, "error": "missing film_id"}
-        with engine.begin() as conn:
-            scenes = conn.execute(text("SELECT id, index_num, assets FROM scenes WHERE film_id=:f ORDER BY index_num ASC"), {"f": film_id}).mappings().all()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch("SELECT id, index_num, assets FROM scenes WHERE film_id=$1 ORDER BY index_num ASC", film_id)
+        scenes = [dict(r) for r in rows]
         payload = {"film_id": film_id, "scenes": [dict(s) for s in scenes], "public_base_url": PUBLIC_BASE_URL}
         if N8N_WEBHOOK_URL:
             try:
@@ -1071,18 +1083,18 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 return {"name": name, "error": str(ex)}
         return {"name": name, "result": payload}
     if name == "film_status":
-        engine = get_engine()
-        if engine is None:
+        pool = await get_pg_pool()
+        if pool is None:
             return {"name": name, "error": "pg not configured"}
         film_id = args.get("film_id")
         if not film_id:
             return {"name": name, "error": "missing film_id"}
-        with engine.begin() as conn:
-            film = conn.execute(text("SELECT id, title, synopsis, created_at, updated_at FROM films WHERE id=:id"), {"id": film_id}).mappings().first()
+        async with pool.acquire() as conn:
+            film = await conn.fetchrow("SELECT id, title, synopsis, created_at, updated_at FROM films WHERE id=$1", film_id)
             if not film:
                 return {"name": name, "error": "not found"}
-            chars = conn.execute(text("SELECT id, name, description FROM characters WHERE film_id=:f"), {"f": film_id}).mappings().all()
-            scenes = conn.execute(text("SELECT id, index_num, status, job_id FROM scenes WHERE film_id=:f ORDER BY index_num"), {"f": film_id}).mappings().all()
+            chars = await conn.fetch("SELECT id, name, description FROM characters WHERE film_id=$1", film_id)
+            scenes = await conn.fetch("SELECT id, index_num, status, job_id FROM scenes WHERE film_id=$1 ORDER BY index_num", film_id)
         return {"name": name, "result": {"film": dict(film), "characters": [dict(c) for c in chars], "scenes": [dict(s) for s in scenes]}}
     if name == "make_movie":
         # High-level convenience: create film, add characters if provided, create scenes from plan
@@ -1411,15 +1423,21 @@ async def _comfy_history(prompt_id: str) -> Dict[str, Any]:
             return {"error": r.text}
 
 
-def _get_film_characters(engine: Engine, film_id: str) -> List[Dict[str, Any]]:
-    with engine.begin() as conn:
-        rows = conn.execute(text("SELECT id, name, description, references FROM characters WHERE film_id=:f"), {"f": film_id}).mappings().all()
+async def get_film_characters(film_id: str) -> List[Dict[str, Any]]:
+    pool = await get_pg_pool()
+    if pool is None:
+        return []
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT id, name, description, references FROM characters WHERE film_id=$1", film_id)
     return [dict(r) for r in rows]
 
 
-def _get_film_preferences(engine: Engine, film_id: str) -> Dict[str, Any]:
-    with engine.begin() as conn:
-        row = conn.execute(text("SELECT metadata FROM films WHERE id=:id"), {"id": film_id}).mappings().first()
+async def get_film_preferences(film_id: str) -> Dict[str, Any]:
+    pool = await get_pg_pool()
+    if pool is None:
+        return {}
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT metadata FROM films WHERE id=$1", film_id)
     meta = (row and row.get("metadata")) or {}
     return dict(meta) if isinstance(meta, dict) else {}
 
@@ -1528,11 +1546,11 @@ def build_animated_scene_workflow(
 
 
 async def _track_comfy_job(job_id: str, prompt_id: str) -> None:
-    engine = get_engine()
-    if engine is None:
+    pool = await get_pg_pool()
+    if pool is None:
         return
-    with engine.begin() as conn:
-        conn.execute(text("UPDATE jobs SET status='running', updated_at=NOW() WHERE id=:id"), {"id": job_id})
+    async with pool.acquire() as conn:
+        await conn.execute("UPDATE jobs SET status='running', updated_at=NOW() WHERE id=$1", job_id)
     _jobs_store.setdefault(job_id, {})["state"] = "running"
     _jobs_store[job_id]["updated_at"] = time.time()
     last_outputs_count = -1
@@ -1553,17 +1571,17 @@ async def _track_comfy_job(job_id: str, prompt_id: str) -> None:
                         outputs_count += 1
             if outputs_count != last_outputs_count and outputs_count > 0:
                 last_outputs_count = outputs_count
-                with engine.begin() as conn:
-                    conn.execute(text("INSERT INTO job_checkpoints (job_id, data) VALUES (:jid, :data)"), {"jid": job_id, "data": detail})
+                async with pool.acquire() as conn:
+                    await conn.execute("INSERT INTO job_checkpoints (job_id, data) VALUES ($1, $2)", job_id, json.dumps(detail))
             if detail.get("status", {}).get("completed") is True:
                 result = {"outputs": detail.get("outputs", {}), "status": detail.get("status")}
-                with engine.begin() as conn:
-                    conn.execute(text("UPDATE jobs SET status='succeeded', updated_at=NOW(), result=:res WHERE id=:id"), {"id": job_id, "res": result})
+                async with pool.acquire() as conn:
+                    await conn.execute("UPDATE jobs SET status='succeeded', updated_at=NOW(), result=$1 WHERE id=$2", json.dumps(result), job_id)
                 _jobs_store[job_id]["state"] = "succeeded"
                 _jobs_store[job_id]["result"] = result
                 # propagate to scene if any
                 try:
-                    await _update_scene_from_job(engine, job_id, detail)
+                    await _update_scene_from_job(job_id, detail)
                 except Exception:
                     pass
                 if JOBS_RAG_INDEX:
@@ -1574,12 +1592,12 @@ async def _track_comfy_job(job_id: str, prompt_id: str) -> None:
                 break
             if detail.get("status", {}).get("status") == "error":
                 err = detail.get("status")
-                with engine.begin() as conn:
-                    conn.execute(text("UPDATE jobs SET status='failed', updated_at=NOW(), error=:err WHERE id=:id"), {"id": job_id, "err": json.dumps(err)})
+                async with pool.acquire() as conn:
+                    await conn.execute("UPDATE jobs SET status='failed', updated_at=NOW(), error=$1 WHERE id=$2", json.dumps(err), job_id)
                 _jobs_store[job_id]["state"] = "failed"
                 _jobs_store[job_id]["error"] = err
                 try:
-                    await _update_scene_from_job(engine, job_id, detail, failed=True)
+                    await _update_scene_from_job(job_id, detail, failed=True)
                 except Exception:
                     pass
                 break
@@ -1602,10 +1620,10 @@ async def create_job(body: Dict[str, Any]):
         return JSONResponse(status_code=502, content={"error": "invalid comfy response", "detail": submit})
     import uuid as _uuid
     job_id = _uuid.uuid4().hex
-    engine = get_engine()
-    if engine is not None:
-        with engine.begin() as conn:
-            conn.execute(text("INSERT INTO jobs (id, prompt_id, status, workflow) VALUES (:id, :pid, 'queued', :wf)"), {"id": job_id, "pid": prompt_id, "wf": workflow})
+    pool = await get_pg_pool()
+    if pool is not None:
+        async with pool.acquire() as conn:
+            await conn.execute("INSERT INTO jobs (id, prompt_id, status, workflow) VALUES ($1, $2, 'queued', $3)", job_id, prompt_id, json.dumps(workflow))
     _jobs_store[job_id] = {"id": job_id, "prompt_id": prompt_id, "state": "queued", "created_at": time.time(), "updated_at": time.time(), "result": None}
     asyncio.create_task(_track_comfy_job(job_id, prompt_id))
     return {"job_id": job_id, "prompt_id": prompt_id}
@@ -1613,17 +1631,17 @@ async def create_job(body: Dict[str, Any]):
 
 @app.get("/jobs/{job_id}")
 async def get_job(job_id: str):
-    engine = get_engine()
-    if engine is None:
+    pool = await get_pg_pool()
+    if pool is None:
         job = _jobs_store.get(job_id)
         if not job:
             return JSONResponse(status_code=404, content={"error": "not found"})
         return job
-    with engine.begin() as conn:
-        row = conn.execute(text("SELECT id, prompt_id, status, created_at, updated_at, workflow, result, error FROM jobs WHERE id=:id"), {"id": job_id}).mappings().first()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT id, prompt_id, status, created_at, updated_at, workflow, result, error FROM jobs WHERE id=$1", job_id)
         if not row:
             return JSONResponse(status_code=404, content={"error": "not found"})
-        cps = conn.execute(text("SELECT id, created_at, data FROM job_checkpoints WHERE job_id=:id ORDER BY id DESC LIMIT 10"), {"id": job_id}).mappings().all()
+        cps = await conn.fetch("SELECT id, created_at, data FROM job_checkpoints WHERE job_id=$1 ORDER BY id DESC LIMIT 10", job_id)
         return {**dict(row), "checkpoints": [dict(c) for c in cps]}
 
 
@@ -1632,12 +1650,12 @@ async def stream_job(job_id: str, interval_ms: Optional[int] = None):
     async def _gen():
         last_snapshot = None
         while True:
-            engine = get_engine()
-            if engine is None:
+            pool = await get_pg_pool()
+            if pool is None:
                 snapshot = json.dumps(_jobs_store.get(job_id) or {"error": "not found"})
             else:
-                with engine.begin() as conn:
-                    row = conn.execute(text("SELECT id, prompt_id, status, created_at, updated_at, workflow, result, error FROM jobs WHERE id=:id"), {"id": job_id}).mappings().first()
+                async with pool.acquire() as conn:
+                    row = await conn.fetchrow("SELECT id, prompt_id, status, created_at, updated_at, workflow, result, error FROM jobs WHERE id=$1", job_id)
                     if not row:
                         yield "data: {\"error\": \"not found\"}\n\n"
                         break
@@ -1656,62 +1674,62 @@ async def stream_job(job_id: str, interval_ms: Optional[int] = None):
 
 @app.get("/jobs")
 async def list_jobs(status: Optional[str] = None, limit: int = 50, offset: int = 0):
-    engine = get_engine()
-    if engine is None:
+    pool = await get_pg_pool()
+    if pool is None:
         items = list(_jobs_store.values())
         if status:
             items = [j for j in items if j.get("state") == status]
         return {"data": items[offset: offset + limit], "total": len(items)}
-    with engine.begin() as conn:
+    async with pool.acquire() as conn:
         if status:
-            rows = conn.execute(text("SELECT id, prompt_id, status, created_at, updated_at FROM jobs WHERE status=:s ORDER BY updated_at DESC LIMIT :l OFFSET :o"), {"s": status, "l": limit, "o": offset}).mappings().all()
-            total = conn.execute(text("SELECT COUNT(*) FROM jobs WHERE status=:s"), {"s": status}).scalar_one()
+            rows = await conn.fetch("SELECT id, prompt_id, status, created_at, updated_at FROM jobs WHERE status=$1 ORDER BY updated_at DESC LIMIT $2 OFFSET $3", status, limit, offset)
+            total = await conn.fetchval("SELECT COUNT(*) FROM jobs WHERE status=$1", status)
         else:
-            rows = conn.execute(text("SELECT id, prompt_id, status, created_at, updated_at FROM jobs ORDER BY updated_at DESC LIMIT :l OFFSET :o"), {"l": limit, "o": offset}).mappings().all()
-            total = conn.execute(text("SELECT COUNT(*) FROM jobs")).scalar_one()
+            rows = await conn.fetch("SELECT id, prompt_id, status, created_at, updated_at FROM jobs ORDER BY updated_at DESC LIMIT $1 OFFSET $2", limit, offset)
+            total = await conn.fetchval("SELECT COUNT(*) FROM jobs")
         return {"data": [dict(r) for r in rows], "total": int(total)}
 
 
 @app.post("/jobs/{job_id}/cancel")
 async def cancel_job(job_id: str):
-    engine = get_engine()
-    if engine is None:
+    pool = await get_pg_pool()
+    if pool is None:
         return JSONResponse(status_code=500, content={"error": "pg not configured"})
-    with engine.begin() as conn:
-        row = conn.execute(text("SELECT prompt_id, status FROM jobs WHERE id=:id"), {"id": job_id}).mappings().first()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT prompt_id, status FROM jobs WHERE id=$1", job_id)
         if not row:
             return JSONResponse(status_code=404, content={"error": "not found"})
         if row["status"] in ("succeeded", "failed", "cancelled"):
             return {"ok": True, "status": row["status"]}
-        conn.execute(text("UPDATE jobs SET status='cancelling', updated_at=NOW() WHERE id=:id"), {"id": job_id})
+        await conn.execute("UPDATE jobs SET status='cancelling', updated_at=NOW() WHERE id=$1", job_id)
     try:
         if COMFYUI_API_URL:
             async with httpx.AsyncClient(timeout=10) as client:
                 await client.post(COMFYUI_API_URL.rstrip("/") + "/interrupt")
     except Exception:
         pass
-    with engine.begin() as conn:
-        conn.execute(text("UPDATE jobs SET status='cancelled', updated_at=NOW() WHERE id=:id"), {"id": job_id})
+    async with pool.acquire() as conn:
+        await conn.execute("UPDATE jobs SET status='cancelled', updated_at=NOW() WHERE id=$1", job_id)
     _jobs_store.setdefault(job_id, {})["state"] = "cancelled"
     return {"ok": True, "status": "cancelled"}
 
 
 async def _index_job_into_rag(job_id: str) -> None:
-    engine = get_engine()
-    if engine is None:
+    pool = await get_pg_pool()
+    if pool is None:
         return
-    with engine.begin() as conn:
-        row = conn.execute(text("SELECT workflow, result FROM jobs WHERE id=:id"), {"id": job_id}).mappings().first()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT workflow, result FROM jobs WHERE id=$1", job_id)
         if not row:
             return
-        wf = json.dumps(row["workflow"], ensure_ascii=False)
-        res = json.dumps(row["result"], ensure_ascii=False)
+        wf = json.dumps(row["workflow"], ensure_ascii=False) if row.get("workflow") is not None else ""
+        res = json.dumps(row["result"], ensure_ascii=False) if row.get("result") is not None else ""
     embedder = get_embedder()
     pieces = [p for p in [wf, res] if p]
-    with engine.begin() as conn:
+    async with pool.acquire() as conn:
         for chunk in pieces:
             vec = embedder.encode([chunk])[0]
-            conn.execute(text("INSERT INTO rag_docs (path, chunk, embedding) VALUES (:p, :c, :e)"), {"p": f"job:{job_id}", "c": chunk, "e": list(vec)})
+            await conn.execute("INSERT INTO rag_docs (path, chunk, embedding) VALUES ($1, $2, $3)", f"job:{job_id}", chunk, list(vec))
 
 
 def _extract_comfy_asset_urls(detail: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -1741,16 +1759,19 @@ def _extract_comfy_asset_urls(detail: Dict[str, Any]) -> List[Dict[str, Any]]:
     return urls
 
 
-async def _update_scene_from_job(engine: Engine, job_id: str, detail: Dict[str, Any], failed: bool = False) -> None:
+async def _update_scene_from_job(job_id: str, detail: Dict[str, Any], failed: bool = False) -> None:
+    pool = await get_pg_pool()
+    if pool is None:
+        return
     assets = {"outputs": (detail or {}).get("outputs", {}), "status": (detail or {}).get("status"), "urls": _extract_comfy_asset_urls(detail)}
-    with engine.begin() as conn:
-        row = conn.execute(text("SELECT id, film_id, plan FROM scenes WHERE job_id=:jid"), {"jid": job_id}).mappings().first()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT id, film_id, plan FROM scenes WHERE job_id=$1", job_id)
         if not row:
             return
         if failed:
-            conn.execute(text("UPDATE scenes SET status='failed', updated_at=NOW(), assets=:a WHERE id=:id"), {"id": row["id"], "a": assets})
+            await conn.execute("UPDATE scenes SET status='failed', updated_at=NOW(), assets=$1 WHERE id=$2", json.dumps(assets), row["id"])
         else:
-            conn.execute(text("UPDATE scenes SET status='succeeded', updated_at=NOW(), assets=:a WHERE id=:id"), {"id": row["id"], "a": assets})
+            await conn.execute("UPDATE scenes SET status='succeeded', updated_at=NOW(), assets=$1 WHERE id=$2", json.dumps(assets), row["id"])
     if not failed:
         # Auto-generate TTS dialogue and background music for the scene
         scene_tts = None
@@ -1760,8 +1781,8 @@ async def _update_scene_from_job(engine: Engine, job_id: str, detail: Dict[str, 
             scene_text = (detail.get("status", {}) or {}).get("prompt", "") or ""
             if not scene_text:
                 # fallback: try to use scene prompt from DB
-                with engine.begin() as conn:
-                    p = conn.execute(text("SELECT prompt FROM scenes WHERE id=:id"), {"id": row["id"]}).scalar_one_or_none()
+                async with pool.acquire() as conn:
+                    p = await conn.fetchval("SELECT prompt FROM scenes WHERE id=$1", row["id"])
                     scene_text = p or ""
             # derive duration preference
             duration = 12
@@ -1791,15 +1812,15 @@ async def _update_scene_from_job(engine: Engine, job_id: str, detail: Dict[str, 
                     # character-specific override if a single character is targeted
                     ch_ids = pl.get("character_ids") if isinstance(pl.get("character_ids"), list) else []
                     if len(ch_ids) == 1:
-                        with engine.begin() as conn:
-                            crow = conn.execute(text("SELECT references FROM characters WHERE id=:id"), {"id": ch_ids[0]}).mappings().first()
+                        async with pool.acquire() as conn:
+                            crow = await conn.fetchrow("SELECT references FROM characters WHERE id=$1", ch_ids[0])
                             if crow and isinstance(crow.get("references"), dict):
                                 v2 = crow["references"].get("voice")
                                 if v2:
                                     voice = v2
                 if not voice:
-                    with engine.begin() as conn:
-                        meta = conn.execute(text("SELECT metadata FROM films WHERE id=:id"), {"id": row["film_id"]}).scalar_one_or_none()
+                    async with pool.acquire() as conn:
+                        meta = await conn.fetchval("SELECT metadata FROM films WHERE id=$1", row["film_id"]) 
                         if isinstance(meta, dict):
                             voice = meta.get("voice")
             except Exception:
@@ -1807,8 +1828,8 @@ async def _update_scene_from_job(engine: Engine, job_id: str, detail: Dict[str, 
             # language preference
             language = None
             try:
-                with engine.begin() as conn:
-                    meta = conn.execute(text("SELECT metadata FROM films WHERE id=:id"), {"id": row["film_id"]}).scalar_one_or_none()
+                async with pool.acquire() as conn:
+                    meta = await conn.fetchval("SELECT metadata FROM films WHERE id=$1", row["film_id"]) 
                     if isinstance(meta, dict):
                         language = meta.get("language")
             except Exception:
@@ -1836,10 +1857,10 @@ async def _update_scene_from_job(engine: Engine, job_id: str, detail: Dict[str, 
                 assets["tts"] = scene_tts
             if scene_music:
                 assets["music"] = scene_music
-            with engine.begin() as conn:
-                conn.execute(text("UPDATE scenes SET assets=:a WHERE id=:id"), {"id": row["id"], "a": assets})
+            async with pool.acquire() as conn:
+                await conn.execute("UPDATE scenes SET assets=$1 WHERE id=$2", json.dumps(assets), row["id"])
         try:
-            await _maybe_compile_film(engine, row["film_id"])
+            await _maybe_compile_film(row["film_id"])
         except Exception:
             pass
 
@@ -1884,15 +1905,19 @@ def _text_to_simple_srt(text: str, duration_seconds: int) -> str:
     return "\n".join(lines)
 
 
-async def _maybe_compile_film(engine: Engine, film_id: str) -> None:
+async def _maybe_compile_film(film_id: str) -> None:
+    pool = await get_pg_pool()
+    if pool is None:
+        return
     # If all scenes for film are succeeded, trigger compilation via N8N if available
-    with engine.begin() as conn:
-        counts = conn.execute(text("SELECT COUNT(*) AS total, SUM(CASE WHEN status='succeeded' THEN 1 ELSE 0 END) AS done FROM scenes WHERE film_id=:f"), {"f": film_id}).mappings().first()
+    async with pool.acquire() as conn:
+        counts = await conn.fetchrow("SELECT COUNT(*) AS total, SUM(CASE WHEN status='succeeded' THEN 1 ELSE 0 END) AS done FROM scenes WHERE film_id=$1", film_id)
         total = int(counts["total"] or 0)
         done = int(counts["done"] or 0)
         if total == 0 or done != total:
             return
-        scenes = conn.execute(text("SELECT id, index_num, assets FROM scenes WHERE film_id=:f ORDER BY index_num ASC"), {"f": film_id}).mappings().all()
+        rows = await conn.fetch("SELECT id, index_num, assets FROM scenes WHERE film_id=$1 ORDER BY index_num ASC", film_id)
+    scenes = [dict(r) for r in rows]
     payload = {"film_id": film_id, "scenes": [dict(s) for s in scenes], "public_base_url": PUBLIC_BASE_URL}
     assembly_result = None
     # Prefer local assembler if available
@@ -1926,9 +1951,8 @@ async def _maybe_compile_film(engine: Engine, film_id: str) -> None:
     except Exception:
         pass
     # persist compile artifact into films.metadata
-    with engine.begin() as conn:
-        # read current metadata
-        meta_row = conn.execute(text("SELECT metadata FROM films WHERE id=:id"), {"id": film_id}).mappings().first()
+    async with pool.acquire() as conn:
+        meta_row = await conn.fetchrow("SELECT metadata FROM films WHERE id=$1", film_id)
         metadata = (meta_row and meta_row.get("metadata")) or {}
         metadata = dict(metadata)
         metadata["compiled_at"] = time.time()
@@ -1937,43 +1961,43 @@ async def _maybe_compile_film(engine: Engine, film_id: str) -> None:
         if manifest_url:
             metadata["manifest_url"] = manifest_url
         metadata["scenes_count"] = total
-        conn.execute(text("UPDATE films SET metadata=:m, updated_at=NOW() WHERE id=:id"), {"id": film_id, "m": metadata})
+        await conn.execute("UPDATE films SET metadata=$1, updated_at=NOW() WHERE id=$2", json.dumps(metadata), film_id)
 
 
 # ---------- Film project endpoints ----------
 @app.post("/films")
 async def create_film(body: Dict[str, Any]):
-    engine = get_engine()
-    if engine is None:
+    pool = await get_pg_pool()
+    if pool is None:
         return JSONResponse(status_code=500, content={"error": "pg not configured"})
     import uuid as _uuid
     film_id = _uuid.uuid4().hex
     title = (body or {}).get("title") or "Untitled"
     synopsis = (body or {}).get("synopsis") or ""
     metadata = (body or {}).get("metadata") or {}
-    with engine.begin() as conn:
-        conn.execute(text("INSERT INTO films (id, title, synopsis, metadata) VALUES (:id, :t, :s, :m)"), {"id": film_id, "t": title, "s": synopsis, "m": metadata})
+    async with pool.acquire() as conn:
+        await conn.execute("INSERT INTO films (id, title, synopsis, metadata) VALUES ($1, $2, $3, $4)", film_id, title, synopsis, json.dumps(metadata))
     return {"id": film_id, "title": title}
 
 
 @app.get("/films")
 async def list_films(limit: int = 50, offset: int = 0):
-    engine = get_engine()
-    if engine is None:
+    pool = await get_pg_pool()
+    if pool is None:
         return {"data": [], "total": 0}
-    with engine.begin() as conn:
-        rows = conn.execute(text("SELECT id, title, synopsis, created_at, updated_at FROM films ORDER BY updated_at DESC LIMIT :l OFFSET :o"), {"l": limit, "o": offset}).mappings().all()
-        total = conn.execute(text("SELECT COUNT(*) FROM films")).scalar_one()
-        return {"data": [dict(r) for r in rows], "total": int(total)}
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT id, title, synopsis, created_at, updated_at FROM films ORDER BY updated_at DESC LIMIT $1 OFFSET $2", limit, offset)
+        total = await conn.fetchval("SELECT COUNT(*) FROM films")
+    return {"data": [dict(r) for r in rows], "total": int(total)}
 
 
 @app.get("/films/{film_id}")
 async def get_film(film_id: str):
-    engine = get_engine()
-    if engine is None:
+    pool = await get_pg_pool()
+    if pool is None:
         return JSONResponse(status_code=500, content={"error": "pg not configured"})
-    with engine.begin() as conn:
-        film = conn.execute(text("SELECT id, title, synopsis, metadata, created_at, updated_at FROM films WHERE id=:id"), {"id": film_id}).mappings().first()
+    async with pool.acquire() as conn:
+        film = await conn.fetchrow("SELECT id, title, synopsis, metadata, created_at, updated_at FROM films WHERE id=$1", film_id)
         if not film:
             return JSONResponse(status_code=404, content={"error": "not found"})
     return dict(film)
@@ -1981,87 +2005,87 @@ async def get_film(film_id: str):
 
 @app.patch("/films/{film_id}")
 async def update_film_preferences(film_id: str, body: Dict[str, Any]):
-    engine = get_engine()
-    if engine is None:
+    pool = await get_pg_pool()
+    if pool is None:
         return JSONResponse(status_code=500, content={"error": "pg not configured"})
     # merge metadata
     updates = (body or {}).get("metadata") or body or {}
-    with engine.begin() as conn:
-        row = conn.execute(text("SELECT metadata FROM films WHERE id=:id"), {"id": film_id}).mappings().first()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT metadata FROM films WHERE id=$1", film_id)
     if not row:
         return JSONResponse(status_code=404, content={"error": "not found"})
     current = row.get("metadata") or {}
     if not isinstance(current, dict):
         current = {}
     merged = {**current, **updates}
-    with engine.begin() as conn:
-        conn.execute(text("UPDATE films SET metadata=:m, updated_at=NOW() WHERE id=:id"), {"id": film_id, "m": merged})
+    async with pool.acquire() as conn:
+        await conn.execute("UPDATE films SET metadata=$1, updated_at=NOW() WHERE id=$2", json.dumps(merged), film_id)
     return {"ok": True, "metadata": merged}
 
 
 @app.get("/films/{film_id}/characters")
 async def get_characters(film_id: str):
-    engine = get_engine()
-    if engine is None:
+    pool = await get_pg_pool()
+    if pool is None:
         return JSONResponse(status_code=500, content={"error": "pg not configured"})
-    with engine.begin() as conn:
-        rows = conn.execute(text("SELECT id, name, description, references FROM characters WHERE film_id=:f"), {"f": film_id}).mappings().all()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT id, name, description, references FROM characters WHERE film_id=$1", film_id)
     return {"data": [dict(r) for r in rows]}
 
 
 @app.get("/films/{film_id}/scenes")
 async def get_scenes(film_id: str):
-    engine = get_engine()
-    if engine is None:
+    pool = await get_pg_pool()
+    if pool is None:
         return JSONResponse(status_code=500, content={"error": "pg not configured"})
-    with engine.begin() as conn:
-        rows = conn.execute(text("SELECT id, index_num, prompt, status, job_id, assets FROM scenes WHERE film_id=:f ORDER BY index_num"), {"f": film_id}).mappings().all()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT id, index_num, prompt, status, job_id, assets FROM scenes WHERE film_id=$1 ORDER BY index_num", film_id)
     return {"data": [dict(r) for r in rows]}
 
 
 @app.patch("/scenes/{scene_id}")
 async def update_scene(scene_id: str, body: Dict[str, Any]):
-    engine = get_engine()
-    if engine is None:
+    pool = await get_pg_pool()
+    if pool is None:
         return JSONResponse(status_code=500, content={"error": "pg not configured"})
     updates = body or {}
-    with engine.begin() as conn:
-        row = conn.execute(text("SELECT id, plan, prompt, index_num FROM scenes WHERE id=:id"), {"id": scene_id}).mappings().first()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT id, plan, prompt, index_num FROM scenes WHERE id=$1", scene_id)
         if not row:
             return JSONResponse(status_code=404, content={"error": "not found"})
         plan = row["plan"] or {}
         if updates.get("plan"):
             plan = {**plan, **updates.get("plan")}
         if updates.get("prompt") is not None:
-            conn.execute(text("UPDATE scenes SET prompt=:p, plan=:pl, updated_at=NOW() WHERE id=:id"), {"id": scene_id, "p": updates.get("prompt"), "pl": plan})
+            await conn.execute("UPDATE scenes SET prompt=$1, plan=$2, updated_at=NOW() WHERE id=$3", updates.get("prompt"), json.dumps(plan), scene_id)
         else:
-            conn.execute(text("UPDATE scenes SET plan=:pl, updated_at=NOW() WHERE id=:id"), {"id": scene_id, "pl": plan})
+            await conn.execute("UPDATE scenes SET plan=$1, updated_at=NOW() WHERE id=$2", json.dumps(plan), scene_id)
     return {"ok": True}
 
 
 @app.post("/films/{film_id}/characters")
 async def add_character(film_id: str, body: Dict[str, Any]):
-    engine = get_engine()
-    if engine is None:
+    pool = await get_pg_pool()
+    if pool is None:
         return JSONResponse(status_code=500, content={"error": "pg not configured"})
     import uuid as _uuid
     char_id = _uuid.uuid4().hex
     name = (body or {}).get("name") or "Unnamed"
     description = (body or {}).get("description") or ""
     references = (body or {}).get("references") or {}
-    with engine.begin() as conn:
-        conn.execute(text("INSERT INTO characters (id, film_id, name, description, references) VALUES (:id, :f, :n, :d, :r)"), {"id": char_id, "f": film_id, "n": name, "d": description, "r": references})
+    async with pool.acquire() as conn:
+        await conn.execute("INSERT INTO characters (id, film_id, name, description, references) VALUES ($1, $2, $3, $4, $5)", char_id, film_id, name, description, json.dumps(references))
     return {"id": char_id, "name": name}
 
 
 @app.patch("/characters/{character_id}")
 async def update_character(character_id: str, body: Dict[str, Any]):
-    engine = get_engine()
-    if engine is None:
+    pool = await get_pg_pool()
+    if pool is None:
         return JSONResponse(status_code=500, content={"error": "pg not configured"})
     updates = body or {}
-    with engine.begin() as conn:
-        row = conn.execute(text("SELECT id, film_id, name, description, references FROM characters WHERE id=:id"), {"id": character_id}).mappings().first()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT id, film_id, name, description, references FROM characters WHERE id=$1", character_id)
         if not row:
             return JSONResponse(status_code=404, content={"error": "not found"})
         new_name = updates.get("name", row["name"])
@@ -2069,14 +2093,14 @@ async def update_character(character_id: str, body: Dict[str, Any]):
         refs = updates.get("references")
         if refs is None:
             refs = row["references"]
-        conn.execute(text("UPDATE characters SET name=:n, description=:d, references=:r, updated_at=NOW() WHERE id=:id"), {"id": character_id, "n": new_name, "d": new_desc, "r": refs})
+        await conn.execute("UPDATE characters SET name=$1, description=$2, references=$3, updated_at=NOW() WHERE id=$4", new_name, new_desc, json.dumps(refs), character_id)
     return {"ok": True}
 
 
 @app.post("/films/{film_id}/scenes")
 async def create_scene(film_id: str, body: Dict[str, Any]):
-    engine = get_engine()
-    if engine is None:
+    pool = await get_pg_pool()
+    if pool is None:
         return JSONResponse(status_code=500, content={"error": "pg not configured"})
     prompt = (body or {}).get("prompt") or ""
     index_num = int((body or {}).get("index_num") or 0)
@@ -2090,9 +2114,9 @@ async def create_scene(film_id: str, body: Dict[str, Any]):
     import uuid as _uuid
     scene_id = _uuid.uuid4().hex
     job_id = _uuid.uuid4().hex
-    with engine.begin() as conn:
-        conn.execute(text("INSERT INTO jobs (id, prompt_id, status, workflow) VALUES (:id, :pid, 'queued', :wf)"), {"id": job_id, "pid": prompt_id, "wf": workflow})
-        conn.execute(text("INSERT INTO scenes (id, film_id, index_num, prompt, plan, status, job_id) VALUES (:id, :f, :idx, :p, :pl, 'queued', :jid)"), {"id": scene_id, "f": film_id, "idx": index_num, "p": prompt, "pl": plan, "jid": job_id})
+    async with pool.acquire() as conn:
+        await conn.execute("INSERT INTO jobs (id, prompt_id, status, workflow) VALUES ($1, $2, 'queued', $3)", job_id, prompt_id, json.dumps(workflow))
+        await conn.execute("INSERT INTO scenes (id, film_id, index_num, prompt, plan, status, job_id) VALUES ($1, $2, $3, $4, $5, 'queued', $6)", scene_id, film_id, index_num, prompt, json.dumps(plan), job_id)
     _jobs_store[job_id] = {"id": job_id, "prompt_id": prompt_id, "state": "queued", "created_at": time.time(), "updated_at": time.time()}
     asyncio.create_task(_track_comfy_job(job_id, prompt_id))
     return {"id": scene_id, "job_id": job_id}
@@ -2100,14 +2124,14 @@ async def create_scene(film_id: str, body: Dict[str, Any]):
 
 @app.post("/films/{film_id}/compile")
 async def compile_film(film_id: str):
-    engine = get_engine()
-    if engine is None:
+    pool = await get_pg_pool()
+    if pool is None:
         return JSONResponse(status_code=500, content={"error": "pg not configured"})
     # Gather scenes and assets
-    with engine.begin() as conn:
-        scenes = conn.execute(text("SELECT id, index_num, assets FROM scenes WHERE film_id=:f ORDER BY index_num ASC"), {"f": film_id}).mappings().all()
-        meta = conn.execute(text("SELECT metadata FROM films WHERE id=:id"), {"id": film_id}).scalar_one_or_none()
-    payload = {"film_id": film_id, "scenes": [dict(s) for s in scenes], "public_base_url": PUBLIC_BASE_URL, "preferences": (meta or {})}
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT id, index_num, assets FROM scenes WHERE film_id=$1 ORDER BY index_num ASC", film_id)
+        meta = await conn.fetchval("SELECT metadata FROM films WHERE id=$1", film_id)
+    payload = {"film_id": film_id, "scenes": [dict(s) for s in rows], "public_base_url": PUBLIC_BASE_URL, "preferences": (meta or {})}
     # Optionally hand off to n8n for compilation pipeline
     if N8N_WEBHOOK_URL:
         try:

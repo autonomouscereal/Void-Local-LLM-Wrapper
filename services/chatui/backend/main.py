@@ -1,4 +1,5 @@
 from __future__ import annotations
+# WARNING: Do NOT add SQLAlchemy to this service. Use asyncpg with proper pooling and raw SQL only.
 
 import os
 import json
@@ -6,11 +7,10 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qs
 
 import httpx
-from fastapi import FastAPI, UploadFile, File, Form, Request
+from fastapi import FastAPI, UploadFile, File, Form, Request, BackgroundTasks
 from fastapi.responses import JSONResponse, HTMLResponse, StreamingResponse, Response
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import create_engine, text
-from sqlalchemy.engine import Engine
+import asyncpg
 from fastapi.middleware.cors import CORSMiddleware
 from .json_parser import JSONParser
 import logging
@@ -24,11 +24,18 @@ DB_USER = os.getenv("POSTGRES_USER")
 DB_PASS = os.getenv("POSTGRES_PASSWORD")
 
 
-def get_engine() -> Engine:
-    url = f"postgresql+psycopg2://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
-    engine = create_engine(url, pool_pre_ping=True)
-    with engine.begin() as conn:
-        conn.execute(text(
+async def init_pool() -> asyncpg.pool.Pool:
+    pool = await asyncpg.create_pool(
+        user=DB_USER,
+        password=DB_PASS,
+        database=DB_NAME,
+        host=DB_HOST,
+        port=DB_PORT,
+        min_size=1,
+        max_size=10,
+    )
+    async with pool.acquire() as conn:
+        await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS conversations (
               id BIGSERIAL PRIMARY KEY,
@@ -37,8 +44,8 @@ def get_engine() -> Engine:
               updated_at TIMESTAMPTZ DEFAULT NOW()
             );
             """
-        ))
-        conn.execute(text(
+        )
+        await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS messages (
               id BIGSERIAL PRIMARY KEY,
@@ -48,8 +55,8 @@ def get_engine() -> Engine:
               created_at TIMESTAMPTZ DEFAULT NOW()
             );
             """
-        ))
-        conn.execute(text(
+        )
+        await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS attachments (
               id BIGSERIAL PRIMARY KEY,
@@ -60,11 +67,20 @@ def get_engine() -> Engine:
               created_at TIMESTAMPTZ DEFAULT NOW()
             );
             """
-        ))
-    return engine
+        )
+    return pool
 
 
-engine = get_engine()
+pool: asyncpg.pool.Pool | None = None
+
+@app.on_event("startup")
+async def _startup():
+    global pool
+    pool = await init_pool()
+
+def _pool() -> asyncpg.pool.Pool:
+    assert pool is not None, "DB pool not initialized"
+    return pool
 app = FastAPI(title="Chat UI Backend", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
@@ -76,8 +92,12 @@ app.add_middleware(
 # Mount static AFTER API routes to avoid intercepting /api/* with 404/405
 
 
+logging.basicConfig(level=logging.INFO)
+
+
 @app.middleware("http")
 async def global_cors_middleware(request: Request, call_next):
+    logging.info("REQ %s %s", request.method, request.url.path)
     # Preflight short-circuit for any path
     if request.method == "OPTIONS":
         return Response(status_code=204, headers={
@@ -91,6 +111,7 @@ async def global_cors_middleware(request: Request, call_next):
             "Connection": "close",
         })
     resp = await call_next(request)
+    logging.info("RES %s %s %s", request.method, request.url.path, getattr(resp, 'status_code', ''))
     resp.headers["Access-Control-Allow-Origin"] = "*"
     resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
     resp.headers["Access-Control-Allow-Headers"] = "*"
@@ -104,24 +125,24 @@ async def global_cors_middleware(request: Request, call_next):
 @app.post("/api/conversations")
 async def create_conversation(body: Dict[str, Any]):
     title = (body or {}).get("title") or "New Conversation"
-    with engine.begin() as conn:
-        row = conn.execute(text("INSERT INTO conversations (title) VALUES (:t) RETURNING id"), {"t": title}).first()
+    async with _pool().acquire() as conn:
+        row = await conn.fetchrow("INSERT INTO conversations (title) VALUES ($1) RETURNING id", title)
     return {"id": row[0], "title": title}
 
 
 @app.get("/api/conversations")
 async def list_conversations():
-    with engine.begin() as conn:
-        rows = conn.execute(text("SELECT id, title, created_at, updated_at FROM conversations ORDER BY updated_at DESC LIMIT 100"))
-        data = [{"id": r[0], "title": r[1], "created_at": str(r[2]), "updated_at": str(r[3])} for r in rows]
+    async with _pool().acquire() as conn:
+        rows = await conn.fetch("SELECT id, title, created_at, updated_at FROM conversations ORDER BY updated_at DESC LIMIT 100")
+        data = [{"id": r["id"], "title": r["title"], "created_at": str(r["created_at"]), "updated_at": str(r["updated_at"]) } for r in rows]
     return {"data": data}
 
 
 @app.get("/api/conversations/{cid}/messages")
 async def list_messages(cid: int):
-    with engine.begin() as conn:
-        rows = conn.execute(text("SELECT id, role, content, created_at FROM messages WHERE conversation_id=:id ORDER BY id ASC"), {"id": cid}).mappings().all()
-        return {"data": [dict(r) for r in rows]}
+    async with _pool().acquire() as conn:
+        rows = await conn.fetch("SELECT id, role, content, created_at FROM messages WHERE conversation_id=$1 ORDER BY id ASC", cid)
+        return {"data": [{"id": r["id"], "role": r["role"], "content": r["content"], "created_at": str(r["created_at"]) } for r in rows]}
 
 
 @app.post("/api/upload")
@@ -137,24 +158,24 @@ async def upload(conversation_id: int = Form(...), file: UploadFile = File(...))
             data = r.json()
     except Exception as ex:
         return JSONResponse(status_code=500, content={"error": str(ex)})
-    with engine.begin() as conn:
-        conn.execute(text("INSERT INTO attachments (conversation_id, name, url, mime) VALUES (:c, :n, :u, :m)"), {"c": conversation_id, "n": file.filename, "u": data.get("url"), "m": file.content_type})
+    async with _pool().acquire() as conn:
+        await conn.execute("INSERT INTO attachments (conversation_id, name, url, mime) VALUES ($1, $2, $3, $4)", conversation_id, file.filename, data.get("url"), file.content_type)
     return {"ok": True, "url": data.get("url"), "name": data.get("name")}
 
 
 @app.get("/api/conversations/{cid}/attachments")
 async def list_attachments(cid: int):
-    with engine.begin() as conn:
-        rows = conn.execute(text("SELECT id, name, url, mime FROM attachments WHERE conversation_id=:id ORDER BY id"), {"id": cid}).mappings().all()
-        return {"data": [dict(r) for r in rows]}
+    async with _pool().acquire() as conn:
+        rows = await conn.fetch("SELECT id, name, url, mime FROM attachments WHERE conversation_id=$1 ORDER BY id", cid)
+        return {"data": [{"id": r["id"], "name": r["name"], "url": r["url"], "mime": r["mime"] } for r in rows]}
 
 
 @app.post("/api/conversations/{cid}/message")
 async def add_message(cid: int, body: Dict[str, Any]):
     role = (body or {}).get("role") or "user"
     content = (body or {}).get("content") or ""
-    with engine.begin() as conn:
-        conn.execute(text("INSERT INTO messages (conversation_id, role, content) VALUES (:c, :r, :x)"), {"c": cid, "r": role, "x": json.dumps({"text": content})})
+    async with _pool().acquire() as conn:
+        await conn.execute("INSERT INTO messages (conversation_id, role, content) VALUES ($1, $2, $3)", cid, role, json.dumps({"text": content}))
     return {"ok": True}
 
 
@@ -167,7 +188,7 @@ def _build_openai_messages(base: List[Dict[str, Any]], attachments: List[Dict[st
 
 
 @app.post("/api/conversations/{cid}/chat")
-async def chat(cid: int, request: Request):
+async def chat(cid: int, request: Request, background_tasks: BackgroundTasks):
     logging.info("/api/conversations/%s/chat: start", cid)
     # Accept JSON, raw text, or x-www-form-urlencoded, and parse via custom JSON parser
     ct = (request.headers.get("content-type") or "").lower()
@@ -226,9 +247,9 @@ async def chat(cid: int, request: Request):
     # Force non-stream proxy for reliability in the UI
     stream = False
     # Store user message
-    with engine.begin() as conn:
-        conn.execute(text("INSERT INTO messages (conversation_id, role, content) VALUES (:c, 'user', :x)"), {"c": cid, "x": json.dumps({"text": user_content})})
-        atts = conn.execute(text("SELECT name, url, mime FROM attachments WHERE conversation_id=:id"), {"id": cid}).mappings().all()
+    async with _pool().acquire() as conn:
+        await conn.execute("INSERT INTO messages (conversation_id, role, content) VALUES ($1, 'user', $2)", cid, json.dumps({"text": user_content}))
+        atts = await conn.fetch("SELECT name, url, mime FROM attachments WHERE conversation_id=$1", cid)
 
     # Build messages for orchestrator
     oa_msgs = _build_openai_messages(messages + [{"role": "user", "content": user_content}], [dict(a) for a in atts])
@@ -286,8 +307,13 @@ async def chat(cid: int, request: Request):
         logging.exception("chat proxy failed: %s", ex)
         return JSONResponse(status_code=502, content={"error": str(ex)})
     content = ((data.get("choices") or [{}])[0].get("message") or {}).get("content")
-    with engine.begin() as conn:
-        conn.execute(text("INSERT INTO messages (conversation_id, role, content) VALUES (:c, 'assistant', :x)"), {"c": cid, "x": json.dumps({"text": content})})
+    async def _persist_assistant_message(conv_id: int, text_value: str) -> None:
+        try:
+            async with _pool().acquire() as c2:
+                await c2.execute("INSERT INTO messages (conversation_id, role, content) VALUES ($1, 'assistant', $2)", conv_id, json.dumps({"text": text_value}))
+        except Exception:
+            logging.exception("persist assistant failed cid=%s", conv_id)
+    background_tasks.add_task(_persist_assistant_message, cid, content)
     # Return explicit body with content-length to avoid client transport quirks
     body = json.dumps(data)
     headers = {
@@ -298,6 +324,7 @@ async def chat(cid: int, request: Request):
         "Connection": "close",
         "Content-Length": str(len(body.encode("utf-8"))),
     }
+    logging.info("/api/conversations/%s/chat: done", cid)
     return Response(content=body, media_type="application/json", headers=headers)
 
 
@@ -325,15 +352,15 @@ async def any_preflight(path: str):
 
 # Alternate chat endpoint to avoid any extension/content filters on "/chat" path
 @app.post("/api/chat")
-async def chat_alt(body: Dict[str, Any]):
+async def chat_alt(body: Dict[str, Any], background_tasks: BackgroundTasks):
     logging.info("/api/chat: start cid=%s", (body or {}).get("conversation_id"))
     cid = int((body or {}).get("conversation_id") or 0)
     user_content = (body or {}).get("content") or ""
     if not cid:
         return JSONResponse(status_code=400, content={"error": "missing conversation_id"})
-    with engine.begin() as conn:
-        conn.execute(text("INSERT INTO messages (conversation_id, role, content) VALUES (:c, 'user', :x)"), {"c": cid, "x": json.dumps({"text": user_content})})
-        atts = conn.execute(text("SELECT name, url, mime FROM attachments WHERE conversation_id=:id"), {"id": cid}).mappings().all()
+    async with _pool().acquire() as conn:
+        await conn.execute("INSERT INTO messages (conversation_id, role, content) VALUES ($1, 'user', $2)", cid, json.dumps({"text": user_content}))
+        atts = await conn.fetch("SELECT name, url, mime FROM attachments WHERE conversation_id=$1", cid)
     oa_msgs = _build_openai_messages([{"role": "user", "content": user_content}], [dict(a) for a in atts])
     payload = {"messages": oa_msgs, "stream": False}
     async with httpx.AsyncClient(timeout=None) as client:
@@ -349,8 +376,13 @@ async def chat_alt(body: Dict[str, Any]):
                 repaired = parser.attempt_repair(decoded)
                 data = parser.method_json_loads(repaired)
     assistant = ((data.get("choices") or [{}])[0].get("message") or {}).get("content")
-    with engine.begin() as conn:
-        conn.execute(text("INSERT INTO messages (conversation_id, role, content) VALUES (:c, 'assistant', :x)"), {"c": cid, "x": json.dumps({"text": assistant})})
+    async def _persist_assistant_message(conv_id: int, text_value: str) -> None:
+        try:
+            async with _pool().acquire() as c2:
+                await c2.execute("INSERT INTO messages (conversation_id, role, content) VALUES ($1, 'assistant', $2)", conv_id, json.dumps({"text": text_value}))
+        except Exception:
+            logging.exception("persist assistant failed cid=%s", conv_id)
+    background_tasks.add_task(_persist_assistant_message, cid, assistant)
     body = json.dumps(data)
     headers = {
         "Cache-Control": "no-store",
@@ -360,12 +392,13 @@ async def chat_alt(body: Dict[str, Any]):
         "Connection": "close",
         "Content-Length": str(len(body.encode("utf-8"))),
     }
+    logging.info("/api/chat: done cid=%s", cid)
     return Response(content=body, media_type="application/json", headers=headers)
 
 
 # Neutral path versions (avoid filters on "chat")
 @app.post("/api/conversations/{cid}/call")
-async def call_conv(cid: int, request: Request):
+async def call_conv(cid: int, request: Request, background_tasks: BackgroundTasks):
     logging.info("/api/conversations/%s/call: start", cid)
     parser = JSONParser()
     try:
@@ -379,9 +412,9 @@ async def call_conv(cid: int, request: Request):
             repaired = parser.attempt_repair(decoded)
             payload_in = parser.method_json_loads(repaired)
     user_content = (payload_in or {}).get("content") or ""
-    with engine.begin() as conn:
-        conn.execute(text("INSERT INTO messages (conversation_id, role, content) VALUES (:c, 'user', :x)"), {"c": cid, "x": json.dumps({"text": user_content})})
-        atts = conn.execute(text("SELECT name, url, mime FROM attachments WHERE conversation_id=:id"), {"id": cid}).mappings().all()
+    async with _pool().acquire() as conn:
+        await conn.execute("INSERT INTO messages (conversation_id, role, content) VALUES ($1, 'user', $2)", cid, json.dumps({"text": user_content}))
+        atts = await conn.fetch("SELECT name, url, mime FROM attachments WHERE conversation_id=$1", cid)
     oa_msgs = _build_openai_messages([{"role": "user", "content": user_content}], [dict(a) for a in atts])
     payload = {"messages": oa_msgs, "stream": False}
     async with httpx.AsyncClient(timeout=None) as client:
@@ -396,8 +429,13 @@ async def call_conv(cid: int, request: Request):
                 repaired = parser.attempt_repair(decoded)
                 data = parser.method_json_loads(repaired)
     assistant = ((data.get("choices") or [{}])[0].get("message") or {}).get("content")
-    with engine.begin() as conn:
-        conn.execute(text("INSERT INTO messages (conversation_id, role, content) VALUES (:c, 'assistant', :x)"), {"c": cid, "x": json.dumps({"text": assistant})})
+    async def _persist_assistant_message(conv_id: int, text_value: str) -> None:
+        try:
+            async with _pool().acquire() as c2:
+                await c2.execute("INSERT INTO messages (conversation_id, role, content) VALUES ($1, 'assistant', $2)", conv_id, json.dumps({"text": text_value}))
+        except Exception:
+            logging.exception("persist assistant failed cid=%s", conv_id)
+    background_tasks.add_task(_persist_assistant_message, cid, assistant)
     body = json.dumps(data)
     headers = {
         "Cache-Control": "no-store",
@@ -407,19 +445,20 @@ async def call_conv(cid: int, request: Request):
         "Connection": "close",
         "Content-Length": str(len(body.encode("utf-8"))),
     }
+    logging.info("/api/conversations/%s/call: done", cid)
     return Response(content=body, media_type="application/json", headers=headers)
 
 
 @app.post("/api/call")
-async def call_alt(body: Dict[str, Any]):
+async def call_alt(body: Dict[str, Any], background_tasks: BackgroundTasks):
     cid = int((body or {}).get("conversation_id") or 0)
     logging.info("/api/call: start cid=%s", cid)
     user_content = (body or {}).get("content") or ""
     if not cid:
         return JSONResponse(status_code=400, content={"error": "missing conversation_id"})
-    with engine.begin() as conn:
-        conn.execute(text("INSERT INTO messages (conversation_id, role, content) VALUES (:c, 'user', :x)"), {"c": cid, "x": json.dumps({"text": user_content})})
-        atts = conn.execute(text("SELECT name, url, mime FROM attachments WHERE conversation_id=:id"), {"id": cid}).mappings().all()
+    async with _pool().acquire() as conn:
+        await conn.execute("INSERT INTO messages (conversation_id, role, content) VALUES ($1, 'user', $2)", cid, json.dumps({"text": user_content}))
+        atts = await conn.fetch("SELECT name, url, mime FROM attachments WHERE conversation_id=$1", cid)
     oa_msgs = _build_openai_messages([{"role": "user", "content": user_content}], [dict(a) for a in atts])
     payload = {"messages": oa_msgs, "stream": False}
     parser = JSONParser()
@@ -435,8 +474,13 @@ async def call_alt(body: Dict[str, Any]):
                 repaired = parser.attempt_repair(decoded)
                 data = parser.method_json_loads(repaired)
     assistant = ((data.get("choices") or [{}])[0].get("message") or {}).get("content")
-    with engine.begin() as conn:
-        conn.execute(text("INSERT INTO messages (conversation_id, role, content) VALUES (:c, 'assistant', :x)"), {"c": cid, "x": json.dumps({"text": assistant})})
+    async def _persist_assistant_message(conv_id: int, text_value: str) -> None:
+        try:
+            async with _pool().acquire() as c2:
+                await c2.execute("INSERT INTO messages (conversation_id, role, content) VALUES ($1, 'assistant', $2)", conv_id, json.dumps({"text": text_value}))
+        except Exception:
+            logging.exception("persist assistant failed cid=%s", conv_id)
+    background_tasks.add_task(_persist_assistant_message, cid, assistant)
     body = json.dumps(data)
     headers = {
         "Cache-Control": "no-store",
@@ -446,7 +490,47 @@ async def call_alt(body: Dict[str, Any]):
         "Connection": "close",
         "Content-Length": str(len(body.encode("utf-8"))),
     }
+    logging.info("/api/call: done cid=%s", cid)
     return Response(content=body, media_type="application/json", headers=headers)
+
+
+@app.post("/api/echo")
+async def echo(body: Dict[str, Any]):
+    logging.info("/api/echo: start")
+    data = {"ok": True, "body": body}
+    b = json.dumps(data)
+    headers = {
+        "Cache-Control": "no-store",
+        "Access-Control-Allow-Origin": "*",
+        "Connection": "close",
+        "Content-Length": str(len(b.encode("utf-8"))),
+    }
+    logging.info("/api/echo: done")
+    return Response(content=b, media_type="application/json", headers=headers)
+
+
+@app.post("/api/passthrough")
+async def passthrough(body: Dict[str, Any]):
+    # Minimal proxy: no DB, no mutation; just relay to orchestrator and return raw
+    logging.info("/api/passthrough: start")
+    user_content = (body or {}).get("content") or ""
+    payload = {"messages": [{"role": "user", "content": user_content}], "stream": False}
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            rr = await client.post(ORCH_URL.rstrip("/") + "/v1/chat/completions", json=payload)
+    except Exception as ex:
+        logging.exception("/api/passthrough proxy error")
+        return JSONResponse(status_code=502, content={"error": str(ex)})
+    ct = rr.headers.get("content-type") or "application/json"
+    headers = {
+        "Cache-Control": "no-store",
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Private-Network": "true",
+        "Access-Control-Expose-Headers": "*",
+        "Connection": "close",
+    }
+    logging.info("/api/passthrough: done status=%s", rr.status_code)
+    return Response(content=rr.content, media_type=ct, status_code=rr.status_code, headers=headers)
 
 
 @app.options("/api/chat")
@@ -489,17 +573,17 @@ async def favicon():
 async def chat_get(cid: int, content: str = ""):
     # Convenience GET for environments where POST fetch is blocked; DO NOT use in production
     user_content = content or ""
-    with engine.begin() as conn:
-        conn.execute(text("INSERT INTO messages (conversation_id, role, content) VALUES (:c, 'user', :x)"), {"c": cid, "x": json.dumps({"text": user_content})})
-        atts = conn.execute(text("SELECT name, url, mime FROM attachments WHERE conversation_id=:id"), {"id": cid}).mappings().all()
+    async with _pool().acquire() as conn:
+        await conn.execute("INSERT INTO messages (conversation_id, role, content) VALUES ($1, 'user', $2)", cid, json.dumps({"text": user_content}))
+        atts = await conn.fetch("SELECT name, url, mime FROM attachments WHERE conversation_id=$1", cid)
     oa_msgs = _build_openai_messages([{"role": "user", "content": user_content}], [dict(a) for a in atts])
     payload = {"messages": oa_msgs, "stream": False}
     async with httpx.AsyncClient(timeout=None) as client:
         rr = await client.post(ORCH_URL.rstrip("/") + "/v1/chat/completions", json=payload)
         data = rr.json()
     assistant = ((data.get("choices") or [{}])[0].get("message") or {}).get("content")
-    with engine.begin() as conn:
-        conn.execute(text("INSERT INTO messages (conversation_id, role, content) VALUES (:c, 'assistant', :x)"), {"c": cid, "x": json.dumps({"text": assistant})})
+    async with _pool().acquire() as conn:
+        await conn.execute("INSERT INTO messages (conversation_id, role, content) VALUES ($1, 'assistant', $2)", cid, json.dumps({"text": assistant}))
     body = json.dumps(data)
     headers = {
         "Cache-Control": "no-store",

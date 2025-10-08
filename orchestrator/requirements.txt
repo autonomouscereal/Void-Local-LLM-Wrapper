@@ -7,8 +7,7 @@ tenacity==9.0.0
 python-multipart==0.0.9
 aiofiles==24.1.0
 requests==2.32.3
-psycopg2-binary==2.9.9
-SQLAlchemy==2.0.35
+asyncpg==0.29.0
 pgvector==0.2.5
 sentence-transformers==3.0.1
 
