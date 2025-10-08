@@ -250,7 +250,11 @@ def get_engine() -> Optional[Engine]:
     url = f"postgresql+psycopg2://{POSTGRES_USER}:{POSTGRES_PASSWORD}@{POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}"
     _engine = create_engine(url, pool_pre_ping=True)
     with _engine.begin() as conn:
-        conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+        try:
+            conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+        except Exception:
+            # Non-fatal: if the user lacks privilege but extension already exists, continue
+            pass
         conn.execute(text(
             """
             CREATE TABLE IF NOT EXISTS rag_docs (
