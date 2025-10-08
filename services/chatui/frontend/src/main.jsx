@@ -43,36 +43,63 @@ function App() {
       conversationId = await newConversation()
     }
     setSending(true)
-    // Persist user message locally
-    await fetch(`/api/conversations/${conversationId}/message`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ role: 'user', content: text }) })
-    let raw = ''
-    let data
-    // Use XMLHttpRequest to avoid fetch NetworkError quirks
-    const xhrResult = await new Promise(resolve => {
-      try {
-        const xhr = new XMLHttpRequest()
-        xhr.open('POST', '/api/chat', true)
-        xhr.setRequestHeader('Content-Type', 'application/json')
-        xhr.setRequestHeader('Accept', 'application/json')
-        xhr.onreadystatechange = function() {
-          if (xhr.readyState === 4) {
-            resolve({ status: xhr.status, text: xhr.responseText || '' })
+    try {
+      let raw = ''
+      let data
+      // Primary: XHR to conversation chat with text/plain for robust backend parsing
+      const primary = await new Promise(resolve => {
+        try {
+          const xhr = new XMLHttpRequest()
+          xhr.open('POST', `/api/conversations/${conversationId}/chat`, true)
+          xhr.setRequestHeader('Content-Type', 'text/plain;charset=UTF-8')
+          xhr.setRequestHeader('Accept', 'application/json')
+          xhr.onreadystatechange = function() {
+            if (xhr.readyState === 4) {
+              resolve({ status: xhr.status, text: xhr.responseText || '' })
+            }
           }
+          xhr.onerror = function() { resolve({ status: 0, text: '' }) }
+          xhr.send(text)
+        } catch (e) {
+          resolve({ status: 0, text: String(e || 'xhr error') })
         }
-        xhr.onerror = function() { resolve({ status: 0, text: '' }) }
-        xhr.send(JSON.stringify({ conversation_id: conversationId, content: text }))
-      } catch (e) {
-        resolve({ status: 0, text: String(e || 'xhr error') })
+      })
+      if (primary.status >= 200 && primary.status < 300) {
+        raw = primary.text || ''
+        try { data = JSON.parse(raw) } catch { data = { error: raw || 'parse error' } }
+      } else {
+        console.warn('primary chat failed', primary.status, primary.text)
+        const fallback = await new Promise(resolve => {
+          try {
+            const xhr = new XMLHttpRequest()
+            xhr.open('POST', '/api/chat', true)
+            xhr.setRequestHeader('Content-Type', 'application/json')
+            xhr.setRequestHeader('Accept', 'application/json')
+            xhr.onreadystatechange = function() {
+              if (xhr.readyState === 4) {
+                resolve({ status: xhr.status, text: xhr.responseText || '' })
+              }
+            }
+            xhr.onerror = function() { resolve({ status: 0, text: '' }) }
+            xhr.send(JSON.stringify({ conversation_id: conversationId, content: text }))
+          } catch (e) {
+            resolve({ status: 0, text: String(e || 'xhr error') })
+          }
+        })
+        raw = fallback.text || ''
+        try { data = JSON.parse(raw) } catch { data = { error: raw || 'parse error' } }
+        if (!(fallback.status >= 200 && fallback.status < 300)) {
+          const errText = raw || `chat proxy error (${fallback.status})`
+          setMsgs(prev => ([...prev, { id: Date.now(), role: 'assistant', content: { text: `Error: ${errText}` } }]))
+          return
+        }
       }
-    })
-    raw = xhrResult.text || ''
-    try { data = JSON.parse(raw) } catch { data = { error: raw || 'parse error' } }
-    if (!(xhrResult.status >= 200 && xhrResult.status < 300)) throw new Error(raw || 'chat proxy error')
-    const content = ((data.choices && data.choices[0] && data.choices[0].message) || {}).content || (data.error || raw)
-    await fetch(`/api/conversations/${conversationId}/message`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ role: 'assistant', content }) })
-    setMsgs(prev => ([...prev, { id: Date.now(), role: 'assistant', content: { text: content } }]))
-    setText('')
-    setSending(false)
+      const content = ((data.choices && data.choices[0] && data.choices[0].message) || {}).content || (data.error || raw)
+      setMsgs(prev => ([...prev, { id: Date.now(), role: 'assistant', content: { text: content } }]))
+      setText('')
+    } finally {
+      setSending(false)
+    }
   }
 
   async function uploadFile(e) {
