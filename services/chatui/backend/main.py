@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 from fastapi import FastAPI, UploadFile, File, Form
-from fastapi.responses import JSONResponse, HTMLResponse, StreamingResponse
+from fastapi.responses import JSONResponse, HTMLResponse, StreamingResponse, Response
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
@@ -211,7 +211,7 @@ async def orch_diag():
 
 @app.get("/favicon.ico")
 async def favicon():
-    return JSONResponse(status_code=204, content=None)
+    return Response(status_code=204)
 
 
 @app.get("/api/jobs")
