@@ -10,6 +10,7 @@ function App() {
   const fileRef = useRef()
   const [jobs, setJobs] = useState([])
   const [showJobs, setShowJobs] = useState(true)
+  const [sending, setSending] = useState(false)
 
   async function refreshConvos() {
     const r = await fetch('/api/conversations')
@@ -20,6 +21,7 @@ function App() {
   }
 
   async function openConversation(id) {
+    if (!id) return
     setCid(id)
     const r = await fetch(`/api/conversations/${id}/messages`)
     const j = await r.json()
@@ -41,6 +43,9 @@ function App() {
       conversationId = await newConversation()
     }
     try {
+      setSending(true)
+      // optimistic placeholder
+      setMsgs(prev => ([...prev, { id: 'tmp', role: 'assistant', content: { text: '…thinking' } }]))
       const r = await fetch(`/api/conversations/${conversationId}/chat`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ content: text }) })
       const j = await r.json()
       setText('')
@@ -48,6 +53,8 @@ function App() {
     } catch (e) {
       console.error('send failed', e)
       alert('Send failed: ' + (e?.message || e))
+    } finally {
+      setSending(false)
     }
   }
 
@@ -121,7 +128,7 @@ function App() {
         <div style={{ padding: 12, display: 'flex', gap: 8, borderTop: '1px solid #222' }}>
           <input ref={fileRef} type='file' onChange={uploadFile} style={{ color: '#9ca3af' }} />
           <input value={text} onChange={e => setText(e.target.value)} placeholder='Type your prompt...' style={{ flex: 1, padding: 10, borderRadius: 6, border: '1px solid #333', background: '#0b0b0f', color: '#fff' }} />
-          <button onClick={send} style={{ padding: '10px 16px', background: '#22c55e', color: '#111', border: 'none', borderRadius: 6, fontWeight: 700 }}>Send</button>
+          <button onClick={send} disabled={sending || !text.trim()} style={{ padding: '10px 16px', background: sending || !text.trim() ? '#16a34a' : '#22c55e', opacity: sending || !text.trim() ? 0.7 : 1, color: '#111', border: 'none', borderRadius: 6, fontWeight: 700, cursor: sending || !text.trim() ? 'not-allowed' : 'pointer' }}>{sending ? 'Sending…' : 'Send'}</button>
         </div>
       </div>
     </div>
