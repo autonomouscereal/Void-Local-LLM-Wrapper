@@ -113,7 +113,19 @@ function App() {
           {(msgs || []).map(m => (
             <div key={m.id} style={{ marginBottom: 16 }}>
               <div style={{ fontSize: 12, color: '#9ca3af' }}>{m.role}</div>
-              <div style={{ padding: 12, background: m.role === 'assistant' ? '#111827' : '#0f172a', borderRadius: 8 }} dangerouslySetInnerHTML={{ __html: marked.parse((m.content?.text || '')) }} />
+              <div
+                style={{
+                  padding: 12,
+                  background: m.role === 'assistant' ? '#111827' : '#0f172a',
+                  borderRadius: 8,
+                  overflowX: 'auto',
+                  wordBreak: 'break-word',
+                  overflowWrap: 'anywhere',
+                  whiteSpace: 'pre-wrap',
+                  maxWidth: '100%'
+                }}
+                dangerouslySetInnerHTML={{ __html: marked.parse((m.content?.text || '')) }}
+              />
             </div>
           ))}
         </div>
