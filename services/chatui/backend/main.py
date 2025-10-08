@@ -168,6 +168,7 @@ def _build_openai_messages(base: List[Dict[str, Any]], attachments: List[Dict[st
 
 @app.post("/api/conversations/{cid}/chat")
 async def chat(cid: int, request: Request):
+    logging.info("/api/conversations/%s/chat: start", cid)
     # Accept JSON, raw text, or x-www-form-urlencoded, and parse via custom JSON parser
     ct = (request.headers.get("content-type") or "").lower()
     body: Dict[str, Any] = {}
@@ -325,6 +326,7 @@ async def any_preflight(path: str):
 # Alternate chat endpoint to avoid any extension/content filters on "/chat" path
 @app.post("/api/chat")
 async def chat_alt(body: Dict[str, Any]):
+    logging.info("/api/chat: start cid=%s", (body or {}).get("conversation_id"))
     cid = int((body or {}).get("conversation_id") or 0)
     user_content = (body or {}).get("content") or ""
     if not cid:
@@ -340,6 +342,92 @@ async def chat_alt(body: Dict[str, Any]):
             data = rr.json()
         except Exception:
             parser = JSONParser()
+            decoded = rr.text
+            try:
+                data = parser.method_json_loads(decoded)
+            except Exception:
+                repaired = parser.attempt_repair(decoded)
+                data = parser.method_json_loads(repaired)
+    assistant = ((data.get("choices") or [{}])[0].get("message") or {}).get("content")
+    with engine.begin() as conn:
+        conn.execute(text("INSERT INTO messages (conversation_id, role, content) VALUES (:c, 'assistant', :x)"), {"c": cid, "x": json.dumps({"text": assistant})})
+    body = json.dumps(data)
+    headers = {
+        "Cache-Control": "no-store",
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Private-Network": "true",
+        "Access-Control-Expose-Headers": "*",
+        "Connection": "close",
+        "Content-Length": str(len(body.encode("utf-8"))),
+    }
+    return Response(content=body, media_type="application/json", headers=headers)
+
+
+# Neutral path versions (avoid filters on "chat")
+@app.post("/api/conversations/{cid}/call")
+async def call_conv(cid: int, request: Request):
+    logging.info("/api/conversations/%s/call: start", cid)
+    parser = JSONParser()
+    try:
+        payload_in = await request.json()
+    except Exception:
+        raw_bytes = await request.body()
+        decoded = raw_bytes.decode("utf-8", errors="replace")
+        try:
+            payload_in = parser.method_json_loads(decoded)
+        except Exception:
+            repaired = parser.attempt_repair(decoded)
+            payload_in = parser.method_json_loads(repaired)
+    user_content = (payload_in or {}).get("content") or ""
+    with engine.begin() as conn:
+        conn.execute(text("INSERT INTO messages (conversation_id, role, content) VALUES (:c, 'user', :x)"), {"c": cid, "x": json.dumps({"text": user_content})})
+        atts = conn.execute(text("SELECT name, url, mime FROM attachments WHERE conversation_id=:id"), {"id": cid}).mappings().all()
+    oa_msgs = _build_openai_messages([{"role": "user", "content": user_content}], [dict(a) for a in atts])
+    payload = {"messages": oa_msgs, "stream": False}
+    async with httpx.AsyncClient(timeout=None) as client:
+        rr = await client.post(ORCH_URL.rstrip("/") + "/v1/chat/completions", json=payload)
+        try:
+            data = rr.json()
+        except Exception:
+            decoded = rr.text
+            try:
+                data = parser.method_json_loads(decoded)
+            except Exception:
+                repaired = parser.attempt_repair(decoded)
+                data = parser.method_json_loads(repaired)
+    assistant = ((data.get("choices") or [{}])[0].get("message") or {}).get("content")
+    with engine.begin() as conn:
+        conn.execute(text("INSERT INTO messages (conversation_id, role, content) VALUES (:c, 'assistant', :x)"), {"c": cid, "x": json.dumps({"text": assistant})})
+    body = json.dumps(data)
+    headers = {
+        "Cache-Control": "no-store",
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Private-Network": "true",
+        "Access-Control-Expose-Headers": "*",
+        "Connection": "close",
+        "Content-Length": str(len(body.encode("utf-8"))),
+    }
+    return Response(content=body, media_type="application/json", headers=headers)
+
+
+@app.post("/api/call")
+async def call_alt(body: Dict[str, Any]):
+    cid = int((body or {}).get("conversation_id") or 0)
+    logging.info("/api/call: start cid=%s", cid)
+    user_content = (body or {}).get("content") or ""
+    if not cid:
+        return JSONResponse(status_code=400, content={"error": "missing conversation_id"})
+    with engine.begin() as conn:
+        conn.execute(text("INSERT INTO messages (conversation_id, role, content) VALUES (:c, 'user', :x)"), {"c": cid, "x": json.dumps({"text": user_content})})
+        atts = conn.execute(text("SELECT name, url, mime FROM attachments WHERE conversation_id=:id"), {"id": cid}).mappings().all()
+    oa_msgs = _build_openai_messages([{"role": "user", "content": user_content}], [dict(a) for a in atts])
+    payload = {"messages": oa_msgs, "stream": False}
+    parser = JSONParser()
+    async with httpx.AsyncClient(timeout=None) as client:
+        rr = await client.post(ORCH_URL.rstrip("/") + "/v1/chat/completions", json=payload)
+        try:
+            data = rr.json()
+        except Exception:
             decoded = rr.text
             try:
                 data = parser.method_json_loads(decoded)
