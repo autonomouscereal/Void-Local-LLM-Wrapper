@@ -155,7 +155,7 @@ async def list_conversations():
 async def list_messages(cid: int):
     async with _pool().acquire() as conn:
         rows = await conn.fetch("SELECT id, role, content, created_at FROM messages WHERE conversation_id=$1 ORDER BY id ASC", cid)
-        return {"data": [{"id": r["id"], "role": r["role"], "content": r["content"], "created_at": str(r["created_at"]) } for r in rows]}
+        return {"data": [{"id": r["id"], "role": r["role"], "content": _decode_json(r["content"]), "created_at": str(r["created_at"]) } for r in rows]}
 
 
 @app.post("/api/upload")
