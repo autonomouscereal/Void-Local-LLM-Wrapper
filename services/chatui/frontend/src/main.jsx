@@ -68,31 +68,9 @@ function App() {
         raw = primary.text || ''
         try { data = JSON.parse(raw) } catch { data = { error: raw || 'parse error' } }
       } else {
-        console.warn('primary chat failed', primary.status, primary.text)
-        const fallback = await new Promise(resolve => {
-          try {
-            const xhr = new XMLHttpRequest()
-            xhr.open('POST', '/api/chat', true)
-            xhr.setRequestHeader('Content-Type', 'application/json')
-            xhr.setRequestHeader('Accept', 'application/json')
-            xhr.onreadystatechange = function() {
-              if (xhr.readyState === 4) {
-                resolve({ status: xhr.status, text: xhr.responseText || '' })
-              }
-            }
-            xhr.onerror = function() { resolve({ status: 0, text: '' }) }
-            xhr.send(JSON.stringify({ conversation_id: conversationId, content: text }))
-          } catch (e) {
-            resolve({ status: 0, text: String(e || 'xhr error') })
-          }
-        })
-        raw = fallback.text || ''
-        try { data = JSON.parse(raw) } catch { data = { error: raw || 'parse error' } }
-        if (!(fallback.status >= 200 && fallback.status < 300)) {
-          const errText = raw || `chat proxy error (${fallback.status})`
-          setMsgs(prev => ([...prev, { id: Date.now(), role: 'assistant', content: { text: `Error: ${errText}` } }]))
-          return
-        }
+        const errText = (primary.text || '').slice(0, 500) || `chat proxy error (${primary.status})`
+        setMsgs(prev => ([...prev, { id: Date.now(), role: 'assistant', content: { text: `Error: ${errText}` } }]))
+        return
       }
       const content = ((data.choices && data.choices[0] && data.choices[0].message) || {}).content || (data.error || raw)
       setMsgs(prev => ([...prev, { id: Date.now(), role: 'assistant', content: { text: content } }]))
