@@ -123,6 +123,15 @@ async def list_attachments(cid: int):
         return {"data": [dict(r) for r in rows]}
 
 
+@app.post("/api/conversations/{cid}/message")
+async def add_message(cid: int, body: Dict[str, Any]):
+    role = (body or {}).get("role") or "user"
+    content = (body or {}).get("content") or ""
+    with engine.begin() as conn:
+        conn.execute(text("INSERT INTO messages (conversation_id, role, content) VALUES (:c, :r, :x)"), {"c": cid, "r": role, "x": json.dumps({"text": content})})
+    return {"ok": True}
+
+
 def _build_openai_messages(base: List[Dict[str, Any]], attachments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     # Reuse attachments implicitly by adding a system hint listing URLs; messages can still pass content arrays
     if not attachments:
