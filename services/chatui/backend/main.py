@@ -11,6 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 from fastapi.middleware.cors import CORSMiddleware
+import logging
 
 
 ORCH_URL = os.getenv("ORCHESTRATOR_URL", "http://orchestrator:8000")
@@ -172,15 +173,38 @@ async def chat(cid: int, body: Dict[str, Any]):
             if rr.status_code >= 400:
                 content_type = rr.headers.get("content-type", "")
                 if content_type.startswith("application/json"):
+                    logging.warning("orchestrator error %s: %s", rr.status_code, rr.text[:500])
                     return JSONResponse(status_code=rr.status_code, content=rr.json())
+                logging.warning("orchestrator error %s (non-json): %s", rr.status_code, rr.text[:500])
                 return JSONResponse(status_code=rr.status_code, content={"error": rr.text})
             data = rr.json()
     except Exception as ex:
+        logging.exception("chat proxy failed: %s", ex)
         return JSONResponse(status_code=502, content={"error": str(ex)})
     content = ((data.get("choices") or [{}])[0].get("message") or {}).get("content")
     with engine.begin() as conn:
         conn.execute(text("INSERT INTO messages (conversation_id, role, content) VALUES (:c, 'assistant', :x)"), {"c": cid, "x": json.dumps({"text": content})})
     return data
+
+
+@app.get("/api/orchestrator/diagnostics")
+async def orch_diag():
+    out: Dict[str, Any] = {}
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            h = await client.get(ORCH_URL.rstrip("/") + "/healthz")
+            out["healthz_status"] = h.status_code
+            out["healthz_body"] = (h.json() if "application/json" in (h.headers.get("content-type") or "") else h.text)
+    except Exception as ex:
+        out["healthz_error"] = str(ex)
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            d = await client.get(ORCH_URL.rstrip("/") + "/debug")
+            out["debug_status"] = d.status_code
+            out["debug_body"] = (d.json() if "application/json" in (d.headers.get("content-type") or "") else d.text)
+    except Exception as ex:
+        out["debug_error"] = str(ex)
+    return out
 
 
 @app.get("/api/jobs")
