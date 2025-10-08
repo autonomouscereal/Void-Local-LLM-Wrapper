@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
+from fastapi.middleware.cors import CORSMiddleware
 
 
 ORCH_URL = os.getenv("ORCHESTRATOR_URL", "http://orchestrator:8000")
@@ -62,6 +63,13 @@ def get_engine() -> Engine:
 
 engine = get_engine()
 app = FastAPI(title="Chat UI Backend", version="0.1.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 app.mount("/", StaticFiles(directory="/app/frontend_dist", html=True), name="static")
 
 
