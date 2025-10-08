@@ -42,13 +42,57 @@ function App() {
     if (!conversationId) {
       conversationId = await newConversation()
     }
+    setSending(true)
+    setMsgs(prev => ([...prev, { id: 'stream', role: 'assistant', content: { text: '' } }]))
     try {
-      setSending(true)
-      // optimistic placeholder
-      setMsgs(prev => ([...prev, { id: 'tmp', role: 'assistant', content: { text: '…thinking' } }]))
-      const r = await fetch(`/api/conversations/${conversationId}/chat`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ content: text }) })
-      const j = await r.json()
+      const res = await fetch(`/api/conversations/${conversationId}/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: text, stream: true })
+      })
       setText('')
+      if (!res.ok) {
+        const t = await res.text()
+        throw new Error(t || `HTTP ${res.status}`)
+      }
+      const reader = res.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        let idx
+        while ((idx = buffer.indexOf('\n\n')) !== -1) {
+          const chunk = buffer.slice(0, idx)
+          buffer = buffer.slice(idx + 2)
+          const line = chunk.trim()
+          if (!line) continue
+          if (line === 'data: [DONE]') {
+            break
+          }
+          const dataIdx = line.indexOf('data: ')
+          if (dataIdx !== -1) {
+            const jsonStr = line.slice(dataIdx + 6)
+            try {
+              const obj = JSON.parse(jsonStr)
+              const choice = (obj.choices && obj.choices[0]) || {}
+              const delta = choice.delta || {}
+              const piece = delta.content || ''
+              if (piece) {
+                setMsgs(prev => {
+                  const copy = [...prev]
+                  const last = copy[copy.length - 1]
+                  if (last && last.id === 'stream') {
+                    last.content = { text: (last.content?.text || '') + piece }
+                  }
+                  return copy
+                })
+              }
+            } catch {}
+          }
+        }
+      }
       await openConversation(conversationId)
     } catch (e) {
       console.error('send failed', e)

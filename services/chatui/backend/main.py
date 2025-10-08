@@ -161,12 +161,17 @@ async def chat(cid: int, body: Dict[str, Any]):
     else:
         # Non-stream: forward and persist assistant message
         try:
-            async with httpx.AsyncClient(timeout=120) as client:
+            async with httpx.AsyncClient(timeout=300) as client:
                 rr = await client.post(ORCH_URL.rstrip("/") + "/v1/chat/completions", json=payload)
-                rr.raise_for_status()
+                if rr.status_code >= 400:
+                    # return orchestrator's error body directly for visibility
+                    content_type = rr.headers.get("content-type", "")
+                    if content_type.startswith("application/json"):
+                        return JSONResponse(status_code=rr.status_code, content=rr.json())
+                    return JSONResponse(status_code=rr.status_code, content={"error": rr.text})
                 data = rr.json()
         except Exception as ex:
-            return JSONResponse(status_code=500, content={"error": str(ex)})
+            return JSONResponse(status_code=502, content={"error": str(ex)})
         content = ((data.get("choices") or [{}])[0].get("message") or {}).get("content")
         with engine.begin() as conn:
             conn.execute(text("INSERT INTO messages (conversation_id, role, content) VALUES (:c, 'assistant', :x)"), {"c": cid, "x": json.dumps({"text": content})})
