@@ -181,7 +181,8 @@ async def list_jobs(status: Optional[str] = None, limit: int = 50, offset: int =
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             r = await client.get(ORCH_URL.rstrip("/") + "/jobs", params=params)
-            r.raise_for_status()
+            if r.status_code >= 400:
+                return JSONResponse(status_code=r.status_code, content={"error": r.text})
             return r.json()
     except Exception as ex:
         return JSONResponse(status_code=500, content={"error": str(ex)})
@@ -192,7 +193,8 @@ async def get_job(job_id: str):
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             r = await client.get(ORCH_URL.rstrip("/") + f"/jobs/{job_id}")
-            r.raise_for_status()
+            if r.status_code >= 400:
+                return JSONResponse(status_code=r.status_code, content={"error": r.text})
             return r.json()
     except Exception as ex:
         return JSONResponse(status_code=500, content={"error": str(ex)})
