@@ -162,7 +162,9 @@ services:
       - "7000"
 
   comfyui:
-    image: ghcr.io/comfyanonymous/comfyui:latest
+    build:
+      context: ./services/comfyui
+      dockerfile: Dockerfile
     container_name: comfyui
     restart: unless-stopped
     expose:
