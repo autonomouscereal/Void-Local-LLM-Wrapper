@@ -55,6 +55,17 @@ function App() {
         const t = await res.text()
         throw new Error(t || `HTTP ${res.status}`)
       }
+      const ct = res.headers.get('content-type') || ''
+      if (!ct.startsWith('text/event-stream')) {
+        const data = await res.json()
+        const content = ((data.choices?.[0]?.message) || {}).content || ''
+        setMsgs(prev => {
+          const copy = prev.filter(m => m.id !== 'stream')
+          return [...copy, { id: Date.now(), role: 'assistant', content: { text: content } }]
+        })
+        await openConversation(conversationId)
+        return
+      }
       const reader = res.body.getReader()
       const decoder = new TextDecoder()
       let buffer = ''
