@@ -15,6 +15,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from .json_parser import JSONParser
 import logging
 
+# Create app BEFORE any decorators use it
+app = FastAPI(title="Chat UI Backend", version="0.1.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 ORCH_URL = os.getenv("ORCHESTRATOR_URL", "http://orchestrator:8000")
 DB_HOST = os.getenv("POSTGRES_HOST")
@@ -81,14 +91,6 @@ async def _startup():
 def _pool() -> asyncpg.pool.Pool:
     assert pool is not None, "DB pool not initialized"
     return pool
-app = FastAPI(title="Chat UI Backend", version="0.1.0")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 # Mount static AFTER API routes to avoid intercepting /api/* with 404/405
 
 
