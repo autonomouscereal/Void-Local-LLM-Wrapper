@@ -47,19 +47,27 @@ function App() {
     await fetch(`/api/conversations/${conversationId}/message`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ role: 'user', content: text }) })
     let raw = ''
     let data
-    const r = await fetch(`/api/chat`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-      body: JSON.stringify({ conversation_id: conversationId, content: text })
+    // Use XMLHttpRequest to avoid fetch NetworkError quirks
+    const xhrResult = await new Promise(resolve => {
+      try {
+        const xhr = new XMLHttpRequest()
+        xhr.open('POST', '/api/chat', true)
+        xhr.setRequestHeader('Content-Type', 'application/json')
+        xhr.setRequestHeader('Accept', 'application/json')
+        xhr.onreadystatechange = function() {
+          if (xhr.readyState === 4) {
+            resolve({ status: xhr.status, text: xhr.responseText || '' })
+          }
+        }
+        xhr.onerror = function() { resolve({ status: 0, text: '' }) }
+        xhr.send(JSON.stringify({ conversation_id: conversationId, content: text }))
+      } catch (e) {
+        resolve({ status: 0, text: String(e || 'xhr error') })
+      }
     })
-    try {
-      data = await r.json()
-      raw = JSON.stringify(data)
-    } catch {
-      raw = await r.text()
-      try { data = JSON.parse(raw) } catch { data = { error: raw } }
-    }
-    if (!r.ok) throw new Error(raw || 'chat proxy error')
+    raw = xhrResult.text || ''
+    try { data = JSON.parse(raw) } catch { data = { error: raw || 'parse error' } }
+    if (!(xhrResult.status >= 200 && xhrResult.status < 300)) throw new Error(raw || 'chat proxy error')
     const content = ((data.choices && data.choices[0] && data.choices[0].message) || {}).content || (data.error || raw)
     await fetch(`/api/conversations/${conversationId}/message`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ role: 'assistant', content }) })
     setMsgs(prev => ([...prev, { id: Date.now(), role: 'assistant', content: { text: content } }]))
