@@ -5,7 +5,7 @@ import json
 from typing import Any, Dict, List, Optional
 
 import httpx
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, UploadFile, File, Form, Request
 from fastapi.responses import JSONResponse, HTMLResponse, StreamingResponse, Response
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import create_engine, text
@@ -132,8 +132,14 @@ def _build_openai_messages(base: List[Dict[str, Any]], attachments: List[Dict[st
 
 
 @app.post("/api/conversations/{cid}/chat")
-async def chat(cid: int, body: Dict[str, Any]):
-    logging.info("chat request cid=%s body_keys=%s", cid, list((body or {}).keys()))
+async def chat(cid: int, request: Request):
+    # Raw-body tolerant: accept JSON or raw text
+    raw = await request.body()
+    try:
+        body = json.loads(raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else raw)
+    except Exception:
+        body = {"content": (raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw))}
+    logging.info("chat request cid=%s body_type=%s", cid, type(body).__name__)
     user_content = (body or {}).get("content") or ""
     messages = (body or {}).get("messages") or []
     # Force non-stream proxy for reliability in the UI

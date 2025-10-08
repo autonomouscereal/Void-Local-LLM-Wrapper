@@ -108,28 +108,16 @@ function App() {
           </div>
         </div>
       </div>
-      <div style={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
-        <div style={{ flex: 1, padding: 16, overflowY: 'auto' }}>
+      <div className="chat-pane" style={{ flex: 1 }}>
+        <div className="chat-scroll" style={{ padding: 16 }}>
           {(msgs || []).map(m => (
             <div key={m.id} style={{ marginBottom: 16 }}>
               <div style={{ fontSize: 12, color: '#9ca3af' }}>{m.role}</div>
-              <div
-                style={{
-                  padding: 12,
-                  background: m.role === 'assistant' ? '#111827' : '#0f172a',
-                  borderRadius: 8,
-                  overflowX: 'auto',
-                  wordBreak: 'break-word',
-                  overflowWrap: 'anywhere',
-                  whiteSpace: 'pre-wrap',
-                  maxWidth: '100%'
-                }}
-                dangerouslySetInnerHTML={{ __html: marked.parse((m.content?.text || '')) }}
-              />
+              <div className="chat-bubble" style={{ padding: 12, background: m.role === 'assistant' ? '#111827' : '#0f172a', borderRadius: 8 }} dangerouslySetInnerHTML={{ __html: marked.parse((m.content?.text || '')) }} />
             </div>
           ))}
         </div>
-        <div style={{ padding: 12, display: 'flex', gap: 8, borderTop: '1px solid #222' }}>
+        <div style={{ padding: 12, display: 'flex', gap: 8, borderTop: '1px solid #222', flexShrink: 0 }}>
           <input ref={fileRef} type='file' onChange={uploadFile} style={{ color: '#9ca3af' }} />
           <input value={text} onChange={e => setText(e.target.value)} placeholder='Type your prompt...' style={{ flex: 1, padding: 10, borderRadius: 6, border: '1px solid #333', background: '#0b0b0f', color: '#fff' }} />
           <button onClick={send} disabled={sending || !text.trim()} style={{ padding: '10px 16px', background: sending || !text.trim() ? '#16a34a' : '#22c55e', opacity: sending || !text.trim() ? 0.7 : 1, color: '#111', border: 'none', borderRadius: 6, fontWeight: 700, cursor: sending || !text.trim() ? 'not-allowed' : 'pointer' }}>{sending ? 'Sending…' : 'Send'}</button>

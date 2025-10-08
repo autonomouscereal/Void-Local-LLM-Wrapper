@@ -4,6 +4,15 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Void Chat</title>
+    <style>
+      * { box-sizing: border-box; }
+      html, body, #root { height: 100%; margin: 0; overflow: hidden; }
+      .chat-pane { display: flex; flex-direction: column; height: 100%; overflow: hidden; }
+      .chat-scroll { flex: 1; overflow-y: auto; overflow-x: hidden; }
+      .chat-bubble { max-width: 100%; overflow-x: auto; word-break: break-word; overflow-wrap: anywhere; white-space: pre-wrap; }
+      .chat-bubble pre, .chat-bubble code { max-width: 100%; overflow-x: auto; }
+      .chat-bubble img, .chat-bubble video, .chat-bubble table { max-width: 100%; height: auto; }
+    </style>
   </head>
   <body>
     <div id="root"></div>
