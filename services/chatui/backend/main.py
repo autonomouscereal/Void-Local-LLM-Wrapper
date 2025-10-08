@@ -146,13 +146,21 @@ async def chat(cid: int, body: Dict[str, Any]):
     async def _proxy_stream():
         try:
             async with httpx.AsyncClient(timeout=None) as client:
-                r = await client.post(ORCH_URL.rstrip("/") + "/v1/chat/completions", json=payload)
-                if stream and r.headers.get("content-type", "").startswith("text/event-stream"):
-                    async for chunk in r.aiter_text():
-                        yield chunk
-                else:
-                    data = r.json()
-                    yield json.dumps(data)
+                url = ORCH_URL.rstrip("/") + "/v1/chat/completions"
+                async with client.stream("POST", url, json=payload) as r:
+                    ct = r.headers.get("content-type", "")
+                    if stream and ct.startswith("text/event-stream"):
+                        async for chunk in r.aiter_text():
+                            # pass through SSE chunks unchanged
+                            yield chunk
+                    else:
+                        body = await r.aread()
+                        # ensure JSON text
+                        try:
+                            obj = json.loads(body.decode("utf-8"))
+                            yield json.dumps(obj)
+                        except Exception:
+                            yield body
         except Exception as ex:
             yield json.dumps({"error": str(ex)})
 
