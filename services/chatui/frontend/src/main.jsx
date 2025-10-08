@@ -44,12 +44,14 @@ function App() {
     }
     setSending(true)
     // Use XMLHttpRequest to avoid fetch-specific quirks
-    // Hybrid path: persist user message locally, call orchestrator directly, then persist assistant
+    // Persist user message locally
     await fetch(`/api/conversations/${conversationId}/message`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ role: 'user', content: text }) })
-    const orch = await fetch('http://'+window.location.hostname+':8000/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ messages: [{ role: 'user', content: text }], stream: false }) })
-    const raw = await orch.text()
+    // Call proxy (same origin) to avoid any CORS
+    const res = await fetch(`/api/conversations/${conversationId}/chat`, { method: 'POST', body: text })
+    const raw = await res.text()
     const data = JSON.parse(raw)
     const content = ((data.choices && data.choices[0] && data.choices[0].message) || {}).content || raw
+    // Persist assistant message locally
     await fetch(`/api/conversations/${conversationId}/message`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ role: 'assistant', content }) })
     setMsgs(prev => ([...prev, { id: Date.now(), role: 'assistant', content: { text: content } }]))
     setText('')

@@ -212,6 +212,16 @@ async def chat(cid: int, request: Request):
     return Response(content=body, media_type="application/json", headers=headers)
 
 
+@app.options("/api/conversations/{cid}/chat")
+async def chat_preflight(cid: int):
+    return Response(status_code=204, headers={
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "POST, OPTIONS",
+        "Access-Control-Allow-Headers": "*",
+        "Access-Control-Max-Age": "86400",
+    })
+
+
 @app.get("/api/orchestrator/diagnostics")
 async def orch_diag():
     out: Dict[str, Any] = {}
