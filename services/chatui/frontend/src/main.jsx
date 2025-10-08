@@ -43,74 +43,18 @@ function App() {
       conversationId = await newConversation()
     }
     setSending(true)
-    setMsgs(prev => ([...prev, { id: 'stream', role: 'assistant', content: { text: '' } }]))
-    try {
-      const res = await fetch(`/api/conversations/${conversationId}/chat`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ content: text, stream: true })
-      })
-      setText('')
-      if (!res.ok) {
-        const t = await res.text()
-        throw new Error(t || `HTTP ${res.status}`)
-      }
-      const ct = res.headers.get('content-type') || ''
-      if (!ct.startsWith('text/event-stream')) {
-        const data = await res.json()
-        const content = ((data.choices?.[0]?.message) || {}).content || ''
-        setMsgs(prev => {
-          const copy = prev.filter(m => m.id !== 'stream')
-          return [...copy, { id: Date.now(), role: 'assistant', content: { text: content } }]
-        })
-        await openConversation(conversationId)
-        return
-      }
-      const reader = res.body.getReader()
-      const decoder = new TextDecoder()
-      let buffer = ''
-      for (;;) {
-        const { done, value } = await reader.read()
-        if (done) break
-        buffer += decoder.decode(value, { stream: true })
-        let idx
-        while ((idx = buffer.indexOf('\n\n')) !== -1) {
-          const chunk = buffer.slice(0, idx)
-          buffer = buffer.slice(idx + 2)
-          const line = chunk.trim()
-          if (!line) continue
-          if (line === 'data: [DONE]') {
-            break
-          }
-          const dataIdx = line.indexOf('data: ')
-          if (dataIdx !== -1) {
-            const jsonStr = line.slice(dataIdx + 6)
-            try {
-              const obj = JSON.parse(jsonStr)
-              const choice = (obj.choices && obj.choices[0]) || {}
-              const delta = choice.delta || {}
-              const piece = delta.content || ''
-              if (piece) {
-                setMsgs(prev => {
-                  const copy = [...prev]
-                  const last = copy[copy.length - 1]
-                  if (last && last.id === 'stream') {
-                    last.content = { text: (last.content?.text || '') + piece }
-                  }
-                  return copy
-                })
-              }
-            } catch {}
-          }
-        }
-      }
-      await openConversation(conversationId)
-    } catch (e) {
-      console.error('send failed', e)
-      alert('Send failed: ' + (e?.message || e))
-    } finally {
-      setSending(false)
-    }
+    const res = await fetch(`/api/conversations/${conversationId}/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: text })
+    })
+    setText('')
+    const raw = await res.text()
+    // Intentionally no try/catch: if this fails, we want the console error
+    const data = JSON.parse(raw)
+    const content = ((data.choices?.[0]?.message) || {}).content || ''
+    setMsgs(prev => ([...prev, { id: Date.now(), role: 'assistant', content: { text: content || raw } }]))
+    setSending(false)
   }
 
   async function uploadFile(e) {

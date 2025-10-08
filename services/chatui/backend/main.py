@@ -170,7 +170,7 @@ async def chat(cid: int, body: Dict[str, Any]):
 
     # Non-stream: forward and persist assistant message
     try:
-        async with httpx.AsyncClient(timeout=300) as client:
+        async with httpx.AsyncClient(timeout=None) as client:
             rr = await client.post(ORCH_URL.rstrip("/") + "/v1/chat/completions", json=payload)
             if rr.status_code >= 400:
                 content_type = rr.headers.get("content-type", "")
