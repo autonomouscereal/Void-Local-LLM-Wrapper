@@ -228,6 +228,31 @@ async def favicon():
     return Response(status_code=204)
 
 
+@app.get("/api/conversations/{cid}/chat")
+async def chat_get(cid: int, content: str = ""):
+    # Convenience GET for environments where POST fetch is blocked; DO NOT use in production
+    user_content = content or ""
+    with engine.begin() as conn:
+        conn.execute(text("INSERT INTO messages (conversation_id, role, content) VALUES (:c, 'user', :x)"), {"c": cid, "x": json.dumps({"text": user_content})})
+        atts = conn.execute(text("SELECT name, url, mime FROM attachments WHERE conversation_id=:id"), {"id": cid}).mappings().all()
+    oa_msgs = _build_openai_messages([{"role": "user", "content": user_content}], [dict(a) for a in atts])
+    payload = {"messages": oa_msgs, "stream": False}
+    async with httpx.AsyncClient(timeout=None) as client:
+        rr = await client.post(ORCH_URL.rstrip("/") + "/v1/chat/completions", json=payload)
+        data = rr.json()
+    assistant = ((data.get("choices") or [{}])[0].get("message") or {}).get("content")
+    with engine.begin() as conn:
+        conn.execute(text("INSERT INTO messages (conversation_id, role, content) VALUES (:c, 'assistant', :x)"), {"c": cid, "x": json.dumps({"text": assistant})})
+    body = json.dumps(data)
+    headers = {
+        "Cache-Control": "no-store",
+        "Connection": "close",
+        "Content-Length": str(len(body.encode("utf-8"))),
+        "Access-Control-Allow-Origin": "*",
+    }
+    return Response(content=body, media_type="application/json", headers=headers)
+
+
 @app.get("/api/jobs")
 async def list_jobs(status: Optional[str] = None, limit: int = 50, offset: int = 0):
     params = {"limit": limit, "offset": offset}

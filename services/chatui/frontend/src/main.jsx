@@ -43,18 +43,35 @@ function App() {
       conversationId = await newConversation()
     }
     setSending(true)
-    const res = await fetch(`/api/conversations/${conversationId}/chat`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ content: text })
+    // Use XMLHttpRequest to avoid fetch-specific quirks
+    await new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest()
+      xhr.open('POST', `/api/conversations/${conversationId}/chat`, true)
+      // No content-type header: backend accepts raw bodies
+      xhr.onreadystatechange = function () {
+        if (xhr.readyState === 4) {
+          setText('')
+          if (xhr.status >= 200 && xhr.status < 300) {
+            const raw = xhr.responseText
+            const data = JSON.parse(raw)
+            const content = ((data.choices && data.choices[0] && data.choices[0].message) || {}).content || ''
+            setMsgs(prev => ([...prev, { id: Date.now(), role: 'assistant', content: { text: content || raw } }]))
+            setSending(false)
+            resolve()
+          } else {
+            console.error('xhr error', xhr.status, xhr.responseText)
+            setSending(false)
+            reject(new Error('xhr ' + xhr.status))
+          }
+        }
+      }
+      xhr.onerror = function () {
+        console.error('xhr network error')
+        setSending(false)
+        reject(new Error('xhr network error'))
+      }
+      xhr.send(text)
     })
-    setText('')
-    const raw = await res.text()
-    // Intentionally no try/catch: if this fails, we want the console error
-    const data = JSON.parse(raw)
-    const content = ((data.choices?.[0]?.message) || {}).content || ''
-    setMsgs(prev => ([...prev, { id: Date.now(), role: 'assistant', content: { text: content || raw } }]))
-    setSending(false)
   }
 
   async function uploadFile(e) {
