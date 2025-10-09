@@ -56,14 +56,24 @@ function App() {
     if (!conversationId) {
       conversationId = await newConversation()
     }
+    // Add user's message immediately to the UI
+    const userText = text
+    setMsgs(prev => ([...prev, { id: Date.now(), role: 'user', content: { text: userText } }]))
+    setText('')
     setSending(true)
     try {
       // Persistent WebSocket: send chat message and await the server push
       const t0 = performance.now()
       console.log('[ui] ws connect')
       const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/api/ws')
+      // Insert a temporary assistant placeholder to show thinking state
+      const thinkingId = Date.now() + 1
+      const showThinking = () => {
+        setMsgs(prev => ([...prev, { id: thinkingId, role: 'assistant', content: { text: 'Thinking…' } }]))
+      }
       ws.onopen = () => {
         console.log('[ui] ws open')
+        showThinking()
         ws.send(JSON.stringify({ conversation_id: conversationId, content: text }))
       }
       ws.onmessage = (ev) => {
@@ -73,20 +83,26 @@ function App() {
         let data
         try { data = raw ? JSON.parse(raw) : {} } catch { data = { error: raw } }
         if (data && data.error) {
-          setMsgs(prev => ([...prev, { id: Date.now(), role: 'assistant', content: { text: `Error: ${data.error}` } }]))
+          // Replace thinking bubble with error
+          setMsgs(prev => (prev.map(m => m.id === thinkingId ? { ...m, content: { text: `Error: ${data.error}` } } : m)))
           ws.close()
           setSending(false)
           return
         }
         const content = ((data.data && data.data.choices && data.data.choices[0] && data.data.choices[0].message) || {}).content || data.text || data.error || raw
-        setMsgs(prev => ([...prev, { id: Date.now(), role: 'assistant', content: { text: content } }]))
-        setText('')
+        // Replace thinking bubble with final assistant content
+        setMsgs(prev => (prev.map(m => m.id === thinkingId ? { ...m, content: { text: content } } : m)))
         ws.close()
         setSending(false)
       }
       ws.onerror = () => {
         console.error('[ui] ws error')
-        setMsgs(prev => ([...prev, { id: Date.now(), role: 'assistant', content: { text: 'Error: Network error' } }]))
+        // Replace thinking bubble with error if present; else append error
+        setMsgs(prev => {
+          const hasThinking = prev.some(m => m.id === thinkingId)
+          if (hasThinking) return prev.map(m => m.id === thinkingId ? { ...m, content: { text: 'Error: Network error' } } : m)
+          return ([...prev, { id: Date.now(), role: 'assistant', content: { text: 'Error: Network error' } }])
+        })
         setSending(false)
       }
       ws.onclose = () => {

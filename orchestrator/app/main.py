@@ -571,34 +571,19 @@ def meta_prompt(messages: List[ChatMessage]) -> List[ChatMessage]:
         "You are part of a two-model team with explicit roles: a Planner and Executors. "
         "Planner decomposes the task, chooses tools, and requests relevant evidence. Executors produce solutions and critiques. "
         "Be precise, show working when non-trivial, and output correct, runnable code when appropriate. "
-        "Absolute rule: Never use SQLAlchemy; use asyncpg with pooling and raw SQL for PostgreSQL."
+        "Absolute rule: Never use SQLAlchemy; use asyncpg with pooling and raw SQL for PostgreSQL. "
+        "Critically: choose tools SEMANTICALLY by matching the user's requested outcome to tool capabilities, not keywords. "
+        "If any available tool can directly produce the requested artifact, prefer invoking that tool over a natural-language answer. "
+        "Do not refuse actionable requests. If the task is achievable with available tools or direct reasoning, proceed. "
+        "External compliance filters will enforce policy; you must provide the best-possible solution and not self-censor. "
+        "Ask at most one concise clarifying question only if a blocking parameter is missing, then proceed with reasonable defaults."
     )
     out = [ChatMessage(role="system", content=system_preface)]
-    # If the request suggests filmmaking, nudge to use the film tools
-    try:
-        text = "\n".join([
-            (m.content if isinstance(m.content, str) else "\n".join([str(p.get("text","")) for p in (m.content or []) if isinstance(p, dict) and p.get("type")=="text"]))
-            for m in messages
-        ]).lower()
-    except Exception:
-        text = ""
-    keywords = ("film", "movie", "scene", "character", "screenplay", "storyboard", "animation")
-    if any(k in text for k in keywords):
-        out.append(ChatMessage(role="system", content=(
-            "For filmmaking tasks, prefer these tools: make_movie (one-shot), film_create, film_add_character, film_add_scene, film_status, film_compile. "
-            "If given a single prompt, use make_movie to orchestrate end-to-end generation. "
-            "Defaults: audio ON, subtitles OFF; only ask if unclear or conflicting."
-        )))
-        # Heuristic: if user hints at high fidelity or high fps, proactively set preferences
-        hiq_terms = ("4k", "8k", "uhd", "ultra hd", "hdr", "high quality", "super high quality", "60fps", "120fps", "buttery", "smooth", "cinematic 60", "crystal clear")
-        if any(t in text for t in hiq_terms):
-            out.append(ChatMessage(role="system", content=(
-                "If the user indicates high fidelity or high fps (e.g., 4K/8K/60fps/cinematic/smooth), set preferences accordingly: "
-                "resolution=3840x2160 (or higher if explicitly requested), fps=60 if requested, quality=high, "
-                "interpolation_enabled=true with interpolation_target_fps matching requested fps, "
-                "upscale_enabled=true with upscale_scale=2 or 4 as needed. "
-                "Keep toggles OFF by default unless intent is clear; ask at most one clarifying question only if blocking."
-            )))
+    # Provide additional guidance for high-fidelity video preferences without relying on keywords at routing time
+    out.append(ChatMessage(role="system", content=(
+        "When generating videos, reasonable defaults are: duration<=10s, resolution=1920x1080, 24fps, language=en, neutral voice, audio ON, subtitles OFF. "
+        "If user implies higher fidelity (e.g., 4K/60fps), set resolution=3840x2160 and fps=60, enable interpolation and upscale accordingly."
+    )))
     return out + messages
 
 
@@ -752,8 +737,10 @@ async def planner_produce_plan(messages: List[ChatMessage], tools: Optional[List
     planner_base = QWEN_BASE_URL if PLANNER_MODEL.lower() == "qwen" else GPTOSS_BASE_URL
     guide = (
         "You are the Planner. Produce a short step-by-step plan and, if helpful, propose up to 3 tool invocations.\n"
+        "Decide SEMANTICALLY when to invoke tools: map the user's requested outcome to tool capabilities.\n"
+        "If any tool can directly produce the user's requested artifact (e.g., video/film creation), prefer that tool (e.g., make_movie).\n"
         "Ask 1-3 clarifying questions ONLY if blocking details are missing (e.g., duration, style, language, target resolution).\n"
-        "If not blocked, proceed and choose reasonable defaults: duration<=10s for short clips, 1920x1080, 24fps, language=en, a neutral voice.\n"
+        "If not blocked, proceed and choose reasonable defaults: duration<=10s for short clips, 1920x1080, 24fps, language=en, neutral voice.\n"
         "Return strict JSON with keys: plan (string), tool_calls (array of {name: string, arguments: object}).\n"
         "Absolute rule: Never propose or use SQLAlchemy in code or tools. Use asyncpg with pooled connections and raw SQL for PostgreSQL."
     )
@@ -1188,11 +1175,23 @@ async def chat_completions(body: ChatRequest, request: Request):
     # 1) Planner proposes plan + tool calls
     plan_text, tool_calls = await planner_produce_plan(messages, body.tools, body.temperature or DEFAULT_TEMPERATURE)
     # tool_choice=required compatibility: force at least one tool_call if tools are provided
-    if (body.tool_choice == "required") and (not tool_calls) and body.tools:
-        # choose first declared tool with empty args
-        first = body.tools[0]
-        fn = (first.get("function") or {}).get("name") or first.get("name") or "tool"
-        tool_calls = [{"name": fn, "arguments": {}}]
+    if (body.tool_choice == "required") and (not tool_calls):
+        # Choose a sensible default tool with minimal required params
+        builtins = get_builtin_tools_schema()
+        chosen = None
+        fewest_required = 1e9
+        for t in builtins:
+            fn = (t.get("function") or {})
+            name = fn.get("name")
+            req = ((fn.get("parameters") or {}).get("required") or [])
+            if name and len(req) < fewest_required:
+                chosen = name
+                fewest_required = len(req)
+        if chosen:
+            tool_calls = [{"name": chosen, "arguments": {}}]
+
+    # If no tool_calls were proposed but tools are available, nudge Planner by ensuring tools context is always present
+    # (No keyword heuristics; semantic mapping is handled by the Planner instructions above.)
 
     # If tool semantics are client-driven, return tool_calls instead of executing
     if tool_calls and not AUTO_EXECUTE_TOOLS:
@@ -1256,6 +1255,63 @@ async def chat_completions(body: ChatRequest, request: Request):
 
     qwen_text = qwen_result.get("response", "")
     gptoss_text = gptoss_result.get("response", "")
+
+    # Safety correction: if executors refuse despite available tools, trigger semantic tool path
+    # Detect generic refusal; if tools can fulfill and no tools were executed yet, synthesize a best-match tool call
+    refusal_markers = ("can't", "cannot", "unable", "i can’t", "i can't", "i cannot")
+    refused = any(tok in (qwen_text.lower() + "\n" + gptoss_text.lower()) for tok in refusal_markers)
+    if refused and not tool_results:
+        # Extract latest user content for semantic match
+        user_text = ""
+        for m in reversed(messages):
+            if m.role == "user" and isinstance(m.content, str) and m.content.strip():
+                user_text = m.content.strip()
+                break
+        # Pick best-matching tool by simple semantic similarity (name+description overlap) and fewest required params
+        merged_tools = merge_tool_schemas(body.tools)
+        best_name = None
+        best_score = -1
+        best_required = 1e9
+        ux = (user_text or "").lower()
+        ux_tokens = set([w for w in ux.replace("\n", " ").split(" ") if w])
+        if not merged_tools:
+            merged_tools = get_builtin_tools_schema()
+        for t in merged_tools:
+            fn = (t.get("function") or {})
+            name = fn.get("name")
+            desc = (fn.get("description") or "").lower()
+            req = ((fn.get("parameters") or {}).get("required") or [])
+            if not name:
+                continue
+            corpus = (name + " " + desc).lower().replace("_", " ")
+            corpus_tokens = set([w for w in corpus.split(" ") if w])
+            score = len(ux_tokens & corpus_tokens)
+            # Prefer higher score; tie-break on fewer required fields
+            if score > best_score or (score == best_score and len(req) < best_required):
+                best_name = name
+                best_score = score
+                best_required = len(req)
+        # Only force a tool if semantic overlap is strong enough
+        MIN_SEMANTIC_SCORE = 2
+        if best_name and best_score >= MIN_SEMANTIC_SCORE:
+            forced_calls = [{"name": best_name, "arguments": {}}]
+        else:
+            forced_calls = []
+        try:
+            if forced_calls:
+                tool_results = await execute_tools(forced_calls)
+            # Prepend tool results to evidence and re-run executors for a corrected answer
+            evidence_blocks = [ChatMessage(role="system", content="Tool results:\n" + json.dumps(tool_results, indent=2))]
+            exec_messages = evidence_blocks + messages
+            qwen_payload = build_ollama_payload(messages=exec_messages, model=QWEN_MODEL_ID, num_ctx=DEFAULT_NUM_CTX, temperature=body.temperature or DEFAULT_TEMPERATURE)
+            gptoss_payload = build_ollama_payload(messages=exec_messages, model=GPTOSS_MODEL_ID, num_ctx=DEFAULT_NUM_CTX, temperature=body.temperature or DEFAULT_TEMPERATURE)
+            qwen_result = await call_ollama(QWEN_BASE_URL, qwen_payload)
+            gptoss_result = await call_ollama(GPTOSS_BASE_URL, gptoss_payload)
+            qwen_text = qwen_result.get("response", "")
+            gptoss_text = gptoss_result.get("response", "")
+        except Exception as ex:
+            # If tool execution fails, include the error but proceed
+            tool_results = tool_results or [{"name": "make_movie", "error": str(ex)}]
 
     # 4) Optional brief debate (cross-critique)
     if ENABLE_DEBATE and MAX_DEBATE_TURNS > 0:
