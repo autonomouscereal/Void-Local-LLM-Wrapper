@@ -16,7 +16,7 @@ RUN git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git .
 RUN pip install --no-cache-dir -r requirements.txt
 # Ensure binary compatibility for OpenCV and custom nodes: pin NumPy < 2
 RUN pip install --no-cache-dir "numpy<2"
-RUN pip install --no-cache-dir opencv-python-headless==4.9.0.80 imageio-ffmpeg==0.4.9 diffusers==0.30.2
+RUN pip install --no-cache-dir opencv-python-headless==4.9.0.80 imageio-ffmpeg==0.4.9 diffusers==0.30.2 insightface==0.7.3 onnxruntime==1.19.2 Pillow==10.4.0
 
 EXPOSE 8188
 
