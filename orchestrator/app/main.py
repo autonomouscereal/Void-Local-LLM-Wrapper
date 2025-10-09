@@ -1671,12 +1671,17 @@ async def chat_completions(body: ChatRequest, request: Request):
             summary_lines.append(f"Film ID: {film_id}")
         if errors:
             summary_lines.append("Errors: " + "; ".join(errors)[:800])
-        summary = "\n" + "\n".join(summary_lines) if summary_lines else ""
-        display_content = (
-            "Initiated tool-based generation flow. "
-            + summary
-            + "\nUse film_status to track progress and /api/jobs for live status."
+        summary = ("\n" + "\n".join(summary_lines)) if summary_lines else ""
+        status_block = (
+            "\n\n### Status\n"
+            "Initiated tool-based generation flow." + summary + "\n"
+            "Use `film_status` to track progress and `/api/jobs` for live status."
         )
+        # If content is empty, use only the status; else append to preserve full answer and appendix
+        if looks_empty:
+            display_content = status_block.lstrip()
+        else:
+            display_content = (display_content or "") + status_block
     response = {
         "id": "orc-1",
         "object": "chat.completion",
