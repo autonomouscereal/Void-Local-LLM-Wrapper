@@ -348,7 +348,19 @@ async def get_pg_pool() -> Optional[asyncpg.pool.Pool]:
             );
             """
         )
-        await conn.execute("CREATE INDEX IF NOT EXISTS rag_docs_embedding_idx ON rag_docs USING ivfflat (embedding vector_cosine) WITH (lists = 100);")
+        # Ensure pgvector extension and indexes exist (safe to run if extension already installed)
+        try:
+            await conn.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+        except Exception:
+            pass
+        try:
+            await conn.execute("CREATE INDEX IF NOT EXISTS rag_docs_embedding_idx ON rag_docs USING ivfflat (embedding vector_cosine) WITH (lists = 100);")
+        except Exception:
+            # Fallback: plain HNSW if ivfflat/vector_cosine opclass unavailable
+            try:
+                await conn.execute("CREATE INDEX IF NOT EXISTS rag_docs_embedding_hnsw_idx ON rag_docs USING hnsw (embedding vector_l2);")
+            except Exception:
+                pass
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS jobs (
