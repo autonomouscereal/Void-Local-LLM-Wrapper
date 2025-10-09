@@ -1526,8 +1526,9 @@ async def chat_completions(body: ChatRequest, request: Request):
     if ENABLE_DEBATE and MAX_DEBATE_TURNS > 0:
         # Previous critique messages were appended to exec_messages; we don't re-summarize them here to avoid bloat
         meta_sections.append("Cross-critique: enabled")
-    meta_block = ("\n\n<!--\n" + "\n\n".join(meta_sections) + "\n-->\n\n") if meta_sections else ""
-    display_content = f"{cleaned}\n\n" + meta_block
+    # Append a plain-text footer instead of HTML comments so it always renders
+    footer = ("\n\n" + "\n\n".join(meta_sections)) if meta_sections else ""
+    display_content = f"{cleaned}{footer}"
     response = {
         "id": "orc-1",
         "object": "chat.completion",
