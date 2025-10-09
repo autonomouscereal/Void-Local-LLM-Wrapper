@@ -11,6 +11,13 @@ function App() {
   const [jobs, setJobs] = useState([])
   const [showJobs, setShowJobs] = useState(false)
   const [sending, setSending] = useState(false)
+  const localIdRef = useRef(1)
+  const knownDoneJobsRef = useRef(new Set())
+  const nextLocalId = () => {
+    const n = localIdRef.current
+    localIdRef.current = n + 1
+    return n
+  }
   // Frontend request policy (history + rationale):
   // - Previous versions sometimes posted twice (to two endpoints) or used polling fallbacks. That led to
   //   confusing timing where the browser “errored” one request while another completed later, creating the
@@ -58,7 +65,8 @@ function App() {
     }
     // Add user's message immediately to the UI
     const userText = text
-    setMsgs(prev => ([...prev, { id: Date.now(), role: 'user', content: { text: userText } }]))
+    const userId = nextLocalId()
+    setMsgs(prev => ([...prev, { id: userId, role: 'user', content: { text: userText } }]))
     setText('')
     setSending(true)
     try {
@@ -67,7 +75,7 @@ function App() {
       console.log('[ui] ws connect')
       const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/api/ws')
       // Insert a temporary assistant placeholder to show thinking state
-      const thinkingId = Date.now() + 1
+      const thinkingId = nextLocalId()
       const showThinking = () => {
         setMsgs(prev => ([...prev, { id: thinkingId, role: 'assistant', content: { text: 'Thinking…' } }]))
       }
@@ -152,6 +160,35 @@ function App() {
     })()
     // Jobs polling disabled by default; re-enable if needed
   }, [])
+
+  // Optional: auto-refresh jobs and surface completions into chat
+  useEffect(() => {
+    let timer
+    const tick = async () => {
+      try {
+        const r = await fetch('/api/jobs')
+        const j = await r.json()
+        const list = Array.isArray(j) ? j : (j.data || [])
+        setJobs(list)
+        // Append minimal completion notices to chat for newly finished jobs
+        for (const job of list) {
+          const jid = job.id || job.job_id
+          const status = job.status || ''
+          if (jid && status.toLowerCase() === 'done' && !knownDoneJobsRef.current.has(jid)) {
+            knownDoneJobsRef.current.add(jid)
+            setMsgs(prev => ([...prev, { id: nextLocalId(), role: 'assistant', content: { text: `Job ${jid} finished.` } }]))
+          }
+        }
+      } catch (_) {
+        // ignore transient errors
+      }
+    }
+    if (showJobs) {
+      tick()
+      timer = setInterval(tick, 4000)
+    }
+    return () => { if (timer) clearInterval(timer) }
+  }, [showJobs])
 
   return (
     <div style={{ display: 'flex', height: '100vh', fontFamily: 'Inter, system-ui, Arial', background: '#0b0b0f', color: '#e6e6e6' }}>

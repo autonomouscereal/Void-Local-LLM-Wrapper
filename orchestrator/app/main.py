@@ -1139,6 +1139,42 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         if fc.get("error"):
             return {"name": name, "error": fc.get("error")}
         film_id = (fc.get("result") or {}).get("film_id")
+        # If caller did not provide characters/scenes, derive a minimal production plan using the LLM
+        if (not characters) or (not scenes):
+            total_duration = float(args.get("duration_seconds") or movie_prefs.get("duration_seconds") or 10)
+            try:
+                # Aim for ~4-6 seconds per scene
+                est_scenes = max(1, min(12, int(round(total_duration / 5))))
+                guidance = (
+                    "Create a concise JSON plan for a short film. Return ONLY JSON with keys 'characters' and 'scenes'.\n"
+                    "Schema: {characters:[{name:string, description:string}], scenes:[{index_num:int, prompt:string}]}.\n"
+                    f"Title: {title}.\nSynopsis: {synopsis}.\n"
+                    f"Preferences: duration_seconds={total_duration}, resolution={movie_prefs.get('resolution') or '1920x1080'}, fps={movie_prefs.get('fps') or 24}, style={movie_prefs.get('style') or 'default'}.\n"
+                    f"Scenes: produce {est_scenes} scenes, evenly covering the story arc.\n"
+                )
+                payload = build_ollama_payload([ChatMessage(role="user", content=guidance)], QWEN_MODEL_ID, DEFAULT_NUM_CTX, DEFAULT_TEMPERATURE)
+                llm_res = await call_ollama(QWEN_BASE_URL, payload)
+                plan_text = (llm_res.get("response") or "").strip()
+                # Extract JSON block if fenced
+                json_text = plan_text
+                if "```" in plan_text:
+                    parts = plan_text.split("```")
+                    for i in range(1, len(parts), 2):
+                        cand = parts[i].strip()
+                        if cand.lstrip().startswith("{"):
+                            json_text = cand
+                            break
+                try:
+                    plan_obj = json.loads(json_text)
+                except Exception:
+                    plan_obj = {}
+                if (not characters) and isinstance(plan_obj.get("characters"), list):
+                    characters = plan_obj.get("characters")
+                if (not scenes) and isinstance(plan_obj.get("scenes"), list):
+                    scenes = plan_obj.get("scenes")
+            except Exception:
+                # If planning fails, proceed with empty lists (caller may add later)
+                pass
         # add characters
         for ch in characters[:25]:
             ch_args = {} if not isinstance(ch, dict) else dict(ch)

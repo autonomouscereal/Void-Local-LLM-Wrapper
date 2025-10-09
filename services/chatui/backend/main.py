@@ -366,10 +366,16 @@ async def chat(cid: int, request: Request, background_tasks: BackgroundTasks):
     async with _pool().acquire() as conn:
         await conn.execute("INSERT INTO messages (conversation_id, role, content) VALUES ($1, 'user', $2::jsonb)", cid, json.dumps({"text": user_content}))
         atts = await conn.fetch("SELECT name, url, mime FROM attachments WHERE conversation_id=$1", cid)
+        # Load full conversation history (user/assistant) so the orchestrator has full context
+        hist_rows = await conn.fetch("SELECT role, content FROM messages WHERE conversation_id=$1 ORDER BY id ASC", cid)
     logging.info("db:user_insert+attachments cid=%s ms=%.2f", cid, (time.perf_counter() - t1) * 1000)
 
-    # Build messages for orchestrator
-    oa_msgs = _build_openai_messages(messages + [{"role": "user", "content": user_content}], [dict(a) for a in atts])
+    # Build messages for orchestrator using DB history
+    base_hist = []
+    for r in hist_rows:
+        decoded = _decode_json(r["content"])
+        base_hist.append({"role": r["role"], "content": decoded.get("text") or ""})
+    oa_msgs = _build_openai_messages(base_hist, [dict(a) for a in atts])
     payload = {"messages": oa_msgs, "stream": False}
 
     async def _proxy_stream():
