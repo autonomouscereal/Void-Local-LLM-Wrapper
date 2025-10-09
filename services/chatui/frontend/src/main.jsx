@@ -46,29 +46,16 @@ function App() {
     try {
       let raw = ''
       let data
-      // Primary: XHR to neutral path to avoid any filter on "chat"
-      const primary = await new Promise(resolve => {
-        try {
-          const xhr = new XMLHttpRequest()
-          xhr.open('POST', `/api/call`, true)
-          xhr.setRequestHeader('Content-Type', 'application/json')
-          xhr.setRequestHeader('Accept', 'application/json')
-          xhr.onreadystatechange = function() {
-            if (xhr.readyState === 4) {
-              resolve({ status: xhr.status, text: xhr.responseText || '' })
-            }
-          }
-          xhr.onerror = function() { resolve({ status: 0, text: '' }) }
-          xhr.send(JSON.stringify({ conversation_id: conversationId, content: text }))
-        } catch (e) {
-          resolve({ status: 0, text: String(e || 'xhr error') })
-        }
+      // Single fetch to neutral path; wait for full response
+      const resp = await fetch('/api/call', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+        body: JSON.stringify({ conversation_id: conversationId, content: text })
       })
-      if (primary.status >= 200 && primary.status < 300) {
-        raw = primary.text || ''
-        try { data = JSON.parse(raw) } catch { data = { error: raw || 'parse error' } }
-      } else {
-        const errText = (primary.text || '').slice(0, 500) || `chat proxy error (${primary.status})`
+      raw = await resp.text()
+      try { data = JSON.parse(raw) } catch { data = { error: raw || 'parse error' } }
+      if (!(resp.status >= 200 && resp.status < 300)) {
+        const errText = (raw || '').slice(0, 500) || `chat proxy error (${resp.status})`
         setMsgs(prev => ([...prev, { id: Date.now(), role: 'assistant', content: { text: `Error: ${errText}` } }]))
         return
       }
