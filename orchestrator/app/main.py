@@ -1480,6 +1480,9 @@ async def chat_completions(body: ChatRequest, request: Request):
 
     qwen_text = qwen_result.get("response", "")
     gptoss_text = gptoss_result.get("response", "")
+    # Preserve the first-pass model outputs for robust fallback in final composition
+    orig_qwen_text = qwen_text
+    orig_gptoss_text = gptoss_text
 
     # Safety correction: if executors refuse despite available tools, trigger semantic tool path
     # Detect generic refusal; if tools can fulfill and no tools were executed yet, synthesize a best-match tool call
@@ -1546,8 +1549,13 @@ async def chat_completions(body: ChatRequest, request: Request):
                 gptoss_payload2 = build_ollama_payload(messages=exec_messages2, model=GPTOSS_MODEL_ID, num_ctx=DEFAULT_NUM_CTX, temperature=body.temperature or DEFAULT_TEMPERATURE)
                 qwen_res2 = await call_ollama(QWEN_BASE_URL, qwen_payload2)
                 gptoss_res2 = await call_ollama(GPTOSS_BASE_URL, gptoss_payload2)
-                qwen_text = qwen_res2.get("response", qwen_text)
-                gptoss_text = gptoss_res2.get("response", gptoss_text)
+                # Do not discard the original answers; append improved content if any
+                new_q = qwen_res2.get("response", "")
+                new_g = gptoss_res2.get("response", "")
+                if isinstance(new_q, str) and new_q.strip():
+                    qwen_text = (orig_qwen_text or qwen_text or "") + ("\n\n" + new_q)
+                if isinstance(new_g, str) and new_g.strip():
+                    gptoss_text = (orig_gptoss_text or gptoss_text or "") + ("\n\n" + new_g)
             except Exception as ex:
                 tool_results = tool_results or [{"name": best_name or "unknown", "error": str(ex)}]
 
