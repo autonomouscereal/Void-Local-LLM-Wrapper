@@ -732,6 +732,54 @@ def get_builtin_tools_schema() -> List[Dict[str, Any]]:
     ]
 
 
+def _detect_video_intent(text: str) -> bool:
+    if not text:
+        return False
+    s = text.lower()
+    keywords = (
+        "video", "film", "movie", "scene", "4k", "8k", "60fps", "fps", "frame rate",
+        "minute", "minutes", "sec", "second", "seconds"
+    )
+    return any(k in s for k in keywords)
+
+
+def _derive_movie_prefs_from_text(text: str) -> Dict[str, Any]:
+    prefs: Dict[str, Any] = {}
+    s = (text or "").lower()
+    # resolution
+    if "4k" in s:
+        prefs["resolution"] = "3840x2160"
+    elif "8k" in s:
+        prefs["resolution"] = "7680x4320"
+    # fps
+    import re as _re
+    m_fps = _re.search(r"(\d{2,3})\s*fps", s)
+    if m_fps:
+        try:
+            prefs["fps"] = float(m_fps.group(1))
+        except Exception:
+            pass
+    elif "60fps" in s or "60 fps" in s:
+        prefs["fps"] = 60.0
+    # duration in minutes/seconds
+    m_min = _re.search(r"(\d+)\s*minute", s)
+    m_sec = _re.search(r"(\d+)\s*sec", s)
+    if m_min:
+        try:
+            prefs["duration_seconds"] = float(int(m_min.group(1)) * 60)
+        except Exception:
+            pass
+    elif m_sec:
+        try:
+            prefs["duration_seconds"] = float(int(m_sec.group(1)))
+        except Exception:
+            pass
+    # defaults
+    prefs.setdefault("resolution", "1920x1080")
+    prefs.setdefault("fps", 24.0)
+    prefs.setdefault("duration_seconds", 10.0)
+    return prefs
+
 def merge_tool_schemas(client_tools: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
     builtins = get_builtin_tools_schema()
     if not client_tools:
@@ -769,6 +817,17 @@ async def planner_produce_plan(messages: List[ChatMessage], tools: Optional[List
     parsed = parser.parse(text, expected)
     plan = parsed.get("plan", "")
     tool_calls = parsed.get("tool_calls", []) or []
+    # If planner proposes nothing but user intent implies video/film, synthesize make_movie call
+    if not tool_calls:
+        # find latest user message
+        last_user = ""
+        for m in reversed(messages):
+            if m.role == "user" and isinstance(m.content, str) and m.content.strip():
+                last_user = m.content.strip()
+                break
+        if _detect_video_intent(last_user):
+            prefs = _derive_movie_prefs_from_text(last_user)
+            tool_calls = [{"name": "make_movie", "arguments": prefs}]
     return plan, tool_calls
 
 
@@ -1427,57 +1486,70 @@ async def chat_completions(body: ChatRequest, request: Request):
     refusal_markers = ("can't", "cannot", "unable", "i can’t", "i can't", "i cannot")
     refused = any(tok in (qwen_text.lower() + "\n" + gptoss_text.lower()) for tok in refusal_markers)
     if refused and not tool_results:
-        # Extract latest user content for semantic match
-        user_text = ""
+        # Safe semantic forcing: only for tools we can call without hidden context (no film_id requirements)
+        # 1) Identify latest user text
+        last_user = ""
         for m in reversed(messages):
             if m.role == "user" and isinstance(m.content, str) and m.content.strip():
-                user_text = m.content.strip()
+                last_user = m.content.strip()
                 break
-        # Pick best-matching tool by simple semantic similarity (name+description overlap) and fewest required params
+        # 2) Merge tools and score semantic overlap
         merged_tools = merge_tool_schemas(body.tools)
-        best_name = None
-        best_score = -1
-        best_required = 1e9
-        ux = (user_text or "").lower()
-        ux_tokens = set([w for w in ux.replace("\n", " ").split(" ") if w])
-        if not merged_tools:
-            merged_tools = get_builtin_tools_schema()
+        allowed_tools: List[Tuple[str, Dict[str, Any]]] = []
         for t in merged_tools:
             fn = (t.get("function") or {})
-            name = fn.get("name")
-            desc = (fn.get("description") or "").lower()
-            req = ((fn.get("parameters") or {}).get("required") or [])
-            if not name:
+            name = fn.get("name") or t.get("name")
+            params = (fn.get("parameters") or {})
+            required = (params.get("required") or [])
+            # Skip tools that require film_id or other unavailable hard requirements
+            if any(req in ("film_id",) for req in required):
                 continue
-            corpus = (name + " " + desc).lower().replace("_", " ")
-            corpus_tokens = set([w for w in corpus.split(" ") if w])
+            if name:
+                allowed_tools.append((name, fn))
+        # 3) Pick best match
+        best_name = None
+        best_score = -1
+        ux_tokens = set([w for w in (last_user or "").lower().replace("\n", " ").split(" ") if w])
+        for name, fn in allowed_tools:
+            desc = (fn.get("description") or "").lower()
+            corpus_tokens = set([w for w in (name.replace("_"," ") + " " + desc).split(" ") if w])
             score = len(ux_tokens & corpus_tokens)
-            # Prefer higher score; tie-break on fewer required fields
-            if score > best_score or (score == best_score and len(req) < best_required):
+            if score > best_score:
                 best_name = name
                 best_score = score
-                best_required = len(req)
-        # For explicit refusal cases, only force when semantic overlap is strong enough
         MIN_SEMANTIC_SCORE = 3
+        forced_calls: List[Dict[str, Any]] = []
         if best_name and best_score >= MIN_SEMANTIC_SCORE:
-            forced_calls = [{"name": best_name, "arguments": {}}]
-        else:
-            forced_calls = []
-        try:
-            if forced_calls:
+            # 4) Build minimal arguments by tool
+            def _minimal_args(tool_name: str, text: str) -> Dict[str, Any]:
+                if tool_name == "make_movie":
+                    prefs = _derive_movie_prefs_from_text(text)
+                    return {**prefs, "synopsis": text}
+                if tool_name == "film_create":
+                    prefs = _derive_movie_prefs_from_text(text)
+                    return {"title": "Untitled", "synopsis": text, "metadata": prefs}
+                if tool_name == "rag_search":
+                    return {"query": text, "k": 8}
+                if tool_name == "tts_speak":
+                    return {"text": text}
+                if tool_name in ("image_generate", "video_generate", "controlnet"):
+                    return {"prompt": text}
+                return {}
+            forced_calls = [{"name": best_name, "arguments": _minimal_args(best_name, last_user)}]
+        # 5) Execute if any, then include results for synthesis context
+        if forced_calls:
+            try:
                 tool_results = await execute_tools(forced_calls)
-            # Prepend tool results to evidence and re-run executors for a corrected answer
-            evidence_blocks = [ChatMessage(role="system", content="Tool results:\n" + json.dumps(tool_results, indent=2))]
-            exec_messages = evidence_blocks + messages
-            qwen_payload = build_ollama_payload(messages=exec_messages, model=QWEN_MODEL_ID, num_ctx=DEFAULT_NUM_CTX, temperature=body.temperature or DEFAULT_TEMPERATURE)
-            gptoss_payload = build_ollama_payload(messages=exec_messages, model=GPTOSS_MODEL_ID, num_ctx=DEFAULT_NUM_CTX, temperature=body.temperature or DEFAULT_TEMPERATURE)
-            qwen_result = await call_ollama(QWEN_BASE_URL, qwen_payload)
-            gptoss_result = await call_ollama(GPTOSS_BASE_URL, gptoss_payload)
-            qwen_text = qwen_result.get("response", "")
-            gptoss_text = gptoss_result.get("response", "")
-        except Exception as ex:
-            # If tool execution fails, include the error but proceed
-            tool_results = tool_results or [{"name": "make_movie", "error": str(ex)}]
+                evidence_blocks = [ChatMessage(role="system", content="Tool results:\n" + json.dumps(tool_results, indent=2))]
+                exec_messages2 = evidence_blocks + messages
+                qwen_payload2 = build_ollama_payload(messages=exec_messages2, model=QWEN_MODEL_ID, num_ctx=DEFAULT_NUM_CTX, temperature=body.temperature or DEFAULT_TEMPERATURE)
+                gptoss_payload2 = build_ollama_payload(messages=exec_messages2, model=GPTOSS_MODEL_ID, num_ctx=DEFAULT_NUM_CTX, temperature=body.temperature or DEFAULT_TEMPERATURE)
+                qwen_res2 = await call_ollama(QWEN_BASE_URL, qwen_payload2)
+                gptoss_res2 = await call_ollama(GPTOSS_BASE_URL, gptoss_payload2)
+                qwen_text = qwen_res2.get("response", qwen_text)
+                gptoss_text = gptoss_res2.get("response", gptoss_text)
+            except Exception as ex:
+                tool_results = tool_results or [{"name": best_name or "unknown", "error": str(ex)}]
 
     # If response still looks like a refusal, synthesize a constructive message using tool_results
     final_refusal = any(tok in (qwen_text.lower() + "\n" + gptoss_text.lower()) for tok in refusal_markers)
@@ -1503,9 +1575,7 @@ async def chat_completions(body: ChatRequest, request: Request):
             + ("\n" + summary if summary else "")
             + "\nUse film_status to track progress, and jobs endpoints for live status."
         )
-        # Append guidance instead of replacing core content so user still sees the full answer
-        qwen_text = (qwen_text or "").strip() + ("\n\n" + affirmative)
-        gptoss_text = (gptoss_text or "").strip() + ("\n\n" + affirmative)
+        # Do not modify model texts here; the final composer will only append status
 
     # 4) Optional brief debate (cross-critique)
     if ENABLE_DEBATE and MAX_DEBATE_TURNS > 0:
@@ -1677,11 +1747,8 @@ async def chat_completions(body: ChatRequest, request: Request):
             "Initiated tool-based generation flow." + summary + "\n"
             "Use `film_status` to track progress and `/api/jobs` for live status."
         )
-        # If content is empty, use only the status; else append to preserve full answer and appendix
-        if looks_empty:
-            display_content = status_block.lstrip()
-        else:
-            display_content = (display_content or "") + status_block
+        # Only append status if there is already content; if empty, fall back to status only
+        display_content = ((display_content or "") + status_block) if not looks_empty else status_block.lstrip()
     response = {
         "id": "orc-1",
         "object": "chat.completion",
