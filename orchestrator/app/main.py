@@ -946,7 +946,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             exists = await conn.fetchval("SELECT 1 FROM films WHERE id=$1", film_id)
             if not exists:
                 return {"name": name, "error": "film not found"}
-            await conn.execute("INSERT INTO characters (id, film_id, name, description, references) VALUES ($1, $2, $3, $4, $5)", char_id, film_id, args.get("name") or "Unnamed", args.get("description") or "", json.dumps(refs))
+            await conn.execute("INSERT INTO characters (id, film_id, name, description, \"references\") VALUES ($1, $2, $3, $4, $5)", char_id, film_id, args.get("name") or "Unnamed", args.get("description") or "", json.dumps(refs))
         return {"name": name, "result": {"character_id": char_id}}
     if name == "film_add_scene":
         film_id = args.get("film_id")
@@ -2167,7 +2167,7 @@ async def add_character(film_id: str, body: Dict[str, Any]):
     description = (body or {}).get("description") or ""
     references = (body or {}).get("references") or {}
     async with pool.acquire() as conn:
-        await conn.execute("INSERT INTO characters (id, film_id, name, description, references) VALUES ($1, $2, $3, $4, $5)", char_id, film_id, name, description, json.dumps(references))
+            await conn.execute("INSERT INTO characters (id, film_id, name, description, \"references\") VALUES ($1, $2, $3, $4, $5)", char_id, film_id, name, description, json.dumps(references))
     return {"id": char_id, "name": name}
 
 

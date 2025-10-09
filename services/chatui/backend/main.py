@@ -789,7 +789,7 @@ async def chat_ws(websocket: WebSocket):
                 atts = await conn.fetch("SELECT name, url, mime FROM attachments WHERE conversation_id=$1", cid)
             oa_msgs = _build_openai_messages([{"role": "user", "content": user_content}], [dict(a) for a in atts])
             payload = {"messages": oa_msgs, "stream": False}
-            # Call orchestrator and relay normalized JSON
+            # Call orchestrator and relay normalized JSON (OpenAI-compatible envelope + simple message)
             try:
                 async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
                     rr = await client.post(ORCH_URL.rstrip("/") + "/v1/chat/completions", json=payload)
@@ -800,7 +800,7 @@ async def chat_ws(websocket: WebSocket):
                 else:
                     # Wrap raw
                     obj = {"text": rr.text}
-                assistant_text = ((obj.get("choices") or [{}])[0].get("message") or {}).get("content")
+                assistant_text = ((obj.get("choices") or [{}])[0].get("message") or {}).get("content") or obj.get("text") or ""
                 if assistant_text:
                     async with _pool().acquire() as c2:
                         await c2.execute(
@@ -808,9 +808,30 @@ async def chat_ws(websocket: WebSocket):
                             cid,
                             json.dumps({"text": assistant_text}),
                         )
-                await websocket.send_text(json.dumps({"ok": True, "data": obj}))
+                # Build OpenAI-compatible response envelope and a simple normalized message
+                completion = {
+                    "id": "ws-orc-1",
+                    "object": "chat.completion",
+                    "model": "orchestrator",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "finish_reason": "stop",
+                            "message": {"role": "assistant", "content": assistant_text},
+                        }
+                    ],
+                }
+                payload_out = {
+                    "ok": True,
+                    "data": completion,
+                    "message": {"role": "assistant", "content": {"text": assistant_text}},
+                }
+                await websocket.send_text(json.dumps(payload_out))
             except Exception as ex:
-                await websocket.send_text(json.dumps({"error": str(ex)}))
+                await websocket.send_text(json.dumps({
+                    "error": str(ex),
+                    "message": {"role": "assistant", "content": {"text": f"Error: {str(ex)}"}},
+                }))
     except WebSocketDisconnect:
         # Client disconnected; end session
         return

@@ -74,7 +74,7 @@ function App() {
       ws.onopen = () => {
         console.log('[ui] ws open')
         showThinking()
-        ws.send(JSON.stringify({ conversation_id: conversationId, content: text }))
+        ws.send(JSON.stringify({ conversation_id: conversationId, content: userText }))
       }
       ws.onmessage = (ev) => {
         const t1 = performance.now()
@@ -89,9 +89,15 @@ function App() {
           setSending(false)
           return
         }
-        const content = ((data.data && data.data.choices && data.data.choices[0] && data.data.choices[0].message) || {}).content || data.text || data.error || raw
-        // Replace thinking bubble with final assistant content
-        setMsgs(prev => (prev.map(m => m.id === thinkingId ? { ...m, content: { text: content } } : m)))
+        // Prefer normalized message payload if provided
+        if (data.message && data.message.role === 'assistant') {
+          const msgContent = (data.message.content && data.message.content.text) || ''
+          setMsgs(prev => (prev.map(m => m.id === thinkingId ? { ...m, content: { text: msgContent } } : m)))
+        } else {
+          const content = ((data.data && data.data.choices && data.data.choices[0] && data.data.choices[0].message) || {}).content || data.text || data.error || raw
+          // Replace thinking bubble with final assistant content
+          setMsgs(prev => (prev.map(m => m.id === thinkingId ? { ...m, content: { text: content } } : m)))
+        }
         ws.close()
         setSending(false)
       }
