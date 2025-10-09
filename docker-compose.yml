@@ -167,6 +167,9 @@ services:
       dockerfile: Dockerfile
     container_name: comfyui
     restart: unless-stopped
+    depends_on:
+      comfyui_init:
+        condition: service_completed_successfully
     expose:
       - "8188"
     volumes:
@@ -178,9 +181,7 @@ services:
       context: ./services/comfyui_init
       dockerfile: Dockerfile
     container_name: comfyui_init
-    depends_on:
-      comfyui:
-        condition: service_started
+    # One-shot init: populate shared model/custom_nodes volumes before comfyui starts
     environment:
       - HUGGINGFACE_TOKEN=${HUGGINGFACE_TOKEN:-}
     volumes:
