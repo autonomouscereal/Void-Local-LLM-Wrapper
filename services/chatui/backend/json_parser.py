@@ -138,10 +138,21 @@ class JSONParser:
     def parse(self, json_string, expected_structure):
         logger.debug("Starting JSON parsing process")
         logger.debug(f"Original JSON string: {json_string}")
-        json_string = self.strip_markdown(json_string)
-        json_string = self.attempt_repair(json_string)
+        # 1) Strip markdown fences only (non-destructive)
+        stripped = self.strip_markdown(json_string)
 
-        # Attempt multiple parsing methods
+        # 2) Prefer a clean parse BEFORE any "repair" steps to avoid corrupting valid JSON
+        try:
+            pristine = self.method_json_loads(stripped)
+            # Ensure expected structure and return early
+            return self.ensure_structure(pristine, expected_structure)
+        except Exception:
+            pass
+
+        # 3) Only now apply repair steps on a working copy
+        json_string = self.attempt_repair(stripped)
+
+        # 4) Attempt multiple parsing methods on the repaired string
         methods = [
             self.method_json_loads,
             self.method_replace_quotes,
