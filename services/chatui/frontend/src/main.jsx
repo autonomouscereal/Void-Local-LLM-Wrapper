@@ -9,7 +9,7 @@ function App() {
   const [text, setText] = useState('')
   const fileRef = useRef()
   const [jobs, setJobs] = useState([])
-  const [showJobs, setShowJobs] = useState(false)
+  const [showJobs, setShowJobs] = useState(true)
   const [sending, setSending] = useState(false)
   const localIdRef = useRef(1)
   const knownDoneJobsRef = useRef(new Set())
@@ -17,6 +17,57 @@ function App() {
     const n = localIdRef.current
     localIdRef.current = n + 1
     return n
+  }
+
+  const extractMedia = (text) => {
+    const urls = []
+    const re = /(https?:\/\/\S+)/g
+    let m
+    while ((m = re.exec(text)) !== null) {
+      urls.push(m[1])
+    }
+    const uniq = Array.from(new Set(urls))
+    const toMeta = (u) => {
+      try {
+        const o = new URL(u)
+        const parts = o.pathname.split('/')
+        const name = parts[parts.length - 1] || o.hostname
+        return { url: u, name, host: o.hostname }
+      } catch {
+        return { url: u, name: u, host: '' }
+      }
+    }
+    const images = uniq.filter(u => /\.(png|jpg|jpeg|gif|webp)$/i.test(u)).map(toMeta)
+    const videos = uniq.filter(u => /\.(mp4|webm|mov|mkv)$/i.test(u)).map(toMeta)
+    return { images, videos }
+  }
+
+  const renderChatContent = (text) => {
+    const html = marked.parse(String(text || ''))
+    const { images, videos } = extractMedia(text || '')
+    return (
+      <div>
+        <div dangerouslySetInnerHTML={{ __html: html }} />
+        {(images.length > 0 || videos.length > 0) && (
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 12, marginTop: 12 }}>
+            {images.map((m, i) => (
+              <div key={`img-${i}`} style={{ background: '#0b0b0f', border: '1px solid #222', borderRadius: 8, padding: 8 }}>
+                <a href={m.url} target='_blank' rel='noreferrer'>
+                  <img src={m.url} alt='' style={{ width: '100%', borderRadius: 6, display: 'block' }} />
+                </a>
+                <div style={{ fontSize: 12, color: '#9ca3af', marginTop: 6, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{m.name}</div>
+              </div>
+            ))}
+            {videos.map((m, i) => (
+              <div key={`vid-${i}`} style={{ background: '#0b0b0f', border: '1px solid #222', borderRadius: 8, padding: 8 }}>
+                <video src={m.url} controls style={{ width: '100%', borderRadius: 6, display: 'block' }} />
+                <div style={{ fontSize: 12, color: '#9ca3af', marginTop: 6, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{m.name}</div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    )
   }
   // Frontend request policy (history + rationale):
   // - Previous versions sometimes posted twice (to two endpoints) or used polling fallbacks. That led to
@@ -161,34 +212,54 @@ function App() {
     // Jobs polling disabled by default; re-enable if needed
   }, [])
 
-  // Optional: auto-refresh jobs and surface completions into chat
+  // Auto-refresh jobs and surface completions with any discovered asset URLs into chat (enabled by default)
   useEffect(() => {
     let timer
+    const extractUrls = (obj) => {
+      const urls = []
+      const walk = (v) => {
+        if (!v) return
+        if (typeof v === 'string') {
+          if (/https?:\/\/\S+\.(mp4|mov|mkv|webm|png|jpg|jpeg|gif)/i.test(v)) urls.push(v)
+        } else if (Array.isArray(v)) {
+          v.forEach(walk)
+        } else if (typeof v === 'object') {
+          Object.values(v).forEach(walk)
+        }
+      }
+      walk(obj)
+      return Array.from(new Set(urls))
+    }
     const tick = async () => {
       try {
         const r = await fetch('/api/jobs')
         const j = await r.json()
         const list = Array.isArray(j) ? j : (j.data || [])
         setJobs(list)
-        // Append minimal completion notices to chat for newly finished jobs
         for (const job of list) {
           const jid = job.id || job.job_id
-          const status = job.status || ''
-          if (jid && status.toLowerCase() === 'done' && !knownDoneJobsRef.current.has(jid)) {
+          const status = (job.status || '').toLowerCase()
+          if (jid && status === 'done' && !knownDoneJobsRef.current.has(jid)) {
             knownDoneJobsRef.current.add(jid)
-            setMsgs(prev => ([...prev, { id: nextLocalId(), role: 'assistant', content: { text: `Job ${jid} finished.` } }]))
+            // Try to fetch job detail for URLs
+            let detailText = ''
+            try {
+              const dr = await fetch(`/api/jobs/${encodeURIComponent(jid)}`)
+              const dj = await dr.json()
+              const urls = extractUrls(dj)
+              if (urls.length) {
+                detailText = `\nAssets:\n` + urls.map(u => `- ${u}`).join('\n')
+              }
+            } catch (_) {}
+            setMsgs(prev => ([...prev, { id: nextLocalId(), role: 'assistant', content: { text: `Job ${jid} finished.${detailText}` } }]))
           }
         }
-      } catch (_) {
-        // ignore transient errors
-      }
+      } catch (_) {}
     }
-    if (showJobs) {
-      tick()
-      timer = setInterval(tick, 4000)
-    }
+    tick()
+    timer = setInterval(tick, 4000)
     return () => { if (timer) clearInterval(timer) }
-  }, [showJobs])
+  }, [])
 
   return (
     <div style={{ display: 'flex', height: '100vh', fontFamily: 'Inter, system-ui, Arial', background: '#0b0b0f', color: '#e6e6e6' }}>
@@ -223,7 +294,9 @@ function App() {
           {(msgs || []).map(m => (
             <div key={m.id} style={{ marginBottom: 16 }}>
               <div style={{ fontSize: 12, color: '#9ca3af' }}>{m.role}</div>
-              <div className="chat-bubble" style={{ padding: 12, background: m.role === 'assistant' ? '#111827' : '#0f172a', borderRadius: 8 }} dangerouslySetInnerHTML={{ __html: marked.parse((m.content?.text || '')) }} />
+              <div className="chat-bubble" style={{ padding: 12, background: m.role === 'assistant' ? '#111827' : '#0f172a', borderRadius: 8 }}>
+                {renderChatContent(m.content?.text || '')}
+              </div>
             </div>
           ))}
         </div>

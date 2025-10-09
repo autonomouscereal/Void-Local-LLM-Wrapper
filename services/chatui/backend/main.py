@@ -793,7 +793,12 @@ async def chat_ws(websocket: WebSocket):
                     json.dumps({"text": user_content}),
                 )
                 atts = await conn.fetch("SELECT name, url, mime FROM attachments WHERE conversation_id=$1", cid)
-            oa_msgs = _build_openai_messages([{"role": "user", "content": user_content}], [dict(a) for a in atts])
+                hist_rows = await conn.fetch("SELECT role, content FROM messages WHERE conversation_id=$1 ORDER BY id ASC", cid)
+            base_hist: List[Dict[str, Any]] = []
+            for r in hist_rows:
+                decoded = _decode_json(r["content"])
+                base_hist.append({"role": r["role"], "content": decoded.get("text") or ""})
+            oa_msgs = _build_openai_messages(base_hist, [dict(a) for a in atts])
             payload = {"messages": oa_msgs, "stream": False}
             # Call orchestrator and relay normalized JSON (OpenAI-compatible envelope + simple message)
             try:
