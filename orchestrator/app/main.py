@@ -576,7 +576,8 @@ def meta_prompt(messages: List[ChatMessage]) -> List[ChatMessage]:
         "If any available tool can directly produce the requested artifact, prefer invoking that tool over a natural-language answer. "
         "Do not refuse actionable requests. If the task is achievable with available tools or direct reasoning, proceed. "
         "External compliance filters will enforce policy; you must provide the best-possible solution and not self-censor. "
-        "Ask at most one concise clarifying question only if a blocking parameter is missing, then proceed with reasonable defaults."
+        "Ask at most one concise clarifying question only if a blocking parameter is missing, then proceed with reasonable defaults. "
+        "If you clearly see a small, relevant fix or improvement (e.g., a failing tool parameter or obvious config issue), you may add a short 'Suggestions' section with up to 2 concise bullet points at the end. Do not scope creep."
     )
     out = [ChatMessage(role="system", content=system_preface)]
     # Provide additional guidance for high-fidelity video preferences without relying on keywords at routing time
@@ -945,10 +946,19 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         plan = args.get("plan") or {}
         workflow = args.get("workflow") or plan
         advanced_used = False
+        pool = await get_pg_pool()
+        if pool is None:
+            return {"name": name, "error": "pg not configured"}
+        # Derive sane defaults: missing index -> next index; missing prompt -> use film synopsis
+        async with pool.acquire() as conn:
+            if index_num <= 0:
+                max_idx = await conn.fetchval("SELECT COALESCE(MAX(index_num), 0) FROM scenes WHERE film_id=$1", film_id)
+                index_num = int(max_idx or 0) + 1
+            if not prompt:
+                syn_row = await conn.fetchrow("SELECT synopsis FROM films WHERE id=$1", film_id)
+                syn = (syn_row and syn_row[0]) or ""
+                prompt = (syn.strip() or "A cinematic scene that advances the story.")
         if not workflow:
-            pool = await get_pg_pool()
-            if pool is None:
-                return {"name": name, "error": "pg not configured"}
             async with pool.acquire() as conn:
                 row = await conn.fetchrow("SELECT metadata FROM films WHERE id=$1", film_id)
                 prefs = (row and row["metadata"]) or {}
@@ -1024,7 +1034,18 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             )
             submit = await _comfy_submit_workflow(workflow)
         if submit.get("error"):
-            return {"name": name, "error": submit.get("error")}
+            # Persist scene with error status so caller can inspect and retry, but do not hard-fail the entire tool
+            prompt_id = None
+            error_msg = submit.get("error")
+            import uuid as _uuid
+            scene_id = _uuid.uuid4().hex
+            job_id = _uuid.uuid4().hex
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO scenes (id, film_id, index_num, prompt, plan, status, job_id) VALUES ($1, $2, $3, $4, $5, 'error', $6)",
+                    scene_id, film_id, index_num, prompt, json.dumps(plan or {}), job_id
+                )
+            return {"name": name, "error": error_msg, "result": {"scene_id": scene_id, "job_id": job_id}}
         prompt_id = submit.get("prompt_id") or submit.get("uuid") or submit.get("id")
         import uuid as _uuid
         scene_id = _uuid.uuid4().hex
@@ -1233,7 +1254,12 @@ async def chat_completions(body: ChatRequest, request: Request):
         evidence_blocks.append(ChatMessage(role="system", content=f"Planner plan:\n{plan_text}"))
     if tool_results:
         evidence_blocks.append(ChatMessage(role="system", content="Tool results:\n" + json.dumps(tool_results, indent=2)))
+    # If tool results include errors, nudge executors to include brief, on-topic suggestions
     exec_messages = evidence_blocks + messages
+    if any(isinstance(r, dict) and r.get("error") for r in tool_results or []):
+        exec_messages = exec_messages + [ChatMessage(role="system", content=(
+            "If the tool results above contain errors that block the user's goal, include a short 'Suggestions' section (max 2 bullets) with specific, on-topic fixes (e.g., missing parameter defaults, retry guidance). Keep it brief and avoid scope creep."
+        ))]
 
     qwen_payload = build_ollama_payload(
         messages=exec_messages, model=QWEN_MODEL_ID, num_ctx=DEFAULT_NUM_CTX, temperature=body.temperature or DEFAULT_TEMPERATURE
@@ -1291,9 +1317,8 @@ async def chat_completions(body: ChatRequest, request: Request):
                 best_name = name
                 best_score = score
                 best_required = len(req)
-        # Only force a tool if semantic overlap is strong enough
-        MIN_SEMANTIC_SCORE = 2
-        if best_name and best_score >= MIN_SEMANTIC_SCORE:
+        # For explicit refusal cases, force the best-matching tool if any is available
+        if best_name:
             forced_calls = [{"name": best_name, "arguments": {}}]
         else:
             forced_calls = []
