@@ -774,19 +774,96 @@ async def planner_produce_plan(messages: List[ChatMessage], tools: Optional[List
 
 async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
     name = call.get("name")
-    args = call.get("arguments") or {}
-    # Normalize tool arguments using the custom parser; accept strings or dicts
-    if isinstance(args, str):
+    raw_args = call.get("arguments") or {}
+    # Normalize tool arguments using the custom parser and strong coercion
+    def _normalize_tool_args(a: Any) -> Dict[str, Any]:
         parser = JSONParser()
-        expected = {"title": str, "synopsis": str}
-        parsed = parser.parse(args, expected)
-        # If parsed looks empty, treat the raw string as synopsis
-        if not any(v for v in parsed.values()):
-            args = {"synopsis": args}
+        if isinstance(a, dict):
+            out = dict(a)
+        elif isinstance(a, str):
+            expected = {
+                "film_id": str,
+                "title": str,
+                "synopsis": str,
+                "prompt": str,
+                "characters": [ {"name": str, "description": str} ],
+                "scenes": [ {"index_num": int, "prompt": str} ],
+                "index_num": int,
+                "duration_seconds": float,
+                "duration": float,
+                "resolution": str,
+                "fps": float,
+                "frame_rate": float,
+                "style": str,
+                "language": str,
+                "voice": str,
+                "audio_enabled": str,
+                "audio_on": str,
+                "subtitles_enabled": str,
+                "subtitles_on": str,
+                "metadata": dict,
+                "references": dict,
+                "reference_data": dict,
+            }
+            parsed = parser.parse(a, expected)
+            # If nothing meaningful parsed, treat as synopsis/prompt
+            if not any(str(parsed.get(k) or "").strip() for k in ("title","synopsis","prompt")):
+                out = {"synopsis": a}
+            else:
+                out = parsed
         else:
-            args = parsed
-    if not isinstance(args, dict):
-        args = {}
+            out = {}
+        # Synonyms → canonical
+        if out.get("duration_seconds") is None and out.get("duration") is not None:
+            out["duration_seconds"] = out.get("duration")
+        if out.get("fps") is None and out.get("frame_rate") is not None:
+            out["fps"] = out.get("frame_rate")
+        if out.get("reference_data") is None and out.get("references") is not None:
+            out["reference_data"] = out.get("references")
+        # Coerce types
+        def _to_float(v):
+            try:
+                return float(v)
+            except Exception:
+                return None
+        def _to_int(v):
+            try:
+                return int(v)
+            except Exception:
+                return None
+        if out.get("fps") is not None:
+            f = _to_float(out.get("fps"))
+            if f is not None:
+                out["fps"] = f
+        if out.get("duration_seconds") is not None:
+            d = _to_float(out.get("duration_seconds"))
+            if d is not None:
+                out["duration_seconds"] = d
+        if out.get("index_num") is not None:
+            i = _to_int(out.get("index_num"))
+            if i is not None:
+                out["index_num"] = i
+        # Booleans that might arrive as strings
+        for key, syn in (("audio_enabled","audio_on"),("subtitles_enabled","subtitles_on")):
+            val = out.get(key)
+            if val is None:
+                val = out.get(syn)
+            if isinstance(val, str):
+                low = val.strip().lower()
+                if low in ("true","1","yes","on"): val = True
+                elif low in ("false","0","no","off"): val = False
+                else: val = None
+            if isinstance(val, (bool,)):
+                out[key] = bool(val)
+        # Normalize resolution synonyms
+        res = out.get("resolution")
+        if isinstance(res, str):
+            r = res.lower()
+            if r in ("4k","3840x2160","3840×2160"): out["resolution"] = "3840x2160"
+            elif r in ("8k","7680x4320","7680×4320"): out["resolution"] = "7680x4320"
+        return out
+
+    args = _normalize_tool_args(raw_args)
     if name == "web_search" and ENABLE_WEBSEARCH and SERPAPI_API_KEY and ALLOW_TOOL_EXECUTION:
         query = args.get("query") or ""
         if not query:
@@ -1542,20 +1619,38 @@ async def chat_completions(body: ChatRequest, request: Request):
                                 if isinstance(p2, str):
                                     prompt_ids.append(p2)
             if film_id:
-                tool_summary_lines.append(f"film_id: {film_id}")
-            if errors:
-                tool_summary_lines.append("errors: " + "; ".join(errors)[:800])
+                tool_summary_lines.append(f"- **film_id**: `{film_id}`")
             if job_ids:
-                # dedupe and truncate for brevity
                 juniq = list(dict.fromkeys([j for j in job_ids if j]))
-                tool_summary_lines.append("jobs: " + ", ".join(juniq[:20]))
+                if juniq:
+                    tool_summary_lines.append("- **jobs**: " + ", ".join([f"`{j}`" for j in juniq[:20]]))
             if prompt_ids:
                 puniq = list(dict.fromkeys([p for p in prompt_ids if p]))
-                tool_summary_lines.append("prompts: " + ", ".join(puniq[:20]))
+                if puniq:
+                    tool_summary_lines.append("- **prompts**: " + ", ".join([f"`{p}`" for p in puniq[:20]]))
+            if errors:
+                tool_summary_lines.append("- **errors**: " + "; ".join(errors)[:800])
         except Exception:
             pass
-    footer = ("\n\nTool Results:\n" + "\n".join(tool_summary_lines)) if tool_summary_lines else ""
+    footer = ("\n\n### Tool Results\n" + "\n".join(tool_summary_lines)) if tool_summary_lines else ""
     display_content = f"{cleaned}{footer}"
+    # Provide an appendix with raw model answers to avoid any perception of truncation
+    try:
+        raw_q = (qwen_text or "").strip()
+        raw_g = (gptoss_text or "").strip()
+        appendix_parts: List[str] = []
+        def _shorten(s: str, max_len: int = 12000) -> str:
+            return s if len(s) <= max_len else (s[:max_len] + "\n... [truncated]")
+        if raw_q or raw_g:
+            appendix_parts.append("\n\n### Appendix — Model Answers")
+        if raw_q:
+            appendix_parts.append("\n\n#### Qwen\n" + _shorten(raw_q))
+        if raw_g:
+            appendix_parts.append("\n\n#### GPT‑OSS\n" + _shorten(raw_g))
+        if appendix_parts:
+            display_content += "".join(appendix_parts)
+    except Exception:
+        pass
     text_lower = (display_content or "").lower()
     refusal_markers = ("can't", "cannot", "unable", "not feasible", "can't create", "cannot create", "won’t be able", "won't be able")
     looks_empty = (not str(display_content or "").strip())
