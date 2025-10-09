@@ -26,7 +26,7 @@ import time
 from urllib.parse import parse_qs
 
 import httpx
-from fastapi import FastAPI, UploadFile, File, Form, Request, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, Form, Request, BackgroundTasks, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, HTMLResponse, StreamingResponse, Response
 from fastapi.staticfiles import StaticFiles
 import asyncpg
@@ -754,6 +754,66 @@ async def get_job(job_id: str):
 @app.get("/healthz")
 async def healthz():
     return {"status": "ok"}
+
+
+@app.websocket("/api/ws")
+async def chat_ws(websocket: WebSocket):
+    # WebSocket chat channel: client sends { conversation_id, content } and receives normalized JSON result
+    await websocket.accept()
+    parser = JSONParser()
+    try:
+        while True:
+            raw = await websocket.receive_text()
+            # Normalize client payload
+            expected_request = {
+                "conversation_id": int,
+                "content": str,
+                "messages": [ {"role": str, "content": str} ],
+            }
+            try:
+                body = parser.parse(raw, expected_request)
+            except Exception:
+                body = {"conversation_id": 0, "content": raw, "messages": []}
+            cid = int((body or {}).get("conversation_id") or 0)
+            user_content = (body or {}).get("content") or ""
+            if not cid:
+                await websocket.send_text(json.dumps({"error": "missing conversation_id"}))
+                continue
+            # Persist user message and fetch attachments
+            async with _pool().acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO messages (conversation_id, role, content) VALUES ($1, 'user', $2::jsonb)",
+                    cid,
+                    json.dumps({"text": user_content}),
+                )
+                atts = await conn.fetch("SELECT name, url, mime FROM attachments WHERE conversation_id=$1", cid)
+            oa_msgs = _build_openai_messages([{"role": "user", "content": user_content}], [dict(a) for a in atts])
+            payload = {"messages": oa_msgs, "stream": False}
+            # Call orchestrator and relay normalized JSON
+            try:
+                async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
+                    rr = await client.post(ORCH_URL.rstrip("/") + "/v1/chat/completions", json=payload)
+                ct = rr.headers.get("content-type") or "application/json"
+                if ct.startswith("application/json"):
+                    expected_response = {"choices": [{"message": {"content": str}}]}
+                    obj = parser.parse(rr.text, expected_response)
+                else:
+                    # Wrap raw
+                    obj = {"text": rr.text}
+                assistant_text = ((obj.get("choices") or [{}])[0].get("message") or {}).get("content")
+                if assistant_text:
+                    async with _pool().acquire() as c2:
+                        await c2.execute(
+                            "INSERT INTO messages (conversation_id, role, content) VALUES ($1, 'assistant', $2::jsonb)",
+                            cid,
+                            json.dumps({"text": assistant_text}),
+                        )
+                await websocket.send_text(json.dumps({"ok": True, "data": obj}))
+            except Exception as ex:
+                await websocket.send_text(json.dumps({"error": str(ex)}))
+    except WebSocketDisconnect:
+        # Client disconnected; end session
+        return
 
 
 app.mount("/", StaticFiles(directory="/app/frontend_dist", html=True), name="static")

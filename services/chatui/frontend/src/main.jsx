@@ -58,43 +58,40 @@ function App() {
     }
     setSending(true)
     try {
-      // Single awaited POST to the proxy. No retries/polling here.
+      // Persistent WebSocket: send chat message and await the server push
       const t0 = performance.now()
-      console.log('[ui] chat POST start', { conversationId })
-      const xhr = new XMLHttpRequest()
-      xhr.open('POST', `/api/conversations/${conversationId}/chat`, true)
-      xhr.responseType = 'text'
-      xhr.setRequestHeader('Content-Type', 'application/json')
-      xhr.setRequestHeader('Accept', 'application/json, text/plain;q=0.9, */*;q=0.8')
-      xhr.onload = () => {
+      console.log('[ui] ws connect')
+      const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/api/ws')
+      ws.onopen = () => {
+        console.log('[ui] ws open')
+        ws.send(JSON.stringify({ conversation_id: conversationId, content: text }))
+      }
+      ws.onmessage = (ev) => {
         const t1 = performance.now()
-        const status = xhr.status
-        const raw = xhr.responseText || ''
-        const ct = xhr.getResponseHeader('Content-Type') || ''
-        console.log('[ui] chat XHR done', { status, ct, dt_ms: (t1 - t0).toFixed(1), bytes: raw.length })
+        const raw = ev.data || ''
+        console.log('[ui] ws message', { bytes: raw.length, dt_ms: (t1 - t0).toFixed(1) })
         let data
-        if ((ct || '').includes('application/json')) {
-          try { data = raw ? JSON.parse(raw) : {} } catch { data = { error: raw } }
-        } else {
-          data = raw && raw.trim().length > 0 ? { text: raw } : { error: raw }
-        }
-        if (!(status >= 200 && status < 300)) {
-          const errText = (raw || '').slice(0, 500) || `chat proxy error (${status})`
-          setMsgs(prev => ([...prev, { id: Date.now(), role: 'assistant', content: { text: `Error: ${errText}` } }]))
+        try { data = raw ? JSON.parse(raw) : {} } catch { data = { error: raw } }
+        if (data && data.error) {
+          setMsgs(prev => ([...prev, { id: Date.now(), role: 'assistant', content: { text: `Error: ${data.error}` } }]))
+          ws.close()
           setSending(false)
           return
         }
-        const content = ((data.choices && data.choices[0] && data.choices[0].message) || {}).content || data.text || data.error || raw
+        const content = ((data.data && data.data.choices && data.data.choices[0] && data.data.choices[0].message) || {}).content || data.text || data.error || raw
         setMsgs(prev => ([...prev, { id: Date.now(), role: 'assistant', content: { text: content } }]))
         setText('')
+        ws.close()
         setSending(false)
       }
-      xhr.onerror = () => {
-        console.error('[ui] chat XHR network error')
+      ws.onerror = () => {
+        console.error('[ui] ws error')
         setMsgs(prev => ([...prev, { id: Date.now(), role: 'assistant', content: { text: 'Error: Network error' } }]))
         setSending(false)
       }
-      xhr.send(JSON.stringify({ conversation_id: conversationId, content: text }))
+      ws.onclose = () => {
+        console.log('[ui] ws closed')
+      }
       return
     } catch (err) {
       // Catch network-level errors so they don’t manifest as unhandled promise rejections.
