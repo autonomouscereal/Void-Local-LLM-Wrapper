@@ -49,7 +49,7 @@ function App() {
       // Single fetch to neutral path; wait for full response
       let resp
       try {
-        resp = await fetch('/api/call', {
+        resp = await fetch(`/api/conversations/${conversationId}/chat`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
           body: JSON.stringify({ conversation_id: conversationId, content: text })

@@ -331,17 +331,8 @@ async def chat(cid: int, request: Request, background_tasks: BackgroundTasks):
             logging.exception("persist assistant failed cid=%s", conv_id)
     background_tasks.add_task(_persist_assistant_message, cid, content)
     # Return explicit body with content-length to avoid client transport quirks
-    body = json.dumps(data)
-    headers = {
-        "Cache-Control": "no-store",
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Private-Network": "true",
-        "Access-Control-Expose-Headers": "*",
-        "Connection": "close",
-        "Content-Length": str(len(body.encode("utf-8"))),
-    }
     logging.info("/api/conversations/%s/chat: done", cid)
-    return Response(content=body, media_type="application/json", headers=headers)
+    return JSONResponse(status_code=200, content=data)
 
 
 @app.options("/api/conversations/{cid}/chat")
@@ -401,17 +392,8 @@ async def chat_alt(body: Dict[str, Any], background_tasks: BackgroundTasks):
         except Exception:
             logging.exception("persist assistant failed cid=%s", conv_id)
     background_tasks.add_task(_persist_assistant_message, cid, assistant)
-    body = json.dumps(data)
-    headers = {
-        "Cache-Control": "no-store",
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Private-Network": "true",
-        "Access-Control-Expose-Headers": "*",
-        "Connection": "close",
-        "Content-Length": str(len(body.encode("utf-8"))),
-    }
     logging.info("/api/chat: done cid=%s", cid)
-    return Response(content=body, media_type="application/json", headers=headers)
+    return JSONResponse(status_code=200, content=data)
 
 
 # Neutral path versions (avoid filters on "chat")
