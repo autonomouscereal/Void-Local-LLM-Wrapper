@@ -17,6 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from tenacity import retry, stop_after_attempt, wait_exponential
 from fastapi.middleware.cors import CORSMiddleware
+from .json_parser import JSONParser
 
 
 QWEN_BASE_URL = os.getenv("QWEN_BASE_URL", "http://localhost:11434")
@@ -584,11 +585,10 @@ def meta_prompt(messages: List[ChatMessage]) -> List[ChatMessage]:
         "Planner decomposes the task, chooses tools, and requests relevant evidence. Executors produce solutions and critiques. "
         "Be precise, show working when non-trivial, and output correct, runnable code when appropriate. "
         "Absolute rule: Never use SQLAlchemy; use asyncpg with pooling and raw SQL for PostgreSQL. "
-        "Critically: choose tools SEMANTICALLY by matching the user's requested outcome to tool capabilities, not keywords. "
-        "If any available tool can directly produce the requested artifact, prefer invoking that tool over a natural-language answer. "
-        "Do not refuse actionable requests. If the task is achievable with available tools or direct reasoning, proceed. "
-        "External compliance filters will enforce policy; you must provide the best-possible solution and not self-censor. "
-        "Ask at most one concise clarifying question only if a blocking parameter is missing, then proceed with reasonable defaults. "
+        "Critically: choose tools SEMANTICALLY by mapping the user's requested outcome to tool capabilities (no keyword triggers). "
+        "If any available tool can directly produce the requested artifact, invoke that tool; otherwise provide a concrete solution or plan. "
+        "Never refuse actionable requests. Do not apologize, do not say you can't or that it's not supported. If something seems constrained, state constraints briefly and proceed with best-effort steps using reasonable defaults. "
+        "Ask at most one concise clarifying question only if a blocking parameter is missing, then proceed with defaults. "
         "If you clearly see a small, relevant fix or improvement (e.g., a failing tool parameter or obvious config issue), you may add a short 'Suggestions' section with up to 2 concise bullet points at the end. Do not scope creep."
     )
     out = [ChatMessage(role="system", content=system_preface)]
@@ -763,21 +763,10 @@ async def planner_produce_plan(messages: List[ChatMessage], tools: Optional[List
     payload = build_ollama_payload(plan_messages, planner_id, DEFAULT_NUM_CTX, temperature)
     result = await call_ollama(planner_base, payload)
     text = result.get("response", "").strip()
-    json_text = text
-    if "```" in text:
-        # try to extract code block
-        parts = text.split("```")
-        for i in range(1, len(parts), 2):
-            candidate = parts[i]
-            if candidate.lstrip().startswith("{"):
-                json_text = candidate
-                break
-    plan = ""
-    tool_calls: List[Dict[str, Any]] = []
-    try:
-        parsed = robust_json_loads(json_text)
-    except Exception:
-        return text, []
+    # Use custom parser to normalise the planner JSON
+    parser = JSONParser()
+    expected = {"plan": str, "tool_calls": [ {"name": str, "arguments": dict} ]}
+    parsed = parser.parse(text, expected)
     plan = parsed.get("plan", "")
     tool_calls = parsed.get("tool_calls", []) or []
     return plan, tool_calls
@@ -786,12 +775,16 @@ async def planner_produce_plan(messages: List[ChatMessage], tools: Optional[List
 async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
     name = call.get("name")
     args = call.get("arguments") or {}
-    # Normalize tool arguments: allow JSON string or other shapes; coerce to dict
+    # Normalize tool arguments using the custom parser; accept strings or dicts
     if isinstance(args, str):
-        try:
-            args = robust_json_loads(args)
-        except Exception:
+        parser = JSONParser()
+        expected = {"title": str, "synopsis": str}
+        parsed = parser.parse(args, expected)
+        # If parsed looks empty, treat the raw string as synopsis
+        if not any(v for v in parsed.values()):
             args = {"synopsis": args}
+        else:
+            args = parsed
     if not isinstance(args, dict):
         args = {}
     if name == "web_search" and ENABLE_WEBSEARCH and SERPAPI_API_KEY and ALLOW_TOOL_EXECUTION:
@@ -1174,19 +1167,9 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 payload = build_ollama_payload([ChatMessage(role="user", content=guidance)], QWEN_MODEL_ID, DEFAULT_NUM_CTX, DEFAULT_TEMPERATURE)
                 llm_res = await call_ollama(QWEN_BASE_URL, payload)
                 plan_text = (llm_res.get("response") or "").strip()
-                # Extract JSON block if fenced
-                json_text = plan_text
-                if "```" in plan_text:
-                    parts = plan_text.split("```")
-                    for i in range(1, len(parts), 2):
-                        cand = parts[i].strip()
-                        if cand.lstrip().startswith("{"):
-                            json_text = cand
-                            break
-                try:
-                    plan_obj = json.loads(json_text)
-                except Exception:
-                    plan_obj = {}
+                parser = JSONParser()
+                expected = {"characters": [ {"name": str, "description": str} ], "scenes": [ {"index_num": int, "prompt": str} ]}
+                plan_obj = parser.parse(plan_text, expected)
                 if (not characters) and isinstance(plan_obj.get("characters"), list):
                     characters = plan_obj.get("characters")
                 if (not scenes) and isinstance(plan_obj.get("scenes"), list):
@@ -1397,8 +1380,9 @@ async def chat_completions(body: ChatRequest, request: Request):
                 best_name = name
                 best_score = score
                 best_required = len(req)
-        # For explicit refusal cases, force the best-matching tool if any is available
-        if best_name:
+        # For explicit refusal cases, only force when semantic overlap is strong enough
+        MIN_SEMANTIC_SCORE = 3
+        if best_name and best_score >= MIN_SEMANTIC_SCORE:
             forced_calls = [{"name": best_name, "arguments": {}}]
         else:
             forced_calls = []
@@ -1523,12 +1507,52 @@ async def chat_completions(body: ChatRequest, request: Request):
             meta_sections.append("Tool Results:\n" + json.dumps(tool_results, indent=2))
         except Exception:
             pass
-    if ENABLE_DEBATE and MAX_DEBATE_TURNS > 0:
-        # Previous critique messages were appended to exec_messages; we don't re-summarize them here to avoid bloat
-        meta_sections.append("Cross-critique: enabled")
-    # Append a plain-text footer instead of HTML comments so it always renders
-    footer = ("\n\n" + "\n\n".join(meta_sections)) if meta_sections else ""
+    # Instead of verbose plan/critique footers, append a minimal Tool Results summary (IDs/errors) only
+    tool_summary_lines: List[str] = []
+    if tool_results:
+        try:
+            film_id = None
+            errors: List[str] = []
+            for tr in (tool_results or []):
+                if isinstance(tr, dict):
+                    if not film_id:
+                        film_id = ((tr.get("result") or {}).get("film_id"))
+                    if tr.get("error"):
+                        errors.append(str(tr.get("error")))
+            if film_id:
+                tool_summary_lines.append(f"film_id: {film_id}")
+            if errors:
+                tool_summary_lines.append("errors: " + "; ".join(errors)[:800])
+        except Exception:
+            pass
+    footer = ("\n\nTool Results:\n" + "\n".join(tool_summary_lines)) if tool_summary_lines else ""
     display_content = f"{cleaned}{footer}"
+    text_lower = (display_content or "").lower()
+    refusal_markers = ("can't", "cannot", "unable", "not feasible", "can't create", "cannot create", "won’t be able", "won't be able")
+    looks_empty = (not str(display_content or "").strip())
+    looks_refusal = any(tok in text_lower for tok in refusal_markers)
+    if looks_empty or looks_refusal:
+        # Build a constructive status from tool_results
+        film_id = None
+        errors = []
+        if isinstance(tool_results, list):
+            for tr in tool_results:
+                if isinstance(tr, dict):
+                    if not film_id:
+                        film_id = ((tr.get("result") or {}).get("film_id"))
+                    if tr.get("error"):
+                        errors.append(str(tr.get("error")))
+        summary_lines = []
+        if film_id:
+            summary_lines.append(f"Film ID: {film_id}")
+        if errors:
+            summary_lines.append("Errors: " + "; ".join(errors)[:800])
+        summary = "\n" + "\n".join(summary_lines) if summary_lines else ""
+        display_content = (
+            "Initiated tool-based generation flow. "
+            + summary
+            + "\nUse film_status to track progress and /api/jobs for live status."
+        )
     response = {
         "id": "orc-1",
         "object": "chat.completion",
@@ -1618,7 +1642,7 @@ async def get_film_characters(film_id: str) -> List[Dict[str, Any]]:
     if pool is None:
         return []
     async with pool.acquire() as conn:
-        rows = await conn.fetch("SELECT id, name, description, references FROM characters WHERE film_id=$1", film_id)
+        rows = await conn.fetch("SELECT id, name, description, reference_data FROM characters WHERE film_id=$1", film_id)
     return [dict(r) for r in rows]
 
 
@@ -2003,9 +2027,9 @@ async def _update_scene_from_job(job_id: str, detail: Dict[str, Any], failed: bo
                     ch_ids = pl.get("character_ids") if isinstance(pl.get("character_ids"), list) else []
                     if len(ch_ids) == 1:
                         async with pool.acquire() as conn:
-                            crow = await conn.fetchrow("SELECT references FROM characters WHERE id=$1", ch_ids[0])
-                            if crow and isinstance(crow.get("references"), dict):
-                                v2 = crow["references"].get("voice")
+                            crow = await conn.fetchrow("SELECT reference_data FROM characters WHERE id=$1", ch_ids[0])
+                            if crow and isinstance(crow.get("reference_data"), dict):
+                                v2 = crow["reference_data"].get("voice")
                                 if v2:
                                     voice = v2
                 if not voice:
@@ -2219,7 +2243,7 @@ async def get_characters(film_id: str):
     if pool is None:
         return JSONResponse(status_code=500, content={"error": "pg not configured"})
     async with pool.acquire() as conn:
-        rows = await conn.fetch("SELECT id, name, description, references FROM characters WHERE film_id=$1", film_id)
+        rows = await conn.fetch("SELECT id, name, description, reference_data FROM characters WHERE film_id=$1", film_id)
     return {"data": [dict(r) for r in rows]}
 
 
@@ -2275,15 +2299,15 @@ async def update_character(character_id: str, body: Dict[str, Any]):
         return JSONResponse(status_code=500, content={"error": "pg not configured"})
     updates = body or {}
     async with pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT id, film_id, name, description, references FROM characters WHERE id=$1", character_id)
+        row = await conn.fetchrow("SELECT id, film_id, name, description, reference_data FROM characters WHERE id=$1", character_id)
         if not row:
             return JSONResponse(status_code=404, content={"error": "not found"})
         new_name = updates.get("name", row["name"])
         new_desc = updates.get("description", row["description"])
         refs = updates.get("references")
         if refs is None:
-            refs = row["references"]
-        await conn.execute("UPDATE characters SET name=$1, description=$2, references=$3, updated_at=NOW() WHERE id=$4", new_name, new_desc, json.dumps(refs), character_id)
+            refs = row["reference_data"]
+        await conn.execute("UPDATE characters SET name=$1, description=$2, reference_data=$3, updated_at=NOW() WHERE id=$4", new_name, new_desc, json.dumps(refs), character_id)
     return {"ok": True}
 
 
