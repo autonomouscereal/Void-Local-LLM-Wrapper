@@ -89,15 +89,19 @@ function App() {
           setSending(false)
           return
         }
-        // Prefer normalized message payload if provided
-        if (data.message && data.message.role === 'assistant') {
-          const msgContent = (data.message.content && data.message.content.text) || ''
-          setMsgs(prev => (prev.map(m => m.id === thinkingId ? { ...m, content: { text: msgContent } } : m)))
-        } else {
-          const content = ((data.data && data.data.choices && data.data.choices[0] && data.data.choices[0].message) || {}).content || data.text || data.error || raw
-          // Replace thinking bubble with final assistant content
-          setMsgs(prev => (prev.map(m => m.id === thinkingId ? { ...m, content: { text: content } } : m)))
+        // Prefer normalized message payload if provided; fallback to OpenAI-style choices
+        let finalContent = ''
+        if (data && data.message && data.message.role === 'assistant') {
+          const mc = data.message.content
+          if (typeof mc === 'string') finalContent = mc
+          else if (mc && typeof mc.text === 'string') finalContent = mc.text
         }
+        if (!finalContent) {
+          const msgObj = (data && data.data && data.data.choices && data.data.choices[0] && data.data.choices[0].message) || {}
+          finalContent = msgObj.content || data.text || data.error || raw
+        }
+        // Replace thinking bubble with final assistant content (never leave it empty)
+        setMsgs(prev => (prev.map(m => m.id === thinkingId ? { ...m, content: { text: String(finalContent || '').trim() } } : m)))
         ws.close()
         setSending(false)
       }
