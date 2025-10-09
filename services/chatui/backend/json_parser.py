@@ -226,6 +226,7 @@ class JSONParser:
 
         # ------------------------------------------------------------------
         # Case 2 – mapping/dict-based expected structure (original behaviour)
+        # Extended to support list/dict schemas as expected_type values.
         # ------------------------------------------------------------------
         if not isinstance(current_best, dict):
             current_best = {}
@@ -234,12 +235,32 @@ class JSONParser:
             for key, expected_type in expected_structure.items():
                 new_val = new_result.get(key)
 
-                # Accept immediately if the new value is of the right type.
-                if isinstance(new_val, expected_type):
-                    current_best[key] = new_val
-                elif key not in current_best:
-                    # Fallback – keep at least a default value.
-                    current_best[key] = self.default_value(expected_type)
+                # If the expected schema at this key is itself a list schema, normalise accordingly
+                if isinstance(expected_type, list):
+                    if isinstance(new_val, list):
+                        current_best[key] = self.ensure_structure(new_val, expected_type)
+                    else:
+                        current_best[key] = []
+                    continue
+
+                # If the expected schema is a dict schema, ensure nested structure
+                if isinstance(expected_type, dict):
+                    if isinstance(new_val, dict):
+                        current_best[key] = self.ensure_structure(new_val, expected_type)
+                    else:
+                        current_best[key] = {}
+                    continue
+
+                # Otherwise expected_type should be an actual Python type (e.g., str, int, float)
+                try:
+                    if isinstance(new_val, expected_type):
+                        current_best[key] = new_val
+                    elif key not in current_best:
+                        current_best[key] = self.default_value(expected_type)
+                except TypeError:
+                    # Guard against non-type expected_type; fall back to defaults
+                    if key not in current_best:
+                        current_best[key] = self.default_value(dict if isinstance(expected_type, dict) else list if isinstance(expected_type, list) else str)
 
         return current_best
 
