@@ -13,6 +13,7 @@ function App() {
   const [sending, setSending] = useState(false)
   const localIdRef = useRef(1)
   const knownDoneJobsRef = useRef(new Set())
+  const jobsTimerRef = useRef(null)
   const nextLocalId = () => {
     const n = localIdRef.current
     localIdRef.current = n + 1
@@ -45,9 +46,16 @@ function App() {
   const renderChatContent = (text) => {
     const html = marked.parse(String(text || ''))
     const { images, videos } = extractMedia(text || '')
+    const hasText = String(text || '').trim().length > 0
     return (
       <div>
-        <div dangerouslySetInnerHTML={{ __html: html }} />
+        {hasText ? (
+          <div dangerouslySetInnerHTML={{ __html: html }} />
+        ) : (
+          (images.length === 0 && videos.length === 0) ? (
+            <div style={{ fontSize: 12, color: '#9ca3af', fontStyle: 'italic' }}>(no content)</div>
+          ) : null
+        )}
         {(images.length > 0 || videos.length > 0) && (
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 12, marginTop: 12 }}>
             {images.map((m, i) => (
@@ -214,7 +222,6 @@ function App() {
 
   // Auto-refresh jobs and surface completions with any discovered asset URLs into chat (enabled by default)
   useEffect(() => {
-    let timer
     const extractUrls = (obj) => {
       const urls = []
       const walk = (v) => {
@@ -256,9 +263,14 @@ function App() {
         }
       } catch (_) {}
     }
+    // Prevent duplicate intervals (e.g., React StrictMode dev double-mount)
+    if (jobsTimerRef.current) {
+      clearInterval(jobsTimerRef.current)
+      jobsTimerRef.current = null
+    }
     tick()
-    timer = setInterval(tick, 4000)
-    return () => { if (timer) clearInterval(timer) }
+    jobsTimerRef.current = setInterval(tick, 5000)
+    return () => { if (jobsTimerRef.current) { clearInterval(jobsTimerRef.current); jobsTimerRef.current = null } }
   }, [])
 
   return (
