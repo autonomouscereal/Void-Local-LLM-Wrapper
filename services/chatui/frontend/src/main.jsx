@@ -14,6 +14,7 @@ function App() {
   const localIdRef = useRef(1)
   const knownDoneJobsRef = useRef(new Set())
   const jobsTimerRef = useRef(null)
+  const progressStreamsRef = useRef({})
   const nextLocalId = () => {
     const n = localIdRef.current
     localIdRef.current = n + 1
@@ -82,6 +83,72 @@ function App() {
         )}
       </div>
     )
+  }
+
+  // ---- Live Job Progress (SSE) ----
+  const parseJobIdsFromText = (txt) => {
+    const ids = new Set()
+    if (!txt) return []
+    // 1) Look for a "jobs:" line with backticked IDs
+    const jobLineMatch = txt.match(/\bjobs:\s*([^\n]+)/i)
+    if (jobLineMatch) {
+      const line = jobLineMatch[1]
+      const backticked = Array.from(line.matchAll(/`([^`]+)`/g)).map(m => m[1])
+      backticked.forEach(x => ids.add(x.trim()))
+    }
+    // 2) Generic job id patterns (UUID-like or hex strings)
+    const generic = Array.from(txt.matchAll(/\bjob[_\s-]*id\b[:\s]*([a-z0-9-]{8,})/ig)).map(m => m[1])
+    generic.forEach(x => ids.add(x.trim()))
+    return Array.from(ids)
+  }
+
+  const startJobStream = (jobId) => {
+    if (!jobId || progressStreamsRef.current[jobId]) return
+    // Create a placeholder assistant bubble with indeterminate progress
+    const placeholderId = nextLocalId()
+    setMsgs(prev => ([...prev, { id: placeholderId, role: 'assistant', content: { text: `Job ${jobId} queued…` } }]))
+    try {
+      const src = new EventSource(`/api/jobs/${encodeURIComponent(jobId)}/stream?interval_ms=1000`)
+      progressStreamsRef.current[jobId] = { src, msgId: placeholderId }
+      src.onmessage = (ev) => {
+        if (!ev?.data) return
+        if (ev.data === '[DONE]') {
+          try { src.close() } catch {}
+          delete progressStreamsRef.current[jobId]
+          knownDoneJobsRef.current.add(jobId)
+          return
+        }
+        let snapshot = {}
+        try { snapshot = JSON.parse(ev.data) } catch { /* ignore */ }
+        const status = (snapshot.status || '').toLowerCase()
+        const assets = snapshot.result || {}
+        let detailText = ''
+        // Try to extract asset URLs from result
+        const urls = []
+        const walk = (v) => {
+          if (!v) return
+          if (typeof v === 'string') {
+            if (/https?:\/\/\S+\.(mp4|mov|mkv|webm|png|jpg|jpeg|gif)/i.test(v)) urls.push(v)
+          } else if (Array.isArray(v)) {
+            v.forEach(walk)
+          } else if (typeof v === 'object') {
+            Object.values(v).forEach(walk)
+          }
+        }
+        walk(assets)
+        if (urls.length) {
+          detailText = `\nAssets:\n` + Array.from(new Set(urls)).map(u => `- ${u}`).join('\n')
+        }
+        const label = status || 'running'
+        setMsgs(prev => prev.map(m => m.id === placeholderId ? { ...m, content: { text: `Job ${jobId} ${label}.${detailText}` } } : m))
+      }
+      src.onerror = () => {
+        try { src.close() } catch {}
+        delete progressStreamsRef.current[jobId]
+      }
+    } catch {
+      // ignore stream failures; polling fallback still exists
+    }
   }
   // Frontend request policy (history + rationale):
   // - Previous versions sometimes posted twice (to two endpoints) or used polling fallbacks. That led to
@@ -174,7 +241,11 @@ function App() {
           finalContent = msgObj.content || data.text || data.error || raw
         }
         // Replace thinking bubble with final assistant content (never leave it empty)
-        setMsgs(prev => (prev.map(m => m.id === thinkingId ? { ...m, content: { text: String(finalContent || '').trim() } } : m)))
+        const finalText = String(finalContent || '').trim()
+        setMsgs(prev => (prev.map(m => m.id === thinkingId ? { ...m, content: { text: finalText } } : m)))
+        // Scan for job IDs and start live progress streams
+        const jobIds = parseJobIdsFromText(finalText)
+        jobIds.forEach(startJobStream)
         ws.close()
         setSending(false)
       }
@@ -252,7 +323,9 @@ function App() {
         for (const job of list) {
           const jid = job.id || job.job_id
           const status = (job.status || '').toLowerCase()
-          if (jid && status === 'done' && !knownDoneJobsRef.current.has(jid)) {
+          // Consider orchestrator statuses; treat succeeded/failed as terminal (done)
+          const isDone = status === 'done' || status === 'succeeded' || status === 'failed'
+          if (jid && isDone && !knownDoneJobsRef.current.has(jid)) {
             knownDoneJobsRef.current.add(jid)
             // Try to fetch job detail for URLs
             let detailText = ''
@@ -264,7 +337,8 @@ function App() {
                 detailText = `\nAssets:\n` + urls.map(u => `- ${u}`).join('\n')
               }
             } catch (_) {}
-            setMsgs(prev => ([...prev, { id: nextLocalId(), role: 'assistant', content: { text: `Job ${jid} finished.${detailText}` } }]))
+            const statusLabel = status === 'failed' ? 'failed' : 'finished'
+            setMsgs(prev => ([...prev, { id: nextLocalId(), role: 'assistant', content: { text: `Job ${jid} ${statusLabel}.${detailText}` } }]))
           }
         }
       } catch (_) {}
