@@ -164,7 +164,7 @@ async def upload(conversation_id: int = Form(...), file: UploadFile = File(...))
     try:
         # Read file and send to orchestrator's upload endpoint
         content = await file.read()
-        async with httpx.AsyncClient(timeout=120) as client:
+        async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
             files = {"file": (file.filename, content, file.content_type)}
             r = await client.post(ORCH_URL.rstrip("/") + "/upload", files=files)
             r.raise_for_status()
@@ -270,8 +270,9 @@ async def chat(cid: int, request: Request, background_tasks: BackgroundTasks):
 
     async def _proxy_stream():
         try:
-            async with httpx.AsyncClient(timeout=None) as client:
+            async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
                 url = ORCH_URL.rstrip("/") + "/v1/chat/completions"
+                logging.info("proxy -> orchestrator POST %s", url)
                 async with client.stream("POST", url, json=payload) as r:
                     ct = r.headers.get("content-type", "")
                     if stream and ct.startswith("text/event-stream"):
@@ -297,8 +298,10 @@ async def chat(cid: int, request: Request, background_tasks: BackgroundTasks):
 
     # Non-stream: forward and persist assistant message
     try:
-        async with httpx.AsyncClient(timeout=None) as client:
-            rr = await client.post(ORCH_URL.rstrip("/") + "/v1/chat/completions", json=payload)
+        async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
+            url = ORCH_URL.rstrip("/") + "/v1/chat/completions"
+            logging.info("proxy -> orchestrator POST %s", url)
+            rr = await client.post(url, json=payload)
             if rr.status_code >= 400:
                 content_type = rr.headers.get("content-type", "")
                 if content_type.startswith("application/json"):
@@ -376,8 +379,10 @@ async def chat_alt(body: Dict[str, Any], background_tasks: BackgroundTasks):
         atts = await conn.fetch("SELECT name, url, mime FROM attachments WHERE conversation_id=$1", cid)
     oa_msgs = _build_openai_messages([{"role": "user", "content": user_content}], [dict(a) for a in atts])
     payload = {"messages": oa_msgs, "stream": False}
-    async with httpx.AsyncClient(timeout=None) as client:
-        rr = await client.post(ORCH_URL.rstrip("/") + "/v1/chat/completions", json=payload)
+    async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
+        url = ORCH_URL.rstrip("/") + "/v1/chat/completions"
+        logging.info("proxy -> orchestrator POST %s", url)
+        rr = await client.post(url, json=payload)
         try:
             data = rr.json()
         except Exception:
@@ -430,8 +435,10 @@ async def call_conv(cid: int, request: Request, background_tasks: BackgroundTask
         atts = await conn.fetch("SELECT name, url, mime FROM attachments WHERE conversation_id=$1", cid)
     oa_msgs = _build_openai_messages([{"role": "user", "content": user_content}], [dict(a) for a in atts])
     payload = {"messages": oa_msgs, "stream": False}
-    async with httpx.AsyncClient(timeout=None) as client:
-        rr = await client.post(ORCH_URL.rstrip("/") + "/v1/chat/completions", json=payload)
+    async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
+        url = ORCH_URL.rstrip("/") + "/v1/chat/completions"
+        logging.info("proxy -> orchestrator POST %s", url)
+        rr = await client.post(url, json=payload)
         try:
             data = rr.json()
         except Exception:
@@ -474,7 +481,7 @@ async def call_alt(body: Dict[str, Any], background_tasks: BackgroundTasks):
         atts = await conn.fetch("SELECT name, url, mime FROM attachments WHERE conversation_id=$1", cid)
     oa_msgs = _build_openai_messages([{"role": "user", "content": user_content}], [dict(a) for a in atts])
     payload = {"messages": oa_msgs, "stream": False}
-    async with httpx.AsyncClient(timeout=None) as client:
+    async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
         rr = await client.post(ORCH_URL.rstrip("/") + "/v1/chat/completions", json=payload)
     # best-effort assistant persistence without affecting response
     def _persist_from_response(conv_id: int, status_code: int, content_type: str, text_body: str) -> None:
@@ -530,7 +537,7 @@ async def passthrough(body: Dict[str, Any]):
     user_content = (body or {}).get("content") or ""
     payload = {"messages": [{"role": "user", "content": user_content}], "stream": False}
     try:
-        async with httpx.AsyncClient(timeout=120) as client:
+        async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
             rr = await client.post(ORCH_URL.rstrip("/") + "/v1/chat/completions", json=payload)
     except Exception as ex:
         logging.exception("/api/passthrough proxy error")
@@ -562,14 +569,14 @@ async def chat_alt_preflight():
 async def orch_diag():
     out: Dict[str, Any] = {}
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
             h = await client.get(ORCH_URL.rstrip("/") + "/healthz")
             out["healthz_status"] = h.status_code
             out["healthz_body"] = (h.json() if "application/json" in (h.headers.get("content-type") or "") else h.text)
     except Exception as ex:
         out["healthz_error"] = str(ex)
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
             d = await client.get(ORCH_URL.rstrip("/") + "/debug")
             out["debug_status"] = d.status_code
             out["debug_body"] = (d.json() if "application/json" in (d.headers.get("content-type") or "") else d.text)
@@ -592,7 +599,7 @@ async def chat_get(cid: int, content: str = ""):
         atts = await conn.fetch("SELECT name, url, mime FROM attachments WHERE conversation_id=$1", cid)
     oa_msgs = _build_openai_messages([{"role": "user", "content": user_content}], [dict(a) for a in atts])
     payload = {"messages": oa_msgs, "stream": False}
-    async with httpx.AsyncClient(timeout=None) as client:
+    async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
         rr = await client.post(ORCH_URL.rstrip("/") + "/v1/chat/completions", json=payload)
         data = rr.json()
     assistant = ((data.get("choices") or [{}])[0].get("message") or {}).get("content")
@@ -614,7 +621,7 @@ async def list_jobs(status: Optional[str] = None, limit: int = 50, offset: int =
     if status:
         params["status"] = status
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
             r = await client.get(ORCH_URL.rstrip("/") + "/jobs", params=params)
             if r.status_code >= 400:
                 return JSONResponse(status_code=r.status_code, content={"error": r.text})
@@ -626,7 +633,7 @@ async def list_jobs(status: Optional[str] = None, limit: int = 50, offset: int =
 @app.get("/api/jobs/{job_id}")
 async def get_job(job_id: str):
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
             r = await client.get(ORCH_URL.rstrip("/") + f"/jobs/{job_id}")
             if r.status_code >= 400:
                 return JSONResponse(status_code=r.status_code, content={"error": r.text})
