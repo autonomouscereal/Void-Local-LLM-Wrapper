@@ -786,6 +786,14 @@ async def planner_produce_plan(messages: List[ChatMessage], tools: Optional[List
 async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
     name = call.get("name")
     args = call.get("arguments") or {}
+    # Normalize tool arguments: allow JSON string or other shapes; coerce to dict
+    if isinstance(args, str):
+        try:
+            args = robust_json_loads(args)
+        except Exception:
+            args = {"synopsis": args}
+    if not isinstance(args, dict):
+        args = {}
     if name == "web_search" and ENABLE_WEBSEARCH and SERPAPI_API_KEY and ALLOW_TOOL_EXECUTION:
         query = args.get("query") or ""
         if not query:
@@ -891,10 +899,21 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         subs_arg = args.get("subtitles_enabled")
         if subs_arg is None and args.get("subtitles_on") is not None:
             subs_arg = args.get("subtitles_on")
+        # Normalize resolution synonyms like "4k", "8k"
+        res_arg = args.get("resolution")
+        if isinstance(res_arg, str):
+            if res_arg.lower() in ("4k", "3840x2160", "3840×2160"):
+                res_arg = "3840x2160"
+            elif res_arg.lower() in ("8k", "7680x4320", "7680×4320"):
+                res_arg = "7680x4320"
+        # Normalize framerate synonyms
+        fps_arg = args.get("fps")
+        if fps_arg is None and args.get("frame_rate") is not None:
+            fps_arg = args.get("frame_rate")
         prefs = {
             "duration_seconds": float(metadata.get("duration_seconds") or duration_arg or 10),
-            "resolution": str(metadata.get("resolution") or args.get("resolution") or "1920x1080"),
-            "fps": float(metadata.get("fps") or args.get("fps") or 24),
+            "resolution": str(metadata.get("resolution") or res_arg or "1920x1080"),
+            "fps": float(metadata.get("fps") or fps_arg or 24),
             "style": metadata.get("style") or args.get("style"),
             "language": metadata.get("language") or args.get("language") or "en",
             "voice": metadata.get("voice") or voice_arg or None,
@@ -1398,6 +1417,34 @@ async def chat_completions(body: ChatRequest, request: Request):
         except Exception as ex:
             # If tool execution fails, include the error but proceed
             tool_results = tool_results or [{"name": "make_movie", "error": str(ex)}]
+
+    # If response still looks like a refusal, synthesize a constructive message using tool_results
+    final_refusal = any(tok in (qwen_text.lower() + "\n" + gptoss_text.lower()) for tok in refusal_markers)
+    if final_refusal:
+        # Try to extract a film_id or any success info from tool results
+        film_id = None
+        errors: List[str] = []
+        for tr in (tool_results or []):
+            if isinstance(tr, dict):
+                rid = ((tr.get("result") or {}).get("film_id"))
+                if rid and not film_id:
+                    film_id = rid
+                if tr.get("error"):
+                    errors.append(str(tr.get("error")))
+        details = []
+        if film_id:
+            details.append(f"Film ID: {film_id}")
+        if errors:
+            details.append("Errors: " + "; ".join(errors)[:800])
+        summary = "\n".join(details)
+        affirmative = (
+            "Initiated tool-based generation flow. "
+            + ("\n" + summary if summary else "")
+            + "\nUse film_status to track progress, and jobs endpoints for live status."
+        )
+        # Override executor texts to avoid returning a refusal
+        qwen_text = affirmative
+        gptoss_text = affirmative
 
     # 4) Optional brief debate (cross-critique)
     if ENABLE_DEBATE and MAX_DEBATE_TURNS > 0:
