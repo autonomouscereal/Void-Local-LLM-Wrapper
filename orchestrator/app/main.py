@@ -1,5 +1,18 @@
 from __future__ import annotations
 # WARNING: Do NOT add SQLAlchemy here. Use asyncpg with pooling and raw SQL only.
+#
+# Historical/rationale (orchestrator):
+# - Planner/Executors (Qwen + GPT-OSS) are coordinated with explicit system guidance to avoid refusals.
+# - Tools are selected SEMANTICALLY (not keywords). On refusal, we may force a single best-match tool
+#   with minimal arguments, but we never overwrite model output; we only append a short Status.
+# - JSON parsing uses a hardened JSONParser with expected structures to survive malformed LLM JSON.
+# - All DB access is via asyncpg; JSONB writes use json.dumps and ::jsonb to avoid type issues.
+# - RAG (pgvector) initializes extension + indexes at startup and uses a simple cache.
+# - OpenAI-compatible /v1/chat/completions returns full Markdown: main answer first, then "### Tool Results"
+#   (film_id, job_id(s), errors), then an "### Appendix — Model Answers" with raw Qwen/GPT-OSS responses (trimmed).
+# - We never replace the main content with status; instead we append a Status block only when empty/refusal.
+# - Long-running film pipeline: film_create → film_add_scene (ComfyUI jobs via /jobs) → film_compile (n8n or local assembler).
+# - Keep LLM models warm: we set options.keep_alive=24h on every Ollama call to avoid reloading between requests.
 
 import os
 import asyncio

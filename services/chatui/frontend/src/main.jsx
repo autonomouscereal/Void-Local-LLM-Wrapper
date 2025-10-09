@@ -2,6 +2,14 @@ import React, { useEffect, useState, useRef } from 'react'
 import { createRoot } from 'react-dom/client'
 import { marked } from 'marked'
 
+// UI notes:
+// - Single-send semantics (exactly one request per Send) with a "Thinking…" placeholder.
+// - Assistant replies are rendered as Markdown; we embed images/videos and show (no content) if empty.
+// - Film/job progress: job_id(s) are parsed from assistant messages; we auto-subscribe to
+//   /api/jobs/{id}/stream (SSE) and update inline progress bubbles until succeeded/failed,
+//   then embed discovered asset URLs.
+// - We keep the full assistant response and only append status/IDs; nothing is overwritten.
+
 function App() {
   const [convos, setConvos] = useState([])
   const [cid, setCid] = useState(null)

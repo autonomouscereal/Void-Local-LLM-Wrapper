@@ -7,16 +7,17 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 ENV CUDA_VISIBLE_DEVICES="" \
     PYTORCH_FORCE_CPU=1
 
-RUN apt-get update && apt-get install -y git ffmpeg && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y git ffmpeg build-essential libgl1 && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /comfyui
 
 RUN git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git .
 
 RUN pip install --no-cache-dir -r requirements.txt
-# Ensure binary compatibility for OpenCV and custom nodes: pin NumPy < 2
-RUN pip install --no-cache-dir "numpy<2"
-RUN pip install --no-cache-dir opencv-python-headless==4.9.0.80 imageio-ffmpeg==0.4.9 diffusers==0.30.2 insightface==0.7.3 onnxruntime==1.19.2 Pillow==10.4.0
+# Pin CPU-safe wheels for Python 3.10 to avoid NumPy 2 breakage and source builds
+RUN pip install --no-cache-dir numpy==1.26.4
+RUN pip install --no-cache-dir opencv-python-headless==4.9.0.80 imageio-ffmpeg==0.4.9 pillow==10.4.0 onnxruntime==1.16.3
+RUN pip install --no-cache-dir scikit-image==0.22.0 scikit-learn==1.3.2 diffusers==0.30.2 insightface==0.7.3
 
 EXPOSE 8188
 
