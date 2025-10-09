@@ -470,7 +470,7 @@ async def call_alt(body: Dict[str, Any], background_tasks: BackgroundTasks):
     if not cid:
         return JSONResponse(status_code=400, content={"error": "missing conversation_id"})
     async with _pool().acquire() as conn:
-        await conn.execute("INSERT INTO messages (conversation_id, role, content) VALUES ($1, 'user', $2)", cid, {"text": user_content})
+        await conn.execute("INSERT INTO messages (conversation_id, role, content) VALUES ($1, 'user', $2::jsonb)", cid, json.dumps({"text": user_content}))
         atts = await conn.fetch("SELECT name, url, mime FROM attachments WHERE conversation_id=$1", cid)
     oa_msgs = _build_openai_messages([{"role": "user", "content": user_content}], [dict(a) for a in atts])
     payload = {"messages": oa_msgs, "stream": False}
@@ -490,7 +490,7 @@ async def call_alt(body: Dict[str, Any], background_tasks: BackgroundTasks):
     async def _persist_assistant_message(conv_id: int, text_value: str) -> None:
         try:
             async with _pool().acquire() as c2:
-                await c2.execute("INSERT INTO messages (conversation_id, role, content) VALUES ($1, 'assistant', $2)", conv_id, {"text": text_value})
+                await c2.execute("INSERT INTO messages (conversation_id, role, content) VALUES ($1, 'assistant', $2::jsonb)", conv_id, json.dumps({"text": text_value}))
         except Exception:
             logging.exception("persist assistant failed cid=%s", conv_id)
     background_tasks.add_task(_persist_assistant_message, cid, assistant)
