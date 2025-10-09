@@ -474,37 +474,38 @@ async def call_alt(body: Dict[str, Any], background_tasks: BackgroundTasks):
         atts = await conn.fetch("SELECT name, url, mime FROM attachments WHERE conversation_id=$1", cid)
     oa_msgs = _build_openai_messages([{"role": "user", "content": user_content}], [dict(a) for a in atts])
     payload = {"messages": oa_msgs, "stream": False}
-    parser = JSONParser()
     async with httpx.AsyncClient(timeout=None) as client:
         rr = await client.post(ORCH_URL.rstrip("/") + "/v1/chat/completions", json=payload)
-        try:
-            data = rr.json()
-        except Exception:
-            decoded = rr.text
-            try:
-                data = parser.method_json_loads(decoded)
-            except Exception:
-                repaired = parser.attempt_repair(decoded)
-                data = parser.method_json_loads(repaired)
-    assistant = ((data.get("choices") or [{}])[0].get("message") or {}).get("content")
-    async def _persist_assistant_message(conv_id: int, text_value: str) -> None:
-        try:
-            async with _pool().acquire() as c2:
-                await c2.execute("INSERT INTO messages (conversation_id, role, content) VALUES ($1, 'assistant', $2::jsonb)", conv_id, json.dumps({"text": text_value}))
-        except Exception:
-            logging.exception("persist assistant failed cid=%s", conv_id)
-    background_tasks.add_task(_persist_assistant_message, cid, assistant)
-    body = json.dumps(data)
+    # best-effort assistant persistence without affecting response
+    def _persist_from_response(conv_id: int, status_code: int, content_type: str, text_body: str) -> None:
+        if content_type.startswith("application/json") and status_code < 500 and (text_body.strip().startswith('{') or text_body.strip().startswith('[')):
+            parser = JSONParser()
+            obj = parser.method_json_loads(text_body)
+            assistant_text = ((obj.get("choices") or [{}])[0].get("message") or {}).get("content")
+            if assistant_text:
+                import asyncio
+                async def _save() -> None:
+                    async with _pool().acquire() as c2:
+                        await c2.execute(
+                            "INSERT INTO messages (conversation_id, role, content) VALUES ($1, 'assistant', $2::jsonb)",
+                            conv_id,
+                            json.dumps({"text": assistant_text}),
+                        )
+                asyncio.get_event_loop().create_task(_save())
+    ct = rr.headers.get("content-type") or "application/json"
+    content_bytes = rr.content
+    logging.info("/api/call: upstream status=%s ct=%s", rr.status_code, ct)
+    background_tasks.add_task(_persist_from_response, cid, rr.status_code, ct, rr.text)
     headers = {
         "Cache-Control": "no-store",
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Private-Network": "true",
         "Access-Control-Expose-Headers": "*",
         "Connection": "close",
-        "Content-Length": str(len(body.encode("utf-8"))),
+        "Content-Length": str(len(content_bytes)),
     }
     logging.info("/api/call: done cid=%s", cid)
-    return Response(content=body, media_type="application/json", headers=headers)
+    return Response(content=content_bytes, media_type=ct, status_code=rr.status_code, headers=headers)
 
 
 @app.post("/api/echo")
