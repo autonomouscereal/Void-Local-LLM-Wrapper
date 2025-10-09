@@ -220,7 +220,8 @@ async def upload(conversation_id: int = Form(...), file: UploadFile = File(...))
             files = {"file": (file.filename, content, file.content_type)}
             r = await client.post(ORCH_URL.rstrip("/") + "/upload", files=files)
             r.raise_for_status()
-            data = r.json()
+            # Avoid native json(); return raw upstream text
+            data = r.text
     except Exception as ex:
         return JSONResponse(status_code=500, content={"error": str(ex)})
     async with _pool().acquire() as conn:
@@ -258,7 +259,7 @@ async def chat(cid: int, request: Request, background_tasks: BackgroundTasks):
     logging.info("/api/conversations/%s/chat: start", cid)
     # Request body parsing:
     # - Accept JSON, raw text, or x-www-form-urlencoded
-    # - Use the custom JSONParser.parse as the single source of truth to normalize structures
+    # - Prefer framework JSON parsing when available; fallback to custom parser
     ct = (request.headers.get("content-type") or "").lower()
     body: Dict[str, Any] = {}
     parser = JSONParser()
@@ -327,19 +328,9 @@ async def chat(cid: int, request: Request, background_tasks: BackgroundTasks):
                             # pass through SSE chunks unchanged
                             yield chunk
                     else:
+                        # Non-SSE: forward raw bytes exactly to avoid browser/client quirks
                         body = await r.aread()
-                        # ensure JSON text by normalizing with the JSONParser
-                        decoded = body.decode("utf-8", errors="replace")
-                        expected_response = {
-                            "choices": [
-                                {"message": {"content": str}}
-                            ]
-                        }
-                        try:
-                            obj = parser.parse(decoded, expected_response)
-                            yield json.dumps(obj)
-                        except Exception:
-                            yield body
+                        yield body
         except Exception as ex:
             yield json.dumps({"error": str(ex)})
 
@@ -354,14 +345,22 @@ async def chat(cid: int, request: Request, background_tasks: BackgroundTasks):
     ct = rr.headers.get("content-type") or "application/octet-stream"
     status = rr.status_code
     if ct.startswith("application/json"):
-        parser_bg = JSONParser()
-        expected_response = {
-            "choices": [
-                {"message": {"content": str}}
-            ]
-        }
-        obj = parser_bg.parse(rr.text, expected_response)
-        assistant_text = ((obj.get("choices") or [{}])[0].get("message") or {}).get("content")
+        # Prefer native JSON for relay; use parser only for best-effort assistant extraction
+        data = None
+        # Always prefer our custom parser per project policy; do not use rr.json()
+        try:
+            expected_response = {"choices": [{"message": {"content": str}}]}
+            data = JSONParser().parse(rr.text, expected_response)
+        except Exception:
+            data = None
+        assistant_text = None
+        try:
+            parser_bg = JSONParser()
+            expected_response = {"choices": [{"message": {"content": str}}]}
+            obj = parser_bg.parse(rr.text, expected_response)
+            assistant_text = ((obj.get("choices") or [{}])[0].get("message") or {}).get("content")
+        except Exception:
+            assistant_text = None
         if assistant_text:
             t4 = time.perf_counter()
             async with _pool().acquire() as c2:
@@ -371,9 +370,8 @@ async def chat(cid: int, request: Request, background_tasks: BackgroundTasks):
                     json.dumps({"text": assistant_text}),
                 )
             logging.info("db:assistant_insert cid=%s ms=%.2f", cid, (time.perf_counter() - t4) * 1000)
-        # Normalize JSON output by re-serializing; then set explicit Content-Length and close connection
-        body_text = json.dumps(obj)
-        body_bytes = body_text.encode("utf-8")
+        # Relay upstream bytes as-is; avoid re-serializing to prevent parser-induced corruption
+        body_bytes = rr.content
         headers = {
             "Cache-Control": "no-store",
             "Access-Control-Allow-Origin": "*",
@@ -381,7 +379,7 @@ async def chat(cid: int, request: Request, background_tasks: BackgroundTasks):
             "Access-Control-Expose-Headers": "*",
             "Connection": "close",
             "Content-Length": str(len(body_bytes)),
-            "Content-Type": "application/json; charset=utf-8",
+            "Content-Type": ct if ct else "application/json; charset=utf-8",
         }
         logging.info("/api/conversations/%s/chat: done status=%s ct=%s t_orch_ms=%.2f t_total_ms=%.2f", cid, status, ct, (t3 - t2) * 1000, (time.perf_counter() - t0) * 1000)
         return Response(content=body_bytes, media_type="application/json", status_code=status, headers=headers)
@@ -466,7 +464,11 @@ async def call_conv(cid: int, request: Request, background_tasks: BackgroundTask
     logging.info("/api/conversations/%s/call: start", cid)
     parser = JSONParser()
     try:
-        payload_in = await request.json()
+        # Per policy use parser, not request.json()
+        raw_bytes = await request.body()
+        decoded = raw_bytes.decode("utf-8", errors="replace")
+        expected_request = {"content": str}
+        payload_in = parser.parse(decoded, expected_request)
     except Exception:
         raw_bytes = await request.body()
         decoded = raw_bytes.decode("utf-8", errors="replace")
@@ -556,7 +558,12 @@ async def call_alt(body: Dict[str, Any], background_tasks: BackgroundTasks):
     # Relay response; for JSON use framework JSONResponse (lets Starlette set headers)
     if ct.startswith("application/json"):
         logging.info("/api/call: done cid=%s json", cid)
-        return JSONResponse(status_code=rr.status_code, content=rr.json())
+        try:
+            expected_response = {"choices": [{"message": {"content": str}}]}
+            parsed = JSONParser().parse(rr.text, expected_response)
+            return JSONResponse(status_code=rr.status_code, content=parsed)
+        except Exception:
+            return Response(content=rr.content, media_type=ct, status_code=rr.status_code)
     logging.info("/api/call: done cid=%s raw", cid)
     return Response(content=rr.content, media_type=ct, status_code=rr.status_code)
 
@@ -618,14 +625,15 @@ async def orch_diag():
         async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
             h = await client.get(ORCH_URL.rstrip("/") + "/healthz")
             out["healthz_status"] = h.status_code
-            out["healthz_body"] = (h.json() if "application/json" in (h.headers.get("content-type") or "") else h.text)
+            # Diagnostics: return raw text to avoid parser coupling
+            out["healthz_body"] = h.text
     except Exception as ex:
         out["healthz_error"] = str(ex)
     try:
         async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
             d = await client.get(ORCH_URL.rstrip("/") + "/debug")
             out["debug_status"] = d.status_code
-            out["debug_body"] = (d.json() if "application/json" in (d.headers.get("content-type") or "") else d.text)
+            out["debug_body"] = d.text
     except Exception as ex:
         out["debug_error"] = str(ex)
     return out
@@ -676,7 +684,8 @@ async def list_jobs(status: Optional[str] = None, limit: int = 50, offset: int =
             r = await client.get(ORCH_URL.rstrip("/") + "/jobs", params=params)
             if r.status_code >= 400:
                 return JSONResponse(status_code=r.status_code, content={"error": r.text})
-            return r.json()
+            # Diagnostics: return raw text to avoid parser coupling
+            return r.text
     except Exception as ex:
         return JSONResponse(status_code=500, content={"error": str(ex)})
 
@@ -688,7 +697,7 @@ async def get_job(job_id: str):
             r = await client.get(ORCH_URL.rstrip("/") + f"/jobs/{job_id}")
             if r.status_code >= 400:
                 return JSONResponse(status_code=r.status_code, content={"error": r.text})
-            return r.json()
+            return r.text
     except Exception as ex:
         return JSONResponse(status_code=500, content={"error": str(ex)})
 
