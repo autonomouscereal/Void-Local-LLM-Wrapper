@@ -43,35 +43,25 @@ function App() {
       conversationId = await newConversation()
     }
     setSending(true)
-    try {
-      let raw = ''
-      let data
-      // Single fetch to neutral path; wait for full response
-      let resp
-      try {
-        resp = await fetch(`/api/conversations/${conversationId}/chat`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-          body: JSON.stringify({ conversation_id: conversationId, content: text })
-        })
-      } catch (e) {
-        const errText = String(e && e.message ? e.message : e || 'network error')
-        setMsgs(prev => ([...prev, { id: Date.now(), role: 'assistant', content: { text: `Error: ${errText}` } }]))
-        return
-      }
-      raw = await resp.text()
-      try { data = JSON.parse(raw) } catch { data = { error: raw || 'parse error' } }
-      if (!(resp.status >= 200 && resp.status < 300)) {
-        const errText = (raw || '').slice(0, 500) || `chat proxy error (${resp.status})`
-        setMsgs(prev => ([...prev, { id: Date.now(), role: 'assistant', content: { text: `Error: ${errText}` } }]))
-        return
-      }
-      const content = ((data.choices && data.choices[0] && data.choices[0].message) || {}).content || (data.error || raw)
-      setMsgs(prev => ([...prev, { id: Date.now(), role: 'assistant', content: { text: content } }]))
-      setText('')
-    } finally {
+    let raw = ''
+    let data
+    const resp = await fetch(`/api/conversations/${conversationId}/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      body: JSON.stringify({ conversation_id: conversationId, content: text })
+    })
+    raw = await resp.text()
+    data = raw && raw.trim().startsWith('{') ? JSON.parse(raw) : { error: raw }
+    if (!(resp.status >= 200 && resp.status < 300)) {
+      const errText = (raw || '').slice(0, 500) || `chat proxy error (${resp.status})`
+      setMsgs(prev => ([...prev, { id: Date.now(), role: 'assistant', content: { text: `Error: ${errText}` } }]))
       setSending(false)
+      return
     }
+    const content = ((data.choices && data.choices[0] && data.choices[0].message) || {}).content || (data.error || raw)
+    setMsgs(prev => ([...prev, { id: Date.now(), role: 'assistant', content: { text: content } }]))
+    setText('')
+    setSending(false)
   }
 
   async function uploadFile(e) {

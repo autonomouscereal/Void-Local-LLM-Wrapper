@@ -296,43 +296,28 @@ async def chat(cid: int, request: Request, background_tasks: BackgroundTasks):
         except Exception as ex:
             yield json.dumps({"error": str(ex)})
 
-    # Non-stream: forward and persist assistant message
-    try:
-        async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
-            url = ORCH_URL.rstrip("/") + "/v1/chat/completions"
-            logging.info("proxy -> orchestrator POST %s", url)
-            rr = await client.post(url, json=payload)
-            if rr.status_code >= 400:
-                content_type = rr.headers.get("content-type", "")
-                if content_type.startswith("application/json"):
-                    logging.warning("orchestrator error %s: %s", rr.status_code, rr.text[:500])
-                    return JSONResponse(status_code=rr.status_code, content=rr.json())
-                logging.warning("orchestrator error %s (non-json): %s", rr.status_code, rr.text[:500])
-                return JSONResponse(status_code=rr.status_code, content={"error": rr.text})
-            try:
-                data = rr.json()
-            except Exception:
-                parser = JSONParser()
-                decoded = rr.text
-                try:
-                    data = parser.method_json_loads(decoded)
-                except Exception:
-                    repaired = parser.attempt_repair(decoded)
-                    data = parser.method_json_loads(repaired)
-    except Exception as ex:
-        logging.exception("chat proxy failed: %s", ex)
-        return JSONResponse(status_code=502, content={"error": str(ex)})
-    content = ((data.get("choices") or [{}])[0].get("message") or {}).get("content")
-    async def _persist_assistant_message(conv_id: int, text_value: str) -> None:
-        try:
+    # Non-stream: forward request; persist assistant text if JSON; relay upstream bytes
+    async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
+        url = ORCH_URL.rstrip("/") + "/v1/chat/completions"
+        logging.info("proxy -> orchestrator POST %s", url)
+        rr = await client.post(url, json=payload)
+    ct = rr.headers.get("content-type") or "application/octet-stream"
+    status = rr.status_code
+    if ct.startswith("application/json"):
+        parser_bg = JSONParser()
+        obj = parser_bg.method_json_loads(rr.text)
+        assistant_text = ((obj.get("choices") or [{}])[0].get("message") or {}).get("content")
+        if assistant_text:
             async with _pool().acquire() as c2:
-                await c2.execute("INSERT INTO messages (conversation_id, role, content) VALUES ($1, 'assistant', $2::jsonb)", conv_id, json.dumps({"text": text_value}))
-        except Exception:
-            logging.exception("persist assistant failed cid=%s", conv_id)
-    background_tasks.add_task(_persist_assistant_message, cid, content)
-    # Return explicit body with content-length to avoid client transport quirks
+                await c2.execute(
+                    "INSERT INTO messages (conversation_id, role, content) VALUES ($1, 'assistant', $2::jsonb)",
+                    cid,
+                    json.dumps({"text": assistant_text}),
+                )
+        logging.info("/api/conversations/%s/chat: done", cid)
+        return Response(content=rr.text, media_type="application/json", status_code=status)
     logging.info("/api/conversations/%s/chat: done", cid)
-    return JSONResponse(status_code=200, content=data)
+    return Response(content=rr.content, media_type=ct, status_code=status)
 
 
 @app.options("/api/conversations/{cid}/chat")
