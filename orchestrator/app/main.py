@@ -1426,9 +1426,9 @@ async def chat_completions(body: ChatRequest, request: Request):
             + ("\n" + summary if summary else "")
             + "\nUse film_status to track progress, and jobs endpoints for live status."
         )
-        # Override executor texts to avoid returning a refusal
-        qwen_text = affirmative
-        gptoss_text = affirmative
+        # Append guidance instead of replacing core content so user still sees the full answer
+        qwen_text = (qwen_text or "").strip() + ("\n\n" + affirmative)
+        gptoss_text = (gptoss_text or "").strip() + ("\n\n" + affirmative)
 
     # 4) Optional brief debate (cross-critique)
     if ENABLE_DEBATE and MAX_DEBATE_TURNS > 0:
@@ -1513,16 +1513,45 @@ async def chat_completions(body: ChatRequest, request: Request):
         try:
             film_id = None
             errors: List[str] = []
+            job_ids: List[str] = []
+            prompt_ids: List[str] = []
             for tr in (tool_results or []):
                 if isinstance(tr, dict):
                     if not film_id:
                         film_id = ((tr.get("result") or {}).get("film_id"))
                     if tr.get("error"):
                         errors.append(str(tr.get("error")))
+                    # direct job_id/prompt_id
+                    res = tr.get("result") or {}
+                    jid = res.get("job_id") or tr.get("job_id")
+                    pid = res.get("prompt_id") or tr.get("prompt_id")
+                    if isinstance(jid, str):
+                        job_ids.append(jid)
+                    if isinstance(pid, str):
+                        prompt_ids.append(pid)
+                    # make_movie created list
+                    created = res.get("created") if isinstance(res, dict) else None
+                    if isinstance(created, list):
+                        for it in created:
+                            if isinstance(it, dict):
+                                r2 = it.get("result") or {}
+                                j2 = r2.get("job_id") or it.get("job_id")
+                                p2 = r2.get("prompt_id") or it.get("prompt_id")
+                                if isinstance(j2, str):
+                                    job_ids.append(j2)
+                                if isinstance(p2, str):
+                                    prompt_ids.append(p2)
             if film_id:
                 tool_summary_lines.append(f"film_id: {film_id}")
             if errors:
                 tool_summary_lines.append("errors: " + "; ".join(errors)[:800])
+            if job_ids:
+                # dedupe and truncate for brevity
+                juniq = list(dict.fromkeys([j for j in job_ids if j]))
+                tool_summary_lines.append("jobs: " + ", ".join(juniq[:20]))
+            if prompt_ids:
+                puniq = list(dict.fromkeys([p for p in prompt_ids if p]))
+                tool_summary_lines.append("prompts: " + ", ".join(puniq[:20]))
         except Exception:
             pass
     footer = ("\n\nTool Results:\n" + "\n".join(tool_summary_lines)) if tool_summary_lines else ""
