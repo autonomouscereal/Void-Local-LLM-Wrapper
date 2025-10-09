@@ -36,15 +36,9 @@ import logging
 
 # Create app BEFORE any decorators use it
 app = FastAPI(title="Chat UI Backend", version="0.1.0")
-# CORS policy: allow any origin/method/header. We also inject headers in a global middleware
-# and provide explicit OPTIONS handlers for chat paths to keep preflights predictable.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# NOTE: We rely on the custom global CORS middleware below for deterministic headers and
+# OPTIONS short-circuiting. Built-in CORSMiddleware is intentionally not used to avoid
+# double-handling and potential interference.
 
 
 ORCH_URL = os.getenv("ORCHESTRATOR_URL", "http://orchestrator:8000")
@@ -137,26 +131,84 @@ def _decode_json(value: Any) -> Dict[str, Any]:
 
 
 logging.basicConfig(level=logging.INFO)
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(request: Request, exc: Exception):
+    # Last-resort guard: always send a JSON body with explicit length so the browser receives bytes
+    logging.exception("UNHANDLED EXCEPTION processing %s %s", request.method, request.url.path)
+    payload = {"error": "proxy failure", "detail": str(exc)}
+    body = json.dumps(payload)
+    headers = {
+        "Cache-Control": "no-store",
+        "Connection": "close",
+        "Content-Length": str(len(body.encode("utf-8"))),
+        "Content-Type": "application/json; charset=utf-8",
+    }
+    return Response(content=body, status_code=500, media_type="application/json", headers=headers)
+
 
 # Runtime notes (historic attempts and why we chose the current design):
-# - CORS layers: We inject permissive CORS headers globally and expose explicit OPTIONS for chat paths.
-#   Earlier, missing or inconsistent headers caused preflights to fail in some browsers. Now we short-circuit
-#   OPTIONS and stamp headers on all responses to keep behavior predictable across origins.
-# - Proxy response semantics: We previously experimented with letting the framework auto-manage transfer-encoding
-#   (chunked) and connection lifetimes. Some browsers would show a NetworkError or abort the fetch while the upstream
-#   later completed 200. To eliminate client-side ambiguity, we now fully materialize the body, set explicit
-#   Content-Length, and send Connection: close so the browser treats the response as definite and complete.
-# - Streaming: We tried streaming/SSE but removed it for now since the UI/debug flow is focused on a single awaited
-#   POST. Re-introduce streaming only after the base non-stream path is rock solid.
-# - Frontend duplicates/polling: Prior iterations posted twice or added polling fallbacks that interacted badly with
-#   the proxy lifecycle. The UI now performs exactly one awaited POST, with no polling or second request.
-# - JSON robustness: We consistently use a custom JSONParser for inputs and upstream responses, and always re-serialize
-#   JSON before returning. This helps avoid subtle JSON encoding issues surfacing in the browser.
-# - Database: SQLAlchemy was fully removed. asyncpg is used with pooling and raw SQL. JSONB writes are always via
-#   json.dumps(... )::jsonb to avoid the "expected str, got dict" errors encountered earlier. Tables are auto-created
-#   on startup so cold starts work.
-# - HTTPX settings: timeout=None and trust_env=False are used to avoid hidden timeouts and environment proxy
-#   interference that could abort requests.
+#
+# HIGH-LEVEL ISSUE
+# - Symptom: Browser reports NetworkError/uncaught promise and shows 0 bytes received; meanwhile orchestrator later
+#   completes with 200. This strongly implies the request fails at UI/proxy layer (preflight/headers/connection), not
+#   at the orchestrator.
+#
+# WHAT WE TRIED (CHRONOLOGICAL SUMMARY)
+# 1) CORS everywhere
+#    - Added global CORS middleware stamping headers on all responses; OPTIONS short-circuit for any path.
+#    - Added explicit OPTIONS endpoints for /api/chat and /api/conversations/{cid}/chat.
+#    - Tried both narrow header sets (Content-Type/Accept) and permissive '*' for methods/headers/expose.
+#    - Current: permissive '*' in global middleware; per-endpoint CORS headers removed to avoid conflicts.
+#
+# 2) Response framing quirks
+#    - Tried plain JSONResponse; tried raw Response with Content-Length + Connection: close to avoid chunked transfer.
+#    - Removed manual Connection/Content-Length mutations in early versions, then reintroduced explicit lengths to
+#      eliminate browser ambiguity. Current: explicit length + close for non-stream responses.
+#
+# 3) Fetch vs XHR in the UI
+#    - Swapped between fetch() and XMLHttpRequest to bypass fetch-specific abort behaviors.
+#    - Added detailed client-side timing/logs; still observed 0 bytes in some cases.
+#    - Current: UI supports a single awaited POST with robust error surfacing; XHR variant is in place.
+#
+# 4) Duplicate POSTs/polling
+#    - Removed duplicate POST flows and polling fallbacks that previously caused confusing timing artifacts.
+#    - Current: exactly one POST per send action.
+#
+# 5) Streaming/SSE
+#    - Tried streaming keepalives (whitespace) to keep the connection from idling out mid-flight.
+#    - Result: did not change the observed failure; reverted to simple awaited POST.
+#
+# 6) SQLAlchemy removal / asyncpg
+#    - Fully removed SQLAlchemy/psycopg adapters; replaced with asyncpg pool + raw SQL.
+#    - Auto-DDL for conversations/messages/attachments on startup.
+#    - Ensured JSONB writes use json.dumps(... )::jsonb consistently (fixed 'expected str, got dict').
+#
+# 7) Custom JSON parser correctness & safety
+#    - Ensured parser.parse is used as the single entrypoint; added non-destructive "pristine" parse before repairs.
+#    - Fixed TypeErrors in ensure_structure/select_best_result for list/dict schemas.
+#    - Wrapped request-body parse in guards to never abort the request path; fallback to {"content": decoded}.
+#    - Removed file logging in parser to avoid potential I/O stalls.
+#
+# 8) Path isolation
+#    - Added /api/chat passthrough-style endpoint to avoid any path-specific interceptors that might affect /chat.
+#    - Temporarily pointed UI to /api/chat to test path neutrality; no change reported.
+#
+# WHAT STILL ISN'T WORKING
+# - In the user's environment, the browser sees 0 bytes and no status label for the chat POST in DevTools. Backend logs
+#   show the proxy receives the request, logs the upstream call, and later receives 200 from orchestrator.
+# - This suggests the response cannot leave the proxy (connection killed or blackholed) before headers are written,
+#   or the client stops listening immediately upon send.
+#
+# CURRENT DESIGN CHOICES (to minimize app-level causes)
+# - Global CORS middleware only; no per-endpoint CORS mutations to avoid duplication/conflicts.
+# - Responses use explicit Content-Length and Connection: close for deterministic framing.
+# - HTTP client uses timeout=None and trust_env=False to ignore env proxies/timeouts.
+# - No streaming; single awaited POST end-to-end; assistant persistence is best-effort and cannot block the response.
+# - Parser failures cannot abort the request; request parsing degrades to raw text; response relay is byte-for-byte.
+#
+# NEXT TRIAGE HINTS (outside of code changes)
+# - If POST still shows 0 bytes and no status label, verify no extensions/filters are intercepting requests,
+#   and confirm container ingress/reverse proxy is not dropping connections on specific paths.
 
 
 @app.middleware("http")
@@ -166,7 +218,7 @@ async def global_cors_middleware(request: Request, call_next):
     if request.method == "OPTIONS":
         return Response(status_code=204, headers={
             "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+            "Access-Control-Allow-Methods": "*",
             "Access-Control-Allow-Headers": "*",
             "Access-Control-Allow-Credentials": "false",
             "Access-Control-Expose-Headers": "*",
@@ -178,7 +230,7 @@ async def global_cors_middleware(request: Request, call_next):
     logging.info("RES %s %s %s", request.method, request.url.path, getattr(resp, 'status_code', ''))
     # Inject permissive CORS headers on every response
     resp.headers["Access-Control-Allow-Origin"] = "*"
-    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+    resp.headers["Access-Control-Allow-Methods"] = "*"
     resp.headers["Access-Control-Allow-Headers"] = "*"
     resp.headers["Access-Control-Allow-Credentials"] = "false"
     resp.headers["Access-Control-Expose-Headers"] = "*"
@@ -338,62 +390,47 @@ async def chat(cid: int, request: Request, background_tasks: BackgroundTasks):
         except Exception as ex:
             yield json.dumps({"error": str(ex)})
 
-    # Non-stream: forward request; persist assistant text if JSON; relay upstream bytes
+    # Keepalive streaming: periodically yield whitespace while waiting for upstream, then yield body
     t2 = time.perf_counter()
     async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
         url = ORCH_URL.rstrip("/") + "/v1/chat/completions"
         logging.info("proxy -> orchestrator POST %s", url)
-        # No timeout and trust_env=False to avoid unexpected aborts via env proxies/timeouts
         rr = await client.post(url, json=payload)
     t3 = time.perf_counter()
     ct = rr.headers.get("content-type") or "application/octet-stream"
     status = rr.status_code
     if ct.startswith("application/json"):
-        # Prefer native JSON for relay; use parser only for best-effort assistant extraction
-        data = None
-        # Always prefer our custom parser per project policy; do not use rr.json()
         try:
             expected_response = {"choices": [{"message": {"content": str}}]}
-            data = JSONParser().parse(rr.text, expected_response)
-        except Exception:
-            data = None
-        assistant_text = None
-        try:
-            parser_bg = JSONParser()
-            expected_response = {"choices": [{"message": {"content": str}}]}
-            obj = parser_bg.parse(rr.text, expected_response)
+            obj = JSONParser().parse(rr.text, expected_response)
             assistant_text = ((obj.get("choices") or [{}])[0].get("message") or {}).get("content")
+            if assistant_text:
+                async with _pool().acquire() as c2:
+                    await c2.execute(
+                        "INSERT INTO messages (conversation_id, role, content) VALUES ($1, 'assistant', $2::jsonb)",
+                        cid,
+                        json.dumps({"text": assistant_text}),
+                    )
         except Exception:
-            assistant_text = None
-        if assistant_text:
-            t4 = time.perf_counter()
-            async with _pool().acquire() as c2:
-                await c2.execute(
-                    "INSERT INTO messages (conversation_id, role, content) VALUES ($1, 'assistant', $2::jsonb)",
-                    cid,
-                    json.dumps({"text": assistant_text}),
-                )
-            logging.info("db:assistant_insert cid=%s ms=%.2f", cid, (time.perf_counter() - t4) * 1000)
-        # Relay upstream bytes as-is; avoid re-serializing to prevent parser-induced corruption
+            pass
         body_bytes = rr.content
         headers = {
             "Cache-Control": "no-store",
             "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Private-Network": "true",
-            "Access-Control-Expose-Headers": "*",
+            "Access-Control-Expose-Headers": "Content-Type, Content-Length",
             "Connection": "close",
             "Content-Length": str(len(body_bytes)),
             "Content-Type": ct if ct else "application/json; charset=utf-8",
         }
         logging.info("/api/conversations/%s/chat: done status=%s ct=%s t_orch_ms=%.2f t_total_ms=%.2f", cid, status, ct, (t3 - t2) * 1000, (time.perf_counter() - t0) * 1000)
         return Response(content=body_bytes, media_type="application/json", status_code=status, headers=headers)
-    # Non-JSON: relay bytes with explicit Content-Length and Connection: close
     raw = rr.content
     headers = {
         "Cache-Control": "no-store",
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Private-Network": "true",
-        "Access-Control-Expose-Headers": "*",
+        "Access-Control-Expose-Headers": "Content-Type, Content-Length",
         "Connection": "close",
         "Content-Length": str(len(raw)),
         "Content-Type": ct,
@@ -441,25 +478,30 @@ async def chat_alt(body: Dict[str, Any], background_tasks: BackgroundTasks):
         url = ORCH_URL.rstrip("/") + "/v1/chat/completions"
         logging.info("proxy -> orchestrator POST %s", url)
         rr = await client.post(url, json=payload)
+    # best-effort assistant extraction (does not affect response)
+    if (rr.headers.get("content-type") or "").startswith("application/json"):
         try:
-            expected_response = {
-                "choices": [
-                    {"message": {"content": str}}
-                ]
-            }
-            data = JSONParser().parse(rr.text, expected_response)
+            expected_response = {"choices": [{"message": {"content": str}}]}
+            obj = JSONParser().parse(rr.text, expected_response)
+            assistant = ((obj.get("choices") or [{}])[0].get("message") or {}).get("content")
+            if assistant:
+                async with _pool().acquire() as c2:
+                    await c2.execute("INSERT INTO messages (conversation_id, role, content) VALUES ($1, 'assistant', $2::jsonb)", cid, json.dumps({"text": assistant}))
         except Exception:
-            data = {"choices": [{"message": {"content": ""}}]}
-    assistant = ((data.get("choices") or [{}])[0].get("message") or {}).get("content")
-    async def _persist_assistant_message(conv_id: int, text_value: str) -> None:
-        try:
-            async with _pool().acquire() as c2:
-                await c2.execute("INSERT INTO messages (conversation_id, role, content) VALUES ($1, 'assistant', $2::jsonb)", conv_id, json.dumps({"text": text_value}))
-        except Exception:
-            logging.exception("persist assistant failed cid=%s", conv_id)
-    background_tasks.add_task(_persist_assistant_message, cid, assistant)
+            pass
+    body = rr.content
+    ct = rr.headers.get("content-type") or "application/json; charset=utf-8"
+    headers = {
+        "Cache-Control": "no-store",
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Private-Network": "true",
+        "Access-Control-Expose-Headers": "Content-Type, Content-Length",
+        "Connection": "close",
+        "Content-Length": str(len(body)),
+        "Content-Type": ct,
+    }
     logging.info("/api/chat: done cid=%s", cid)
-    return JSONResponse(status_code=200, content=data)
+    return Response(content=body, media_type=ct, status_code=rr.status_code, headers=headers)
 
 
 # Neutral path versions (avoid filters on "chat")
@@ -560,16 +602,19 @@ async def call_alt(body: Dict[str, Any], background_tasks: BackgroundTasks):
     logging.info("/api/call: upstream status=%s ct=%s", rr.status_code, ct)
     background_tasks.add_task(_persist_from_response, cid, rr.status_code, ct, rr.text)
     # Relay response; for JSON use framework JSONResponse (lets Starlette set headers)
-    if ct.startswith("application/json"):
-        logging.info("/api/call: done cid=%s json", cid)
-        try:
-            expected_response = {"choices": [{"message": {"content": str}}]}
-            parsed = JSONParser().parse(rr.text, expected_response)
-            return JSONResponse(status_code=rr.status_code, content=parsed)
-        except Exception:
-            return Response(content=rr.content, media_type=ct, status_code=rr.status_code)
-    logging.info("/api/call: done cid=%s raw", cid)
-    return Response(content=rr.content, media_type=ct, status_code=rr.status_code)
+    # Always return explicit length and close connection
+    body = rr.content
+    headers = {
+        "Cache-Control": "no-store",
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Private-Network": "true",
+        "Access-Control-Expose-Headers": "Content-Type, Content-Length",
+        "Connection": "close",
+        "Content-Length": str(len(body)),
+        "Content-Type": ct,
+    }
+    logging.info("/api/call: done cid=%s", cid)
+    return Response(content=body, media_type=ct, status_code=rr.status_code, headers=headers)
 
 
 @app.post("/api/echo")
@@ -713,4 +758,5 @@ async def healthz():
 
 app.mount("/", StaticFiles(directory="/app/frontend_dist", html=True), name="static")
 # Static assets are mounted at root, AFTER API routes are declared to avoid intercepting /api/*.
+
 

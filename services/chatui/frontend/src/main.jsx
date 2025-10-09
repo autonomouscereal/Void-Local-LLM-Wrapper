@@ -20,6 +20,11 @@ function App() {
   //   Connection: close so the browser treats the response as definite and avoids chunked-transfer quirks.
   // - Parsing is based on content-type: JSON is parsed; otherwise we show raw text. Network failures are caught
   //   and surfaced as a single assistant “Error:” message instead of unhandled promise rejections.
+  // - Historical attempts and current approach:
+  //   * Tried fetch() and XMLHttpRequest back and forth: both implemented; XHR currently active for clarity.
+  //   * Tried streaming keepalives from the proxy: removed after no improvement; now a single awaited POST.
+  //   * Pointed UI to /api/chat (neutral path) to avoid any path-specific issues; still persisted errors reported.
+  //   * CORS is unified server-side via a single global middleware stamping permissive headers on every response.
 
   async function refreshConvos() {
     const r = await fetch('/api/conversations')
@@ -56,41 +61,41 @@ function App() {
       // Single awaited POST to the proxy. No retries/polling here.
       const t0 = performance.now()
       console.log('[ui] chat POST start', { conversationId })
-      const resp = await fetch(`/api/conversations/${conversationId}/chat`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json, text/plain;q=0.9, */*;q=0.8' },
-        body: JSON.stringify({ conversation_id: conversationId, content: text }),
-        cache: 'no-store',
-        mode: 'cors',
-        credentials: 'omit',
-        redirect: 'follow',
-        referrerPolicy: 'no-referrer'
-      })
-      const t1 = performance.now()
-      console.log('[ui] chat POST headers', { status: resp.status, ct: resp.headers.get('content-type') || '', dt_ms: (t1 - t0).toFixed(1) })
-      const ct = resp.headers.get('content-type') || ''
-      const raw = await resp.text()
-      const t2 = performance.now()
-      console.log('[ui] chat POST body', { bytes: raw ? raw.length : 0, dt_ms: (t2 - t0).toFixed(1) })
-      let data
-      if (ct.includes('application/json')) {
-        try {
-          data = raw ? JSON.parse(raw) : {}
-        } catch (e) {
-          console.warn('JSON parse failed, returning raw text', e)
-          data = { error: raw }
+      const xhr = new XMLHttpRequest()
+      xhr.open('POST', `/api/conversations/${conversationId}/chat`, true)
+      xhr.responseType = 'text'
+      xhr.setRequestHeader('Content-Type', 'application/json')
+      xhr.setRequestHeader('Accept', 'application/json, text/plain;q=0.9, */*;q=0.8')
+      xhr.onload = () => {
+        const t1 = performance.now()
+        const status = xhr.status
+        const raw = xhr.responseText || ''
+        const ct = xhr.getResponseHeader('Content-Type') || ''
+        console.log('[ui] chat XHR done', { status, ct, dt_ms: (t1 - t0).toFixed(1), bytes: raw.length })
+        let data
+        if ((ct || '').includes('application/json')) {
+          try { data = raw ? JSON.parse(raw) : {} } catch { data = { error: raw } }
+        } else {
+          data = raw && raw.trim().length > 0 ? { text: raw } : { error: raw }
         }
-      } else {
-        data = raw && raw.trim().length > 0 ? { text: raw } : { error: raw }
+        if (!(status >= 200 && status < 300)) {
+          const errText = (raw || '').slice(0, 500) || `chat proxy error (${status})`
+          setMsgs(prev => ([...prev, { id: Date.now(), role: 'assistant', content: { text: `Error: ${errText}` } }]))
+          setSending(false)
+          return
+        }
+        const content = ((data.choices && data.choices[0] && data.choices[0].message) || {}).content || data.text || data.error || raw
+        setMsgs(prev => ([...prev, { id: Date.now(), role: 'assistant', content: { text: content } }]))
+        setText('')
+        setSending(false)
       }
-      if (!resp.ok) {
-        const errText = (raw || '').slice(0, 500) || `chat proxy error (${resp.status})`
-        setMsgs(prev => ([...prev, { id: Date.now(), role: 'assistant', content: { text: `Error: ${errText}` } }]))
-        return
+      xhr.onerror = () => {
+        console.error('[ui] chat XHR network error')
+        setMsgs(prev => ([...prev, { id: Date.now(), role: 'assistant', content: { text: 'Error: Network error' } }]))
+        setSending(false)
       }
-      const content = ((data.choices && data.choices[0] && data.choices[0].message) || {}).content || data.text || data.error || raw
-      setMsgs(prev => ([...prev, { id: Date.now(), role: 'assistant', content: { text: content } }]))
-      setText('')
+      xhr.send(JSON.stringify({ conversation_id: conversationId, content: text }))
+      return
     } catch (err) {
       // Catch network-level errors so they don’t manifest as unhandled promise rejections.
       console.error('Network error while calling proxy', err)

@@ -1,5 +1,18 @@
 '''
 JSONParser.py
+
+History and behavior (summary):
+- Primary goal: robust, non-destructive parsing of possibly malformed JSON returned by LLMs or tool outputs.
+- Parse order:
+  1) Strip markdown fences.
+  2) Try pristine json.loads (fast path). If it works, immediately normalise to expected structure.
+  3) Only then apply repair steps (quote/braces/commas) and retry multiple methods, including segment extraction
+     and permissive regex parsing.
+- Structure enforcement:
+  - ensure_structure/select_best_result handle both dict- and list-based schemas and never raise on type mismatches.
+  - Unknown or invalid types default to safe values rather than throwing.
+- Logging:
+  - File logging disabled; logger uses WARNING level with NullHandler to avoid runtime I/O overheads.
 '''
 
 
@@ -7,20 +20,11 @@ import json
 import logging
 import re
 
-# Configure logging
+# Configure logging (non-intrusive by default to avoid I/O stalls)
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
-
-# Create a file handler
-handler = logging.FileHandler('json_parser.log')
-handler.setLevel(logging.DEBUG)
-
-# Create a formatter and set it for the handler
-formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-handler.setFormatter(formatter)
-
-# Add the handler to the logger
-logger.addHandler(handler)
+logger.setLevel(logging.WARNING)
+if not logger.handlers:
+    logger.addHandler(logging.NullHandler())
 
 class JSONParser:
     def __init__(self):
