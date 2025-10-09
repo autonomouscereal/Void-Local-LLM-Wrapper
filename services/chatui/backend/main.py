@@ -500,19 +500,14 @@ async def call_alt(body: Dict[str, Any], background_tasks: BackgroundTasks):
                         )
                 asyncio.get_event_loop().create_task(_save())
     ct = rr.headers.get("content-type") or "application/json"
-    content_bytes = rr.content
     logging.info("/api/call: upstream status=%s ct=%s", rr.status_code, ct)
     background_tasks.add_task(_persist_from_response, cid, rr.status_code, ct, rr.text)
-    headers = {
-        "Cache-Control": "no-store",
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Private-Network": "true",
-        "Access-Control-Expose-Headers": "*",
-        "Connection": "close",
-        "Content-Length": str(len(content_bytes)),
-    }
-    logging.info("/api/call: done cid=%s", cid)
-    return Response(content=content_bytes, media_type=ct, status_code=rr.status_code, headers=headers)
+    # Relay response; for JSON use framework JSONResponse (lets Starlette set headers)
+    if ct.startswith("application/json"):
+        logging.info("/api/call: done cid=%s json", cid)
+        return JSONResponse(status_code=rr.status_code, content=rr.json())
+    logging.info("/api/call: done cid=%s raw", cid)
+    return Response(content=rr.content, media_type=ct, status_code=rr.status_code)
 
 
 @app.post("/api/echo")
