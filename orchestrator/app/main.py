@@ -1455,6 +1455,7 @@ async def chat_completions(body: ChatRequest, request: Request):
         evidence_blocks.append(ChatMessage(role="system", content="Tool results:\n" + json.dumps(tool_results, indent=2)))
     # If tool results include errors, nudge executors to include brief, on-topic suggestions
     exec_messages = evidence_blocks + messages
+    exec_messages_current = exec_messages
     if any(isinstance(r, dict) and r.get("error") for r in tool_results or []):
         exec_messages = exec_messages + [ChatMessage(role="system", content=(
             "If the tool results above contain errors that block the user's goal, include a short 'Suggestions' section (max 2 bullets) with specific, on-topic fixes (e.g., missing parameter defaults, retry guidance). Keep it brief and avoid scope creep."
@@ -1556,6 +1557,7 @@ async def chat_completions(body: ChatRequest, request: Request):
                     qwen_text = (orig_qwen_text or qwen_text or "") + ("\n\n" + new_q)
                 if isinstance(new_g, str) and new_g.strip():
                     gptoss_text = (orig_gptoss_text or gptoss_text or "") + ("\n\n" + new_g)
+                exec_messages_current = exec_messages2
             except Exception as ex:
                 tool_results = tool_results or [{"name": best_name or "unknown", "error": str(ex)}]
 
@@ -1606,7 +1608,7 @@ async def chat_completions(body: ChatRequest, request: Request):
         ]
 
     # 5) Final synthesis by Planner
-    final_request = exec_messages + [
+    final_request = exec_messages_current + [
         ChatMessage(
             role="user",
             content=(
@@ -1653,6 +1655,17 @@ async def chat_completions(body: ChatRequest, request: Request):
 
     # Ensure clean markdown content: collapse excessive whitespace but keep newlines
     cleaned = final_text.replace('\r\n', '\n')
+    # If the planner synthesis is empty or trivially short, fall back to merged model answers as the main body
+    def _is_trivial(s: str) -> bool:
+        return not s.strip() or len(s.strip()) < 8
+    if _is_trivial(cleaned):
+        merged_main = []
+        if (qwen_text or '').strip():
+            merged_main.append("### Qwen\n" + qwen_text.strip())
+        if (gptoss_text or '').strip():
+            merged_main.append("### GPT‑OSS\n" + gptoss_text.strip())
+        if merged_main:
+            cleaned = "\n\n".join(merged_main)
     # If tools/plan/critique exist, wrap them into a hidden metadata block and present a concise final answer
     meta_sections: List[str] = []
     if plan_text:
