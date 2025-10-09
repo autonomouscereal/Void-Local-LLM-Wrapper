@@ -880,17 +880,28 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         synopsis = args.get("synopsis") or ""
         metadata = args.get("metadata") or {}
         # normalize preferences with sensible defaults
+        # Accept synonyms from callers (duration -> duration_seconds, voice_type -> voice, audio_on -> audio_enabled, subtitles_on -> subtitles_enabled)
+        duration_arg = args.get("duration_seconds")
+        if duration_arg is None and args.get("duration") is not None:
+            duration_arg = args.get("duration")
+        voice_arg = args.get("voice") or args.get("voice_type")
+        audio_arg = args.get("audio_enabled")
+        if audio_arg is None and args.get("audio_on") is not None:
+            audio_arg = args.get("audio_on")
+        subs_arg = args.get("subtitles_enabled")
+        if subs_arg is None and args.get("subtitles_on") is not None:
+            subs_arg = args.get("subtitles_on")
         prefs = {
-            "duration_seconds": float(metadata.get("duration_seconds") or args.get("duration_seconds") or 10),
+            "duration_seconds": float(metadata.get("duration_seconds") or duration_arg or 10),
             "resolution": str(metadata.get("resolution") or args.get("resolution") or "1920x1080"),
             "fps": float(metadata.get("fps") or args.get("fps") or 24),
             "style": metadata.get("style") or args.get("style"),
             "language": metadata.get("language") or args.get("language") or "en",
-            "voice": metadata.get("voice") or args.get("voice") or None,
+            "voice": metadata.get("voice") or voice_arg or None,
             "quality": metadata.get("quality") or "standard",
-        "audio_enabled": bool(metadata.get("audio_enabled") if metadata.get("audio_enabled") is not None else (args.get("audio_enabled") if args.get("audio_enabled") is not None else True)),
-        "subtitles_enabled": bool(metadata.get("subtitles_enabled") if metadata.get("subtitles_enabled") is not None else (args.get("subtitles_enabled") if args.get("subtitles_enabled") is not None else False)),
-        "animation_enabled": bool(metadata.get("animation_enabled") if metadata.get("animation_enabled") is not None else (args.get("animation_enabled") if args.get("animation_enabled") is not None else True)),
+            "audio_enabled": bool(metadata.get("audio_enabled") if metadata.get("audio_enabled") is not None else (audio_arg if audio_arg is not None else True)),
+            "subtitles_enabled": bool(metadata.get("subtitles_enabled") if metadata.get("subtitles_enabled") is not None else (subs_arg if subs_arg is not None else False)),
+            "animation_enabled": bool(metadata.get("animation_enabled") if metadata.get("animation_enabled") is not None else (args.get("animation_enabled") if args.get("animation_enabled") is not None else True)),
         }
         # attach preferences back to metadata
         metadata = {**metadata, **{k: v for k, v in prefs.items() if v is not None}}
@@ -1130,13 +1141,15 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         film_id = (fc.get("result") or {}).get("film_id")
         # add characters
         for ch in characters[:25]:
-            await execute_tool_call({"name": "film_add_character", "arguments": {"film_id": film_id, **({} if not isinstance(ch, dict) else ch)}})
+            ch_args = {} if not isinstance(ch, dict) else dict(ch)
+            ch_args["film_id"] = film_id  # ensure correct film id cannot be overridden
+            await execute_tool_call({"name": "film_add_character", "arguments": ch_args})
         # add scenes
         created = []
         for sc in scenes[:200]:
-            if not isinstance(sc, dict):
-                sc = {"prompt": str(sc)}
-            res = await execute_tool_call({"name": "film_add_scene", "arguments": {"film_id": film_id, **sc}})
+            sc_args = {"prompt": str(sc)} if not isinstance(sc, dict) else dict(sc)
+            sc_args["film_id"] = film_id  # ensure correct film id cannot be overridden
+            res = await execute_tool_call({"name": "film_add_scene", "arguments": sc_args})
             created.append(res)
         return {"name": name, "result": {"film_id": film_id, "created": created}}
     if name == "run_python" and EXECUTOR_BASE_URL and ALLOW_TOOL_EXECUTION:
