@@ -11,6 +11,15 @@ function App() {
   const [jobs, setJobs] = useState([])
   const [showJobs, setShowJobs] = useState(false)
   const [sending, setSending] = useState(false)
+  // Frontend request policy (history + rationale):
+  // - Previous versions sometimes posted twice (to two endpoints) or used polling fallbacks. That led to
+  //   confusing timing where the browser “errored” one request while another completed later, creating the
+  //   impression of flakes. We now send exactly one awaited POST and await it fully in the UI.
+  // - If you see a browser NetworkError yet the backend logs later show a 200, it generally means the client
+  //   (or an intermediary) aborted/reset the connection. The backend now returns explicit Content-Length and
+  //   Connection: close so the browser treats the response as definite and avoids chunked-transfer quirks.
+  // - Parsing is based on content-type: JSON is parsed; otherwise we show raw text. Network failures are caught
+  //   and surfaced as a single assistant “Error:” message instead of unhandled promise rejections.
 
   async function refreshConvos() {
     const r = await fetch('/api/conversations')
@@ -43,25 +52,54 @@ function App() {
       conversationId = await newConversation()
     }
     setSending(true)
-    let raw = ''
-    let data
-    const resp = await fetch(`/api/conversations/${conversationId}/chat`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-      body: JSON.stringify({ conversation_id: conversationId, content: text })
-    })
-    raw = await resp.text()
-    data = raw && raw.trim().startsWith('{') ? JSON.parse(raw) : { error: raw }
-    if (!(resp.status >= 200 && resp.status < 300)) {
-      const errText = (raw || '').slice(0, 500) || `chat proxy error (${resp.status})`
-      setMsgs(prev => ([...prev, { id: Date.now(), role: 'assistant', content: { text: `Error: ${errText}` } }]))
+    try {
+      // Single awaited POST to the proxy. No retries/polling here.
+      const t0 = performance.now()
+      console.log('[ui] chat POST start', { conversationId })
+      const resp = await fetch(`/api/conversations/${conversationId}/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json, text/plain;q=0.9, */*;q=0.8' },
+        body: JSON.stringify({ conversation_id: conversationId, content: text }),
+        cache: 'no-store',
+        mode: 'cors',
+        credentials: 'omit',
+        redirect: 'follow',
+        referrerPolicy: 'no-referrer'
+      })
+      const t1 = performance.now()
+      console.log('[ui] chat POST headers', { status: resp.status, ct: resp.headers.get('content-type') || '', dt_ms: (t1 - t0).toFixed(1) })
+      const ct = resp.headers.get('content-type') || ''
+      const raw = await resp.text()
+      const t2 = performance.now()
+      console.log('[ui] chat POST body', { bytes: raw ? raw.length : 0, dt_ms: (t2 - t0).toFixed(1) })
+      let data
+      if (ct.includes('application/json')) {
+        try {
+          data = raw ? JSON.parse(raw) : {}
+        } catch (e) {
+          console.warn('JSON parse failed, returning raw text', e)
+          data = { error: raw }
+        }
+      } else {
+        data = raw && raw.trim().length > 0 ? { text: raw } : { error: raw }
+      }
+      if (!resp.ok) {
+        const errText = (raw || '').slice(0, 500) || `chat proxy error (${resp.status})`
+        setMsgs(prev => ([...prev, { id: Date.now(), role: 'assistant', content: { text: `Error: ${errText}` } }]))
+        return
+      }
+      const content = ((data.choices && data.choices[0] && data.choices[0].message) || {}).content || data.text || data.error || raw
+      setMsgs(prev => ([...prev, { id: Date.now(), role: 'assistant', content: { text: content } }]))
+      setText('')
+    } catch (err) {
+      // Catch network-level errors so they don’t manifest as unhandled promise rejections.
+      console.error('Network error while calling proxy', err)
+      const msg = err && err.message ? err.message : 'Network error'
+      setMsgs(prev => ([...prev, { id: Date.now(), role: 'assistant', content: { text: `Error: ${msg}` } }]))
+    } finally {
+      console.log('[ui] chat POST end')
       setSending(false)
-      return
     }
-    const content = ((data.choices && data.choices[0] && data.choices[0].message) || {}).content || (data.error || raw)
-    setMsgs(prev => ([...prev, { id: Date.now(), role: 'assistant', content: { text: content } }]))
-    setText('')
-    setSending(false)
   }
 
   async function uploadFile(e) {

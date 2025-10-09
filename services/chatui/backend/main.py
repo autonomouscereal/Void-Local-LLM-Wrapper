@@ -1,9 +1,28 @@
 from __future__ import annotations
 # WARNING: Do NOT add SQLAlchemy to this service. Use asyncpg with proper pooling and raw SQL only.
+#
+# Historical context (high-signal notes, not exhaustive):
+# - Original implementation sometimes used SQLAlchemy/psycopg; this project now forbids it.
+#   We use asyncpg exclusively with connection pooling and raw SQL. All JSONB writes go through
+#   json.dumps(... )::jsonb to avoid type errors (e.g., "expected str, got dict").
+# - The browser previously showed NetworkError/uncaught promise rejections while the orchestrator
+#   actually completed later with 200 OK. Root causes we mitigated here:
+#     * Potential chunked transfer/keep-alive quirks: We now fully materialize bodies, set
+#       explicit Content-Length, and send Connection: close on proxy responses to force the browser
+#       to treat the response as complete.
+#     * CORS inconsistencies: We add global CORS headers to every response and short-circuit OPTIONS
+#       preflights on any path.
+#     * Duplicated frontend POSTs: The UI now sends exactly one awaited POST to the chat endpoint
+#       and waits for completion; no polling or background fallbacks.
+#     * Hidden timeouts/proxies: httpx is used with timeout=None and trust_env=False so no implicit
+#       time limits or environment proxies can abort the upstream request.
+# - For JSON robustness, we rely on a custom JSONParser when decoding inputs or upstream responses.
+#   We also re-serialize JSON on output to normalize payloads before returning to the browser.
 
 import os
 import json
 from typing import Any, Dict, List, Optional
+import time
 from urllib.parse import parse_qs
 
 import httpx
@@ -17,6 +36,8 @@ import logging
 
 # Create app BEFORE any decorators use it
 app = FastAPI(title="Chat UI Backend", version="0.1.0")
+# CORS policy: allow any origin/method/header. We also inject headers in a global middleware
+# and provide explicit OPTIONS handlers for chat paths to keep preflights predictable.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -35,6 +56,7 @@ DB_PASS = os.getenv("POSTGRES_PASSWORD")
 
 
 async def init_pool() -> asyncpg.pool.Pool:
+    # Asyncpg pool with auto-DDL for required tables. No ORM anywhere.
     pool = await asyncpg.create_pool(
         user=DB_USER,
         password=DB_PASS,
@@ -45,6 +67,7 @@ async def init_pool() -> asyncpg.pool.Pool:
         max_size=10,
     )
     async with pool.acquire() as conn:
+        # conversations/messages/attachments are created up-front so cold-starts succeed
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS conversations (
@@ -95,11 +118,19 @@ def _decode_json(value: Any) -> Dict[str, Any]:
     if isinstance(value, dict):
         return value
     if isinstance(value, str):
-        try:
-            obj = json.loads(value)
-            return obj if isinstance(obj, dict) else {"text": str(value)}
-        except Exception:
-            return {"text": value}
+        # Use custom JSON parser only when the string looks like JSON; otherwise
+        # treat it as plain text to avoid over-eager coercion.
+        txt = value.strip()
+        if txt.startswith("{") or txt.startswith("["):
+            try:
+                parser = JSONParser()
+                expected = {"text": str}
+                obj = parser.parse(txt, expected)
+                # If the normalized parse still doesn't look like a dict, fall back to raw text
+                return obj if isinstance(obj, dict) and obj else {"text": value}
+            except Exception:
+                return {"text": value}
+        return {"text": value}
     return {"text": str(value or "")}
 
 # Mount static AFTER API routes to avoid intercepting /api/* with 404/405
@@ -107,11 +138,31 @@ def _decode_json(value: Any) -> Dict[str, Any]:
 
 logging.basicConfig(level=logging.INFO)
 
+# Runtime notes (historic attempts and why we chose the current design):
+# - CORS layers: We inject permissive CORS headers globally and expose explicit OPTIONS for chat paths.
+#   Earlier, missing or inconsistent headers caused preflights to fail in some browsers. Now we short-circuit
+#   OPTIONS and stamp headers on all responses to keep behavior predictable across origins.
+# - Proxy response semantics: We previously experimented with letting the framework auto-manage transfer-encoding
+#   (chunked) and connection lifetimes. Some browsers would show a NetworkError or abort the fetch while the upstream
+#   later completed 200. To eliminate client-side ambiguity, we now fully materialize the body, set explicit
+#   Content-Length, and send Connection: close so the browser treats the response as definite and complete.
+# - Streaming: We tried streaming/SSE but removed it for now since the UI/debug flow is focused on a single awaited
+#   POST. Re-introduce streaming only after the base non-stream path is rock solid.
+# - Frontend duplicates/polling: Prior iterations posted twice or added polling fallbacks that interacted badly with
+#   the proxy lifecycle. The UI now performs exactly one awaited POST, with no polling or second request.
+# - JSON robustness: We consistently use a custom JSONParser for inputs and upstream responses, and always re-serialize
+#   JSON before returning. This helps avoid subtle JSON encoding issues surfacing in the browser.
+# - Database: SQLAlchemy was fully removed. asyncpg is used with pooling and raw SQL. JSONB writes are always via
+#   json.dumps(... )::jsonb to avoid the "expected str, got dict" errors encountered earlier. Tables are auto-created
+#   on startup so cold starts work.
+# - HTTPX settings: timeout=None and trust_env=False are used to avoid hidden timeouts and environment proxy
+#   interference that could abort requests.
+
 
 @app.middleware("http")
 async def global_cors_middleware(request: Request, call_next):
     logging.info("REQ %s %s", request.method, request.url.path)
-    # Preflight short-circuit for any path
+    # Preflight short-circuit for any path: respond quickly and add permissive headers
     if request.method == "OPTIONS":
         return Response(status_code=204, headers={
             "Access-Control-Allow-Origin": "*",
@@ -125,6 +176,7 @@ async def global_cors_middleware(request: Request, call_next):
         })
     resp = await call_next(request)
     logging.info("RES %s %s %s", request.method, request.url.path, getattr(resp, 'status_code', ''))
+    # Inject permissive CORS headers on every response
     resp.headers["Access-Control-Allow-Origin"] = "*"
     resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
     resp.headers["Access-Control-Allow-Headers"] = "*"
@@ -202,26 +254,26 @@ def _build_openai_messages(base: List[Dict[str, Any]], attachments: List[Dict[st
 
 @app.post("/api/conversations/{cid}/chat")
 async def chat(cid: int, request: Request, background_tasks: BackgroundTasks):
+    t0 = time.perf_counter()
     logging.info("/api/conversations/%s/chat: start", cid)
-    # Accept JSON, raw text, or x-www-form-urlencoded, and parse via custom JSON parser
+    # Request body parsing:
+    # - Accept JSON, raw text, or x-www-form-urlencoded
+    # - Use the custom JSONParser.parse as the single source of truth to normalize structures
     ct = (request.headers.get("content-type") or "").lower()
     body: Dict[str, Any] = {}
     parser = JSONParser()
+    # Expected request shape for normalization – parser will ensure defaults
+    expected_request = {
+        "conversation_id": int,
+        "content": str,
+        "messages": [
+            {"role": str, "content": str}
+        ],
+    }
     if "application/json" in ct:
-        try:
-            # Try FastAPI JSON first; if that fails, repair with custom parser
-            body = await request.json()
-        except Exception:
-            raw_bytes = await request.body()
-            decoded = raw_bytes.decode("utf-8", errors="replace")
-            try:
-                body = parser.method_json_loads(decoded)
-            except Exception:
-                repaired = parser.attempt_repair(decoded)
-                try:
-                    body = parser.method_json_loads(repaired)
-                except Exception:
-                    body = {"content": decoded}
+        raw_bytes = await request.body()
+        decoded = raw_bytes.decode("utf-8", errors="replace")
+        body = parser.parse(decoded, expected_request)
     else:
         raw_bytes = await request.body()
         raw_text = raw_bytes.decode("utf-8", errors="replace")
@@ -229,26 +281,19 @@ async def chat(cid: int, request: Request, background_tasks: BackgroundTasks):
             form = parse_qs(raw_text, keep_blank_values=True)
             if "content" in form and len(form["content"]) > 0:
                 candidate = form["content"][0]
+                # Attempt full parse/normalize; if not JSON, fall back to treating as raw content
                 try:
-                    body = parser.method_json_loads(candidate)
+                    body = parser.parse(candidate, expected_request)
                 except Exception:
-                    repaired = parser.attempt_repair(candidate)
-                    try:
-                        body = parser.method_json_loads(repaired)
-                    except Exception:
-                        body = {"content": candidate}
+                    body = {"content": candidate}
             elif len(form) == 1:
                 first_key = next(iter(form))
                 vals = form.get(first_key) or [raw_text]
                 candidate = vals[0]
                 try:
-                    body = parser.method_json_loads(candidate)
+                    body = parser.parse(candidate, expected_request)
                 except Exception:
-                    repaired = parser.attempt_repair(candidate)
-                    try:
-                        body = parser.method_json_loads(repaired)
-                    except Exception:
-                        body = {"content": candidate}
+                    body = {"content": candidate}
             else:
                 body = {"content": raw_text}
         else:
@@ -257,12 +302,14 @@ async def chat(cid: int, request: Request, background_tasks: BackgroundTasks):
     logging.info("chat request cid=%s ct=%s keys=%s", cid, ct, list(body.keys()))
     user_content = (body or {}).get("content") or ""
     messages = (body or {}).get("messages") or []
-    # Force non-stream proxy for reliability in the UI
+    # Streaming is disabled here; we proxy non-stream to simplify the browser path
     stream = False
-    # Store user message
+    # Store user message in JSONB; ALWAYS json.dumps(... )::jsonb to match DB types
+    t1 = time.perf_counter()
     async with _pool().acquire() as conn:
         await conn.execute("INSERT INTO messages (conversation_id, role, content) VALUES ($1, 'user', $2::jsonb)", cid, json.dumps({"text": user_content}))
         atts = await conn.fetch("SELECT name, url, mime FROM attachments WHERE conversation_id=$1", cid)
+    logging.info("db:user_insert+attachments cid=%s ms=%.2f", cid, (time.perf_counter() - t1) * 1000)
 
     # Build messages for orchestrator
     oa_msgs = _build_openai_messages(messages + [{"role": "user", "content": user_content}], [dict(a) for a in atts])
@@ -281,43 +328,76 @@ async def chat(cid: int, request: Request, background_tasks: BackgroundTasks):
                             yield chunk
                     else:
                         body = await r.aread()
-                        # ensure JSON text
+                        # ensure JSON text by normalizing with the JSONParser
+                        decoded = body.decode("utf-8", errors="replace")
+                        expected_response = {
+                            "choices": [
+                                {"message": {"content": str}}
+                            ]
+                        }
                         try:
-                            decoded = body.decode("utf-8")
-                            obj = parser.method_json_loads(decoded)
+                            obj = parser.parse(decoded, expected_response)
                             yield json.dumps(obj)
                         except Exception:
-                            try:
-                                repaired = parser.attempt_repair(decoded)
-                                obj = parser.method_json_loads(repaired)
-                                yield json.dumps(obj)
-                            except Exception:
-                                yield body
+                            yield body
         except Exception as ex:
             yield json.dumps({"error": str(ex)})
 
     # Non-stream: forward request; persist assistant text if JSON; relay upstream bytes
+    t2 = time.perf_counter()
     async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
         url = ORCH_URL.rstrip("/") + "/v1/chat/completions"
         logging.info("proxy -> orchestrator POST %s", url)
+        # No timeout and trust_env=False to avoid unexpected aborts via env proxies/timeouts
         rr = await client.post(url, json=payload)
+    t3 = time.perf_counter()
     ct = rr.headers.get("content-type") or "application/octet-stream"
     status = rr.status_code
     if ct.startswith("application/json"):
         parser_bg = JSONParser()
-        obj = parser_bg.method_json_loads(rr.text)
+        expected_response = {
+            "choices": [
+                {"message": {"content": str}}
+            ]
+        }
+        obj = parser_bg.parse(rr.text, expected_response)
         assistant_text = ((obj.get("choices") or [{}])[0].get("message") or {}).get("content")
         if assistant_text:
+            t4 = time.perf_counter()
             async with _pool().acquire() as c2:
                 await c2.execute(
                     "INSERT INTO messages (conversation_id, role, content) VALUES ($1, 'assistant', $2::jsonb)",
                     cid,
                     json.dumps({"text": assistant_text}),
                 )
-        logging.info("/api/conversations/%s/chat: done", cid)
-        return Response(content=rr.text, media_type="application/json", status_code=status)
-    logging.info("/api/conversations/%s/chat: done", cid)
-    return Response(content=rr.content, media_type=ct, status_code=status)
+            logging.info("db:assistant_insert cid=%s ms=%.2f", cid, (time.perf_counter() - t4) * 1000)
+        # Normalize JSON output by re-serializing; then set explicit Content-Length and close connection
+        body_text = json.dumps(obj)
+        body_bytes = body_text.encode("utf-8")
+        headers = {
+            "Cache-Control": "no-store",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Private-Network": "true",
+            "Access-Control-Expose-Headers": "*",
+            "Connection": "close",
+            "Content-Length": str(len(body_bytes)),
+            "Content-Type": "application/json; charset=utf-8",
+        }
+        logging.info("/api/conversations/%s/chat: done status=%s ct=%s t_orch_ms=%.2f t_total_ms=%.2f", cid, status, ct, (t3 - t2) * 1000, (time.perf_counter() - t0) * 1000)
+        return Response(content=body_bytes, media_type="application/json", status_code=status, headers=headers)
+    # Non-JSON: relay bytes with explicit Content-Length and Connection: close
+    raw = rr.content
+    headers = {
+        "Cache-Control": "no-store",
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Private-Network": "true",
+        "Access-Control-Expose-Headers": "*",
+        "Connection": "close",
+        "Content-Length": str(len(raw)),
+        "Content-Type": ct,
+    }
+    logging.info("/api/conversations/%s/chat: done status=%s ct=%s t_orch_ms=%.2f t_total_ms=%.2f", cid, status, ct, (t3 - t2) * 1000, (time.perf_counter() - t0) * 1000)
+    return Response(content=raw, media_type=ct, status_code=status, headers=headers)
 
 
 @app.options("/api/conversations/{cid}/chat")
@@ -360,15 +440,14 @@ async def chat_alt(body: Dict[str, Any], background_tasks: BackgroundTasks):
         logging.info("proxy -> orchestrator POST %s", url)
         rr = await client.post(url, json=payload)
         try:
-            data = rr.json()
+            expected_response = {
+                "choices": [
+                    {"message": {"content": str}}
+                ]
+            }
+            data = JSONParser().parse(rr.text, expected_response)
         except Exception:
-            parser = JSONParser()
-            decoded = rr.text
-            try:
-                data = parser.method_json_loads(decoded)
-            except Exception:
-                repaired = parser.attempt_repair(decoded)
-                data = parser.method_json_loads(repaired)
+            data = {"choices": [{"message": {"content": ""}}]}
     assistant = ((data.get("choices") or [{}])[0].get("message") or {}).get("content")
     async def _persist_assistant_message(conv_id: int, text_value: str) -> None:
         try:
@@ -407,14 +486,14 @@ async def call_conv(cid: int, request: Request, background_tasks: BackgroundTask
         logging.info("proxy -> orchestrator POST %s", url)
         rr = await client.post(url, json=payload)
         try:
-            data = rr.json()
+            expected_response = {
+                "choices": [
+                    {"message": {"content": str}}
+                ]
+            }
+            data = JSONParser().parse(rr.text, expected_response)
         except Exception:
-            decoded = rr.text
-            try:
-                data = parser.method_json_loads(decoded)
-            except Exception:
-                repaired = parser.attempt_repair(decoded)
-                data = parser.method_json_loads(repaired)
+            data = {"choices": [{"message": {"content": ""}}]}
     assistant = ((data.get("choices") or [{}])[0].get("message") or {}).get("content")
     async def _persist_assistant_message(conv_id: int, text_value: str) -> None:
         try:
@@ -454,7 +533,12 @@ async def call_alt(body: Dict[str, Any], background_tasks: BackgroundTasks):
     def _persist_from_response(conv_id: int, status_code: int, content_type: str, text_body: str) -> None:
         if content_type.startswith("application/json") and status_code < 500 and (text_body.strip().startswith('{') or text_body.strip().startswith('[')):
             parser = JSONParser()
-            obj = parser.method_json_loads(text_body)
+            expected_response = {
+                "choices": [
+                    {"message": {"content": str}}
+                ]
+            }
+            obj = parser.parse(text_body, expected_response)
             assistant_text = ((obj.get("choices") or [{}])[0].get("message") or {}).get("content")
             if assistant_text:
                 import asyncio
@@ -563,7 +647,12 @@ async def chat_get(cid: int, content: str = ""):
     payload = {"messages": oa_msgs, "stream": False}
     async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
         rr = await client.post(ORCH_URL.rstrip("/") + "/v1/chat/completions", json=payload)
-        data = rr.json()
+        expected_response = {
+            "choices": [
+                {"message": {"content": str}}
+            ]
+        }
+        data = JSONParser().parse(rr.text, expected_response)
     assistant = ((data.get("choices") or [{}])[0].get("message") or {}).get("content")
     async with _pool().acquire() as conn:
         await conn.execute("INSERT INTO messages (conversation_id, role, content) VALUES ($1, 'assistant', $2::jsonb)", cid, json.dumps({"text": assistant}))
@@ -610,4 +699,5 @@ async def healthz():
 
 
 app.mount("/", StaticFiles(directory="/app/frontend_dist", html=True), name="static")
+# Static assets are mounted at root, AFTER API routes are declared to avoid intercepting /api/*.
 
