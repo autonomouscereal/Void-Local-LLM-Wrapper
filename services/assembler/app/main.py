@@ -48,8 +48,9 @@ def _ffmpeg_mux(
     if target_fps and target_fps > fps:
         filters.append(f"minterpolate=fps={target_fps}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1")
     if srt_path and os.path.exists(srt_path):
-        # burn-in subtitles
-        filters.append(f"subtitles='{srt_path.replace('\\', '/')}':force_style='FontName=Arial,FontSize=18' ")
+        # burn-in subtitles (avoid backslashes directly in f-string expressions)
+        srt_posix = srt_path.replace('\\', '/')
+        filters.append(f"subtitles='{srt_posix}':force_style='FontName=Arial,FontSize=18'")
     vf = []
     if filters:
         vf = ["-vf", ",".join(filters)]

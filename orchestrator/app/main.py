@@ -489,7 +489,12 @@ async def rag_search(query: str, k: int = 8) -> List[Dict[str, Any]]:
 async def call_ollama(base_url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     async with httpx.AsyncClient(timeout=45) as client:
         try:
-            resp = await client.post(f"{base_url}/api/generate", json=payload)
+            # Keep models warm across requests
+            ppayload = dict(payload)
+            opts = dict(ppayload.get("options") or {})
+            opts["keep_alive"] = opts.get("keep_alive") or "24h"
+            ppayload["options"] = opts
+            resp = await client.post(f"{base_url}/api/generate", json=ppayload)
             resp.raise_for_status()
             data = resp.json()
             if isinstance(data, dict) and ("prompt_eval_count" in data or "eval_count" in data):
