@@ -47,11 +47,18 @@ function App() {
       let raw = ''
       let data
       // Single fetch to neutral path; wait for full response
-      const resp = await fetch('/api/call', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-        body: JSON.stringify({ conversation_id: conversationId, content: text })
-      })
+      let resp
+      try {
+        resp = await fetch('/api/call', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+          body: JSON.stringify({ conversation_id: conversationId, content: text })
+        })
+      } catch (e) {
+        const errText = String(e && e.message ? e.message : e || 'network error')
+        setMsgs(prev => ([...prev, { id: Date.now(), role: 'assistant', content: { text: `Error: ${errText}` } }]))
+        return
+      }
       raw = await resp.text()
       try { data = JSON.parse(raw) } catch { data = { error: raw || 'parse error' } }
       if (!(resp.status >= 200 && resp.status < 300)) {
