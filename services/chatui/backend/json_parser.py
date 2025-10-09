@@ -117,8 +117,20 @@ class JSONParser:
                 else:
                     item_structure = expected_type[0]
                     value = [self.ensure_structure(item, item_structure) if isinstance(item, dict) else item for item in value]
-            elif not isinstance(value, expected_type):
-                value = self.default_value(expected_type)
+            elif isinstance(expected_type, dict):
+                # Nested object schema – ensure recursively
+                if isinstance(value, dict):
+                    value = self.ensure_structure(value, expected_type)
+                else:
+                    value = self.default_value(dict)
+            else:
+                # Primitive type check with guard against non-type schemas
+                try:
+                    if not isinstance(value, expected_type):
+                        value = self.default_value(expected_type)
+                except TypeError:
+                    # If expected_type isn't a real type, default safely
+                    value = self.default_value(str)
             result[key] = value
             logger.debug(f"Ensured key '{key}' with value: {result[key]}")
         return result

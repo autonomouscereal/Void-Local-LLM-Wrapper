@@ -274,7 +274,11 @@ async def chat(cid: int, request: Request, background_tasks: BackgroundTasks):
     if "application/json" in ct:
         raw_bytes = await request.body()
         decoded = raw_bytes.decode("utf-8", errors="replace")
-        body = parser.parse(decoded, expected_request)
+        try:
+            body = parser.parse(decoded, expected_request)
+        except Exception:
+            # Never let parsing kill the request path; degrade gracefully
+            body = {"content": decoded}
     else:
         raw_bytes = await request.body()
         raw_text = raw_bytes.decode("utf-8", errors="replace")
