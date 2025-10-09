@@ -44,13 +44,19 @@ function App() {
   }
 
   const renderChatContent = (text) => {
-    const html = marked.parse(String(text || ''))
+    const raw = String(text || '')
+    const html = marked.parse(raw)
     const { images, videos } = extractMedia(text || '')
-    const hasText = String(text || '').trim().length > 0
+    const hasText = raw.trim().length > 0
+    const htmlLooksEmpty = (String(html || '').replace(/<[^>]*>/g, '').trim().length === 0)
     return (
       <div>
         {hasText ? (
-          <div dangerouslySetInnerHTML={{ __html: html }} />
+          htmlLooksEmpty ? (
+            <pre style={{ whiteSpace: 'pre-wrap', fontSize: 13, color: '#e5e7eb', background: 'transparent', margin: 0 }}>{raw}</pre>
+          ) : (
+            <div dangerouslySetInnerHTML={{ __html: html }} />
+          )
         ) : (
           (images.length === 0 && videos.length === 0) ? (
             <div style={{ fontSize: 12, color: '#9ca3af', fontStyle: 'italic' }}>(no content)</div>
