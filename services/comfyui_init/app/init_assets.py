@@ -64,10 +64,10 @@ def main() -> None:
     for repo, fn, tgt, rename in instantid:
         dl(repo, fn, tgt, rename, token)
 
-    # AnimateDiff motion modules
+    # AnimateDiff motion modules (place where ComfyUI expects them)
     animatediff = [
-        ("guoyww/animatediff", "animatediff_motion_module/mm_sd_v15_v2.ckpt", "/models/animatediff", "mm_sd_v15_v2.ckpt"),
-        ("guoyww/animatediff", "animatediff_motion_module/mm_sdxl_v10.ckpt", "/models/animatediff", "mm_sdxl_v10.ckpt"),
+        ("guoyww/animatediff", "animatediff_motion_module/mm_sd_v15_v2.ckpt", "/models/animatediff_models", "mm_sd_v15_v2.ckpt"),
+        ("guoyww/animatediff", "animatediff_motion_module/mm_sdxl_v10.ckpt", "/models/animatediff_models", "mm_sdxl_v10.ckpt"),
     ]
     for repo, fn, tgt, rename in animatediff:
         dl(repo, fn, tgt, rename, token)

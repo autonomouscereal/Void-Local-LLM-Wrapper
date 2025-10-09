@@ -14,6 +14,7 @@ WORKDIR /comfyui
 RUN git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git .
 
 RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir opencv-python-headless==4.9.0.80 imageio-ffmpeg==0.4.9 diffusers==0.30.2
 
 EXPOSE 8188
 
