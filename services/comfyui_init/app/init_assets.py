@@ -72,6 +72,18 @@ def main() -> None:
     for repo, fn, tgt, rename in animatediff:
         dl(repo, fn, tgt, rename, token)
 
+    # Also mirror AnimateDiff motion models into the custom node's expected path so ComfyUI-AnimateDiff-Evolved finds them
+    try:
+        src_dir = "/models/animatediff_models"
+        dst_dir = "/custom_nodes/ComfyUI-AnimateDiff-Evolved/models"
+        ensure_dir(dst_dir)
+        for name in ("mm_sd_v15_v2.ckpt", "mm_sdxl_v10.ckpt"):
+            p = os.path.join(src_dir, name)
+            if os.path.exists(p):
+                copy_to_dir(p, dst_dir)
+    except Exception as ex:
+        print("Failed to mirror AnimateDiff models to custom_nodes path:", ex)
+
     # Clone commonly used custom nodes (idempotent)
     nodes = [
         ("https://github.com/cubiq/ComfyUI_IPAdapter_plus", "/custom_nodes/ComfyUI_IPAdapter_plus"),
