@@ -7,7 +7,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 ENV CUDA_VISIBLE_DEVICES="" \
     PYTORCH_FORCE_CPU=1
 
-RUN apt-get update && apt-get install -y git ffmpeg build-essential libgl1 && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y git ffmpeg build-essential libgl1 curl && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /comfyui
 
@@ -22,7 +22,9 @@ RUN pip install --no-cache-dir scikit-image==0.22.0 scikit-learn==1.3.2 diffuser
 
 EXPOSE 8188
 
-# Run ComfyUI in CPU mode
-CMD ["python", "main.py", "--listen", "0.0.0.0", "--port", "8188", "--cpu"]
+# Entrypoint ensures required models exist, then starts ComfyUI in CPU mode
+COPY docker-entrypoint.sh /usr/local/bin/comfyui-entrypoint.sh
+RUN chmod +x /usr/local/bin/comfyui-entrypoint.sh
+ENTRYPOINT ["/usr/local/bin/comfyui-entrypoint.sh"]
 
 
