@@ -5,6 +5,7 @@ import subprocess
 from typing import Optional
 
 from huggingface_hub import hf_hub_download
+import requests
 
 
 def ensure_dir(path: str) -> None:
@@ -19,11 +20,25 @@ def copy_to_dir(src: str, target_dir: str, rename: Optional[str] = None) -> None
 
 
 def dl(repo: str, filename: str, target_dir: str, rename: Optional[str] = None, token: Optional[str] = None) -> None:
+    """Download a file from HuggingFace. Falls back to raw URL if hf_hub_download fails."""
     try:
         p = hf_hub_download(repo_id=repo, filename=filename, token=token)
         copy_to_dir(p, target_dir, rename)
+        return
     except Exception as ex:
-        print("Failed to download", repo, filename, ex)
+        print("hf_hub_download failed:", repo, filename, ex)
+    # Fallback: try raw URL
+    try:
+        url = f"https://huggingface.co/{repo}/resolve/main/{filename}"
+        ensure_dir(target_dir)
+        dst = os.path.join(target_dir, rename or os.path.basename(filename))
+        r = requests.get(url, timeout=120)
+        r.raise_for_status()
+        with open(dst, "wb") as f:
+            f.write(r.content)
+        print("Fetched via raw URL:", url, "->", dst)
+    except Exception as ex:
+        print("Raw URL fallback failed:", repo, filename, ex)
 
 
 def main() -> None:

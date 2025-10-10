@@ -185,8 +185,8 @@ services:
     environment:
       - HUGGINGFACE_TOKEN=${HUGGINGFACE_TOKEN:-}
     volumes:
-      - comfyui_models:/models
-      - comfyui_custom_nodes:/custom_nodes
+      - comfyui_models:/comfyui/models
+      - comfyui_custom_nodes:/comfyui/custom_nodes
     command: ["python", "/app/init_assets.py"]
 
   n8n:
