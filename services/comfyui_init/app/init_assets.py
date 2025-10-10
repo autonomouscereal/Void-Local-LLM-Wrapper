@@ -41,6 +41,17 @@ def dl(repo: str, filename: str, target_dir: str, rename: Optional[str] = None, 
         print("Raw URL fallback failed:", repo, filename, ex)
 
 
+def dl_candidates(repo: str, filenames: list[str], target_dir: str, rename: Optional[str] = None, token: Optional[str] = None) -> None:
+    """Try multiple candidate paths under a repo until one succeeds."""
+    for fn in filenames:
+        try:
+            dl(repo, fn, target_dir, rename, token)
+            return
+        except Exception:
+            continue
+    print("All candidates failed for", repo, filenames)
+
+
 def main() -> None:
     token = os.environ.get("HUGGINGFACE_TOKEN")
     # Root paths aligned with docker-compose volume mounts
@@ -83,12 +94,21 @@ def main() -> None:
         dl(repo, fn, tgt, rename, token)
 
     # AnimateDiff motion modules (place where ComfyUI expects them)
-    animatediff = [
-        ("guoyww/animatediff", "animatediff_motion_module/mm_sd_v15_v2.ckpt", f"{MODELS_ROOT}/animatediff_models", "mm_sd_v15_v2.ckpt"),
-        ("guoyww/animatediff", "animatediff_motion_module/mm_sdxl_v10.ckpt", f"{MODELS_ROOT}/animatediff_models", "mm_sdxl_v10.ckpt"),
-    ]
-    for repo, fn, tgt, rename in animatediff:
-        dl(repo, fn, tgt, rename, token)
+    # Animatediff candidates: try multiple known paths per file
+    dl_candidates("guoyww/animatediff",
+                  [
+                      "animatediff_motion_module/mm_sd_v15_v2.ckpt",
+                      "v3_mm/sd15/mm_sd_v15_v2.ckpt",
+                      "mm_sd_v15_v2.ckpt",
+                  ],
+                  f"{MODELS_ROOT}/animatediff_models", "mm_sd_v15_v2.ckpt", token)
+    dl_candidates("guoyww/animatediff",
+                  [
+                      "animatediff_motion_module/mm_sdxl_v10.ckpt",
+                      "v3_mm/sdxl/mm_sdxl_v10.ckpt",
+                      "mm_sdxl_v10.ckpt",
+                  ],
+                  f"{MODELS_ROOT}/animatediff_models", "mm_sdxl_v10.ckpt", token)
 
     # Also mirror AnimateDiff motion models into the custom node's expected path so ComfyUI-AnimateDiff-Evolved finds them
     try:
@@ -108,7 +128,8 @@ def main() -> None:
         ("https://github.com/ZHO-ZHO-ZHO/ComfyUI-InstantID", f"{CUSTOM_ROOT}/ComfyUI-InstantID"),
         ("https://github.com/Kosinkadink/ComfyUI-AnimateDiff-Evolved", f"{CUSTOM_ROOT}/ComfyUI-AnimateDiff-Evolved"),
         ("https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite", f"{CUSTOM_ROOT}/ComfyUI-VideoHelperSuite"),
-        ("https://github.com/KoreTeknology/ComfyUI-RealESRGAN", f"{CUSTOM_ROOT}/ComfyUI-RealESRGAN"),
+        # RealESRGAN clone can fail without GitHub creds; treat as optional
+        # ("https://github.com/KoreTeknology/ComfyUI-RealESRGAN", f"{CUSTOM_ROOT}/ComfyUI-RealESRGAN"),
     ]
     for url, path in nodes:
         try:
