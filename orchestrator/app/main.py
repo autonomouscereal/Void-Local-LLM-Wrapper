@@ -1204,6 +1204,13 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         pool = await get_pg_pool()
         if pool is None:
             return {"name": name, "error": "pg not configured"}
+        # Validate workflow shape; if missing/invalid, build a proper default/animated graph
+        def _has_outputs(wf: Dict[str, Any]) -> bool:
+            try:
+                g = (wf or {}).get("prompt") or {}
+                return isinstance(g, dict) and len(g) > 0
+            except Exception:
+                return False
         # Derive sane defaults: missing index -> next index; missing prompt -> use film synopsis
         async with pool.acquire() as conn:
             if index_num <= 0:
@@ -1213,7 +1220,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 syn_row = await conn.fetchrow("SELECT synopsis FROM films WHERE id=$1", film_id)
                 syn = (syn_row and syn_row[0]) or ""
                 prompt = (syn.strip() or "A cinematic scene that advances the story.")
-        if not workflow:
+        if not _has_outputs(workflow):
             async with pool.acquire() as conn:
                 row = await conn.fetchrow("SELECT metadata FROM films WHERE id=$1", film_id)
                 prefs = (row and row["metadata"]) or {}
@@ -1295,10 +1302,12 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             if isinstance(args.get("video"), list):
                 workflow.setdefault("attachments", {})["video"] = args.get("video")
             # Enforce appearance consistency: include face embeddings and a stable seed in the workflow metadata
-            if characters:
+            # use current characters list; fetch again to ensure up-to-date
+            _chs = await get_film_characters(film_id)
+            if _chs:
                 try:
                     ce = []
-                    for ch in characters:
+                    for ch in _chs:
                         rd = ch.get("reference_data") or {}
                         if isinstance(rd.get("face_embedding_mean"), list):
                             ce.append(rd.get("face_embedding_mean"))
@@ -1326,6 +1335,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             _jobs_store[job_id] = {"id": job_id, "prompt_id": prompt_id, "state": "failed", "created_at": time.time(), "updated_at": time.time(), "result": {"error": error_msg}}
             return {"name": name, "error": error_msg, "result": {"scene_id": scene_id, "job_id": job_id}}
         prompt_id = submit.get("prompt_id") or submit.get("uuid") or submit.get("id")
+        if not isinstance(prompt_id, str) or not prompt_id:
+            return {"name": name, "error": "invalid comfy response (missing prompt_id)", "result": {}}
         import uuid as _uuid
         scene_id = _uuid.uuid4().hex
         job_id = _uuid.uuid4().hex
@@ -1463,18 +1474,6 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 sc_args["subtitles_enabled"] = default_subs
             res = await execute_tool_call({"name": "film_add_scene", "arguments": sc_args})
             created.append(res)
-        # Safety: ensure at least one scene exists for this film; if none were created due to upstream issues, force-create a minimal scene
-        try:
-            pool = await get_pg_pool()
-            if pool is not None:
-                async with pool.acquire() as conn:
-                    num_scenes = await conn.fetchval("SELECT COUNT(*) FROM scenes WHERE film_id=$1", film_id)
-                if int(num_scenes or 0) == 0:
-                    minimal = {"film_id": film_id, "index_num": 1, "prompt": (synopsis or title or "Visual narrative."), "audio_enabled": default_audio, "subtitles_enabled": default_subs}
-                    forced = await execute_tool_call({"name": "film_add_scene", "arguments": minimal})
-                    created.append(forced)
-        except Exception:
-            pass
         return {"name": name, "result": {"film_id": film_id, "created": created}}
     if name == "run_python" and EXECUTOR_BASE_URL and ALLOW_TOOL_EXECUTION:
         async with httpx.AsyncClient(timeout=120) as client:
