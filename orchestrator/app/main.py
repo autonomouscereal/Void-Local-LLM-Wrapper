@@ -606,7 +606,9 @@ def meta_prompt(messages: List[ChatMessage]) -> List[ChatMessage]:
         "Critically: choose tools SEMANTICALLY by mapping the user's requested outcome to tool capabilities (no keyword triggers). "
         "If any available tool can directly produce the requested artifact, invoke that tool; otherwise provide a concrete solution or plan. "
         "Never refuse actionable requests. Do not apologize, do not say you can't or that it's not supported. If something seems constrained, state constraints briefly and proceed with best-effort steps using reasonable defaults. "
-        "Ask at most one concise clarifying question only if a blocking parameter is missing, then proceed with defaults. "
+        "Ask at most one concise clarifying message if a blocking parameter is missing; include up to three targeted questions in that single message, then proceed. "
+        "When the user provides reference media (audio, images, video, files), treat them as style/constraint references. "
+        "Do NOT reuse source media as-is unless explicitly instructed; transform or condition on them to match style, timing/beat, or visual attributes (e.g., hair/face), respecting the user's constraints. "
         "If you clearly see a small, relevant fix or improvement (e.g., a failing tool parameter or obvious config issue), you may add a short 'Suggestions' section with up to 2 concise bullet points at the end. Do not scope creep."
     )
     out = [ChatMessage(role="system", content=system_preface)]
@@ -779,7 +781,7 @@ def _derive_movie_prefs_from_text(text: str) -> Dict[str, Any]:
             pass
     elif "60fps" in s or "60 fps" in s:
         prefs["fps"] = 60.0
-    # duration in minutes/seconds
+    # explicit duration in minutes/seconds
     m_min = _re.search(r"(\d+)\s*minute", s)
     m_sec = _re.search(r"(\d+)\s*sec", s)
     if m_min:
@@ -792,10 +794,40 @@ def _derive_movie_prefs_from_text(text: str) -> Dict[str, Any]:
             prefs["duration_seconds"] = float(int(m_sec.group(1)))
         except Exception:
             pass
-    # defaults
+    # infer minimal coherent duration if not specified
+    if "duration_seconds" not in prefs:
+        words = len([w for w in s.replace("\n", " ").split(" ") if w.strip()])
+        # category heuristics (minimal coherent durations)
+        if any(k in s for k in ("meme", "clip", "gif")):
+            inferred = 10.0
+        elif any(k in s for k in ("trailer", "teaser")):
+            inferred = 60.0
+        elif any(k in s for k in ("ad", "advert", "commercial")):
+            inferred = 30.0
+        elif "music video" in s:
+            inferred = 210.0  # ~3.5 minutes
+        elif "short film" in s:
+            inferred = 300.0  # ~5 minutes
+        elif any(k in s for k in ("episode", "tv episode")):
+            inferred = 1500.0  # ~25 minutes
+        elif any(k in s for k in ("feature film",)):
+            inferred = 5400.0  # ~90 minutes (minimal feature)
+        elif "documentary" in s:
+            inferred = 900.0  # ~15 minutes minimal doc short
+        else:
+            # scale with description complexity
+            if words >= 1500:
+                inferred = 3600.0
+            elif words >= 600:
+                inferred = 600.0
+            elif words >= 150:
+                inferred = 60.0
+            else:
+                inferred = 20.0
+        prefs["duration_seconds"] = inferred
+    # sensible defaults
     prefs.setdefault("resolution", "1920x1080")
     prefs.setdefault("fps", 24.0)
-    prefs.setdefault("duration_seconds", 10.0)
     return prefs
 
 def merge_tool_schemas(client_tools: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
@@ -1221,6 +1253,25 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 seed=seed,
                 filename_prefix=filename_prefix,
             )
+            # Prefer user-provided attachments from tool args
+            if isinstance(args.get("images"), list):
+                workflow.setdefault("attachments", {})["images"] = args.get("images")
+            if isinstance(args.get("audio"), list):
+                workflow.setdefault("attachments", {})["audio"] = args.get("audio")
+            if isinstance(args.get("video"), list):
+                workflow.setdefault("attachments", {})["video"] = args.get("video")
+            # Enforce appearance consistency: include face embeddings and a stable seed in the workflow metadata
+            if characters:
+                try:
+                    ce = []
+                    for ch in characters:
+                        rd = ch.get("reference_data") or {}
+                        if isinstance(rd.get("face_embedding_mean"), list):
+                            ce.append(rd.get("face_embedding_mean"))
+                    if ce:
+                        workflow.setdefault("attachments", {})["face_embeddings"] = ce
+                except Exception:
+                    pass
             submit = await _comfy_submit_workflow(workflow)
         if submit.get("error"):
             # Persist scene with error status so caller can inspect and retry, but do not hard-fail the entire tool
@@ -1253,8 +1304,15 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 merged_prefs["audio_enabled"] = bool(pref_audio)
             if pref_subs is not None:
                 merged_prefs["subtitles_enabled"] = bool(pref_subs)
-            # include character_ids into plan for downstream consistency
-            scene_plan = {**plan, "preferences": merged_prefs, "character_ids": character_ids}
+            # include character_ids and attachments into plan for downstream consistency
+            att = {}
+            if isinstance(args.get("images"), list):
+                att["images"] = args.get("images")
+            if isinstance(args.get("audio"), list):
+                att["audio"] = args.get("audio")
+            if isinstance(args.get("video"), list):
+                att["video"] = args.get("video")
+            scene_plan = {**plan, "preferences": merged_prefs, "character_ids": character_ids, "attachments": att}
             await conn.execute("INSERT INTO scenes (id, film_id, index_num, prompt, plan, status, job_id) VALUES ($1, $2, $3, $4, $5, 'queued', $6)", scene_id, film_id, index_num, prompt, json.dumps(scene_plan), job_id)
         _jobs_store[job_id] = {"id": job_id, "prompt_id": prompt_id, "state": "queued", "created_at": time.time(), "updated_at": time.time()}
         asyncio.create_task(_track_comfy_job(job_id, prompt_id))
@@ -1329,8 +1387,22 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 if (not scenes) and isinstance(plan_obj.get("scenes"), list):
                     scenes = plan_obj.get("scenes")
             except Exception:
-                # If planning fails, proceed with empty lists (caller may add later)
+                # If planning fails, proceed to fallback scenes below
                 pass
+        # Fallback: if scenes are still empty, synthesize a minimal sequence to ensure jobs are created
+        if not scenes:
+            total_duration = float(args.get("duration_seconds") or movie_prefs.get("duration_seconds") or 10)
+            est_scenes = max(3, min(30, int(round(total_duration / 5))))
+            scenes = [{"index_num": i + 1, "prompt": f"Scene {i + 1} of {est_scenes}. {synopsis or 'Visual narrative.'}"} for i in range(est_scenes)]
+        # If characters still empty, create minimal defaults derived from synopsis
+        if not characters:
+            base_desc = (synopsis or title or "").strip() or "Main character"
+            if "husky" in (synopsis or "").lower():
+                characters = [{"name": "Husky", "description": base_desc}]
+            else:
+                characters = [
+                    {"name": "Protagonist", "description": base_desc},
+                ]
         # add characters
         for ch in characters[:25]:
             ch_args = {} if not isinstance(ch, dict) else dict(ch)
@@ -1338,9 +1410,18 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             await execute_tool_call({"name": "film_add_character", "arguments": ch_args})
         # add scenes
         created = []
+        # default toggles to enable full audiovisual output if unspecified
+        pref_audio = args.get("audio_enabled")
+        pref_subs = args.get("subtitles_enabled")
+        default_audio = True if pref_audio is None else bool(pref_audio)
+        default_subs = True if pref_subs is None else bool(pref_subs)
         for sc in scenes[:200]:
             sc_args = {"prompt": str(sc)} if not isinstance(sc, dict) else dict(sc)
             sc_args["film_id"] = film_id  # ensure correct film id cannot be overridden
+            if "audio_enabled" not in sc_args:
+                sc_args["audio_enabled"] = default_audio
+            if "subtitles_enabled" not in sc_args:
+                sc_args["subtitles_enabled"] = default_subs
             res = await execute_tool_call({"name": "film_add_scene", "arguments": sc_args})
             created.append(res)
         return {"name": name, "result": {"film_id": film_id, "created": created}}
@@ -1412,6 +1493,29 @@ async def chat_completions(body: ChatRequest, request: Request):
 
     # 1) Planner proposes plan + tool calls
     plan_text, tool_calls = await planner_produce_plan(messages, body.tools, body.temperature or DEFAULT_TEMPERATURE)
+    # Surface attachments in tool arguments so downstream jobs can use user media
+    if tool_calls and attachments:
+        enriched: List[Dict[str, Any]] = []
+        for tc in tool_calls:
+            args = tc.get("arguments") or {}
+            if not isinstance(args, dict):
+                args = {"_raw": args}
+            # Attachments by type for convenience
+            imgs = [a for a in attachments if a.get("type") == "image"]
+            auds = [a for a in attachments if a.get("type") == "audio"]
+            vids = [a for a in attachments if a.get("type") == "video"]
+            files = [a for a in attachments if a.get("type") == "file"]
+            if imgs:
+                args.setdefault("images", imgs)
+            if auds:
+                args.setdefault("audio", auds)
+            if vids:
+                args.setdefault("video", vids)
+            if files:
+                args.setdefault("files", files)
+            tc = {**tc, "arguments": args}
+            enriched.append(tc)
+        tool_calls = enriched
     # tool_choice=required compatibility: force at least one tool_call if tools are provided
     if (body.tool_choice == "required") and (not tool_calls):
         # Choose a sensible default tool with minimal required params
@@ -1471,6 +1575,8 @@ async def chat_completions(body: ChatRequest, request: Request):
         evidence_blocks.append(ChatMessage(role="system", content=f"Planner plan:\n{plan_text}"))
     if tool_results:
         evidence_blocks.append(ChatMessage(role="system", content="Tool results:\n" + json.dumps(tool_results, indent=2)))
+    if attachments:
+        evidence_blocks.append(ChatMessage(role="system", content="User attachments (for tools):\n" + json.dumps(attachments, indent=2)))
     # If tool results include errors, nudge executors to include brief, on-topic suggestions
     exec_messages = evidence_blocks + messages
     exec_messages_current = exec_messages
@@ -1505,7 +1611,7 @@ async def chat_completions(body: ChatRequest, request: Request):
 
     # Safety correction: if executors refuse despite available tools, trigger semantic tool path
     # Detect generic refusal; if tools can fulfill and no tools were executed yet, synthesize a best-match tool call
-    refusal_markers = ("can't", "cannot", "unable", "i can’t", "i can't", "i cannot")
+    refusal_markers = ("can't", "cannot", "unable", "i can't", "i can't", "i cannot")
     refused = any(tok in (qwen_text.lower() + "\n" + gptoss_text.lower()) for tok in refusal_markers)
     if refused and not tool_results:
         # Safe semantic forcing: only for tools we can call without hidden context (no film_id requirements)
@@ -1742,6 +1848,12 @@ async def chat_completions(body: ChatRequest, request: Request):
         except Exception:
             pass
     footer = ("\n\n### Tool Results\n" + "\n".join(tool_summary_lines)) if tool_summary_lines else ""
+    # Decide emptiness/refusal based on the main body only, not the footer
+    main_only = cleaned
+    text_lower = (main_only or "").lower()
+    refusal_markers = ("can't", "cannot", "unable", "not feasible", "can't create", "cannot create", "won't be able", "won't be able")
+    looks_empty = (not str(main_only or "").strip())
+    looks_refusal = any(tok in text_lower for tok in refusal_markers)
     display_content = f"{cleaned}{footer}"
     # Provide an appendix with raw model answers to avoid any perception of truncation
     try:
@@ -1760,10 +1872,7 @@ async def chat_completions(body: ChatRequest, request: Request):
             display_content += "".join(appendix_parts)
     except Exception:
         pass
-    text_lower = (display_content or "").lower()
-    refusal_markers = ("can't", "cannot", "unable", "not feasible", "can't create", "cannot create", "won’t be able", "won't be able")
-    looks_empty = (not str(display_content or "").strip())
-    looks_refusal = any(tok in text_lower for tok in refusal_markers)
+    # Evaluate fallback after footer creation, but using main-only flags
     if looks_empty or looks_refusal:
         # Build a constructive status from tool_results
         film_id = None
@@ -2592,4 +2701,67 @@ async def compile_film(film_id: str):
             return JSONResponse(status_code=502, content={"error": str(ex)})
     # If no n8n, return payload for client-side assembly
     return {"ok": True, "payload": payload}
+
+
+@app.post("/films/{film_id}/assets/music")
+async def attach_music(film_id: str, body: Dict[str, Any]):
+    pool = await get_pg_pool()
+    if pool is None:
+        return JSONResponse(status_code=500, content={"error": "pg not configured"})
+    url = (body or {}).get("url")
+    if not url:
+        return JSONResponse(status_code=400, content={"error": "missing url"})
+    async with pool.acquire() as conn:
+        meta = await conn.fetchval("SELECT metadata FROM films WHERE id=$1", film_id)
+        if not isinstance(meta, dict):
+            meta = {}
+        mus = meta.get("music") if isinstance(meta.get("music"), list) else []
+        mus = list(mus) + [url]
+        meta["music"] = mus
+        await conn.execute("UPDATE films SET metadata=$1, updated_at=NOW() WHERE id=$2", json.dumps(meta), film_id)
+    return {"ok": True, "music": [url]}
+
+@app.post("/characters/{character_id}/references")
+async def add_character_reference(character_id: str, body: Dict[str, Any]):
+    pool = await get_pg_pool()
+    if pool is None:
+        return JSONResponse(status_code=500, content={"error": "pg not configured"})
+    refs = (body or {}).get("references") or {}
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT reference_data FROM characters WHERE id=$1", character_id)
+        if not row:
+            return JSONResponse(status_code=404, content={"error": "not found"})
+        cur = row["reference_data"] if isinstance(row["reference_data"], dict) else {}
+        merged = {**cur, **refs}
+        await conn.execute("UPDATE characters SET reference_data=$1, updated_at=NOW() WHERE id=$2", json.dumps(merged), character_id)
+    return {"ok": True}
+
+@app.post("/scenes/{scene_id}/remake")
+async def remake_scene(scene_id: str, body: Dict[str, Any]):
+    pool = await get_pg_pool()
+    if pool is None:
+        return JSONResponse(status_code=500, content={"error": "pg not configured"})
+    # allow prompt overrides, parameter tweaks, and external assets
+    prompt_override = (body or {}).get("prompt")
+    plan_overrides = (body or {}).get("plan") or {}
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT id, film_id, index_num, prompt, plan FROM scenes WHERE id=$1", scene_id)
+        if not row:
+            return JSONResponse(status_code=404, content={"error": "not found"})
+        prompt = prompt_override if prompt_override is not None else (row["prompt"] or "")
+        base_plan = row["plan"] if isinstance(row["plan"], dict) else {}
+        new_plan = {**base_plan, **plan_overrides}
+        workflow = new_plan or {}
+    submit = await _comfy_submit_workflow(workflow)
+    if submit.get("error"):
+        return JSONResponse(status_code=502, content=submit)
+    prompt_id = submit.get("prompt_id") or submit.get("uuid") or submit.get("id")
+    import uuid as _uuid
+    new_job_id = _uuid.uuid4().hex
+    async with pool.acquire() as conn:
+        await conn.execute("INSERT INTO jobs (id, prompt_id, status, workflow) VALUES ($1, $2, 'queued', $3)", new_job_id, prompt_id, json.dumps(workflow))
+        await conn.execute("UPDATE scenes SET prompt=$1, plan=$2, status='queued', job_id=$3, updated_at=NOW() WHERE id=$4", prompt, json.dumps(new_plan), new_job_id, scene_id)
+    _jobs_store[new_job_id] = {"id": new_job_id, "prompt_id": prompt_id, "state": "queued", "created_at": time.time(), "updated_at": time.time()}
+    asyncio.create_task(_track_comfy_job(new_job_id, prompt_id))
+    return {"job_id": new_job_id, "prompt_id": prompt_id}
 

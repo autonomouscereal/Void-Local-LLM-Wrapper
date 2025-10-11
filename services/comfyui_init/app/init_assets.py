@@ -47,7 +47,8 @@ def dl(repo: str, filename: str, target_dir: str, rename: Optional[str] = None, 
     # Fallback: try raw URL
     try:
         url = f"https://huggingface.co/{repo}/resolve/main/{filename}"
-        r = requests.get(url, timeout=120)
+        headers = {"Authorization": f"Bearer {token}"} if token else None
+        r = requests.get(url, timeout=120, headers=headers)
         r.raise_for_status()
         with open(dst, "wb") as f:
             f.write(r.content)
@@ -58,20 +59,24 @@ def dl(repo: str, filename: str, target_dir: str, rename: Optional[str] = None, 
 
 def dl_candidates(repo: str, filenames: list[str], target_dir: str, rename: Optional[str] = None, token: Optional[str] = None) -> None:
     """Try multiple candidate paths under a repo until one succeeds."""
+    ensure_dir(target_dir)
     for fn in filenames:
         try:
+            dst = os.path.join(target_dir, rename or os.path.basename(fn))
             dl(repo, fn, target_dir, rename, token)
-            return
-        except Exception:
+            if file_exists_nonempty(dst):
+                return
+        except Exception as ex:
+            print("Candidate failed:", repo, fn, ex)
             continue
     print("All candidates failed for", repo, filenames)
 
 
-def download_with_retries(url: str, dst: str, timeout: int = 300, max_retries: int = 3, backoff_seconds: int = 2) -> None:
+def download_with_retries(url: str, dst: str, timeout: int = 300, max_retries: int = 3, backoff_seconds: int = 2, headers: Optional[dict] = None) -> None:
     last_err: Optional[Exception] = None
     for attempt in range(1, max_retries + 1):
         try:
-            r = requests.get(url, timeout=timeout)
+            r = requests.get(url, timeout=timeout, headers=headers)
             r.raise_for_status()
             with open(dst, "wb") as f:
                 f.write(r.content)
@@ -211,12 +216,14 @@ def main() -> None:
         else:
             ensure_dir(dest_dir)
             tmp_zip = "/tmp/antelopev2.zip"
+            headers = {"Authorization": f"Bearer {token}"} if token else None
             download_with_retries(
                 "https://huggingface.co/deepinsight/insightface/resolve/main/models/antelopev2.zip",
                 tmp_zip,
                 timeout=600,
                 max_retries=3,
                 backoff_seconds=3,
+                headers=headers,
             )
             with zipfile.ZipFile(tmp_zip, 'r') as z:
                 z.extractall(path=f"{MODELS_ROOT}/insightface/models/")
