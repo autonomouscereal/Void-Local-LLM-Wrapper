@@ -901,6 +901,8 @@ async def planner_produce_plan(messages: List[ChatMessage], tools: Optional[List
 async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
     name = call.get("name")
     raw_args = call.get("arguments") or {}
+    # DB pool (may be None if PG not configured)
+    pool = await get_pg_pool()
     # Normalize tool arguments using the custom parser and strong coercion
     # NOTE: Do not use json.loads here. Always use JSONParser with a schema so we never crash on
     # malformed/partial JSON or return unexpected shapes from LLM/tool output.
