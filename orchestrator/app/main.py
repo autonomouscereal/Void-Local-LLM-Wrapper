@@ -1990,13 +1990,16 @@ async def upload(file: UploadFile = File(...)):
 async def _comfy_submit_workflow(workflow: Dict[str, Any]) -> Dict[str, Any]:
     if not COMFYUI_API_URL:
         return {"error": "COMFYUI_API_URL not configured"}
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(COMFYUI_API_URL.rstrip("/") + "/prompt", json=workflow)
-        try:
-            r.raise_for_status()
-            return r.json()
-        except Exception:
-            return {"error": r.text}
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.post(COMFYUI_API_URL.rstrip("/") + "/prompt", json=workflow)
+            try:
+                r.raise_for_status()
+                return r.json()
+            except Exception:
+                return {"error": r.text}
+    except Exception as ex:
+        return {"error": str(ex)}
 
 
 async def _comfy_history(prompt_id: str) -> Dict[str, Any]:
@@ -2027,7 +2030,15 @@ async def get_film_preferences(film_id: str) -> Dict[str, Any]:
     async with pool.acquire() as conn:
         row = await conn.fetchrow("SELECT metadata FROM films WHERE id=$1", film_id)
     meta = (row and row.get("metadata")) or {}
-    return dict(meta) if isinstance(meta, dict) else {}
+    if isinstance(meta, dict):
+        return dict(meta)
+    if isinstance(meta, str):
+        try:
+            parsed = json.loads(meta)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
 
 
 def _parse_resolution(res: Optional[str]) -> Tuple[int, int]:
@@ -2719,9 +2730,8 @@ async def create_scene(film_id: str, body: Dict[str, Any]):
                 syn_row = await conn.fetchrow("SELECT synopsis FROM films WHERE id=$1", film_id)
                 syn = (syn_row and syn_row[0]) or ""
                 prompt = (syn.strip() or "A cinematic scene that advances the story.")
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow("SELECT metadata FROM films WHERE id=$1", film_id)
-            prefs = (row and row["metadata"]) or {}
+        prefs = await get_film_preferences(film_id)
+        prefs = await get_film_preferences(film_id)
         res_w, res_h = _parse_resolution(prefs.get("resolution") or "1024x1024")
         steps = 25
         if isinstance(prefs.get("quality"), str) and prefs.get("quality") == "high":
