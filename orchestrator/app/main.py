@@ -1433,68 +1433,72 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         if fc.get("error"):
             return {"name": name, "error": fc.get("error")}
         film_id = (fc.get("result") or {}).get("film_id")
-        # If caller did not provide characters/scenes, derive a minimal production plan using the LLM
-        if (not characters) or (not scenes):
-            total_duration = float(args.get("duration_seconds") or movie_prefs.get("duration_seconds") or 10)
-            try:
-                # Aim for ~4-6 seconds per scene
-                est_scenes = max(1, min(12, int(round(total_duration / 5))))
-                guidance = (
-                    "Create a concise JSON plan for a short film. Return ONLY JSON with keys 'characters' and 'scenes'.\n"
-                    "Schema: {characters:[{name:string, description:string}], scenes:[{index_num:int, prompt:string}]}.\n"
-                    f"Title: {title}.\nSynopsis: {synopsis}.\n"
-                    f"Preferences: duration_seconds={total_duration}, resolution={movie_prefs.get('resolution') or '1920x1080'}, fps={movie_prefs.get('fps') or 24}, style={movie_prefs.get('style') or 'default'}.\n"
-                    f"Scenes: produce {est_scenes} scenes, evenly covering the story arc.\n"
-                )
-                payload = build_ollama_payload([ChatMessage(role="user", content=guidance)], QWEN_MODEL_ID, DEFAULT_NUM_CTX, DEFAULT_TEMPERATURE)
-                llm_res = await call_ollama(QWEN_BASE_URL, payload)
-                plan_text = (llm_res.get("response") or "").strip()
-                parser = JSONParser()
-                expected = {"characters": [ {"name": str, "description": str} ], "scenes": [ {"index_num": int, "prompt": str} ]}
-                plan_obj = parser.parse(plan_text, expected)
-                if (not characters) and isinstance(plan_obj.get("characters"), list):
-                    characters = plan_obj.get("characters")
-                if (not scenes) and isinstance(plan_obj.get("scenes"), list):
-                    scenes = plan_obj.get("scenes")
-            except Exception:
-                # If planning fails, proceed to fallback scenes below
-                pass
-        # Fallback: if scenes are still empty, synthesize a minimal sequence to ensure jobs are created
-        if not scenes:
-            total_duration = float(args.get("duration_seconds") or movie_prefs.get("duration_seconds") or 10)
-            est_scenes = max(3, min(30, int(round(total_duration / 5))))
-            scenes = [{"index_num": i + 1, "prompt": f"Scene {i + 1} of {est_scenes}. {synopsis or 'Visual narrative.'}"} for i in range(est_scenes)]
-        # If characters still empty, create minimal defaults derived from synopsis
-        if not characters:
-            base_desc = (synopsis or title or "").strip() or "Main character"
-            if "husky" in (synopsis or "").lower():
-                characters = [{"name": "Husky", "description": base_desc}]
-            else:
-                characters = [
-                    {"name": "Protagonist", "description": base_desc},
-                ]
-        # add characters
-        for ch in characters[:25]:
-            ch_args = {} if not isinstance(ch, dict) else dict(ch)
-            ch_args["film_id"] = film_id  # ensure correct film id cannot be overridden
-            await execute_tool_call({"name": "film_add_character", "arguments": ch_args})
-        # add scenes
-        created = []
-        # default toggles to enable full audiovisual output if unspecified
-        pref_audio = args.get("audio_enabled")
-        pref_subs = args.get("subtitles_enabled")
-        default_audio = True if pref_audio is None else bool(pref_audio)
-        default_subs = True if pref_subs is None else bool(pref_subs)
-        for sc in scenes[:200]:
-            sc_args = {"prompt": str(sc)} if not isinstance(sc, dict) else dict(sc)
-            sc_args["film_id"] = film_id  # ensure correct film id cannot be overridden
-            if "audio_enabled" not in sc_args:
-                sc_args["audio_enabled"] = default_audio
-            if "subtitles_enabled" not in sc_args:
-                sc_args["subtitles_enabled"] = default_subs
-            res = await execute_tool_call({"name": "film_add_scene", "arguments": sc_args})
-            created.append(res)
-        return {"name": name, "result": {"film_id": film_id, "created": created}}
+        try:
+            # If caller did not provide characters/scenes, derive a production plan using the LLM
+            if (not characters) or (not scenes):
+                total_duration = float(args.get("duration_seconds") or movie_prefs.get("duration_seconds") or 10)
+                try:
+                    # Aim for ~4-6 seconds per scene
+                    est_scenes = max(1, min(12, int(round(total_duration / 5))))
+                    guidance = (
+                        "Create a concise JSON plan for a short film. Return ONLY JSON with keys 'characters' and 'scenes'.\n"
+                        "Schema: {characters:[{name:string, description:string}], scenes:[{index_num:int, prompt:string}]}.\n"
+                        f"Title: {title}.\nSynopsis: {synopsis}.\n"
+                        f"Preferences: duration_seconds={total_duration}, resolution={movie_prefs.get('resolution') or '1920x1080'}, fps={movie_prefs.get('fps') or 24}, style={movie_prefs.get('style') or 'default'}.\n"
+                        f"Scenes: produce {est_scenes} scenes, evenly covering the story arc.\n"
+                    )
+                    payload = build_ollama_payload([ChatMessage(role="user", content=guidance)], QWEN_MODEL_ID, DEFAULT_NUM_CTX, DEFAULT_TEMPERATURE)
+                    llm_res = await call_ollama(QWEN_BASE_URL, payload)
+                    plan_text = (llm_res.get("response") or "").strip()
+                    parser = JSONParser()
+                    expected = {"characters": [ {"name": str, "description": str} ], "scenes": [ {"index_num": int, "prompt": str} ]}
+                    plan_obj = parser.parse(plan_text, expected)
+                    if (not characters) and isinstance(plan_obj.get("characters"), list):
+                        characters = plan_obj.get("characters")
+                    if (not scenes) and isinstance(plan_obj.get("scenes"), list):
+                        scenes = plan_obj.get("scenes")
+                except Exception:
+                    # If planning fails, proceed to fallback scenes below
+                    pass
+            # Fallback: if scenes are still empty, synthesize a minimal sequence to ensure jobs are created
+            if not scenes:
+                total_duration = float(args.get("duration_seconds") or movie_prefs.get("duration_seconds") or 10)
+                est_scenes = max(3, min(30, int(round(total_duration / 5))))
+                scenes = [{"index_num": i + 1, "prompt": f"Scene {i + 1} of {est_scenes}. {synopsis or 'Visual narrative.'}"} for i in range(est_scenes)]
+            # If characters still empty, create minimal defaults derived from synopsis
+            if not characters:
+                base_desc = (synopsis or title or "").strip() or "Main character"
+                if "husky" in (synopsis or "").lower():
+                    characters = [{"name": "Husky", "description": base_desc}]
+                else:
+                    characters = [
+                        {"name": "Protagonist", "description": base_desc},
+                    ]
+            # add characters
+            for ch in characters[:25]:
+                ch_args = {} if not isinstance(ch, dict) else dict(ch)
+                ch_args["film_id"] = film_id  # ensure correct film id cannot be overridden
+                await execute_tool_call({"name": "film_add_character", "arguments": ch_args})
+            # add scenes
+            created = []
+            # default toggles to enable full audiovisual output if unspecified
+            pref_audio = args.get("audio_enabled")
+            pref_subs = args.get("subtitles_enabled")
+            default_audio = True if pref_audio is None else bool(pref_audio)
+            default_subs = True if pref_subs is None else bool(pref_subs)
+            for sc in scenes[:200]:
+                sc_args = {"prompt": str(sc)} if not isinstance(sc, dict) else dict(sc)
+                sc_args["film_id"] = film_id  # ensure correct film id cannot be overridden
+                if "audio_enabled" not in sc_args:
+                    sc_args["audio_enabled"] = default_audio
+                if "subtitles_enabled" not in sc_args:
+                    sc_args["subtitles_enabled"] = default_subs
+                res = await execute_tool_call({"name": "film_add_scene", "arguments": sc_args})
+                created.append(res)
+            return {"name": name, "result": {"film_id": film_id, "created": created}}
+        except Exception as ex:
+            # Surface film_id even on failure, plus traceback for debugging
+            return {"name": name, "error": str(ex), "result": {"film_id": film_id}, "traceback": traceback.format_exc()}
     if name == "run_python" and EXECUTOR_BASE_URL and ALLOW_TOOL_EXECUTION:
         async with httpx.AsyncClient(timeout=120) as client:
             r = await client.post(EXECUTOR_BASE_URL.rstrip("/") + "/run_python", json={"code": args.get("code", "")})
