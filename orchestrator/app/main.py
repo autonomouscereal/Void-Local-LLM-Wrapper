@@ -1274,17 +1274,22 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     pass
             submit = await _comfy_submit_workflow(workflow)
         if submit.get("error"):
-            # Persist scene with error status so caller can inspect and retry, but do not hard-fail the entire tool
-            prompt_id = None
+            # Persist scene and a corresponding failed job so status surfaces in /api/jobs
             error_msg = submit.get("error")
             import uuid as _uuid
             scene_id = _uuid.uuid4().hex
             job_id = _uuid.uuid4().hex
+            prompt_id = f"scene:{scene_id}"
             async with pool.acquire() as conn:
                 await conn.execute(
                     "INSERT INTO scenes (id, film_id, index_num, prompt, plan, status, job_id) VALUES ($1, $2, $3, $4, $5, 'error', $6)",
                     scene_id, film_id, index_num, prompt, json.dumps(plan or {}), job_id
                 )
+                await conn.execute(
+                    "INSERT INTO jobs (id, prompt_id, status, workflow) VALUES ($1, $2, 'failed', $3)",
+                    job_id, prompt_id, json.dumps(plan or {})
+                )
+            _jobs_store[job_id] = {"id": job_id, "prompt_id": prompt_id, "state": "failed", "created_at": time.time(), "updated_at": time.time(), "result": {"error": error_msg}}
             return {"name": name, "error": error_msg, "result": {"scene_id": scene_id, "job_id": job_id}}
         prompt_id = submit.get("prompt_id") or submit.get("uuid") or submit.get("id")
         import uuid as _uuid
