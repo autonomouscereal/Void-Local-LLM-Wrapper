@@ -2066,8 +2066,8 @@ def build_default_scene_workflow(prompt: str, characters: List[Dict[str, Any]], 
         "4": {"class_type": "CLIPTextEncode", "inputs": {"text": "", "clip": ["1", 1]}},
         "7": {"class_type": "EmptyLatentImage", "inputs": {"width": width, "height": height, "batch_size": 1}},
         "8": {"class_type": "KSampler", "inputs": {"seed": seed, "steps": steps, "cfg": 6.5, "sampler_name": "dpmpp_2m", "scheduler": "karras", "denoise": 1.0, "model": ["1", 0], "positive": ["3", 0], "negative": ["4", 0], "latent_image": ["7", 0]}},
-        "9": {"class_type": "VAE Decode", "inputs": {"samples": ["8", 0], "vae": ["1", 2]}},
-        "10": {"class_type": "Save Image", "inputs": {"filename_prefix": filename_prefix, "images": ["9", 0]}},
+        "9": {"class_type": "VAEDecode", "inputs": {"samples": ["8", 0], "vae": ["1", 2]}},
+        "10": {"class_type": "SaveImage", "inputs": {"filename_prefix": filename_prefix, "images": ["9", 0]}},
     }
     return {"prompt": g}
 
@@ -2120,7 +2120,7 @@ def build_animated_scene_workflow(
         "4": {"class_type": "CLIPTextEncode", "inputs": {"text": "", "clip": ["1", 1]}},
         "7": {"class_type": "EmptyLatentImage", "inputs": {"width": width, "height": height, "batch_size": frames}},
         "8": {"class_type": "KSampler", "inputs": {"seed": seed, "steps": 20, "cfg": 6.0, "sampler_name": "dpmpp_2m", "scheduler": "karras", "denoise": 1.0, "model": ["1", 0], "positive": ["3", 0], "negative": ["4", 0], "latent_image": ["7", 0]}},
-        "9": {"class_type": "VAE Decode", "inputs": {"samples": ["8", 0], "vae": ["1", 2]}},
+        "9": {"class_type": "VAEDecode", "inputs": {"samples": ["8", 0], "vae": ["1", 2]}},
     }
     last_image_node = "9"
     # Optional Real-ESRGAN upscale
@@ -2133,7 +2133,7 @@ def build_animated_scene_workflow(
         g["13"] = {"class_type": "VHS_RIFE_VFI", "inputs": {"frames": [last_image_node, 0], "multiplier": interpolation_multiplier, "model": "rife-v4.6"}}
         last_image_node = "13"
     # Final save
-    g["10"] = {"class_type": "Save Image", "inputs": {"filename_prefix": filename_prefix, "images": [last_image_node, 0]}}
+    g["10"] = {"class_type": "SaveImage", "inputs": {"filename_prefix": filename_prefix, "images": [last_image_node, 0]}}
     return {"prompt": g}
 
 
