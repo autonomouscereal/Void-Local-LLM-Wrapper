@@ -1099,10 +1099,10 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         film_id = _uuid.uuid4().hex
         title = args.get("title") or "Untitled"
         synopsis = args.get("synopsis") or ""
-    metadata = args.get("metadata") or {}
+        metadata = args.get("metadata") or {}
         # IMPORTANT: metadata may arrive as a JSON string — parse before any .get usage
-    if isinstance(metadata, (str, dict)):
-        metadata = _normalize_dict_body(metadata, {})
+        if isinstance(metadata, (str, dict)):
+            metadata = _normalize_dict_body(metadata, {})
         # normalize preferences with sensible defaults
         # Accept synonyms from callers (duration -> duration_seconds, voice_type -> voice, audio_on -> audio_enabled, subtitles_on -> subtitles_enabled)
         duration_arg = args.get("duration_seconds")
