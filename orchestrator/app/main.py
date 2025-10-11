@@ -494,8 +494,8 @@ async def rag_search(query: str, k: int = 8) -> List[Dict[str, Any]]:
     async with pool.acquire() as conn:
         rows = await conn.fetch("SELECT path, chunk FROM rag_docs ORDER BY embedding <=> $1 LIMIT $2", list(vec), k)
         results = [{"path": r["path"], "chunk": r["chunk"]} for r in rows]
-    _rag_cache[key] = (now, results)
-    return results
+        _rag_cache[key] = (now, results)
+        return results
 
 
 @retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=0.5, max=2))
@@ -2275,7 +2275,15 @@ async def list_jobs(status: Optional[str] = None, limit: int = 50, offset: int =
         else:
             rows = await conn.fetch("SELECT id, prompt_id, status, created_at, updated_at FROM jobs ORDER BY updated_at DESC LIMIT $1 OFFSET $2", limit, offset)
             total = await conn.fetchval("SELECT COUNT(*) FROM jobs")
-        return {"data": [dict(r) for r in rows], "total": int(total)}
+        db_items = [dict(r) for r in rows]
+        # Union with in-memory items to avoid empty UI when DB insert fails
+        db_ids = {it.get("id") for it in db_items}
+        mem_items = list(_jobs_store.values())
+        if status:
+            mem_items = [j for j in mem_items if j.get("state") == status]
+        mem_only = [j for j in mem_items if j.get("id") not in db_ids]
+        all_items = db_items + mem_only
+        return {"data": all_items, "total": int(total) + len([1 for j in mem_only])}
 
 
 @app.post("/jobs/{job_id}/cancel")
@@ -2693,10 +2701,90 @@ async def create_scene(film_id: str, body: Dict[str, Any]):
     prompt = (body or {}).get("prompt") or ""
     index_num = int((body or {}).get("index_num") or 0)
     plan = (body or {}).get("plan") or {}
-    # fire a ComfyUI job using the plan as workflow
+    # fire a ComfyUI job using the plan as workflow; if invalid/missing, build a default workflow
     workflow = (body or {}).get("workflow") or plan
+    def _has_outputs(wf: Dict[str, Any]) -> bool:
+        try:
+            g = (wf or {}).get("prompt") or {}
+            return isinstance(g, dict) and len(g) > 0
+        except Exception:
+            return False
+    if not workflow or not _has_outputs(workflow):
+        # Mirror film_add_scene defaults
+        async with pool.acquire() as conn:
+            if index_num <= 0:
+                max_idx = await conn.fetchval("SELECT COALESCE(MAX(index_num), 0) FROM scenes WHERE film_id=$1", film_id)
+                index_num = int(max_idx or 0) + 1
+            if not prompt:
+                syn_row = await conn.fetchrow("SELECT synopsis FROM films WHERE id=$1", film_id)
+                syn = (syn_row and syn_row[0]) or ""
+                prompt = (syn.strip() or "A cinematic scene that advances the story.")
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT metadata FROM films WHERE id=$1", film_id)
+            prefs = (row and row["metadata"]) or {}
+        res_w, res_h = _parse_resolution(prefs.get("resolution") or "1024x1024")
+        steps = 25
+        if isinstance(prefs.get("quality"), str) and prefs.get("quality") == "high":
+            steps = 35
+        chars = await get_film_characters(film_id)
+        seed = _derive_seed(film_id, str(index_num), prompt)
+        filename_prefix = f"scene_{index_num:03d}"
+        if bool(prefs.get("animation_enabled", True)):
+            fps = _round_fps(prefs.get("fps") or 24)
+            duration = float(prefs.get("duration_seconds") or 4)
+            up_enabled = bool(prefs.get("upscale_enabled", False))
+            up_scale = int(prefs.get("upscale_scale") or 0)
+            it_enabled = bool(prefs.get("interpolation_enabled", False))
+            it_multiplier = 0
+            try:
+                target_fps = int(prefs.get("interpolation_target_fps") or 0)
+                if target_fps and target_fps > fps:
+                    it_multiplier = max(2, min(4, int(round(target_fps / fps))))
+            except Exception:
+                it_multiplier = 0
+            workflow = build_animated_scene_workflow(
+                prompt=prompt,
+                characters=chars,
+                width=res_w,
+                height=res_h,
+                fps=fps,
+                duration_seconds=duration,
+                style=(body.get("style") if isinstance(body, dict) else None) or (prefs.get("style") or None),
+                seed=seed,
+                filename_prefix=filename_prefix,
+                upscale_enabled=up_enabled,
+                upscale_scale=up_scale,
+                interpolation_enabled=it_enabled,
+                interpolation_multiplier=it_multiplier,
+            )
+        else:
+            workflow = build_default_scene_workflow(
+                prompt=prompt,
+                characters=chars,
+                style=(body.get("style") if isinstance(body, dict) else None) or (prefs.get("style") or None),
+                width=res_w,
+                height=res_h,
+                steps=steps,
+                seed=seed,
+                filename_prefix=filename_prefix,
+            )
     submit = await _comfy_submit_workflow(workflow)
     if submit.get("error"):
+        # Insert a failed job & error scene so it shows up in /jobs
+        import uuid as _uuid
+        prompt_id = f"scene:{_uuid.uuid4().hex}"
+        scene_id = _uuid.uuid4().hex
+        job_id = _uuid.uuid4().hex
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO scenes (id, film_id, index_num, prompt, plan, status, job_id) VALUES ($1, $2, $3, $4, $5, 'error', $6)",
+                scene_id, film_id, index_num, prompt, json.dumps(plan or {}), job_id
+            )
+            await conn.execute(
+                "INSERT INTO jobs (id, prompt_id, status, workflow) VALUES ($1, $2, 'failed', $3)",
+                job_id, prompt_id, json.dumps(workflow)
+            )
+        _jobs_store[job_id] = {"id": job_id, "prompt_id": prompt_id, "state": "failed", "created_at": time.time(), "updated_at": time.time(), "result": {"error": submit.get("error")}}
         return JSONResponse(status_code=502, content=submit)
     prompt_id = submit.get("prompt_id") or submit.get("uuid") or submit.get("id")
     import uuid as _uuid
