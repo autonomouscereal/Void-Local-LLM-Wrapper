@@ -128,4 +128,33 @@ Executor service
   - POST `/read_file` { path }
 - Environment knobs: `EXEC_TIMEOUT_SEC`, `EXEC_MEMORY_MB`, `ALLOW_SHELL` (optional `/run_shell` disabled by default).
 
+Scaling & Multi‑GPU ComfyUI
+---------------------------
+- Current default: single ComfyUI instance (CPU‑mode is fine for validation).
+- To scale without code changes:
+  1) Add more ComfyUI services (e.g., `comfyui-1`, `comfyui-2`) using the same image and shared volumes.
+     - For GPU pinning, set per‑service:
+       - `runtime: nvidia`
+       - `environment: [NVIDIA_VISIBLE_DEVICES=<gpu_id>, NVIDIA_DRIVER_CAPABILITIES=compute,utility]`
+  2) Set the orchestrator envs:
+     - `COMFYUI_API_URLS` to a comma‑separated list of instance URLs (e.g., `http://comfyui:8188,http://comfyui-1:8188`)
+     - `SCENE_SUBMIT_CONCURRENCY` to your desired parallelism (e.g., `4`)
+  3) Leave GPUs 0,1 reserved for `ollama_qwen` and `ollama_gptoss`. Use other GPU IDs for ComfyUI instances.
+- Behavior:
+  - The orchestrator picks the least‑loaded ComfyUI instance for each submit and pins the job’s `prompt_id` to that instance for history polling.
+  - If one instance fails, it falls back to others automatically.
+- Example `.env` for 2 ComfyUI GPUs (IDs 2 and 3):
+  ```env
+  COMFYUI_API_URLS=http://comfyui:8188,http://comfyui-1:8188
+  SCENE_SUBMIT_CONCURRENCY=4
+  # In compose override, set comfyui-1 with NVIDIA_VISIBLE_DEVICES=3 (comfyui uses 2)
+  ```
+
+Inline Safety Notes
+-------------------
+- Orchestrator warns against SQLAlchemy and uses asyncpg exclusively for DB access.
+- JSON parsing uses a hardened parser to survive malformed LLM outputs.
+- Film consistency: character face embeddings are computed once and propagated to each scene; seeds are deterministic by `(film_id, index_num, prompt)`.
+- Jobs persist as failed even on submit/network errors so the UI never shows an empty queue during errors.
+
 

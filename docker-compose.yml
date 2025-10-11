@@ -120,7 +120,10 @@ services:
       - WHISPER_API_URL=http://whisper:9090
       - FACEID_API_URL=http://faceid:7000
       - MUSIC_API_URL=http://music:7860
-      - COMFYUI_API_URL=http://comfyui:8188
+      - COMFYUI_API_URL=${COMFYUI_API_URL:-http://comfyui:8188}
+      - COMFYUI_API_URLS=${COMFYUI_API_URLS:-}
+      - COMFYUI_REPLICAS=${COMFYUI_REPLICAS:-1}
+      - SCENE_SUBMIT_CONCURRENCY=${SCENE_SUBMIT_CONCURRENCY:-4}
       - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-}
       - UPLOAD_DIR=/workspace/uploads
       - VLM_API_URL=http://vlm:8050
@@ -175,15 +178,17 @@ services:
     volumes:
       - comfyui_models:/comfyui/models
       - comfyui_custom_nodes:/comfyui/custom_nodes
+    # For GPU deployments, create additional comfyui-* services and set COMFYUI_API_URLS accordingly
 
   comfyui_init:
     build:
       context: ./services/comfyui_init
       dockerfile: Dockerfile
     container_name: comfyui_init
-    # One-shot init: populate shared model/custom_nodes volumes before comfyui starts
     environment:
       - HUGGINGFACE_TOKEN=${HUGGINGFACE_TOKEN:-}
+      - COMFYUI_REPLICAS=${COMFYUI_REPLICAS:-1}
+      - COMFYUI_GPU_DEVICES=${COMFYUI_GPU_DEVICES:-}
     volumes:
       - comfyui_models:/comfyui/models
       - comfyui_custom_nodes:/comfyui/custom_nodes

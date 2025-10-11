@@ -63,6 +63,13 @@ RAG_CACHE_TTL_SEC = int(os.getenv("RAG_CACHE_TTL_SEC", "300"))
 
 # Optional external tool services (set URLs to enable)
 COMFYUI_API_URL = os.getenv("COMFYUI_API_URL")  # e.g., http://comfyui:8188
+COMFYUI_API_URLS = [u.strip() for u in os.getenv("COMFYUI_API_URLS", "").split(",") if u.strip()]
+COMFYUI_REPLICAS = int(os.getenv("COMFYUI_REPLICAS", "1"))
+SCENE_SUBMIT_CONCURRENCY = int(os.getenv("SCENE_SUBMIT_CONCURRENCY", "4"))
+SCENE_MAX_BATCH_FRAMES = int(os.getenv("SCENE_MAX_BATCH_FRAMES", "8"))
+RESUME_MAX_RETRIES = int(os.getenv("RESUME_MAX_RETRIES", "3"))
+COMFYUI_API_URLS = [u.strip() for u in os.getenv("COMFYUI_API_URLS", "").split(",") if u.strip()]
+SCENE_SUBMIT_CONCURRENCY = int(os.getenv("SCENE_SUBMIT_CONCURRENCY", "4"))
 XTTS_API_URL = os.getenv("XTTS_API_URL")      # e.g., http://xtts:8020
 WHISPER_API_URL = os.getenv("WHISPER_API_URL")# e.g., http://whisper:9090
 FACEID_API_URL = os.getenv("FACEID_API_URL")  # e.g., http://faceid:7000
@@ -193,6 +200,8 @@ async def global_cors_middleware(request: Request, call_next):
 
 # In-memory job cache (DB is source of truth)
 _jobs_store: Dict[str, Dict[str, Any]] = {}
+_job_endpoint: Dict[str, str] = {}
+_comfy_load: Dict[str, int] = {}
 
 
 def build_ollama_payload(messages: List[ChatMessage], model: str, num_ctx: int, temperature: float) -> Dict[str, Any]:
@@ -1987,26 +1996,61 @@ async def upload(file: UploadFile = File(...)):
 
 
 # ---------- Jobs API for long ComfyUI workflows ----------
+_job_endpoint: Dict[str, str] = {}
+_comfy_load: Dict[str, int] = {}
+
+
+def _comfy_candidates() -> List[str]:
+    if COMFYUI_API_URLS:
+        return COMFYUI_API_URLS
+    if COMFYUI_API_URL:
+        return [COMFYUI_API_URL]
+    return []
+
+
+async def _pick_comfy_base() -> Optional[str]:
+    candidates = _comfy_candidates()
+    if not candidates:
+        return None
+    for u in candidates:
+        _comfy_load.setdefault(u, 0)
+    return min(candidates, key=lambda u: _comfy_load.get(u, 0))
+
+
 async def _comfy_submit_workflow(workflow: Dict[str, Any]) -> Dict[str, Any]:
-    if not COMFYUI_API_URL:
-        return {"error": "COMFYUI_API_URL not configured"}
-    try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            r = await client.post(COMFYUI_API_URL.rstrip("/") + "/prompt", json=workflow)
-            try:
-                r.raise_for_status()
-                return r.json()
-            except Exception:
-                return {"error": r.text}
-    except Exception as ex:
-        return {"error": str(ex)}
+    candidates = _comfy_candidates()
+    if not candidates:
+        return {"error": "COMFYUI_API_URL(S) not configured"}
+    # sort by current load ascending
+    ordered = sorted(candidates, key=lambda u: _comfy_load.get(u, 0))
+    last_err: Optional[str] = None
+    for base in ordered:
+        try:
+            async with httpx.AsyncClient(timeout=60) as client:
+                _comfy_load[base] = _comfy_load.get(base, 0) + 1
+                r = await client.post(base.rstrip("/") + "/prompt", json=workflow)
+                try:
+                    r.raise_for_status()
+                    res = r.json()
+                    pid = res.get("prompt_id") or res.get("uuid") or res.get("id")
+                    if isinstance(pid, str):
+                        _job_endpoint[pid] = base
+                    return res
+                except Exception:
+                    last_err = r.text
+        except Exception as ex:
+            last_err = str(ex)
+        finally:
+            _comfy_load[base] = max(0, _comfy_load.get(base, 1) - 1)
+    return {"error": last_err or "all comfyui instances failed"}
 
 
 async def _comfy_history(prompt_id: str) -> Dict[str, Any]:
-    if not COMFYUI_API_URL:
-        return {"error": "COMFYUI_API_URL not configured"}
+    base = _job_endpoint.get(prompt_id) or (await _pick_comfy_base())
+    if not base:
+        return {"error": "COMFYUI_API_URL(S) not configured"}
     async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.get(COMFYUI_API_URL.rstrip("/") + f"/history/{prompt_id}")
+        r = await client.get(base.rstrip("/") + f"/history/{prompt_id}")
         try:
             r.raise_for_status()
             return r.json()
@@ -2109,16 +2153,19 @@ def build_animated_scene_workflow(
     interpolation_enabled: bool = False,
     interpolation_multiplier: int = 0,
 ) -> Dict[str, Any]:
-    # Simple animation via batch sampling using CheckpointLoaderSimple
-    frames = _clamp_frames(int(max(1, duration_seconds) * fps))
+    # Simple animation via chunked batch sampling using CheckpointLoaderSimple
+    total_frames = int(max(1, duration_seconds) * fps)
+    frames = _clamp_frames(total_frames)
+    batch_frames = max(1, min(SCENE_MAX_BATCH_FRAMES, frames))
     positive = prompt
     if style:
         positive = f"{prompt} in {style} style"
+    # Build a graph that renders a smaller batch (batch_frames)
     g = {
         "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "sd_xl_base_1.0.safetensors"}},
         "3": {"class_type": "CLIPTextEncode", "inputs": {"text": positive, "clip": ["1", 1]}},
         "4": {"class_type": "CLIPTextEncode", "inputs": {"text": "", "clip": ["1", 1]}},
-        "7": {"class_type": "EmptyLatentImage", "inputs": {"width": width, "height": height, "batch_size": frames}},
+        "7": {"class_type": "EmptyLatentImage", "inputs": {"width": width, "height": height, "batch_size": batch_frames}},
         "8": {"class_type": "KSampler", "inputs": {"seed": seed, "steps": 20, "cfg": 6.0, "sampler_name": "dpmpp_2m", "scheduler": "karras", "denoise": 1.0, "model": ["1", 0], "positive": ["3", 0], "negative": ["4", 0], "latent_image": ["7", 0]}},
         "9": {"class_type": "VAEDecode", "inputs": {"samples": ["8", 0], "vae": ["1", 2]}},
     }
@@ -2134,7 +2181,7 @@ def build_animated_scene_workflow(
         last_image_node = "13"
     # Final save
     g["10"] = {"class_type": "SaveImage", "inputs": {"filename_prefix": filename_prefix, "images": [last_image_node, 0]}}
-    return {"prompt": g}
+    return {"prompt": g, "_batch_frames": batch_frames, "_total_frames": total_frames}
 
 
 async def _track_comfy_job(job_id: str, prompt_id: str) -> None:
@@ -2146,6 +2193,8 @@ async def _track_comfy_job(job_id: str, prompt_id: str) -> None:
     _jobs_store.setdefault(job_id, {})["state"] = "running"
     _jobs_store[job_id]["updated_at"] = time.time()
     last_outputs_count = -1
+    retries_left = RESUME_MAX_RETRIES
+    last_error = None
     while True:
         data = await _comfy_history(prompt_id)
         _jobs_store[job_id]["updated_at"] = time.time()
@@ -2193,6 +2242,55 @@ async def _track_comfy_job(job_id: str, prompt_id: str) -> None:
                 except Exception:
                     pass
                 break
+        else:
+            # Missing history – try to auto-resubmit the same workflow a few times to survive restarts
+            if isinstance(data, dict) and data.get("error"):
+                last_error = data.get("error")
+            if retries_left > 0:
+                retries_left -= 1
+                wf = None
+                try:
+                    async with pool.acquire() as conn:
+                        row = await conn.fetchrow("SELECT workflow FROM jobs WHERE id=$1", job_id)
+                        if row is not None:
+                            wf = row.get("workflow")
+                except Exception:
+                    wf = None
+                if isinstance(wf, str):
+                    try:
+                        wf = json.loads(wf)
+                    except Exception:
+                        wf = None
+                if isinstance(wf, dict):
+                    submit = await _comfy_submit_workflow(wf)
+                    new_pid = submit.get("prompt_id") or submit.get("uuid") or submit.get("id")
+                    if isinstance(new_pid, str):
+                        prompt_id = new_pid
+                        try:
+                            async with pool.acquire() as conn:
+                                await conn.execute("UPDATE jobs SET prompt_id=$1, updated_at=NOW() WHERE id=$2", prompt_id, job_id)
+                        except Exception:
+                            pass
+                        # immediately loop to poll the new prompt_id
+                        await asyncio.sleep(2.0)
+                        continue
+                # Could not resubmit; wait briefly and retry
+                await asyncio.sleep(2.0)
+                continue
+            # Out of retries – mark failed
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE jobs SET status='failed', updated_at=NOW(), error=$1 WHERE id=$2",
+                    json.dumps(last_error or {"error": "history missing"}),
+                    job_id,
+                )
+            _jobs_store[job_id]["state"] = "failed"
+            _jobs_store[job_id]["error"] = last_error or {"error": "history missing"}
+            try:
+                await _update_scene_from_job(job_id, {}, failed=True)
+            except Exception:
+                pass
+            break
         # keep polling
         await asyncio.sleep(2.0)
 
