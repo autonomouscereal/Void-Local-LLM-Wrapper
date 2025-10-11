@@ -878,6 +878,31 @@ async def planner_produce_plan(messages: List[ChatMessage], tools: Optional[List
         if _detect_video_intent(last_user):
             prefs = _derive_movie_prefs_from_text(last_user)
             tool_calls = [{"name": "make_movie", "arguments": prefs}]
+    else:
+        # If planner proposed film_create for a film request (but not make_movie), upgrade to make_movie
+        last_user = ""
+        for m in reversed(messages):
+            if m.role == "user" and isinstance(m.content, str) and m.content.strip():
+                last_user = m.content.strip()
+                break
+        if _detect_video_intent(last_user):
+            has_make = any((tc.get("name") == "make_movie") for tc in tool_calls if isinstance(tc, dict))
+            if not has_make:
+                new_calls: List[Dict[str, Any]] = []
+                upgraded = False
+                for tc in tool_calls:
+                    if (isinstance(tc, dict) and not upgraded and (tc.get("name") == "film_create")):
+                        args = tc.get("arguments") or {}
+                        if not isinstance(args, dict):
+                            args = {"_raw": args}
+                        prefs = _derive_movie_prefs_from_text(last_user)
+                        synopsis = args.get("synopsis") or args.get("prompt") or last_user
+                        mm_args = {**prefs, "title": args.get("title") or "Untitled", "synopsis": synopsis}
+                        new_calls.append({"name": "make_movie", "arguments": mm_args})
+                        upgraded = True
+                    else:
+                        new_calls.append(tc)
+                tool_calls = new_calls
     return plan, tool_calls
 
 
