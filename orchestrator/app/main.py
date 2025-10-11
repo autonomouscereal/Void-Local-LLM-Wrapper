@@ -1858,6 +1858,7 @@ async def chat_completions(body: ChatRequest, request: Request):
             pass
     # Instead of verbose plan/critique footers, append a minimal Tool Results summary (IDs/errors) only
     tool_summary_lines: List[str] = []
+    tool_tracebacks: List[str] = []
     if tool_results:
         try:
             film_id = None
@@ -1870,6 +1871,9 @@ async def chat_completions(body: ChatRequest, request: Request):
                         film_id = ((tr.get("result") or {}).get("film_id"))
                     if tr.get("error"):
                         errors.append(str(tr.get("error")))
+                    tb = tr.get("traceback")
+                    if isinstance(tb, str) and tb.strip():
+                        tool_tracebacks.append(tb)
                     # direct job_id/prompt_id
                     res = tr.get("result") or {}
                     jid = res.get("job_id") or tr.get("job_id")
@@ -1905,6 +1909,11 @@ async def chat_completions(body: ChatRequest, request: Request):
         except Exception:
             pass
     footer = ("\n\n### Tool Results\n" + "\n".join(tool_summary_lines)) if tool_summary_lines else ""
+    if tool_tracebacks:
+        # Include full tracebacks verbatim (truncated to a safe length per item)
+        def _tb(s: str) -> str:
+            return s if len(s) <= 16000 else (s[:16000] + "\n... [traceback truncated]")
+        footer += "\n\n### Debug — Tracebacks\n" + "\n\n".join([f"```\n{_tb(t)}\n```" for t in tool_tracebacks])
     # Decide emptiness/refusal based on the main body only, not the footer
     main_only = cleaned
     text_lower = (main_only or "").lower()
