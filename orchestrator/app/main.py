@@ -343,11 +343,12 @@ async def get_pg_pool() -> Optional[asyncpg.pool.Pool]:
         except Exception:
             pass
         try:
-            await conn.execute("CREATE INDEX IF NOT EXISTS rag_docs_embedding_idx ON rag_docs USING ivfflat (embedding vector_cosine) WITH (lists = 100);")
+            # pgvector opclass names differ by version: use *_ops form
+            await conn.execute("CREATE INDEX IF NOT EXISTS rag_docs_embedding_idx ON rag_docs USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);")
         except Exception:
-            # Fallback: plain HNSW if ivfflat/vector_cosine opclass unavailable
+            # Fallback: HNSW with L2 opclass
             try:
-                await conn.execute("CREATE INDEX IF NOT EXISTS rag_docs_embedding_hnsw_idx ON rag_docs USING hnsw (embedding vector_l2);")
+                await conn.execute("CREATE INDEX IF NOT EXISTS rag_docs_embedding_hnsw_idx ON rag_docs USING hnsw (embedding vector_l2_ops);")
             except Exception:
                 pass
         await conn.execute(
@@ -1189,6 +1190,13 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         prompt = args.get("prompt") or ""
         index_num = int(args.get("index_num", 0))
         character_ids = args.get("character_ids") or []
+        # Coerce character_ids into a list of strings if provided as a single string
+        if isinstance(character_ids, str):
+            try:
+                parsed_ids = JSONParser().parse(character_ids, [str])
+                character_ids = parsed_ids if isinstance(parsed_ids, list) else [character_ids]
+            except Exception:
+                character_ids = [character_ids]
         # Coerce plan/workflow to dicts when passed as JSON strings
         # IMPORTANT: Use JSONParser with explicit schemas; never call json.loads.
         plan_raw = args.get("plan") or {}
@@ -1316,6 +1324,11 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     ce = []
                     for ch in _chs:
                         rd = ch.get("reference_data") or {}
+                        if isinstance(rd, str):
+                            try:
+                                rd = JSONParser().parse(rd, {})
+                            except Exception:
+                                rd = {}
                         if isinstance(rd.get("face_embedding_mean"), list):
                             ce.append(rd.get("face_embedding_mean"))
                     if ce:
@@ -2551,10 +2564,17 @@ async def _update_scene_from_job(job_id: str, detail: Dict[str, Any], failed: bo
                     if len(ch_ids) == 1:
                         async with pool.acquire() as conn:
                             crow = await conn.fetchrow("SELECT reference_data FROM characters WHERE id=$1", ch_ids[0])
-                            if crow and isinstance(crow.get("reference_data"), dict):
-                                v2 = crow["reference_data"].get("voice")
-                                if v2:
-                                    voice = v2
+                            if crow:
+                                rd = crow.get("reference_data")
+                                if isinstance(rd, str):
+                                    try:
+                                        rd = JSONParser().parse(rd, {})
+                                    except Exception:
+                                        rd = {}
+                                if isinstance(rd, dict):
+                                    v2 = rd.get("voice")
+                                    if v2:
+                                        voice = v2
                 if not voice:
                     async with pool.acquire() as conn:
                         meta = await conn.fetchval("SELECT metadata FROM films WHERE id=$1", row["film_id"]) 
@@ -3007,8 +3027,13 @@ async def remake_scene(scene_id: str, body: Dict[str, Any]):
         if not row:
             return JSONResponse(status_code=404, content={"error": "not found"})
         prompt = prompt_override if prompt_override is not None else (row["prompt"] or "")
-        base_plan = row["plan"] if isinstance(row["plan"], dict) else {}
-        new_plan = {**base_plan, **plan_overrides}
+        plan = row["plan"] or {}
+        if isinstance(plan, str):
+            try:
+                plan = JSONParser().parse(plan, {"preferences": dict, "character_ids": [str]})
+            except Exception:
+                plan = {}
+        new_plan = {**plan, **plan_overrides}
         workflow = new_plan or {}
     submit = await _comfy_submit_workflow(workflow)
     if submit.get("error"):
