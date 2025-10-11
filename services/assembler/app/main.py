@@ -89,6 +89,13 @@ async def assemble(body: Dict[str, Any]):
         frame_idx = 1
         for sc in scenes:
             assets = sc.get("assets") or {}
+            if isinstance(assets, str):
+                # Guard against stringified assets
+                try:
+                    import json as _json
+                    assets = _json.loads(assets)
+                except Exception:
+                    assets = {}
             urls = assets.get("urls") or []
             # Try to sort predictably by filename within each scene
             def _key(u: Dict[str, Any]):
@@ -113,6 +120,12 @@ async def assemble(body: Dict[str, Any]):
         audio_path = None
         for sc in scenes:
             assets = sc.get("assets") or {}
+            if isinstance(assets, str):
+                try:
+                    import json as _json
+                    assets = _json.loads(assets)
+                except Exception:
+                    assets = {}
             tts = assets.get("tts") or {}
             music = assets.get("music") or {}
             data_b64 = tts.get("audio_wav_base64") or music.get("audio_wav_base64")
@@ -129,6 +142,12 @@ async def assemble(body: Dict[str, Any]):
         srt_path = None
         for sc in scenes:
             assets = sc.get("assets") or {}
+            if isinstance(assets, str):
+                try:
+                    import json as _json
+                    assets = _json.loads(assets)
+                except Exception:
+                    assets = {}
             srt = assets.get("subtitles_srt")
             if isinstance(srt, str) and srt.strip():
                 srt_path = os.path.join(tmpd, "subtitles.srt")

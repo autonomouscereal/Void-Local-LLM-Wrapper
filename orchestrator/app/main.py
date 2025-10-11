@@ -1884,15 +1884,24 @@ async def chat_completions(body: ChatRequest, request: Request):
             prompt_ids: List[str] = []
             for tr in (tool_results or []):
                 if isinstance(tr, dict):
+                    # Safely normalize result to a dict before any .get
+                    res_field = tr.get("result")
+                    if isinstance(res_field, str):
+                        try:
+                            res_field = JSONParser().parse(res_field, {"film_id": str, "job_id": str, "prompt_id": str, "created": [ {"result": dict, "job_id": str, "prompt_id": str} ]})
+                        except Exception:
+                            res_field = {}
+                    if not isinstance(res_field, dict):
+                        res_field = {}
                     if not film_id:
-                        film_id = ((tr.get("result") or {}).get("film_id"))
+                        film_id = res_field.get("film_id")
                     if tr.get("error"):
                         errors.append(str(tr.get("error")))
                     tb = tr.get("traceback")
                     if isinstance(tb, str) and tb.strip():
                         tool_tracebacks.append(tb)
                     # direct job_id/prompt_id
-                    res = tr.get("result") or {}
+                    res = res_field
                     jid = res.get("job_id") or tr.get("job_id")
                     pid = res.get("prompt_id") or tr.get("prompt_id")
                     if isinstance(jid, str):
@@ -1963,8 +1972,17 @@ async def chat_completions(body: ChatRequest, request: Request):
         if isinstance(tool_results, list):
             for tr in tool_results:
                 if isinstance(tr, dict):
+                    # Safely normalize result to a dict before any .get
+                    res_field = tr.get("result")
+                    if isinstance(res_field, str):
+                        try:
+                            res_field = JSONParser().parse(res_field, {"film_id": str})
+                        except Exception:
+                            res_field = {}
+                    if not isinstance(res_field, dict):
+                        res_field = {}
                     if not film_id:
-                        film_id = ((tr.get("result") or {}).get("film_id"))
+                        film_id = res_field.get("film_id")
                     if tr.get("error"):
                         errors.append(str(tr.get("error")))
         summary_lines = []
@@ -1978,8 +1996,8 @@ async def chat_completions(body: ChatRequest, request: Request):
             "Initiated tool-based generation flow." + summary + "\n"
             "Use `film_status` to track progress and `/api/jobs` for live status."
         )
-        # Only append status if there is already content; if empty, fall back to status only
-        display_content = ((display_content or "") + status_block) if not looks_empty else status_block.lstrip()
+        # Always append status; never replace footer/body
+        display_content = (display_content or "") + status_block
     response = {
         "id": "orc-1",
         "object": "chat.completion",

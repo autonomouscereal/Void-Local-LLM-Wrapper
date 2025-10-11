@@ -272,13 +272,14 @@ async def upload(conversation_id: int = Form(...), file: UploadFile = File(...))
             files = {"file": (file.filename, content, file.content_type)}
             r = await client.post(ORCH_URL.rstrip("/") + "/upload", files=files)
             r.raise_for_status()
-            # Avoid native json(); return raw upstream text
-            data = r.text
+            # Parse upstream JSON safely
+            parser = JSONParser()
+            data = parser.parse(r.text or "", {"url": str, "name": str})
     except Exception as ex:
         return JSONResponse(status_code=500, content={"error": str(ex)})
     async with _pool().acquire() as conn:
-        await conn.execute("INSERT INTO attachments (conversation_id, name, url, mime) VALUES ($1, $2, $3, $4)", conversation_id, file.filename, data.get("url"), file.content_type)
-    return {"ok": True, "url": data.get("url"), "name": data.get("name")}
+        await conn.execute("INSERT INTO attachments (conversation_id, name, url, mime) VALUES ($1, $2, $3, $4)", conversation_id, file.filename, (data.get("url") if isinstance(data, dict) else None), file.content_type)
+    return {"ok": True, "url": (data.get("url") if isinstance(data, dict) else None), "name": (data.get("name") if isinstance(data, dict) else file.filename)}
 
 
 @app.get("/api/conversations/{cid}/attachments")
