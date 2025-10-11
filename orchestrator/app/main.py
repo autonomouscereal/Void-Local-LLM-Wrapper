@@ -2052,28 +2052,23 @@ def _parse_resolution(res: Optional[str]) -> Tuple[int, int]:
 
 
 def build_default_scene_workflow(prompt: str, characters: List[Dict[str, Any]], style: Optional[str] = None, *, width: int = 1024, height: int = 1024, steps: int = 25, seed: int = 0, filename_prefix: str = "scene") -> Dict[str, Any]:
-    # Minimal SDXL image generation graph with optional IP-Adapter face conditioning when available
-    # This is a safe fallback workflow; more advanced animated workflows can replace this.
+    # Minimal SDXL image generation graph using CheckpointLoaderSimple (MODEL, CLIP, VAE)
     positive = prompt
     if style:
         positive = f"{prompt} in {style} style"
-    # Optionally incorporate character hints
     for ch in characters[:2]:
         name = ch.get("name")
         if name:
             positive += f", featuring {name}"
-    # ComfyUI graph
     g = {
-        "3": {"class_type": "CLIPTextEncode", "inputs": {"text": positive, "clip": ["5", 0]}},
-        "4": {"class_type": "CLIPTextEncode", "inputs": {"text": "", "clip": ["5", 0]}},
-        "5": {"class_type": "LoadCLIP", "inputs": {"clip_name": "clip_g"}},
-        "6": {"class_type": "Load Checkpoint", "inputs": {"ckpt_name": "sd_xl_base_1.0.safetensors"}},
+        "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "sd_xl_base_1.0.safetensors"}},
+        "3": {"class_type": "CLIPTextEncode", "inputs": {"text": positive, "clip": ["1", 1]}},
+        "4": {"class_type": "CLIPTextEncode", "inputs": {"text": "", "clip": ["1", 1]}},
         "7": {"class_type": "EmptyLatentImage", "inputs": {"width": width, "height": height, "batch_size": 1}},
-        "8": {"class_type": "KSampler", "inputs": {"seed": seed, "steps": steps, "cfg": 6.5, "sampler_name": "dpmpp_2m", "scheduler": "karras", "denoise": 1.0, "model": ["6", 0], "positive": ["3", 0], "negative": ["4", 0], "latent_image": ["7", 0]}},
-        "9": {"class_type": "VAE Decode", "inputs": {"samples": ["8", 0], "vae": ["6", 2]}},
+        "8": {"class_type": "KSampler", "inputs": {"seed": seed, "steps": steps, "cfg": 6.5, "sampler_name": "dpmpp_2m", "scheduler": "karras", "denoise": 1.0, "model": ["1", 0], "positive": ["3", 0], "negative": ["4", 0], "latent_image": ["7", 0]}},
+        "9": {"class_type": "VAE Decode", "inputs": {"samples": ["8", 0], "vae": ["1", 2]}},
         "10": {"class_type": "Save Image", "inputs": {"filename_prefix": filename_prefix, "images": ["9", 0]}},
     }
-    # If a character has a face_embedding, hint via positive text; proper IP-Adapter nodes can be added in a richer graph
     return {"prompt": g}
 
 
@@ -2114,20 +2109,18 @@ def build_animated_scene_workflow(
     interpolation_enabled: bool = False,
     interpolation_multiplier: int = 0,
 ) -> Dict[str, Any]:
-    # Simple animation via batch sampling: generate N frames in a batch and save sequentially.
-    # This is a safe, minimal fallback until advanced AnimateDiff graphs are provided.
+    # Simple animation via batch sampling using CheckpointLoaderSimple
     frames = _clamp_frames(int(max(1, duration_seconds) * fps))
     positive = prompt
     if style:
         positive = f"{prompt} in {style} style"
     g = {
-        "3": {"class_type": "CLIPTextEncode", "inputs": {"text": positive, "clip": ["5", 0]}},
-        "4": {"class_type": "CLIPTextEncode", "inputs": {"text": "", "clip": ["5", 0]}},
-        "5": {"class_type": "LoadCLIP", "inputs": {"clip_name": "clip_g"}},
-        "6": {"class_type": "Load Checkpoint", "inputs": {"ckpt_name": "sd_xl_base_1.0.safetensors"}},
+        "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "sd_xl_base_1.0.safetensors"}},
+        "3": {"class_type": "CLIPTextEncode", "inputs": {"text": positive, "clip": ["1", 1]}},
+        "4": {"class_type": "CLIPTextEncode", "inputs": {"text": "", "clip": ["1", 1]}},
         "7": {"class_type": "EmptyLatentImage", "inputs": {"width": width, "height": height, "batch_size": frames}},
-        "8": {"class_type": "KSampler", "inputs": {"seed": seed, "steps": 20, "cfg": 6.0, "sampler_name": "dpmpp_2m", "scheduler": "karras", "denoise": 1.0, "model": ["6", 0], "positive": ["3", 0], "negative": ["4", 0], "latent_image": ["7", 0]}},
-        "9": {"class_type": "VAE Decode", "inputs": {"samples": ["8", 0], "vae": ["6", 2]}},
+        "8": {"class_type": "KSampler", "inputs": {"seed": seed, "steps": 20, "cfg": 6.0, "sampler_name": "dpmpp_2m", "scheduler": "karras", "denoise": 1.0, "model": ["1", 0], "positive": ["3", 0], "negative": ["4", 0], "latent_image": ["7", 0]}},
+        "9": {"class_type": "VAE Decode", "inputs": {"samples": ["8", 0], "vae": ["1", 2]}},
     }
     last_image_node = "9"
     # Optional Real-ESRGAN upscale
