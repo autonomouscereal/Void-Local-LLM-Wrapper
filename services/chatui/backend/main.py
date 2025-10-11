@@ -377,6 +377,7 @@ async def chat(cid: int, request: Request, background_tasks: BackgroundTasks):
         decoded = _decode_json(r["content"])
         base_hist.append({"role": r["role"], "content": decoded.get("text") or ""})
     oa_msgs = _build_openai_messages(base_hist, [dict(a) for a in atts])
+    # Accept both object and string payloads for future compatibility
     payload = {"messages": oa_msgs, "stream": False}
 
     async def _proxy_stream():

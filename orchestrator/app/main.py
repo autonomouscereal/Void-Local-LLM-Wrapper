@@ -40,6 +40,18 @@ from pydantic import BaseModel, Field
 from tenacity import retry, stop_after_attempt, wait_exponential
 from fastapi.middleware.cors import CORSMiddleware
 from .json_parser import JSONParser
+def _normalize_dict_body(body: Any, expected_schema: Dict[str, Any]) -> Dict[str, Any]:
+    """Accept either a dict or a JSON string and return a dict shaped by expected_schema.
+    Never raise on bad input; return {} as a safe default.
+    """
+    if isinstance(body, dict):
+        return body
+    if isinstance(body, str):
+        try:
+            return JSONParser().parse(body, expected_schema or {})
+        except Exception:
+            return {}
+    return {}
 
 
 QWEN_BASE_URL = os.getenv("QWEN_BASE_URL", "http://localhost:11434")
@@ -1085,13 +1097,10 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         film_id = _uuid.uuid4().hex
         title = args.get("title") or "Untitled"
         synopsis = args.get("synopsis") or ""
-        metadata = args.get("metadata") or {}
+    metadata = args.get("metadata") or {}
         # IMPORTANT: metadata may arrive as a JSON string — parse before any .get usage
-        if isinstance(metadata, str):
-            try:
-                metadata = JSONParser().parse(metadata, {})
-            except Exception:
-                metadata = {}
+    if isinstance(metadata, (str, dict)):
+        metadata = _normalize_dict_body(metadata, {})
         # normalize preferences with sensible defaults
         # Accept synonyms from callers (duration -> duration_seconds, voice_type -> voice, audio_on -> audio_enabled, subtitles_on -> subtitles_enabled)
         duration_arg = args.get("duration_seconds")
@@ -1200,20 +1209,14 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         # Coerce plan/workflow to dicts when passed as JSON strings
         # IMPORTANT: Use JSONParser with explicit schemas; never call json.loads.
         plan_raw = args.get("plan") or {}
-        if isinstance(plan_raw, str):
-            try:
-                expected_plan = {"preferences": dict, "character_ids": [str], "attachments": dict, "style": str}
-                plan_raw = JSONParser().parse(plan_raw, expected_plan)
-            except Exception:
-                plan_raw = {}
+        if isinstance(plan_raw, (str, dict)):
+            expected_plan = {"preferences": dict, "character_ids": [str], "attachments": dict, "style": str}
+            plan_raw = _normalize_dict_body(plan_raw, expected_plan)
         plan = plan_raw if isinstance(plan_raw, dict) else {}
         wf_raw = args.get("workflow")
-        if isinstance(wf_raw, str):
-            try:
-                expected_workflow = {"prompt": dict}
-                wf_raw = JSONParser().parse(wf_raw, expected_workflow)
-            except Exception:
-                wf_raw = None
+        if isinstance(wf_raw, (str, dict)):
+            expected_workflow = {"prompt": dict}
+            wf_raw = _normalize_dict_body(wf_raw or {}, expected_workflow)
         workflow = (wf_raw if isinstance(wf_raw, dict) else plan)
         advanced_used = False
         pool = await get_pg_pool()
@@ -1236,9 +1239,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 syn = (syn_row and syn_row[0]) or ""
                 prompt = (syn.strip() or "A cinematic scene that advances the story.")
         if not _has_outputs(workflow):
-            async with pool.acquire() as conn:
-                row = await conn.fetchrow("SELECT metadata FROM films WHERE id=$1", film_id)
-                prefs = (row and row["metadata"]) or {}
+            # Always fetch film preferences via helper to ensure dict (not string)
+            prefs = await get_film_preferences(film_id)
             res_w, res_h = _parse_resolution(prefs.get("resolution") or "1024x1024")
             steps = 25
             if isinstance(prefs.get("quality"), str) and prefs.get("quality") == "high":
@@ -1642,6 +1644,9 @@ async def chat_completions(body: ChatRequest, request: Request):
     tool_results: List[Dict[str, Any]] = []
     if tool_calls:
         tool_results = await execute_tools(tool_calls)
+        # Inject tool_results as system evidence so committee always sees them
+        if tool_results:
+            messages = [ChatMessage(role="system", content="Tool results:\n" + json.dumps(tool_results, indent=2))] + messages
 
     # 3) Executors respond independently using plan + evidence
     evidence_blocks: List[ChatMessage] = []
@@ -2497,7 +2502,12 @@ async def _index_job_into_rag(job_id: str) -> None:
             await conn.execute("INSERT INTO rag_docs (path, chunk, embedding) VALUES ($1, $2, $3)", f"job:{job_id}", chunk, list(vec))
 
 
-def _extract_comfy_asset_urls(detail: Dict[str, Any], base_override: Optional[str] = None) -> List[Dict[str, Any]]:
+def _extract_comfy_asset_urls(detail: Dict[str, Any] | str, base_override: Optional[str] = None) -> List[Dict[str, Any]]:
+    if isinstance(detail, str):
+        try:
+            detail = JSONParser().parse(detail, {"outputs": dict, "status": dict})
+        except Exception:
+            detail = {}
     outputs = (detail or {}).get("outputs", {}) or {}
     urls: List[Dict[str, Any]] = []
     base_url = base_override or COMFYUI_API_URL
@@ -2525,7 +2535,7 @@ def _extract_comfy_asset_urls(detail: Dict[str, Any], base_override: Optional[st
     return urls
 
 
-async def _update_scene_from_job(job_id: str, detail: Dict[str, Any], failed: bool = False) -> None:
+async def _update_scene_from_job(job_id: str, detail: Dict[str, Any] | str, failed: bool = False) -> None:
     pool = await get_pg_pool()
     if pool is None:
         return
@@ -2535,6 +2545,11 @@ async def _update_scene_from_job(job_id: str, detail: Dict[str, Any], failed: bo
         base = _job_endpoint.get(pid) if pid else None
     except Exception:
         base = None
+    if isinstance(detail, str):
+        try:
+            detail = JSONParser().parse(detail, {"outputs": dict, "status": dict})
+        except Exception:
+            detail = {}
     assets = {"outputs": (detail or {}).get("outputs", {}), "status": (detail or {}).get("status"), "urls": _extract_comfy_asset_urls(detail, base)}
     async with pool.acquire() as conn:
         row = await conn.fetchrow("SELECT id, film_id, plan FROM scenes WHERE job_id=$1", job_id)
@@ -2751,6 +2766,7 @@ async def create_film(body: Dict[str, Any]):
         return JSONResponse(status_code=500, content={"error": "pg not configured"})
     import uuid as _uuid
     film_id = _uuid.uuid4().hex
+    body = _normalize_dict_body(body, {"title": str, "synopsis": str, "metadata": dict})
     title = (body or {}).get("title") or "Untitled"
     synopsis = (body or {}).get("synopsis") or ""
     metadata = (body or {}).get("metadata") or {}
@@ -2788,6 +2804,7 @@ async def update_film_preferences(film_id: str, body: Dict[str, Any]):
     if pool is None:
         return JSONResponse(status_code=500, content={"error": "pg not configured"})
     # merge metadata
+    body = _normalize_dict_body(body, {"metadata": dict})
     updates = (body or {}).get("metadata") or body or {}
     async with pool.acquire() as conn:
         row = await conn.fetchrow("SELECT metadata FROM films WHERE id=$1", film_id)
@@ -2827,7 +2844,7 @@ async def update_scene(scene_id: str, body: Dict[str, Any]):
     pool = await get_pg_pool()
     if pool is None:
         return JSONResponse(status_code=500, content={"error": "pg not configured"})
-    updates = body or {}
+    updates = _normalize_dict_body(body, {"plan": dict, "prompt": str})
     async with pool.acquire() as conn:
         row = await conn.fetchrow("SELECT id, plan, prompt, index_num FROM scenes WHERE id=$1", scene_id)
         if not row:
@@ -2849,6 +2866,7 @@ async def add_character(film_id: str, body: Dict[str, Any]):
         return JSONResponse(status_code=500, content={"error": "pg not configured"})
     import uuid as _uuid
     char_id = _uuid.uuid4().hex
+    body = _normalize_dict_body(body, {"name": str, "description": str, "references": dict})
     name = (body or {}).get("name") or "Unnamed"
     description = (body or {}).get("description") or ""
     references = (body or {}).get("references") or {}
@@ -2881,6 +2899,7 @@ async def create_scene(film_id: str, body: Dict[str, Any]):
     pool = await get_pg_pool()
     if pool is None:
         return JSONResponse(status_code=500, content={"error": "pg not configured"})
+    body = _normalize_dict_body(body, {"prompt": str, "index_num": int, "plan": dict, "style": str})
     prompt = (body or {}).get("prompt") or ""
     index_num = int((body or {}).get("index_num") or 0)
     plan = (body or {}).get("plan") or {}
@@ -3026,6 +3045,7 @@ async def add_character_reference(character_id: str, body: Dict[str, Any]):
     pool = await get_pg_pool()
     if pool is None:
         return JSONResponse(status_code=500, content={"error": "pg not configured"})
+    body = _normalize_dict_body(body, {"references": dict})
     refs = (body or {}).get("references") or {}
     async with pool.acquire() as conn:
         row = await conn.fetchrow("SELECT reference_data FROM characters WHERE id=$1", character_id)
