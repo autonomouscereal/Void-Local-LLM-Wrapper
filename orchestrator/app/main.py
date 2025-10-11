@@ -1463,6 +1463,18 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 sc_args["subtitles_enabled"] = default_subs
             res = await execute_tool_call({"name": "film_add_scene", "arguments": sc_args})
             created.append(res)
+        # Safety: ensure at least one scene exists for this film; if none were created due to upstream issues, force-create a minimal scene
+        try:
+            pool = await get_pg_pool()
+            if pool is not None:
+                async with pool.acquire() as conn:
+                    num_scenes = await conn.fetchval("SELECT COUNT(*) FROM scenes WHERE film_id=$1", film_id)
+                if int(num_scenes or 0) == 0:
+                    minimal = {"film_id": film_id, "index_num": 1, "prompt": (synopsis or title or "Visual narrative."), "audio_enabled": default_audio, "subtitles_enabled": default_subs}
+                    forced = await execute_tool_call({"name": "film_add_scene", "arguments": minimal})
+                    created.append(forced)
+        except Exception:
+            pass
         return {"name": name, "result": {"film_id": film_id, "created": created}}
     if name == "run_python" and EXECUTOR_BASE_URL and ALLOW_TOOL_EXECUTION:
         async with httpx.AsyncClient(timeout=120) as client:
