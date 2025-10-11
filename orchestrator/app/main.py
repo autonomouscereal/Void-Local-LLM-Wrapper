@@ -1,6 +1,14 @@
 from __future__ import annotations
 # WARNING: Do NOT add SQLAlchemy here. Use asyncpg with pooling and raw SQL only.
 #
+# JSON POLICY (critical):
+# - Never call json.loads directly in this service. All JSON coming from LLMs, tools, env/config,
+#   or external services MUST be parsed via JSONParser().parse with an explicit expected structure.
+# - Always pass an expected schema (dict/list with primitive types) to enforce shape and defaults;
+#   avoid parser(..., {}) unless the value is truly open‑ended (e.g., opaque metadata).
+# - When receiving strings that may be JSON (e.g., plan/workflow/metadata), coerce using JSONParser
+#   BEFORE any .get or type‑dependent access to prevent 'str'.get type errors.
+#
 # Historical/rationale (orchestrator):
 # - Planner/Executors (Qwen + GPT-OSS) are coordinated with explicit system guidance to avoid refusals.
 # - Tools are selected SEMANTICALLY (not keywords). On refusal, we may force a single best-match tool
@@ -568,7 +576,8 @@ def meta_prompt(messages: List[ChatMessage]) -> List[ChatMessage]:
     system_preface = (
         "You are part of a two-model team with explicit roles: a Planner and Executors. "
         "Planner decomposes the task, chooses tools, and requests relevant evidence. Executors produce solutions and critiques. "
-        "Be precise, show working when non-trivial, and output correct, runnable code when appropriate. "
+        "You execute tools yourself. Never ask the user to run code or call tools; do not output scripts for the user to execute. "
+        "Be precise, show working when non-trivial, and when a tool can fulfill the request, invoke it directly. "
         "Absolute rule: Never use SQLAlchemy; use asyncpg with pooling and raw SQL for PostgreSQL. "
         "Critically: choose tools SEMANTICALLY by mapping the user's requested outcome to tool capabilities (no keyword triggers). "
         "If any available tool can directly produce the requested artifact, invoke that tool; otherwise provide a concrete solution or plan. "
@@ -576,6 +585,8 @@ def meta_prompt(messages: List[ChatMessage]) -> List[ChatMessage]:
         "Ask at most one concise clarifying message if a blocking parameter is missing; include up to three targeted questions in that single message, then proceed. "
         "When the user provides reference media (audio, images, video, files), treat them as style/constraint references. "
         "Do NOT reuse source media as-is unless explicitly instructed; transform or condition on them to match style, timing/beat, or visual attributes (e.g., hair/face), respecting the user's constraints. "
+        "Always surface IDs and errors produced by tools: include film_id, job_id(s), prompt_id(s) when available, and concise error/traceback summaries. "
+        "Return the complete Markdown answer; do not omit the main body when tools are used. "
         "If you clearly see a small, relevant fix or improvement (e.g., a failing tool parameter or obvious config issue), you may add a short 'Suggestions' section with up to 2 concise bullet points at the end. Do not scope creep."
     )
     out = [ChatMessage(role="system", content=system_preface)]
@@ -814,7 +825,8 @@ async def planner_produce_plan(messages: List[ChatMessage], tools: Optional[List
     planner_id = QWEN_MODEL_ID if PLANNER_MODEL.lower() == "qwen" else GPTOSS_MODEL_ID
     planner_base = QWEN_BASE_URL if PLANNER_MODEL.lower() == "qwen" else GPTOSS_BASE_URL
     guide = (
-        "You are the Planner. Produce a short step-by-step plan and, if helpful, propose up to 3 tool invocations.\n"
+        "You are the Planner. Produce a short step-by-step plan and propose up to 3 tool invocations YOU will execute.\n"
+        "Never instruct the user to run code or call tools. Do not emit shell/python snippets for the user; invoke tools yourself.\n"
         "Decide SEMANTICALLY when to invoke tools: map the user's requested outcome to tool capabilities.\n"
         "If any tool can directly produce the user's requested artifact (e.g., video/film creation), prefer that tool (e.g., make_movie).\n"
         "Ask 1-3 clarifying questions ONLY if blocking details are missing (e.g., duration, style, language, target resolution).\n"
@@ -877,6 +889,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
     name = call.get("name")
     raw_args = call.get("arguments") or {}
     # Normalize tool arguments using the custom parser and strong coercion
+    # NOTE: Do not use json.loads here. Always use JSONParser with a schema so we never crash on
+    # malformed/partial JSON or return unexpected shapes from LLM/tool output.
     def _normalize_tool_args(a: Any) -> Dict[str, Any]:
         parser = JSONParser()
         if isinstance(a, dict):
@@ -956,6 +970,19 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 else: val = None
             if isinstance(val, (bool,)):
                 out[key] = bool(val)
+        # Additional aliases often provided by clients
+        if out.get("audio_enabled") is None and ("audio" in out):
+            v = out.get("audio")
+            if isinstance(v, str):
+                vv = v.strip().lower(); v = True if vv in ("true","1","yes","on") else False if vv in ("false","0","no","off") else None
+            if isinstance(v, (bool,)):
+                out["audio_enabled"] = bool(v)
+        if out.get("subtitles_enabled") is None and ("subtitles" in out):
+            v = out.get("subtitles")
+            if isinstance(v, str):
+                vv = v.strip().lower(); v = True if vv in ("true","1","yes","on") else False if vv in ("false","0","no","off") else None
+            if isinstance(v, (bool,)):
+                out["subtitles_enabled"] = bool(v)
         # Normalize resolution synonyms
         res = out.get("resolution")
         if isinstance(res, str):
@@ -1058,6 +1085,12 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         title = args.get("title") or "Untitled"
         synopsis = args.get("synopsis") or ""
         metadata = args.get("metadata") or {}
+        # IMPORTANT: metadata may arrive as a JSON string — parse before any .get usage
+        if isinstance(metadata, str):
+            try:
+                metadata = JSONParser().parse(metadata, {})
+            except Exception:
+                metadata = {}
         # normalize preferences with sensible defaults
         # Accept synonyms from callers (duration -> duration_seconds, voice_type -> voice, audio_on -> audio_enabled, subtitles_on -> subtitles_enabled)
         duration_arg = args.get("duration_seconds")
@@ -1157,6 +1190,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         index_num = int(args.get("index_num", 0))
         character_ids = args.get("character_ids") or []
         # Coerce plan/workflow to dicts when passed as JSON strings
+        # IMPORTANT: Use JSONParser with explicit schemas; never call json.loads.
         plan_raw = args.get("plan") or {}
         if isinstance(plan_raw, str):
             try:
@@ -2339,6 +2373,7 @@ async def stream_job(job_id: str, interval_ms: Optional[int] = None):
                 yield f"data: {snapshot}\n\n"
                 last_snapshot = snapshot
             try:
+                # Parse current job status safely via JSONParser. Never use json.loads.
                 state = (JSONParser().parse(snapshot or "", {"status": str}) or {}).get("status")
             except Exception:
                 state = None
