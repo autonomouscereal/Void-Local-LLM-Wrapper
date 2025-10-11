@@ -142,6 +142,8 @@ services:
       - XTTS_MODEL_NAME=tts_models/multilingual/multi-dataset/xtts_v2
     expose:
       - "8020"
+    ports:
+      - "8020:8020"
 
   whisper:
     build:
@@ -154,6 +156,8 @@ services:
       - WHISPER_CPU_THREADS=8
     expose:
       - "9090"
+    ports:
+      - "9090:9090"
 
   faceid:
     build:
@@ -163,6 +167,8 @@ services:
     restart: unless-stopped
     expose:
       - "7000"
+    ports:
+      - "7000:7000"
 
   comfyui:
     build:
@@ -175,10 +181,50 @@ services:
         condition: service_completed_successfully
     expose:
       - "8188"
+    ports:
+      - "8188:8188"
     volumes:
       - comfyui_models:/comfyui/models
       - comfyui_custom_nodes:/comfyui/custom_nodes
     # For GPU deployments, create additional comfyui-* services and set COMFYUI_API_URLS accordingly
+
+  # Optional additional ComfyUI replicas for dynamic distribution
+  # After enabling, set COMFYUI_API_URLS to include all endpoints, e.g.:
+  # COMFYUI_API_URLS=http://comfyui:8188,http://comfyui-1:8188,http://comfyui-2:8188
+  # And access from host via the mapped ports below for debugging
+  comfyui-1:
+    build:
+      context: ./services/comfyui
+      dockerfile: Dockerfile
+    container_name: comfyui-1
+    restart: unless-stopped
+    depends_on:
+      comfyui_init:
+        condition: service_completed_successfully
+    expose:
+      - "8188"
+    ports:
+      - "8189:8188"
+    volumes:
+      - comfyui_models:/comfyui/models
+      - comfyui_custom_nodes:/comfyui/custom_nodes
+
+  comfyui-2:
+    build:
+      context: ./services/comfyui
+      dockerfile: Dockerfile
+    container_name: comfyui-2
+    restart: unless-stopped
+    depends_on:
+      comfyui_init:
+        condition: service_completed_successfully
+    expose:
+      - "8188"
+    ports:
+      - "8190:8188"
+    volumes:
+      - comfyui_models:/comfyui/models
+      - comfyui_custom_nodes:/comfyui/custom_nodes
 
   comfyui_init:
     build:
@@ -208,6 +254,8 @@ services:
       - NODE_ENV=production
     expose:
       - "5678"
+    ports:
+      - "5678:5678"
     volumes:
       - n8n_data:/home/node/.n8n
     healthcheck:
@@ -243,6 +291,8 @@ services:
       - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-}
     expose:
       - "9095"
+    ports:
+      - "9095:9095"
     volumes:
       - ./:/workspace
 
@@ -256,6 +306,8 @@ services:
       - MUSIC_MODEL_ID=facebook/musicgen-small
     expose:
       - "7860"
+    ports:
+      - "7860:7860"
 
   vlm:
     build:
@@ -265,6 +317,8 @@ services:
     restart: unless-stopped
     expose:
       - "8050"
+    ports:
+      - "8050:8050"
 
   executor:
     build:
@@ -280,6 +334,8 @@ services:
       - SHELL_WHITELIST=${SHELL_WHITELIST:-}
     expose:
       - "8081"
+    ports:
+      - "8081:8081"
     volumes:
       - ./:/workspace
 

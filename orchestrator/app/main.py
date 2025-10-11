@@ -2430,12 +2430,13 @@ async def _index_job_into_rag(job_id: str) -> None:
             await conn.execute("INSERT INTO rag_docs (path, chunk, embedding) VALUES ($1, $2, $3)", f"job:{job_id}", chunk, list(vec))
 
 
-def _extract_comfy_asset_urls(detail: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _extract_comfy_asset_urls(detail: Dict[str, Any], base_override: Optional[str] = None) -> List[Dict[str, Any]]:
     outputs = (detail or {}).get("outputs", {}) or {}
     urls: List[Dict[str, Any]] = []
-    if not COMFYUI_API_URL:
+    base_url = base_override or COMFYUI_API_URL
+    if not base_url:
         return urls
-    base = COMFYUI_API_URL.rstrip('/')
+    base = base_url.rstrip('/')
     def _url(fn: str, ftype: str, sub: Optional[str]) -> str:
         from urllib.parse import urlencode
         q = {"filename": fn, "type": ftype or "output"}
@@ -2461,7 +2462,13 @@ async def _update_scene_from_job(job_id: str, detail: Dict[str, Any], failed: bo
     pool = await get_pg_pool()
     if pool is None:
         return
-    assets = {"outputs": (detail or {}).get("outputs", {}), "status": (detail or {}).get("status"), "urls": _extract_comfy_asset_urls(detail)}
+    # Prefer the exact ComfyUI base that handled this job (per-job endpoint pinning)
+    try:
+        pid = (_jobs_store.get(job_id) or {}).get("prompt_id")
+        base = _job_endpoint.get(pid) if pid else None
+    except Exception:
+        base = None
+    assets = {"outputs": (detail or {}).get("outputs", {}), "status": (detail or {}).get("status"), "urls": _extract_comfy_asset_urls(detail, base)}
     async with pool.acquire() as conn:
         row = await conn.fetchrow("SELECT id, film_id, plan FROM scenes WHERE job_id=$1", job_id)
         if not row:
