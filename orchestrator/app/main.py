@@ -19,6 +19,7 @@ import asyncio
 import json
 from typing import Any, Dict, List, Optional, Tuple
 import time
+import traceback
 
 import httpx
 import re
@@ -1198,8 +1199,23 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         prompt = args.get("prompt") or ""
         index_num = int(args.get("index_num", 0))
         character_ids = args.get("character_ids") or []
-        plan = args.get("plan") or {}
-        workflow = args.get("workflow") or plan
+        # Coerce plan/workflow to dicts when passed as JSON strings
+        plan_raw = args.get("plan") or {}
+        if isinstance(plan_raw, str):
+            try:
+                expected_plan = {"preferences": dict, "character_ids": [str], "attachments": dict, "style": str}
+                plan_raw = JSONParser().parse(plan_raw, expected_plan)
+            except Exception:
+                plan_raw = {}
+        plan = plan_raw if isinstance(plan_raw, dict) else {}
+        wf_raw = args.get("workflow")
+        if isinstance(wf_raw, str):
+            try:
+                expected_workflow = {"prompt": dict}
+                wf_raw = JSONParser().parse(wf_raw, expected_workflow)
+            except Exception:
+                wf_raw = None
+        workflow = (wf_raw if isinstance(wf_raw, dict) else plan)
         advanced_used = False
         pool = await get_pg_pool()
         if pool is None:
@@ -1362,7 +1378,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 att["audio"] = args.get("audio")
             if isinstance(args.get("video"), list):
                 att["video"] = args.get("video")
-            scene_plan = {**plan, "preferences": merged_prefs, "character_ids": character_ids, "attachments": att}
+            scene_plan = {**(plan or {}), "preferences": merged_prefs, "character_ids": character_ids, "attachments": att}
             await conn.execute("INSERT INTO scenes (id, film_id, index_num, prompt, plan, status, job_id) VALUES ($1, $2, $3, $4, $5, 'queued', $6)", scene_id, film_id, index_num, prompt, json.dumps(scene_plan), job_id)
         _jobs_store[job_id] = {"id": job_id, "prompt_id": prompt_id, "state": "queued", "created_at": time.time(), "updated_at": time.time()}
         asyncio.create_task(_track_comfy_job(job_id, prompt_id))
@@ -1514,7 +1530,7 @@ async def execute_tools(tool_calls: List[Dict[str, Any]]) -> List[Dict[str, Any]
             res = await execute_tool_call(call)
             results.append(res)
         except Exception as ex:
-            results.append({"name": call.get("name", "unknown"), "error": str(ex)})
+            results.append({"name": call.get("name", "unknown"), "error": str(ex), "traceback": traceback.format_exc()})
     return results
 
 
@@ -2089,7 +2105,7 @@ async def get_film_preferences(film_id: str) -> Dict[str, Any]:
         return dict(meta)
     if isinstance(meta, str):
         try:
-            parsed = json.loads(meta)
+            parsed = JSONParser().parse(meta, {})
             return parsed if isinstance(parsed, dict) else {}
         except Exception:
             return {}
@@ -2269,7 +2285,7 @@ async def _track_comfy_job(job_id: str, prompt_id: str) -> None:
                     wf = None
                 if isinstance(wf, str):
                     try:
-                        wf = json.loads(wf)
+                        wf = JSONParser().parse(wf, {})
                     except Exception:
                         wf = None
                 if isinstance(wf, dict):

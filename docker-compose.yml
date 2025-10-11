@@ -197,6 +197,7 @@ services:
       context: ./services/comfyui
       dockerfile: Dockerfile
     container_name: comfyui-1
+    profiles: ["comfy-replicas"]
     restart: unless-stopped
     depends_on:
       comfyui_init:
@@ -214,6 +215,7 @@ services:
       context: ./services/comfyui
       dockerfile: Dockerfile
     container_name: comfyui-2
+    profiles: ["comfy-replicas"]
     restart: unless-stopped
     depends_on:
       comfyui_init:
