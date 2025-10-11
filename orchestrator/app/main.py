@@ -83,50 +83,7 @@ N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL")  # optional external workflow orc
 ASSEMBLER_API_URL = os.getenv("ASSEMBLER_API_URL")  # http://assembler:9095
 
 
-def robust_json_loads(json_string: str) -> Any:
-    try:
-        return json.loads(json_string)
-    except Exception:
-        pass
-    s = json_string or ""
-    # strip markdown fences
-    s = s.replace("```json", "").replace("```", "").strip()
-    # common fixes
-    replacements = [
-        ('\\"', '"'),
-        ("\\'", "'"),
-        ('"{', '{'),
-        ('}"', '}'),
-        (",}", "}"),
-        (",]", "]"),
-        ('"False"', 'false'),
-        ('"True"', 'true'),
-    ]
-    for old, new in replacements:
-        s = s.replace(old, new)
-    # fix adjacent objects
-    s = s.replace('}{', '},{')
-    try:
-        return json.loads(s)
-    except Exception:
-        pass
-    # extract first balanced {...}
-    stack = []
-    start = -1
-    for i, ch in enumerate(s):
-        if ch == '{':
-            if not stack:
-                start = i
-            stack.append(ch)
-        elif ch == '}' and stack:
-            stack.pop()
-            if not stack and start != -1:
-                seg = s[start:i+1]
-                try:
-                    return json.loads(seg)
-                except Exception:
-                    break
-    return {}
+# removed: robust_json_loads — use JSONParser().parse with explicit expected structures everywhere
 
 
 class ChatMessage(BaseModel):
@@ -2105,6 +2062,7 @@ async def get_film_preferences(film_id: str) -> Dict[str, Any]:
         return dict(meta)
     if isinstance(meta, str):
         try:
+            # Expect a preferences dict (open schema)
             parsed = JSONParser().parse(meta, {})
             return parsed if isinstance(parsed, dict) else {}
         except Exception:
@@ -2380,7 +2338,10 @@ async def stream_job(job_id: str, interval_ms: Optional[int] = None):
             if snapshot != last_snapshot:
                 yield f"data: {snapshot}\n\n"
                 last_snapshot = snapshot
-            state = (robust_json_loads(snapshot) or {}).get("status")
+            try:
+                state = (JSONParser().parse(snapshot or "", {"status": str}) or {}).get("status")
+            except Exception:
+                state = None
             if state in ("succeeded", "failed", "cancelled"):
                 yield "data: [DONE]\n\n"
                 break
