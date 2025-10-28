@@ -1,0 +1,26 @@
+{
+  "version": "1.0.0",
+  "model_route": "qwen3-ablation-coder",
+  "novelty_floor": 0.15,
+  "dedup_threshold": 0.92,
+  "nli_top_peers": 10,
+  "min_citations": 3,
+  "require_money_map": true,
+  "weights": { "E": 0.35, "I": 0.20, "C": 0.20, "N": 0.15, "B": 0.10 },
+  "keep_threshold": 0.70,
+  "evidence_floor": 0.65,
+  "independence_floor": 0.60,
+  "consistency_floor": 0.75,
+  "consistency_alt_floor": { "C": 0.60, "E": 0.80 },
+  "compression_policy": {
+    "max_input_tok": 700,
+    "max_output_tok": 600,
+    "keep_numbers": true,
+    "keep_units": true,
+    "citation_tags": true,
+    "language": "source",
+    "style": "concise-factual"
+  }
+}
+
+

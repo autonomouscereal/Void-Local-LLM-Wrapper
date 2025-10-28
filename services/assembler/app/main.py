@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 import base64
 import requests
 from urllib.parse import urlparse, parse_qs
+from .json_parser import JSONParser
 
 
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")
@@ -90,10 +91,11 @@ async def assemble(body: Dict[str, Any]):
         for sc in scenes:
             assets = sc.get("assets") or {}
             if isinstance(assets, str):
-                # Guard against stringified assets
+                # Use hardened JSON parser with expected structure
                 try:
-                    import json as _json
-                    assets = _json.loads(assets)
+                    parser = JSONParser()
+                    expected = {"urls": list, "outputs": dict, "status": dict}
+                    assets = parser.parse(assets, expected)
                 except Exception:
                     assets = {}
             urls = assets.get("urls") or []
@@ -122,8 +124,9 @@ async def assemble(body: Dict[str, Any]):
             assets = sc.get("assets") or {}
             if isinstance(assets, str):
                 try:
-                    import json as _json
-                    assets = _json.loads(assets)
+                    parser = JSONParser()
+                    expected = {"tts": dict, "music": dict, "urls": list}
+                    assets = parser.parse(assets, expected)
                 except Exception:
                     assets = {}
             tts = assets.get("tts") or {}
@@ -144,8 +147,9 @@ async def assemble(body: Dict[str, Any]):
             assets = sc.get("assets") or {}
             if isinstance(assets, str):
                 try:
-                    import json as _json
-                    assets = _json.loads(assets)
+                    parser = JSONParser()
+                    expected = {"subtitles_srt": str, "urls": list}
+                    assets = parser.parse(assets, expected)
                 except Exception:
                     assets = {}
             srt = assets.get("subtitles_srt")

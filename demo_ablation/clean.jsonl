@@ -1,0 +1,3 @@
+{"id":"cand_01","keep":true,"score":0.81,"signals":{"evidence":0.86,"independence":0.72,"consistency":0.78,"novelty":0.22,"stance_balance":0.67},"rationale":["valid citations"],"icw_refs":[],"train_payload":{"input":"...","output":"...","metadata":{"mode":"research_follow_money","seed":1337}}}
+
+

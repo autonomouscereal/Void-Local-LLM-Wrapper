@@ -1,0 +1,21 @@
+{
+  "seed": 1337,
+  "project": "ot-research",
+  "task": "research",
+  "candidates": [
+    {
+      "id": "cand_01",
+      "text": "candidate content...",
+      "mode": "research_follow_money",
+      "citations": [{"id":"src_07","url":"https://example.org","hash":"sha256:abc","kind":"primary"}],
+      "money_map": {"funders":[],"coi":[],"policy_timeline":[]},
+      "metrics": {"len_tokens": 812, "latency_ms": 920},
+      "trace": {"run_id":"demo","model":"teacher","tools":["web_search"]}
+    }
+  ],
+  "evidence_index": [{"id":"src_07","url":"https://example.org","hash":"sha256:abc","kind":"primary","owner":"NEJM"}],
+  "icw_pack": "",
+  "config": {"min_citations": 1, "require_money_map": false, "dedup_threshold": 0.92, "contradiction_check": false, "bias_scoring": {"stance_balance": false, "source_diversity": true}, "novelty_floor": 0.15}
+}
+
+

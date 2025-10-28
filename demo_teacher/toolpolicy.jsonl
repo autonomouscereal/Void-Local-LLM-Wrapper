@@ -1,0 +1,3 @@
+{"context_hash":"sha256:pack","tools_considered":["web_search"],"decision":{"use":["web_search"],"skip":[]},"params":{"web_search":{"q":"hi"}},"outcome":{"success":true},"meta":{"mode":"general","seed":1337,"trace_id":"tt_demo"}}
+
+

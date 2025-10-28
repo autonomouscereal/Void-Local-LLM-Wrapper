@@ -1,0 +1,10 @@
+{
+  "film_version": "2.0.0",
+  "fps_default": 24,
+  "res": { "preview": "512x288", "final": "1024x576" },
+  "post": { "interpolate_factor": 2, "upscale_scale": 2, "tile": 512, "overlap": 16 },
+  "audio": { "sr": 48000, "lufs_target": -14, "ducking_db": -6, "lip_sync_ms": 40 },
+  "qc": { "char_match_min": 0.88, "deltaE_max": 2.0 }
+}
+
+

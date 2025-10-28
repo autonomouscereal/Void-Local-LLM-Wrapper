@@ -341,6 +341,78 @@ services:
     volumes:
       - ./:/workspace
 
+  icw:
+    build:
+      context: ./services/icw
+      dockerfile: Dockerfile
+    container_name: icw_service
+    restart: unless-stopped
+    expose:
+      - "8085"
+    ports:
+      - "8085:8085"
+
+  drt:
+    build:
+      context: ./services/drt
+      dockerfile: Dockerfile
+    container_name: deep_research_tool
+    restart: unless-stopped
+    environment:
+      - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-}
+    expose:
+      - "8086"
+    ports:
+      - "8086:8086"
+    volumes:
+      - ./:/workspace
+
+  film2:
+    build:
+      context: ./services/film2
+      dockerfile: Dockerfile
+    container_name: film2_service
+    restart: unless-stopped
+    environment:
+      - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-}
+    expose:
+      - "8090"
+    ports:
+      - "8090:8090"
+    volumes:
+      - ./:/workspace
+
+  ablation:
+    build:
+      context: ./services/ablation
+      dockerfile: Dockerfile
+    container_name: ablation_layer
+    restart: unless-stopped
+    environment:
+      - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-}
+      - ABLCODER_URL=${ABLCODER_URL:-}
+    expose:
+      - "8095"
+    ports:
+      - "8095:8095"
+    volumes:
+      - ./:/workspace
+
+  teacher:
+    build:
+      context: ./services/teacher
+      dockerfile: Dockerfile
+    container_name: teacher_service
+    restart: unless-stopped
+    environment:
+      - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-}
+    expose:
+      - "8097"
+    ports:
+      - "8097:8097"
+    volumes:
+      - ./:/workspace
+
   chatui:
     build:
       context: ./services/chatui

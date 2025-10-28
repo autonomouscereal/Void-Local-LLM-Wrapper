@@ -1,0 +1,14 @@
+{
+  "version": "1.0",
+  "hash_algo": "xxhash64",
+  "master_seed": 1337,
+  "derivation": {
+    "scene": "xxhash64('scene'|project_id|scene_id|master_seed)",
+    "shot": "xxhash64('shot'|project_id|shot_id|master_seed)",
+    "pass": "xxhash64('pass'|project_id|shot_id|pass|master_seed)",
+    "tool": "xxhash64('tool'|project_id|shot_id|tool_id|master_seed)",
+    "router": "xxhash64('router'|trace_id|master_seed)"
+  }
+}
+
+

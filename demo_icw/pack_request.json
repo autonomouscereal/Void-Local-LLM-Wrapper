@@ -1,0 +1,13 @@
+{
+  "seed": 1337,
+  "budget_tokens": 3500,
+  "goal": "Concise description of what the next model call must achieve.",
+  "query": "User query or expanded task string",
+  "candidates": [
+    {"id":"src_01","title":"Example","content":"...","url":"https://example.org/a","published_at":"2024-01-01","source":{"domain":"example.org","owner":"Owner Inc"},"hash":"sha256:abc","kind":"primary","metadata":{"modality":"text","lang":"en"}}
+  ],
+  "policies": {"max_per_source": 2, "time_horizon": "2000-01-01..2025-10-28"},
+  "context_hints": {"known_entities": [], "preferred_domains": [], "forbidden_domains": []}
+}
+
+

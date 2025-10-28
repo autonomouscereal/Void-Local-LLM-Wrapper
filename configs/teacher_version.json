@@ -1,0 +1,9 @@
+{
+  "teacher_version": "1.0.0",
+  "buffer_max": 1000,
+  "max_text_capture_chars": 4000,
+  "max_artifact_list": 64,
+  "max_tools_per_trace": 64
+}
+
+

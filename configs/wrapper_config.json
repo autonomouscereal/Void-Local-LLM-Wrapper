@@ -1,0 +1,17 @@
+{
+  "openai_compat": { "enabled": true, "mount_path": "/v1" },
+  "teacher": { "enabled": true, "capture_bodies": true, "default_label": "exp_default" },
+  "icw": { "enabled": true },
+  "film": { "enabled": true },
+  "ablation": { "enabled": true, "model_route": "qwen3-ablation-coder" },
+  "tools": {
+    "allowlist": [
+      "web_search", "source_fetch", "repo_fs",
+      "video_gen", "frame_interpolate", "upscale",
+      "tts", "music", "mux"
+    ]
+  },
+  "cors": { "enabled": true, "origins": ["*"] }
+}
+
+

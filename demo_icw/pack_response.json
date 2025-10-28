@@ -1,0 +1,11 @@
+{
+  "run_id": "2025-10-28T16:21:05Z-icw-1337",
+  "seed": 1337,
+  "budget_tokens": 3500,
+  "estimated_tokens": 3472,
+  "scores_summary": {"selected": 1, "independence_index": 1.0, "dup_rate": 0.0},
+  "evidence_index": [{"id":"src_01","url":"https://example.org/a","hash":"sha256:abc","kind":"primary","authority":0.82,"recency":0.77,"diversity":1.0,"compression_tier":"summary","char_count":100}],
+  "sections": {"QUERY":"...","GOAL":"...","PACK":"FINAL CONTEXT [#src_01]"}
+}
+
+

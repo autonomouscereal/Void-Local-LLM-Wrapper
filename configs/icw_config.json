@@ -1,0 +1,17 @@
+{
+  "icw_version": "1.0.0",
+  "tokenizer_name": "tiktoken-like:generic",
+  "calibration": { "a": 0.25, "b": 0.0, "c": 0.0 },
+  "weights": {
+    "topical": 0.40,
+    "authority": 0.25,
+    "recency": 0.20,
+    "diversity": 0.15
+  },
+  "reserve_frac": 0.12,
+  "novelty": { "enabled": true },
+  "rrf": { "k": 60 },
+  "limits": { "max_items": 512 }
+}
+
+
