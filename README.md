@@ -49,20 +49,22 @@ Quick Start
 OpenAI-Compatible Usage
 -----------------------
 Point your client (e.g., Void or OpenAI SDK) to `http://localhost:8000` and call `/v1/chat/completions`.
-- Tool-calling semantics (default: client executes):
-  - `AUTO_EXECUTE_TOOLS=false` (default) → endpoint returns `tool_calls` for Void to execute; send results back as `role: "tool"` messages.
-  - `AUTO_EXECUTE_TOOLS=true` → backend executes supported tools automatically.
+- Tool-calling semantics (server executes by default):
+  - `AUTO_EXECUTE_TOOLS=true` (default) → backend executes supported tools automatically.
+  - Set `AUTO_EXECUTE_TOOLS=false` only if you want the client to receive `tool_calls` and execute tools itself.
 
 
-Example request:
+Single‑prompt film example (server orchestrates tools automatically):
 ```bash
 curl -s http://localhost:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
+        "model": "wrapper-film-orchestrator",
         "messages": [
-          {"role": "system", "content": "You are a helpful assistant."},
-          {"role": "user", "content": "Draft a Python function to quicksort a list."}
-        ]
+          {"role": "user", "content": "Make a 3-minute 4K 60fps film about monarch butterflies with interpolation and motion smoothing. Title: Butterflies."}
+        ],
+        "tool_choice": "auto",
+        "stream": true
       }'
 ```
 

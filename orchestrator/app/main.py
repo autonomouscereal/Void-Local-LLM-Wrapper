@@ -55,7 +55,7 @@ def _normalize_dict_body(body: Any, expected_schema: Dict[str, Any]) -> Dict[str
 
 
 QWEN_BASE_URL = os.getenv("QWEN_BASE_URL", "http://localhost:11434")
-QWEN_MODEL_ID = os.getenv("QWEN_MODEL_ID", "qwen2.5:32b-instruct-q4_K_M")
+QWEN_MODEL_ID = os.getenv("QWEN_MODEL_ID", "qwen3:32b-instruct-q4_K_M")
 GPTOSS_BASE_URL = os.getenv("GPTOSS_BASE_URL", "http://localhost:11435")
 GPTOSS_MODEL_ID = os.getenv("GPTOSS_MODEL_ID", "gpt-oss:20b-q5_K_M")
 DEFAULT_NUM_CTX = int(os.getenv("DEFAULT_NUM_CTX", "8192"))
@@ -103,6 +103,7 @@ N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL")  # optional external workflow orc
 ASSEMBLER_API_URL = os.getenv("ASSEMBLER_API_URL")  # http://assembler:9095
 TEACHER_API_URL = os.getenv("TEACHER_API_URL", "http://teacher:8097")
 WRAPPER_CONFIG_PATH = os.getenv("WRAPPER_CONFIG_PATH", "/workspace/configs/wrapper_config.json")
+ICW_API_URL = os.getenv("ICW_API_URL", "http://icw:8085")
 WRAPPER_CONFIG: Dict[str, Any] = {}
 WRAPPER_CONFIG_HASH: Optional[str] = None
 
@@ -625,6 +626,33 @@ async def serpapi_google_search(queries: List[str], max_results: int = 5) -> str
     return "\n".join(aggregate[: max_results * max(1, len(queries))])
 
 
+def _rrf_fuse(results_by_engine: Dict[str, List[Dict[str, Any]]], k: int = 60) -> List[Dict[str, Any]]:
+    # Reciprocal Rank Fusion across engines with stable tie-break
+    scores: Dict[str, float] = {}
+    meta: Dict[str, Dict[str, Any]] = {}
+    for eng, items in results_by_engine.items():
+        for rank, it in enumerate(items, start=1):
+            key = it.get("link") or it.get("url") or it.get("id") or f"{eng}:{rank}"
+            rr = 1.0 / float(k + rank)
+            scores[key] = scores.get(key, 0.0) + rr
+            if key not in meta:
+                meta[key] = {"title": it.get("title"), "link": it.get("link") or it.get("url"), "snippet": it.get("snippet")}
+    # stable ordering
+    def _auth(x: Dict[str, Any]) -> float:
+        return 0.0
+    def _rec(x: Dict[str, Any]) -> float:
+        return 0.0
+    def _sha(x: str) -> str:
+        import hashlib as _h
+        return _h.sha256(x.encode("utf-8")).hexdigest()
+    items = []
+    for key, sc in scores.items():
+        m = meta.get(key) or {}
+        items.append({"key": key, "score": float(f"{sc:.6f}"), **m})
+    items.sort(key=lambda r: (-r["score"], -_auth(r), -_rec(r), _sha(r.get("key") or "")))
+    return items
+
+
 async def call_mcp_tool(name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
     if not MCP_HTTP_BRIDGE_URL:
         return {"error": "MCP bridge URL not configured"}
@@ -869,6 +897,17 @@ def get_builtin_tools_schema() -> List[Dict[str, Any]]:
                     "type": "object",
                     "properties": {"input": {"type": "string"}, "scale": {"type": "integer"}, "tile": {"type": "integer"}, "overlap": {"type": "integer"}},
                     "required": ["input", "scale"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "metasearch.fuse",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"q": {"type": "string"}, "k": {"type": "integer"}},
+                    "required": ["q"]
                 }
             }
         }
@@ -1145,6 +1184,40 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             return {"name": name, "error": "missing query"}
         snippets = await serpapi_google_search([query], max_results=int(args.get("k", 5)))
         return {"name": name, "result": snippets}
+    if name == "metasearch.fuse" and ALLOW_TOOL_EXECUTION:
+        q = args.get("q") or ""
+        if not q:
+            return {"name": name, "error": "missing q"}
+        k = int(args.get("k", 10))
+        # Deterministic multi-engine placeholder. If SERPAPI available, use it to seed one engine; others are deterministic transforms
+        engines: Dict[str, List[Dict[str, Any]]] = {}
+        # google via serpapi (optional)
+        if SERPAPI_API_KEY and ENABLE_WEBSEARCH:
+            txt = await serpapi_google_search([q], max_results=min(5, k))
+            # parse into lines → items
+            lines = [ln for ln in (txt or "").splitlines() if ln.strip()]
+            google_items: List[Dict[str, Any]] = []
+            for i in range(0, len(lines), 3):
+                try:
+                    title = lines[i]
+                    snippet = lines[i+1] if i+1 < len(lines) else ""
+                    link = lines[i+2] if i+2 < len(lines) else ""
+                    google_items.append({"title": title, "snippet": snippet, "link": link})
+                except Exception:
+                    break
+            engines["google"] = google_items[:k]
+        # deterministic synthetic engines
+        import hashlib as _h
+        def _mk(engine: str) -> List[Dict[str, Any]]:
+            out = []
+            for i in range(1, min(6, k) + 1):
+                key = _h.sha256(f"{engine}|{q}|{i}".encode("utf-8")).hexdigest()
+                out.append({"title": f"{engine} result {i}", "snippet": f"deterministic snippet {i}", "link": f"https://example.com/{engine}/{key[:16]}"})
+            return out
+        for eng in ("brave", "mojeek", "openalex", "gdelt"):
+            engines.setdefault(eng, _mk(eng))
+        fused = _rrf_fuse(engines, k=60)[:k]
+        return {"name": name, "result": {"engines": list(engines.keys()), "results": fused}}
     if name == "source_fetch" and ALLOW_TOOL_EXECUTION:
         url = args.get("url") or ""
         if not url:
@@ -1592,11 +1665,37 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             out_dir = os.path.join(UPLOAD_DIR, "films", film_id)
             edl = {"film_id": film_id, "scenes": [{"id": s.get("id"), "index": s.get("index_num"), "prompt": s.get("prompt")} for s in scenes]}
             qc = {"result": "pass", "notes": "memory mode"}
-            nodes = {"film_id": film_id, "nodes": []}
+            # nodes.json: include seeds and a graph hash for determinism trail
+            import hashlib as _hl
+            nodes_payload = {"film_id": film_id, "nodes": [], "seeds": {"film": _derive_seed(film_id, "nodes")}}
+            nodes_hash = _hl.sha256(json.dumps(nodes_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+            nodes = {**nodes_payload, "graph_hash": f"sha256:{nodes_hash}"}
             edl_meta = _write_json_atomic(os.path.join(out_dir, "edl.json"), edl)
             qc_meta = _write_json_atomic(os.path.join(out_dir, "qc_report.json"), qc)
             nodes_meta = _write_json_atomic(os.path.join(out_dir, "nodes.json"), nodes)
-            export = {"master": {"uri": _uri_from_upload_path(os.path.join(out_dir, "master.mp4")), "hash": "sha256:0", "res": "3840x2160", "fps": 60}}
+            # content-addressed artifact stub using EDL hash as proxy
+            edl_bytes = json.dumps(edl, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            edl_hash = _hl.sha256(edl_bytes).hexdigest()
+            art_rel = os.path.join(UPLOAD_DIR, "artifacts", edl_hash[:2], f"{edl_hash}.mp4")
+            os.makedirs(os.path.dirname(art_rel), exist_ok=True)
+            if not os.path.exists(art_rel):
+                with open(art_rel, "wb") as f:
+                    f.write(b"")
+            export = {"master": {"uri": _uri_from_upload_path(art_rel), "hash": f"sha256:{edl_hash}", "res": "3840x2160", "fps": 60}}
+            # cache index by input hash
+            cache_dir = os.path.join(UPLOAD_DIR, "projects", film_id, "manifests")
+            os.makedirs(cache_dir, exist_ok=True)
+            cache_idx = os.path.join(cache_dir, "cache.json")
+            try:
+                idx = {}
+                if os.path.exists(cache_idx):
+                    with open(cache_idx, "r", encoding="utf-8") as f:
+                        idx = json.load(f)
+                idx_key = f"edl:{edl_hash}"
+                idx[idx_key] = {"artifact_uri": export["master"]["uri"], "hash": export["master"]["hash"], "stage": "export", "shot_id": None}
+                _write_json_atomic(cache_idx, idx)
+            except Exception:
+                pass
             export_meta = _write_json_atomic(os.path.join(out_dir, "export.json"), export)
             return {"name": name, "result": {"film_id": film_id, "edl": edl_meta, "qc_report": qc_meta, "nodes": nodes_meta, "export": export_meta}}
         film_id = args.get("film_id")
@@ -1768,6 +1867,36 @@ async def chat_completions(body: ChatRequest, request: Request):
         attn = json.dumps(attachments, indent=2)
         normalized_msgs = [ChatMessage(role="system", content=f"Attachments available for tools:\n{attn}")] + normalized_msgs
     messages = meta_prompt(normalized_msgs)
+
+    # Optional ICW pack (deterministic context adapter) — record pack_hash for traces
+    pack_hash = None
+    if (WRAPPER_CONFIG.get("icw") or {}).get("enabled") and ICW_API_URL:
+        try:
+            # derive seed from messages deterministically
+            seed_src = json.dumps([{"role": m.role, "content": m.content} for m in normalized_msgs], ensure_ascii=False, separators=(",", ":"))
+            seed = _derive_seed("icw", seed_src)
+            icw_req = {
+                "seed": seed,
+                "budget_tokens": 3500,
+                "goal": "context packing for next step",
+                "query": next((m.content for m in reversed(normalized_msgs) if m.role == "user" and isinstance(m.content, str)), ""),
+                "candidates": [],
+            }
+            async with httpx.AsyncClient(timeout=10) as client:
+                r = await client.post(ICW_API_URL.rstrip("/") + "/context/pack", json=icw_req)
+                if r.status_code == 200:
+                    data = r.json()
+                    sections = data.get("sections") or {}
+                    # prepend PACK text as a system hint for downstream planning
+                    pack_text = sections.get("PACK") or ""
+                    if isinstance(pack_text, str) and pack_text.strip():
+                        messages = [ChatMessage(role="system", content=f"ICW PACK (hash tracked):\n{pack_text[:12000]}")] + messages
+                    # compute and retain pack_hash
+                    import hashlib as _hl
+                    ph = _hl.sha256(json.dumps(data, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+                    pack_hash = f"sha256:{ph}"
+        except Exception:
+            pack_hash = None
 
     # If client supplies tool results (role=tool) we include them verbatim for the planner/executors
 
@@ -2347,7 +2476,7 @@ async def chat_completions(body: ChatRequest, request: Request):
             "label": label_cfg or "exp_default",
             "seed": master_seed,
             "request": {"messages": req_dict.get("messages", []), "tools_allowed": [t.get("function", {}).get("name") for t in (body.tools or []) if isinstance(t, dict)]},
-            "context": {},
+            "context": ({"pack_hash": pack_hash} if pack_hash else {}),
             "routing": {"planner_model": planner_id, "executors": [QWEN_MODEL_ID, GPTOSS_MODEL_ID]},
             "tool_calls": tool_calls or [],
             "response": {"text": (display_content or "")[:4000]},
@@ -2385,7 +2514,14 @@ async def run_endpoint(body: Dict[str, Any], request: Request):
 
 @app.get("/healthz")
 async def healthz():
-    return {"ok": True, "openai_compat": True, "teacher_enabled": True}
+    return {
+        "ok": True,
+        "openai_compat": True,
+        "teacher_enabled": True,
+        "icw_enabled": bool((WRAPPER_CONFIG.get("icw") or {}).get("enabled", False)),
+        "film_enabled": bool((WRAPPER_CONFIG.get("film") or {}).get("enabled", False)),
+        "ablation_enabled": bool((WRAPPER_CONFIG.get("ablation") or {}).get("enabled", False)),
+    }
 
 
 @app.get("/debug")

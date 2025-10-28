@@ -8,7 +8,7 @@
     "allowlist": [
       "web_search", "source_fetch", "repo_fs",
       "video_gen", "frame_interpolate", "upscale",
-      "tts", "music", "mux"
+      "tts", "music", "mux", "metasearch.fuse"
     ]
   },
   "cors": { "enabled": true, "origins": ["*"] }
