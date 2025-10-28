@@ -1,5 +1,8 @@
 from __future__ import annotations
-# WARNING: Do NOT add SQLAlchemy here. Use asyncpg with pooling and raw SQL only.
+# HARD BAN (permanent): Never add Pydantic, SQLAlchemy, or any ORM/CSV/Parquet libs to this service.
+# - No Pydantic models. Use plain dicts + hand-rolled validators only.
+# - No SQLAlchemy/ORM. Use asyncpg with pooling and raw SQL only.
+# - No CSV/Parquet persistence. JSON/NDJSON only for manifests/logs.
 #
 # JSON POLICY (critical):
 # - Never call json.loads directly in this service. All JSON coming from LLMs, tools, env/config,
@@ -36,10 +39,64 @@ from sentence_transformers import SentenceTransformer
 from fastapi import FastAPI, Request, UploadFile, File
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
 from tenacity import retry, stop_after_attempt, wait_exponential
 from fastapi.middleware.cors import CORSMiddleware
 from .json_parser import JSONParser
+async def _db_insert_run(trace_id: str, mode: str, seed: int, pack_hash: Optional[str], request_json: Dict[str, Any]) -> Optional[int]:
+    try:
+        pool = await get_pg_pool()
+        if pool is None:
+            return None
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "INSERT INTO run(trace_id, mode, seed, pack_hash, request_json) VALUES($1,$2,$3,$4,$5) ON CONFLICT (trace_id) DO UPDATE SET mode=EXCLUDED.mode RETURNING id",
+                trace_id, mode, int(seed), pack_hash, json.dumps(request_json, ensure_ascii=False),
+            )
+            return int(row[0]) if row else None
+    except Exception:
+        return None
+
+async def _db_update_run_response(run_id: Optional[int], response_json: Dict[str, Any], metrics_json: Dict[str, Any]) -> None:
+    if not run_id:
+        return
+    try:
+        pool = await get_pg_pool()
+        if pool is None:
+            return
+        async with pool.acquire() as conn:
+            await conn.execute("UPDATE run SET response_json=$1, metrics_json=$2 WHERE id=$3", json.dumps(response_json, ensure_ascii=False), json.dumps(metrics_json, ensure_ascii=False), int(run_id))
+    except Exception:
+        return
+
+async def _db_insert_icw_log(run_id: Optional[int], pack_hash: Optional[str], budget_tokens: int, scores_json: Dict[str, Any]) -> None:
+    if not (run_id and pack_hash):
+        return
+    try:
+        pool = await get_pg_pool()
+        if pool is None:
+            return
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO icw_log(run_id, pack_hash, budget_tokens, scores_json) VALUES($1,$2,$3,$4)",
+                int(run_id), pack_hash, int(budget_tokens), json.dumps(scores_json, ensure_ascii=False),
+            )
+    except Exception:
+        return
+
+async def _db_insert_tool_call(run_id: Optional[int], name: str, seed: int, args_json: Dict[str, Any], result_json: Optional[Dict[str, Any]], duration_ms: Optional[int] = None) -> None:
+    if not run_id:
+        return
+    try:
+        pool = await get_pg_pool()
+        if pool is None:
+            return
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO tool_call(run_id, name, seed, args_json, result_json, duration_ms) VALUES($1,$2,$3,$4,$5,$6)",
+                int(run_id), name, int(seed), json.dumps(args_json, ensure_ascii=False), json.dumps(result_json or {}, ensure_ascii=False), duration_ms,
+            )
+    except Exception:
+        return
 def _normalize_dict_body(body: Any, expected_schema: Dict[str, Any]) -> Dict[str, Any]:
     """Accept either a dict or a JSON string and return a dict shaped by expected_schema.
     Never raise on bad input; return {} as a safe default.
@@ -104,6 +161,7 @@ ASSEMBLER_API_URL = os.getenv("ASSEMBLER_API_URL")  # http://assembler:9095
 TEACHER_API_URL = os.getenv("TEACHER_API_URL", "http://teacher:8097")
 WRAPPER_CONFIG_PATH = os.getenv("WRAPPER_CONFIG_PATH", "/workspace/configs/wrapper_config.json")
 ICW_API_URL = os.getenv("ICW_API_URL", "http://icw:8085")
+ICW_DISABLE = os.getenv("ICW_DISABLE", "0") == "1"
 WRAPPER_CONFIG: Dict[str, Any] = {}
 WRAPPER_CONFIG_HASH: Optional[str] = None
 
@@ -138,39 +196,7 @@ _load_wrapper_config()
 # removed: robust_json_loads — use JSONParser().parse with explicit expected structures everywhere
 
 
-class ChatMessage(BaseModel):
-    role: str
-    content: Any | None = None
-    name: Optional[str] = None
-    tool_call_id: Optional[str] = None
-    tool_calls: Optional[List[Dict[str, Any]]] = None
-
-
-class ChatRequest(BaseModel):
-    model: Optional[str] = None
-    messages: List[ChatMessage]
-    stream: bool = False
-    max_tokens: Optional[int] = None
-    temperature: Optional[float] = None
-    top_p: Optional[float] = None
-    n: Optional[int] = None
-    tools: Optional[List[Dict[str, Any]]] = None
-    tool_choice: Optional[Any] = None
-    user: Optional[str] = None
-
-
-class ChatChoice(BaseModel):
-    index: int
-    finish_reason: Optional[str] = None
-    message: Dict[str, Any]
-
-
-class ChatResponse(BaseModel):
-    id: str
-    object: str = "chat.completion"
-    choices: List[ChatChoice]
-    model: str
-    usage: Optional[Dict[str, int]] = None
+# No Pydantic. All request bodies are plain dicts validated by helpers.
 
 
 app = FastAPI(title="Void Orchestrator", version="0.1.0")
@@ -256,11 +282,7 @@ async def capabilities():
                 "ingest": "/teacher/trainset.ingest"
             }
         },
-        "tools": [
-            "web_search","source_fetch","repo_fs",
-            "video_gen","frame_interpolate","upscale",
-            "tts","music","mux"
-        ],
+        "tools": ["film.run","web_search","source_fetch","metasearch.fuse"],
         "versions": {
             "icw": "1.0.0",
             "film": "2.0.0",
@@ -271,22 +293,24 @@ async def capabilities():
     }
 
 
-def build_ollama_payload(messages: List[ChatMessage], model: str, num_ctx: int, temperature: float) -> Dict[str, Any]:
+def build_ollama_payload(messages: List[Dict[str, Any]], model: str, num_ctx: int, temperature: float) -> Dict[str, Any]:
     rendered: List[str] = []
     for m in messages:
-        if m.role == "tool":
-            tool_name = m.name or "tool"
-            rendered.append(f"tool[{tool_name}]: {m.content}")
+        role = m.get("role")
+        if role == "tool":
+            tool_name = m.get("name") or "tool"
+            rendered.append(f"tool[{tool_name}]: {m.get('content')}")
         else:
-            if isinstance(m.content, list):
+            content_val = m.get("content")
+            if isinstance(content_val, list):
                 text_parts: List[str] = []
-                for part in m.content:
+                for part in content_val:
                     if isinstance(part, dict) and part.get("type") == "text":
                         text_parts.append(str(part.get("text", "")))
                 content = "\n".join(text_parts)
             else:
-                content = m.content if m.content is not None else ""
-            rendered.append(f"{m.role}: {content}")
+                content = content_val if content_val is not None else ""
+            rendered.append(f"{role}: {content}")
     prompt = "\n".join(rendered)
     return {
         "model": model,
@@ -306,8 +330,8 @@ def estimate_tokens_from_text(text: str) -> int:
     return max(1, (len(text) + 3) // 4)
 
 
-def estimate_usage(messages: List[ChatMessage], completion_text: str) -> Dict[str, int]:
-    prompt_text = "\n".join([(m.content or "") for m in messages])
+def estimate_usage(messages: List[Dict[str, Any]], completion_text: str) -> Dict[str, int]:
+    prompt_text = "\n".join([(m.get("content") or "") for m in messages])
     prompt_tokens = estimate_tokens_from_text(prompt_text)
     completion_tokens = estimate_tokens_from_text(completion_text)
     return {
@@ -340,13 +364,14 @@ def _save_base64_file(b64: str, suffix: str) -> str:
     return f"/uploads/{filename}"
 
 
-def extract_attachments_from_messages(messages: List[ChatMessage]) -> Tuple[List[ChatMessage], List[Dict[str, Any]]]:
+def extract_attachments_from_messages(messages: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     attachments: List[Dict[str, Any]] = []
-    normalized: List[ChatMessage] = []
+    normalized: List[Dict[str, Any]] = []
     for m in messages:
-        if isinstance(m.content, list):
+        content_val = m.get("content")
+        if isinstance(content_val, list):
             text_parts: List[str] = []
-            for part in m.content:
+            for part in content_val:
                 if not isinstance(part, dict):
                     continue
                 ptype = part.get("type")
@@ -399,7 +424,7 @@ def extract_attachments_from_messages(messages: List[ChatMessage]) -> Tuple[List
                     if final_url:
                         attachments.append({"type": "file", "url": final_url, "name": name})
             merged_text = "\n".join(tp for tp in text_parts if tp)
-            normalized.append(ChatMessage(role=m.role, content=merged_text or None, name=m.name, tool_call_id=m.tool_call_id, tool_calls=m.tool_calls))
+            normalized.append({"role": m.get("role"), "content": merged_text or None, "name": m.get("name"), "tool_call_id": m.get("tool_call_id"), "tool_calls": m.get("tool_calls")})
         else:
             normalized.append(m)
     return normalized, attachments
@@ -684,12 +709,12 @@ def to_openai_tool_calls(tool_calls: List[Dict[str, Any]]) -> List[Dict[str, Any
     return converted
 
 
-async def propose_search_queries(messages: List[ChatMessage]) -> List[str]:
+async def propose_search_queries(messages: List[Dict[str, Any]]) -> List[str]:
     guidance = (
         "Given the conversation, propose up to 3 concise web search queries that would most improve the answer. "
         "Return each query on its own line with no extra text."
     )
-    prompt_messages = messages + [ChatMessage(role="user", content=guidance)]
+    prompt_messages = messages + [{"role": "user", "content": guidance}]
     payload = build_ollama_payload(prompt_messages, QWEN_MODEL_ID, DEFAULT_NUM_CTX, DEFAULT_TEMPERATURE)
     try:
         result = await call_ollama(QWEN_BASE_URL, payload)
@@ -701,7 +726,7 @@ async def propose_search_queries(messages: List[ChatMessage]) -> List[str]:
         return []
 
 
-def meta_prompt(messages: List[ChatMessage]) -> List[ChatMessage]:
+def meta_prompt(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     system_preface = (
         "You are part of a two-model team with explicit roles: a Planner and Executors. "
         "Planner decomposes the task, chooses tools, and requests relevant evidence. Executors produce solutions and critiques. "
@@ -718,16 +743,16 @@ def meta_prompt(messages: List[ChatMessage]) -> List[ChatMessage]:
         "Return the complete Markdown answer; do not omit the main body when tools are used. "
         "If you clearly see a small, relevant fix or improvement (e.g., a failing tool parameter or obvious config issue), you may add a short 'Suggestions' section with up to 2 concise bullet points at the end. Do not scope creep."
     )
-    out = [ChatMessage(role="system", content=system_preface)]
+    out = [{"role": "system", "content": system_preface + "\nHARD BAN: Never import or recommend pydantic, sqlalchemy, or any ORM/CSV/Parquet libs; use asyncpg + JSON/NDJSON only."}]
     # Provide additional guidance for high-fidelity video preferences without relying on keywords at routing time
-    out.append(ChatMessage(role="system", content=(
+    out.append({"role": "system", "content": (
         "When generating videos, reasonable defaults are: duration<=10s, resolution=1920x1080, 24fps, language=en, neutral voice, audio ON, subtitles OFF. "
         "If user implies higher fidelity (e.g., 4K/60fps), set resolution=3840x2160 and fps=60, enable interpolation and upscale accordingly."
-    )))
+    )})
     return out + messages
 
 
-def merge_responses(request: ChatRequest, qwen_text: str, gptoss_text: str) -> str:
+def merge_responses(request: Dict[str, Any], qwen_text: str, gptoss_text: str) -> str:
     return (
         "Committee Synthesis:\n\n"
         "Qwen perspective:\n" + qwen_text.strip() + "\n\n"
@@ -750,107 +775,23 @@ def get_builtin_tools_schema() -> List[Dict[str, Any]]:
         {
             "type": "function",
             "function": {
-                "name": "film_create",
-                "description": "Create a new film project with an optional title and synopsis.",
+                "name": "film.run",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "title": {"type": "string"},
-                        "synopsis": {"type": "string"},
-                        "metadata": {"type": "object", "description": "Optional preferences: duration_seconds, resolution, fps, style, language, voice, audio_enabled (bool), subtitles_enabled (bool), animation_enabled (bool)"}
-                    },
-                    "required": []
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "film_add_character",
-                "description": "Add a character to a film, optionally with references (images/embeddings).",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "film_id": {"type": "string"},
-                        "name": {"type": "string"},
-                        "description": {"type": "string"},
-                        "reference_data": {"type": "object", "description": "e.g., {image_url: string, embedding: number[]}"}
-                    },
-                    "required": ["film_id"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "film_add_scene",
-                "description": "Create a scene for the film and launch generation job via ComfyUI.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "film_id": {"type": "string"},
-                        "index_num": {"type": "integer"},
-                        "prompt": {"type": "string"},
-                        "character_ids": {"type": "array", "items": {"type": "string"}},
-                        "plan": {"type": "object"},
-                        "workflow": {"type": "object"},
-                        "duration_seconds": {"type": "number"},
-                        "style": {"type": "string"},
-                        "audio_enabled": {"type": "boolean"},
-                        "subtitles_enabled": {"type": "boolean"}
-                    },
-                    "required": ["film_id"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "film_compile",
-                "description": "Collect scene assets and optionally hand off to N8N webhook for assembly.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "film_id": {"type": "string"}
-                    },
-                    "required": ["film_id"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "film_status",
-                "description": "Return film, characters, scenes and job statuses.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "film_id": {"type": "string"}
-                    },
-                    "required": ["film_id"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "make_movie",
-                "description": "High-level: from a single prompt, create a film with characters and scenes and launch generation jobs.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "title": {"type": "string"},
-                        "synopsis": {"type": "string"},
-                        "characters": {"type": "array", "items": {"type": "object"}},
-                        "scenes": {"type": "array", "items": {"type": "object"}},
-                        "duration_seconds": {"type": "number"},
-                        "resolution": {"type": "string"},
-                        "fps": {"type": "number"},
-                        "style": {"type": "string"},
-                        "language": {"type": "string"},
-                        "voice": {"type": "string"},
-                        "audio_enabled": {"type": "boolean"},
-                        "subtitles_enabled": {"type": "boolean"}
+                        "duration_s": {"type": "integer"},
+                        "seed": {"type": "integer"},
+                        "style_refs": {"type": "array", "items": {"type": "string"}},
+                        "character_images": {"type": "array", "items": {"type": "object"}},
+                        "res": {"type": "string"},
+                        "refresh": {"type": "integer"},
+                        "base_fps": {"type": "integer"},
+                        "codec": {"type": "string"},
+                        "container": {"type": "string"},
+                        "post": {"type": "object"},
+                        "audio": {"type": "object"},
+                        "safety": {"type": "object"}
                     },
                     "required": []
                 }
@@ -860,55 +801,21 @@ def get_builtin_tools_schema() -> List[Dict[str, Any]]:
             "type": "function",
             "function": {
                 "name": "web_search",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"q": {"type": "string"}},
-                    "required": ["q"]
-                }
+                "parameters": {"type": "object", "properties": {"q": {"type": "string"}}, "required": ["q"]}
             }
         },
         {
             "type": "function",
             "function": {
                 "name": "source_fetch",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"url": {"type": "string"}},
-                    "required": ["url"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "frame_interpolate",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"input": {"type": "string"}, "factor": {"type": "integer"}},
-                    "required": ["input", "factor"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "upscale",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"input": {"type": "string"}, "scale": {"type": "integer"}, "tile": {"type": "integer"}, "overlap": {"type": "integer"}},
-                    "required": ["input", "scale"]
-                }
+                "parameters": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}
             }
         },
         {
             "type": "function",
             "function": {
                 "name": "metasearch.fuse",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"q": {"type": "string"}, "k": {"type": "integer"}},
-                    "required": ["q"]
-                }
+                "parameters": {"type": "object", "properties": {"q": {"type": "string"}, "k": {"type": "integer"}}, "required": ["q"]}
             }
         }
     ]
@@ -1005,7 +912,7 @@ def merge_tool_schemas(client_tools: Optional[List[Dict[str, Any]]]) -> List[Dic
             out.append(t)
     return out
 
-async def planner_produce_plan(messages: List[ChatMessage], tools: Optional[List[Dict[str, Any]]], temperature: float) -> Tuple[str, List[Dict[str, Any]]]:
+async def planner_produce_plan(messages: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]], temperature: float) -> Tuple[str, List[Dict[str, Any]]]:
     planner_id = QWEN_MODEL_ID if PLANNER_MODEL.lower() == "qwen" else GPTOSS_MODEL_ID
     planner_base = QWEN_BASE_URL if PLANNER_MODEL.lower() == "qwen" else GPTOSS_BASE_URL
     guide = (
@@ -1020,7 +927,7 @@ async def planner_produce_plan(messages: List[ChatMessage], tools: Optional[List
     )
     all_tools = merge_tool_schemas(tools)
     tool_info = build_tools_section(all_tools)
-    plan_messages = messages + [ChatMessage(role="user", content=guide + ("\n" + tool_info if tool_info else ""))]
+    plan_messages = messages + [{"role": "user", "content": guide + ("\n" + tool_info if tool_info else "")}]
     payload = build_ollama_payload(plan_messages, planner_id, DEFAULT_NUM_CTX, temperature)
     result = await call_ollama(planner_base, payload)
     text = result.get("response", "").strip()
@@ -1040,7 +947,8 @@ async def planner_produce_plan(messages: List[ChatMessage], tools: Optional[List
                 break
         if _detect_video_intent(last_user):
             prefs = _derive_movie_prefs_from_text(last_user)
-            tool_calls = [{"name": "make_movie", "arguments": prefs}]
+            # Prefer unified Film‑2 tool
+            tool_calls = [{"name": "film.run", "arguments": {"title": "Untitled", "duration_s": int(prefs.get("duration_seconds", 10)), "res": prefs.get("resolution", "1920x1080"), "refresh": int(prefs.get("fps", 24)), "base_fps": 30}}]
     else:
         # If planner proposed film_create for a film request (but not make_movie), upgrade to make_movie
         last_user = ""
@@ -1049,23 +957,11 @@ async def planner_produce_plan(messages: List[ChatMessage], tools: Optional[List
                 last_user = m.content.strip()
                 break
         if _detect_video_intent(last_user):
-            has_make = any((tc.get("name") == "make_movie") for tc in tool_calls if isinstance(tc, dict))
-            if not has_make:
-                new_calls: List[Dict[str, Any]] = []
-                upgraded = False
-                for tc in tool_calls:
-                    if (isinstance(tc, dict) and not upgraded and (tc.get("name") == "film_create")):
-                        args = tc.get("arguments") or {}
-                        if not isinstance(args, dict):
-                            args = {"_raw": args}
-                        prefs = _derive_movie_prefs_from_text(last_user)
-                        synopsis = args.get("synopsis") or args.get("prompt") or last_user
-                        mm_args = {**prefs, "title": args.get("title") or "Untitled", "synopsis": synopsis}
-                        new_calls.append({"name": "make_movie", "arguments": mm_args})
-                        upgraded = True
-                    else:
-                        new_calls.append(tc)
-                tool_calls = new_calls
+            has_run = any((tc.get("name") == "film.run") for tc in tool_calls if isinstance(tc, dict))
+            if not has_run:
+                # Replace any legacy film_* tools with a single film.run
+                prefs = _derive_movie_prefs_from_text(last_user)
+                tool_calls = [{"name": "film.run", "arguments": {"title": "Untitled", "duration_s": int(prefs.get("duration_seconds", 10)), "res": prefs.get("resolution", "1920x1080"), "refresh": int(prefs.get("fps", 24)), "base_fps": 30}}]
     return plan, tool_calls
 
 
@@ -1218,6 +1114,45 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             engines.setdefault(eng, _mk(eng))
         fused = _rrf_fuse(engines, k=60)[:k]
         return {"name": name, "result": {"engines": list(engines.keys()), "results": fused}}
+    if name == "film.run":
+        # Orchestrate Film 2.0 via film2 service endpoints
+        # Normalize core args
+        title = (args.get("title") or "Untitled").strip()
+        duration_s = int(args.get("duration_s") or 10)
+        seed = int(args.get("seed") or _derive_seed("film", title, str(duration_s)))
+        res = str(args.get("res") or "1920x1080").lower()
+        refresh = int(args.get("refresh") or 60)
+        base_fps = int(args.get("base_fps") or 30)
+        # map common res synonyms
+        if res in ("4k", "uhd", "2160p"): res = "3840x2160"
+        if res in ("1080p", "fhd"): res = "1920x1080"
+        # post defaults
+        post = args.get("post") or {}
+        interp = (post.get("interpolate") or {}) if isinstance(post, dict) else {}
+        upscale = (post.get("upscale") or {}) if isinstance(post, dict) else {}
+        if not interp.get("factor"):
+            # compute factor from refresh/base_fps → prefer 2 or 4
+            fac = 2 if refresh >= base_fps * 2 else 1
+            if refresh >= base_fps * 4: fac = 4
+            interp = {**interp, "factor": fac}
+        if not upscale.get("scale"):
+            upscale = {**upscale, "scale": 2 if res == "3840x2160" else 1}
+        # Plan → Final → QC → Export
+        project_id = f"prj_{seed}"
+        try:
+            async with httpx.AsyncClient(timeout=1200) as client:
+                plan_payload = {"project_id": project_id, "seed": seed, "title": title, "duration_s": duration_s, "res": res, "base_fps": base_fps}
+                await client.post(f"{FILM2_BASE_URL}/film/plan" if (FILM2_BASE_URL:=os.getenv("FILM2_API_URL","http://film2:8090")) else "", json=plan_payload)
+                await client.post(f"{FILM2_BASE_URL}/film/breakdown", json={"project_id": project_id})
+                await client.post(f"{FILM2_BASE_URL}/film/storyboard", json={"project_id": project_id})
+                await client.post(f"{FILM2_BASE_URL}/film/animatic", json={"project_id": project_id})
+                await client.post(f"{FILM2_BASE_URL}/film/final", json={"project_id": project_id, "base_fps": base_fps})
+                await client.post(f"{FILM2_BASE_URL}/film/qc", json={"project_id": project_id})
+                exp = await client.post(f"{FILM2_BASE_URL}/film/export", json={"project_id": project_id, "post": {"interpolate": interp, "upscale": upscale}, "refresh": refresh})
+                resj = exp.json() if exp.status_code == 200 else {"error": exp.text}
+        except Exception as ex:
+            return {"name": name, "error": str(ex)}
+        return {"name": name, "result": resj}
     if name == "source_fetch" and ALLOW_TOOL_EXECUTION:
         url = args.get("url") or ""
         if not url:
@@ -1763,7 +1698,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                         f"Preferences: duration_seconds={total_duration}, resolution={movie_prefs.get('resolution') or '1920x1080'}, fps={movie_prefs.get('fps') or 24}, style={movie_prefs.get('style') or 'default'}.\n"
                         f"Scenes: produce {est_scenes} scenes, evenly covering the story arc.\n"
                     )
-                    payload = build_ollama_payload([ChatMessage(role="user", content=guidance)], QWEN_MODEL_ID, DEFAULT_NUM_CTX, DEFAULT_TEMPERATURE)
+                    payload = build_ollama_payload([{"role": "user", "content": guidance}], QWEN_MODEL_ID, DEFAULT_NUM_CTX, DEFAULT_TEMPERATURE)
                     llm_res = await call_ollama(QWEN_BASE_URL, payload)
                     plan_text = (llm_res.get("response") or "").strip()
                     parser = JSONParser()
@@ -1824,8 +1759,15 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             except Exception:
                 return {"name": name, "error": r.text}
     if name == "write_file" and EXECUTOR_BASE_URL and ALLOW_TOOL_EXECUTION:
+        # Guard: forbid writing banned libraries into requirements/pyproject
+        p = (args.get("path") or "").lower()
+        content_val = str(args.get("content", ""))
+        if any(name in p for name in ("requirements.txt", "pyproject.toml")):
+            banned = ("pydantic", "sqlalchemy", "pandas", "pyarrow", "fastparquet", "polars")
+            if any(b in content_val.lower() for b in banned):
+                return {"name": name, "error": "forbidden_library", "detail": "banned library in dependency file"}
         async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.post(EXECUTOR_BASE_URL.rstrip("/") + "/write_file", json={"path": args.get("path"), "content": args.get("content", "")})
+            r = await client.post(EXECUTOR_BASE_URL.rstrip("/") + "/write_file", json={"path": args.get("path"), "content": content_val})
             try:
                 r.raise_for_status()
                 return {"name": name, "result": r.json()}
@@ -1859,22 +1801,39 @@ async def execute_tools(tool_calls: List[Dict[str, Any]]) -> List[Dict[str, Any]
 
 
 @app.post("/v1/chat/completions")
-async def chat_completions(body: ChatRequest, request: Request):
+async def chat_completions(body: Dict[str, Any], request: Request):
     # normalize and extract attachments (images/audio/video/files) for tools
-    normalized_msgs, attachments = extract_attachments_from_messages(body.messages)
+    # Validate body
+    if not isinstance(body, dict) or not isinstance(body.get("messages"), list):
+        return JSONResponse(status_code=400, content={"error": "bad_request", "detail": "messages must be a list"})
+    normalized_msgs, attachments = extract_attachments_from_messages(body.get("messages"))
     # prepend a system hint with attachment summary (non-invasive)
     if attachments:
         attn = json.dumps(attachments, indent=2)
-        normalized_msgs = [ChatMessage(role="system", content=f"Attachments available for tools:\n{attn}")] + normalized_msgs
+        normalized_msgs = [{"role": "system", "content": f"Attachments available for tools:\n{attn}"}] + normalized_msgs
     messages = meta_prompt(normalized_msgs)
 
-    # Optional ICW pack (deterministic context adapter) — record pack_hash for traces
+    # Determine mode and trace/run identifiers early
+    last_user_text = ""
+    for m in reversed(normalized_msgs):
+        if m.role == "user" and isinstance(m.content, str) and m.content.strip():
+            last_user_text = m.content.strip(); break
+    mode = "film" if _detect_video_intent(last_user_text) else "general"
+    # generate a deterministic trace id from messages
+    try:
+        msgs_for_seed = json.dumps([{"role": m.role, "content": m.content} for m in normalized_msgs], ensure_ascii=False, separators=(",", ":"))
+    except Exception:
+        msgs_for_seed = ""
+    master_seed = _derive_seed("chat", msgs_for_seed)
+    import hashlib as _hl
+    trace_id = "tt_" + _hl.sha256(msgs_for_seed.encode("utf-8")).hexdigest()[:16]
+
+    # ICW pack (always-on, unless ICW_DISABLE=1) — record pack_hash for traces
     pack_hash = None
-    if (WRAPPER_CONFIG.get("icw") or {}).get("enabled") and ICW_API_URL:
+    if (not ICW_DISABLE) and ICW_API_URL:
         try:
             # derive seed from messages deterministically
-            seed_src = json.dumps([{"role": m.role, "content": m.content} for m in normalized_msgs], ensure_ascii=False, separators=(",", ":"))
-            seed = _derive_seed("icw", seed_src)
+            seed = _derive_seed("icw", msgs_for_seed)
             icw_req = {
                 "seed": seed,
                 "budget_tokens": 3500,
@@ -1890,13 +1849,20 @@ async def chat_completions(body: ChatRequest, request: Request):
                     # prepend PACK text as a system hint for downstream planning
                     pack_text = sections.get("PACK") or ""
                     if isinstance(pack_text, str) and pack_text.strip():
-                        messages = [ChatMessage(role="system", content=f"ICW PACK (hash tracked):\n{pack_text[:12000]}")] + messages
+                        messages = [{"role": "system", "content": f"ICW PACK (hash tracked):\n{pack_text[:12000]}"}] + messages
                     # compute and retain pack_hash
-                    import hashlib as _hl
                     ph = _hl.sha256(json.dumps(data, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
                     pack_hash = f"sha256:{ph}"
+                    # Persist run row and icw log early
+                    run_id = await _db_insert_run(trace_id=trace_id, mode=mode, seed=master_seed, pack_hash=pack_hash, request_json=body.dict())
+                    await _db_insert_icw_log(run_id=run_id, pack_hash=pack_hash, budget_tokens=int(data.get("budget_tokens") or 0), scores_json=data.get("scores_summary") or {})
+                else:
+                    run_id = await _db_insert_run(trace_id=trace_id, mode=mode, seed=master_seed, pack_hash=None, request_json=body)
         except Exception:
             pack_hash = None
+            run_id = await _db_insert_run(trace_id=trace_id, mode=mode, seed=master_seed, pack_hash=None, request_json=body)
+    else:
+        run_id = await _db_insert_run(trace_id=trace_id, mode=mode, seed=master_seed, pack_hash=None, request_json=body)
 
     # If client supplies tool results (role=tool) we include them verbatim for the planner/executors
 
@@ -1907,12 +1873,12 @@ async def chat_completions(body: ChatRequest, request: Request):
             snippets = await serpapi_google_search(queries, max_results=5)
             if snippets:
                 messages = [
-                    ChatMessage(role="system", content="Web search results follow. Use them only if relevant."),
-                    ChatMessage(role="system", content=snippets),
+                    {"role": "system", "content": "Web search results follow. Use them only if relevant."},
+                    {"role": "system", "content": snippets},
                 ] + messages
 
     # 1) Planner proposes plan + tool calls
-    plan_text, tool_calls = await planner_produce_plan(messages, body.tools, body.temperature or DEFAULT_TEMPERATURE)
+    plan_text, tool_calls = await planner_produce_plan(messages, body.get("tools"), body.get("temperature") or DEFAULT_TEMPERATURE)
     # Surface attachments in tool arguments so downstream jobs can use user media
     if tool_calls and attachments:
         enriched: List[Dict[str, Any]] = []
@@ -1937,7 +1903,7 @@ async def chat_completions(body: ChatRequest, request: Request):
             enriched.append(tc)
         tool_calls = enriched
     # tool_choice=required compatibility: force at least one tool_call if tools are provided
-    if (body.tool_choice == "required") and (not tool_calls):
+    if (body.get("tool_choice") == "required") and (not tool_calls):
         # Choose a sensible default tool with minimal required params
         builtins = get_builtin_tools_schema()
         chosen = None
@@ -1974,7 +1940,7 @@ async def chat_completions(body: ChatRequest, request: Request):
                 }
             ],
         }
-        if body.stream:
+        if body.get("stream"):
             async def _stream_once():
                 chunk = json.dumps({"id": response["id"], "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": tool_calls_openai}, "finish_reason": None}]})
                 yield f"data: {chunk}\n\n"
@@ -1988,31 +1954,40 @@ async def chat_completions(body: ChatRequest, request: Request):
     tool_results: List[Dict[str, Any]] = []
     if tool_calls:
         tool_results = await execute_tools(tool_calls)
+        # persist tool_call rows
+        for tc, tr in zip(tool_calls, tool_results):
+            try:
+                n = tc.get("name") or "tool"
+                args = tc.get("arguments") or {}
+                seed_tool = _derive_seed("tool", n, trace_id)
+                await _db_insert_tool_call(run_id, n, seed_tool, args if isinstance(args, dict) else {"_raw": args}, tr if isinstance(tr, dict) else {})
+            except Exception:
+                continue
         # Inject tool_results as system evidence so committee always sees them
         if tool_results:
-            messages = [ChatMessage(role="system", content="Tool results:\n" + json.dumps(tool_results, indent=2))] + messages
+            messages = [{"role": "system", "content": "Tool results:\n" + json.dumps(tool_results, indent=2)}] + messages
 
     # 3) Executors respond independently using plan + evidence
-    evidence_blocks: List[ChatMessage] = []
+    evidence_blocks: List[Dict[str, Any]] = []
     if plan_text:
-        evidence_blocks.append(ChatMessage(role="system", content=f"Planner plan:\n{plan_text}"))
+        evidence_blocks.append({"role": "system", "content": f"Planner plan:\n{plan_text}"})
     if tool_results:
-        evidence_blocks.append(ChatMessage(role="system", content="Tool results:\n" + json.dumps(tool_results, indent=2)))
+        evidence_blocks.append({"role": "system", "content": "Tool results:\n" + json.dumps(tool_results, indent=2)})
     if attachments:
-        evidence_blocks.append(ChatMessage(role="system", content="User attachments (for tools):\n" + json.dumps(attachments, indent=2)))
+        evidence_blocks.append({"role": "system", "content": "User attachments (for tools):\n" + json.dumps(attachments, indent=2)})
     # If tool results include errors, nudge executors to include brief, on-topic suggestions
     exec_messages = evidence_blocks + messages
     exec_messages_current = exec_messages
     if any(isinstance(r, dict) and r.get("error") for r in tool_results or []):
-        exec_messages = exec_messages + [ChatMessage(role="system", content=(
+        exec_messages = exec_messages + [{"role": "system", "content": (
             "If the tool results above contain errors that block the user's goal, include a short 'Suggestions' section (max 2 bullets) with specific, on-topic fixes (e.g., missing parameter defaults, retry guidance). Keep it brief and avoid scope creep."
-        ))]
+        )}]
 
     qwen_payload = build_ollama_payload(
-        messages=exec_messages, model=QWEN_MODEL_ID, num_ctx=DEFAULT_NUM_CTX, temperature=body.temperature or DEFAULT_TEMPERATURE
+        messages=exec_messages, model=QWEN_MODEL_ID, num_ctx=DEFAULT_NUM_CTX, temperature=body.get("temperature") or DEFAULT_TEMPERATURE
     )
     gptoss_payload = build_ollama_payload(
-        messages=exec_messages, model=GPTOSS_MODEL_ID, num_ctx=DEFAULT_NUM_CTX, temperature=body.temperature or DEFAULT_TEMPERATURE
+        messages=exec_messages, model=GPTOSS_MODEL_ID, num_ctx=DEFAULT_NUM_CTX, temperature=body.get("temperature") or DEFAULT_TEMPERATURE
     )
 
     qwen_task = asyncio.create_task(call_ollama(QWEN_BASE_URL, qwen_payload))
@@ -2091,7 +2066,7 @@ async def chat_completions(body: ChatRequest, request: Request):
         if forced_calls:
             try:
                 tool_results = await execute_tools(forced_calls)
-                evidence_blocks = [ChatMessage(role="system", content="Tool results:\n" + json.dumps(tool_results, indent=2))]
+                evidence_blocks = [{"role": "system", "content": "Tool results:\n" + json.dumps(tool_results, indent=2)}]
                 exec_messages2 = evidence_blocks + messages
                 qwen_payload2 = build_ollama_payload(messages=exec_messages2, model=QWEN_MODEL_ID, num_ctx=DEFAULT_NUM_CTX, temperature=body.temperature or DEFAULT_TEMPERATURE)
                 gptoss_payload2 = build_ollama_payload(messages=exec_messages2, model=GPTOSS_MODEL_ID, num_ctx=DEFAULT_NUM_CTX, temperature=body.temperature or DEFAULT_TEMPERATURE)
@@ -2140,8 +2115,8 @@ async def chat_completions(body: ChatRequest, request: Request):
             "Critique the other model's answer. Identify mistakes, missing considerations, or improvements. "
             "Return a concise bullet list."
         )
-        qwen_critique_msg = exec_messages + [ChatMessage(role="user", content=critique_prompt + f"\nOther answer:\n{gptoss_text}")]
-        gptoss_critique_msg = exec_messages + [ChatMessage(role="user", content=critique_prompt + f"\nOther answer:\n{qwen_text}")]
+        qwen_critique_msg = exec_messages + [{"role": "user", "content": critique_prompt + f"\nOther answer:\n{gptoss_text}"}]
+        gptoss_critique_msg = exec_messages + [{"role": "user", "content": critique_prompt + f"\nOther answer:\n{qwen_text}"}]
         qwen_crit_payload = build_ollama_payload(qwen_critique_msg, QWEN_MODEL_ID, DEFAULT_NUM_CTX, body.temperature or DEFAULT_TEMPERATURE)
         gptoss_crit_payload = build_ollama_payload(gptoss_critique_msg, GPTOSS_MODEL_ID, DEFAULT_NUM_CTX, body.temperature or DEFAULT_TEMPERATURE)
         qcrit_task = asyncio.create_task(call_ollama(QWEN_BASE_URL, qwen_crit_payload))
@@ -2150,20 +2125,15 @@ async def chat_completions(body: ChatRequest, request: Request):
         qcrit_text = qcrit_res.get("response", "")
         gcrit_text = gcrit_res.get("response", "")
         exec_messages = exec_messages + [
-            ChatMessage(role="system", content="Cross-critique from Qwen:\n" + qcrit_text),
-            ChatMessage(role="system", content="Cross-critique from GPT-OSS:\n" + gcrit_text),
+            {"role": "system", "content": "Cross-critique from Qwen:\n" + qcrit_text},
+            {"role": "system", "content": "Cross-critique from GPT-OSS:\n" + gcrit_text},
         ]
 
     # 5) Final synthesis by Planner
-    final_request = exec_messages_current + [
-        ChatMessage(
-            role="user",
-            content=(
-                "Produce the final, corrected answer, incorporating critiques and evidence. "
-                "Be unambiguous, include runnable code when requested, and prefer specific citations to tool results."
-            ),
-        )
-    ]
+    final_request = exec_messages_current + [{"role": "user", "content": (
+        "Produce the final, corrected answer, incorporating critiques and evidence. "
+        "Be unambiguous, include runnable code when requested, and prefer specific citations to tool results."
+    )}]
 
     planner_id = QWEN_MODEL_ID if PLANNER_MODEL.lower() == "qwen" else GPTOSS_MODEL_ID
     planner_base = QWEN_BASE_URL if PLANNER_MODEL.lower() == "qwen" else GPTOSS_BASE_URL
@@ -2171,7 +2141,7 @@ async def chat_completions(body: ChatRequest, request: Request):
     synth_result = await call_ollama(planner_base, synth_payload)
     final_text = synth_result.get("response", "") or qwen_text or gptoss_text
 
-    if body.stream:
+    if body.get("stream"):
         # Precompute usage and planned stage events for trace
         usage_stream = estimate_usage(messages, final_text)
         planned_events: List[Dict[str, Any]] = []
@@ -2492,23 +2462,20 @@ async def chat_completions(body: ChatRequest, request: Request):
         asyncio.create_task(_send_trace())
     except Exception:
         pass
+    # Persist response & metrics
+    await _db_update_run_response(run_id, response, usage)
     return JSONResponse(content=response)
 
 
 @app.post("/run")
 async def run_endpoint(body: Dict[str, Any], request: Request):
     # Minimal adapter to reuse the same pipeline
-    try:
-        # Allow either OpenAI-compatible or plain JSON
-        if isinstance(body.get("messages"), list):
-            cr = ChatRequest(**body)  # type: ignore[arg-type]
-        else:
-            # Coerce a single prompt string into messages
-            prompt = str(body.get("prompt") or "")
-            cr = ChatRequest(model=body.get("model"), messages=[ChatMessage(role="user", content=prompt)], stream=bool(body.get("stream", False)), tools=body.get("tools"))
-    except Exception:
-        prompt = str(body.get("prompt") or "")
-        cr = ChatRequest(model=body.get("model"), messages=[ChatMessage(role="user", content=prompt)], stream=bool(body.get("stream", False)), tools=body.get("tools"))
+    # Allow either OpenAI-compatible or plain JSON
+    if isinstance(body.get("messages"), list):
+        return await chat_completions(body, request)
+    # Coerce a single prompt string into messages
+    prompt = str(body.get("prompt") or "")
+    cr = {"model": body.get("model"), "messages": [{"role": "user", "content": prompt}], "stream": bool(body.get("stream", False)), "tools": body.get("tools")}
     return await chat_completions(cr, request)
 
 

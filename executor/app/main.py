@@ -1,4 +1,5 @@
 from __future__ import annotations
+# HARD BAN (permanent): No Pydantic, no SQLAlchemy/ORM, no CSV/Parquet. JSON/NDJSON only.
 
 import os
 import json
@@ -46,6 +47,35 @@ def run_subprocess(cmd: list[str], cwd: Optional[str] = None, timeout: int = EXE
         return {"returncode": -1, "stdout": "", "stderr": "timeout"}
 
 
+def _banned_reason_from_code(code: str) -> Optional[str]:
+    c = (code or "").lower()
+    banned_libs = (
+        ("pydantic", ("import pydantic", "from pydantic")),
+        ("sqlalchemy", ("import sqlalchemy", "from sqlalchemy")),
+        ("pandas", ("import pandas", "from pandas", "to_csv(", "read_csv(", "to_parquet(", "read_parquet(")),
+        ("pyarrow", ("import pyarrow", "from pyarrow")),
+        ("fastparquet", ("import fastparquet", "from fastparquet")),
+        ("polars", ("import polars", "from polars")),
+        ("django.orm", ("from django.db",)),
+        ("peewee", ("import peewee", "from peewee")),
+        ("tortoise-orm", ("from tortoise", "import tortoise")),
+    )
+    for name, needles in banned_libs:
+        if any(n in c for n in needles):
+            return name
+    return None
+
+
+def _banned_reason_from_shell(cmd: str) -> Optional[str]:
+    c = (cmd or "").lower()
+    if "pip install" in c or "pip3 install" in c:
+        banned = ("pydantic", "sqlalchemy", "pandas", "pyarrow", "fastparquet", "polars", "peewee", "tortoise")
+        hits = [b for b in banned if b in c]
+        if hits:
+            return ",".join(hits)
+    return None
+
+
 @app.get("/healthz")
 async def healthz():
     return {"status": "ok"}
@@ -56,6 +86,9 @@ async def run_python(body: Dict[str, Any]):
     code = body.get("code") or ""
     if not code:
         return JSONResponse(status_code=400, content={"error": "missing code"})
+    reason = _banned_reason_from_code(code)
+    if reason:
+        return JSONResponse(status_code=422, content={"error": "forbidden_library", "detail": f"use of banned library detected: {reason}"})
     with tempfile.TemporaryDirectory(dir=WORKSPACE_DIR) as tmpd:
         path = os.path.join(tmpd, "snippet.py")
         with open(path, "w", encoding="utf-8") as f:
@@ -71,6 +104,9 @@ async def run_shell(body: Dict[str, Any]):
     cmd = body.get("cmd")
     if not cmd:
         return JSONResponse(status_code=400, content={"error": "missing cmd"})
+    reason = _banned_reason_from_shell(cmd)
+    if reason:
+        return JSONResponse(status_code=422, content={"error": "forbidden_library", "detail": f"pip install of banned library detected: {reason}"})
     if SHELL_WHITELIST and (cmd.split(" ")[0] not in SHELL_WHITELIST):
         return JSONResponse(status_code=403, content={"error": "command not whitelisted"})
     res = run_subprocess(["bash", "-lc", cmd])

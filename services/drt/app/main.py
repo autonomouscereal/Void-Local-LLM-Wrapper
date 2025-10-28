@@ -1,4 +1,5 @@
 from __future__ import annotations
+# HARD BAN (permanent): No Pydantic, no SQLAlchemy/ORM, no CSV/Parquet. JSON/NDJSON only.
 
 import csv
 import hashlib
