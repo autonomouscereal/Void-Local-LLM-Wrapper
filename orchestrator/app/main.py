@@ -943,8 +943,8 @@ async def planner_produce_plan(messages: List[Dict[str, Any]], tools: Optional[L
         # find latest user message
         last_user = ""
         for m in reversed(messages):
-            if m.role == "user" and isinstance(m.content, str) and m.content.strip():
-                last_user = m.content.strip()
+            if (isinstance(m, dict) and m.get("role") == "user" and isinstance(m.get("content"), str) and m.get("content").strip()):
+                last_user = m.get("content").strip()
                 break
         if _detect_video_intent(last_user):
             prefs = _derive_movie_prefs_from_text(last_user)
@@ -954,8 +954,8 @@ async def planner_produce_plan(messages: List[Dict[str, Any]], tools: Optional[L
         # If planner proposed film_create for a film request (but not make_movie), upgrade to make_movie
         last_user = ""
         for m in reversed(messages):
-            if m.role == "user" and isinstance(m.content, str) and m.content.strip():
-                last_user = m.content.strip()
+            if (isinstance(m, dict) and m.get("role") == "user" and isinstance(m.get("content"), str) and m.get("content").strip()):
+                last_user = m.get("content").strip()
                 break
         if _detect_video_intent(last_user):
             has_run = any((tc.get("name") == "film.run") for tc in tool_calls if isinstance(tc, dict))
@@ -1820,12 +1820,12 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     # Determine mode and trace/run identifiers early
     last_user_text = ""
     for m in reversed(normalized_msgs):
-        if m.role == "user" and isinstance(m.content, str) and m.content.strip():
-            last_user_text = m.content.strip(); break
+        if (m.get("role") == "user") and isinstance(m.get("content"), str) and m.get("content").strip():
+            last_user_text = m.get("content").strip(); break
     mode = "film" if _detect_video_intent(last_user_text) else "general"
     # generate a deterministic trace id from messages
     try:
-        msgs_for_seed = json.dumps([{"role": m.role, "content": m.content} for m in normalized_msgs], ensure_ascii=False, separators=(",", ":"))
+        msgs_for_seed = json.dumps([{"role": m.get("role"), "content": m.get("content")} for m in normalized_msgs], ensure_ascii=False, separators=(",", ":"))
     except Exception:
         msgs_for_seed = ""
     master_seed = _derive_seed("chat", msgs_for_seed)
@@ -1858,13 +1858,13 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                     ph = _hl.sha256(json.dumps(data, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
                     pack_hash = f"sha256:{ph}"
                     # Persist run row and icw log early
-                    run_id = await _db_insert_run(trace_id=trace_id, mode=mode, seed=master_seed, pack_hash=pack_hash, request_json=body.dict())
+                    run_id = await _db_insert_run(trace_id=trace_id, mode=mode, seed=master_seed, pack_hash=pack_hash, request_json=body)
                     await _db_insert_icw_log(run_id=run_id, pack_hash=pack_hash, budget_tokens=int(data.get("budget_tokens") or 0), scores_json=data.get("scores_summary") or {})
                 else:
                     run_id = await _db_insert_run(trace_id=trace_id, mode=mode, seed=master_seed, pack_hash=None, request_json=body)
         except Exception:
-            pack_hash = None
-            run_id = await _db_insert_run(trace_id=trace_id, mode=mode, seed=master_seed, pack_hash=None, request_json=body)
+                    pack_hash = None
+                    run_id = await _db_insert_run(trace_id=trace_id, mode=mode, seed=master_seed, pack_hash=None, request_json=body)
     else:
         run_id = await _db_insert_run(trace_id=trace_id, mode=mode, seed=master_seed, pack_hash=None, request_json=body)
 
@@ -2024,7 +2024,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 last_user = m.content.strip()
                 break
         # 2) Merge tools and score semantic overlap
-        merged_tools = merge_tool_schemas(body.tools)
+        merged_tools = merge_tool_schemas(body.get("tools"))
         allowed_tools: List[Tuple[str, Dict[str, Any]]] = []
         for t in merged_tools:
             fn = (t.get("function") or {})
@@ -2072,8 +2072,8 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 tool_results = await execute_tools(forced_calls)
                 evidence_blocks = [{"role": "system", "content": "Tool results:\n" + json.dumps(tool_results, indent=2)}]
                 exec_messages2 = evidence_blocks + messages
-                qwen_payload2 = build_ollama_payload(messages=exec_messages2, model=QWEN_MODEL_ID, num_ctx=DEFAULT_NUM_CTX, temperature=body.temperature or DEFAULT_TEMPERATURE)
-                gptoss_payload2 = build_ollama_payload(messages=exec_messages2, model=GPTOSS_MODEL_ID, num_ctx=DEFAULT_NUM_CTX, temperature=body.temperature or DEFAULT_TEMPERATURE)
+                qwen_payload2 = build_ollama_payload(messages=exec_messages2, model=QWEN_MODEL_ID, num_ctx=DEFAULT_NUM_CTX, temperature=body.get("temperature") or DEFAULT_TEMPERATURE)
+                gptoss_payload2 = build_ollama_payload(messages=exec_messages2, model=GPTOSS_MODEL_ID, num_ctx=DEFAULT_NUM_CTX, temperature=body.get("temperature") or DEFAULT_TEMPERATURE)
                 qwen_res2 = await call_ollama(QWEN_BASE_URL, qwen_payload2)
                 gptoss_res2 = await call_ollama(GPTOSS_BASE_URL, gptoss_payload2)
                 # Do not discard the original answers; append improved content if any
@@ -2173,7 +2173,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
 
         # Fire-and-forget teacher trace for streaming path as well
         try:
-            req_dict = body.dict()
+            req_dict = dict(body)
             try:
                 msgs_for_seed = json.dumps(req_dict.get("messages", []), ensure_ascii=False, separators=(",", ":"))
             except Exception:
@@ -2187,7 +2187,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             trace_payload_stream = {
                 "label": label_cfg or "exp_default",
                 "seed": master_seed,
-                "request": {"messages": req_dict.get("messages", []), "tools_allowed": [t.get("function", {}).get("name") for t in (body.tools or []) if isinstance(t, dict)]},
+                "request": {"messages": req_dict.get("messages", []), "tools_allowed": [t.get("function", {}).get("name") for t in (body.get("tools") or []) if isinstance(t, dict)]},
                 "context": {},
                 "routing": {"planner_model": planner_id, "executors": [QWEN_MODEL_ID, GPTOSS_MODEL_ID]},
                 "tool_calls": tool_calls or [],
@@ -2449,7 +2449,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         trace_payload = {
             "label": label_cfg or "exp_default",
             "seed": master_seed,
-            "request": {"messages": req_dict.get("messages", []), "tools_allowed": [t.get("function", {}).get("name") for t in (body.tools or []) if isinstance(t, dict)]},
+            "request": {"messages": req_dict.get("messages", []), "tools_allowed": [t.get("function", {}).get("name") for t in (body.get("tools") or []) if isinstance(t, dict)]},
             "context": ({"pack_hash": pack_hash} if pack_hash else {}),
             "routing": {"planner_model": planner_id, "executors": [QWEN_MODEL_ID, GPTOSS_MODEL_ID]},
             "tool_calls": tool_calls or [],

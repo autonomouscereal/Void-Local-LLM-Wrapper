@@ -93,7 +93,7 @@ services:
         condition: service_started
     environment:
       - QWEN_BASE_URL=http://ollama_qwen:11434
-      - QWEN_MODEL_ID=${QWEN_MODEL_ID:-qwen2.5:32b-instruct-q4_K_M}
+      - QWEN_MODEL_ID=${QWEN_MODEL_ID:-qwen3:32b-instruct-q4_K_M}
       - GPTOSS_BASE_URL=http://ollama_gptoss:11434
       - GPTOSS_MODEL_ID=${GPTOSS_MODEL_ID:-gpt-oss:20b-q5_K_M}
       - DEFAULT_NUM_CTX=${DEFAULT_NUM_CTX:-4096}

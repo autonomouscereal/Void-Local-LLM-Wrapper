@@ -75,8 +75,8 @@ Notes
 - Increase `DEFAULT_NUM_CTX` if your quantization and VRAM permit.
 - Planner-Executor flow: Planner produces a plan + tool calls (semantic, not keyword-based). On refusals, the backend may force a single best-match tool with minimal args and re-synthesize, but it never overwrites the model’s content (only appends a Status/Tool Results section).
 - MCP/tool-calling: Send a `tools` array (OpenAI-style JSON schema). The planner may propose `tool_calls` which the orchestrator executes when supported.
-  - Built-in tools: `web_search` (SerpAPI), `run_python`, `write_file`, `read_file` (via Executor service).
-  - Film tools (auto-exposed even if client doesn't declare them): `film_create`, `film_add_character`, `film_add_scene`, `film_compile`, `film_status`, `make_movie`.
+  - Built-in tools: `web_search` (SerpAPI), `metasearch.fuse` (multi‑engine rank fusion), `run_python`, `write_file`, `read_file` (via Executor service).
+  - Film tools: Film‑1 removed. A single internal Film‑2 orchestrator is used (`film.run`).
   - Preferences: duration_seconds, resolution, fps, style, language, voice, quality, audio_enabled (default true), subtitles_enabled (default false), animation_enabled (default true)
   - MCP bridge: set `MCP_HTTP_BRIDGE_URL` to forward unknown tool calls prefixed with `mcp:` to your MCP HTTP server.
   - RAG tools (pgvector): `rag_index` (index `/workspace` into Postgres+pgvector), `rag_search` (retrieve top-k chunks).
@@ -101,18 +101,20 @@ Persistence & RAG
 -----------------
 - Jobs persist to Postgres (`jobs`, `job_checkpoints` tables). On completion, if `JOBS_RAG_INDEX=true` (default), the job workflow and result are embedded into `rag_docs` for retrieval.
 
-Film pipeline (LLM-driven)
---------------------------
-- Built-in tools auto-exposed to planner: `make_movie`, `film_create`, `film_add_character`, `film_add_scene`, `film_status`, `film_compile`.
-- A single prompt can create a film, define characters, spawn scene jobs, and compile automatically when scenes finish.
-- Optional `N8N_WEBHOOK_URL` is called automatically once all scenes succeed; assembly result stored under `films.metadata`.
-  - Local n8n is included in docker-compose and auto-imports the `Film Assemble` workflow at `/webhook/film-assemble`.
-  - By default `N8N_WEBHOOK_URL` points to the internal n8n service: `http://n8n:5678/webhook/film-assemble`.
-- PATCH endpoints for refinement:
+Film‑2 pipeline (LLM-driven)
+----------------------------
+- Server uses a single internal tool `film.run` to orchestrate: `plan → breakdown → storyboard → animatic → final → post → qc → export`.
+- Per‑stage manifests are persisted (DB authoritative; JSON optional): `plan/scenes/characters`, `shots (DSL + seeds)`, per‑shot `storyboard/animatic/final/nodes`, project‑level `edl/qc/export`.
+- n8n is optional. If configured, it may be invoked at export; otherwise local assembler is used.
+- PATCH endpoints remain for refinement:
   - PATCH `/films/{film_id}`: update film preferences (metadata)
-  - PATCH `/characters/{character_id}`: update name/description/references (e.g., add more refs or set a character-specific voice)
+  - PATCH `/characters/{character_id}`: update name/description/references
   - PATCH `/scenes/{scene_id}`: update prompt/plan
-- A film manifest JSON is written under `/uploads/film_<id>_manifest.json` on auto-compile for convenience.
+
+Capabilities and Health
+-----------------------
+- `GET /capabilities.json` advertises endpoints, versions, tool allowlist, and config hash for IDE discovery.
+- `GET /healthz` includes: `{ ok, openai_compat, teacher_enabled, icw_enabled, film_enabled, ablation_enabled }`.
 
 Enhanced Streaming
 ------------------
@@ -156,7 +158,12 @@ Inline Safety Notes
 -------------------
 - Orchestrator warns against SQLAlchemy and uses asyncpg exclusively for DB access.
 - JSON parsing uses a hardened parser to survive malformed LLM outputs.
-- Film consistency: character face embeddings are computed once and propagated to each scene; seeds are deterministic by `(film_id, index_num, prompt)`.
+- Film consistency: character face embeddings are computed once and propagated to each scene; seeds are deterministic for every tool call and stage.
+
+Model defaults
+--------------
+- Planner/Executors default to Qwen‑3 for the primary model (`QWEN_MODEL_ID=qwen3:32b-instruct-q4_K_M`).
+- Ablation judge/compressor is routed to Qwen‑3 (via `ABLCODER_URL`).
 - Jobs persist as failed even on submit/network errors so the UI never shows an empty queue during errors.
 
 
