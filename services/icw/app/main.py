@@ -19,7 +19,7 @@ from fastapi.responses import JSONResponse
 # Infinite Context Window (ICW) — CPU‑friendly, deterministic
 # ------------------------------------------------------------
 # Endpoints:
-#  - POST /context/pack
+#  - POST /internal/icw_pack
 #  - POST /output/plan
 #  - POST /output/render
 #
@@ -498,7 +498,7 @@ def _lru_put(cache: Dict[str, Any], key: str, val: Any):
             pass
 
 
-@app.post("/context/pack")
+@app.post("/internal/icw_pack")
 async def context_pack(body: Dict[str, Any]):
     t0 = time.perf_counter()
     seed = int(_safe_get(body, "seed", 0) or 0)

@@ -26,6 +26,7 @@ services:
       - "11434:11434"
     environment:
       - OLLAMA_HOST=0.0.0.0
+      - OLLAMA_KEEP_ALIVE=24h
       - NVIDIA_VISIBLE_DEVICES=0
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     volumes:
@@ -56,6 +57,7 @@ services:
       - "11435:11434"
     environment:
       - OLLAMA_HOST=0.0.0.0
+      - OLLAMA_KEEP_ALIVE=24h
       - NVIDIA_VISIBLE_DEVICES=1
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     volumes:
@@ -86,11 +88,9 @@ services:
       pgvector:
         condition: service_healthy
       ollama_qwen:
-        condition: service_started
+        condition: service_healthy
       ollama_gptoss:
-        condition: service_started
-      executor:
-        condition: service_started
+        condition: service_healthy
     environment:
       - QWEN_BASE_URL=http://ollama_qwen:11434
       - QWEN_MODEL_ID=${QWEN_MODEL_ID:-qwen3:32b-instruct-q4_K_M}
@@ -324,6 +324,9 @@ services:
       - "8050:8050"
 
   executor:
+    depends_on:
+      orchestrator:
+        condition: service_started
     build:
       context: ./executor
       dockerfile: Dockerfile

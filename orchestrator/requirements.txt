@@ -10,4 +10,5 @@ requests==2.32.3
 asyncpg==0.29.0
 pgvector==0.2.5
 sentence-transformers==3.0.1
+xxhash==3.4.1
 

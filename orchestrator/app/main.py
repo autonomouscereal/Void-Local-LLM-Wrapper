@@ -42,6 +42,7 @@ from fastapi.staticfiles import StaticFiles
 from tenacity import retry, stop_after_attempt, wait_exponential
 from fastapi.middleware.cors import CORSMiddleware
 from .json_parser import JSONParser
+from .determinism import seed_router as det_seed_router, seed_tool as det_seed_tool, round6 as det_round6
 async def _db_insert_run(trace_id: str, mode: str, seed: int, pack_hash: Optional[str], request_json: Dict[str, Any]) -> Optional[int]:
     try:
         pool = await get_pg_pool()
@@ -130,6 +131,11 @@ ALLOW_TOOL_EXECUTION = AUTO_EXECUTE_TOOLS if os.getenv("ALLOW_TOOL_EXECUTION") i
 STREAM_CHUNK_SIZE_CHARS = int(os.getenv("STREAM_CHUNK_SIZE_CHARS", "0"))
 STREAM_CHUNK_INTERVAL_MS = int(os.getenv("STREAM_CHUNK_INTERVAL_MS", "50"))
 JOBS_RAG_INDEX = os.getenv("JOBS_RAG_INDEX", "true").lower() == "true"
+# Defensive bounds
+MAX_INPUT_CHARS = int(os.getenv("MAX_INPUT_CHARS", "20000"))
+MAX_TOOL_OUTPUT_CHARS = int(os.getenv("MAX_TOOL_OUTPUT_CHARS", "40000"))
+MAX_MESSAGES = int(os.getenv("MAX_MESSAGES", "50"))
+MAX_TOOL_CALLS = int(os.getenv("MAX_TOOL_CALLS", "6"))
 
 # RAG configuration (pgvector)
 POSTGRES_HOST = os.getenv("POSTGRES_HOST")
@@ -158,6 +164,7 @@ PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/workspace/uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL")  # optional external workflow orchestration
+ENABLE_N8N = os.getenv("ENABLE_N8N", "false").lower() == "true"
 ASSEMBLER_API_URL = os.getenv("ASSEMBLER_API_URL")  # http://assembler:9095
 TEACHER_API_URL = os.getenv("TEACHER_API_URL", "http://teacher:8097")
 WRAPPER_CONFIG_PATH = os.getenv("WRAPPER_CONFIG_PATH", "/workspace/configs/wrapper_config.json")
@@ -239,6 +246,13 @@ async def global_cors_middleware(request: Request, call_next):
 _jobs_store: Dict[str, Dict[str, Any]] = {}
 _job_endpoint: Dict[str, str] = {}
 _comfy_load: Dict[str, int] = {}
+COMFYUI_BACKOFF_MS = int(os.getenv("COMFYUI_BACKOFF_MS", "250"))
+COMFYUI_BACKOFF_MAX_MS = int(os.getenv("COMFYUI_BACKOFF_MAX_MS", "4000"))
+COMFYUI_MAX_RETRIES = int(os.getenv("COMFYUI_MAX_RETRIES", "6"))
+try:
+    _comfy_sem = asyncio.Semaphore(max(1, SCENE_SUBMIT_CONCURRENCY))
+except Exception:
+    _comfy_sem = None
 _films_mem: Dict[str, Dict[str, Any]] = {}
 _characters_mem: Dict[str, Dict[str, Any]] = {}
 _scenes_mem: Dict[str, Dict[str, Any]] = {}
@@ -266,7 +280,6 @@ async def capabilities():
         "openai_compat": True,
         "endpoints": {
             "run": "/run",
-            "icw_pack": "/context/pack",
             "film": {
                 "plan": "/film/plan",
                 "breakdown": "/film/breakdown",
@@ -1481,6 +1494,24 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     # Validate body
     if not isinstance(body, dict) or not isinstance(body.get("messages"), list):
         return JSONResponse(status_code=400, content={"error": "bad_request", "detail": "messages must be a list"})
+    # Defensive bounds: messages count and total chars
+    try:
+        raw_msgs = body.get("messages") or []
+        if len(raw_msgs) > MAX_MESSAGES:
+            return JSONResponse(status_code=400, content={"error": "too_many_messages", "detail": f">{MAX_MESSAGES}"})
+        total_chars = 0
+        for m in raw_msgs:
+            c = m.get("content")
+            if isinstance(c, str):
+                total_chars += len(c)
+            elif isinstance(c, list):
+                for part in c:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        total_chars += len(str(part.get("text") or ""))
+        if total_chars > MAX_INPUT_CHARS:
+            return JSONResponse(status_code=400, content={"error": "input_too_large", "detail": f">{MAX_INPUT_CHARS} chars"})
+    except Exception:
+        pass
     normalized_msgs, attachments = extract_attachments_from_messages(body.get("messages"))
     # prepend a system hint with attachment summary (non-invasive)
     if attachments:
@@ -1499,7 +1530,13 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         msgs_for_seed = json.dumps([{"role": m.get("role"), "content": m.get("content")} for m in normalized_msgs], ensure_ascii=False, separators=(",", ":"))
     except Exception:
         msgs_for_seed = ""
-    master_seed = _derive_seed("chat", msgs_for_seed)
+    provided_seed = None
+    try:
+        if isinstance(body.get("seed"), (int, float)):
+            provided_seed = int(body.get("seed"))
+    except Exception:
+        provided_seed = None
+    master_seed = provided_seed if provided_seed is not None else _derive_seed("chat", msgs_for_seed)
     import hashlib as _hl
     trace_id = "tt_" + _hl.sha256(msgs_for_seed.encode("utf-8")).hexdigest()[:16]
 
@@ -1605,20 +1642,33 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             return StreamingResponse(_stream_once(), media_type="text/event-stream")
         # include usage estimate even in tool_calls path (no completion tokens yet)
         response["usage"] = estimate_usage(messages, "")
+        response["seed"] = master_seed
         return JSONResponse(content=response)
 
     # 2) Optionally execute tools
     tool_results: List[Dict[str, Any]] = []
     tool_exec_meta: List[Dict[str, Any]] = []
+    # Enforce tool call budget
+    if tool_calls and len(tool_calls) > MAX_TOOL_CALLS:
+        return JSONResponse(status_code=429, content={"error": "tool_budget_exceeded", "detail": f">{MAX_TOOL_CALLS} tool calls"})
     if tool_calls:
         for tc in tool_calls[:5]:
             try:
                 n = tc.get("name") or "tool"
                 args = tc.get("arguments") or {}
-                seed_tool = _derive_seed("tool", n, trace_id)
+                seed_tool = det_seed_tool(n, trace_id, master_seed)
                 tstart = time.time()
                 tr = await execute_tool_call(tc)
                 duration_ms = int(round((time.time() - tstart) * 1000))
+                # Clamp potentially large string outputs in tool result
+                try:
+                    if isinstance(tr, dict) and isinstance(tr.get("result"), dict):
+                        resd = tr.get("result")
+                        prev = resd.get("preview")
+                        if isinstance(prev, str) and len(prev) > MAX_TOOL_OUTPUT_CHARS:
+                            resd["preview"] = prev[:MAX_TOOL_OUTPUT_CHARS] + "\n... [truncated]"
+                except Exception:
+                    pass
                 tool_results.append(tr)
                 # persist to DB
                 try:
@@ -1849,8 +1899,14 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 msgs_for_seed = json.dumps(req_dict.get("messages", []), ensure_ascii=False, separators=(",", ":"))
             except Exception:
                 msgs_for_seed = ""
-            master_seed = _derive_seed("chat", msgs_for_seed)
-            seed_router = _derive_seed("router", trace_id, str(master_seed))
+            provided_seed3 = None
+            try:
+                if isinstance(body.get("seed"), (int, float)):
+                    provided_seed3 = int(body.get("seed"))
+            except Exception:
+                provided_seed3 = None
+            master_seed = provided_seed3 if provided_seed3 is not None else _derive_seed("chat", msgs_for_seed)
+            seed_router = det_seed_router(trace_id, master_seed)
             label_cfg = None
             try:
                 label_cfg = (WRAPPER_CONFIG.get("teacher") or {}).get("default_label")
@@ -1883,19 +1939,21 @@ async def chat_completions(body: Dict[str, Any], request: Request):
 
         async def _stream_with_stages(text: str):
             # Open the stream with assistant role
-            head = json.dumps({"id": "orc-1", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]})
+            now = int(time.time())
+            model_id = f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}"
+            head = json.dumps({"id": "orc-1", "object": "chat.completion.chunk", "created": now, "model": model_id, "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]})
             yield f"data: {head}\n\n"
             # Progress events as content JSON lines to match example
             try:
                 # plan
                 evt = {"stage": "plan", "ok": True}
-                yield f"data: {json.dumps({"id": "orc-1", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"content": json.dumps(evt)} , "finish_reason": None}]})}\n\n"
+                yield f"data: {json.dumps({"id": "orc-1", "object": "chat.completion.chunk", "created": int(time.time()), "model": model_id, "choices": [{"index": 0, "delta": {"content": json.dumps(evt)} , "finish_reason": None}]})}\n\n"
                 # breakdown/storyboard/animatic heuristics: if any film tool present, emit these scaffolding stages
                 has_film = any(isinstance(tc, dict) and str(tc.get("name", "")).startswith("film_") for tc in (tool_calls or []))
                 if has_film:
                     for st in ("breakdown", "storyboard", "animatic"):
                         ev = {"stage": st}
-                        yield f"data: {json.dumps({"id": "orc-1", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"content": json.dumps(ev)} , "finish_reason": None}]})}\n\n"
+                        yield f"data: {json.dumps({"id": "orc-1", "object": "chat.completion.chunk", "created": int(time.time()), "model": model_id, "choices": [{"index": 0, "delta": {"content": json.dumps(ev)} , "finish_reason": None}]})}\n\n"
                 # Emit per-tool mapped events
                 for tc in (tool_calls or [])[:20]:
                     try:
@@ -1903,22 +1961,22 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                         args = tc.get("arguments") or tc.get("args") or {}
                         if name == "film_add_scene":
                             ev = {"stage": "final", "shot_id": args.get("index_num") or args.get("scene_id")}
-                            yield f"data: {json.dumps({"id": "orc-1", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"content": json.dumps(ev)} , "finish_reason": None}]})}\n\n"
+                            yield f"data: {json.dumps({"id": "orc-1", "object": "chat.completion.chunk", "created": int(time.time()), "model": model_id, "choices": [{"index": 0, "delta": {"content": json.dumps(ev)} , "finish_reason": None}]})}\n\n"
                         if name == "frame_interpolate":
                             ev = {"stage": "post", "op": "frame_interpolate", "factor": args.get("factor")}
-                            yield f"data: {json.dumps({"id": "orc-1", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"content": json.dumps(ev)} , "finish_reason": None}]})}\n\n"
+                            yield f"data: {json.dumps({"id": "orc-1", "object": "chat.completion.chunk", "created": int(time.time()), "model": model_id, "choices": [{"index": 0, "delta": {"content": json.dumps(ev)} , "finish_reason": None}]})}\n\n"
                         if name == "upscale":
                             ev = {"stage": "post", "op": "upscale", "scale": args.get("scale")}
-                            yield f"data: {json.dumps({"id": "orc-1", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"content": json.dumps(ev)} , "finish_reason": None}]})}\n\n"
+                            yield f"data: {json.dumps({"id": "orc-1", "object": "chat.completion.chunk", "created": int(time.time()), "model": model_id, "choices": [{"index": 0, "delta": {"content": json.dumps(ev)} , "finish_reason": None}]})}\n\n"
                         if name == "film_compile":
                             ev = {"stage": "export"}
-                            yield f"data: {json.dumps({"id": "orc-1", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"content": json.dumps(ev)} , "finish_reason": None}]})}\n\n"
+                            yield f"data: {json.dumps({"id": "orc-1", "object": "chat.completion.chunk", "created": int(time.time()), "model": model_id, "choices": [{"index": 0, "delta": {"content": json.dumps(ev)} , "finish_reason": None}]})}\n\n"
                     except Exception:
                         continue
                 # Optionally signal qc if present in plan text
                 if isinstance(plan_text, str) and ("qc" in plan_text.lower() or "quality" in plan_text.lower()):
                     ev = {"stage": "qc"}
-                    yield f"data: {json.dumps({"id": "orc-1", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"content": json.dumps(ev)} , "finish_reason": None}]})}\n\n"
+                    yield f"data: {json.dumps({"id": "orc-1", "object": "chat.completion.chunk", "created": int(time.time()), "model": model_id, "choices": [{"index": 0, "delta": {"content": json.dumps(ev)} , "finish_reason": None}]})}\n\n"
             except Exception:
                 pass
             # Stream final content
@@ -1926,14 +1984,14 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 size = max(1, STREAM_CHUNK_SIZE_CHARS)
                 for i in range(0, len(text), size):
                     piece = text[i : i + size]
-                    chunk = json.dumps({"id": "orc-1", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"content": piece}, "finish_reason": None}]})
+                    chunk = json.dumps({"id": "orc-1", "object": "chat.completion.chunk", "created": int(time.time()), "model": model_id, "choices": [{"index": 0, "delta": {"content": piece}, "finish_reason": None}]})
                     yield f"data: {chunk}\n\n"
                     if STREAM_CHUNK_INTERVAL_MS > 0:
                         await asyncio.sleep(STREAM_CHUNK_INTERVAL_MS / 1000.0)
             else:
-                content_chunk = json.dumps({"id": "orc-1", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}]})
+                content_chunk = json.dumps({"id": "orc-1", "object": "chat.completion.chunk", "created": int(time.time()), "model": model_id, "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}]})
                 yield f"data: {content_chunk}\n\n"
-            done = json.dumps({"id": "orc-1", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})
+            done = json.dumps({"id": "orc-1", "object": "chat.completion.chunk", "created": int(time.time()), "model": model_id, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})
             yield f"data: {done}\n\n"
             yield "data: [DONE]\n\n"
         return StreamingResponse(_stream_with_stages(final_text), media_type="text/event-stream")
@@ -2136,6 +2194,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             }
         ],
         "usage": usage_with_wall,
+        "seed": master_seed,
     }
     if artifacts:
         response["artifacts"] = artifacts
@@ -2147,7 +2206,13 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             msgs_for_seed = json.dumps(req_dict.get("messages", []), ensure_ascii=False, separators=(",", ":"))
         except Exception:
             msgs_for_seed = ""
-        master_seed = _derive_seed("chat", msgs_for_seed)
+        provided_seed2 = None
+        try:
+            if isinstance(req_dict.get("seed"), (int, float)):
+                provided_seed2 = int(req_dict.get("seed"))
+        except Exception:
+            provided_seed2 = None
+        master_seed = provided_seed2 if provided_seed2 is not None else _derive_seed("chat", msgs_for_seed)
         label_cfg = None
         try:
             label_cfg = (WRAPPER_CONFIG.get("teacher") or {}).get("default_label")
@@ -2160,7 +2225,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             "seed": master_seed,
             "request": {"messages": req_dict.get("messages", []), "tools_allowed": [t.get("function", {}).get("name") for t in (body.get("tools") or []) if isinstance(t, dict)]},
             "context": ({"pack_hash": pack_hash} if pack_hash else {}),
-            "routing": {"planner_model": planner_id, "executors": [QWEN_MODEL_ID, GPTOSS_MODEL_ID], "seed_router": _derive_seed("router", trace_id, str(master_seed))},
+            "routing": {"planner_model": planner_id, "executors": [QWEN_MODEL_ID, GPTOSS_MODEL_ID], "seed_router": det_seed_router(trace_id, master_seed)},
             "tool_calls": _tc2,
             "response": {"text": (display_content or "")[:4000]},
             "metrics": usage,
@@ -2269,28 +2334,40 @@ async def _comfy_submit_workflow(workflow: Dict[str, Any]) -> Dict[str, Any]:
     candidates = _comfy_candidates()
     if not candidates:
         return {"error": "COMFYUI_API_URL(S) not configured"}
-    # sort by current load ascending
-    ordered = sorted(candidates, key=lambda u: _comfy_load.get(u, 0))
+    delay = COMFYUI_BACKOFF_MS
     last_err: Optional[str] = None
-    for base in ordered:
+    for attempt in range(1, COMFYUI_MAX_RETRIES + 1):
+        ordered = sorted(candidates, key=lambda u: _comfy_load.get(u, 0))
+        for base in ordered:
+            try:
+                async with httpx.AsyncClient(timeout=60) as client:
+                    if _comfy_sem is not None:
+                        async with _comfy_sem:
+                            _comfy_load[base] = _comfy_load.get(base, 0) + 1
+                            r = await client.post(base.rstrip("/") + "/prompt", json=workflow)
+                    else:
+                        _comfy_load[base] = _comfy_load.get(base, 0) + 1
+                        r = await client.post(base.rstrip("/") + "/prompt", json=workflow)
+                    try:
+                        r.raise_for_status()
+                        res = r.json()
+                        pid = res.get("prompt_id") or res.get("uuid") or res.get("id")
+                        if isinstance(pid, str):
+                            _job_endpoint[pid] = base
+                        return res
+                    except Exception:
+                        last_err = r.text
+            except Exception as ex:
+                last_err = str(ex)
+            finally:
+                _comfy_load[base] = max(0, _comfy_load.get(base, 1) - 1)
+        # backoff before next round
         try:
-            async with httpx.AsyncClient(timeout=60) as client:
-                _comfy_load[base] = _comfy_load.get(base, 0) + 1
-                r = await client.post(base.rstrip("/") + "/prompt", json=workflow)
-                try:
-                    r.raise_for_status()
-                    res = r.json()
-                    pid = res.get("prompt_id") or res.get("uuid") or res.get("id")
-                    if isinstance(pid, str):
-                        _job_endpoint[pid] = base
-                    return res
-                except Exception:
-                    last_err = r.text
-        except Exception as ex:
-            last_err = str(ex)
-        finally:
-            _comfy_load[base] = max(0, _comfy_load.get(base, 1) - 1)
-    return {"error": last_err or "all comfyui instances failed"}
+            await asyncio.sleep(max(0.0, float(delay) / 1000.0))
+        except Exception:
+            pass
+        delay = min(delay * 2, COMFYUI_BACKOFF_MAX_MS)
+    return {"error": last_err or "all comfyui instances failed after retries"}
 
 
 async def _comfy_history(prompt_id: str) -> Dict[str, Any]:
@@ -2936,7 +3013,7 @@ async def _maybe_compile_film(film_id: str) -> None:
                 assembly_result = r.json()
         except Exception:
             assembly_result = {"error": True}
-    elif N8N_WEBHOOK_URL:
+    elif N8N_WEBHOOK_URL and ENABLE_N8N:
         try:
             async with httpx.AsyncClient(timeout=600) as client:
                 r = await client.post(N8N_WEBHOOK_URL, json=payload)
