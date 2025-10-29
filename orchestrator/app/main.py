@@ -917,8 +917,10 @@ def merge_tool_schemas(client_tools: Optional[List[Dict[str, Any]]]) -> List[Dic
     return out
 
 async def planner_produce_plan(messages: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]], temperature: float) -> Tuple[str, List[Dict[str, Any]]]:
-    planner_id = QWEN_MODEL_ID if PLANNER_MODEL.lower() == "qwen" else GPTOSS_MODEL_ID
-    planner_base = QWEN_BASE_URL if PLANNER_MODEL.lower() == "qwen" else GPTOSS_BASE_URL
+    # Treat any 'qwen*' value as Qwen route (e.g., 'qwen3')
+    use_qwen = str(PLANNER_MODEL or "qwen").lower().startswith("qwen")
+    planner_id = QWEN_MODEL_ID if use_qwen else GPTOSS_MODEL_ID
+    planner_base = QWEN_BASE_URL if use_qwen else GPTOSS_BASE_URL
     guide = (
         "You are the Planner. Produce a short step-by-step plan and propose up to 3 tool invocations YOU will execute.\n"
         "Never instruct the user to run code or call tools. Do not emit shell/python snippets for the user; invoke tools yourself.\n"
@@ -1144,8 +1146,12 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             fac = 2 if refresh >= base_fps * 2 else 1
             if refresh >= base_fps * 4: fac = 4
             interp = {**interp, "factor": fac}
+        # ensure upscale defaults include tile/overlap
         if not upscale.get("scale"):
             upscale = {**upscale, "scale": 2 if res == "3840x2160" else 1}
+        if upscale.get("scale", 1) > 1:
+            upscale.setdefault("tile", 512)
+            upscale.setdefault("overlap", 16)
         # Aggregate style references and character images dynamically if present
         style_refs = args.get("style_refs") or []
         # If the planner passed generic images list, allow using them as style refs by default
@@ -1760,13 +1766,20 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 label_cfg = (WRAPPER_CONFIG.get("teacher") or {}).get("default_label")
             except Exception:
                 label_cfg = None
+            # Normalize tool_calls shape for teacher (use args, not arguments)
+            _tc = []
+            for tc in (tool_calls or []):
+                try:
+                    _tc.append({"name": tc.get("name"), "args": (tc.get("arguments") or {})})
+                except Exception:
+                    _tc.append({"name": tc.get("name") or "tool", "args": {}})
             trace_payload_stream = {
                 "label": label_cfg or "exp_default",
                 "seed": master_seed,
                 "request": {"messages": req_dict.get("messages", []), "tools_allowed": [t.get("function", {}).get("name") for t in (body.get("tools") or []) if isinstance(t, dict)]},
                 "context": ({"pack_hash": pack_hash} if ("pack_hash" in locals() and pack_hash) else {}),
                 "routing": {"planner_model": planner_id, "executors": [QWEN_MODEL_ID, GPTOSS_MODEL_ID]},
-                "tool_calls": tool_calls or [],
+                "tool_calls": _tc,
                 "response": {"text": (final_text or "")[:4000]},
                 "metrics": usage_stream,
                 "env": {"public_base_url": PUBLIC_BASE_URL, "config_hash": WRAPPER_CONFIG_HASH},
@@ -1995,6 +2008,33 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         )
         # Always append status; never replace footer/body
         display_content = (display_content or "") + status_block
+    # Build artifacts block from tool_results (prefer film.run)
+    artifacts: Dict[str, Any] = {}
+    try:
+        film_run = None
+        for tr in (tool_results or []):
+            if isinstance(tr, dict) and tr.get("name") == "film.run" and isinstance(tr.get("result"), dict):
+                film_run = tr.get("result")
+        if film_run:
+            master_uri = film_run.get("master_uri") or (film_run.get("master") or {}).get("uri")
+            master_hash = film_run.get("hash") or (film_run.get("master") or {}).get("hash")
+            eff = film_run.get("effective") or {}
+            res_eff = eff.get("res")
+            fps_eff = eff.get("refresh")
+            edl = film_run.get("edl") or {}
+            nodes = film_run.get("nodes") or {}
+            qc = film_run.get("qc_report") or {}
+            export_pkg = {"uri": film_run.get("package_uri"), "hash": film_run.get("hash")}
+            artifacts = {
+                "master": {"uri": master_uri, "hash": master_hash, "res": res_eff, "fps": fps_eff},
+                "edl": {"uri": edl.get("uri"), "hash": edl.get("hash")},
+                "nodes": {"uri": nodes.get("uri"), "hash": nodes.get("hash")},
+                "qc": {"uri": qc.get("uri"), "hash": qc.get("hash")},
+                "export": export_pkg,
+            }
+    except Exception:
+        artifacts = {}
+
     response = {
         "id": "orc-1",
         "object": "chat.completion",
@@ -2008,6 +2048,8 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         ],
         "usage": usage,
     }
+    if artifacts:
+        response["artifacts"] = artifacts
     # Fire-and-forget: Teacher trace tap (if reachable)
     try:
         # Build trace payload
@@ -2022,13 +2064,20 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             label_cfg = (WRAPPER_CONFIG.get("teacher") or {}).get("default_label")
         except Exception:
             label_cfg = None
+        # Normalize tool_calls shape for teacher (use args, not arguments)
+        _tc2 = []
+        for tc in (tool_calls or []):
+            try:
+                _tc2.append({"name": tc.get("name"), "args": (tc.get("arguments") or {})})
+            except Exception:
+                _tc2.append({"name": tc.get("name") or "tool", "args": {}})
         trace_payload = {
             "label": label_cfg or "exp_default",
             "seed": master_seed,
             "request": {"messages": req_dict.get("messages", []), "tools_allowed": [t.get("function", {}).get("name") for t in (body.get("tools") or []) if isinstance(t, dict)]},
             "context": ({"pack_hash": pack_hash} if pack_hash else {}),
             "routing": {"planner_model": planner_id, "executors": [QWEN_MODEL_ID, GPTOSS_MODEL_ID]},
-            "tool_calls": tool_calls or [],
+            "tool_calls": _tc2,
             "response": {"text": (display_content or "")[:4000]},
             "metrics": usage,
             "env": {"public_base_url": PUBLIC_BASE_URL, "config_hash": WRAPPER_CONFIG_HASH},

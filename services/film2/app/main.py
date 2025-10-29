@@ -522,9 +522,44 @@ async def film_final(body: Dict[str, Any]):
         t += float(round(d,2))
     edl_obj = {"edl_version": "1.0", "project_id": project_id, "fps": outputs.get("fps", 24), "resolution": outputs.get("res", "1024x576"), "audio_sr": 48000, "tracks": {"video": video_tracks}}
     edl_meta = _write_json(project_id, "edl.json", edl_obj)
+    # Nodes manifest: capture per-shot seed and a graph hash for determinism
+    nodes_obj: Dict[str, Any] = {"project_id": project_id, "shots": []}
+    try:
+        sp = _proj_dir(project_id, "shots.jsonl")
+        if os.path.exists(sp):
+            with open(sp, "r", encoding="utf-8") as f:
+                for ln in f:
+                    if ln.strip():
+                        try:
+                            obj = json.loads(ln)
+                            sid = obj.get("id")
+                            sseed = obj.get("seed")
+                            if sid is not None:
+                                nodes_obj["shots"].append({"shot_id": sid, "seed": sseed})
+                        except Exception:
+                            continue
+    except Exception:
+        pass
+    try:
+        import hashlib as _hl
+        ghash = _hl.sha256(json.dumps(nodes_obj, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+        nodes_obj["graph_hash"] = f"sha256:{ghash}"
+    except Exception:
+        nodes_obj["graph_hash"] = None
+    nodes_meta = _write_json(project_id, "nodes.json", nodes_obj)
     reel = _save_bytes(f"{PROJECTS_PREFIX}/{project_id}/reel_v0.mp4", _sha256_str(f"{project_id}|{seed}|reel").encode("utf-8"))
-    _log_run(project_id, "final", [{"type": "json", "uri": edl_meta["uri"]}, {"type": "mp4", "uri": reel["uri"], "hash": reel["hash"]}], {"seed": seed})
-    return {"final_shots": final_shots, "assembly": {"timeline_json": edl_meta["uri"], "reel_mp4": reel["uri"], "hash": reel["hash"], **({"cache": "hit"} if cache_hits else {})}}
+    _log_run(project_id, "final", [{"type": "json", "uri": edl_meta["uri"]}, {"type": "json", "uri": nodes_meta["uri"]}, {"type": "mp4", "uri": reel["uri"], "hash": reel["hash"]}], {"seed": seed})
+    # Optionally persist nodes manifest to DB
+    try:
+        pool = await get_pool()
+        if pool is not None:
+            row = await db_fetchrow("SELECT id FROM film_project WHERE project_uid=$1", project_id)
+            if row:
+                pid = int(row[0])
+                await db_execute("INSERT INTO film_manifest(project_id, kind, json) VALUES($1,$2,$3)", pid, "nodes", nodes_obj)
+    except Exception:
+        pass
+    return {"final_shots": final_shots, "assembly": {"timeline_json": edl_meta["uri"], "nodes_json": nodes_meta["uri"], "reel_mp4": reel["uri"], "hash": reel["hash"], **({"cache": "hit"} if cache_hits else {})}}
 
 
 @app.post("/film/voice")
@@ -620,6 +655,34 @@ async def film_export(body: Dict[str, Any]):
     # Capture requested/effective post pipeline if provided
     requested = body.get("requested") or {}
     effective = body.get("effective") or {}
+    # Try to attach EDL/QC URIs and hashes if present
+    edl_uri = _proj_uri(project_id, "edl.json")
+    nodes_uri = _proj_uri(project_id, "nodes.json")
+    qc_uri = _proj_uri(project_id, "qc_report.json")
+    edl_hash = None
+    qc_hash = None
+    nodes_hash = None
+    try:
+        ep = _proj_dir(project_id, "edl.json")
+        if os.path.exists(ep):
+            with open(ep, "rb") as f:
+                edl_hash = f"sha256:{_sha256_bytes(f.read())}"
+    except Exception:
+        edl_hash = None
+    try:
+        np = _proj_dir(project_id, "nodes.json")
+        if os.path.exists(np):
+            with open(np, "rb") as f:
+                nodes_hash = f"sha256:{_sha256_bytes(f.read())}"
+    except Exception:
+        nodes_hash = None
+    try:
+        qp = _proj_dir(project_id, "qc_report.json")
+        if os.path.exists(qp):
+            with open(qp, "rb") as f:
+                qc_hash = f"sha256:{_sha256_bytes(f.read())}"
+    except Exception:
+        qc_hash = None
     export = {
         "master_uri": master["uri"],
         "subs_uri": subs["uri"],
@@ -627,6 +690,9 @@ async def film_export(body: Dict[str, Any]):
         "hash": master["hash"],
         "requested": requested,
         "effective": effective,
+        "edl": {"uri": edl_uri, "hash": edl_hash},
+        "nodes": {"uri": nodes_uri, "hash": nodes_hash},
+        "qc_report": {"uri": qc_uri, "hash": qc_hash},
     }
     _write_json(project_id, "export.json", export)
     _log_run(project_id, "export", [{"type": "json", "uri": _proj_uri(project_id, "export.json")}])
