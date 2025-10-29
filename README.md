@@ -12,7 +12,7 @@ Prerequisites
 Quick Start
 -----------
 1. Configure models via environment variables (optional):
-   - `QWEN_MODEL_ID` default: `qwen2.5:32b-instruct-q4_K_M`
+   - `QWEN_MODEL_ID` default: `qwen3:32b-instruct-q4_K_M`
    - `GPTOSS_MODEL_ID` default: `gpt-oss:20b`
    - `DEFAULT_NUM_CTX` default: `8192`
    - `DEFAULT_TEMPERATURE` default: `0.3`
@@ -20,7 +20,7 @@ Quick Start
    - `ENABLE_DEBATE` default: `true`
    - `MAX_DEBATE_TURNS` default: `1`
    - `ENABLE_WEBSEARCH` default: `true`
-   - `ALLOW_TOOL_EXECUTION` default: `true`
+   - `AUTO_EXECUTE_TOOLS` default: `true`
    - `SERPAPI_API_KEY` set to enable web search
 
 2. Start services:
@@ -37,7 +37,7 @@ Quick Start
 
    If environment variables are not set, replace with explicit tags, e.g.:
    ```bash
-   docker exec -it ollama_qwen bash -lc "ollama pull qwen2.5:32b-instruct-q4_K_M"
+   docker exec -it ollama_qwen bash -lc "ollama pull qwen3:32b-instruct-q4_K_M"
    docker exec -it ollama_gptoss bash -lc "ollama pull gpt-oss:20b"
    ```
 
