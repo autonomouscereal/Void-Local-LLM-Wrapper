@@ -98,6 +98,87 @@ def _log_run(project_id: str, stage: str, artifacts: List[Dict[str, str]], extra
     _append_ndjson(rr, entry)
 
 
+async def _get_locked_config(project_id: str) -> Dict[str, Any]:
+    try:
+        from db.core import get_pool
+        pool = await get_pool()
+        if pool is None:
+            return {}
+        from db.core import fetchrow as db_fetchrow
+        row = await db_fetchrow("SELECT config_json FROM film_project WHERE project_uid=$1", project_id)
+        if row and isinstance(row.get("config_json"), dict):
+            return dict(row.get("config_json"))
+    except Exception:
+        pass
+    # Try reading plan.json as fallback
+    try:
+        plan = os.path.join(_proj_dir(project_id), "plan.json")
+        if os.path.exists(plan):
+            with open(plan, "r", encoding="utf-8") as f:
+                _ = json.load(f)
+                # Not authoritative for lock; return empty
+    except Exception:
+        pass
+    return {}
+
+
+async def _get_project_row(project_id: str) -> Optional[Dict[str, Any]]:
+    try:
+        from db.core import get_pool, fetchrow as db_fetchrow
+        pool = await get_pool()
+        if pool is None:
+            return None
+        row = await db_fetchrow("SELECT id FROM film_project WHERE project_uid=$1", project_id)
+        if row and (row.get("id") is not None):
+            return {"id": int(row.get("id"))}
+    except Exception:
+        return None
+    return None
+
+
+async def _get_manifest(project_id: str, kind: str) -> Optional[Any]:
+    # Prefer DB
+    try:
+        from db.core import get_pool, fetchrow as db_fetchrow
+        pool = await get_pool()
+        if pool is not None:
+            prow = await _get_project_row(project_id)
+            if prow:
+                row = await db_fetchrow("SELECT json FROM film_manifest WHERE project_id=$1 AND kind=$2 ORDER BY id DESC LIMIT 1", int(prow["id"]), kind)
+                if row and (row.get("json") is not None):
+                    return row.get("json")
+    except Exception:
+        pass
+    # Fallback to JSON files under uploads
+    try:
+        name = {
+            "plan": "plan.json",
+            "scenes": "scenes.json",
+            "characters": "characters.json",
+            "shots": "shots.jsonl",
+            "export": "export.json",
+        }.get(kind)
+        if not name:
+            return None
+        path = _proj_dir(project_id, name)
+        if not os.path.exists(path):
+            return None
+        if name.endswith(".jsonl"):
+            items = []
+            with open(path, "r", encoding="utf-8") as f:
+                for ln in f:
+                    if ln.strip():
+                        try:
+                            items.append(json.loads(ln))
+                        except Exception:
+                            continue
+            return items
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
 # -------------------- API --------------------
 
 
@@ -110,57 +191,112 @@ async def film_plan(body: Dict[str, Any]):
     outputs = body.get("outputs") or {"fps": 24, "resolution": "1024x576"}
     if not isinstance(outputs, dict):
         outputs = {"fps": 24, "resolution": "1024x576"}
-    # Deterministic project id
-    project_id = _det_id("film", str(seed), title, logline, str(duration_s))
-    # Deterministic beats and scenes
-    words = [w for w in (title + " " + logline).split() if w]
-    beats = []
-    total_beats = max(3, min(8, len(words) // 3 or 3))
-    for i in range(total_beats):
-        b_id = f"B{i+1}"
-        desc = " ".join(words[i::total_beats][:6]) or f"Beat {i+1}"
-        beats.append({"id": b_id, "desc": desc, "weight": round(1.0 / total_beats, 2)})
-    scenes = []
-    per_scene = max(6.0, duration_s / max(3, total_beats))
-    for i, b in enumerate(beats):
-        scenes.append({
-            "id": f"S{i+1}",
-            "beat_id": b["id"],
-            "location": "interior",
-            "tod": "golden hour" if (i % 2 == 0) else "night",
-            "mood": "dramatic" if (i % 2 == 0) else "tense",
-            "duration_s": round(per_scene, 2),
-        })
+    style_refs = body.get("style_refs") or []
+    character_images = body.get("character_images") or []
+    ideas = body.get("ideas") or []
+    # Project id: prefer provided, else deterministic from seed/title/logline/duration
+    provided_pid = str(body.get("project_id") or "").strip()
+    project_id = provided_pid if provided_pid else _det_id("film", str(seed), title, logline, str(duration_s))
+    # Deterministic beats and scenes (unless already locked)
+    cfg = await _get_locked_config(project_id)
+    locked = bool(cfg.get("locked", False)) if isinstance(cfg, dict) else False
+    if locked:
+        plan_manifest = await _get_manifest(project_id, "plan") or {}
+        beats = plan_manifest.get("beats") or []
+        scenes = (await _get_manifest(project_id, "scenes")) or []
+        # Apply locked duration_s to scenes if present
+        try:
+            if isinstance(cfg.get("duration_s"), (int, float)) and scenes:
+                total_beats = max(1, len(beats) or len(scenes))
+                per_scene = max(1.0, float(cfg.get("duration_s")) / max(1, len(scenes)))
+                for i, s in enumerate(scenes):
+                    s["duration_s"] = round(per_scene, 2)
+        except Exception:
+            pass
+        # Characters locked: load from manifest if present
+        locked_chars = (await _get_manifest(project_id, "characters")) or []
+        characters = locked_chars if isinstance(locked_chars, list) and locked_chars else characters
+    else:
+        words = [w for w in (title + " " + logline).split() if w]
+        # Incorporate ideas into beat generation
+        if isinstance(ideas, list):
+            for it in ideas:
+                try:
+                    if isinstance(it, str):
+                        words.extend([w for w in it.split() if w])
+                    elif isinstance(it, dict):
+                        txt = (it.get("text") or it.get("idea") or "")
+                        words.extend([w for w in str(txt).split() if w])
+                except Exception:
+                    continue
+        beats = []
+        total_beats = max(3, min(8, len(words) // 3 or 3))
+        for i in range(total_beats):
+            b_id = f"B{i+1}"
+            desc = " ".join(words[i::total_beats][:6]) or f"Beat {i+1}"
+            beats.append({"id": b_id, "desc": desc, "weight": round(1.0 / total_beats, 2)})
+        scenes = []
+        per_scene = max(6.0, duration_s / max(3, total_beats))
+        for i, b in enumerate(beats):
+            scenes.append({
+                "id": f"S{i+1}",
+                "beat_id": b["id"],
+                "location": "interior",
+                "tod": "golden hour" if (i % 2 == 0) else "night",
+                "mood": "dramatic" if (i % 2 == 0) else "tense",
+                "duration_s": round(per_scene, 2),
+            })
     characters = [{"id": "C_A", "name": "Protagonist", "tags": ["age:29", "hair:black", "jacket:leather"]}]
-    assets = {"references": body.get("style_refs") or []}
+    assets = {"references": style_refs, "character_images": character_images}
     shot_budget = {"target_count": int(round(duration_s / 3.2))}
     # Persist JSON manifests
-    _write_json(project_id, "plan.json", {"project_id": project_id, "seed": seed, "title": title, "logline": logline, "duration_s": duration_s, "outputs": outputs})
+    _write_json(project_id, "plan.json", {"project_id": project_id, "seed": seed, "title": title, "logline": logline, "duration_s": duration_s, "outputs": outputs, "beats": beats, "style_refs": style_refs, "character_images": character_images, "ideas": ideas})
     _write_json(project_id, "scenes.json", scenes)
     # characters with bible
     chars_json = []
     for c in characters:
         bible = {"hair": "black", "jacket": "leather"} if c.get("id") == "C_A" else {}
+        if character_images:
+            bible = {**bible, "images": character_images}
         chars_json.append({**c, "bible": bible})
     _write_json(project_id, "characters.json", chars_json)
     # project catalog
     _append_ndjson(os.path.join(UPLOAD_ROOT, "projects.jsonl"), {"id": project_id, "title": title, "created_at": _now_iso(), "state": "planned"})
     _log_run(project_id, "plan", [{"type": "json", "uri": _proj_uri(project_id, "plan.json") }], {"seed": seed})
 
-    # DB upserts: project, manifests, scenes
+    # DB upserts: enforce lock-on-first-plan semantics
     try:
         pool = await get_pool()
         if pool is not None:
-            cfg = {"outputs": outputs}
-            await db_execute(
-                "INSERT INTO film_project(project_uid, seed, title, duration_s, config_json, state) VALUES($1,$2,$3,$4,$5,'planning') "
-                "ON CONFLICT (project_uid) DO UPDATE SET title=EXCLUDED.title, duration_s=EXCLUDED.duration_s, config_json=EXCLUDED.config_json",
-                project_id, int(seed), title, int(round(duration_s)), cfg,
-            )
+            # Read current config to decide lock behavior
+            existing = await db_fetchrow("SELECT id, config_json FROM film_project WHERE project_uid=$1", project_id)
+            locked = False
+            if existing and isinstance(existing.get("config_json"), dict):
+                locked = bool(existing.get("config_json", {}).get("locked", False))
+                if locked:
+                    # Use locked config values; ignore new inputs
+                    ex_cfg = dict(existing.get("config_json"))
+                    outputs = ex_cfg.get("outputs") or outputs
+                    style_refs = ex_cfg.get("style_refs") or style_refs
+                    character_images = ex_cfg.get("character_images") or character_images
+                    try:
+                        duration_s = float(ex_cfg.get("duration_s") or duration_s)
+                    except Exception:
+                        pass
+            cfg = {"outputs": outputs, "style_refs": style_refs, "character_images": character_images, "duration_s": int(round(duration_s)), "locked": True}
+            if not existing:
+                await db_execute(
+                    "INSERT INTO film_project(project_uid, seed, title, duration_s, config_json, state) VALUES($1,$2,$3,$4,$5,'planning')",
+                    project_id, int(seed), title, int(round(duration_s)), cfg,
+                )
+            else:
+                # Update config to locked values, keep state
+                pid_existing = int(existing["id"])
+                await db_execute("UPDATE film_project SET title=$1, duration_s=$2, config_json=$3 WHERE id=$4", title, int(round(duration_s)), cfg, pid_existing)
             row = await db_fetchrow("SELECT id FROM film_project WHERE project_uid=$1", project_id)
             if row:
                 pid = int(row[0])
-                await db_execute("INSERT INTO film_manifest(project_id, kind, json) VALUES($1,$2,$3)", pid, "plan", {"title": title, "duration_s": duration_s, "outputs": outputs})
+                await db_execute("INSERT INTO film_manifest(project_id, kind, json) VALUES($1,$2,$3)", pid, "plan", {"title": title, "logline": logline, "duration_s": duration_s, "outputs": outputs, "beats": beats, "style_refs": style_refs, "character_images": character_images, "ideas": ideas})
                 await db_execute("INSERT INTO film_manifest(project_id, kind, json) VALUES($1,$2,$3)", pid, "scenes", scenes)
                 await db_execute("INSERT INTO film_manifest(project_id, kind, json) VALUES($1,$2,$3)", pid, "characters", chars_json)
                 for sc in scenes:
@@ -189,6 +325,13 @@ async def film_breakdown(body: Dict[str, Any]):
     max_shots = int(rules.get("max_shots", 24) or 24)
     if not project_id:
         return _response_error(400, "missing project_id")
+    # Respect locked statics if present
+    cfg = await _get_locked_config(project_id)
+    target_duration = None
+    try:
+        target_duration = float(cfg.get("duration_s")) if isinstance(cfg.get("duration_s"), (int, float)) else None
+    except Exception:
+        target_duration = None
     # Deterministic shots for a single scene S1 as baseline
     shots: List[Dict[str, Any]] = []
     count = max(1, min(max_shots, 6))
@@ -209,6 +352,21 @@ async def film_breakdown(body: Dict[str, Any]):
             "neg": "no flicker, no warp faces, no extra limbs",
         }
         shots.append({"id": sh_id, "scene_id": "S1", "seed": sh_seed, "dsl": dsl})
+    # Normalize durations to match target_duration if locked
+    if target_duration:
+        ssum = sum([float(s.get("dsl", {}).get("duration_s") or avg_len) for s in shots])
+        scale = (target_duration / ssum) if ssum > 0 else 1.0
+        acc = 0.0
+        for idx, s in enumerate(shots):
+            base = float(s.get("dsl", {}).get("duration_s") or avg_len)
+            if idx < len(shots) - 1:
+                nd = round(base * scale, 2)
+                s["dsl"]["duration_s"] = nd
+                acc += nd
+            else:
+                # Adjust last shot to exact target
+                last = round(max(0.1, target_duration - acc), 2)
+                s["dsl"]["duration_s"] = last
     # Append NDJSON shots
     shots_path = _proj_dir(project_id, "shots.jsonl")
     for sh in shots:
@@ -268,7 +426,9 @@ async def film_animatic(body: Dict[str, Any]):
     project_id = str(body.get("project_id") or "")
     shots = body.get("shots") or []
     seed = int(body.get("seed", 0) or 0)
-    outputs = body.get("outputs") or {"fps": 12, "res": "512x288"}
+    # Enforce locked outputs if present
+    cfg = await _get_locked_config(project_id)
+    outputs = (cfg.get("outputs") if isinstance(cfg.get("outputs"), dict) else None) or body.get("outputs") or {"fps": 12, "res": "512x288"}
     if not project_id or not shots:
         return _response_error(400, "missing project_id or shots")
     animatics: List[Dict[str, Any]] = []
@@ -287,7 +447,9 @@ async def film_final(body: Dict[str, Any]):
     project_id = str(body.get("project_id") or "")
     shots = body.get("shots") or []
     seed = int(body.get("seed", 0) or 0)
-    outputs = body.get("outputs") or {"fps": 24, "res": "1024x576", "codec": "h264"}
+    # Enforce locked outputs if present
+    cfg = await _get_locked_config(project_id)
+    outputs = (cfg.get("outputs") if isinstance(cfg.get("outputs"), dict) else None) or body.get("outputs") or {"fps": 24, "res": "1024x576", "codec": "h264"}
     post = body.get("post") or {}
     if not project_id or not shots:
         return _response_error(400, "missing project_id or shots")
@@ -319,8 +481,46 @@ async def film_final(body: Dict[str, Any]):
         cache["by_input"][input_hash] = {"artifact": asset["uri"], "hash": asset["hash"], "stage": "final", "shot_id": sh_id}
     # Persist cache
     _write_json(project_id, os.path.join("manifests", "cache.json"), cache)
-    # Deterministic EDL/assembly
-    edl_obj = {"edl_version": "1.0", "project_id": project_id, "fps": outputs.get("fps", 24), "resolution": outputs.get("res", "1024x576"), "audio_sr": 48000, "tracks": {"video": [{"shot_id": s, "mp4": _proj_uri(project_id, "shots", s, "final.mp4"), "in": 0.0, "out": 3.0, "at": 0.0} for s in shots]}}
+    # Deterministic EDL/assembly honoring locked duration and shot durations
+    # Load shot durations from shots.jsonl
+    durations_map: Dict[str, float] = {}
+    try:
+        sp = _proj_dir(project_id, "shots.jsonl")
+        if os.path.exists(sp):
+            with open(sp, "r", encoding="utf-8") as f:
+                for ln in f:
+                    if ln.strip():
+                        try:
+                            obj = json.loads(ln)
+                            sid = obj.get("id")
+                            d = float(((obj.get("dsl") or {}).get("duration_s") or 3.0))
+                            if sid:
+                                durations_map[sid] = d
+                        except Exception:
+                            continue
+    except Exception:
+        pass
+    # If a total target is locked, scale shot durations deterministically
+    target_total = None
+    try:
+        target_total = float(cfg.get("duration_s")) if isinstance(cfg.get("duration_s"), (int, float)) else None
+    except Exception:
+        target_total = None
+    durations: List[float] = [float(durations_map.get(s, 3.0)) for s in shots]
+    if target_total and durations:
+        ssum = sum(durations)
+        if ssum > 0:
+            scale = target_total / ssum
+            durations = [round(d * scale, 2) for d in durations]
+            # fix last to exact
+            acc = sum(durations[:-1])
+            durations[-1] = round(max(0.1, target_total - acc), 2)
+    t = 0.0
+    video_tracks = []
+    for sid, d in zip(shots, durations):
+        video_tracks.append({"shot_id": sid, "mp4": _proj_uri(project_id, "shots", sid, "final.mp4"), "in": 0.0, "out": float(round(d,2)), "at": float(round(t,2))})
+        t += float(round(d,2))
+    edl_obj = {"edl_version": "1.0", "project_id": project_id, "fps": outputs.get("fps", 24), "resolution": outputs.get("res", "1024x576"), "audio_sr": 48000, "tracks": {"video": video_tracks}}
     edl_meta = _write_json(project_id, "edl.json", edl_obj)
     reel = _save_bytes(f"{PROJECTS_PREFIX}/{project_id}/reel_v0.mp4", _sha256_str(f"{project_id}|{seed}|reel").encode("utf-8"))
     _log_run(project_id, "final", [{"type": "json", "uri": edl_meta["uri"]}, {"type": "mp4", "uri": reel["uri"], "hash": reel["hash"]}], {"seed": seed})
@@ -417,7 +617,17 @@ async def film_export(body: Dict[str, Any]):
     subs = _save_bytes(f"{PROJECTS_PREFIX}/{project_id}/subtitles.srt", srt.encode("utf-8"))
     # Package
     pkg = _save_bytes(f"{PROJECTS_PREFIX}/{project_id}/delivery.zip", _sha256_str(f"{project_id}|package").encode("utf-8"))
-    export = {"master_uri": master["uri"], "subs_uri": subs["uri"], "package_uri": pkg["uri"], "hash": master["hash"]}
+    # Capture requested/effective post pipeline if provided
+    requested = body.get("requested") or {}
+    effective = body.get("effective") or {}
+    export = {
+        "master_uri": master["uri"],
+        "subs_uri": subs["uri"],
+        "package_uri": pkg["uri"],
+        "hash": master["hash"],
+        "requested": requested,
+        "effective": effective,
+    }
     _write_json(project_id, "export.json", export)
     _log_run(project_id, "export", [{"type": "json", "uri": _proj_uri(project_id, "export.json")}])
     try:

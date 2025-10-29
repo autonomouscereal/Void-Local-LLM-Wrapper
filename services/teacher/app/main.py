@@ -293,9 +293,26 @@ async def trace_flush(body: Dict[str, Any]):
                 if not rr:
                     continue
                 rid = int(rr[0])
-                if mode in ("general", "research", "text"):
-                    await db_execute("INSERT INTO distill_sft(run_id, sample_json) VALUES($1,$2)", rid, json.loads(sft_lines[0]) if sft_lines else {})
-                # Insert ToolPolicy/DPO lines if available
+                t_mode = (t.get("mode") or "general")
+                # Build an SFT sample directly from this trace row (avoid coupling to sft_lines order)
+                if t_mode in ("general", "research", "text"):
+                    sft_sample = {
+                        "input": {
+                            "pack_hash": (t.get("context") or {}).get("pack_hash"),
+                            "messages": (t.get("request") or {}).get("messages", []),
+                        },
+                        "output": {"text": (t.get("response") or {}).get("text", "")},
+                        "meta": {"mode": t_mode, "seed": t.get("seed"), "trace_id": t.get("trace_id"), "time": t.get("ts")},
+                    }
+                    if sft_sample["output"]["text"]:
+                        await db_execute("INSERT INTO distill_sft(run_id, sample_json) VALUES($1,$2)", rid, sft_sample)
+            # ToolPolicy/DPO are aggregate lines; insert them once per available run id
+            # (safe no-op if arrays are empty)
+            for t in buf:
+                rr = await db_fetchrow("SELECT id FROM run WHERE trace_id=$1", t.get("trace_id"))
+                if not rr:
+                    continue
+                rid = int(rr[0])
                 for tp in tp_lines:
                     await db_execute("INSERT INTO distill_toolpolicy(run_id, policy_json) VALUES($1,$2)", rid, json.loads(tp))
                 for dp in dpo_lines:

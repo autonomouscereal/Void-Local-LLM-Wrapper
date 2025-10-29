@@ -653,17 +653,19 @@ async def serpapi_google_search(queries: List[str], max_results: int = 5) -> str
 
 
 def _rrf_fuse(results_by_engine: Dict[str, List[Dict[str, Any]]], k: int = 60) -> List[Dict[str, Any]]:
-    # Reciprocal Rank Fusion across engines with stable tie-break
+    # Reciprocal Rank Fusion + CombMNZ with stable tie-break
     scores: Dict[str, float] = {}
+    freq: Dict[str, int] = {}
     meta: Dict[str, Dict[str, Any]] = {}
     for eng, items in results_by_engine.items():
         for rank, it in enumerate(items, start=1):
             key = it.get("link") or it.get("url") or it.get("id") or f"{eng}:{rank}"
             rr = 1.0 / float(k + rank)
             scores[key] = scores.get(key, 0.0) + rr
+            freq[key] = freq.get(key, 0) + 1
             if key not in meta:
                 meta[key] = {"title": it.get("title"), "link": it.get("link") or it.get("url"), "snippet": it.get("snippet")}
-    # stable ordering
+    # Combine: CombMNZ = (sum of scores) * freq; round to 1e-6 and tie-break deterministically
     def _auth(x: Dict[str, Any]) -> float:
         return 0.0
     def _rec(x: Dict[str, Any]) -> float:
@@ -671,10 +673,11 @@ def _rrf_fuse(results_by_engine: Dict[str, List[Dict[str, Any]]], k: int = 60) -
     def _sha(x: str) -> str:
         import hashlib as _h
         return _h.sha256(x.encode("utf-8")).hexdigest()
-    items = []
+    items: List[Dict[str, Any]] = []
     for key, sc in scores.items():
         m = meta.get(key) or {}
-        items.append({"key": key, "score": float(f"{sc:.6f}"), **m})
+        comb = float(f"{(sc * float(freq.get(key, 1))):.6f}")
+        items.append({"key": key, "score": comb, "rrf": float(f"{sc:.6f}"), "freq": int(freq.get(key, 1)), **m})
     items.sort(key=lambda r: (-r["score"], -_auth(r), -_rec(r), _sha(r.get("key") or "")))
     return items
 
@@ -1122,10 +1125,12 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         # Orchestrate Film 2.0 via film2 service endpoints
         # Normalize core args
         title = (args.get("title") or "Untitled").strip()
-        duration_s = int(args.get("duration_s") or 10)
+        duration_s = int(args.get("duration_s") or _parse_duration_seconds_dynamic(args.get("duration") or args.get("duration_text"), 10))
         seed = int(args.get("seed") or _derive_seed("film", title, str(duration_s)))
-        res = str(args.get("res") or "1920x1080").lower()
-        refresh = int(args.get("refresh") or 60)
+        _requested_res = args.get("res")
+        res = str(_requested_res or "1920x1080").lower()
+        _requested_refresh = args.get("refresh")
+        refresh = int(_requested_refresh or _parse_fps_dynamic(args.get("fps") or args.get("frame_rate") or "60fps", 60))
         base_fps = int(args.get("base_fps") or 30)
         # map common res synonyms
         if res in ("4k", "uhd", "2160p"): res = "3840x2160"
@@ -1141,18 +1146,78 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             interp = {**interp, "factor": fac}
         if not upscale.get("scale"):
             upscale = {**upscale, "scale": 2 if res == "3840x2160" else 1}
+        # Aggregate style references and character images dynamically if present
+        style_refs = args.get("style_refs") or []
+        # If the planner passed generic images list, allow using them as style refs by default
+        if not style_refs and isinstance(args.get("images"), list):
+            try:
+                style_refs = [it.get("url") for it in args.get("images") if isinstance(it, dict) and it.get("url")]
+            except Exception:
+                style_refs = []
+        character_images = args.get("character_images") or []
+        # Additional quality/format preferences passthrough
+        quality = args.get("quality") or {}
+        codec = args.get("codec") or quality.get("codec")
+        container = args.get("container") or quality.get("container")
+        bitrate = args.get("bitrate") or quality.get("bitrate")
+        audio = args.get("audio") or {}
+        audio_sr = audio.get("sr") or quality.get("audio_sr")
+        lufs_target = audio.get("lufs_target") or quality.get("lufs_target")
+        requested_meta = {
+            "res": _requested_res,
+            "refresh": _requested_refresh,
+            "base_fps": base_fps,
+            "post": (args.get("post") or {}),
+            "style_refs": style_refs,
+            "character_images": character_images,
+            "duration_s": duration_s,
+            "codec": codec,
+            "container": container,
+            "bitrate": bitrate,
+            "audio_sr": audio_sr,
+            "lufs_target": lufs_target,
+        }
+        effective_meta = {
+            "res": res,
+            "refresh": refresh,
+            "post": {"interpolate": interp, "upscale": upscale},
+            "codec": codec,
+            "container": container,
+            "bitrate": bitrate,
+            "audio_sr": audio_sr,
+            "lufs_target": lufs_target,
+        }
         # Plan → Final → QC → Export
         project_id = f"prj_{seed}"
         try:
             async with httpx.AsyncClient(timeout=1200) as client:
-                plan_payload = {"project_id": project_id, "seed": seed, "title": title, "duration_s": duration_s, "res": res, "base_fps": base_fps}
-                await client.post(f"{FILM2_BASE_URL}/film/plan" if (FILM2_BASE_URL:=os.getenv("FILM2_API_URL","http://film2:8090")) else "", json=plan_payload)
-                await client.post(f"{FILM2_BASE_URL}/film/breakdown", json={"project_id": project_id})
-                await client.post(f"{FILM2_BASE_URL}/film/storyboard", json={"project_id": project_id})
-                await client.post(f"{FILM2_BASE_URL}/film/animatic", json={"project_id": project_id})
-                await client.post(f"{FILM2_BASE_URL}/film/final", json={"project_id": project_id, "base_fps": base_fps})
-                await client.post(f"{FILM2_BASE_URL}/film/qc", json={"project_id": project_id})
-                exp = await client.post(f"{FILM2_BASE_URL}/film/export", json={"project_id": project_id, "post": {"interpolate": interp, "upscale": upscale}, "refresh": refresh})
+                base_url = os.getenv("FILM2_API_URL","http://film2:8090")
+                outputs_payload = args.get("outputs") or {"fps": refresh, "resolution": res, "codec": codec, "container": container, "bitrate": bitrate, "audio": {"sr": audio_sr, "lufs_target": lufs_target}}
+                rules_payload = args.get("rules") or {}
+                plan_payload = {"project_id": project_id, "seed": seed, "title": title, "duration_s": duration_s, "outputs": outputs_payload}
+                ideas = args.get("ideas") or []
+                if ideas:
+                    plan_payload["ideas"] = ideas
+                if style_refs:
+                    plan_payload["style_refs"] = style_refs
+                if character_images:
+                    plan_payload["character_images"] = character_images
+                await client.post(f"{base_url}/film/plan", json=plan_payload)
+                br = await client.post(f"{base_url}/film/breakdown", json={"project_id": project_id, "rules": rules_payload})
+                shots = []
+                try:
+                    js = br.json() if br.status_code == 200 else {}
+                    shots = [s.get("id") for s in (js.get("shots") or []) if isinstance(s, dict) and s.get("id")]
+                except Exception:
+                    shots = []
+                if not shots:
+                    # Fallback to minimal deterministic guess
+                    shots = [f"S1_SH{i+1:02d}" for i in range(max(1, min(6, int(duration_s // 3) or 1)))]
+                await client.post(f"{base_url}/film/storyboard", json={"project_id": project_id, "shots": shots})
+                await client.post(f"{base_url}/film/animatic", json={"project_id": project_id, "shots": shots, "outputs": {"fps": outputs_payload.get("fps", 12), "res": outputs_payload.get("resolution", "512x288")}})
+                await client.post(f"{base_url}/film/final", json={"project_id": project_id, "shots": shots, "outputs": outputs_payload, "post": {"interpolate": interp, "upscale": upscale}})
+                await client.post(f"{base_url}/film/qc", json={"project_id": project_id})
+                exp = await client.post(f"{base_url}/film/export", json={"project_id": project_id, "post": {"interpolate": interp, "upscale": upscale}, "refresh": refresh, "requested": requested_meta, "effective": effective_meta})
                 resj = exp.json() if exp.status_code == 200 else {"error": exp.text}
         except Exception as ex:
             return {"name": name, "error": str(ex)}
@@ -1699,7 +1764,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 "label": label_cfg or "exp_default",
                 "seed": master_seed,
                 "request": {"messages": req_dict.get("messages", []), "tools_allowed": [t.get("function", {}).get("name") for t in (body.get("tools") or []) if isinstance(t, dict)]},
-                "context": {},
+                "context": ({"pack_hash": pack_hash} if ("pack_hash" in locals() and pack_hash) else {}),
                 "routing": {"planner_model": planner_id, "executors": [QWEN_MODEL_ID, GPTOSS_MODEL_ID]},
                 "tool_calls": tool_calls or [],
                 "response": {"text": (final_text or "")[:4000]},
@@ -2143,6 +2208,55 @@ def _parse_resolution(res: Optional[str]) -> Tuple[int, int]:
     except Exception:
         pass
     return 1024, 1024
+
+
+def _parse_duration_seconds_dynamic(value: Any, default_seconds: float = 10.0) -> int:
+    try:
+        if value is None:
+            return int(default_seconds)
+        if isinstance(value, (int, float)):
+            return max(1, int(round(float(value))))
+        s = str(value).strip().lower()
+        if not s:
+            return int(default_seconds)
+        # HH:MM:SS or MM:SS
+        import re as _re
+        if _re.match(r"^\d{1,2}:\d{2}(:\d{2})?$", s):
+            parts = [int(x) for x in s.split(":")]
+            if len(parts) == 2:
+                return parts[0] * 60 + parts[1]
+            if len(parts) == 3:
+                return parts[0] * 3600 + parts[1] * 60 + parts[2]
+        # textual: "3 minutes", "180s", "3m"
+        m = _re.match(r"^(\d+)\s*(seconds|second|secs|sec|s)$", s)
+        if m:
+            return max(1, int(m.group(1)))
+        m = _re.match(r"^(\d+)\s*(minutes|minute|mins|min|m)$", s)
+        if m:
+            return max(1, int(m.group(1)) * 60)
+        m = _re.match(r"^(\d+)\s*(hours|hour|hrs|hr|h)$", s)
+        if m:
+            return max(1, int(m.group(1)) * 3600)
+        # plain integer string
+        return max(1, int(round(float(s))))
+    except Exception:
+        return int(default_seconds)
+
+
+def _parse_fps_dynamic(value: Any, default_fps: int = 60) -> int:
+    try:
+        if value is None:
+            return default_fps
+        if isinstance(value, (int, float)):
+            return max(1, min(240, int(round(float(value)))))
+        s = str(value).strip().lower()
+        import re as _re
+        m = _re.match(r"^(\d{1,3})\s*fps$", s)
+        if m:
+            return max(1, min(240, int(m.group(1))))
+        return max(1, min(240, int(round(float(s)))))
+    except Exception:
+        return default_fps
 
 
 def build_default_scene_workflow(prompt: str, characters: List[Dict[str, Any]], style: Optional[str] = None, *, width: int = 1024, height: int = 1024, steps: int = 25, seed: int = 0, filename_prefix: str = "scene") -> Dict[str, Any]:
