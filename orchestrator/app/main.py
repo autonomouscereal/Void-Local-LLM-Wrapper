@@ -343,39 +343,90 @@ def estimate_usage(messages: List[Dict[str, Any]], completion_text: str) -> Dict
 
 
 def _icw_pack(messages: List[Dict[str, Any]], seed: int, budget_tokens: int = 3500) -> Dict[str, Any]:
-    # Inline, deterministic packer (JSON-only). No network. Budget enforced using a simple token estimator.
-    # Strategy: take conversation in order, prefer user/system/tool content; truncate to fit budget.
-    # Determinism: stable ordering; no randomness beyond provided seed; rounding implicit in estimator.
+    # Inline, deterministic packer with simple multi-signal scoring and graded budget allocation.
+    # No network; JSON-only; scores rounded to 1e-6; stable tie-break by sha256.
     try:
-        linearized: List[str] = []
-        for m in messages:
-            role = m.get("role")
-            if role == "tool":
-                # keep tool outputs short in pack
-                content = str(m.get("content") or "")[:4000]
-            else:
-                content = str(m.get("content") or "")
-            if content:
-                linearized.append(f"{role}: {content}")
-        full = "\n".join(linearized)
-        # Fit to budget
-        est = estimate_tokens_from_text(full)
-        if est <= budget_tokens:
-            pack = full
-        else:
-            # truncate conservatively by ratio; refine line-by-line
-            ratio = max(0.1, float(budget_tokens) / float(est))
-            target_chars = int(len(full) * ratio)
-            pack = full[:target_chars]
-            # ensure we don't overshoot after hard cut
-            while estimate_tokens_from_text(pack) > budget_tokens and len(pack) > 10:
-                pack = pack[:-int(max(10, len(pack) * 0.02))]
         import hashlib as _hl
+        def _round6(x: float) -> float:
+            return float(f"{float(x):.6f}")
+        def _tok(s: str) -> List[str]:
+            import re as _re
+            return [w for w in _re.findall(r"[a-z0-9]{3,}", (s or "").lower())]
+        def _jacc(a: List[str], b: List[str]) -> float:
+            if not a or not b:
+                return 0.0
+            sa, sb = set(a), set(b)
+            if not sa or not sb:
+                return 0.0
+            inter = len(sa & sb)
+            uni = len(sa | sb)
+            return inter / float(uni or 1)
+        # Query = latest user message
+        query_text = ""
+        for m in reversed(messages):
+            if m.get("role") == "user" and isinstance(m.get("content"), str) and m.get("content").strip():
+                query_text = m.get("content").strip()
+                break
+        qtok = _tok(query_text)
+        # Candidates = each message content (with role), scored
+        items: List[Dict[str, Any]] = []
+        owner_counts: Dict[str, int] = {}
+        for idx, m in enumerate(messages):
+            role = m.get("role") or "user"
+            content = str(m.get("content") or "")
+            if not content:
+                continue
+            toks = _tok(content)
+            topical = _jacc(toks, qtok)
+            # Simple role-based authority prior
+            authority = {"system": 0.9, "tool": 0.7, "assistant": 0.5, "user": 0.4}.get(role, 0.4)
+            # Recency prior: later messages higher
+            recency = (idx + 1) / float(len(messages))
+            # Diversity proxy by role owner
+            owner = role
+            owner_counts[owner] = owner_counts.get(owner, 0) + 1
+            items.append({"role": role, "content": content, "topical": topical, "authority": authority, "recency": recency, "owner": owner})
+        # Diversity score needs owner counts
+        for it in items:
+            own = it.get("owner")
+            freq = owner_counts.get(own, 1)
+            it["diversity"] = 1.0 / float(freq)
+        # Composite score (weights): topical 0.40, authority 0.25, recency 0.20, diversity 0.15
+        for it in items:
+            s = 0.40 * it["topical"] + 0.25 * it["authority"] + 0.20 * it["recency"] + 0.15 * it["diversity"]
+            it["score"] = _round6(s)
+            it["sha"] = _hl.sha256((it.get("role") + "\n" + it.get("content")).encode("utf-8")).hexdigest()
+        # Stable sort: score desc, topical desc, authority desc, recency desc, sha asc
+        items.sort(key=lambda x: (-x["score"], -x["topical"], -x["authority"], -x["recency"], x["sha"]))
+        # Budget allocator: try full texts in order, then degrade to summaries (first N chars) if overflow
+        def _fit(texts: List[str], budget: int) -> str:
+            acc: List[str] = []
+            used = 0
+            for t in texts:
+                need = estimate_tokens_from_text(t)
+                if used + need <= budget:
+                    acc.append(t)
+                    used += need
+                else:
+                    # try a shorter summary tier
+                    short = t[: max(200, int(len(t) * 0.25))]
+                    need2 = estimate_tokens_from_text(short)
+                    if used + need2 <= budget:
+                        acc.append(short)
+                        used += need2
+                if used >= budget:
+                    break
+            return "\n\n".join(acc)
+        ranked_texts = [f"{it['role']}: {it['content']}" for it in items]
+        pack = _fit(ranked_texts, budget_tokens)
         ph = _hl.sha256(pack.encode("utf-8")).hexdigest()
-        scores_summary = {"selected": 1, "dup_rate": 0.0, "independence_index": 1.0}
+        scores_summary = {
+            "selected": len([1 for _ in ranked_texts]),
+            "dup_rate": _round6(0.0),
+            "independence_index": _round6(min(1.0, len(owner_counts.keys()) / 6.0)),
+        }
         return {"pack": pack, "hash": f"sha256:{ph}", "budget_tokens": budget_tokens, "estimated_tokens": estimate_tokens_from_text(pack), "scores_summary": scores_summary}
     except Exception:
-        # Fail-safe: empty pack
         return {"pack": "", "hash": None, "budget_tokens": budget_tokens, "estimated_tokens": 0, "scores_summary": {}}
 
 
@@ -1558,18 +1609,36 @@ async def chat_completions(body: Dict[str, Any], request: Request):
 
     # 2) Optionally execute tools
     tool_results: List[Dict[str, Any]] = []
+    tool_exec_meta: List[Dict[str, Any]] = []
     if tool_calls:
-        tool_results = await execute_tools(tool_calls)
-        # persist tool_call rows
-        for tc, tr in zip(tool_calls, tool_results):
+        for tc in tool_calls[:5]:
             try:
                 n = tc.get("name") or "tool"
                 args = tc.get("arguments") or {}
                 seed_tool = _derive_seed("tool", n, trace_id)
-                await _db_insert_tool_call(run_id, n, seed_tool, args if isinstance(args, dict) else {"_raw": args}, tr if isinstance(tr, dict) else {})
-            except Exception:
-                continue
-        # Inject tool_results as system evidence so committee always sees them
+                tstart = time.time()
+                tr = await execute_tool_call(tc)
+                duration_ms = int(round((time.time() - tstart) * 1000))
+                tool_results.append(tr)
+                # persist to DB
+                try:
+                    await _db_insert_tool_call(run_id, n, seed_tool, args if isinstance(args, dict) else {"_raw": args}, tr if isinstance(tr, dict) else {}, duration_ms)
+                except Exception:
+                    pass
+                # extract artifacts minimally for trace policy
+                artifacts = {}
+                if isinstance(tr, dict):
+                    res = tr.get("result") if isinstance(tr.get("result"), dict) else {}
+                    if res:
+                        if res.get("master_uri") and res.get("hash"):
+                            artifacts["master"] = {"uri": res.get("master_uri"), "hash": res.get("hash")}
+                        for key in ("edl", "nodes", "qc_report"):
+                            if isinstance(res.get(key), dict) and (res.get(key).get("uri") or res.get(key).get("hash")):
+                                artifacts[key] = {k: v for k, v in res.get(key).items() if k in ("uri", "hash")}
+                tool_exec_meta.append({"name": n, "args": args if isinstance(args, dict) else {"_raw": args}, "seed": seed_tool, "duration_ms": duration_ms, "artifacts": artifacts})
+            except Exception as ex:
+                tool_results.append({"name": tc.get("name", "tool"), "error": str(ex)})
+                tool_exec_meta.append({"name": tc.get("name", "tool"), "args": tc.get("arguments") or {}, "seed": _derive_seed("tool", tc.get("name", "tool"), trace_id), "duration_ms": 0, "artifacts": {}})
         if tool_results:
             messages = [{"role": "system", "content": "Tool results:\n" + json.dumps(tool_results, indent=2)}] + messages
 
@@ -1781,28 +1850,25 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             except Exception:
                 msgs_for_seed = ""
             master_seed = _derive_seed("chat", msgs_for_seed)
+            seed_router = _derive_seed("router", trace_id, str(master_seed))
             label_cfg = None
             try:
                 label_cfg = (WRAPPER_CONFIG.get("teacher") or {}).get("default_label")
             except Exception:
                 label_cfg = None
             # Normalize tool_calls shape for teacher (use args, not arguments)
-            _tc = []
-            for tc in (tool_calls or []):
-                try:
-                    _tc.append({"name": tc.get("name"), "args": (tc.get("arguments") or {})})
-                except Exception:
-                    _tc.append({"name": tc.get("name") or "tool", "args": {}})
+            _tc = tool_exec_meta or []
             trace_payload_stream = {
                 "label": label_cfg or "exp_default",
                 "seed": master_seed,
                 "request": {"messages": req_dict.get("messages", []), "tools_allowed": [t.get("function", {}).get("name") for t in (body.get("tools") or []) if isinstance(t, dict)]},
                 "context": ({"pack_hash": pack_hash} if ("pack_hash" in locals() and pack_hash) else {}),
-                "routing": {"planner_model": planner_id, "executors": [QWEN_MODEL_ID, GPTOSS_MODEL_ID]},
+                "routing": {"planner_model": planner_id, "executors": [QWEN_MODEL_ID, GPTOSS_MODEL_ID], "seed_router": seed_router},
                 "tool_calls": _tc,
                 "response": {"text": (final_text or "")[:4000]},
                 "metrics": usage_stream,
                 "env": {"public_base_url": PUBLIC_BASE_URL, "config_hash": WRAPPER_CONFIG_HASH},
+                "privacy": {"vault_refs": 0, "secrets_in": 0, "secrets_out": 0},
                 "events": planned_events[:64],
             }
             async def _send_trace_stream():
@@ -2088,22 +2154,18 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         except Exception:
             label_cfg = None
         # Normalize tool_calls shape for teacher (use args, not arguments)
-        _tc2 = []
-        for tc in (tool_calls or []):
-            try:
-                _tc2.append({"name": tc.get("name"), "args": (tc.get("arguments") or {})})
-            except Exception:
-                _tc2.append({"name": tc.get("name") or "tool", "args": {}})
+        _tc2 = tool_exec_meta or []
         trace_payload = {
             "label": label_cfg or "exp_default",
             "seed": master_seed,
             "request": {"messages": req_dict.get("messages", []), "tools_allowed": [t.get("function", {}).get("name") for t in (body.get("tools") or []) if isinstance(t, dict)]},
             "context": ({"pack_hash": pack_hash} if pack_hash else {}),
-            "routing": {"planner_model": planner_id, "executors": [QWEN_MODEL_ID, GPTOSS_MODEL_ID]},
+            "routing": {"planner_model": planner_id, "executors": [QWEN_MODEL_ID, GPTOSS_MODEL_ID], "seed_router": _derive_seed("router", trace_id, str(master_seed))},
             "tool_calls": _tc2,
             "response": {"text": (display_content or "")[:4000]},
             "metrics": usage,
             "env": {"public_base_url": PUBLIC_BASE_URL, "config_hash": WRAPPER_CONFIG_HASH},
+            "privacy": {"vault_refs": 0, "secrets_in": 0, "secrets_out": 0},
         }
         async def _send_trace():
             try:
