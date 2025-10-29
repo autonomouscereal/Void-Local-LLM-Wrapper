@@ -9,6 +9,15 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
+try:
+    from db.core import get_pool, execute as db_execute, fetchrow as db_fetchrow
+except Exception:  # optional DB
+    async def get_pool():
+        return None
+    async def db_execute(*args, **kwargs):
+        return ""
+    async def db_fetchrow(*args, **kwargs):
+        return None
 
 
 FILM_VERSION = "2.0.0"
@@ -138,6 +147,27 @@ async def film_plan(body: Dict[str, Any]):
     _append_ndjson(os.path.join(UPLOAD_ROOT, "projects.jsonl"), {"id": project_id, "title": title, "created_at": _now_iso(), "state": "planned"})
     _log_run(project_id, "plan", [{"type": "json", "uri": _proj_uri(project_id, "plan.json") }], {"seed": seed})
 
+    # DB upserts: project, manifests, scenes
+    try:
+        pool = await get_pool()
+        if pool is not None:
+            cfg = {"outputs": outputs}
+            await db_execute(
+                "INSERT INTO film_project(project_uid, seed, title, duration_s, config_json, state) VALUES($1,$2,$3,$4,$5,'planning') "
+                "ON CONFLICT (project_uid) DO UPDATE SET title=EXCLUDED.title, duration_s=EXCLUDED.duration_s, config_json=EXCLUDED.config_json",
+                project_id, int(seed), title, int(round(duration_s)), cfg,
+            )
+            row = await db_fetchrow("SELECT id FROM film_project WHERE project_uid=$1", project_id)
+            if row:
+                pid = int(row[0])
+                await db_execute("INSERT INTO film_manifest(project_id, kind, json) VALUES($1,$2,$3)", pid, "plan", {"title": title, "duration_s": duration_s, "outputs": outputs})
+                await db_execute("INSERT INTO film_manifest(project_id, kind, json) VALUES($1,$2,$3)", pid, "scenes", scenes)
+                await db_execute("INSERT INTO film_manifest(project_id, kind, json) VALUES($1,$2,$3)", pid, "characters", chars_json)
+                for sc in scenes:
+                    await db_execute("INSERT INTO film_scene(project_id, scene_uid, meta_json) VALUES($1,$2,$3) ON CONFLICT (project_id, scene_uid) DO NOTHING", pid, sc.get("id"), sc)
+    except Exception:
+        pass
+
     return {
         "project_id": project_id,
         "seed": seed,
@@ -184,6 +214,22 @@ async def film_breakdown(body: Dict[str, Any]):
     for sh in shots:
         _append_ndjson(shots_path, sh)
     _log_run(project_id, "breakdown", [{"type": "ndjson", "uri": _proj_uri(project_id, "shots.jsonl")}], {"seed": seed})
+    # DB: shots manifest + rows
+    try:
+        pool = await get_pool()
+        if pool is not None:
+            row = await db_fetchrow("SELECT id FROM film_project WHERE project_uid=$1", project_id)
+            if row:
+                pid = int(row[0])
+                await db_execute("INSERT INTO film_manifest(project_id, kind, json) VALUES($1,$2,$3)", pid, "shots", shots)
+                for sh in shots:
+                    seeds_json = {"shot": sh.get("seed"), "tools": {}}
+                    await db_execute(
+                        "INSERT INTO film_shot(project_id, shot_uid, scene_uid, dsl_json, seeds_json, status) VALUES($1,$2,$3,$4,$5,'planned') ON CONFLICT (project_id, shot_uid) DO NOTHING",
+                        pid, sh.get("id"), sh.get("scene_id"), sh.get("dsl", {}), seeds_json,
+                    )
+    except Exception:
+        pass
     return {"shots": shots}
 
 
@@ -346,6 +392,16 @@ async def film_qc(body: Dict[str, Any]):
     suggested = [{"shot_id": "S1_SH02", "action": "re-render partial", "reason": "flicker", "seed_adj": "+3"}]
     _write_json(project_id, "qc_report.json", {**qc_report, "suggested_fixes": suggested})
     _log_run(project_id, "qc", [{"type": "json", "uri": _proj_uri(project_id, "qc_report.json")}])
+    try:
+        pool = await get_pool()
+        if pool is not None:
+            row = await db_fetchrow("SELECT id FROM film_project WHERE project_uid=$1", project_id)
+            if row:
+                pid = int(row[0])
+                await db_execute("INSERT INTO film_qc(project_id, report_json) VALUES($1,$2)", pid, {**qc_report, "suggested_fixes": suggested})
+                await db_execute("UPDATE film_project SET state='qc' WHERE id=$1", pid)
+    except Exception:
+        pass
     return {"qc_report": qc_report, "suggested_fixes": suggested}
 
 
@@ -364,6 +420,16 @@ async def film_export(body: Dict[str, Any]):
     export = {"master_uri": master["uri"], "subs_uri": subs["uri"], "package_uri": pkg["uri"], "hash": master["hash"]}
     _write_json(project_id, "export.json", export)
     _log_run(project_id, "export", [{"type": "json", "uri": _proj_uri(project_id, "export.json")}])
+    try:
+        pool = await get_pool()
+        if pool is not None:
+            row = await db_fetchrow("SELECT id FROM film_project WHERE project_uid=$1", project_id)
+            if row:
+                pid = int(row[0])
+                await db_execute("INSERT INTO film_manifest(project_id, kind, json) VALUES($1,$2,$3)", pid, "export", export)
+                await db_execute("UPDATE film_project SET state='exported' WHERE id=$1", pid)
+    except Exception:
+        pass
     return export
 
 

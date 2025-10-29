@@ -11,6 +11,15 @@ from typing import Any, Dict, List, Optional, Tuple
 import httpx
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
+try:
+    from db.core import get_pool, execute as db_execute, fetchrow as db_fetchrow
+except Exception:
+    async def get_pool():
+        return None
+    async def db_execute(*args, **kwargs):
+        return ""
+    async def db_fetchrow(*args, **kwargs):
+        return None
 
 
 ABLATION_VERSION = "1.0.0"
@@ -382,11 +391,33 @@ async def ablate(body: Dict[str, Any]):
     }
     _write_json(runrec_path, run_record)
 
-    return {
+    result = {
         "run_id": f"{_now_iso()}-ablate-{seed}",
         "paths": {"clean_jsonl": _uri_from_path(clean_path), "drops_jsonl": _uri_from_path(drops_path), "report_json": _uri_from_path(report_path), "run_record": _uri_from_path(runrec_path)},
         "metrics": {"candidates": total, "kept": kept_count, "drop_rate": _round6((total - kept_count) / max(1, total)), "dup_rate": _round6(near_dups / max(1, total)), "avg_score": avg_score},
     }
+    # Optional DB: persist batch + items
+    try:
+        pool = await get_pool()
+        if pool is not None:
+            batch_uid = result["run_id"]
+            await db_execute("INSERT INTO ablation_run(batch_uid, config_json, report_json) VALUES($1,$2,$3)", batch_uid, cfg, report)
+            row = await db_fetchrow("SELECT id FROM ablation_run WHERE batch_uid=$1", batch_uid)
+            if row:
+                aid = int(row[0])
+                for c in kept_items:
+                    await db_execute("INSERT INTO ablation_clean(ablation_id, item_json) VALUES($1,$2)", aid, c)
+                # read drops.jsonl quickly
+                try:
+                    with open(drops_path, "r", encoding="utf-8") as f:
+                        for ln in f:
+                            if ln.strip():
+                                await db_execute("INSERT INTO ablation_drop(ablation_id, item_json) VALUES($1,$2)", aid, json.loads(ln))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return result
 
 
 @app.post("/trainset/ingest")

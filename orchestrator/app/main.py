@@ -124,8 +124,9 @@ EXECUTOR_BASE_URL = os.getenv("EXECUTOR_BASE_URL")  # http://executor:8081
 PLANNER_MODEL = os.getenv("PLANNER_MODEL", "qwen")  # qwen | gptoss
 ENABLE_DEBATE = os.getenv("ENABLE_DEBATE", "true").lower() == "true"
 MAX_DEBATE_TURNS = int(os.getenv("MAX_DEBATE_TURNS", "1"))
-ALLOW_TOOL_EXECUTION = os.getenv("ALLOW_TOOL_EXECUTION", "true").lower() == "true"
 AUTO_EXECUTE_TOOLS = os.getenv("AUTO_EXECUTE_TOOLS", "true").lower() == "true"
+# Alias legacy flag to canonical; do not document legacy externally
+ALLOW_TOOL_EXECUTION = AUTO_EXECUTE_TOOLS if os.getenv("ALLOW_TOOL_EXECUTION") is None else (os.getenv("ALLOW_TOOL_EXECUTION", "true").lower() == "true")
 STREAM_CHUNK_SIZE_CHARS = int(os.getenv("STREAM_CHUNK_SIZE_CHARS", "0"))
 STREAM_CHUNK_INTERVAL_MS = int(os.getenv("STREAM_CHUNK_INTERVAL_MS", "50"))
 JOBS_RAG_INDEX = os.getenv("JOBS_RAG_INDEX", "true").lower() == "true"
@@ -968,6 +969,9 @@ async def planner_produce_plan(messages: List[Dict[str, Any]], tools: Optional[L
 async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
     name = call.get("name")
     raw_args = call.get("arguments") or {}
+    # Hard-disable legacy Film-1 tools to enforce Film-2-only orchestration
+    if name in ("film_create", "film_add_character", "film_add_scene", "film_status", "film_compile", "make_movie"):
+        return {"name": name, "skipped": True, "reason": "film1_disabled"}
     # DB pool (may be None if PG not configured)
     pool = await get_pg_pool()
     # Normalize tool arguments using the custom parser and strong coercion

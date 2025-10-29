@@ -10,6 +10,15 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
+try:
+    from db.core import get_pool, execute as db_execute, fetchrow as db_fetchrow
+except Exception:
+    async def get_pool():
+        return None
+    async def db_execute(*args, **kwargs):
+        return ""
+    async def db_fetchrow(*args, **kwargs):
+        return None
 
 
 TEACHER_VERSION = "1.0.0"
@@ -169,6 +178,15 @@ async def trace_append(body: Dict[str, Any]):
         "privacy": body.get("privacy") or {"vault_refs": 0, "secrets_in": 0, "secrets_out": 0},
     }
     _BUFFER[label].append(line)
+    # Optional DB: attach trace to run if present (by trace_id)
+    try:
+        pool = await get_pool()
+        if pool is not None:
+            rr = await db_fetchrow("SELECT id FROM run WHERE trace_id=$1", line.get("trace_id"))
+            if rr:
+                await db_execute("INSERT INTO teacher_trace(run_id, trace_line) VALUES($1,$2)", int(rr[0]), line)
+    except Exception:
+        pass
     return {"ok": True, "buffer_size": len(_BUFFER[label]), "label": label, "trace_id": trace_id}
 
 
@@ -266,6 +284,24 @@ async def trace_flush(body: Dict[str, Any]):
         _write_text(paths["toolpolicy"], (open(paths["toolpolicy"], "r", encoding="utf-8").read() if os.path.exists(paths["toolpolicy"]) else "") + "\n".join(tp_lines) + "\n")
     if dpo_lines:
         _write_text(paths["dpo"], (open(paths["dpo"], "r", encoding="utf-8").read() if os.path.exists(paths["dpo"]) else "") + "\n".join(dpo_lines) + "\n")
+    # Optional DB: materialize distill rows linked to run
+    try:
+        pool = await get_pool()
+        if pool is not None:
+            for t in buf:
+                rr = await db_fetchrow("SELECT id FROM run WHERE trace_id=$1", t.get("trace_id"))
+                if not rr:
+                    continue
+                rid = int(rr[0])
+                if mode in ("general", "research", "text"):
+                    await db_execute("INSERT INTO distill_sft(run_id, sample_json) VALUES($1,$2)", rid, json.loads(sft_lines[0]) if sft_lines else {})
+                # Insert ToolPolicy/DPO lines if available
+                for tp in tp_lines:
+                    await db_execute("INSERT INTO distill_toolpolicy(run_id, policy_json) VALUES($1,$2)", rid, json.loads(tp))
+                for dp in dpo_lines:
+                    await db_execute("INSERT INTO distill_dpo(run_id, pair_json) VALUES($1,$2)", rid, json.loads(dp))
+    except Exception:
+        pass
     # run record
     inputs_hash = _sha256_str("".join([x.get("trace_id") or "" for x in buf]))
     # include wrapper config hash if present
