@@ -16,7 +16,7 @@ Quick Start
    - `GPTOSS_MODEL_ID` default: `gpt-oss:20b`
    - `DEFAULT_NUM_CTX` default: `8192`
    - `DEFAULT_TEMPERATURE` default: `0.3`
-   - `PLANNER_MODEL` default: `qwen` (values: `qwen` | `gptoss`)
+   - `PLANNER_MODEL` default: `qwen3` (values: `qwen3` | `qwen` | `gptoss`)
    - `ENABLE_DEBATE` default: `true`
    - `MAX_DEBATE_TURNS` default: `1`
    - `ENABLE_WEBSEARCH` default: `true`

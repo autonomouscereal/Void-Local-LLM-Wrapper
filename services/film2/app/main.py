@@ -44,6 +44,18 @@ def _sha256_str(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 
+def _seed64(*parts: str) -> int:
+    try:
+        import xxhash  # optional; prefer xxhash when available
+        h = xxhash.xxh64()
+        for p in parts:
+            h.update(str(p))
+        return h.intdigest() & ((1 << 64) - 1)
+    except Exception:
+        # fallback: lower 64 bits of sha256
+        return int(_sha256_str("::".join(parts))[:16], 16)
+
+
 def _save_bytes(rel_name: str, data: bytes) -> Dict[str, str]:
     path = os.path.join(UPLOAD_ROOT, rel_name)
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -75,8 +87,10 @@ def _write_json(project_id: str, rel_name: str, obj: Any) -> Dict[str, str]:
     path = _proj_dir(project_id, rel_name)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     data = json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
-    with open(path, "w", encoding="utf-8") as f:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         f.write(data)
+    os.replace(tmp, path)
     uri = _proj_uri(project_id, rel_name)
     return {"uri": uri, "hash": f"sha256:{_sha256_bytes(data.encode('utf-8'))}"}
 
@@ -540,6 +554,21 @@ async def film_final(body: Dict[str, Any]):
                             continue
     except Exception:
         pass
+    # Record post pipeline seeds (deterministic) and params if present
+    post_nodes: Dict[str, Any] = {}
+    try:
+        # Persist post info based on export effective or last known post params
+        eff = (effective if isinstance(locals().get("effective"), dict) else {}) if "effective" in locals() else {}
+        post_eff = eff.get("post") if isinstance(eff.get("post"), dict) else {}
+        # Derive stable seeds
+        if post_eff.get("interpolate"):
+            post_nodes["interpolate"] = {"seed": _seed64("post", project_id, "interpolate"), **post_eff.get("interpolate")}
+        if post_eff.get("upscale"):
+            post_nodes["upscale"] = {"seed": _seed64("post", project_id, "upscale"), **post_eff.get("upscale")}
+    except Exception:
+        post_nodes = {}
+    if post_nodes:
+        nodes_obj["post"] = post_nodes
     try:
         import hashlib as _hl
         ghash = _hl.sha256(json.dumps(nodes_obj, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()

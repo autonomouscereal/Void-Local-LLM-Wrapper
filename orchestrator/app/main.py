@@ -342,6 +342,43 @@ def estimate_usage(messages: List[Dict[str, Any]], completion_text: str) -> Dict
     }
 
 
+def _icw_pack(messages: List[Dict[str, Any]], seed: int, budget_tokens: int = 3500) -> Dict[str, Any]:
+    # Inline, deterministic packer (JSON-only). No network. Budget enforced using a simple token estimator.
+    # Strategy: take conversation in order, prefer user/system/tool content; truncate to fit budget.
+    # Determinism: stable ordering; no randomness beyond provided seed; rounding implicit in estimator.
+    try:
+        linearized: List[str] = []
+        for m in messages:
+            role = m.get("role")
+            if role == "tool":
+                # keep tool outputs short in pack
+                content = str(m.get("content") or "")[:4000]
+            else:
+                content = str(m.get("content") or "")
+            if content:
+                linearized.append(f"{role}: {content}")
+        full = "\n".join(linearized)
+        # Fit to budget
+        est = estimate_tokens_from_text(full)
+        if est <= budget_tokens:
+            pack = full
+        else:
+            # truncate conservatively by ratio; refine line-by-line
+            ratio = max(0.1, float(budget_tokens) / float(est))
+            target_chars = int(len(full) * ratio)
+            pack = full[:target_chars]
+            # ensure we don't overshoot after hard cut
+            while estimate_tokens_from_text(pack) > budget_tokens and len(pack) > 10:
+                pack = pack[:-int(max(10, len(pack) * 0.02))]
+        import hashlib as _hl
+        ph = _hl.sha256(pack.encode("utf-8")).hexdigest()
+        scores_summary = {"selected": 1, "dup_rate": 0.0, "independence_index": 1.0}
+        return {"pack": pack, "hash": f"sha256:{ph}", "budget_tokens": budget_tokens, "estimated_tokens": estimate_tokens_from_text(pack), "scores_summary": scores_summary}
+    except Exception:
+        # Fail-safe: empty pack
+        return {"pack": "", "hash": None, "budget_tokens": budget_tokens, "estimated_tokens": 0, "scores_summary": {}}
+
+
 def merge_usages(usages: List[Optional[Dict[str, int]]]) -> Dict[str, int]:
     out = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     for u in usages:
@@ -1389,6 +1426,7 @@ async def execute_tools(tool_calls: List[Dict[str, Any]]) -> List[Dict[str, Any]
 @app.post("/v1/chat/completions")
 async def chat_completions(body: Dict[str, Any], request: Request):
     # normalize and extract attachments (images/audio/video/files) for tools
+    t0 = time.time()
     # Validate body
     if not isinstance(body, dict) or not isinstance(body.get("messages"), list):
         return JSONResponse(status_code=400, content={"error": "bad_request", "detail": "messages must be a list"})
@@ -1414,40 +1452,22 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     import hashlib as _hl
     trace_id = "tt_" + _hl.sha256(msgs_for_seed.encode("utf-8")).hexdigest()[:16]
 
-    # ICW pack (always-on, unless ICW_DISABLE=1) — record pack_hash for traces
+    # ICW pack (always-on, unless ICW_DISABLE=1) — inline; record pack_hash for traces
     pack_hash = None
-    if (not ICW_DISABLE) and ICW_API_URL:
-        try:
-            # derive seed from messages deterministically
-            seed = _derive_seed("icw", msgs_for_seed)
-            icw_req = {
-                "seed": seed,
-                "budget_tokens": 3500,
-                "goal": "context packing for next step",
-                "query": next((m.content for m in reversed(normalized_msgs) if m.role == "user" and isinstance(m.content, str)), ""),
-                "candidates": [],
-            }
-            async with httpx.AsyncClient(timeout=10) as client:
-                r = await client.post(ICW_API_URL.rstrip("/") + "/context/pack", json=icw_req)
-                if r.status_code == 200:
-                    data = r.json()
-                    sections = data.get("sections") or {}
-                    # prepend PACK text as a system hint for downstream planning
-                    pack_text = sections.get("PACK") or ""
-                    if isinstance(pack_text, str) and pack_text.strip():
-                        messages = [{"role": "system", "content": f"ICW PACK (hash tracked):\n{pack_text[:12000]}"}] + messages
-                    # compute and retain pack_hash
-                    ph = _hl.sha256(json.dumps(data, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
-                    pack_hash = f"sha256:{ph}"
-                    # Persist run row and icw log early
-                    run_id = await _db_insert_run(trace_id=trace_id, mode=mode, seed=master_seed, pack_hash=pack_hash, request_json=body)
-                    await _db_insert_icw_log(run_id=run_id, pack_hash=pack_hash, budget_tokens=int(data.get("budget_tokens") or 0), scores_json=data.get("scores_summary") or {})
-                else:
-                    run_id = await _db_insert_run(trace_id=trace_id, mode=mode, seed=master_seed, pack_hash=None, request_json=body)
-        except Exception:
-                    pack_hash = None
-                    run_id = await _db_insert_run(trace_id=trace_id, mode=mode, seed=master_seed, pack_hash=None, request_json=body)
-    else:
+    try:
+        seed_icw = _derive_seed("icw", msgs_for_seed)
+        if not ICW_DISABLE:
+            icw = _icw_pack(normalized_msgs, seed_icw, budget_tokens=3500)
+            pack_text = icw.get("pack") or ""
+            if isinstance(pack_text, str) and pack_text.strip():
+                messages = [{"role": "system", "content": f"ICW PACK (hash tracked):\n{pack_text[:12000]}"}] + messages
+            pack_hash = icw.get("hash")
+            run_id = await _db_insert_run(trace_id=trace_id, mode=mode, seed=master_seed, pack_hash=pack_hash, request_json=body)
+            await _db_insert_icw_log(run_id=run_id, pack_hash=pack_hash or None, budget_tokens=int(icw.get("budget_tokens") or 0), scores_json=icw.get("scores_summary") or {})
+        else:
+            run_id = await _db_insert_run(trace_id=trace_id, mode=mode, seed=master_seed, pack_hash=None, request_json=body)
+    except Exception:
+        pack_hash = None
         run_id = await _db_insert_run(trace_id=trace_id, mode=mode, seed=master_seed, pack_hash=None, request_json=body)
 
     # If client supplies tool results (role=tool) we include them verbatim for the planner/executors
@@ -1860,6 +1880,9 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     ])
     if usage["total_tokens"] == 0:
         usage = estimate_usage(messages, final_text)
+    wall_ms = int(round((time.time() - t0) * 1000))
+    usage_with_wall = dict(usage)
+    usage_with_wall["wall_ms"] = wall_ms
 
     # Ensure clean markdown content: collapse excessive whitespace but keep newlines
     cleaned = final_text.replace('\r\n', '\n')
@@ -2046,7 +2069,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 "message": {"role": "assistant", "content": display_content}
             }
         ],
-        "usage": usage,
+        "usage": usage_with_wall,
     }
     if artifacts:
         response["artifacts"] = artifacts
