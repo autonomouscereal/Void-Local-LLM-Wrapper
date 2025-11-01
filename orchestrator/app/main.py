@@ -184,6 +184,7 @@ WHISPER_API_URL = os.getenv("WHISPER_API_URL")# e.g., http://whisper:9090
 FACEID_API_URL = os.getenv("FACEID_API_URL")  # e.g., http://faceid:7000
 MUSIC_API_URL = os.getenv("MUSIC_API_URL")    # e.g., http://musicgen:7860
 VLM_API_URL = os.getenv("VLM_API_URL")        # e.g., http://vlm:8050
+OCR_API_URL = os.getenv("OCR_API_URL")        # e.g., http://ocr:8070
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/workspace/uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -1435,6 +1436,96 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 return {"name": name, "result": r.json()}
             except Exception:
                 return {"name": name, "error": r.text}
+    if name == "ocr.read" and ALLOW_TOOL_EXECUTION:
+        if not OCR_API_URL:
+            return {"name": name, "error": "OCR_API_URL not configured"}
+        ext = (args.get("ext") or "").strip().lower()
+        b64 = None
+        if isinstance(args.get("b64"), str) and args.get("b64").strip():
+            b64 = args.get("b64").strip()
+        elif isinstance(args.get("url"), str) and args.get("url").strip():
+            try:
+                async with httpx.AsyncClient(timeout=60) as client:
+                    rr = await client.get(args.get("url").strip())
+                    rr.raise_for_status()
+                    import base64 as _b
+                    b64 = _b.b64encode(rr.content).decode("ascii")
+                    if not ext:
+                        from urllib.parse import urlparse
+                        p = urlparse(args.get("url").strip()).path
+                        if "." in p:
+                            ext = "." + p.split(".")[-1].lower()
+            except Exception as ex:
+                return {"name": name, "error": f"fetch_error: {str(ex)}"}
+        elif isinstance(args.get("path"), str) and args.get("path").strip():
+            try:
+                rel = args.get("path").strip()
+                full = os.path.abspath(os.path.join(UPLOAD_DIR, rel)) if not os.path.isabs(rel) else rel
+                if not full.startswith(os.path.abspath(UPLOAD_DIR)):
+                    return {"name": name, "error": "path escapes uploads"}
+                with open(full, "rb") as f:
+                    data = f.read()
+                import base64 as _b
+                b64 = _b.b64encode(data).decode("ascii")
+                if not ext and "." in rel:
+                    ext = "." + rel.split(".")[-1].lower()
+            except Exception as ex:
+                return {"name": name, "error": f"path_error: {str(ex)}"}
+        else:
+            return {"name": name, "error": "missing b64|url|path"}
+        try:
+            async with httpx.AsyncClient(timeout=180) as client:
+                r = await client.post(OCR_API_URL.rstrip("/") + "/ocr", json={"b64": b64, "ext": ext})
+                r.raise_for_status()
+                js = r.json()
+                return {"name": name, "result": {"text": js.get("text") or "", "ext": ext}}
+        except Exception as ex:
+            return {"name": name, "error": str(ex)}
+    if name == "vlm.analyze" and ALLOW_TOOL_EXECUTION:
+        if not VLM_API_URL:
+            return {"name": name, "error": "VLM_API_URL not configured"}
+        ext = (args.get("ext") or "").strip().lower()
+        b64 = None
+        if isinstance(args.get("b64"), str) and args.get("b64").strip():
+            b64 = args.get("b64").strip()
+        elif isinstance(args.get("url"), str) and args.get("url").strip():
+            try:
+                async with httpx.AsyncClient(timeout=60) as client:
+                    rr = await client.get(args.get("url").strip())
+                    rr.raise_for_status()
+                    import base64 as _b
+                    b64 = _b.b64encode(rr.content).decode("ascii")
+                    if not ext:
+                        from urllib.parse import urlparse
+                        p = urlparse(args.get("url").strip()).path
+                        if "." in p:
+                            ext = "." + p.split(".")[-1].lower()
+            except Exception as ex:
+                return {"name": name, "error": f"fetch_error: {str(ex)}"}
+        elif isinstance(args.get("path"), str) and args.get("path").strip():
+            try:
+                rel = args.get("path").strip()
+                full = os.path.abspath(os.path.join(UPLOAD_DIR, rel)) if not os.path.isabs(rel) else rel
+                if not full.startswith(os.path.abspath(UPLOAD_DIR)):
+                    return {"name": name, "error": "path escapes uploads"}
+                with open(full, "rb") as f:
+                    data = f.read()
+                import base64 as _b
+                b64 = _b.b64encode(data).decode("ascii")
+                if not ext and "." in rel:
+                    ext = "." + rel.split(".")[-1].lower()
+            except Exception as ex:
+                return {"name": name, "error": f"path_error: {str(ex)}"}
+        else:
+            return {"name": name, "error": "missing b64|url|path"}
+        try:
+            async with httpx.AsyncClient(timeout=60) as client:
+                r = await client.post(VLM_API_URL.rstrip("/") + "/analyze", json={"b64": b64, "ext": ext})
+                r.raise_for_status()
+                js = r.json()
+                return {"name": name, "result": js}
+        except Exception as ex:
+            return {"name": name, "error": str(ex)}
     if name == "music.dispatch" and MUSIC_API_URL and ALLOW_TOOL_EXECUTION:
         async with httpx.AsyncClient(timeout=1200) as client:
             r = await client.post(MUSIC_API_URL.rstrip("/") + "/generate", json=args)
@@ -3000,6 +3091,24 @@ async def upload(file: UploadFile = File(...)):
     with open(path, "wb") as f:
         f.write(await file.read())
     url = f"{PUBLIC_BASE_URL.rstrip('/')}/uploads/{name}" if PUBLIC_BASE_URL else f"/uploads/{name}"
+    # Ingest and index into RAG if possible
+    try:
+        from .ingest.core import ingest_file
+        texts_meta = ingest_file(path, vlm_url=VLM_API_URL, whisper_url=WHISPER_API_URL, ocr_url=OCR_API_URL)
+        texts = texts_meta.get("texts") or []
+        if texts:
+            pool = await get_pg_pool()
+            if pool is not None:
+                emb = get_embedder()
+                async with pool.acquire() as conn:
+                    for t in texts[:20]:
+                        try:
+                            vec = emb.encode([t])[0]
+                            await conn.execute("INSERT INTO rag_docs (path, chunk, embedding) VALUES ($1, $2, $3)", name, t, list(vec))
+                        except Exception:
+                            continue
+    except Exception:
+        pass
     return {"url": url, "name": file.filename}
 
 

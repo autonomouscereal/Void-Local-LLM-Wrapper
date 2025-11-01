@@ -18,9 +18,11 @@ def get_capabilities() -> Dict[str, Any]:
         "rag_search",
         "research.run",
         "image.dispatch",
+        "vlm.analyze",
         "tts.speak",
         "music.dispatch",
         "code.super_loop",
+        "ocr.read",
     ]
     edge = {
         "edge_ok": os.getenv("EDGE_MODE", "off") == "on",

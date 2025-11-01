@@ -128,6 +128,7 @@ services:
       - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-}
       - UPLOAD_DIR=/workspace/uploads
       - VLM_API_URL=http://vlm:8050
+      - OCR_API_URL=http://ocr:8070
     ports:
       - "8000:8000"
     volumes:
@@ -322,6 +323,17 @@ services:
       - "8050"
     ports:
       - "8050:8050"
+
+  ocr:
+    build:
+      context: ./services/ocr
+      dockerfile: Dockerfile
+    container_name: ocr_service
+    restart: unless-stopped
+    expose:
+      - "8070"
+    ports:
+      - "8070:8070"
 
   executor:
     depends_on:
