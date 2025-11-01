@@ -5,6 +5,8 @@ from typing import Any, Dict, List
 import time
 import socket
 from ..jsonio.normalize import normalize_to_envelope
+from ..jsonio.versioning import bump_envelope, assert_envelope
+from ..determinism.seeds import stamp_envelope
 
 
 class ProviderError(Exception):
@@ -80,6 +82,8 @@ def ask_model_json(provider, prompt: str, max_tokens: int) -> dict:
         text = getattr(raw, "text", "")
         model_name = getattr(raw, "model_name", "unknown")
     env = normalize_to_envelope(text)
+    env = bump_envelope(env); assert_envelope(env)
+    env = stamp_envelope(env, tool=None, model=model_name)
     env.setdefault("meta", {})
     env["meta"]["model"] = model_name
     return env

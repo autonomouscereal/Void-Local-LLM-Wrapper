@@ -58,6 +58,9 @@ from .artifacts.manifest import add_manifest_row as _manifest_add_row, write_man
 from .state.ids import step_id as _step_id
 from .research.orchestrator import run_research
 from .jobs.state import get_job as _get_orcjob, request_cancel as _orcjob_cancel
+from .jsonio.versioning import bump_envelope as _env_bump, assert_envelope as _env_assert
+from .determinism.seeds import stamp_envelope as _env_stamp, stamp_tool_args as _tool_stamp
+from .ops.health import get_capabilities as _get_caps, get_health as _get_health
 from .artifacts.shard import open_shard as _art_open_shard, append_jsonl as _art_append_jsonl, _finalize_shard as _art_finalize
 from .artifacts.shard import newest_part as _art_newest_part, list_parts as _art_list_parts
 from .artifacts.manifest import add_manifest_row as _art_manifest_add, write_manifest_atomic as _art_manifest_write
@@ -1798,6 +1801,11 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         # Normalize envelopes (optional log material)
         step_envs = [normalize_to_envelope(p) for p in (result.partials or [])]
         final_env = stitch_merge_envelopes(step_envs)
+        try:
+            final_env = _env_bump(final_env); _env_assert(final_env)
+            final_env = _env_stamp(final_env, tool=None, model=provider.model_id)
+        except Exception:
+            pass
         final_oai = stitch_openai_final(result.partials, model_name=provider.model_id)
         # Optional ablation
         try:
@@ -1843,6 +1851,11 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             "seed": master_seed,
         }
         if isinstance(final_env, dict):
+            try:
+                final_env = _env_bump(final_env); _env_assert(final_env)
+                final_env = _env_stamp(final_env, tool=None, model=final_oai.get("model") or f"{QWEN_MODEL_ID}")
+            except Exception:
+                pass
             response["envelope"] = final_env
         # Persist response & metrics
         await _db_update_run_response(run_id, response, usage)
@@ -1986,6 +1999,10 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             try:
                 n = tc.get("name") or "tool"
                 args = tc.get("arguments") or {}
+                try:
+                    args = _tool_stamp(n, args if isinstance(args, dict) else {})
+                except Exception:
+                    pass
                 if n == "research.run":
                     try:
                         if isinstance(args, dict):
@@ -2614,6 +2631,11 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     if artifacts:
         response["artifacts"] = artifacts
     if isinstance(final_env, dict) and final_env:
+        try:
+            final_env = _env_bump(final_env); _env_assert(final_env)
+            final_env = _env_stamp(final_env, tool=None, model=f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}")
+        except Exception:
+            pass
         # Optional ablation: extract grounded facts and export
         try:
             do_ablate = os.getenv("ABLATE", "on").lower() == "on"
