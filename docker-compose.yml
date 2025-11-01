@@ -68,8 +68,6 @@ services:
     volumes:
       - ollama_qwen_data:/root/.ollama
       - nvidia_libdir:/usr/lib/x86_64-linux-gnu
-      - ./docker/stubs/libEGL_nvidia.so.580.65.06:/usr/lib/x86_64-linux-gnu/libEGL_nvidia.so.580.65.06:ro
-      - ./docker/stubs/libcudadebugger.so.580.65.06:/usr/lib/x86_64-linux-gnu/libcudadebugger.so.580.65.06:ro
     healthcheck:
       test: ["CMD", "sh", "-lc", "ollama list >/dev/null 2>&1"]
       interval: 10s
@@ -105,8 +103,6 @@ services:
     volumes:
       - ollama_gptoss_data:/root/.ollama
       - nvidia_libdir:/usr/lib/x86_64-linux-gnu
-      - ./docker/stubs/libEGL_nvidia.so.580.65.06:/usr/lib/x86_64-linux-gnu/libEGL_nvidia.so.580.65.06:ro
-      - ./docker/stubs/libcudadebugger.so.580.65.06:/usr/lib/x86_64-linux-gnu/libcudadebugger.so.580.65.06:ro
     healthcheck:
       test: ["CMD", "sh", "-lc", "ollama list >/dev/null 2>&1"]
       interval: 10s
@@ -200,8 +196,6 @@ services:
       - "8020:8020"
     volumes:
       - nvidia_libdir:/usr/lib/x86_64-linux-gnu
-      - ./docker/stubs/libEGL_nvidia.so.580.65.06:/usr/lib/x86_64-linux-gnu/libEGL_nvidia.so.580.65.06:ro
-      - ./docker/stubs/libcudadebugger.so.580.65.06:/usr/lib/x86_64-linux-gnu/libcudadebugger.so.580.65.06:ro
 
   whisper:
     build:
@@ -225,8 +219,6 @@ services:
       - "9090:9090"
     volumes:
       - nvidia_libdir:/usr/lib/x86_64-linux-gnu
-      - ./docker/stubs/libEGL_nvidia.so.580.65.06:/usr/lib/x86_64-linux-gnu/libEGL_nvidia.so.580.65.06:ro
-      - ./docker/stubs/libcudadebugger.so.580.65.06:/usr/lib/x86_64-linux-gnu/libcudadebugger.so.580.65.06:ro
 
   faceid:
     build:
@@ -248,8 +240,6 @@ services:
       - "7000:7000"
     volumes:
       - nvidia_libdir:/usr/lib/x86_64-linux-gnu
-      - ./docker/stubs/libEGL_nvidia.so.580.65.06:/usr/lib/x86_64-linux-gnu/libEGL_nvidia.so.580.65.06:ro
-      - ./docker/stubs/libcudadebugger.so.580.65.06:/usr/lib/x86_64-linux-gnu/libcudadebugger.so.580.65.06:ro
 
   comfyui:
     build:
@@ -275,8 +265,6 @@ services:
       - comfyui_models:/comfyui/models
       - comfyui_custom_nodes:/comfyui/custom_nodes
       - nvidia_libdir:/usr/lib/x86_64-linux-gnu
-      - ./docker/stubs/libEGL_nvidia.so.580.65.06:/usr/lib/x86_64-linux-gnu/libEGL_nvidia.so.580.65.06:ro
-      - ./docker/stubs/libcudadebugger.so.580.65.06:/usr/lib/x86_64-linux-gnu/libcudadebugger.so.580.65.06:ro
     # For GPU deployments, create additional comfyui-* services and set COMFYUI_API_URLS accordingly
 
   # Optional additional ComfyUI replicas for dynamic distribution
@@ -308,8 +296,6 @@ services:
       - comfyui_models:/comfyui/models
       - comfyui_custom_nodes:/comfyui/custom_nodes
       - nvidia_libdir:/usr/lib/x86_64-linux-gnu
-      - ./docker/stubs/libEGL_nvidia.so.580.65.06:/usr/lib/x86_64-linux-gnu/libEGL_nvidia.so.580.65.06:ro
-      - ./docker/stubs/libcudadebugger.so.580.65.06:/usr/lib/x86_64-linux-gnu/libcudadebugger.so.580.65.06:ro
 
   comfyui-2:
     build:
@@ -336,8 +322,6 @@ services:
       - comfyui_models:/comfyui/models
       - comfyui_custom_nodes:/comfyui/custom_nodes
       - nvidia_libdir:/usr/lib/x86_64-linux-gnu
-      - ./docker/stubs/libEGL_nvidia.so.580.65.06:/usr/lib/x86_64-linux-gnu/libEGL_nvidia.so.580.65.06:ro
-      - ./docker/stubs/libcudadebugger.so.580.65.06:/usr/lib/x86_64-linux-gnu/libcudadebugger.so.580.65.06:ro
 
   comfyui_init:
     build:
@@ -430,8 +414,6 @@ services:
       - "7860:7860"
     volumes:
       - nvidia_libdir:/usr/lib/x86_64-linux-gnu
-      - ./docker/stubs/libEGL_nvidia.so.580.65.06:/usr/lib/x86_64-linux-gnu/libEGL_nvidia.so.580.65.06:ro
-      - ./docker/stubs/libcudadebugger.so.580.65.06:/usr/lib/x86_64-linux-gnu/libcudadebugger.so.580.65.06:ro
 
   vlm:
     build:
@@ -453,8 +435,6 @@ services:
       - "8050:8050"
     volumes:
       - nvidia_libdir:/usr/lib/x86_64-linux-gnu
-      - ./docker/stubs/libEGL_nvidia.so.580.65.06:/usr/lib/x86_64-linux-gnu/libEGL_nvidia.so.580.65.06:ro
-      - ./docker/stubs/libcudadebugger.so.580.65.06:/usr/lib/x86_64-linux-gnu/libcudadebugger.so.580.65.06:ro
 
   ocr:
     build:
@@ -537,8 +517,6 @@ services:
     volumes:
       - ./:/workspace
       - nvidia_libdir:/usr/lib/x86_64-linux-gnu
-      - ./docker/stubs/libEGL_nvidia.so.580.65.06:/usr/lib/x86_64-linux-gnu/libEGL_nvidia.so.580.65.06:ro
-      - ./docker/stubs/libcudadebugger.so.580.65.06:/usr/lib/x86_64-linux-gnu/libcudadebugger.so.580.65.06:ro
 
   ablation:
     build:

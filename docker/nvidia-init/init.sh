@@ -86,9 +86,13 @@ if [ -e "libcudadebugger.so.1" ]; then
   ln -sf "libcudadebugger.so.1" "libcudadebugger.so.580" 2>/dev/null || true
   ln -sf "libcudadebugger.so.1" "libcudadebugger.so.580.65" 2>/dev/null || true
   ln -sf "libcudadebugger.so.1" "libcudadebugger.so.580.65.06" 2>/dev/null || true
+else
+  : > "libcudadebugger.so.580" 2>/dev/null || true
+  : > "libcudadebugger.so.580.65" 2>/dev/null || true
+  : > "libcudadebugger.so.580.65.06" 2>/dev/null || true
 fi
 
-# Parse NVIDIA runtime host file manifests and materialize any missing versioned paths
+# Parse NVIDIA runtime host file manifests and materialize any missing versioned paths (version-agnostic)
 MAN_DIR="$HOST_ROOT/usr/share/nvidia-container-runtime/host-files-for-container.d"
 ensure_path() {
   local ap="$1"
@@ -110,7 +114,7 @@ ensure_path() {
     tgt=$(ls -1 "$dir/$stem".* 2>/dev/null | xargs -r -n1 basename | sort -rV | head -n1 || true)
   fi
   if [ -z "$tgt" ]; then
-    # As a last resort, create an empty placeholder so the bind target exists
+    # As a last resort, create an empty placeholder so the bind target exists (version-agnostic)
     mkdir -p "$(dirname "$dir/$name")" 2>/dev/null || true
     : > "$dir/$name" 2>/dev/null || true
   else
