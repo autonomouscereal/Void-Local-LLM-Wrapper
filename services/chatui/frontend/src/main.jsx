@@ -21,6 +21,28 @@ function App() {
   const [sending, setSending] = useState(false)
   const [voiceOn, setVoiceOn] = useState(false)
   const recognizerRef = useRef(null)
+  const [makeMode, setMakeMode] = useState('auto')
+  const [activeTab, setActiveTab] = useState('chat')
+  // Image panel refs
+  const imgModeRef = useRef()
+  const imgSizeRef = useRef()
+  const imgPromptRef = useRef()
+  const imgSeedRef = useRef()
+  const imgRefIdRef = useRef()
+  const imgFileRef = useRef()
+  // TTS panel refs
+  const ttsTextRef = useRef()
+  const ttsVoiceRef = useRef()
+  const ttsVoiceIdRef = useRef()
+  const ttsRateRef = useRef()
+  const ttsPitchRef = useRef()
+  const ttsSeedRef = useRef()
+  // Music panel refs
+  const musicPromptRef = useRef()
+  const musicBpmRef = useRef()
+  const musicLenRef = useRef()
+  const musicRefIdRef = useRef()
+  const musicSeedRef = useRef()
   const localIdRef = useRef(1)
   const knownDoneJobsRef = useRef(new Set())
   const jobsTimerRef = useRef(null)
@@ -51,13 +73,14 @@ function App() {
     }
     const images = uniq.filter(u => /\.(png|jpg|jpeg|gif|webp)$/i.test(u)).map(toMeta)
     const videos = uniq.filter(u => /\.(mp4|webm|mov|mkv)$/i.test(u)).map(toMeta)
-    return { images, videos }
+    const audios = uniq.filter(u => /\.(wav|mp3|m4a|ogg|flac|opus)$/i.test(u)).map(toMeta)
+    return { images, videos, audios }
   }
 
   const renderChatContent = (text) => {
     const raw = String(text || '')
     const html = marked.parse(raw)
-    const { images, videos } = extractMedia(text || '')
+    const { images, videos, audios } = extractMedia(text || '')
     const hasText = raw.trim().length > 0
     const htmlLooksEmpty = (String(html || '').replace(/<[^>]*>/g, '').trim().length === 0)
     return (
@@ -73,7 +96,7 @@ function App() {
             <div style={{ fontSize: 12, color: '#9ca3af', fontStyle: 'italic' }}>(no content)</div>
           ) : null
         )}
-        {(images.length > 0 || videos.length > 0) && (
+        {(images.length > 0 || videos.length > 0 || audios.length > 0) && (
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 12, marginTop: 12 }}>
             {images.map((m, i) => (
               <div key={`img-${i}`} style={{ background: '#0b0b0f', border: '1px solid #222', borderRadius: 8, padding: 8 }}>
@@ -86,6 +109,12 @@ function App() {
             {videos.map((m, i) => (
               <div key={`vid-${i}`} style={{ background: '#0b0b0f', border: '1px solid #222', borderRadius: 8, padding: 8 }}>
                 <video src={m.url} controls style={{ width: '100%', borderRadius: 6, display: 'block' }} />
+                <div style={{ fontSize: 12, color: '#9ca3af', marginTop: 6, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{m.name}</div>
+              </div>
+            ))}
+            {audios.map((m, i) => (
+              <div key={`aud-${i}`} style={{ background: '#0b0b0f', border: '1px solid #222', borderRadius: 8, padding: 8 }}>
+                <audio src={m.url} controls style={{ width: '100%', display: 'block' }} />
                 <div style={{ fontSize: 12, color: '#9ca3af', marginTop: 6, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{m.name}</div>
               </div>
             ))}
@@ -201,6 +230,41 @@ function App() {
 
   async function send() {
     if (!text.trim()) return
+    // Quick per-modality path for non-power users
+    if (makeMode !== 'auto') {
+      try {
+        if (makeMode === 'image') {
+          const resp = await callTool('image.dispatch', { mode: 'gen', prompt: text.trim(), size: '1024x1024' })
+          const cid = resp?.result?.meta?.cid
+          const id = resp?.result?.tool_calls?.[0]?.result_ref
+          const url = (cid && id) ? `/uploads/artifacts/image/${cid}/${id}` : ''
+          setMsgs(prev => ([...prev, { id: nextLocalId(), role: 'assistant', content: { text: url || JSON.stringify(resp) } }]))
+          setText('')
+          return
+        }
+        if (makeMode === 'tts') {
+          const resp = await callTool('tts.speak', { text: text.trim() })
+          const cid = resp?.result?.meta?.cid
+          const id = resp?.result?.tool_calls?.[0]?.result_ref
+          const url = (cid && id) ? `/uploads/artifacts/audio/tts/${cid}/${id}` : ''
+          setMsgs(prev => ([...prev, { id: nextLocalId(), role: 'assistant', content: { text: url || JSON.stringify(resp) } }]))
+          setText('')
+          return
+        }
+        if (makeMode === 'music') {
+          const resp = await callTool('music.compose', { prompt: text.trim(), length_s: 30 })
+          const cid = resp?.result?.meta?.cid
+          const id = resp?.result?.tool_calls?.[0]?.result_ref
+          const url = (cid && id) ? `/uploads/artifacts/music/${cid}/${id}` : ''
+          setMsgs(prev => ([...prev, { id: nextLocalId(), role: 'assistant', content: { text: url || JSON.stringify(resp) } }]))
+          setText('')
+          return
+        }
+      } catch (e) {
+        setMsgs(prev => ([...prev, { id: nextLocalId(), role: 'assistant', content: { text: `Error: ${e?.message || e}` } }]))
+        return
+      }
+    }
     let conversationId = cid
     if (!conversationId) {
       conversationId = await newConversation()
@@ -346,6 +410,138 @@ function App() {
     alert('Uploaded! The orchestrator will see it in conversation context.')
   }
 
+  // ------- Step 20: Tool runner helpers -------
+  async function uploadOne(file) {
+    const fd = new FormData()
+    fd.append('file', file)
+    const r = await fetch('/api/upload', { method: 'POST', body: fd })
+    const j = await r.json()
+    // Prefer URL if provided, else construct uploads path
+    if (j && typeof j.url === 'string' && j.url.includes('/uploads/')) return j.url
+    if (j && typeof j.name === 'string') return '/uploads/' + j.name
+    return ''
+  }
+  async function uploadMany(fileList) {
+    const out = []
+    for (const f of fileList) {
+      const p = await uploadOne(f)
+      if (p) out.push(p)
+    }
+    return out
+  }
+  async function callTool(name, args) {
+    const r = await fetch('/api/tool.run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, args }) })
+    const j = await r.json()
+    return j
+  }
+  async function runImage() {
+    const mode = imgModeRef.current?.value || 'gen'
+    const size = imgSizeRef.current?.value || ''
+    const prompt = imgPromptRef.current?.value || ''
+    const seed = imgSeedRef.current?.value ? Number(imgSeedRef.current.value) : null
+    const refid = imgRefIdRef.current?.value || ''
+    const file = imgFileRef.current?.files?.[0]
+    const args = { mode, prompt, size, seed, ref_ids: refid ? [refid] : [] }
+    if (mode !== 'gen' && file) {
+      const url = await uploadOne(file)
+      // Map to path if needed
+      args.image_ref = url
+    }
+    const resp = await callTool('image.dispatch', args)
+    if (resp && resp.result && resp.result.meta && resp.result.tool_calls) {
+      const cid = resp.result.meta.cid
+      const tc = resp.result.tool_calls[0] || {}
+      const resultRef = tc.result_ref
+      if (cid && resultRef) {
+        const url = `/uploads/artifacts/image/${cid}/${resultRef}`
+        setMsgs(prev => ([...prev, { id: nextLocalId(), role: 'assistant', content: { text: `Generated: ${url}` } }]))
+      } else {
+        setMsgs(prev => ([...prev, { id: nextLocalId(), role: 'assistant', content: { text: JSON.stringify(resp.result) } }]))
+      }
+    } else {
+      setMsgs(prev => ([...prev, { id: nextLocalId(), role: 'assistant', content: { text: JSON.stringify(resp) } }]))
+    }
+  }
+  async function runTTS() {
+    const textV = ttsTextRef.current?.value || ''
+    const voice = ttsVoiceRef.current?.value || ''
+    const voice_id = ttsVoiceIdRef.current?.value || ''
+    const rate = ttsRateRef.current?.value ? Number(ttsRateRef.current.value) : 1.0
+    const pitch = ttsPitchRef.current?.value ? Number(ttsPitchRef.current.value) : 0.0
+    const seed = ttsSeedRef.current?.value ? Number(ttsSeedRef.current.value) : null
+    const args = { text: textV, voice, voice_id, rate, pitch, seed }
+    const resp = await callTool('tts.speak', args)
+    if (resp && resp.result && resp.result.meta && resp.result.tool_calls) {
+      const cid = resp.result.meta.cid
+      const tc = resp.result.tool_calls[0] || {}
+      const resultRef = tc.result_ref
+      if (cid && resultRef) {
+        const url = `/uploads/artifacts/audio/tts/${cid}/${resultRef}`
+        setMsgs(prev => ([...prev, { id: nextLocalId(), role: 'assistant', content: { text: `Spoken: ${url}` } }]))
+      } else {
+        setMsgs(prev => ([...prev, { id: nextLocalId(), role: 'assistant', content: { text: JSON.stringify(resp.result) } }]))
+      }
+    } else {
+      setMsgs(prev => ([...prev, { id: nextLocalId(), role: 'assistant', content: { text: JSON.stringify(resp) } }]))
+    }
+  }
+  async function runMusic() {
+    const prompt = musicPromptRef.current?.value || ''
+    const bpm = musicBpmRef.current?.value ? Number(musicBpmRef.current.value) : null
+    const length_s = musicLenRef.current?.value ? Number(musicLenRef.current.value) : null
+    const music_id = musicRefIdRef.current?.value || ''
+    const seed = musicSeedRef.current?.value ? Number(musicSeedRef.current.value) : null
+    const args = { prompt, bpm, length_s, music_id: music_id || null, seed }
+    const resp = await callTool('music.compose', args)
+    if (resp && resp.result && resp.result.meta && resp.result.tool_calls) {
+      const cid = resp.result.meta.cid
+      const tc = resp.result.tool_calls[0] || {}
+      const resultRef = tc.result_ref
+      if (cid && resultRef) {
+        const url = `/uploads/artifacts/music/${cid}/${resultRef}`
+        setMsgs(prev => ([...prev, { id: nextLocalId(), role: 'assistant', content: { text: `Track: ${url}` } }]))
+      } else {
+        setMsgs(prev => ([...prev, { id: nextLocalId(), role: 'assistant', content: { text: JSON.stringify(resp.result) } }]))
+      }
+    } else {
+      setMsgs(prev => ([...prev, { id: nextLocalId(), role: 'assistant', content: { text: JSON.stringify(resp) } }]))
+    }
+  }
+  async function saveRef() {
+    const kindEl = document.getElementById('ref-kind')
+    const titleEl = document.getElementById('ref-title')
+    const embEl = document.getElementById('ref-emb')
+    const filesEl = document.getElementById('ref-files')
+    const kind = kindEl.value
+    const title = titleEl.value
+    const compute_embeds = embEl.checked
+    const files = filesEl.files
+    let payload = { kind, title, files: {}, compute_embeds }
+    if (kind === 'image') {
+      const paths = await uploadMany(files)
+      payload.files.images = paths
+    } else if (kind === 'voice') {
+      const paths = await uploadMany(files)
+      payload.files.voice_samples = paths
+    } else if (kind === 'music') {
+      const paths = await uploadMany(files)
+      if (paths.length > 0) payload.files.track = paths[0]
+      if (paths.length > 1) payload.files.stems = paths.slice(1)
+    }
+    const r = await fetch('/api/refs.save', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
+    const j = await r.json()
+    const out = document.getElementById('ref-list')
+    out.textContent = JSON.stringify(j, null, 2)
+  }
+  async function listRefs() {
+    const kindEl = document.getElementById('ref-kind')
+    const kind = kindEl.value
+    const r = await fetch('/api/refs.list' + (kind ? ('?kind=' + encodeURIComponent(kind)) : ''))
+    const j = await r.json()
+    const out = document.getElementById('ref-list')
+    out.textContent = JSON.stringify(j, null, 2)
+  }
+
   useEffect(() => {
     (async () => {
       const list = await refreshConvos()
@@ -443,7 +639,16 @@ function App() {
         </div>
       </div>
       <div className="chat-pane" style={{ flex: 1 }}>
-        <div className="chat-scroll" style={{ padding: 16 }}>
+        {/* Tabs */}
+        <div style={{ display: 'flex', gap: 8, padding: 12, borderBottom: '1px solid #222' }}>
+          {['chat','images','tts','music','refs'].map(t => (
+            <button key={t} onClick={() => setActiveTab(t)} style={{ padding: '6px 10px', background: activeTab===t ? '#1f2937' : '#0f172a', border: '1px solid #333', borderRadius: 6, color: '#e6e6e6' }}>{t.toUpperCase()}</button>
+          ))}
+        </div>
+
+        {/* Panels */}
+        {activeTab === 'chat' && (
+          <div className="chat-scroll" style={{ padding: 16 }}>
           {(msgs || []).map(m => (
             <div key={m.id} style={{ marginBottom: 16 }}>
               <div style={{ fontSize: 12, color: '#9ca3af' }}>{m.role}</div>
@@ -452,10 +657,78 @@ function App() {
               </div>
             </div>
           ))}
-        </div>
+          </div>
+        )}
+
+        {activeTab === 'images' && (
+          <div style={{ padding: 16 }}>
+            <div className="row" style={{ display: 'flex', gap: 8, marginBottom: 8 }}>
+              <select ref={imgModeRef} defaultValue="gen"><option value="gen">gen</option><option value="edit">edit</option><option value="upscale">upscale</option></select>
+              <input ref={imgSizeRef} placeholder="size e.g. 1024x1024" />
+              <input ref={imgRefIdRef} placeholder="ref_id (optional)" />
+              <input ref={imgSeedRef} placeholder="seed (optional)" />
+            </div>
+            <textarea ref={imgPromptRef} rows={3} placeholder="Describe the image…" style={{ width: '100%', marginBottom: 8 }} />
+            <div className="row" style={{ display: 'flex', gap: 8, marginBottom: 8 }}>
+              <input type='file' ref={imgFileRef} />
+              <button onClick={runImage}>Run</button>
+            </div>
+          </div>
+        )}
+
+        {activeTab === 'tts' && (
+          <div style={{ padding: 16 }}>
+            <textarea ref={ttsTextRef} rows={3} placeholder="Text to speak…" style={{ width: '100%', marginBottom: 8 }} />
+            <div className="row" style={{ display: 'flex', gap: 8, marginBottom: 8 }}>
+              <input ref={ttsVoiceRef} placeholder="voice preset/name" />
+              <input ref={ttsVoiceIdRef} placeholder="voice ref_id (optional)" />
+              <input ref={ttsRateRef} placeholder="rate (1.0)" defaultValue="1.0" />
+              <input ref={ttsPitchRef} placeholder="pitch (0.0)" defaultValue="0.0" />
+              <input ref={ttsSeedRef} placeholder="seed (optional)" />
+            </div>
+            <button onClick={runTTS}>Speak</button>
+          </div>
+        )}
+
+        {activeTab === 'music' && (
+          <div style={{ padding: 16 }}>
+            <textarea ref={musicPromptRef} rows={3} placeholder="Music prompt (mood/genre)…" style={{ width: '100%', marginBottom: 8 }} />
+            <div className="row" style={{ display: 'flex', gap: 8, marginBottom: 8 }}>
+              <input ref={musicBpmRef} placeholder="bpm" />
+              <input ref={musicLenRef} placeholder="length_s" />
+              <input ref={musicRefIdRef} placeholder="music ref_id (optional)" />
+              <input ref={musicSeedRef} placeholder="seed (optional)" />
+            </div>
+            <button onClick={runMusic}>Compose</button>
+          </div>
+        )}
+
+        {activeTab === 'refs' && (
+          <div style={{ padding: 16 }}>
+            <div className="row" style={{ display: 'flex', gap: 8, marginBottom: 8 }}>
+              <select id='ref-kind' defaultValue='image'><option value='image'>image</option><option value='voice'>voice</option><option value='music'>music</option></select>
+              <input id='ref-title' placeholder='title' />
+              <label className='small' style={{ display:'flex', alignItems:'center', gap:6 }}>compute embeds <input type='checkbox' id='ref-emb' defaultChecked /></label>
+            </div>
+            <div className='row' style={{ display: 'flex', gap: 8, marginBottom: 8 }}>
+              <input type='file' id='ref-files' multiple />
+              <button onClick={saveRef}>Save Ref</button>
+              <button onClick={listRefs}>List</button>
+            </div>
+            <pre id='ref-list' className='log' style={{ whiteSpace:'pre-wrap' }}></pre>
+          </div>
+        )}
+
+        {/* Chat input stays always visible */}
         <div style={{ padding: 12, display: 'flex', gap: 8, borderTop: '1px solid #222', flexShrink: 0 }}>
           <input ref={fileRef} type='file' onChange={uploadFile} style={{ color: '#9ca3af' }} />
           <input value={text} onChange={e => setText(e.target.value)} placeholder='Type your prompt...' style={{ flex: 1, padding: 10, borderRadius: 6, border: '1px solid #333', background: '#0b0b0f', color: '#fff' }} />
+          <select value={makeMode} onChange={e => setMakeMode(e.target.value)} style={{ padding: '10px 8px' }}>
+            <option value='auto'>Auto</option>
+            <option value='image'>Image</option>
+            <option value='tts'>TTS</option>
+            <option value='music'>Music</option>
+          </select>
           <button onClick={toggleVoice} style={{ padding: '10px 12px', background: voiceOn ? '#f59e0b' : '#374151', color: '#fff', border: 'none', borderRadius: 6 }}>{voiceOn ? 'Voice: ON' : 'Voice: OFF'}</button>
           <button onClick={send} disabled={sending || !text.trim()} style={{ padding: '10px 16px', background: sending || !text.trim() ? '#16a34a' : '#22c55e', opacity: sending || !text.trim() ? 0.7 : 1, color: '#111', border: 'none', borderRadius: 6, fontWeight: 700, cursor: sending || !text.trim() ? 'not-allowed' : 'pointer' }}>{sending ? 'Sending…' : 'Send'}</button>
         </div>

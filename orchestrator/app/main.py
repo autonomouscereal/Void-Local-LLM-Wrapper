@@ -259,6 +259,12 @@ app.add_middleware(
     max_age=86400,
 )
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
+STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
+try:
+    os.makedirs(STATIC_DIR, exist_ok=True)
+    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+except Exception:
+    pass
 @app.middleware("http")
 async def global_cors_middleware(request: Request, call_next):
     if request.method == "OPTIONS":
@@ -3128,6 +3134,187 @@ async def refs_apply(body: Dict[str, Any]):
         return JSONResponse(status_code=400, content={"error": str(ex)})
 
 
+# ---------- Direct Tool Runner (for UI) ----------
+@app.post("/tool.run")
+async def tool_run(body: Dict[str, Any]):
+    name = (body or {}).get("name")
+    args = (body or {}).get("args") or {}
+    try:
+        # Reuse the exact branches from planner-executed tools
+        if name == "image.dispatch" and ALLOW_TOOL_EXECUTION:
+            mode = (args.get("mode") or "gen").strip().lower()
+            class _ImageProvider:
+                def __init__(self, base: str | None):
+                    self.base = (base or "").rstrip("/") if base else None
+                def _post_prompt(self, graph: Dict[str, Any]) -> Dict[str, Any]:
+                    import httpx as _hx
+                    with _hx.Client(timeout=60) as client:
+                        r = client.post(self.base + "/prompt", json={"prompt": graph})
+                        r.raise_for_status(); return r.json()
+                def _poll(self, pid: str, timeout_s: int = 60) -> Dict[str, Any]:
+                    import httpx as _hx, time as _tm
+                    t0 = _tm.time()
+                    while True:
+                        r = _hx.get(self.base + f"/history/{pid}", timeout=30)
+                        if r.status_code == 200:
+                            js = r.json(); h = (js.get("history") or {}).get(pid)
+                            if h and (h.get("status", {}).get("completed") is True):
+                                return h
+                        if (_tm.time() - t0) > timeout_s: break
+                        _tm.sleep(1.0)
+                    return {}
+                def _download_first(self, detail: Dict[str, Any]) -> bytes:
+                    import httpx as _hx
+                    outputs = (detail.get("outputs") or {})
+                    for items in outputs.values():
+                        if isinstance(items, list) and items:
+                            it = items[0]
+                            fn = it.get("filename"); tp = it.get("type") or "output"; sub = it.get("subfolder")
+                            if fn and self.base:
+                                from urllib.parse import urlencode
+                                q = {"filename": fn, "type": tp}
+                                if sub: q["subfolder"] = sub
+                                url = self.base + "/view?" + urlencode(q)
+                                r = _hx.get(url, timeout=60)
+                                if r.status_code == 200:
+                                    return r.content
+                    return b""
+                def _parse_wh(self, size: str) -> tuple[int, int]:
+                    try:
+                        w, h = size.lower().split("x"); return int(w), int(h)
+                    except Exception:
+                        return 1024, 1024
+                def generate(self, a: Dict[str, Any]) -> Dict[str, Any]:
+                    if not self.base:
+                        return {"image_bytes": b"", "model": "placeholder"}
+                    w, h = self._parse_wh(a.get("size") or "1024x1024")
+                    positive = a.get("prompt") or ""; negative = a.get("negative") or ""; seed = int(a.get("seed") or 0)
+                    g = {
+                        "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "sd_xl_base_1.0.safetensors"}},
+                        "3": {"class_type": "CLIPTextEncode", "inputs": {"text": positive, "clip": ["1", 1]}},
+                        "4": {"class_type": "CLIPTextEncode", "inputs": {"text": negative, "clip": ["1", 1]}},
+                        "7": {"class_type": "EmptyLatentImage", "inputs": {"width": w, "height": h, "batch_size": 1}},
+                        "8": {"class_type": "KSampler", "inputs": {"seed": seed, "steps": 25, "cfg": 6.5, "sampler_name": "dpmpp_2m", "scheduler": "karras", "denoise": 1.0, "model": ["1", 0], "positive": ["3", 0], "negative": ["4", 0], "latent_image": ["7", 0]}},
+                        "9": {"class_type": "VAEDecode", "inputs": {"samples": ["8", 0], "vae": ["1", 2]}},
+                        "10": {"class_type": "SaveImage", "inputs": {"filename_prefix": "image_gen", "images": ["9", 0]}},
+                    }
+                    js = self._post_prompt(g); pid = js.get("prompt_id") or js.get("uuid") or js.get("id")
+                    det = self._poll(pid, timeout_s=300)
+                    data = self._download_first(det)
+                    return {"image_bytes": data, "model": "comfyui:sdxl"}
+                def edit(self, a: Dict[str, Any]) -> Dict[str, Any]:
+                    if not self.base:
+                        return self.generate(a)
+                    positive = a.get("prompt") or ""; negative = a.get("negative") or ""; seed = int(a.get("seed") or 0)
+                    w, h = self._parse_wh(a.get("size") or "1024x1024")
+                    g = {
+                        "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "sd_xl_base_1.0.safetensors"}},
+                        "2": {"class_type": "LoadImage", "inputs": {"image": a.get("image_ref") or ""}},
+                        "3": {"class_type": "CLIPTextEncode", "inputs": {"text": positive, "clip": ["1", 1]}},
+                        "4": {"class_type": "CLIPTextEncode", "inputs": {"text": negative, "clip": ["1", 1]}},
+                        "5": {"class_type": "VAEEncode", "inputs": {"pixels": ["2", 0], "vae": ["1", 2]}},
+                        "8": {"class_type": "KSampler", "inputs": {"seed": seed, "steps": 20, "cfg": 6.0, "sampler_name": "dpmpp_2m", "scheduler": "karras", "denoise": 0.6, "model": ["1", 0], "positive": ["3", 0], "negative": ["4", 0], "latent_image": ["5", 0]}},
+                        "9": {"class_type": "VAEDecode", "inputs": {"samples": ["8", 0], "vae": ["1", 2]}},
+                        "10": {"class_type": "SaveImage", "inputs": {"filename_prefix": "image_edit", "images": ["9", 0]}},
+                    }
+                    js = self._post_prompt(g); pid = js.get("prompt_id") or js.get("uuid") or js.get("id"); det = self._poll(pid, timeout_s=300)
+                    data = self._download_first(det)
+                    return {"image_bytes": data, "model": "comfyui:sdxl"}
+                def upscale(self, a: Dict[str, Any]) -> Dict[str, Any]:
+                    if not self.base:
+                        return self.generate(a)
+                    scale = int(a.get("scale") or 2)
+                    g = {
+                        "2": {"class_type": "LoadImage", "inputs": {"image": a.get("image_ref") or ""}},
+                        "11": {"class_type": "RealESRGANModelLoader", "inputs": {"model_name": "realesr-general-x4v3.pth"}},
+                        "12": {"class_type": "RealESRGAN", "inputs": {"image": ["2", 0], "model": ["11", 0], "scale": scale}},
+                        "10": {"class_type": "SaveImage", "inputs": {"filename_prefix": "image_upscale", "images": ["12", 0]}},
+                    }
+                    js = self._post_prompt(g); pid = js.get("prompt_id") or js.get("uuid") or js.get("id"); det = self._poll(pid, timeout_s=300)
+                    data = self._download_first(det)
+                    return {"image_bytes": data, "model": "comfyui:realesrgan"}
+            provider = _ImageProvider(COMFYUI_API_URL)
+            manifest = {"items": []}
+            if mode == "gen":
+                env = run_image_gen(args if isinstance(args, dict) else {}, provider, manifest)
+            elif mode == "edit":
+                env = run_image_edit(args if isinstance(args, dict) else {}, provider, manifest)
+            elif mode == "upscale":
+                env = run_image_upscale(args if isinstance(args, dict) else {}, provider, manifest)
+            else:
+                env = run_image_gen(args if isinstance(args, dict) else {}, provider, manifest)
+            return {"ok": True, "name": name, "result": env}
+        if name == "tts.speak" and ALLOW_TOOL_EXECUTION:
+            if not XTTS_API_URL:
+                return JSONResponse(status_code=400, content={"error": "XTTS_API_URL not configured"})
+            class _TTSProvider:
+                async def _xtts(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+                    async with httpx.AsyncClient(timeout=300) as client:
+                        r = await client.post(XTTS_API_URL.rstrip("/") + "/tts", json=payload)
+                        r.raise_for_status(); js = r.json()
+                        wav = b""
+                        if isinstance(js.get("wav_b64"), str):
+                            import base64 as _b
+                            wav = _b.b64decode(js.get("wav_b64"))
+                        elif isinstance(js.get("url"), str):
+                            rr = await client.get(js.get("url"));
+                            if rr.status_code == 200: wav = rr.content
+                        return {"wav_bytes": wav, "duration_s": float(js.get("duration_s") or 0.0), "model": js.get("model") or "xtts"}
+                def speak(self, args: Dict[str, Any]) -> Dict[str, Any]:
+                    import asyncio as _as
+                    return _as.get_event_loop().run_until_complete(self._xtts(args))
+            provider = _TTSProvider(); manifest = {"items": []}; env = run_tts_speak(args, provider, manifest)
+            return {"ok": True, "name": name, "result": env}
+        if name == "audio.sfx.compose" and ALLOW_TOOL_EXECUTION:
+            manifest = {"items": []}; env = run_sfx_compose(args, manifest)
+            return {"ok": True, "name": name, "result": env}
+        if name == "music.compose" and ALLOW_TOOL_EXECUTION:
+            if not MUSIC_API_URL:
+                return JSONResponse(status_code=400, content={"error": "MUSIC_API_URL not configured"})
+            class _MusicProvider:
+                async def _compose(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+                    import base64 as _b
+                    async with httpx.AsyncClient(timeout=600) as client:
+                        r = await client.post(MUSIC_API_URL.rstrip("/") + "/generate", json={"prompt": payload.get("prompt"), "duration": int(payload.get("length_s") or 8)})
+                        r.raise_for_status(); js = r.json(); b64 = js.get("audio_wav_base64") or js.get("wav_b64"); wav = _b.b64decode(b64) if isinstance(b64, str) else b""; return {"wav_bytes": wav, "model": f"musicgen:{os.getenv('MUSIC_MODEL_ID','')}"}
+                def compose(self, args: Dict[str, Any]) -> Dict[str, Any]:
+                    import asyncio as _as
+                    return _as.get_event_loop().run_until_complete(self._compose(args))
+            provider = _MusicProvider(); manifest = {"items": []}; env = run_music_compose(args, provider, manifest)
+            return {"ok": True, "name": name, "result": env}
+        if name == "music.variation" and ALLOW_TOOL_EXECUTION:
+            manifest = {"items": []}; env = run_music_variation(args, manifest); return {"ok": True, "name": name, "result": env}
+        if name == "music.mixdown" and ALLOW_TOOL_EXECUTION:
+            manifest = {"items": []}; env = run_music_mixdown(args, manifest); return {"ok": True, "name": name, "result": env}
+        if name == "ocr.read" and ALLOW_TOOL_EXECUTION:
+            if not OCR_API_URL:
+                return JSONResponse(status_code=400, content={"error": "OCR_API_URL not configured"})
+            ext = (args.get("ext") or "").strip().lower(); b64 = args.get("b64")
+            if not b64 and isinstance(args.get("url"), str):
+                async with httpx.AsyncClient(timeout=60) as client:
+                    rr = await client.get(args.get("url").strip()); rr.raise_for_status(); import base64 as _b; b64 = _b.b64encode(rr.content).decode("ascii")
+            if not b64 and isinstance(args.get("path"), str):
+                rel = args.get("path").strip(); full = os.path.abspath(os.path.join(UPLOAD_DIR, rel)) if not os.path.isabs(rel) else rel
+                with open(full, "rb") as f: import base64 as _b; b64 = _b.b64encode(f.read()).decode("ascii");
+                if not ext and "." in rel: ext = "." + rel.split(".")[-1].lower()
+            async with httpx.AsyncClient(timeout=180) as client:
+                r = await client.post(OCR_API_URL.rstrip("/") + "/ocr", json={"b64": b64, "ext": ext}); r.raise_for_status(); js = r.json(); return {"ok": True, "name": name, "result": {"text": js.get("text") or "", "ext": ext}}
+        if name == "vlm.analyze" and ALLOW_TOOL_EXECUTION:
+            if not VLM_API_URL:
+                return JSONResponse(status_code=400, content={"error": "VLM_API_URL not configured"})
+            ext = (args.get("ext") or "").strip().lower(); b64 = args.get("b64")
+            if not b64 and isinstance(args.get("url"), str):
+                async with httpx.AsyncClient(timeout=60) as client:
+                    rr = await client.get(args.get("url").strip()); rr.raise_for_status(); import base64 as _b; b64 = _b.b64encode(rr.content).decode("ascii")
+            if not b64 and isinstance(args.get("path"), str):
+                rel = args.get("path").strip(); full = os.path.abspath(os.path.join(UPLOAD_DIR, rel)) if not os.path.isabs(rel) else rel
+                with open(full, "rb") as f: import base64 as _b; b64 = _b.b64encode(f.read()).decode("ascii");
+                if not ext and "." in rel: ext = "." + rel.split(".")[-1].lower()
+            async with httpx.AsyncClient(timeout=60) as client:
+                r = await client.post(VLM_API_URL.rstrip("/") + "/analyze", json={"b64": b64, "ext": ext}); r.raise_for_status(); js = r.json(); return {"ok": True, "name": name, "result": js}
+        return JSONResponse(status_code=400, content={"error": f"unsupported tool: {name}"})
+    except Exception as ex:
+        return JSONResponse(status_code=400, content={"error": str(ex)})
 # Lightweight in-memory job controls for orchestrator-run tools (research.run, etc.)
 @app.get("/orcjobs/{job_id}")
 async def orcjob_get(job_id: str):

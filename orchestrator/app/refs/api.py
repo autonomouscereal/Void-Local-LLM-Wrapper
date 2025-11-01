@@ -1,12 +1,41 @@
 from __future__ import annotations
 
 from typing import Dict, Any, Tuple
+import os
 from .registry import create_ref, refine_ref, list_refs, load_manifest
 from .embeds import compute_face_embeddings, compute_voice_embedding, compute_music_embedding
 
 
+UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/workspace/uploads")
+
+
+def _map_upload_path(p: str) -> str:
+    if not isinstance(p, str) or not p:
+        return p
+    if p.startswith("/uploads/"):
+        return os.path.join(UPLOAD_DIR, p.split("/")[-1])
+    if p.startswith("http") and "/uploads/" in p:
+        return os.path.join(UPLOAD_DIR, p.split("/")[-1])
+    return p
+
+
+def _normalize_files(kind: str, files: Dict[str, Any]) -> Dict[str, Any]:
+    f2 = dict(files or {})
+    if kind == "image":
+        f2["images"] = [_map_upload_path(p) for p in (files or {}).get("images", [])]
+    if kind == "voice":
+        f2["voice_samples"] = [_map_upload_path(p) for p in (files or {}).get("voice_samples", [])]
+    if kind == "music":
+        if (files or {}).get("track"):
+            f2["track"] = _map_upload_path(files["track"])  # type: ignore
+        f2["stems"] = [_map_upload_path(p) for p in (files or {}).get("stems", [])]
+    return f2
+
+
 def post_refs_save(body: Dict[str, Any]):
-    ref = create_ref(body.get("kind"), body.get("title", ""), body.get("files", {}), meta=body.get("meta"))
+    kind = body.get("kind")
+    files = _normalize_files(kind, body.get("files", {}))
+    ref = create_ref(kind, body.get("title", ""), files, meta=body.get("meta"))
     if body.get("compute_embeds"):
         try:
             if ref.get("kind") == "image":
@@ -23,7 +52,16 @@ def post_refs_save(body: Dict[str, Any]):
 
 
 def post_refs_refine(body: Dict[str, Any]):
-    ref = refine_ref(body.get("parent_id"), body.get("title", ""), body.get("files_delta"), body.get("meta_delta"))
+    files_delta = body.get("files_delta")
+    kind = None
+    try:
+        man = load_manifest(body.get("parent_id"))
+        kind = (man or {}).get("kind")
+    except Exception:
+        pass
+    if isinstance(files_delta, dict) and kind:
+        files_delta = _normalize_files(kind, files_delta)
+    ref = refine_ref(body.get("parent_id"), body.get("title", ""), files_delta, body.get("meta_delta"))
     if body.get("compute_embeds"):
         try:
             if ref.get("kind") == "image":
