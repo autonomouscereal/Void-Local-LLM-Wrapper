@@ -16,7 +16,7 @@ services:
       - /dev:/host/dev:rw
       - /run/systemd/resolve:/host/run/systemd/resolve:ro
       - ./docker/nvidia-init/init.sh:/init.sh:ro
-    entrypoint: ["/bin/bash","-lc","chmod +x /init.sh; sed -i 's/\\r$//' /init.sh || true; bash /init.sh || true"]
+    entrypoint: ["/bin/bash","-lc","cp /init.sh /tmp/init.sh; chmod +x /tmp/init.sh; sed -i 's/\\r$//' /tmp/init.sh || true; bash /tmp/init.sh || true"]
 
   pgvector:
     image: pgvector/pgvector:0.7.4-pg16
