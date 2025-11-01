@@ -20,6 +20,7 @@ def get_capabilities() -> Dict[str, Any]:
         "image.dispatch",
         "vlm.analyze",
         "tts.speak",
+        "audio.sfx.compose",
         "music.dispatch",
         "code.super_loop",
         "ocr.read",

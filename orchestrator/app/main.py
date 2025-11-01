@@ -64,6 +64,8 @@ from .ops.health import get_capabilities as _get_caps, get_health as _get_health
 from .tools_image.gen import run_image_gen
 from .tools_image.edit import run_image_edit
 from .tools_image.upscale import run_image_upscale
+from .tools_tts.speak import run_tts_speak
+from .tools_tts.sfx import run_sfx_compose
 from .artifacts.shard import open_shard as _art_open_shard, append_jsonl as _art_append_jsonl, _finalize_shard as _art_finalize
 from .artifacts.shard import newest_part as _art_newest_part, list_parts as _art_list_parts
 from .artifacts.manifest import add_manifest_row as _art_manifest_add, write_manifest_atomic as _art_manifest_write
@@ -1428,14 +1430,43 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             return {"name": name, "result": env}
         except Exception as ex:
             return {"name": name, "error": str(ex)}
-    if name == "tts.speak" and XTTS_API_URL and ALLOW_TOOL_EXECUTION:
-        async with httpx.AsyncClient(timeout=180) as client:
-            r = await client.post(XTTS_API_URL.rstrip("/") + "/tts", json={"text": args.get("text"), "voice": args.get("voice") or "narrator"})
-            try:
-                r.raise_for_status()
-                return {"name": name, "result": r.json()}
-            except Exception:
-                return {"name": name, "error": r.text}
+    if name == "tts.speak" and ALLOW_TOOL_EXECUTION:
+        if not XTTS_API_URL:
+            return {"name": name, "error": "XTTS_API_URL not configured"}
+        class _TTSProvider:
+            async def _xtts(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+                async with httpx.AsyncClient(timeout=300) as client:
+                    r = await client.post(XTTS_API_URL.rstrip("/") + "/tts", json=payload)
+                    r.raise_for_status()
+                    js = r.json()
+                    # Expected: wav_b64 or url
+                    wav = b""
+                    if isinstance(js.get("wav_b64"), str):
+                        import base64 as _b
+                        wav = _b.b64decode(js.get("wav_b64"))
+                    elif isinstance(js.get("url"), str):
+                        rr = await client.get(js.get("url"))
+                        if rr.status_code == 200:
+                            wav = rr.content
+                    return {"wav_bytes": wav, "duration_s": float(js.get("duration_s") or 0.0), "model": js.get("model") or "xtts"}
+            def speak(self, args: Dict[str, Any]) -> Dict[str, Any]:
+                # Bridge sync to async
+                import asyncio as _as
+                return _as.get_event_loop().run_until_complete(self._xtts(args))
+        provider = _TTSProvider()
+        manifest = {"items": []}
+        try:
+            env = run_tts_speak(args if isinstance(args, dict) else {}, provider, manifest)
+            return {"name": name, "result": env}
+        except Exception as ex:
+            return {"name": name, "error": str(ex)}
+    if name == "audio.sfx.compose" and ALLOW_TOOL_EXECUTION:
+        manifest = {"items": []}
+        try:
+            env = run_sfx_compose(args if isinstance(args, dict) else {}, manifest)
+            return {"name": name, "result": env}
+        except Exception as ex:
+            return {"name": name, "error": str(ex)}
     if name == "ocr.read" and ALLOW_TOOL_EXECUTION:
         if not OCR_API_URL:
             return {"name": name, "error": "OCR_API_URL not configured"}
