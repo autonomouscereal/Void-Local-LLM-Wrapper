@@ -11,6 +11,8 @@ from .compress import (
 )
 from .relevance import score_chunk
 from .continuation import make_system_hint
+from ..rag.hygiene import rag_filter, evidence_binding_footer
+import os
 
 
 def render_header(entity_header: str) -> str:
@@ -60,6 +62,20 @@ def assemble_window(request_msg: dict, state: dict, in_limit_bytes: int, step_ou
     header = make_entity_header({"entities": state.get("entities", []), "goals": goal})
     # Candidates = history chunks + RAG chunks + artifacts summaries (strings)
     candidates = list(state.get("candidates", []) or [])
+    # Optional: append filtered RAG evidence footer at the tail (newest-first)
+    retrieved = state.get("retrieved") or state.get("retrieved_chunks") or []
+    footer = ""
+    try:
+        if isinstance(retrieved, list) and retrieved:
+            ttl = None
+            try:
+                ttl = int(os.getenv("RAG_TTL_SECONDS", "3600"))
+            except Exception:
+                ttl = None
+            distilled = rag_filter(retrieved, ttl_s=ttl)
+            footer = evidence_binding_footer(distilled)
+    except Exception:
+        footer = ""
     # Rank by relevance
     ranked = sorted(candidates, key=lambda t: score_chunk(t, goal), reverse=True)
     # Build parts in priority order
@@ -74,6 +90,8 @@ def assemble_window(request_msg: dict, state: dict, in_limit_bytes: int, step_ou
             if bytes_len(prompt) > in_limit_bytes:
                 parts.pop()  # defer this chunk to next window
                 break
+    if footer:
+        parts.append(footer)
     return SimpleNamespace(prompt=_joined(parts), target_output_tokens=step_out_tokens)
 
 

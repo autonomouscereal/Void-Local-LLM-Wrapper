@@ -706,6 +706,16 @@ async def rag_search(query: str, k: int = 8) -> List[Dict[str, Any]]:
     async with pool.acquire() as conn:
         rows = await conn.fetch("SELECT path, chunk FROM rag_docs ORDER BY embedding <=> $1 LIMIT $2", list(vec), k)
         results = [{"path": r["path"], "chunk": r["chunk"]} for r in rows]
+        # Apply hygiene: de-dup and newest-first (ts may be absent)
+        try:
+            from .rag.hygiene import rag_filter as _rf
+            # map to {title,text,ts,url}
+            mapped = [{"title": it.get("path"), "text": it.get("chunk"), "ts": 0, "url": it.get("path")} for it in results]
+            clean = _rf(mapped)
+            # map back to original structure but keep order
+            results = [{"path": c.get("title"), "chunk": c.get("text") } for c in clean]
+        except Exception:
+            pass
         _rag_cache[key] = (now, results)
         return results
 
