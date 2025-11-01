@@ -13,6 +13,7 @@ from .relevance import score_chunk
 from .continuation import make_system_hint
 from ..rag.hygiene import rag_filter, evidence_binding_footer
 import os
+from ..artifacts.shard import newest_part, list_parts
 
 
 def render_header(entity_header: str) -> str:
@@ -76,6 +77,22 @@ def assemble_window(request_msg: dict, state: dict, in_limit_bytes: int, step_ou
             footer = evidence_binding_footer(distilled)
     except Exception:
         footer = ""
+    # Artifacts preference (research ledger): include newest shard summary if present
+    try:
+        cid = state.get("cid")
+        if cid:
+            root = os.path.join(os.getenv("UPLOAD_DIR", "/workspace/uploads"), "artifacts", "research", str(cid))
+            latest = newest_part(root, "ledger")
+            if latest:
+                parts.append(render_chunk(f"[Ledger newest] {latest.get('path')} ~{int(latest.get('bytes') or 0)} bytes"))
+                # Summarize older shards as one-liners
+                older = list_parts(root, "ledger")[:-1]
+                for p in older[-5:]:  # cap summaries
+                    sha = (p.get('sha256') or '')
+                    parts.append(render_chunk(f"[Ledger older] {p.get('path')} sha256:{sha[:8]}"))
+    except Exception:
+        pass
+
     # Rank by relevance
     ranked = sorted(candidates, key=lambda t: score_chunk(t, goal), reverse=True)
     # Build parts in priority order

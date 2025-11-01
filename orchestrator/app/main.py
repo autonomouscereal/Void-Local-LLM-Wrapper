@@ -54,6 +54,11 @@ from .ablation.export import write_facts_jsonl as ablate_write_facts
 from .code_loop.super_loop import run_super_loop
 from .state.checkpoints import append_event as _append_event
 from .state.lock import acquire_lock as _acquire_lock, release_lock as _release_lock
+from .artifacts.manifest import add_manifest_row as _manifest_add_row, write_manifest_atomic as _manifest_write
+from .state.ids import step_id as _step_id
+from .artifacts.shard import open_shard as _art_open_shard, append_jsonl as _art_append_jsonl, _finalize_shard as _art_finalize
+from .artifacts.shard import newest_part as _art_newest_part, list_parts as _art_list_parts
+from .artifacts.manifest import add_manifest_row as _art_manifest_add, write_manifest_atomic as _art_manifest_write
 async def _db_insert_run(trace_id: str, mode: str, seed: int, pack_hash: Optional[str], request_json: Dict[str, Any]) -> Optional[int]:
     try:
         pool = await get_pg_pool()
@@ -186,6 +191,10 @@ WRAPPER_CONFIG_HASH: Optional[str] = None
 DRT_API_URL = os.getenv("DRT_API_URL", "http://drt:8086")
 STATE_DIR = os.path.join(UPLOAD_DIR, "state")
 os.makedirs(STATE_DIR, exist_ok=True)
+ARTIFACT_SHARD_BYTES = int(os.getenv("ARTIFACT_SHARD_BYTES", "200000"))
+ARTIFACT_LATEST_ONLY = os.getenv("ARTIFACT_LATEST_ONLY", "true").lower() == "true"
+ARTIFACT_SHARD_BYTES = int(os.getenv("ARTIFACT_SHARD_BYTES", "200000"))
+ARTIFACT_LATEST_ONLY = os.getenv("ARTIFACT_LATEST_ONLY", "true").lower() == "true"
 
 
 def _sha256_bytes(b: bytes) -> str:
@@ -1724,6 +1733,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             "anchor_text": anchor_text,
             "entities": [],
             "candidates": [t for t in [pack_text] if isinstance(t, str) and t.strip()],
+            "cid": trace_id,
         }
         # Sync Ollama provider
         class _SyncOllamaProvider:
@@ -1782,7 +1792,23 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 if do_export:
                     try:
                         outdir = os.path.join(UPLOAD_DIR, "ablation", trace_id)
-                        ablate_write_facts(abl, trace_id, outdir)
+                        facts_path = ablate_write_facts(abl, trace_id, outdir)
+                        # Record in manifest
+                        try:
+                            mdir = os.path.join(UPLOAD_DIR, "manifests", trace_id)
+                            mpath = os.path.join(mdir, "manifest.json")
+                            existing = {}
+                            if os.path.exists(mpath):
+                                try:
+                                    with open(mpath, "r", encoding="utf-8") as _mf:
+                                        existing = json.load(_mf)
+                                except Exception:
+                                    existing = {}
+                            sid = _step_id()
+                            _manifest_add_row(existing, facts_path, sid)
+                            _manifest_write(mdir, existing)
+                        except Exception:
+                            pass
                     except Exception:
                         pass
         except Exception:
@@ -1930,6 +1956,10 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     # 2) Optionally execute tools
     tool_results: List[Dict[str, Any]] = []
     tool_exec_meta: List[Dict[str, Any]] = []
+    # Artifacts ledger (lazy-open)
+    _ledger_shard = None
+    _ledger_root = os.path.join(UPLOAD_DIR, "artifacts", "runs", trace_id)
+    _ledger_name = "ledger"
     # Enforce tool call budget
     if tool_calls and len(tool_calls) > MAX_TOOL_CALLS:
         return JSONResponse(status_code=429, content={"error": "tool_budget_exceeded", "detail": f">{MAX_TOOL_CALLS} tool calls"})
@@ -1960,6 +1990,25 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 # append checkpoint event
                 try:
                     _append_event(STATE_DIR, trace_id, "tool_call", {"name": n, "duration_ms": int(duration_ms), "ok": (not (isinstance(tr, dict) and tr.get("error")))})
+                except Exception:
+                    pass
+                # Append a compact ledger row for this tool call
+                try:
+                    if _ledger_shard is None:
+                        _ledger_shard = _art_open_shard(_ledger_root, _ledger_name, ARTIFACT_SHARD_BYTES)
+                    row = {"tool": n, "duration_ms": int(duration_ms)}
+                    if isinstance(args, dict):
+                        row["args_keys"] = list(args.keys())[:10]
+                    if isinstance(tr, dict):
+                        if tr.get("error"):
+                            row["error"] = str(tr.get("error"))[:200]
+                        res = tr.get("result") if isinstance(tr.get("result"), dict) else {}
+                        if res:
+                            for k in ("master_uri", "hash", "package_uri"):
+                                v = res.get(k)
+                                if isinstance(v, str) and v:
+                                    row[k] = v
+                    _ledger_shard = _art_append_jsonl(_ledger_shard, row)
                 except Exception:
                     pass
                 # extract artifacts minimally for trace policy
@@ -2563,6 +2612,18 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         except Exception:
             pass
         response["envelope"] = final_env
+    # Finalize artifacts shard and write a tiny manifest reference
+    try:
+        if _ledger_shard is not None:
+            _art_finalize_shard_local = _art_finalize  # alias to avoid shadowing name
+            _art_finalize_shard_local(_ledger_shard)
+            _mani = {"items": []}
+            idx_path = os.path.join(_ledger_root, f"{_ledger_name}.index.json")
+            _art_manifest_add(_mani, idx_path, step_id="final")
+            _art_manifest_write(_ledger_root, _mani)
+    except Exception:
+        pass
+
     # Fire-and-forget: Teacher trace tap (if reachable)
     try:
         # Build trace payload
