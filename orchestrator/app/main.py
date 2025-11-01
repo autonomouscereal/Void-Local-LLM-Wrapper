@@ -49,6 +49,8 @@ from .icw.windowed_solver import solve as windowed_solve
 from .jsonio.normalize import normalize_to_envelope
 from .jsonio.stitch import merge_envelopes as stitch_merge_envelopes, stitch_openai as stitch_openai_final
 from .router.route import route_for_request
+from .ablation.core import ablate as ablate_env
+from .ablation.export import write_facts_jsonl as ablate_write_facts
 async def _db_insert_run(trace_id: str, mode: str, seed: int, pack_hash: Optional[str], request_json: Dict[str, Any]) -> Optional[int]:
     try:
         pool = await get_pg_pool()
@@ -1656,6 +1658,22 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         step_envs = [normalize_to_envelope(p) for p in (result.partials or [])]
         final_env = stitch_merge_envelopes(step_envs)
         final_oai = stitch_openai_final(result.partials, model_name=provider.model_id)
+        # Optional ablation
+        try:
+            do_ablate = os.getenv("ABLATE", "on").lower() == "on"
+            do_export = os.getenv("ABLATE_EXPORT", "on").lower() == "on"
+            scope = os.getenv("ABLATE_SCOPE", "auto")
+            if do_ablate and isinstance(final_env, dict):
+                abl = ablate_env(final_env, scope_hint=(scope if scope != "auto" else "chat"))
+                final_env["ablated"] = abl
+                if do_export:
+                    try:
+                        outdir = os.path.join(UPLOAD_DIR, "ablation", trace_id)
+                        ablate_write_facts(abl, trace_id, outdir)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
         # Build response wrapper compatible with our existing format
         final_text = (final_oai.get("choices", [{}])[0].get("message", {}) or {}).get("content", "")
         usage = estimate_usage(messages, final_text)
@@ -1667,6 +1685,8 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             "usage": usage,
             "seed": master_seed,
         }
+        if isinstance(final_env, dict):
+            response["envelope"] = final_env
         # Persist response & metrics
         await _db_update_run_response(run_id, response, usage)
         if body.get("stream"):
@@ -2364,6 +2384,27 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     if artifacts:
         response["artifacts"] = artifacts
     if isinstance(final_env, dict) and final_env:
+        # Optional ablation: extract grounded facts and export
+        try:
+            do_ablate = os.getenv("ABLATE", "on").lower() == "on"
+            do_export = os.getenv("ABLATE_EXPORT", "on").lower() == "on"
+            scope = os.getenv("ABLATE_SCOPE", "auto")
+            if do_ablate:
+                abl = ablate_env(final_env, scope_hint=(scope if scope != "auto" else "chat"))
+                final_env["ablated"] = abl
+                if do_export:
+                    try:
+                        outdir = os.path.join(UPLOAD_DIR, "ablation", trace_id)
+                        facts_path = ablate_write_facts(abl, trace_id, outdir)
+                        # attach a reference to the exported dataset
+                        response.setdefault("artifacts", {})
+                        if isinstance(response["artifacts"], dict):
+                            uri = _uri_from_upload_path(facts_path)
+                            response["artifacts"]["ablation_facts"] = {"uri": uri}
+                    except Exception:
+                        pass
+        except Exception:
+            pass
         response["envelope"] = final_env
     # Fire-and-forget: Teacher trace tap (if reachable)
     try:
