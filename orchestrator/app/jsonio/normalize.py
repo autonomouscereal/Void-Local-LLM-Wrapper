@@ -3,6 +3,8 @@ from __future__ import annotations
 import time
 from typing import Any, Dict
 from ..json_parser import JSONParser
+from .coerce import coerce_to_envelope
+from .limits import enforce_field_limits
 
 
 def normalize_envelope(obj: Dict[str, Any]) -> Dict[str, Any]:
@@ -52,6 +54,25 @@ def to_envelope(raw_text: str, model_name: str, cid: str, step: int) -> Dict[str
     env["meta"]["model"] = model_name or env["meta"].get("model")
     env["meta"]["cid"] = cid or env["meta"].get("cid")
     env["meta"]["step"] = int(step)
+    return env
+
+
+def _parse_json(text: str) -> Dict[str, Any]:
+    parser = JSONParser()
+    try:
+        return parser.parse(text or "{}", {})
+    except Exception:
+        return {}
+
+
+def normalize_to_envelope(raw_text: str) -> Dict[str, Any]:
+    """
+    Converts any provider/tool output into the canonical envelope using the hardened parser.
+    Must never throw on mildly malformed JSON—coerce or fill defaults instead.
+    """
+    obj = _parse_json(raw_text)
+    env = coerce_to_envelope(obj)
+    env = enforce_field_limits(env)
     return env
 
 
