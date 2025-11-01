@@ -1,4 +1,16 @@
 services:
+  nvidia_init:
+    image: ubuntu:22.04
+    container_name: nvidia_init
+    privileged: true
+    restart: "no"
+    environment:
+      - TARGET_LIB_DIR=/host/lib
+    volumes:
+      - /usr/lib/x86_64-linux-gnu:/host/lib:rw
+      - ./docker/nvidia-init/init.sh:/init.sh:ro
+    entrypoint: ["/bin/bash","-lc","/init.sh"]
+
   pgvector:
     image: pgvector/pgvector:0.7.4-pg16
     container_name: pgvector_db
