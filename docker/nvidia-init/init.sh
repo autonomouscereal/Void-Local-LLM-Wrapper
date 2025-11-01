@@ -26,6 +26,8 @@ EGL_TARGET=$(pick_target libEGL_nvidia.so)
 GLX_TARGET=$(pick_target libGLX_nvidia.so)
 GLES2_TARGET=$(pick_target libGLESv2_nvidia.so)
 GLES1_TARGET=$(pick_target libGLESv1_CM_nvidia.so)
+CUDA_TARGET=$(pick_target libcuda.so)
+NVML_TARGET=$(pick_target libnvidia-ml.so)
 
 # Create symlinks only for installed driver version
 DRV_VER=$(grep -oE '[0-9]{3}\.[0-9]{2,3}\.[0-9]{2}' /proc/driver/nvidia/version 2>/dev/null | head -n1 || true)
@@ -46,10 +48,12 @@ if [ -n "$DRV_VER" ]; then
   link_for libGLX_nvidia.so "$GLX_TARGET"
   link_for libGLESv2_nvidia.so "$GLES2_TARGET"
   link_for libGLESv1_CM_nvidia.so "$GLES1_TARGET"
+  link_for libcuda.so "$CUDA_TARGET"
+  link_for libnvidia-ml.so "$NVML_TARGET"
 fi
 
 # Always provide 580.65.06 aliases (observed in the error)
-for stem in libEGL_nvidia.so libGLX_nvidia.so libGLESv2_nvidia.so libGLESv1_CM_nvidia.so; do
+for stem in libEGL_nvidia.so libGLX_nvidia.so libGLESv2_nvidia.so libGLESv1_CM_nvidia.so libcuda.so libnvidia-ml.so; do
   tgt="${stem}.1"
   [ -e "$tgt" ] || tgt="$(ls -1 ${stem}.* 2>/dev/null | head -n1 || echo "${stem}.1")"
   [ -e "$tgt" ] || echo -n > "$tgt"
