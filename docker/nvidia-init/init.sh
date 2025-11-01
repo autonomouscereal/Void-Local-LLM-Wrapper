@@ -1,22 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
+trap 'exit 0' TERM INT
 
 # Host lib path mounted at /host/lib
 HOST_ROOT=${HOST_ROOT:-/host}
 LIBDIR=${TARGET_LIB_DIR:-$HOST_ROOT/usr/lib/x86_64-linux-gnu}
-mkdir -p "$LIBDIR"
-cd "$LIBDIR" || exit 0
-
-# Try to align NVIDIA container toolkit and set docker runtime caps on the host (best effort)
-if [ -x "$HOST_ROOT/usr/bin/apt-get" ]; then
-  chroot "$HOST_ROOT" /usr/bin/bash -lc "apt-get update -y || true"
-  chroot "$HOST_ROOT" /usr/bin/bash -lc "DEBIAN_FRONTEND=noninteractive apt-get install -y ubuntu-drivers-common || true"
-  chroot "$HOST_ROOT" /usr/bin/bash -lc "ubuntu-drivers autoinstall -q || true"
-  chroot "$HOST_ROOT" /usr/bin/bash -lc "DEBIAN_FRONTEND=noninteractive apt-get install -y nvidia-container-toolkit nvidia-container-toolkit-base nvidia-container-runtime || true"
-  chroot "$HOST_ROOT" /usr/bin/bash -lc "which nvidia-ctk >/dev/null 2>&1 && nvidia-ctk runtime configure --runtime=docker --set-as-default || true"
-  chroot "$HOST_ROOT" /usr/bin/bash -lc "which nvidia-ctk >/dev/null 2>&1 && nvidia-ctk runtime configure --runtime=docker --set default-caps=compute,utility || true"
-  chroot "$HOST_ROOT" /usr/bin/bash -lc "systemctl restart docker || service docker restart || true"
+MARKER="$HOST_ROOT/var/run/nvidia-init.done"
+mkdir -p "$LIBDIR" "$HOST_ROOT/var/run"
+if [ -f "$MARKER" ]; then
+  exit 0
 fi
+cd "$LIBDIR" || exit 0
 
 pick_target() {
   local stem="$1"
@@ -62,6 +56,8 @@ for stem in libEGL_nvidia.so libGLX_nvidia.so libGLESv2_nvidia.so libGLESv1_CM_n
   ln -sf "$tgt" "$stem.580.65" 2>/dev/null || true
   ln -sf "$tgt" "$stem.580.65.06" 2>/dev/null || true
 done
+
+touch "$MARKER"
 
 # Best effort: ensure directory exists so bind-target is valid
 mkdir -p "$LIBDIR"
