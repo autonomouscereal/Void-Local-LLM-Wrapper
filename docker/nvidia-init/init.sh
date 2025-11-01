@@ -6,8 +6,9 @@ trap 'exit 0' TERM INT
 HOST_ROOT=${HOST_ROOT:-/host}
 LIBDIR=${TARGET_LIB_DIR:-$HOST_ROOT/usr/lib/x86_64-linux-gnu}
 MARKER="$HOST_ROOT/var/run/nvidia-init.done"
+FORCE=${FORCE:-}
 mkdir -p "$LIBDIR" "$HOST_ROOT/var/run"
-if [ -f "$MARKER" ]; then
+if [ -f "$MARKER" ] && [ -z "$FORCE" ]; then
   exit 0
 fi
 cd "$LIBDIR" || exit 0
@@ -30,7 +31,7 @@ CUDA_TARGET=$(pick_target libcuda.so)
 NVML_TARGET=$(pick_target libnvidia-ml.so)
 
 # Create symlinks only for installed driver version
-DRV_VER=$(grep -oE '[0-9]{3}\.[0-9]{2,3}\.[0-9]{2}' /proc/driver/nvidia/version 2>/dev/null | head -n1 || true)
+DRV_VER=$(grep -oE '[0-9]{3}\.[0-9]{2,3}\.[0-9]{2}' "$HOST_ROOT/proc/driver/nvidia/version" 2>/dev/null | head -n1 || true)
 # Create links for detected driver version if available
 if [ -n "$DRV_VER" ]; then
   MAJ=$(echo "$DRV_VER" | cut -d. -f1)
