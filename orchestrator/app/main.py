@@ -1588,14 +1588,42 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 return {"name": name, "result": js}
         except Exception as ex:
             return {"name": name, "error": str(ex)}
-    if name == "music.dispatch" and MUSIC_API_URL and ALLOW_TOOL_EXECUTION:
-        async with httpx.AsyncClient(timeout=1200) as client:
-            r = await client.post(MUSIC_API_URL.rstrip("/") + "/generate", json=args)
+    if name == "music.dispatch" and ALLOW_TOOL_EXECUTION:
+        mode = (args.get("mode") or "compose").strip().lower()
+        if mode == "compose":
+            if not MUSIC_API_URL:
+                return {"name": name, "error": "MUSIC_API_URL not configured"}
+            class _MusicProvider:
+                async def _compose(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+                    import base64 as _b
+                    async with httpx.AsyncClient(timeout=600) as client:
+                        r = await client.post(MUSIC_API_URL.rstrip("/") + "/generate", json={"prompt": payload.get("prompt"), "duration": int(payload.get("length_s") or 8)})
+                        r.raise_for_status(); js = r.json(); b64 = js.get("audio_wav_base64") or js.get("wav_b64"); wav = _b.b64decode(b64) if isinstance(b64, str) else b""; return {"wav_bytes": wav, "model": f"musicgen:{os.getenv('MUSIC_MODEL_ID','')}"}
+                def compose(self, args: Dict[str, Any]) -> Dict[str, Any]:
+                    import asyncio as _as
+                    return _as.get_event_loop().run_until_complete(self._compose(args))
+            provider = _MusicProvider(); manifest = {"items": []}
             try:
-                r.raise_for_status()
-                return {"name": name, "result": r.json()}
-            except Exception:
-                return {"name": name, "error": r.text}
+                env = run_music_compose(args if isinstance(args, dict) else {}, provider, manifest)
+                return {"name": name, "result": env}
+            except Exception as ex:
+                return {"name": name, "error": str(ex)}
+        elif mode == "variation":
+            manifest = {"items": []}
+            try:
+                env = run_music_variation(args if isinstance(args, dict) else {}, manifest)
+                return {"name": name, "result": env}
+            except Exception as ex:
+                return {"name": name, "error": str(ex)}
+        elif mode == "mixdown":
+            manifest = {"items": []}
+            try:
+                env = run_music_mixdown(args if isinstance(args, dict) else {}, manifest)
+                return {"name": name, "result": env}
+            except Exception as ex:
+                return {"name": name, "error": str(ex)}
+        else:
+            return {"name": name, "error": f"unsupported music mode: {mode}"}
     if name == "music.compose" and ALLOW_TOOL_EXECUTION:
         if not MUSIC_API_URL:
             return {"name": name, "error": "MUSIC_API_URL not configured"}
@@ -3313,6 +3341,29 @@ async def tool_run(body: Dict[str, Any]):
             async with httpx.AsyncClient(timeout=60) as client:
                 r = await client.post(VLM_API_URL.rstrip("/") + "/analyze", json={"b64": b64, "ext": ext}); r.raise_for_status(); js = r.json(); return {"ok": True, "name": name, "result": js}
         return JSONResponse(status_code=400, content={"error": f"unsupported tool: {name}"})
+    except Exception as ex:
+        return JSONResponse(status_code=400, content={"error": str(ex)})
+
+
+@app.post("/jobs/start")
+async def jobs_start(body: Dict[str, Any]):
+    """
+    Minimal job starter compatible with smoke tests.
+    Immediately executes the requested tool synchronously and returns the result with a synthetic job_id.
+    """
+    try:
+        import uuid
+        jid = uuid.uuid4().hex
+        name = (body or {}).get("tool") or (body or {}).get("name")
+        args = (body or {}).get("args") or {}
+        res = await tool_run({"name": name, "args": args})
+        # Pass through result; include job_id for clients expecting it
+        if isinstance(res, JSONResponse):
+            # unwrap JSONResponse content
+            return JSONResponse(status_code=res.status_code, content={"job_id": jid, "result": res.body.decode("utf-8") if hasattr(res, 'body') else None})
+        if isinstance(res, dict):
+            return {"job_id": jid, **res}
+        return {"job_id": jid, "result": res}
     except Exception as ex:
         return JSONResponse(status_code=400, content={"error": str(ex)})
 # Lightweight in-memory job controls for orchestrator-run tools (research.run, etc.)
