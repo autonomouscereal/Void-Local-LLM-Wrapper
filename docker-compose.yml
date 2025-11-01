@@ -31,10 +31,6 @@ services:
       - NVIDIA_DISABLE_REQUIRE=1
     volumes:
       - ollama_qwen_data:/root/.ollama
-    device_requests:
-      - driver: nvidia
-        count: all
-        capabilities: ["compute","utility"]
     healthcheck:
       test: ["CMD", "sh", "-lc", "ollama list >/dev/null 2>&1"]
       interval: 10s
@@ -66,10 +62,6 @@ services:
       - NVIDIA_DISABLE_REQUIRE=1
     volumes:
       - ollama_gptoss_data:/root/.ollama
-    device_requests:
-      - driver: nvidia
-        count: all
-        capabilities: ["compute","utility"]
     healthcheck:
       test: ["CMD", "sh", "-lc", "ollama list >/dev/null 2>&1"]
       interval: 10s
@@ -158,10 +150,6 @@ services:
       - "8020"
     ports:
       - "8020:8020"
-    device_requests:
-      - driver: nvidia
-        count: all
-        capabilities: ["compute","utility"]
 
   whisper:
     build:
@@ -180,10 +168,6 @@ services:
       - "9090"
     ports:
       - "9090:9090"
-    device_requests:
-      - driver: nvidia
-        count: all
-        capabilities: ["compute","utility"]
 
   faceid:
     build:
@@ -200,10 +184,6 @@ services:
       - "7000"
     ports:
       - "7000:7000"
-    device_requests:
-      - driver: nvidia
-        count: all
-        capabilities: ["compute","utility"]
 
   comfyui:
     build:
@@ -226,10 +206,6 @@ services:
     volumes:
       - comfyui_models:/comfyui/models
       - comfyui_custom_nodes:/comfyui/custom_nodes
-    device_requests:
-      - driver: nvidia
-        count: all
-        capabilities: ["compute","utility"]
     # For GPU deployments, create additional comfyui-* services and set COMFYUI_API_URLS accordingly
 
   # Optional additional ComfyUI replicas for dynamic distribution
@@ -258,10 +234,6 @@ services:
     volumes:
       - comfyui_models:/comfyui/models
       - comfyui_custom_nodes:/comfyui/custom_nodes
-    device_requests:
-      - driver: nvidia
-        count: all
-        capabilities: ["compute","utility"]
 
   comfyui-2:
     build:
@@ -285,10 +257,6 @@ services:
     volumes:
       - comfyui_models:/comfyui/models
       - comfyui_custom_nodes:/comfyui/custom_nodes
-    device_requests:
-      - driver: nvidia
-        count: all
-        capabilities: ["compute","utility"]
 
   comfyui_init:
     build:
@@ -376,10 +344,6 @@ services:
       - "7860"
     ports:
       - "7860:7860"
-    device_requests:
-      - driver: nvidia
-        count: all
-        capabilities: ["compute","utility"]
 
   vlm:
     build:
@@ -396,10 +360,6 @@ services:
       - "8050"
     ports:
       - "8050:8050"
-    device_requests:
-      - driver: nvidia
-        count: all
-        capabilities: ["compute","utility"]
 
   ocr:
     build:
@@ -478,10 +438,6 @@ services:
       - "8090:8090"
     volumes:
       - ./:/workspace
-    device_requests:
-      - driver: nvidia
-        count: all
-        capabilities: ["compute","utility"]
 
   ablation:
     build:
