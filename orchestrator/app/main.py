@@ -26,6 +26,7 @@ from __future__ import annotations
 # - Keep LLM models warm: we set options.keep_alive=24h on every Ollama call to avoid reloading between requests.
 
 import os
+from types import SimpleNamespace
 import asyncio
 import json
 from typing import Any, Dict, List, Optional, Tuple
@@ -33,6 +34,7 @@ import time
 import traceback
 
 import httpx
+import requests
 import re
 import asyncpg
 from sentence_transformers import SentenceTransformer
@@ -43,6 +45,10 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 from fastapi.middleware.cors import CORSMiddleware
 from .json_parser import JSONParser
 from .determinism import seed_router as det_seed_router, seed_tool as det_seed_tool, round6 as det_round6
+from .icw.windowed_solver import solve as windowed_solve
+from .jsonio.normalize import normalize_to_envelope
+from .jsonio.stitch import merge_envelopes as stitch_merge_envelopes, stitch_openai as stitch_openai_final
+from .router.route import route_for_request
 async def _db_insert_run(trace_id: str, mode: str, seed: int, pack_hash: Optional[str], request_json: Dict[str, Any]) -> Optional[int]:
     try:
         pool = await get_pg_pool()
@@ -1184,6 +1190,37 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         return out
 
     args = _normalize_tool_args(raw_args)
+    # Deterministic grouped dispatchers
+    if name == "image.dispatch" and ALLOW_TOOL_EXECUTION:
+        mode = (args.get("mode") or "gen").lower()
+        if mode == "upscale":
+            return {"name": "image.dispatch", "result": {"accepted": True, "op": "upscale", "params": {"scale": int(args.get("scale") or 2)}}}
+        if mode == "edit" and COMFYUI_API_URL and ALLOW_TOOL_EXECUTION:
+            async with httpx.AsyncClient(timeout=600) as client:
+                r = await client.post(COMFYUI_API_URL.rstrip("/") + "/prompt", json=args.get("workflow") or args)
+                try:
+                    r.raise_for_status()
+                    return {"name": name, "result": r.json()}
+                except Exception:
+                    return {"name": name, "error": r.text}
+        # default gen
+        if COMFYUI_API_URL and ALLOW_TOOL_EXECUTION:
+            async with httpx.AsyncClient(timeout=600) as client:
+                r = await client.post(COMFYUI_API_URL.rstrip("/") + "/prompt", json=args.get("workflow") or args)
+                try:
+                    r.raise_for_status()
+                    return {"name": name, "result": r.json()}
+                except Exception:
+                    return {"name": name, "error": r.text}
+        return {"name": name, "skipped": True, "reason": "image backend not configured"}
+    if name == "music.dispatch" and MUSIC_API_URL and ALLOW_TOOL_EXECUTION:
+        async with httpx.AsyncClient(timeout=1200) as client:
+            r = await client.post(MUSIC_API_URL.rstrip("/") + "/generate", json=args)
+            try:
+                r.raise_for_status()
+                return {"name": name, "result": r.json()}
+            except Exception:
+                return {"name": name, "error": r.text}
     if name == "web_search" and ENABLE_WEBSEARCH and SERPAPI_API_KEY and ALLOW_TOOL_EXECUTION:
         query = args.get("q") or args.get("query") or ""
         if not query:
@@ -1560,6 +1597,86 @@ async def chat_completions(body: Dict[str, Any], request: Request):
 
     # If client supplies tool results (role=tool) we include them verbatim for the planner/executors
 
+    # Optional Windowed Solver path (capless sliding window + CONT/HALT)
+    route_mode = os.getenv("ICW_MODE", "off").lower()
+    if route_mode == "windowed":
+        # Build minimal state
+        anchor_msgs = []
+        for m in normalized_msgs[-6:]:
+            if isinstance(m.get("content"), str) and m.get("content").strip():
+                role = m.get("role")
+                anchor_msgs.append(f"{role}: {m.get('content')}")
+        anchor_text = "\n".join(anchor_msgs[-4:])
+        try:
+            pack_text = icw.get("pack") if (not ICW_DISABLE) else ""
+        except Exception:
+            pack_text = ""
+        state = {
+            "anchor_text": anchor_text,
+            "entities": [],
+            "candidates": [t for t in [pack_text] if isinstance(t, str) and t.strip()],
+        }
+        # Sync Ollama provider
+        class _SyncOllamaProvider:
+            def __init__(self, base_url: str, model_id: str, num_ctx: int, temperature: float):
+                self.base_url = base_url.rstrip("/")
+                self.model_id = model_id
+                self.num_ctx = num_ctx
+                self.temperature = temperature
+            def chat(self, prompt: str, max_tokens: int) -> SimpleNamespace:
+                payload = {
+                    "model": self.model_id,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {
+                        "num_ctx": self.num_ctx,
+                        "temperature": self.temperature,
+                        "keep_alive": "24h",
+                        "num_predict": max(1, int(max_tokens or 900)),
+                    },
+                }
+                try:
+                    r = requests.post(self.base_url + "/api/generate", json=payload, timeout=60)
+                    r.raise_for_status()
+                    js = r.json()
+                    return SimpleNamespace(text=str(js.get("response", "")), model_name=self.model_id)
+                except Exception as ex:
+                    return SimpleNamespace(text=f"", model_name=self.model_id)
+        ctx_limit = DEFAULT_NUM_CTX
+        step_out = int(os.getenv("ICW_STEP_TOKENS", "900") or 900)
+        provider = _SyncOllamaProvider(QWEN_BASE_URL, QWEN_MODEL_ID, ctx_limit, body.get("temperature") or DEFAULT_TEMPERATURE)
+        result = windowed_solve(
+            request={"content": last_user_text},
+            global_state=state,
+            model=provider,
+            model_ctx_limit_tokens=ctx_limit,
+            step_out_tokens=step_out,
+        )
+        # Normalize envelopes (optional log material)
+        step_envs = [normalize_to_envelope(p) for p in (result.partials or [])]
+        final_env = stitch_merge_envelopes(step_envs)
+        final_oai = stitch_openai_final(result.partials, model_name=provider.model_id)
+        # Build response wrapper compatible with our existing format
+        final_text = (final_oai.get("choices", [{}])[0].get("message", {}) or {}).get("content", "")
+        usage = estimate_usage(messages, final_text)
+        response = {
+            "id": final_oai.get("id", "orc-1"),
+            "object": "chat.completion",
+            "model": final_oai.get("model") or f"{QWEN_MODEL_ID}",
+            "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": final_text}}],
+            "usage": usage,
+            "seed": master_seed,
+        }
+        # Persist response & metrics
+        await _db_update_run_response(run_id, response, usage)
+        if body.get("stream"):
+            async def _stream_once():
+                chunk = json.dumps({"id": response["id"], "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"role": "assistant", "content": final_text}, "finish_reason": None}]})
+                yield f"data: {chunk}\n\n"
+                yield "data: [DONE]\n\n"
+            return StreamingResponse(_stream_once(), media_type="text/event-stream")
+        return JSONResponse(content=response)
+
     # Optional self-ask-with-search augmentation
     if ENABLE_WEBSEARCH and SERPAPI_API_KEY:
         queries = await propose_search_queries(messages)
@@ -1573,6 +1690,13 @@ async def chat_completions(body: Dict[str, Any], request: Request):
 
     # 1) Planner proposes plan + tool calls
     plan_text, tool_calls = await planner_produce_plan(messages, body.get("tools"), body.get("temperature") or DEFAULT_TEMPERATURE)
+    # Deterministic router: if intent is recognized, override planner with a direct tool call
+    try:
+        decision = route_for_request({"messages": normalized_msgs})
+    except Exception:
+        decision = None
+    if decision and getattr(decision, "kind", None) == "tool" and getattr(decision, "tool", None):
+        tool_calls = [{"name": decision.tool, "arguments": (decision.args or {})}]
     # Surface attachments in tool arguments so downstream jobs can use user media
     if tool_calls and attachments:
         enriched: List[Dict[str, Any]] = []
@@ -2182,6 +2306,47 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     except Exception:
         artifacts = {}
 
+    # Build canonical envelope (merged from steps) to attach to response for internal use
+    try:
+        step_texts: List[str] = []
+        if isinstance(plan_text, str) and plan_text.strip():
+            step_texts.append(plan_text)
+        if tool_results:
+            try:
+                step_texts.append(json.dumps(tool_results, ensure_ascii=False))
+            except Exception:
+                pass
+        if isinstance(qwen_text, str) and qwen_text.strip():
+            step_texts.append(qwen_text)
+        if isinstance(gptoss_text, str) and gptoss_text.strip():
+            step_texts.append(gptoss_text)
+        if isinstance(display_content, str) and display_content.strip():
+            step_texts.append(display_content)
+        step_envs = [normalize_to_envelope(t) for t in step_texts]
+        final_env = stitch_merge_envelopes(step_envs)
+        # Merge tool_calls and artifacts deterministically from tool_exec_meta
+        tc_merged: List[Dict[str, Any]] = []
+        arts: List[Dict[str, Any]] = []
+        seen_art_ids = set()
+        for meta in (tool_exec_meta or []):
+            name = meta.get("name")
+            args = meta.get("args") if isinstance(meta.get("args"), dict) else {}
+            tc_merged.append({"tool": name, "args": args, "status": "done", "result_ref": None})
+            a = meta.get("artifacts") or {}
+            if isinstance(a, dict):
+                for k, v in a.items():
+                    if isinstance(v, dict):
+                        aid = v.get("hash") or v.get("uri") or f"{name}:{k}"
+                        if aid in seen_art_ids:
+                            continue
+                        seen_art_ids.add(aid)
+                        arts.append({"id": aid, "kind": k, "summary": name or k, **{kk: vv for kk, vv in v.items() if kk in ("uri", "hash")}})
+        if isinstance(final_env, dict):
+            final_env["tool_calls"] = tc_merged
+            final_env["artifacts"] = arts
+    except Exception:
+        final_env = {}
+
     response = {
         "id": "orc-1",
         "object": "chat.completion",
@@ -2198,6 +2363,8 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     }
     if artifacts:
         response["artifacts"] = artifacts
+    if isinstance(final_env, dict) and final_env:
+        response["envelope"] = final_env
     # Fire-and-forget: Teacher trace tap (if reachable)
     try:
         # Build trace payload
