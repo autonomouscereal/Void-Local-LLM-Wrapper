@@ -13,28 +13,27 @@ if [ ! -e "$BASE_EGL" ]; then
   echo -n > "$BASE_EGL"
 fi
 
-# Generate version-agnostic symlinks for common patterns
-make_links() {
-  local stem="$1"; shift
-  for major in $(seq 450 650); do
-    ln -sf "$stem.1" "$stem.$major" 2>/dev/null || true
-    for minor in $(seq 0 200); do
-      # create stem.major.minor
-      ln -sf "$stem.1" "$stem.$major.$minor" 2>/dev/null || true
-      for patch in $(seq 0 200); do
-        # zero-pad patch to 2 digits and also create non-padded variant
-        zp=$(printf "%02d" "$patch")
-        ln -sf "$stem.1" "$stem.$major.$minor.$zp" 2>/dev/null || true
-        ln -sf "$stem.1" "$stem.$major.$minor.$patch" 2>/dev/null || true
-      done
-    done
-  done
-}
-
-make_links libEGL_nvidia.so
-make_links libGLX_nvidia.so
-make_links libGLESv2_nvidia.so
-make_links libGLESv1_CM_nvidia.so
+# Create symlinks only for installed driver version
+DRV_VER=$(grep -oE '[0-9]{3}\.[0-9]{2,3}\.[0-9]{2}' /proc/driver/nvidia/version 2>/dev/null | head -n1 || true)
+if [ -n "$DRV_VER" ]; then
+  MAJ=$(echo "$DRV_VER" | cut -d. -f1)
+  MIN=$(echo "$DRV_VER" | cut -d. -f2)
+  PAT=$(echo "$DRV_VER" | cut -d. -f3)
+  link_for() {
+    local stem="$1"; shift
+    local target=""
+    if   [ -e "$stem.1" ]; then target="$stem.1";
+    elif [ -e "$stem.0" ]; then target="$stem.0";
+    else return 0; fi
+    ln -sf "$target" "$stem.$MAJ" 2>/dev/null || true
+    ln -sf "$target" "$stem.$MAJ.$MIN" 2>/dev/null || true
+    ln -sf "$target" "$stem.$MAJ.$MIN.$PAT" 2>/dev/null || true
+  }
+  link_for libEGL_nvidia.so
+  link_for libGLX_nvidia.so
+  link_for libGLESv2_nvidia.so
+  link_for libGLESv1_CM_nvidia.so
+fi
 
 # Best effort: ensure directory exists so bind-target is valid
 mkdir -p "$LIBDIR"
