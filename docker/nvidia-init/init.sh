@@ -51,10 +51,23 @@ if [ -n "$DRV_VER" ]; then
   link_for libGLESv1_CM_nvidia.so "$GLES1_TARGET"
   link_for libcuda.so "$CUDA_TARGET"
   link_for libnvidia-ml.so "$NVML_TARGET"
+
+  # Dynamically link all NVIDIA/CUDA-related libs present
+  for f in $(ls -1 lib*{nvidia,cuda}*.so* 2>/dev/null | sort -u); do
+    stem="${f%%.so*}.so"
+    tgt=$(pick_target "$stem")
+    [ -n "$tgt" ] && link_for "$stem" "$tgt"
+  done
 fi
 
-# Always provide 580.65.06 aliases (observed in the error)
-for stem in libEGL_nvidia.so libGLX_nvidia.so libGLESv2_nvidia.so libGLESv1_CM_nvidia.so libcuda.so libnvidia-ml.so; do
+# Always provide 580.65.06 aliases (observed in the error) for all discovered stems
+STEMS="$(
+  (
+    echo libEGL_nvidia.so; echo libGLX_nvidia.so; echo libGLESv2_nvidia.so; echo libGLESv1_CM_nvidia.so; echo libcuda.so; echo libnvidia-ml.so;
+    ls -1 lib*{nvidia,cuda}*.so* 2>/dev/null | sed -E 's#(.*\.so).*#\1#' | sort -u
+  ) | sort -u
+)"
+for stem in $STEMS; do
   tgt="${stem}.1"
   [ -e "$tgt" ] || tgt="$(ls -1 ${stem}.* 2>/dev/null | head -n1 || echo "${stem}.1")"
   [ -e "$tgt" ] || echo -n > "$tgt"
