@@ -109,8 +109,13 @@ ensure_path() {
   else
     tgt=$(ls -1 "$dir/$stem".* 2>/dev/null | xargs -r -n1 basename | sort -rV | head -n1 || true)
   fi
-  [ -z "$tgt" ] && return 0
-  ln -sf "$tgt" "$dir/$name" 2>/dev/null || true
+  if [ -z "$tgt" ]; then
+    # As a last resort, create an empty placeholder so the bind target exists
+    mkdir -p "$(dirname "$dir/$name")" 2>/dev/null || true
+    : > "$dir/$name" 2>/dev/null || true
+  else
+    ln -sf "$tgt" "$dir/$name" 2>/dev/null || true
+  fi
 }
 
 if [ -d "$MAN_DIR" ]; then
