@@ -18,6 +18,20 @@ services:
       - ./docker/nvidia-init/init.sh:/init.sh:ro
     entrypoint: ["/bin/bash","-lc","cp /init.sh /tmp/init.sh; chmod +x /tmp/init.sh; sed -i 's/\\r$//' /tmp/init.sh || true; bash /tmp/init.sh || true"]
 
+  nvidia_volume_init:
+    image: ubuntu:22.04
+    container_name: nvidia_volume_init
+    restart: "no"
+    network_mode: host
+    environment:
+      - LIBVOL=/libdir
+    volumes:
+      - nvidia_libdir:/libdir:rw
+      - /usr/share/nvidia-container-runtime/host-files-for-container.d:/host-man:ro
+      - /proc:/host-proc:ro
+      - ./docker/nvidia-init/volume_init.sh:/volume_init.sh:ro
+    entrypoint: ["/bin/bash","-lc","cp /volume_init.sh /tmp/volume_init.sh; chmod +x /tmp/volume_init.sh; sed -i 's/\\r$//' /tmp/volume_init.sh || true; bash /tmp/volume_init.sh || true"]
+
   pgvector:
     image: pgvector/pgvector:0.7.4-pg16
     container_name: pgvector_db
@@ -42,6 +56,8 @@ services:
     runtime: ${OLLAMA_RUNTIME:-nvidia}
     depends_on:
       nvidia_init:
+        condition: service_completed_successfully
+      nvidia_volume_init:
         condition: service_completed_successfully
     ports:
       - "11434:11434"
@@ -76,6 +92,8 @@ services:
     runtime: ${OLLAMA_RUNTIME:-nvidia}
     depends_on:
       nvidia_init:
+        condition: service_completed_successfully
+      nvidia_volume_init:
         condition: service_completed_successfully
     ports:
       - "11435:11434"
@@ -169,6 +187,8 @@ services:
     depends_on:
       nvidia_init:
         condition: service_completed_successfully
+      nvidia_volume_init:
+        condition: service_completed_successfully
     environment:
       - XTTS_MODEL_NAME=tts_models/multilingual/multi-dataset/xtts_v2
       - NVIDIA_VISIBLE_DEVICES=all
@@ -189,6 +209,8 @@ services:
     runtime: nvidia
     depends_on:
       nvidia_init:
+        condition: service_completed_successfully
+      nvidia_volume_init:
         condition: service_completed_successfully
     environment:
       - WHISPER_MODEL_NAME=large-v3
@@ -212,6 +234,8 @@ services:
     depends_on:
       nvidia_init:
         condition: service_completed_successfully
+      nvidia_volume_init:
+        condition: service_completed_successfully
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
     expose:
@@ -232,6 +256,8 @@ services:
       comfyui_init:
         condition: service_completed_successfully
       nvidia_init:
+        condition: service_completed_successfully
+      nvidia_volume_init:
         condition: service_completed_successfully
     runtime: nvidia
     environment:
@@ -263,6 +289,8 @@ services:
         condition: service_completed_successfully
       nvidia_init:
         condition: service_completed_successfully
+      nvidia_volume_init:
+        condition: service_completed_successfully
     runtime: nvidia
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
@@ -287,6 +315,8 @@ services:
       comfyui_init:
         condition: service_completed_successfully
       nvidia_init:
+        condition: service_completed_successfully
+      nvidia_volume_init:
         condition: service_completed_successfully
     runtime: nvidia
     environment:
@@ -381,6 +411,8 @@ services:
     depends_on:
       nvidia_init:
         condition: service_completed_successfully
+      nvidia_volume_init:
+        condition: service_completed_successfully
     environment:
       - MUSIC_MODEL_ID=facebook/musicgen-small
       - NVIDIA_VISIBLE_DEVICES=all
@@ -401,6 +433,8 @@ services:
     runtime: nvidia
     depends_on:
       nvidia_init:
+        condition: service_completed_successfully
+      nvidia_volume_init:
         condition: service_completed_successfully
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
@@ -480,6 +514,8 @@ services:
     runtime: nvidia
     depends_on:
       nvidia_init:
+        condition: service_completed_successfully
+      nvidia_volume_init:
         condition: service_completed_successfully
     environment:
       - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-}
