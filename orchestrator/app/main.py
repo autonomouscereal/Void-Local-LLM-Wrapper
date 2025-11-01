@@ -56,6 +56,7 @@ from .state.checkpoints import append_event as _append_event
 from .state.lock import acquire_lock as _acquire_lock, release_lock as _release_lock
 from .artifacts.manifest import add_manifest_row as _manifest_add_row, write_manifest_atomic as _manifest_write
 from .state.ids import step_id as _step_id
+from .research.orchestrator import run_research
 from .artifacts.shard import open_shard as _art_open_shard, append_jsonl as _art_append_jsonl, _finalize_shard as _art_finalize
 from .artifacts.shard import newest_part as _art_newest_part, list_parts as _art_list_parts
 from .artifacts.manifest import add_manifest_row as _art_manifest_add, write_manifest_atomic as _art_manifest_write
@@ -1291,16 +1292,21 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             except Exception:
                 return {"name": name, "error": r.text}
     if name == "research.run" and ALLOW_TOOL_EXECUTION:
-        base = (DRT_API_URL or "").rstrip("/")
-        if not base:
-            return {"name": name, "skipped": True, "reason": "drt service not configured"}
+        # Prefer local orchestrator; on failure, try DRT service if configured
         try:
-            async with httpx.AsyncClient(timeout=900) as client:
-                r = await client.post(base + "/research/run", json=args)
-                r.raise_for_status()
-                return {"name": name, "result": r.json()}
+            result = run_research(args if isinstance(args, dict) else {})
+            return {"name": name, "result": result}
         except Exception as ex:
-            return {"name": name, "error": str(ex)}
+            base = (DRT_API_URL or "").rstrip("/")
+            if not base:
+                return {"name": name, "error": str(ex)}
+            try:
+                async with httpx.AsyncClient(timeout=900) as client:
+                    r = await client.post(base + "/research/run", json=args)
+                    r.raise_for_status()
+                    return {"name": name, "result": r.json()}
+            except Exception as ex2:
+                return {"name": name, "error": str(ex2)}
     if name == "code.super_loop" and ALLOW_TOOL_EXECUTION:
         # Build a local provider wrapper on top of Qwen
         class _LocalProvider:
@@ -1968,6 +1974,12 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             try:
                 n = tc.get("name") or "tool"
                 args = tc.get("arguments") or {}
+                if n == "research.run":
+                    try:
+                        if isinstance(args, dict):
+                            args.setdefault("cid", trace_id)
+                    except Exception:
+                        pass
                 seed_tool = det_seed_tool(n, trace_id, master_seed)
                 tstart = time.time()
                 tr = await execute_tool_call(tc)
