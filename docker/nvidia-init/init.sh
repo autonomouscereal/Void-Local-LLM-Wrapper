@@ -36,7 +36,8 @@ if [ -n "$DRV_VER" ]; then
   PAT=$(echo "$DRV_VER" | cut -d. -f3)
   link_for() {
     local stem="$1"; shift
-    local target="$2"
+    local target="${1:-}"
+    [ -z "$target" ] && return 0
     ln -sf "$target" "$stem.$MAJ" 2>/dev/null || true
     ln -sf "$target" "$stem.$MAJ.$MIN" 2>/dev/null || true
     ln -sf "$target" "$stem.$MAJ.$MIN.$PAT" 2>/dev/null || true
