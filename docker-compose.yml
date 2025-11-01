@@ -33,6 +33,9 @@ services:
     container_name: ollama_qwen
     restart: unless-stopped
     runtime: ${OLLAMA_RUNTIME:-nvidia}
+    depends_on:
+      nvidia_init:
+        condition: service_completed_successfully
     ports:
       - "11434:11434"
     environment:
@@ -63,6 +66,9 @@ services:
     container_name: ollama_gptoss
     restart: unless-stopped
     runtime: ${OLLAMA_RUNTIME:-nvidia}
+    depends_on:
+      nvidia_init:
+        condition: service_completed_successfully
     ports:
       - "11435:11434"
     environment:
@@ -151,6 +157,9 @@ services:
     container_name: xtts_service
     restart: unless-stopped
     runtime: nvidia
+    depends_on:
+      nvidia_init:
+        condition: service_completed_successfully
     environment:
       - XTTS_MODEL_NAME=tts_models/multilingual/multi-dataset/xtts_v2
       - NVIDIA_VISIBLE_DEVICES=all
@@ -168,6 +177,9 @@ services:
     container_name: whisper_service
     restart: unless-stopped
     runtime: nvidia
+    depends_on:
+      nvidia_init:
+        condition: service_completed_successfully
     environment:
       - WHISPER_MODEL_NAME=large-v3
       - WHISPER_CPU_THREADS=8
@@ -186,6 +198,9 @@ services:
     container_name: faceid_service
     restart: unless-stopped
     runtime: nvidia
+    depends_on:
+      nvidia_init:
+        condition: service_completed_successfully
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
     expose:
@@ -203,6 +218,8 @@ services:
     restart: unless-stopped
     depends_on:
       comfyui_init:
+        condition: service_completed_successfully
+      nvidia_init:
         condition: service_completed_successfully
     runtime: nvidia
     environment:
@@ -231,6 +248,8 @@ services:
     depends_on:
       comfyui_init:
         condition: service_completed_successfully
+      nvidia_init:
+        condition: service_completed_successfully
     runtime: nvidia
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
@@ -252,6 +271,8 @@ services:
     restart: unless-stopped
     depends_on:
       comfyui_init:
+        condition: service_completed_successfully
+      nvidia_init:
         condition: service_completed_successfully
     runtime: nvidia
     environment:
@@ -342,6 +363,9 @@ services:
     container_name: music_service
     restart: unless-stopped
     runtime: nvidia
+    depends_on:
+      nvidia_init:
+        condition: service_completed_successfully
     environment:
       - MUSIC_MODEL_ID=facebook/musicgen-small
       - NVIDIA_VISIBLE_DEVICES=all
@@ -359,6 +383,9 @@ services:
     container_name: vlm_service
     restart: unless-stopped
     runtime: nvidia
+    depends_on:
+      nvidia_init:
+        condition: service_completed_successfully
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
     expose:
@@ -434,6 +461,9 @@ services:
     container_name: film2_service
     restart: unless-stopped
     runtime: nvidia
+    depends_on:
+      nvidia_init:
+        condition: service_completed_successfully
     environment:
       - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-}
       - NVIDIA_VISIBLE_DEVICES=all
