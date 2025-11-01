@@ -169,11 +169,7 @@ ALLOW_TOOL_EXECUTION = AUTO_EXECUTE_TOOLS if os.getenv("ALLOW_TOOL_EXECUTION") i
 STREAM_CHUNK_SIZE_CHARS = int(os.getenv("STREAM_CHUNK_SIZE_CHARS", "0"))
 STREAM_CHUNK_INTERVAL_MS = int(os.getenv("STREAM_CHUNK_INTERVAL_MS", "50"))
 JOBS_RAG_INDEX = os.getenv("JOBS_RAG_INDEX", "true").lower() == "true"
-# Defensive bounds
-MAX_INPUT_CHARS = int(os.getenv("MAX_INPUT_CHARS", "20000"))
-MAX_TOOL_OUTPUT_CHARS = int(os.getenv("MAX_TOOL_OUTPUT_CHARS", "40000"))
-MAX_MESSAGES = int(os.getenv("MAX_MESSAGES", "50"))
-MAX_TOOL_CALLS = int(os.getenv("MAX_TOOL_CALLS", "6"))
+# No caps — never enforce caps inline
 
 # RAG configuration (pgvector)
 POSTGRES_HOST = os.getenv("POSTGRES_HOST")
@@ -2026,24 +2022,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     # Validate body
     if not isinstance(body, dict) or not isinstance(body.get("messages"), list):
         return JSONResponse(status_code=400, content={"error": "bad_request", "detail": "messages must be a list"})
-    # Defensive bounds: messages count and total chars
-    try:
-        raw_msgs = body.get("messages") or []
-        if len(raw_msgs) > MAX_MESSAGES:
-            return JSONResponse(status_code=400, content={"error": "too_many_messages", "detail": f">{MAX_MESSAGES}"})
-        total_chars = 0
-        for m in raw_msgs:
-            c = m.get("content")
-            if isinstance(c, str):
-                total_chars += len(c)
-            elif isinstance(c, list):
-                for part in c:
-                    if isinstance(part, dict) and part.get("type") == "text":
-                        total_chars += len(str(part.get("text") or ""))
-        if total_chars > MAX_INPUT_CHARS:
-            return JSONResponse(status_code=400, content={"error": "input_too_large", "detail": f">{MAX_INPUT_CHARS} chars"})
-    except Exception:
-        pass
+    # No caps — never enforce caps inline (no message count/size caps here)
     try:
         body["messages"] = nfc_msgs(body.get("messages") or [])
     except Exception:
@@ -2365,9 +2344,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     _ledger_shard = None
     _ledger_root = os.path.join(UPLOAD_DIR, "artifacts", "runs", trace_id)
     _ledger_name = "ledger"
-    # Enforce tool call budget
-    if tool_calls and len(tool_calls) > MAX_TOOL_CALLS:
-        return JSONResponse(status_code=429, content={"error": "tool_budget_exceeded", "detail": f">{MAX_TOOL_CALLS} tool calls"})
+    # No caps — never enforce caps inline (no tool call limit enforced)
     if tool_calls:
         for tc in tool_calls[:5]:
             try:
@@ -2387,15 +2364,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 tstart = time.time()
                 tr = await execute_tool_call(tc)
                 duration_ms = int(round((time.time() - tstart) * 1000))
-                # Clamp potentially large string outputs in tool result
-                try:
-                    if isinstance(tr, dict) and isinstance(tr.get("result"), dict):
-                        resd = tr.get("result")
-                        prev = resd.get("preview")
-                        if isinstance(prev, str) and len(prev) > MAX_TOOL_OUTPUT_CHARS:
-                            resd["preview"] = prev[:MAX_TOOL_OUTPUT_CHARS] + "\n... [truncated]"
-                except Exception:
-                    pass
+                # No caps — never enforce caps inline (no output truncation)
                 tool_results.append(tr)
                 # persist to DB
                 try:
