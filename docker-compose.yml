@@ -20,7 +20,6 @@ services:
     image: ollama/ollama:latest
     container_name: ollama_qwen
     restart: unless-stopped
-    runtime: nvidia
     gpus: "all"
     ports:
       - "11434:11434"
@@ -29,6 +28,7 @@ services:
       - OLLAMA_KEEP_ALIVE=24h
       - NVIDIA_VISIBLE_DEVICES=0
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - NVIDIA_DISABLE_REQUIRE=1
     volumes:
       - ollama_qwen_data:/root/.ollama
     healthcheck:
@@ -51,7 +51,6 @@ services:
     image: ollama/ollama:latest
     container_name: ollama_gptoss
     restart: unless-stopped
-    runtime: nvidia
     gpus: "all"
     ports:
       - "11435:11434"
@@ -60,6 +59,7 @@ services:
       - OLLAMA_KEEP_ALIVE=24h
       - NVIDIA_VISIBLE_DEVICES=1
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - NVIDIA_DISABLE_REQUIRE=1
     volumes:
       - ollama_gptoss_data:/root/.ollama
     healthcheck:
@@ -75,7 +75,7 @@ services:
       ollama_gptoss:
         condition: service_started
     environment:
-      - GPTOSS_MODEL_ID=${GPTOSS_MODEL_ID:-gpt-oss:20b-q5_K_M}
+      - GPTOSS_MODEL_ID=${GPTOSS_MODEL_ID}
     command: ["sh","-lc","until curl -s http://ollama_gptoss:11434/api/tags >/dev/null; do sleep 2; done; curl -s -X POST http://ollama_gptoss:11434/api/pull -H 'Content-Type: application/json' -d '{\"name\":\"${GPTOSS_MODEL_ID}\"}'"]
 
   orchestrator:
@@ -95,7 +95,7 @@ services:
       - QWEN_BASE_URL=http://ollama_qwen:11434
       - QWEN_MODEL_ID=${QWEN_MODEL_ID:-qwen3:32b-instruct-q4_K_M}
       - GPTOSS_BASE_URL=http://ollama_gptoss:11434
-      - GPTOSS_MODEL_ID=${GPTOSS_MODEL_ID:-gpt-oss:20b-q5_K_M}
+      - GPTOSS_MODEL_ID=${GPTOSS_MODEL_ID}
       - DEFAULT_NUM_CTX=${DEFAULT_NUM_CTX:-4096}
       - DEFAULT_TEMPERATURE=${DEFAULT_TEMPERATURE:-0.3}
       - ENABLE_WEBSEARCH=${ENABLE_WEBSEARCH:-true}
@@ -140,8 +140,12 @@ services:
       dockerfile: Dockerfile
     container_name: xtts_service
     restart: unless-stopped
+    gpus: "all"
     environment:
       - XTTS_MODEL_NAME=tts_models/multilingual/multi-dataset/xtts_v2
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - NVIDIA_DISABLE_REQUIRE=1
     expose:
       - "8020"
     ports:
@@ -153,9 +157,13 @@ services:
       dockerfile: Dockerfile
     container_name: whisper_service
     restart: unless-stopped
+    gpus: "all"
     environment:
       - WHISPER_MODEL_NAME=large-v3
       - WHISPER_CPU_THREADS=8
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - NVIDIA_DISABLE_REQUIRE=1
     expose:
       - "9090"
     ports:
@@ -167,6 +175,11 @@ services:
       dockerfile: Dockerfile
     container_name: faceid_service
     restart: unless-stopped
+    gpus: "all"
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - NVIDIA_DISABLE_REQUIRE=1
     expose:
       - "7000"
     ports:
@@ -181,6 +194,11 @@ services:
     depends_on:
       comfyui_init:
         condition: service_completed_successfully
+    gpus: "all"
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - NVIDIA_DISABLE_REQUIRE=1
     expose:
       - "8188"
     ports:
@@ -204,6 +222,11 @@ services:
     depends_on:
       comfyui_init:
         condition: service_completed_successfully
+    gpus: "all"
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - NVIDIA_DISABLE_REQUIRE=1
     expose:
       - "8188"
     ports:
@@ -222,6 +245,11 @@ services:
     depends_on:
       comfyui_init:
         condition: service_completed_successfully
+    gpus: "all"
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - NVIDIA_DISABLE_REQUIRE=1
     expose:
       - "8188"
     ports:
@@ -306,8 +334,12 @@ services:
       dockerfile: Dockerfile
     container_name: music_service
     restart: unless-stopped
+    gpus: "all"
     environment:
       - MUSIC_MODEL_ID=facebook/musicgen-small
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - NVIDIA_DISABLE_REQUIRE=1
     expose:
       - "7860"
     ports:
@@ -319,6 +351,11 @@ services:
       dockerfile: Dockerfile
     container_name: vlm_service
     restart: unless-stopped
+    gpus: "all"
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - NVIDIA_DISABLE_REQUIRE=1
     expose:
       - "8050"
     ports:
@@ -389,8 +426,12 @@ services:
       dockerfile: Dockerfile
     container_name: film2_service
     restart: unless-stopped
+    gpus: "all"
     environment:
       - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-}
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - NVIDIA_DISABLE_REQUIRE=1
     expose:
       - "8090"
     ports:
