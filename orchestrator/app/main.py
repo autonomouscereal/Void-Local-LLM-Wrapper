@@ -52,6 +52,8 @@ from .router.route import route_for_request
 from .ablation.core import ablate as ablate_env
 from .ablation.export import write_facts_jsonl as ablate_write_facts
 from .code_loop.super_loop import run_super_loop
+from .state.checkpoints import append_event as _append_event
+from .state.lock import acquire_lock as _acquire_lock, release_lock as _release_lock
 async def _db_insert_run(trace_id: str, mode: str, seed: int, pack_hash: Optional[str], request_json: Dict[str, Any]) -> Optional[int]:
     try:
         pool = await get_pg_pool()
@@ -181,6 +183,9 @@ ICW_API_URL = os.getenv("ICW_API_URL", "http://icw:8085")
 ICW_DISABLE = os.getenv("ICW_DISABLE", "0") == "1"
 WRAPPER_CONFIG: Dict[str, Any] = {}
 WRAPPER_CONFIG_HASH: Optional[str] = None
+DRT_API_URL = os.getenv("DRT_API_URL", "http://drt:8086")
+STATE_DIR = os.path.join(UPLOAD_DIR, "state")
+os.makedirs(STATE_DIR, exist_ok=True)
 
 
 def _sha256_bytes(b: bytes) -> str:
@@ -973,6 +978,13 @@ def get_builtin_tools_schema() -> List[Dict[str, Any]]:
         {
             "type": "function",
             "function": {
+                "name": "research.run",
+                "parameters": {"type": "object", "properties": {"query": {"type": "string"}, "scope": {"type": "string"}}, "required": ["query"]}
+            }
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "code.super_loop",
                 "parameters": {"type": "object", "properties": {"task": {"type": "string"}, "repo_root": {"type": "string"}}, "required": ["task"]}
             }
@@ -1269,6 +1281,17 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 return {"name": name, "result": r.json()}
             except Exception:
                 return {"name": name, "error": r.text}
+    if name == "research.run" and ALLOW_TOOL_EXECUTION:
+        base = (DRT_API_URL or "").rstrip("/")
+        if not base:
+            return {"name": name, "skipped": True, "reason": "drt service not configured"}
+        try:
+            async with httpx.AsyncClient(timeout=900) as client:
+                r = await client.post(base + "/research/run", json=args)
+                r.raise_for_status()
+                return {"name": name, "result": r.json()}
+        except Exception as ex:
+            return {"name": name, "error": str(ex)}
     if name == "code.super_loop" and ALLOW_TOOL_EXECUTION:
         # Build a local provider wrapper on top of Qwen
         class _LocalProvider:
@@ -1652,6 +1675,16 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     master_seed = provided_seed if provided_seed is not None else _derive_seed("chat", msgs_for_seed)
     import hashlib as _hl
     trace_id = "tt_" + _hl.sha256(msgs_for_seed.encode("utf-8")).hexdigest()[:16]
+    # Acquire per-trace lock and record start event
+    _lock_token = None
+    try:
+        _lock_token = _acquire_lock(STATE_DIR, trace_id, timeout_s=10)
+    except Exception:
+        _lock_token = None
+    try:
+        _append_event(STATE_DIR, trace_id, "start", {"seed": int(master_seed), "mode": mode})
+    except Exception:
+        pass
 
     # ICW pack (always-on, unless ICW_DISABLE=1) — inline; record pack_hash for traces
     pack_hash = None
@@ -1721,12 +1754,18 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         ctx_limit = DEFAULT_NUM_CTX
         step_out = int(os.getenv("ICW_STEP_TOKENS", "900") or 900)
         provider = _SyncOllamaProvider(QWEN_BASE_URL, QWEN_MODEL_ID, ctx_limit, body.get("temperature") or DEFAULT_TEMPERATURE)
+        def _progress(step: int, kind: str, info: Dict[str, Any] | None = None):
+            try:
+                _append_event(STATE_DIR, trace_id, f"window_{kind}", {"step": int(step), **(info or {})})
+            except Exception:
+                pass
         result = windowed_solve(
             request={"content": last_user_text},
             global_state=state,
             model=provider,
             model_ctx_limit_tokens=ctx_limit,
             step_out_tokens=step_out,
+            progress=_progress,
         )
         # Normalize envelopes (optional log material)
         step_envs = [normalize_to_envelope(p) for p in (result.partials or [])]
@@ -1763,12 +1802,27 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             response["envelope"] = final_env
         # Persist response & metrics
         await _db_update_run_response(run_id, response, usage)
+        # Record finalization for state tracking
+        try:
+            _append_event(STATE_DIR, trace_id, "halt", {"kind": "windowed", "chars": len(final_text)})
+        except Exception:
+            pass
         if body.get("stream"):
             async def _stream_once():
                 chunk = json.dumps({"id": response["id"], "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"role": "assistant", "content": final_text}, "finish_reason": None}]})
                 yield f"data: {chunk}\n\n"
                 yield "data: [DONE]\n\n"
+            try:
+                if _lock_token:
+                    _release_lock(STATE_DIR, trace_id)
+            except Exception:
+                pass
             return StreamingResponse(_stream_once(), media_type="text/event-stream")
+        try:
+            if _lock_token:
+                _release_lock(STATE_DIR, trace_id)
+        except Exception:
+            pass
         return JSONResponse(content=response)
 
     # Optional self-ask-with-search augmentation
@@ -1857,10 +1911,20 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 chunk = json.dumps({"id": response["id"], "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": tool_calls_openai}, "finish_reason": None}]})
                 yield f"data: {chunk}\n\n"
                 yield "data: [DONE]\n\n"
+            try:
+                if _lock_token:
+                    _release_lock(STATE_DIR, trace_id)
+            except Exception:
+                pass
             return StreamingResponse(_stream_once(), media_type="text/event-stream")
         # include usage estimate even in tool_calls path (no completion tokens yet)
         response["usage"] = estimate_usage(messages, "")
         response["seed"] = master_seed
+        try:
+            if _lock_token:
+                _release_lock(STATE_DIR, trace_id)
+        except Exception:
+            pass
         return JSONResponse(content=response)
 
     # 2) Optionally execute tools
@@ -1891,6 +1955,11 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 # persist to DB
                 try:
                     await _db_insert_tool_call(run_id, n, seed_tool, args if isinstance(args, dict) else {"_raw": args}, tr if isinstance(tr, dict) else {}, duration_ms)
+                except Exception:
+                    pass
+                # append checkpoint event
+                try:
+                    _append_event(STATE_DIR, trace_id, "tool_call", {"name": n, "duration_ms": int(duration_ms), "ok": (not (isinstance(tr, dict) and tr.get("error")))})
                 except Exception:
                     pass
                 # extract artifacts minimally for trace policy
@@ -1942,6 +2011,11 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             "qwen": {k: v for k, v in qwen_result.items() if k in ("error", "_base_url")},
             "gptoss": {k: v for k, v in gptoss_result.items() if k in ("error", "_base_url")},
         }
+        try:
+            if _lock_token:
+                _release_lock(STATE_DIR, trace_id)
+        except Exception:
+            pass
         return JSONResponse(status_code=502, content={"error": "backend_failed", "detail": detail})
 
     qwen_text = qwen_result.get("response", "")
@@ -2212,6 +2286,15 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             done = json.dumps({"id": "orc-1", "object": "chat.completion.chunk", "created": int(time.time()), "model": model_id, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})
             yield f"data: {done}\n\n"
             yield "data: [DONE]\n\n"
+        try:
+            _append_event(STATE_DIR, trace_id, "halt", {"kind": "committee", "chars": len(final_text)})
+        except Exception:
+            pass
+        try:
+            if _lock_token:
+                _release_lock(STATE_DIR, trace_id)
+        except Exception:
+            pass
         return StreamingResponse(_stream_with_stages(final_text), media_type="text/event-stream")
 
     # Merge exact usages if available, else approximate
@@ -2525,6 +2608,15 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         pass
     # Persist response & metrics
     await _db_update_run_response(run_id, response, usage)
+    try:
+        _append_event(STATE_DIR, trace_id, "halt", {"kind": "committee", "chars": len(display_content)})
+    except Exception:
+        pass
+    try:
+        if _lock_token:
+            _release_lock(STATE_DIR, trace_id)
+    except Exception:
+        pass
     return JSONResponse(content=response)
 
 
