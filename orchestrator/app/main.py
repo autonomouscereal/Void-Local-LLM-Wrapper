@@ -195,6 +195,9 @@ STATE_DIR = os.path.join(UPLOAD_DIR, "state")
 os.makedirs(STATE_DIR, exist_ok=True)
 ARTIFACT_SHARD_BYTES = int(os.getenv("ARTIFACT_SHARD_BYTES", "200000"))
 ARTIFACT_LATEST_ONLY = os.getenv("ARTIFACT_LATEST_ONLY", "true").lower() == "true"
+SPOOL_RAM_LIMIT = int(os.getenv("SPOOL_RAM_LIMIT", "524288"))
+SPOOL_SPILL_THRESHOLD = int(os.getenv("SPOOL_SPILL_THRESHOLD", "262144"))
+EVENT_BUFFER_MAX = int(os.getenv("EVENT_BUFFER_MAX", "100"))
 ARTIFACT_SHARD_BYTES = int(os.getenv("ARTIFACT_SHARD_BYTES", "200000"))
 ARTIFACT_LATEST_ONLY = os.getenv("ARTIFACT_LATEST_ONLY", "true").lower() == "true"
 

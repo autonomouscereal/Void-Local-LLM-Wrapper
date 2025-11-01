@@ -16,6 +16,8 @@ from .judge import judge_findings
 from .report import make_report
 from ..jobs.state import create_job, set_state, get_job
 from ..jobs.progress import event as progress_event
+from ..jobs.partials import emit_partial
+from ..ops.timeout_retry import run_phase_with_timeout, PhaseTimeout
 
 
 RAG_TTL = int(os.getenv("RAG_TTL_SECONDS", "3600"))
@@ -50,15 +52,26 @@ def run_research(job: Dict[str, Any]) -> Dict[str, Any]:
     if jid:
         try:
             set_state(jid, "running", phase="normalize", progress=0.2)
+            _append_job_event(jid, progress_event("running", "discover", 0.2, artifacts=[]))
         except Exception:
             pass
 
-    # Phase: normalize → Evidence Ledger
-    ledger_rows = normalize_sources(sources)
+    # Phase: normalize → Evidence Ledger (with timeout)
+    try:
+        ledger_rows, _attempts_norm, _elapsed_norm = run_phase_with_timeout(
+            fn=normalize_sources,
+            args={"sources": sources},
+            timeout_s=int(os.getenv("RESEARCH_NORMALIZE_TIMEOUT", "120")),
+        )
+    except (PhaseTimeout, Exception):
+        if jid:
+            emit_partial(jid, "normalize", {**manifest, "root": root}, lambda ev: _append_job_event(jid, ev))
+        return {"phase": "cancelled", "artifacts": manifest.get("items", []), "cid": cid}
     sh = open_shard(root, "ledger", max_bytes=int(os.getenv("ARTIFACT_SHARD_BYTES", "200000")))
     for row in ledger_rows:
         if jid and (get_job(jid) and get_job(jid).cancel_flag):
             set_state(jid, "cancelled", phase="normalize", progress=0.0)
+            _append_job_event(jid, progress_event("cancelled", "normalize", 0.0, artifacts=[]))
             write_manifest_atomic(root, manifest)
             return {"phase": "cancelled", "artifacts": manifest.get("items", []), "cid": cid}
         sh = append_jsonl(sh, row)
@@ -67,17 +80,28 @@ def run_research(job: Dict[str, Any]) -> Dict[str, Any]:
     if jid:
         try:
             set_state(jid, "running", phase="analyze", progress=0.4)
+            _append_job_event(jid, progress_event("running", "normalize", 0.4, artifacts=[{"path": os.path.join(root, "ledger.index.json")}]))
         except Exception:
             pass
 
-    # Phase: analyze → Money Map
-    edges = extract_edges(ledger_rows, query=q)
+    # Phase: analyze → Money Map (with timeout)
+    try:
+        edges, _attempts_an, _elapsed_an = run_phase_with_timeout(
+            fn=extract_edges,
+            args={"ledger_rows": ledger_rows, "query": q},
+            timeout_s=int(os.getenv("RESEARCH_ANALYZE_TIMEOUT", "120")),
+        )
+    except (PhaseTimeout, Exception):
+        if jid:
+            emit_partial(jid, "analyze", {**manifest, "root": root}, lambda ev: _append_job_event(jid, ev))
+        return {"phase": "cancelled", "artifacts": manifest.get("items", []), "cid": cid}
     money_map = build_money_map(edges)
     _write_json_atomic(os.path.join(root, "money_map.json"), money_map)
     add_manifest_row(manifest, os.path.join(root, "money_map.json"), step_id="analyze")
     if jid:
         try:
             set_state(jid, "running", phase="timeline", progress=0.6)
+            _append_job_event(jid, progress_event("running", "analyze", 0.6, artifacts=[{"path": os.path.join(root, "money_map.json")}]))
         except Exception:
             pass
 
@@ -88,6 +112,7 @@ def run_research(job: Dict[str, Any]) -> Dict[str, Any]:
     if jid:
         try:
             set_state(jid, "running", phase="judge", progress=0.75)
+            _append_job_event(jid, progress_event("running", "timeline", 0.75, artifacts=[{"path": os.path.join(root, "timeline.json")}]))
         except Exception:
             pass
 
@@ -98,6 +123,7 @@ def run_research(job: Dict[str, Any]) -> Dict[str, Any]:
     if jid:
         try:
             set_state(jid, "running", phase="report", progress=0.9)
+            _append_job_event(jid, progress_event("running", "judge", 0.9, artifacts=[{"path": os.path.join(root, "judge.json")}]))
         except Exception:
             pass
 
@@ -110,9 +136,24 @@ def run_research(job: Dict[str, Any]) -> Dict[str, Any]:
     if jid:
         try:
             set_state(jid, "done", phase="done", progress=1.0)
+            _append_job_event(jid, progress_event("done", "done", 1.0, artifacts=[{"path": os.path.join(root, "report.json")}]))
         except Exception:
             pass
     return {"phase": "done", "artifacts": manifest.get("items", []), "cid": cid}
+
+
+def _append_job_event(jid: str, ev: Dict[str, Any]) -> None:
+    try:
+        uploads = os.path.join("/workspace", "uploads")
+        d = os.path.join(uploads, "jobs", str(jid))
+        os.makedirs(d, exist_ok=True)
+        p = os.path.join(d, "events.jsonl")
+        line = json.dumps(ev, ensure_ascii=False) + "\n"
+        with open(p, "ab") as f:
+            f.write(line.encode("utf-8"))
+            f.flush(); os.fsync(f.fileno())
+    except Exception:
+        return
 
 
 def _write_json_atomic(path: str, obj: dict) -> None:
