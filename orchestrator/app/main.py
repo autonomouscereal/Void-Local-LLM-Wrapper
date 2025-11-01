@@ -924,6 +924,13 @@ def get_builtin_tools_schema() -> List[Dict[str, Any]]:
         {
             "type": "function",
             "function": {
+                "name": "rag_search",
+                "parameters": {"type": "object", "properties": {"query": {"type": "string"}, "k": {"type": "integer"}}, "required": ["query"]}
+            }
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "web_search",
                 "parameters": {"type": "object", "properties": {"q": {"type": "string"}}, "required": ["q"]}
             }
@@ -940,6 +947,34 @@ def get_builtin_tools_schema() -> List[Dict[str, Any]]:
             "function": {
                 "name": "metasearch.fuse",
                 "parameters": {"type": "object", "properties": {"q": {"type": "string"}, "k": {"type": "integer"}}, "required": ["q"]}
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "image.dispatch",
+                "parameters": {"type": "object", "properties": {"mode": {"type": "string"}, "prompt": {"type": "string"}, "scale": {"type": "integer"}}, "required": []}
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "music.dispatch",
+                "parameters": {"type": "object", "properties": {"prompt": {"type": "string"}}, "required": []}
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "tts_speak",
+                "parameters": {"type": "object", "properties": {"text": {"type": "string"}, "voice": {"type": "string"}}, "required": ["text"]}
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "code.super_loop",
+                "parameters": {"type": "object", "properties": {"task": {"type": "string"}, "repo_root": {"type": "string"}}, "required": ["task"]}
             }
         }
     ]
@@ -1639,7 +1674,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     # If client supplies tool results (role=tool) we include them verbatim for the planner/executors
 
     # Optional Windowed Solver path (capless sliding window + CONT/HALT)
-    route_mode = os.getenv("ICW_MODE", "off").lower()
+    route_mode = os.getenv("ICW_MODE", "windowed").lower()
     if route_mode == "windowed":
         # Build minimal state
         anchor_msgs = []

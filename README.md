@@ -1,7 +1,7 @@
 Void Local LLM Committee (Qwen3-32B + GPT-OSS 20B)
 ===================================================
 
-This repository brings up two Ollama services (Qwen and GPT-OSS), a sandboxed Executor, and a FastAPI orchestrator that exposes an OpenAI-compatible endpoint `/v1/chat/completions` which consults both models and synthesizes a final answer.
+This repository brings up two Ollama services (Qwen and GPT-OSS), a sandboxed Executor, and a FastAPI orchestrator that exposes an OpenAI-compatible endpoint `/v1/chat/completions` which consults both models and synthesizes a final answer. By default the orchestrator runs a capless sliding WindowedSolver (CONT/HALT) with JSON-only normalization, deterministic routing, RAG hygiene, and an ablation step that emits training-ready facts.
 
 Prerequisites
 -------------
@@ -22,6 +22,17 @@ Quick Start
    - `ENABLE_WEBSEARCH` default: `true`
    - `AUTO_EXECUTE_TOOLS` default: `true`
    - `SERPAPI_API_KEY` set to enable web search
+   - ICW/Ablation defaults (safe):
+     - `ICW_MODE=windowed`
+     - `ICW_STEP_TOKENS=900`
+     - `ABLATE=on`
+     - `ABLATE_EXPORT=on`
+   - RAG hygiene:
+     - `RAG_TTL_SECONDS=3600`
+     - `RAG_EVIDENCE_MAX=6`
+   - Code Loop:
+     - `CODE_LOOP_STEP_TOKENS=900`
+     - `REPO_ROOT=/workspace`
 
 2. Start services:
    ```bash
@@ -53,6 +64,15 @@ Point your client (e.g., Void or OpenAI SDK) to `http://localhost:8000` and call
   - `AUTO_EXECUTE_TOOLS=true` (default) → backend executes supported tools automatically.
   - Set `AUTO_EXECUTE_TOOLS=false` only if you want the client to receive `tool_calls` and execute tools itself.
 
+- Deterministic routing (server-side):
+  - Film → `film.run`
+  - RAG → `rag_search`
+  - Deep research → `research.run` (router decision; tool optional)
+  - Images → `image.dispatch` (gen/edit/upscale)
+  - TTS → `tts_speak`
+  - Music → `music.dispatch`
+  - Code tasks → `code.super_loop` (Architect→Implementer→Reviewer, returns `patch.diff`)
+
 
 Single‑prompt film example (server orchestrates tools automatically):
 ```bash
@@ -79,7 +99,13 @@ Notes
   - Film tools: Film‑1 removed. A single internal Film‑2 orchestrator is used (`film.run`).
   - Preferences: duration_seconds, resolution, fps, style, language, voice, quality, audio_enabled (default true), subtitles_enabled (default false), animation_enabled (default true)
   - MCP bridge: set `MCP_HTTP_BRIDGE_URL` to forward unknown tool calls prefixed with `mcp:` to your MCP HTTP server.
-  - RAG tools (pgvector): `rag_index` (index `/workspace` into Postgres+pgvector), `rag_search` (retrieve top-k chunks).
+- RAG tools (pgvector): `rag_index` (index `/workspace` into Postgres+pgvector), `rag_search` (retrieve top-k chunks). RAG hygiene filters duplicates and applies TTL; an `[Evidence]` footer is appended near the end of the packed prompt.
+
+- WindowedSolver (default): Capless sliding window with CONT/HALT tags. Continuation is robust (fallback CONT, last-fragment repeat); a gentle governor adapts step size; a stall detector triggers a one-shot reframe.
+
+- JSON-only normalization & stitch: Every step/tool is normalized to a canonical envelope and stitched; the final OpenAI-compatible response includes an `envelope` field for internal use.
+
+- Ablation: After HALT, grounded facts are extracted and exported to `uploads/ablation/<trace_id>/facts_<trace_id>.jsonl`. A URI pointer is attached under `artifacts.ablation_facts`.
 
 Jobs API (ComfyUI long-running workflows)
 -----------------------------------------
@@ -99,7 +125,7 @@ Model keep-alive
 
 Persistence & RAG
 -----------------
-- Jobs persist to Postgres (`jobs`, `job_checkpoints` tables). On completion, if `JOBS_RAG_INDEX=true` (default), the job workflow and result are embedded into `rag_docs` for retrieval.
+- Jobs persist to Postgres (`jobs`, `job_checkpoints` tables). On completion, if `JOBS_RAG_INDEX=true` (default), the job workflow and result are embedded into `rag_docs` for retrieval. Additionally, append-only JSONL checkpoints under `uploads/<cid>/trace.jsonl` can be used to reconstruct solver state (resume WindowedSolver) and Film‑2 phase markers.
 
 Film‑2 pipeline (LLM-driven)
 ----------------------------
@@ -166,4 +192,14 @@ Model defaults
 - Ablation judge/compressor is routed to Qwen‑3 (via `ABLCODER_URL`).
 - Jobs persist as failed even on submit/network errors so the UI never shows an empty queue during errors.
 
+Project structure (high-level)
+------------------------------
+- `orchestrator/app/icw/` — WindowedSolver, continuation, CAC assembler, reframe
+- `orchestrator/app/jsonio/` — JSON envelope normalization & stitch
+- `orchestrator/app/router/` — deterministic intent predicates & args builders
+- `orchestrator/app/rag/` — RAG hygiene (TTL, de-dup, evidence footer)
+- `orchestrator/app/ablation/` — facts extractor + exporter
+- `orchestrator/app/film2/` — Film‑2 state machine (clarify, bibles, planner, QA, refs, resume, artifacts)
+- `orchestrator/app/code_loop/` — Coding Super‑Loop (Architect→Implementer→Reviewer)
+- `orchestrator/app/state/` — ids, locks, checkpoints (append-only), resume helpers
 
