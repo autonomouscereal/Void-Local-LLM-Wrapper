@@ -19,6 +19,7 @@ RESEARCH_KEYS = [
 IMAGE_KEYS = ["image", "picture", "render", "upscale", "edit", "inpaint", "outpaint", "png", "jpg"]
 TTS_KEYS = ["tts", "voiceover", "narrate", "read this", "text to speech", "voice over"]
 MUSIC_KEYS = ["music", "compose", "instrumental", "song", "track", "bpm", "stems", "variation"]
+CODE_KEYS = ["patch", "diff", "modify file", "add endpoint", "refactor", "unified diff"]
 
 
 def _contains_any(text: str, keys: list[str]) -> bool:
@@ -51,5 +52,9 @@ def looks_like_tts(req_text: str) -> bool:
 
 def looks_like_music(req_text: str) -> bool:
     return _contains_any(req_text, MUSIC_KEYS)
+
+
+def looks_like_code_task(req_text: str) -> bool:
+    return _contains_any(req_text, CODE_KEYS)
 
 

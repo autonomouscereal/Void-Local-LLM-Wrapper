@@ -9,6 +9,7 @@ from .predicates import (
     looks_like_image,
     looks_like_tts,
     looks_like_music,
+    looks_like_code_task,
 )
 from .args_builders import (
     build_film_args,
@@ -41,6 +42,8 @@ def _last_user_text(req: Dict[str, Any]) -> str:
 
 def route_for_request(req: Dict[str, Any]) -> RouteDecision:
     t = _last_user_text(req)
+    if looks_like_code_task(t):
+        return RouteDecision(kind="tool", tool="code.super_loop", args={"task": t, "repo_root": os.getenv("REPO_ROOT", "/workspace")}, reason="code-intent")
     if looks_like_film(t):
         return RouteDecision(kind="tool", tool="film.run", args=build_film_args(t), reason="film-intent")
     if looks_like_research(t):

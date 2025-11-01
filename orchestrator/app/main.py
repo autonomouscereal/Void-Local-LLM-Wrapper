@@ -51,6 +51,7 @@ from .jsonio.stitch import merge_envelopes as stitch_merge_envelopes, stitch_ope
 from .router.route import route_for_request
 from .ablation.core import ablate as ablate_env
 from .ablation.export import write_facts_jsonl as ablate_write_facts
+from .code_loop.super_loop import run_super_loop
 async def _db_insert_run(trace_id: str, mode: str, seed: int, pack_hash: Optional[str], request_json: Dict[str, Any]) -> Optional[int]:
     try:
         pool = await get_pg_pool()
@@ -1233,6 +1234,34 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 return {"name": name, "result": r.json()}
             except Exception:
                 return {"name": name, "error": r.text}
+    if name == "code.super_loop" and ALLOW_TOOL_EXECUTION:
+        # Build a local provider wrapper on top of Qwen
+        class _LocalProvider:
+            def __init__(self, base_url: str, model_id: str, num_ctx: int, temperature: float):
+                self.base_url = base_url
+                self.model_name = model_id
+                self.num_ctx = num_ctx
+                self.temperature = temperature
+            def chat(self, prompt: str, max_tokens: int):
+                payload = build_ollama_payload([{"role": "user", "content": prompt}], self.model_name, self.num_ctx, self.temperature)
+                opts = dict(payload.get("options") or {})
+                opts["num_predict"] = max(1, int(max_tokens or 900))
+                payload["options"] = opts
+                # reuse async call_ollama via blocking run
+                import requests as _rq
+                try:
+                    r = _rq.post(self.base_url.rstrip("/") + "/api/generate", json=payload, timeout=60)
+                    r.raise_for_status()
+                    js = r.json()
+                    return SimpleNamespace(text=str(js.get("response", "")), model_name=self.model_name)
+                except Exception:
+                    return SimpleNamespace(text="{}", model_name=self.model_name)
+        repo_root = os.getenv("REPO_ROOT", "/workspace")
+        step_tokens = int(os.getenv("CODE_LOOP_STEP_TOKENS", "900") or 900)
+        prov = _LocalProvider(QWEN_BASE_URL, QWEN_MODEL_ID, DEFAULT_NUM_CTX, DEFAULT_TEMPERATURE)
+        task = args.get("task") or ""
+        env = run_super_loop(task=task, repo_root=repo_root, model=prov, step_tokens=step_tokens)
+        return {"name": name, "result": env}
     if name == "web_search" and ENABLE_WEBSEARCH and SERPAPI_API_KEY and ALLOW_TOOL_EXECUTION:
         query = args.get("q") or args.get("query") or ""
         if not query:
