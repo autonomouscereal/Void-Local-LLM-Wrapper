@@ -62,6 +62,12 @@ from .jsonio.versioning import bump_envelope as _env_bump, assert_envelope as _e
 from .determinism.seeds import stamp_envelope as _env_stamp, stamp_tool_args as _tool_stamp
 from .ops.health import get_capabilities as _get_caps, get_health as _get_health
 from .refs.api import post_refs_save as _refs_save, post_refs_refine as _refs_refine, get_refs_list as _refs_list, post_refs_apply as _refs_apply
+from .datasets.api import post_datasets_start as _datasets_start, get_datasets_list as _datasets_list, get_datasets_versions as _datasets_versions, get_datasets_index as _datasets_index
+from .jobs.state import create_job as _orcjob_create, set_state as _orcjob_set_state
+from .admin.api import get_jobs_list as _admin_jobs_list, get_jobs_replay as _admin_jobs_replay, post_artifacts_gc as _admin_gc
+from .ops.unicode import nfc_msgs
+from .admin.prompts import _id_of as _prompt_id_of, save_prompt as _save_prompt, list_prompts as _list_prompts
+from .state.checkpoints import append_ndjson as _append_jsonl, read_tail as _read_tail
 from .tools_image.gen import run_image_gen
 from .tools_image.edit import run_image_edit
 from .tools_image.upscale import run_image_upscale
@@ -323,35 +329,18 @@ def _write_json_atomic(path: str, obj: Any) -> Dict[str, Any]:
 
 @app.get("/capabilities.json")
 async def capabilities():
-    return {
-        "openai_compat": True,
-        "endpoints": {
-            "run": "/run",
-            "film": {
-                "plan": "/film/plan",
-                "breakdown": "/film/breakdown",
-                "storyboard": "/film/storyboard",
-                "animatic": "/film/animatic",
-                "final": "/film/final",
-                "qc": "/film/qc",
-                "export": "/film/export"
-            },
-            "ablation": "/ablate",
-            "teacher": {
-                "enable": "/teacher/trace.enable",
-                "flush": "/teacher/trace.flush",
-                "ingest": "/teacher/trainset.ingest"
-            }
-        },
-        "tools": ["film.run","web_search","source_fetch","metasearch.fuse"],
-        "versions": {
-            "icw": "1.0.0",
-            "film": "2.0.0",
-            "ablation": "1.0.0",
-            "teacher": "1.0.0"
-        },
-        "config_hash": WRAPPER_CONFIG_HASH
-    }
+    try:
+        tools_schema = get_builtin_tools_schema()
+        tool_names = []
+        for t in tools_schema:
+            fn = (t or {}).get("function") or {}
+            nm = fn.get("name")
+            if isinstance(nm, str):
+                tool_names.append(nm)
+        tools_sorted = sorted(list(dict.fromkeys(tool_names)))
+    except Exception:
+        tools_sorted = []
+    return {"openai_compat": True, "tools": tools_sorted, "config_hash": WRAPPER_CONFIG_HASH}
 
 
 def build_ollama_payload(messages: List[Dict[str, Any]], model: str, num_ctx: int, temperature: float) -> Dict[str, Any]:
@@ -2053,6 +2042,10 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             return JSONResponse(status_code=400, content={"error": "input_too_large", "detail": f">{MAX_INPUT_CHARS} chars"})
     except Exception:
         pass
+    try:
+        body["messages"] = nfc_msgs(body.get("messages") or [])
+    except Exception:
+        pass
     normalized_msgs, attachments = extract_attachments_from_messages(body.get("messages"))
     # prepend a system hint with attachment summary (non-invasive)
     if attachments:
@@ -2080,6 +2073,10 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     master_seed = provided_seed if provided_seed is not None else _derive_seed("chat", msgs_for_seed)
     import hashlib as _hl
     trace_id = "tt_" + _hl.sha256(msgs_for_seed.encode("utf-8")).hexdigest()[:16]
+    try:
+        _append_jsonl(os.path.join(STATE_DIR, "traces", trace_id, "requests.jsonl"), {"t": int(time.time()*1000), "trace_id": trace_id, "route_mode": os.getenv("ICW_MODE", "windowed"), "messages": normalized_msgs[:50]})
+    except Exception:
+        pass
     # Acquire per-trace lock and record start event
     _lock_token = None
     try:
@@ -2870,6 +2867,10 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     looks_empty = (not str(main_only or "").strip())
     looks_refusal = any(tok in text_lower for tok in refusal_markers)
     display_content = f"{cleaned}{footer}"
+    try:
+        _append_jsonl(os.path.join(STATE_DIR, "traces", trace_id, "responses.jsonl"), {"t": int(time.time()*1000), "trace_id": trace_id, "seed": int(master_seed), "pack_hash": pack_hash, "route_mode": route_mode, "tool_results_count": len(tool_results or []), "content_preview": (display_content or "")[:800]})
+    except Exception:
+        pass
     # Provide an appendix with raw model answers to avoid any perception of truncation
     try:
         raw_q = (qwen_text or "").strip()
@@ -3168,6 +3169,10 @@ async def tool_run(body: Dict[str, Any]):
     name = (body or {}).get("name")
     args = (body or {}).get("args") or {}
     try:
+        try:
+            _append_jsonl(os.path.join(STATE_DIR, "tools", "tools.jsonl"), {"t": int(time.time()*1000), "event": "start", "tool": name, "args": args})
+        except Exception:
+            pass
         # Reuse the exact branches from planner-executed tools
         if name == "image.dispatch" and ALLOW_TOOL_EXECUTION:
             mode = (args.get("mode") or "gen").strip().lower()
@@ -3343,6 +3348,11 @@ async def tool_run(body: Dict[str, Any]):
         return JSONResponse(status_code=400, content={"error": f"unsupported tool: {name}"})
     except Exception as ex:
         return JSONResponse(status_code=400, content={"error": str(ex)})
+    finally:
+        try:
+            _append_jsonl(os.path.join(STATE_DIR, "tools", "tools.jsonl"), {"t": int(time.time()*1000), "event": "end", "tool": name})
+        except Exception:
+            pass
 
 
 @app.post("/jobs/start")
@@ -3364,6 +3374,114 @@ async def jobs_start(body: Dict[str, Any]):
         if isinstance(res, dict):
             return {"job_id": jid, **res}
         return {"job_id": jid, "result": res}
+    except Exception as ex:
+        return JSONResponse(status_code=400, content={"error": str(ex)})
+
+
+# ---------- Dataset Registry / Export (Step 21) ----------
+@app.post("/datasets/start")
+async def datasets_start(body: Dict[str, Any]):
+    try:
+        # Stream via /orcjobs/{id}/stream
+        import time as _tm, uuid as _uuid
+        jid = body.get("id") or f"ds-{_uuid.uuid4().hex}"
+        j = _orcjob_create(jid=jid, tool="datasets.export", args=body or {})
+        _orcjob_set_state(j.id, "running", phase="start", progress=0.0)
+        def _emit(ev: Dict[str, Any]):
+            try:
+                ph = (ev or {}).get("phase") or "running"
+                pr = float((ev or {}).get("progress") or 0.0)
+                _orcjob_set_state(j.id, "running", phase=ph, progress=pr)
+            except Exception:
+                pass
+        async def _runner():
+            try:
+                # Offload sync export to a thread to avoid blocking loop
+                import asyncio as _as
+                res = await _as.to_thread(_datasets_start, body or {}, _emit)
+                _orcjob_set_state(j.id, "done", phase="done", progress=1.0)
+            except Exception as ex:
+                _orcjob_set_state(j.id, "failed", phase="error", progress=1.0, error=str(ex))
+        asyncio.create_task(_runner())
+        return {"id": j.id}
+    except Exception as ex:
+        return JSONResponse(status_code=400, content={"error": str(ex)})
+
+
+@app.get("/datasets/list")
+async def datasets_list():
+    try:
+        return _datasets_list()
+    except Exception as ex:
+        return JSONResponse(status_code=400, content={"error": str(ex)})
+
+
+@app.get("/datasets/versions")
+async def datasets_versions(name: str):
+    try:
+        return _datasets_versions(name)
+    except Exception as ex:
+        return JSONResponse(status_code=400, content={"error": str(ex)})
+
+
+@app.get("/datasets/index")
+async def datasets_index(name: str, version: str):
+    try:
+        content, code, headers = _datasets_index(name, version)
+        return Response(content=content, status_code=code, headers=headers)
+    except Exception as ex:
+        return JSONResponse(status_code=400, content={"error": str(ex)})
+
+
+# ---------- Admin & Ops (Step 22) ----------
+@app.get("/jobs.list")
+async def admin_jobs_list():
+    try:
+        return _admin_jobs_list()
+    except Exception as ex:
+        return JSONResponse(status_code=400, content={"error": str(ex)})
+
+
+@app.get("/jobs.replay")
+async def admin_jobs_replay(cid: str):
+    try:
+        return _admin_jobs_replay(cid)
+    except Exception as ex:
+        return JSONResponse(status_code=400, content={"error": str(ex)})
+
+
+@app.post("/artifacts.gc")
+async def admin_artifacts_gc(body: Dict[str, Any]):
+    try:
+        return _admin_gc(body or {})
+    except Exception as ex:
+        return JSONResponse(status_code=400, content={"error": str(ex)})
+
+
+@app.get("/prompts/list")
+async def prompts_list():
+    try:
+        return {"prompts": _list_prompts()}
+    except Exception as ex:
+        return JSONResponse(status_code=400, content={"error": str(ex)})
+
+
+# ---------- Logs Tail (debug) ----------
+@app.get("/logs/tools.tail")
+async def logs_tools_tail(limit: int = 200):
+    try:
+        path = os.path.join(STATE_DIR, "tools", "tools.jsonl")
+        return {"data": _read_tail(path, n=int(limit))}
+    except Exception as ex:
+        return JSONResponse(status_code=400, content={"error": str(ex)})
+
+
+@app.get("/logs/trace.tail")
+async def logs_trace_tail(id: str, kind: str = "responses", limit: int = 200):
+    try:
+        safe_kind = "responses" if kind not in ("responses", "requests") else kind
+        path = os.path.join(STATE_DIR, "traces", id, f"{safe_kind}.jsonl")
+        return {"id": id, "kind": safe_kind, "data": _read_tail(path, n=int(limit))}
     except Exception as ex:
         return JSONResponse(status_code=400, content={"error": str(ex)})
 # Lightweight in-memory job controls for orchestrator-run tools (research.run, etc.)

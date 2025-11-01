@@ -14,3 +14,14 @@ def write_music_samples(rows: List[Dict[str, Any]], outdir: str, run_id: str) ->
     return path
 
 
+def append_music_sample(outdir: str, row: Dict[str, Any]) -> str:
+    os.makedirs(outdir, exist_ok=True)
+    path = os.path.join(outdir, "music_samples.jsonl")
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+    return path
+
+

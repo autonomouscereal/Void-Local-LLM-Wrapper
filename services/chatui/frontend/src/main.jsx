@@ -1,6 +1,7 @@
 import React, { useEffect, useState, useRef } from 'react'
 import { createRoot } from 'react-dom/client'
 import { marked } from 'marked'
+import AdminTab from './Admin.jsx'
 
 // UI notes:
 // - Single-send semantics (exactly one request per Send) with a "Thinking…" placeholder.
@@ -641,7 +642,7 @@ function App() {
       <div className="chat-pane" style={{ flex: 1 }}>
         {/* Tabs */}
         <div style={{ display: 'flex', gap: 8, padding: 12, borderBottom: '1px solid #222' }}>
-          {['chat','images','tts','music','refs'].map(t => (
+          {['chat','images','tts','music','refs','admin'].map(t => (
             <button key={t} onClick={() => setActiveTab(t)} style={{ padding: '6px 10px', background: activeTab===t ? '#1f2937' : '#0f172a', border: '1px solid #333', borderRadius: 6, color: '#e6e6e6' }}>{t.toUpperCase()}</button>
           ))}
         </div>
@@ -716,6 +717,12 @@ function App() {
               <button onClick={listRefs}>List</button>
             </div>
             <pre id='ref-list' className='log' style={{ whiteSpace:'pre-wrap' }}></pre>
+          </div>
+        )}
+
+        {activeTab === 'admin' && (
+          <div style={{ padding: 16 }}>
+            <AdminTab/>
           </div>
         )}
 

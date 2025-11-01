@@ -10,6 +10,7 @@ from ..jsonio.normalize import normalize_to_envelope
 from ..jsonio.versioning import bump_envelope, assert_envelope
 from ..refs.music import resolve_music_lock
 from ..refs.registry import append_provenance
+from .export import append_music_sample
 
 
 def run_music_compose(job: dict, provider, manifest: dict) -> dict:
@@ -55,6 +56,21 @@ def run_music_compose(job: dict, provider, manifest: dict) -> dict:
     try:
         if job.get("music_id"):
             append_provenance(job.get("music_id"), {"when": now_ts(), "tool": "music.compose", "artifact": track_path, "seed": int(args.get("seed") or 0)})
+    except Exception:
+        pass
+    try:
+        append_music_sample(outdir, {
+            "prompt": job.get("prompt"),
+            "bpm": args.get("bpm"),
+            "length_s": args.get("length_s"),
+            "structure": args.get("structure"),
+            "seed": int(args.get("seed") or 0),
+            "music_lock": bool(lock),
+            "track_ref": track_path,
+            "stems": [s.get("path") for s in stems_meta],
+            "model": model,
+            "created_at": now_ts(),
+        })
     except Exception:
         pass
     add_manifest_row(manifest, track_path, step_id="music.compose")

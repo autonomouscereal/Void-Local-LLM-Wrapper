@@ -9,6 +9,7 @@ from ..jsonio.normalize import normalize_to_envelope
 from ..jsonio.versioning import bump_envelope, assert_envelope
 from ..refs.voice import resolve_voice_lock
 from ..refs.registry import append_provenance
+from .export import append_tts_sample
 
 
 def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
@@ -62,6 +63,22 @@ def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
         "max_seconds": args.get("max_seconds"), "seed": args.get("seed"), "voice_lock": lock,
         "model": model, "duration_s": dur,
     })
+    try:
+        append_tts_sample(outdir, {
+            "text": args.get("text"),
+            "voice": args.get("voice"),
+            "rate": args.get("rate"),
+            "pitch": args.get("pitch"),
+            "sample_rate": args.get("sample_rate"),
+            "seed": int(args.get("seed") or 0),
+            "voice_lock": bool(lock),
+            "audio_ref": wav_path,
+            "duration_s": dur,
+            "model": model,
+            "created_at": now_ts(),
+        })
+    except Exception:
+        pass
     try:
         if job.get("voice_id"):
             append_provenance(job.get("voice_id"), {"when": now_ts(), "tool": "tts.speak", "artifact": wav_path, "seed": int(args.get("seed") or 0)})
