@@ -10,6 +10,7 @@ from ..artifacts.manifest import add_manifest_row
 from ..jsonio.normalize import normalize_to_envelope
 from ..jsonio.versioning import bump_envelope, assert_envelope
 from ..refs.apply import load_refs
+from ..refs.registry import append_provenance
 from .export import append_image_sample
 
 
@@ -44,6 +45,12 @@ def run_image_gen(job: dict, provider, manifest: dict) -> dict:
     with open(png_path, "wb") as f:
         f.write(img_bytes)
     sidecar(png_path, {"tool": "image.gen", "prompt": args.get("prompt"), "negative": args.get("negative"), "size": args.get("size"), "seed": args.get("seed"), "refs": refs, "model": model})
+    # provenance for any referenced ids
+    try:
+        for rid in (job.get("ref_ids") or []):
+            append_provenance(rid, {"when": now_ts(), "tool": "image.gen", "artifact": png_path, "seed": int(args.get("seed") or 0)})
+    except Exception:
+        pass
     add_manifest_row(manifest, png_path, step_id="image.gen")
     try:
         append_image_sample(outdir, {"tool": "image.gen", "prompt": args.get("prompt"), "negative": args.get("negative"), "size": args.get("size"), "seed": int(args.get("seed") or 0), "model": model, "path": png_path, "ts": now_ts()})

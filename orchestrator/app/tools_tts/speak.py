@@ -8,6 +8,7 @@ from ..artifacts.manifest import add_manifest_row
 from ..jsonio.normalize import normalize_to_envelope
 from ..jsonio.versioning import bump_envelope, assert_envelope
 from ..refs.voice import resolve_voice_lock
+from ..refs.registry import append_provenance
 
 
 def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
@@ -61,6 +62,11 @@ def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
         "max_seconds": args.get("max_seconds"), "seed": args.get("seed"), "voice_lock": lock,
         "model": model, "duration_s": dur,
     })
+    try:
+        if job.get("voice_id"):
+            append_provenance(job.get("voice_id"), {"when": now_ts(), "tool": "tts.speak", "artifact": wav_path, "seed": int(args.get("seed") or 0)})
+    except Exception:
+        pass
     add_manifest_row(manifest, wav_path, step_id="tts.speak")
     env = {
         "meta": {"model": model, "ts": now_ts(), "cid": cid, "step": 0, "state": "halt", "cont": {"present": False, "state_hash": None, "reason": None}},

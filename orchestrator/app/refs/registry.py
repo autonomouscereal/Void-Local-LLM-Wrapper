@@ -76,3 +76,15 @@ def list_refs(kind: str | None = None) -> List[Dict[str, Any]]:
     return sorted(out, key=lambda x: str(x.get("ref_id", "")), reverse=True)
 
 
+def append_provenance(ref_id: str, row: Dict[str, Any]) -> None:
+    man = load_manifest(ref_id)
+    if not man:
+        return
+    prov = man.get("provenance") or {}
+    used = prov.get("used_by") or []
+    used.append(row)
+    prov["used_by"] = used
+    man["provenance"] = prov
+    save_manifest(ref_id, man)
+
+

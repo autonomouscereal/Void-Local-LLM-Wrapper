@@ -9,6 +9,7 @@ from ..artifacts.manifest import add_manifest_row
 from ..jsonio.normalize import normalize_to_envelope
 from ..jsonio.versioning import bump_envelope, assert_envelope
 from ..refs.music import resolve_music_lock
+from ..refs.registry import append_provenance
 
 
 def run_music_compose(job: dict, provider, manifest: dict) -> dict:
@@ -51,6 +52,11 @@ def run_music_compose(job: dict, provider, manifest: dict) -> dict:
                 f.write(s.get("wav_bytes") or b"")
             stems_meta.append({"name": s.get("name"), "path": sp})
     sidecar(track_path, {"tool": "music.compose", **args, "model": model, "stems": stems_meta})
+    try:
+        if job.get("music_id"):
+            append_provenance(job.get("music_id"), {"when": now_ts(), "tool": "music.compose", "artifact": track_path, "seed": int(args.get("seed") or 0)})
+    except Exception:
+        pass
     add_manifest_row(manifest, track_path, step_id="music.compose")
     env = {
         "meta": {"model": model, "ts": now_ts(), "cid": cid, "step": 0, "state": "halt", "cont": {"present": False, "state_hash": None, "reason": None}},

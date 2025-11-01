@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from typing import Literal, Dict, Any
 from .predicates import (
     looks_like_film,
@@ -53,7 +54,7 @@ def route_for_request(req: Dict[str, Any]) -> RouteDecision:
     if looks_like_image(t):
         return RouteDecision(kind="tool", tool="image.dispatch", args=build_image_args(t), reason="image-intent")
     if looks_like_tts(t):
-        return RouteDecision(kind="tool", tool="tts_speak", args=build_tts_args(t), reason="tts-intent")
+        return RouteDecision(kind="tool", tool="tts.speak", args=build_tts_args(t), reason="tts-intent")
     if looks_like_music(t):
         return RouteDecision(kind="tool", tool="music.dispatch", args=build_music_args(t), reason="music-intent")
     return RouteDecision(kind="planner", tool=None, args=None, reason="fallback-planner")

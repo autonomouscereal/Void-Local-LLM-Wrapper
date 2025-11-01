@@ -10,6 +10,7 @@ from ..artifacts.manifest import add_manifest_row
 from ..jsonio.normalize import normalize_to_envelope
 from ..jsonio.versioning import bump_envelope, assert_envelope
 from ..refs.music import resolve_music_lock
+from ..refs.registry import append_provenance
 
 
 def _read_wav(path: str):
@@ -61,6 +62,11 @@ def run_music_variation(job: dict, manifest: dict) -> dict:
         sidecar(path, {"tool": "music.variation", **args, "variant_index": i, "gain": g})
         add_manifest_row(manifest, path, step_id="music.variation")
         artifacts.append({"id": os.path.basename(path), "kind": "audio-ref", "summary": stem})
+        try:
+            if job.get("music_id"):
+                append_provenance(job.get("music_id"), {"when": now_ts(), "tool": "music.variation", "artifact": path, "seed": int(args.get("seed") or 0)})
+        except Exception:
+            pass
     env = {
         "meta": {"model": "variation-local", "ts": now_ts(), "cid": cid, "step": 0, "state": "halt", "cont": {"present": False, "state_hash": None, "reason": None}},
         "reasoning": {"goal": "music variation", "constraints": ["json-only"], "decisions": [f"music.variation x{len(artifacts)} done"]},

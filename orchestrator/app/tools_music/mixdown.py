@@ -9,6 +9,7 @@ from ..determinism.seeds import stamp_tool_args
 from ..artifacts.manifest import add_manifest_row
 from ..jsonio.normalize import normalize_to_envelope
 from ..jsonio.versioning import bump_envelope, assert_envelope
+from ..refs.registry import append_provenance
 
 
 def _read_wav(path: str):
@@ -82,6 +83,14 @@ def run_music_mixdown(job: dict, manifest: dict) -> dict:
         wf.setnchannels(args["channels"]); wf.setsampwidth(2); wf.setframerate(args["sample_rate"])
         wf.writeframes(pcm)
     sidecar(path, {"tool": "music.mixdown", **args})
+    try:
+        if isinstance(args.get("stems"), list):
+            # If a higher-level music_id was provided in job, record it; otherwise record per-stem provenance is optional
+            mid = (job.get("music_id") if isinstance(job, dict) else None)
+            if mid:
+                append_provenance(mid, {"when": now_ts(), "tool": "music.mixdown", "artifact": path, "seed": int(args.get("seed") or 0)})
+    except Exception:
+        pass
     add_manifest_row(manifest, path, step_id="music.mixdown")
     env = {
         "meta": {"model": "mix-local", "ts": now_ts(), "cid": cid, "step": 0, "state": "halt", "cont": {"present": False, "state_hash": None, "reason": None}},
