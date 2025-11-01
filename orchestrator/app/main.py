@@ -61,11 +61,15 @@ from .jobs.state import get_job as _get_orcjob, request_cancel as _orcjob_cancel
 from .jsonio.versioning import bump_envelope as _env_bump, assert_envelope as _env_assert
 from .determinism.seeds import stamp_envelope as _env_stamp, stamp_tool_args as _tool_stamp
 from .ops.health import get_capabilities as _get_caps, get_health as _get_health
+from .refs.api import post_refs_save as _refs_save, post_refs_refine as _refs_refine, get_refs_list as _refs_list, post_refs_apply as _refs_apply
 from .tools_image.gen import run_image_gen
 from .tools_image.edit import run_image_edit
 from .tools_image.upscale import run_image_upscale
 from .tools_tts.speak import run_tts_speak
 from .tools_tts.sfx import run_sfx_compose
+from .tools_music.compose import run_music_compose
+from .tools_music.variation import run_music_variation
+from .tools_music.mixdown import run_music_mixdown
 from .artifacts.shard import open_shard as _art_open_shard, append_jsonl as _art_append_jsonl, _finalize_shard as _art_finalize
 from .artifacts.shard import newest_part as _art_newest_part, list_parts as _art_list_parts
 from .artifacts.manifest import add_manifest_row as _art_manifest_add, write_manifest_atomic as _art_manifest_write
@@ -1015,6 +1019,27 @@ def get_builtin_tools_schema() -> List[Dict[str, Any]]:
         {
             "type": "function",
             "function": {
+                "name": "music.compose",
+                "parameters": {"type": "object", "properties": {"prompt": {"type": "string"}, "bpm": {"type": "integer"}, "length_s": {"type": "integer"}, "structure": {"type": "array", "items": {"type": "string"}}, "sample_rate": {"type": "integer"}, "channels": {"type": "integer"}, "music_id": {"type": "string"}, "music_refs": {"type": "object"}, "seed": {"type": "integer"}, "cid": {"type": "string"}}, "required": ["prompt"]}
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "music.variation",
+                "parameters": {"type": "object", "properties": {"variation_of": {"type": "string"}, "n": {"type": "integer"}, "intensity": {"type": "number"}, "music_id": {"type": "string"}, "music_refs": {"type": "object"}, "seed": {"type": "integer"}, "cid": {"type": "string"}}, "required": ["variation_of"]}
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "music.mixdown",
+                "parameters": {"type": "object", "properties": {"stems": {"type": "array", "items": {"type": "object"}}, "sample_rate": {"type": "integer"}, "channels": {"type": "integer"}, "seed": {"type": "integer"}, "cid": {"type": "string"}}, "required": ["stems"]}
+            }
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "tts.speak",
                 "parameters": {"type": "object", "properties": {"text": {"type": "string"}, "voice": {"type": "string"}}, "required": ["text"]}
             }
@@ -1565,6 +1590,42 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 return {"name": name, "result": r.json()}
             except Exception:
                 return {"name": name, "error": r.text}
+    if name == "music.compose" and ALLOW_TOOL_EXECUTION:
+        if not MUSIC_API_URL:
+            return {"name": name, "error": "MUSIC_API_URL not configured"}
+        class _MusicProvider:
+            async def _compose(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+                import base64 as _b
+                async with httpx.AsyncClient(timeout=600) as client:
+                    r = await client.post(MUSIC_API_URL.rstrip("/") + "/generate", json={"prompt": payload.get("prompt"), "duration": int(payload.get("length_s") or 8)})
+                    r.raise_for_status(); js = r.json()
+                    b64 = js.get("audio_wav_base64") or js.get("wav_b64")
+                    wav = _b.b64decode(b64) if isinstance(b64, str) else b""
+                    return {"wav_bytes": wav, "model": f"musicgen:{os.getenv('MUSIC_MODEL_ID','')}"}
+            def compose(self, args: Dict[str, Any]) -> Dict[str, Any]:
+                import asyncio as _as
+                return _as.get_event_loop().run_until_complete(self._compose(args))
+        provider = _MusicProvider()
+        manifest = {"items": []}
+        try:
+            env = run_music_compose(args if isinstance(args, dict) else {}, provider, manifest)
+            return {"name": name, "result": env}
+        except Exception as ex:
+            return {"name": name, "error": str(ex)}
+    if name == "music.variation" and ALLOW_TOOL_EXECUTION:
+        manifest = {"items": []}
+        try:
+            env = run_music_variation(args if isinstance(args, dict) else {}, manifest)
+            return {"name": name, "result": env}
+        except Exception as ex:
+            return {"name": name, "error": str(ex)}
+    if name == "music.mixdown" and ALLOW_TOOL_EXECUTION:
+        manifest = {"items": []}
+        try:
+            env = run_music_mixdown(args if isinstance(args, dict) else {}, manifest)
+            return {"name": name, "result": env}
+        except Exception as ex:
+            return {"name": name, "error": str(ex)}
     if name in ("image.gen", "image.edit", "image.upscale") and ALLOW_TOOL_EXECUTION:
         # Minimal local provider: returns a 1x1 PNG placeholder; replace with ComfyUI-backed provider later.
         if not COMFYUI_API_URL:
@@ -3029,6 +3090,42 @@ async def healthz():
         "film_enabled": bool((WRAPPER_CONFIG.get("film") or {}).get("enabled", False)),
         "ablation_enabled": bool((WRAPPER_CONFIG.get("ablation") or {}).get("enabled", False)),
     }
+
+
+# ---------- Refs API ----------
+@app.post("/refs.save")
+async def refs_save(body: Dict[str, Any]):
+    try:
+        return _refs_save(body or {})
+    except Exception as ex:
+        return JSONResponse(status_code=400, content={"error": str(ex)})
+
+
+@app.post("/refs.refine")
+async def refs_refine(body: Dict[str, Any]):
+    try:
+        return _refs_refine(body or {})
+    except Exception as ex:
+        return JSONResponse(status_code=400, content={"error": str(ex)})
+
+
+@app.get("/refs.list")
+async def refs_list(kind: Optional[str] = None):
+    try:
+        return _refs_list(kind)
+    except Exception as ex:
+        return JSONResponse(status_code=400, content={"error": str(ex)})
+
+
+@app.post("/refs.apply")
+async def refs_apply(body: Dict[str, Any]):
+    try:
+        res, code = _refs_apply(body or {})
+        if code != 200:
+            return JSONResponse(status_code=code, content=res)
+        return res
+    except Exception as ex:
+        return JSONResponse(status_code=400, content={"error": str(ex)})
 
 
 # Lightweight in-memory job controls for orchestrator-run tools (research.run, etc.)

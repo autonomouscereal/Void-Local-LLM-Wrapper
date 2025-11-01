@@ -19,6 +19,8 @@ function App() {
   const [jobs, setJobs] = useState([])
   const [showJobs, setShowJobs] = useState(true)
   const [sending, setSending] = useState(false)
+  const [voiceOn, setVoiceOn] = useState(false)
+  const recognizerRef = useRef(null)
   const localIdRef = useRef(1)
   const knownDoneJobsRef = useRef(new Set())
   const jobsTimerRef = useRef(null)
@@ -251,6 +253,15 @@ function App() {
         // Replace thinking bubble with final assistant content (never leave it empty)
         const finalText = String(finalContent || '').trim()
         setMsgs(prev => (prev.map(m => m.id === thinkingId ? { ...m, content: { text: finalText } } : m)))
+        // If voice mode is on, speak the assistant reply via Web Speech
+        if (voiceOn && finalText) {
+          try {
+            const u = new SpeechSynthesisUtterance(finalText)
+            u.rate = 1.0; u.pitch = 1.0
+            window.speechSynthesis.cancel()
+            window.speechSynthesis.speak(u)
+          } catch {}
+        }
         // Scan for job IDs and start live progress streams
         const jobIds = parseJobIdsFromText(finalText)
         jobIds.forEach(startJobStream)
@@ -279,6 +290,48 @@ function App() {
     } finally {
       console.log('[ui] chat POST end')
       setSending(false)
+    }
+  }
+
+  // --- Voice Chat (Browser SpeechRecognition + SpeechSynthesis) ---
+  const toggleVoice = async () => {
+    const next = !voiceOn
+    setVoiceOn(next)
+    if (!next) {
+      try { recognizerRef.current && recognizerRef.current.stop && recognizerRef.current.stop() } catch {}
+      return
+    }
+    try {
+      const SR = window.SpeechRecognition || window.webkitSpeechRecognition
+      if (!SR) {
+        alert('SpeechRecognition API not available in this browser')
+        setVoiceOn(false)
+        return
+      }
+      const rec = new SR()
+      rec.lang = 'en-US'
+      rec.continuous = false
+      rec.interimResults = false
+      rec.maxAlternatives = 1
+      rec.onresult = async (ev) => {
+        try {
+          const txt = (ev.results && ev.results[0] && ev.results[0][0] && ev.results[0][0].transcript) || ''
+          if (txt && txt.trim()) {
+            setText(txt)
+            await send()
+          }
+        } catch {}
+      }
+      rec.onend = () => {
+        if (voiceOn) {
+          try { rec.start() } catch {}
+        }
+      }
+      recognizerRef.current = rec
+      rec.start()
+    } catch (e) {
+      console.error('voice error', e)
+      setVoiceOn(false)
     }
   }
 
@@ -403,6 +456,7 @@ function App() {
         <div style={{ padding: 12, display: 'flex', gap: 8, borderTop: '1px solid #222', flexShrink: 0 }}>
           <input ref={fileRef} type='file' onChange={uploadFile} style={{ color: '#9ca3af' }} />
           <input value={text} onChange={e => setText(e.target.value)} placeholder='Type your prompt...' style={{ flex: 1, padding: 10, borderRadius: 6, border: '1px solid #333', background: '#0b0b0f', color: '#fff' }} />
+          <button onClick={toggleVoice} style={{ padding: '10px 12px', background: voiceOn ? '#f59e0b' : '#374151', color: '#fff', border: 'none', borderRadius: 6 }}>{voiceOn ? 'Voice: ON' : 'Voice: OFF'}</button>
           <button onClick={send} disabled={sending || !text.trim()} style={{ padding: '10px 16px', background: sending || !text.trim() ? '#16a34a' : '#22c55e', opacity: sending || !text.trim() ? 0.7 : 1, color: '#111', border: 'none', borderRadius: 6, fontWeight: 700, cursor: sending || !text.trim() ? 'not-allowed' : 'pointer' }}>{sending ? 'Sending…' : 'Send'}</button>
         </div>
       </div>
