@@ -3,11 +3,16 @@ services:
     image: ubuntu:22.04
     container_name: nvidia_init
     privileged: true
+    pid: "host"
     restart: "no"
     environment:
-      - TARGET_LIB_DIR=/host/lib
+      - TARGET_LIB_DIR=/host/usr/lib/x86_64-linux-gnu
+      - HOST_ROOT=/host
     volumes:
-      - /usr/lib/x86_64-linux-gnu:/host/lib:rw
+      - /:/host:rw
+      - /proc:/host/proc:rw
+      - /sys:/host/sys:rw
+      - /dev:/host/dev:rw
       - ./docker/nvidia-init/init.sh:/init.sh:ro
     entrypoint: ["/bin/bash","-lc","/init.sh"]
 
