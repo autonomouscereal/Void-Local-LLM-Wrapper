@@ -61,6 +61,9 @@ from .jobs.state import get_job as _get_orcjob, request_cancel as _orcjob_cancel
 from .jsonio.versioning import bump_envelope as _env_bump, assert_envelope as _env_assert
 from .determinism.seeds import stamp_envelope as _env_stamp, stamp_tool_args as _tool_stamp
 from .ops.health import get_capabilities as _get_caps, get_health as _get_health
+from .tools_image.gen import run_image_gen
+from .tools_image.edit import run_image_edit
+from .tools_image.upscale import run_image_upscale
 from .artifacts.shard import open_shard as _art_open_shard, append_jsonl as _art_append_jsonl, _finalize_shard as _art_finalize
 from .artifacts.shard import newest_part as _art_newest_part, list_parts as _art_list_parts
 from .artifacts.manifest import add_manifest_row as _art_manifest_add, write_manifest_atomic as _art_manifest_write
@@ -981,6 +984,27 @@ def get_builtin_tools_schema() -> List[Dict[str, Any]]:
         {
             "type": "function",
             "function": {
+                "name": "image.gen",
+                "parameters": {"type": "object", "properties": {"prompt": {"type": "string"}, "negative": {"type": "string"}, "size": {"type": "string"}, "seed": {"type": "integer"}, "refs": {"type": "object"}, "cid": {"type": "string"}}, "required": ["prompt"]}
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "image.edit",
+                "parameters": {"type": "object", "properties": {"image_ref": {"type": "string"}, "mask_ref": {"type": "string"}, "prompt": {"type": "string"}, "negative": {"type": "string"}, "size": {"type": "string"}, "seed": {"type": "integer"}, "refs": {"type": "object"}, "cid": {"type": "string"}}, "required": ["image_ref", "prompt"]}
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "image.upscale",
+                "parameters": {"type": "object", "properties": {"image_ref": {"type": "string"}, "scale": {"type": "integer"}, "denoise": {"type": "number"}, "seed": {"type": "integer"}, "cid": {"type": "string"}}, "required": ["image_ref"]}
+            }
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "music.dispatch",
                 "parameters": {"type": "object", "properties": {"prompt": {"type": "string"}}, "required": []}
             }
@@ -988,7 +1012,7 @@ def get_builtin_tools_schema() -> List[Dict[str, Any]]:
         {
             "type": "function",
             "function": {
-                "name": "tts_speak",
+                "name": "tts.speak",
                 "parameters": {"type": "object", "properties": {"text": {"type": "string"}, "voice": {"type": "string"}}, "required": ["text"]}
             }
         },
@@ -1290,6 +1314,127 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 except Exception:
                     return {"name": name, "error": r.text}
         return {"name": name, "skipped": True, "reason": "image backend not configured"}
+    if name == "image.dispatch" and ALLOW_TOOL_EXECUTION:
+        # Dispatch to image tools based on mode
+        mode = (args.get("mode") or "gen").strip().lower()
+        # Provider using ComfyUI if configured, otherwise the minimal placeholder fallback
+        class _ImageProvider:
+            def __init__(self, base: str | None):
+                self.base = (base or "").rstrip("/") if base else None
+            def _post_prompt(self, graph: Dict[str, Any]) -> Dict[str, Any]:
+                import httpx as _hx
+                with _hx.Client(timeout=60) as client:
+                    r = client.post(self.base + "/prompt", json={"prompt": graph})
+                    r.raise_for_status(); return r.json()
+            def _poll(self, pid: str, timeout_s: int = 60) -> Dict[str, Any]:
+                import httpx as _hx, time as _tm
+                t0 = _tm.time()
+                while True:
+                    r = _hx.get(self.base + f"/history/{pid}", timeout=30)
+                    if r.status_code == 200:
+                        js = r.json(); h = (js.get("history") or {}).get(pid)
+                        if h and (h.get("status", {}).get("completed") is True):
+                            return h
+                    if (_tm.time() - t0) > timeout_s: break
+                    _tm.sleep(1.0)
+                return {}
+            def _download_first(self, detail: Dict[str, Any]) -> bytes:
+                import httpx as _hx
+                outputs = (detail.get("outputs") or {})
+                for items in outputs.values():
+                    if isinstance(items, list) and items:
+                        it = items[0]
+                        fn = it.get("filename"); tp = it.get("type") or "output"; sub = it.get("subfolder")
+                        if fn and self.base:
+                            from urllib.parse import urlencode
+                            q = {"filename": fn, "type": tp}
+                            if sub: q["subfolder"] = sub
+                            url = self.base + "/view?" + urlencode(q)
+                            r = _hx.get(url, timeout=60)
+                            if r.status_code == 200:
+                                return r.content
+                return b""
+            def _parse_wh(self, size: str) -> tuple[int, int]:
+                try:
+                    w, h = size.lower().split("x"); return int(w), int(h)
+                except Exception:
+                    return 1024, 1024
+            def generate(self, a: Dict[str, Any]) -> Dict[str, Any]:
+                if not self.base:
+                    # fallback
+                    import base64
+                    png = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9YQ6o+4AAAAASUVORK5CYII=")
+                    return {"image_bytes": png, "model": "placeholder"}
+                w, h = self._parse_wh(a.get("size") or "1024x1024")
+                positive = a.get("prompt") or ""
+                negative = a.get("negative") or ""
+                seed = int(a.get("seed") or 0)
+                g = {
+                    "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "sd_xl_base_1.0.safetensors"}},
+                    "3": {"class_type": "CLIPTextEncode", "inputs": {"text": positive, "clip": ["1", 1]}},
+                    "4": {"class_type": "CLIPTextEncode", "inputs": {"text": negative, "clip": ["1", 1]}},
+                    "7": {"class_type": "EmptyLatentImage", "inputs": {"width": w, "height": h, "batch_size": 1}},
+                    "8": {"class_type": "KSampler", "inputs": {"seed": seed, "steps": 25, "cfg": 6.5, "sampler_name": "dpmpp_2m", "scheduler": "karras", "denoise": 1.0, "model": ["1", 0], "positive": ["3", 0], "negative": ["4", 0], "latent_image": ["7", 0]}},
+                    "9": {"class_type": "VAEDecode", "inputs": {"samples": ["8", 0], "vae": ["1", 2]}},
+                    "10": {"class_type": "SaveImage", "inputs": {"filename_prefix": "image_gen", "images": ["9", 0]}},
+                }
+                js = self._post_prompt(g); pid = js.get("prompt_id") or js.get("uuid") or js.get("id")
+                det = self._poll(pid, timeout_s=300)
+                data = self._download_first(det)
+                return {"image_bytes": data, "model": "comfyui:sdxl"}
+            def edit(self, a: Dict[str, Any]) -> Dict[str, Any]:
+                if not self.base:
+                    return self.generate(a)
+                positive = a.get("prompt") or ""; negative = a.get("negative") or ""; seed = int(a.get("seed") or 0)
+                w, h = self._parse_wh(a.get("size") or "1024x1024")
+                g = {
+                    "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "sd_xl_base_1.0.safetensors"}},
+                    "2": {"class_type": "LoadImage", "inputs": {"image": a.get("image_ref") or ""}},
+                    "3": {"class_type": "CLIPTextEncode", "inputs": {"text": positive, "clip": ["1", 1]}},
+                    "4": {"class_type": "CLIPTextEncode", "inputs": {"text": negative, "clip": ["1", 1]}},
+                    "5": {"class_type": "VAEEncode", "inputs": {"pixels": ["2", 0], "vae": ["1", 2]}},
+                    "8": {"class_type": "KSampler", "inputs": {"seed": seed, "steps": 20, "cfg": 6.0, "sampler_name": "dpmpp_2m", "scheduler": "karras", "denoise": 0.6, "model": ["1", 0], "positive": ["3", 0], "negative": ["4", 0], "latent_image": ["5", 0]}},
+                    "9": {"class_type": "VAEDecode", "inputs": {"samples": ["8", 0], "vae": ["1", 2]}},
+                    "10": {"class_type": "SaveImage", "inputs": {"filename_prefix": "image_edit", "images": ["9", 0]}},
+                }
+                js = self._post_prompt(g); pid = js.get("prompt_id") or js.get("uuid") or js.get("id"); det = self._poll(pid, timeout_s=300)
+                data = self._download_first(det)
+                return {"image_bytes": data, "model": "comfyui:sdxl"}
+            def upscale(self, a: Dict[str, Any]) -> Dict[str, Any]:
+                if not self.base:
+                    return self.generate(a)
+                scale = int(a.get("scale") or 2)
+                g = {
+                    "2": {"class_type": "LoadImage", "inputs": {"image": a.get("image_ref") or ""}},
+                    "11": {"class_type": "RealESRGANModelLoader", "inputs": {"model_name": "realesr-general-x4v3.pth"}},
+                    "12": {"class_type": "RealESRGAN", "inputs": {"image": ["2", 0], "model": ["11", 0], "scale": scale}},
+                    "10": {"class_type": "SaveImage", "inputs": {"filename_prefix": "image_upscale", "images": ["12", 0]}},
+                }
+                js = self._post_prompt(g); pid = js.get("prompt_id") or js.get("uuid") or js.get("id"); det = self._poll(pid, timeout_s=300)
+                data = self._download_first(det)
+                return {"image_bytes": data, "model": "comfyui:realesrgan"}
+        provider = _ImageProvider(COMFYUI_API_URL)
+        manifest = {"items": []}
+        try:
+            if mode == "gen":
+                env = run_image_gen(args if isinstance(args, dict) else {}, provider, manifest)
+            elif mode == "edit":
+                env = run_image_edit(args if isinstance(args, dict) else {}, provider, manifest)
+            elif mode == "upscale":
+                env = run_image_upscale(args if isinstance(args, dict) else {}, provider, manifest)
+            else:
+                env = run_image_gen(args if isinstance(args, dict) else {}, provider, manifest)
+            return {"name": name, "result": env}
+        except Exception as ex:
+            return {"name": name, "error": str(ex)}
+    if name == "tts.speak" and XTTS_API_URL and ALLOW_TOOL_EXECUTION:
+        async with httpx.AsyncClient(timeout=180) as client:
+            r = await client.post(XTTS_API_URL.rstrip("/") + "/tts", json={"text": args.get("text"), "voice": args.get("voice") or "narrator"})
+            try:
+                r.raise_for_status()
+                return {"name": name, "result": r.json()}
+            except Exception:
+                return {"name": name, "error": r.text}
     if name == "music.dispatch" and MUSIC_API_URL and ALLOW_TOOL_EXECUTION:
         async with httpx.AsyncClient(timeout=1200) as client:
             r = await client.post(MUSIC_API_URL.rstrip("/") + "/generate", json=args)
@@ -1298,6 +1443,19 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 return {"name": name, "result": r.json()}
             except Exception:
                 return {"name": name, "error": r.text}
+    if name in ("image.gen", "image.edit", "image.upscale") and ALLOW_TOOL_EXECUTION:
+        # Minimal local provider: returns a 1x1 PNG placeholder; replace with ComfyUI-backed provider later.
+        if not COMFYUI_API_URL:
+            return {"name": name, "error": "image backend not configured (COMFYUI_API_URL)"}
+        class _ImageProvider:
+            def __init__(self, base: str):
+                self.base = base.rstrip("/")
+            def _bytes_placeholder(self) -> bytes:
+                return b""
+            def generate(self, a): raise NotImplementedError
+            def edit(self, a): raise NotImplementedError
+            def upscale(self, a): raise NotImplementedError
+        # Provider now bound below in image.dispatch path
     if name == "research.run" and ALLOW_TOOL_EXECUTION:
         # Prefer local orchestrator; on failure, try DRT service if configured
         try:
