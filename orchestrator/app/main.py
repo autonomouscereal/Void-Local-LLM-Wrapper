@@ -57,6 +57,7 @@ from .state.lock import acquire_lock as _acquire_lock, release_lock as _release_
 from .artifacts.manifest import add_manifest_row as _manifest_add_row, write_manifest_atomic as _manifest_write
 from .state.ids import step_id as _step_id
 from .research.orchestrator import run_research
+from .jobs.state import get_job as _get_orcjob, request_cancel as _orcjob_cancel
 from .artifacts.shard import open_shard as _art_open_shard, append_jsonl as _art_append_jsonl, _finalize_shard as _art_finalize
 from .artifacts.shard import newest_part as _art_newest_part, list_parts as _art_list_parts
 from .artifacts.manifest import add_manifest_row as _art_manifest_add, write_manifest_atomic as _art_manifest_write
@@ -1294,7 +1295,15 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
     if name == "research.run" and ALLOW_TOOL_EXECUTION:
         # Prefer local orchestrator; on failure, try DRT service if configured
         try:
-            result = run_research(args if isinstance(args, dict) else {})
+            job_args = args if isinstance(args, dict) else {}
+            try:
+                import uuid as _uuid
+                job_args.setdefault("job_id", _uuid.uuid4().hex)
+            except Exception:
+                pass
+            result = run_research(job_args)
+            if isinstance(result, dict):
+                result.setdefault("job_id", job_args.get("job_id"))
             return {"name": name, "result": result}
         except Exception as ex:
             base = (DRT_API_URL or "").rstrip("/")
@@ -2715,6 +2724,63 @@ async def healthz():
         "film_enabled": bool((WRAPPER_CONFIG.get("film") or {}).get("enabled", False)),
         "ablation_enabled": bool((WRAPPER_CONFIG.get("ablation") or {}).get("enabled", False)),
     }
+
+
+# Lightweight in-memory job controls for orchestrator-run tools (research.run, etc.)
+@app.get("/orcjobs/{job_id}")
+async def orcjob_get(job_id: str):
+    j = _get_orcjob(job_id)
+    if not j:
+        return JSONResponse(status_code=404, content={"error": "not_found"})
+    return {
+        "id": j.id,
+        "tool": j.tool,
+        "args": j.args,
+        "state": j.state,
+        "phase": j.phase,
+        "progress": j.progress,
+        "created_at": j.created_at,
+        "updated_at": j.updated_at,
+        "error": j.error,
+    }
+
+
+@app.post("/orcjobs/{job_id}/cancel")
+async def orcjob_cancel(job_id: str):
+    j = _get_orcjob(job_id)
+    if not j:
+        return JSONResponse(status_code=404, content={"error": "not_found"})
+    if j.state in ("done", "failed", "cancelled"):
+        return {"ok": True, "state": j.state}
+    _orcjob_cancel(job_id)
+    return {"ok": True, "state": "cancelling"}
+
+
+@app.get("/orcjobs/{job_id}/stream")
+async def orcjob_stream(job_id: str, interval_ms: Optional[int] = None):
+    async def _gen():
+        last = None
+        while True:
+            j = _get_orcjob(job_id)
+            if not j:
+                yield "data: {\"error\": \"not_found\"}\n\n"
+                break
+            snapshot = json.dumps({
+                "id": j.id,
+                "tool": j.tool,
+                "state": j.state,
+                "phase": j.phase,
+                "progress": j.progress,
+                "updated_at": j.updated_at,
+            })
+            if snapshot != last:
+                yield f"data: {snapshot}\n\n"
+                last = snapshot
+            if j.state in ("done", "failed", "cancelled"):
+                yield "data: [DONE]\n\n"
+                break
+            await asyncio.sleep(max(0.01, (interval_ms or 1000) / 1000.0))
+    return StreamingResponse(_gen(), media_type="text/event-stream")
 
 
 @app.get("/debug")
