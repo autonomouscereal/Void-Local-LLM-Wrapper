@@ -29,6 +29,8 @@ services:
       - NVIDIA_VISIBLE_DEVICES=${OLLAMA_QWEN_GPU:-all}
     volumes:
       - ollama_qwen_data:/root/.ollama
+    tmpfs:
+      - /usr/lib/x86_64-linux-gnu
     healthcheck:
       test: ["CMD", "sh", "-lc", "ollama list >/dev/null 2>&1"]
       interval: 10s
@@ -58,6 +60,8 @@ services:
       - NVIDIA_VISIBLE_DEVICES=${OLLAMA_GPTOSS_GPU:-all}
     volumes:
       - ollama_gptoss_data:/root/.ollama
+    tmpfs:
+      - /usr/lib/x86_64-linux-gnu
     healthcheck:
       test: ["CMD", "sh", "-lc", "ollama list >/dev/null 2>&1"]
       interval: 10s
@@ -144,6 +148,8 @@ services:
       - "8020"
     ports:
       - "8020:8020"
+    tmpfs:
+      - /usr/lib/x86_64-linux-gnu
 
   whisper:
     build:
@@ -160,6 +166,8 @@ services:
       - "9090"
     ports:
       - "9090:9090"
+    tmpfs:
+      - /usr/lib/x86_64-linux-gnu
 
   faceid:
     build:
@@ -174,6 +182,8 @@ services:
       - "7000"
     ports:
       - "7000:7000"
+    tmpfs:
+      - /usr/lib/x86_64-linux-gnu
 
   comfyui:
     build:
@@ -194,6 +204,8 @@ services:
     volumes:
       - comfyui_models:/comfyui/models
       - comfyui_custom_nodes:/comfyui/custom_nodes
+    tmpfs:
+      - /usr/lib/x86_64-linux-gnu
     # For GPU deployments, create additional comfyui-* services and set COMFYUI_API_URLS accordingly
 
   # Optional additional ComfyUI replicas for dynamic distribution
@@ -220,6 +232,8 @@ services:
     volumes:
       - comfyui_models:/comfyui/models
       - comfyui_custom_nodes:/comfyui/custom_nodes
+    tmpfs:
+      - /usr/lib/x86_64-linux-gnu
 
   comfyui-2:
     build:
@@ -241,6 +255,8 @@ services:
     volumes:
       - comfyui_models:/comfyui/models
       - comfyui_custom_nodes:/comfyui/custom_nodes
+    tmpfs:
+      - /usr/lib/x86_64-linux-gnu
 
   comfyui_init:
     build:
@@ -326,6 +342,8 @@ services:
       - "7860"
     ports:
       - "7860:7860"
+    tmpfs:
+      - /usr/lib/x86_64-linux-gnu
 
   vlm:
     build:
@@ -340,6 +358,8 @@ services:
       - "8050"
     ports:
       - "8050:8050"
+    tmpfs:
+      - /usr/lib/x86_64-linux-gnu
 
   ocr:
     build:
@@ -416,6 +436,8 @@ services:
       - "8090:8090"
     volumes:
       - ./:/workspace
+    tmpfs:
+      - /usr/lib/x86_64-linux-gnu
 
   ablation:
     build:
