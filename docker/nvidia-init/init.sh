@@ -16,10 +16,15 @@ fi
 # Generate version-agnostic symlinks for common patterns
 make_links() {
   local stem="$1"; shift
-  for major in $(seq 470 600); do
+  for major in $(seq 450 650); do
     ln -sf "$stem.1" "$stem.$major" 2>/dev/null || true
-    for minor in 18 24 30 45 49 73 82 89 92; do
-      for patch in 02 05 06 10 14; do
+    for minor in $(seq 0 200); do
+      # create stem.major.minor
+      ln -sf "$stem.1" "$stem.$major.$minor" 2>/dev/null || true
+      for patch in $(seq 0 200); do
+        # zero-pad patch to 2 digits and also create non-padded variant
+        zp=$(printf "%02d" "$patch")
+        ln -sf "$stem.1" "$stem.$major.$minor.$zp" 2>/dev/null || true
         ln -sf "$stem.1" "$stem.$major.$minor.$patch" 2>/dev/null || true
       done
     done
