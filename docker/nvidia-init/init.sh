@@ -81,6 +81,48 @@ touch "$MARKER"
 # Best effort: ensure directory exists so bind-target is valid
 mkdir -p "$LIBDIR"
 
+# Explicitly ensure libcudadebugger 580 aliases exist (observed toolchain expectation)
+if [ -e "libcudadebugger.so.1" ]; then
+  ln -sf "libcudadebugger.so.1" "libcudadebugger.so.580" 2>/dev/null || true
+  ln -sf "libcudadebugger.so.1" "libcudadebugger.so.580.65" 2>/dev/null || true
+  ln -sf "libcudadebugger.so.1" "libcudadebugger.so.580.65.06" 2>/dev/null || true
+fi
+
+# Parse NVIDIA runtime host file manifests and materialize any missing versioned paths
+MAN_DIR="$HOST_ROOT/usr/share/nvidia-container-runtime/host-files-for-container.d"
+ensure_path() {
+  local ap="$1"
+  # Only handle files under libdir
+  case "$ap" in
+    /usr/lib/x86_64-linux-gnu/*) ;;
+    *) return 0 ;;
+  esac
+  local rel="${ap#/usr/lib/x86_64-linux-gnu/}"
+  local dir="$LIBDIR"
+  local name="$rel"
+  # If already exists, nothing to do
+  [ -e "$dir/$name" ] && return 0
+  # Determine stem (strip trailing .so.* to .so)
+  local stem="${name%%.so*}.so"
+  local tgt=""
+  if [ -e "$dir/$stem.1" ]; then tgt="$stem.1";
+  else
+    tgt=$(ls -1 "$dir/$stem".* 2>/dev/null | xargs -r -n1 basename | sort -rV | head -n1 || true)
+  fi
+  [ -z "$tgt" ] && return 0
+  ln -sf "$tgt" "$dir/$name" 2>/dev/null || true
+}
+
+if [ -d "$MAN_DIR" ]; then
+  for jf in "$MAN_DIR"/*.json; do
+    [ -e "$jf" ] || continue
+    # Extract absolute paths from JSON (simple grep; structure is stable)
+    for p in $(grep -oE '"/usr/lib/x86_64-linux-gnu/[^"]+"' "$jf" | tr -d '"'); do
+      ensure_path "$p"
+    done
+  done
+fi
+
 # Done
 exit 0
 
