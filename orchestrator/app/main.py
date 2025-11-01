@@ -68,6 +68,8 @@ from .admin.api import get_jobs_list as _admin_jobs_list, get_jobs_replay as _ad
 from .ops.unicode import nfc_msgs
 from .admin.prompts import _id_of as _prompt_id_of, save_prompt as _save_prompt, list_prompts as _list_prompts
 from .state.checkpoints import append_ndjson as _append_jsonl, read_tail as _read_tail
+from .film2.snapshots import save_shot_snapshot as _film_save_snap, load_shot_snapshot as _film_load_snap
+from .film2.qa_embed import face_similarity as _qa_face, voice_similarity as _qa_voice, music_similarity as _qa_music
 from .tools_image.gen import run_image_gen
 from .tools_image.edit import run_image_edit
 from .tools_image.upscale import run_image_upscale
@@ -3276,6 +3278,13 @@ async def tool_run(body: Dict[str, Any]):
                 env = run_image_upscale(args if isinstance(args, dict) else {}, provider, manifest)
             else:
                 env = run_image_gen(args if isinstance(args, dict) else {}, provider, manifest)
+            # Film-2 snapshot
+            try:
+                fc = args.get("film_cid"); sid = args.get("shot_id")
+                if isinstance(fc, str) and isinstance(sid, str):
+                    _film_save_snap(fc, sid, {"tool": "image.dispatch", "mode": mode, "seed": int((args or {}).get("seed") or 0), "refs": (args or {}).get("refs") or {}, "artifacts": (env or {}).get("artifacts")})
+            except Exception:
+                pass
             return {"ok": True, "name": name, "result": env}
         if name == "tts.speak" and ALLOW_TOOL_EXECUTION:
             if not XTTS_API_URL:
@@ -3297,6 +3306,12 @@ async def tool_run(body: Dict[str, Any]):
                     import asyncio as _as
                     return _as.get_event_loop().run_until_complete(self._xtts(args))
             provider = _TTSProvider(); manifest = {"items": []}; env = run_tts_speak(args, provider, manifest)
+            try:
+                fc = args.get("film_cid"); lid = args.get("line_id") or args.get("shot_id")
+                if isinstance(fc, str) and isinstance(lid, str):
+                    _film_save_snap(fc, f"vo_{lid}", {"tool": "tts.speak", "seed": int((args or {}).get("seed") or 0), "refs": (args or {}).get("voice_refs") or {}, "artifacts": (env or {}).get("artifacts")})
+            except Exception:
+                pass
             return {"ok": True, "name": name, "result": env}
         if name == "audio.sfx.compose" and ALLOW_TOOL_EXECUTION:
             manifest = {"items": []}; env = run_sfx_compose(args, manifest)
@@ -3314,6 +3329,12 @@ async def tool_run(body: Dict[str, Any]):
                     import asyncio as _as
                     return _as.get_event_loop().run_until_complete(self._compose(args))
             provider = _MusicProvider(); manifest = {"items": []}; env = run_music_compose(args, provider, manifest)
+            try:
+                fc = args.get("film_cid"); cid = args.get("cue_id") or args.get("shot_id")
+                if isinstance(fc, str) and isinstance(cid, str):
+                    _film_save_snap(fc, f"cue_{cid}", {"tool": "music.compose", "seed": int((args or {}).get("seed") or 0), "refs": (args or {}).get("music_refs") or {}, "artifacts": (env or {}).get("artifacts")})
+            except Exception:
+                pass
             return {"ok": True, "name": name, "result": env}
         if name == "music.variation" and ALLOW_TOOL_EXECUTION:
             manifest = {"items": []}; env = run_music_variation(args, manifest); return {"ok": True, "name": name, "result": env}
@@ -3429,6 +3450,66 @@ async def datasets_index(name: str, version: str):
     try:
         content, code, headers = _datasets_index(name, version)
         return Response(content=content, status_code=code, headers=headers)
+    except Exception as ex:
+        return JSONResponse(status_code=400, content={"error": str(ex)})
+
+
+# ---------- Film-2 QA (Step 23) ----------
+@app.post("/film2/qa")
+async def film2_qa(body: Dict[str, Any]):
+    try:
+        cid = body.get("cid") or body.get("film_id")
+        if not cid:
+            return JSONResponse(status_code=400, content={"error": "missing cid"})
+        shots = body.get("shots") or []
+        voice_lines = body.get("voice_lines") or []
+        music_cues = body.get("music_cues") or []
+        T_FACE = float(os.getenv("FILM2_QA_T_FACE", "0.85"))
+        T_VOICE = float(os.getenv("FILM2_QA_T_VOICE", "0.85"))
+        T_MUSIC = float(os.getenv("FILM2_QA_T_MUSIC", "0.80"))
+        issues = []
+        for shot in shots:
+            sid = shot.get("id") or shot.get("shot_id")
+            if not sid:
+                continue
+            snap = _film_load_snap(cid, sid) or {}
+            sb_meta = {"face_vec": snap.get("face_vec")}
+            fin_meta = {"face_vec": None}
+            score = _qa_face(sb_meta, fin_meta, face_ref_embed=None)
+            if score < T_FACE:
+                args = {"name": "image.dispatch", "args": {"mode": "gen", "prompt": shot.get("prompt") or "", "size": shot.get("size", "1024x1024"), "refs": snap.get("refs", {}), "seed": int(snap.get("seed") or 0), "film_cid": cid, "shot_id": sid}}
+                try:
+                    await tool_run(args)
+                except Exception:
+                    pass
+                issues.append({"shot": sid, "type": "image", "score": score})
+        for ln in voice_lines:
+            lid = ln.get("id") or ln.get("line_id")
+            if not lid:
+                continue
+            snap = _film_load_snap(cid, f"vo_{lid}") or {}
+            score = _qa_voice({"voice_vec": None}, voice_ref_embed=None)
+            if score < T_VOICE:
+                args = {"name": "tts.speak", "args": {"text": ln.get("text") or "", "voice_id": ln.get("voice_ref_id"), "voice_refs": snap.get("refs", {}), "seed": int(snap.get("seed") or 0), "film_cid": cid, "line_id": lid}}
+                try:
+                    await tool_run(args)
+                except Exception:
+                    pass
+                issues.append({"line": lid, "type": "voice", "score": score})
+        for cue in music_cues:
+            cid2 = cue.get("id") or cue.get("cue_id")
+            if not cid2:
+                continue
+            snap = _film_load_snap(cid, f"cue_{cid2}") or {}
+            score = _qa_music({"motif_vec": None}, motif_embed=None)
+            if score < T_MUSIC:
+                args = {"name": "music.dispatch", "args": {"mode": "compose", "prompt": cue.get("prompt") or "", "music_id": cue.get("music_ref_id"), "music_refs": snap.get("refs", {}), "seed": int(snap.get("seed") or 0), "film_cid": cid, "cue_id": cid2}}
+                try:
+                    await tool_run(args)
+                except Exception:
+                    pass
+                issues.append({"cue": cid2, "type": "music", "score": score})
+        return {"cid": cid, "issues": issues, "thresholds": {"face": T_FACE, "voice": T_VOICE, "music": T_MUSIC}}
     except Exception as ex:
         return JSONResponse(status_code=400, content={"error": str(ex)})
 
