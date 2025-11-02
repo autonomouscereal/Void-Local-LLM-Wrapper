@@ -24,6 +24,8 @@ from __future__ import annotations
 # - We never replace the main content with status; instead we append a Status block only when empty/refusal.
 # - Long-running film pipeline: film_create → film_add_scene (ComfyUI jobs via /jobs) → film_compile (n8n or local assembler).
 # - Keep LLM models warm: we set options.keep_alive=24h on every Ollama call to avoid reloading between requests.
+# - ABSOLUTE RULE: TIMEOUTS ARE FORBIDDEN. Do not pass timeout args to HTTP/model/tool calls.
+#   All requests must wait for completion; backoff/retry is allowed, but never hard time caps.
 
 import os
 from types import SimpleNamespace
@@ -167,6 +169,7 @@ MAX_DEBATE_TURNS = 1
 AUTO_EXECUTE_TOOLS = True
 # Always allow tool execution
 ALLOW_TOOL_EXECUTION = True
+TIMEOUTS_FORBIDDEN = True
 STREAM_CHUNK_SIZE_CHARS = int(os.getenv("STREAM_CHUNK_SIZE_CHARS", "0"))
 STREAM_CHUNK_INTERVAL_MS = int(os.getenv("STREAM_CHUNK_INTERVAL_MS", "50"))
 JOBS_RAG_INDEX = os.getenv("JOBS_RAG_INDEX", "true").lower() == "true"
@@ -1335,14 +1338,14 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 self.base = (base or "").rstrip("/") if base else None
             def _post_prompt(self, graph: Dict[str, Any]) -> Dict[str, Any]:
                 import httpx as _hx  # type: ignore
-                with _hx.Client(timeout=60) as client:
+                with _hx.Client() as client:
                     r = client.post(self.base + "/prompt", json={"prompt": graph})
                     r.raise_for_status(); return r.json()
             def _poll(self, pid: str, timeout_s: int = 60) -> Dict[str, Any]:
                 import httpx as _hx, time as _tm  # type: ignore
                 t0 = _tm.time()
                 while True:
-                    r = _hx.get(self.base + f"/history/{pid}", timeout=30)
+                    r = _hx.get(self.base + f"/history/{pid}")
                     if r.status_code == 200:
                         js = r.json(); h = (js.get("history") or {}).get(pid)
                         if h and (h.get("status", {}).get("completed") is True):
@@ -1362,7 +1365,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                             q = {"filename": fn, "type": tp}
                             if sub: q["subfolder"] = sub
                             url = self.base + "/view?" + urlencode(q)
-                            r = _hx.get(url, timeout=60)
+                            r = _hx.get(url)
                             if r.status_code == 200:
                                 return r.content
                 return b""
@@ -1391,7 +1394,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     "10": {"class_type": "SaveImage", "inputs": {"filename_prefix": "image_gen", "images": ["9", 0]}},
                 }
                 js = self._post_prompt(g); pid = js.get("prompt_id") or js.get("uuid") or js.get("id")
-                det = self._poll(pid, timeout_s=300)
+                det = self._poll(pid, timeout_s=900)
                 data = self._download_first(det)
                 view_url = f"{self.base}/history/{pid}" if (self.base and pid) else None
                 return {"image_bytes": data, "model": "comfyui:sdxl", "prompt_id": pid, "history_url": view_url}
@@ -1410,7 +1413,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     "9": {"class_type": "VAEDecode", "inputs": {"samples": ["8", 0], "vae": ["1", 2]}},
                     "10": {"class_type": "SaveImage", "inputs": {"filename_prefix": "image_edit", "images": ["9", 0]}},
                 }
-                js = self._post_prompt(g); pid = js.get("prompt_id") or js.get("uuid") or js.get("id"); det = self._poll(pid, timeout_s=300)
+                js = self._post_prompt(g); pid = js.get("prompt_id") or js.get("uuid") or js.get("id"); det = self._poll(pid, timeout_s=900)
                 data = self._download_first(det)
                 view_url = f"{self.base}/history/{pid}" if (self.base and pid) else None
                 return {"image_bytes": data, "model": "comfyui:sdxl", "prompt_id": pid, "history_url": view_url}
@@ -1424,7 +1427,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     "12": {"class_type": "RealESRGAN", "inputs": {"image": ["2", 0], "model": ["11", 0], "scale": scale}},
                     "10": {"class_type": "SaveImage", "inputs": {"filename_prefix": "image_upscale", "images": ["12", 0]}},
                 }
-                js = self._post_prompt(g); pid = js.get("prompt_id") or js.get("uuid") or js.get("id"); det = self._poll(pid, timeout_s=300)
+                js = self._post_prompt(g); pid = js.get("prompt_id") or js.get("uuid") or js.get("id"); det = self._poll(pid, timeout_s=900)
                 data = self._download_first(det)
                 view_url = f"{self.base}/history/{pid}" if (self.base and pid) else None
                 return {"image_bytes": data, "model": "comfyui:realesrgan", "prompt_id": pid, "history_url": view_url}
@@ -2460,8 +2463,25 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     qwen_task = asyncio.create_task(call_ollama(QWEN_BASE_URL, qwen_payload))
     gptoss_task = asyncio.create_task(call_ollama(GPTOSS_BASE_URL, gptoss_payload))
     qwen_result, gptoss_result = await asyncio.gather(qwen_task, gptoss_task)
-    # Fast-fail if either backend errored
+    # If backends errored but we have tool results (e.g., image job still running/finishing), degrade gracefully
     if qwen_result.get("error") or gptoss_result.get("error"):
+        if tool_results:
+            final_text = ""
+            usage = estimate_usage(messages, final_text)
+            response = {
+                "id": "orc-1",
+                "object": "chat.completion",
+                "model": f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}",
+                "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": final_text}}],
+                "usage": usage,
+                "seed": master_seed,
+            }
+            try:
+                if _lock_token:
+                    _release_lock(STATE_DIR, trace_id)
+            except Exception:
+                pass
+            return JSONResponse(content=response)
         detail = {
             "qwen": {k: v for k, v in qwen_result.items() if k in ("error", "_base_url")},
             "gptoss": {k: v for k, v in gptoss_result.items() if k in ("error", "_base_url")},

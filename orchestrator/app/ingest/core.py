@@ -50,7 +50,8 @@ def ingest_file(path: str, vlm_url: str | None = None, whisper_url: str | None =
             try:
                 import httpx
                 b64 = _b64_of(path, max_bytes=10_000_000)
-                with httpx.Client(timeout=180) as client:
+                # TIMEOUTS FORBIDDEN: never pass timeout to HTTP clients
+                with httpx.Client() as client:
                     r = client.post(ocr_url.rstrip("/") + "/ocr", json={"b64": b64, "ext": ext})
                     r.raise_for_status()
                     js = r.json()
@@ -70,7 +71,8 @@ def ingest_file(path: str, vlm_url: str | None = None, whisper_url: str | None =
             try:
                 import httpx
                 b64 = _b64_of(path)
-                with httpx.Client(timeout=30) as client:
+                # TIMEOUTS FORBIDDEN
+                with httpx.Client() as client:
                     r = client.post(vlm_url.rstrip("/") + "/analyze", json={"b64": b64})
                     r.raise_for_status()
                     js = r.json()
@@ -83,7 +85,8 @@ def ingest_file(path: str, vlm_url: str | None = None, whisper_url: str | None =
             try:
                 import httpx
                 b64 = _b64_of(path)
-                with httpx.Client(timeout=60) as client:
+                # TIMEOUTS FORBIDDEN
+                with httpx.Client() as client:
                     r = client.post(ocr_url.rstrip("/") + "/ocr", json={"b64": b64, "ext": ext})
                     r.raise_for_status()
                     js = r.json()
@@ -99,7 +102,8 @@ def ingest_file(path: str, vlm_url: str | None = None, whisper_url: str | None =
             try:
                 import httpx
                 b64 = _b64_of(path)
-                with httpx.Client(timeout=120) as client:
+                # TIMEOUTS FORBIDDEN
+                with httpx.Client() as client:
                     r = client.post(whisper_url.rstrip("/") + "/transcribe", json={"b64": b64})
                     r.raise_for_status()
                     js = r.json()

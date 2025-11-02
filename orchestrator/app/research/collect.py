@@ -27,7 +27,8 @@ def discover_sources(query: str, scope: str, since: Optional[str], until: Option
                 "api_key": api_key,
             }
             url = "https://serpapi.com/search.json?" + urllib.parse.urlencode(params)
-            with urllib.request.urlopen(url, timeout=20) as resp:
+            # TIMEOUTS FORBIDDEN: never pass timeout; allow long-running networks to complete
+            with urllib.request.urlopen(url) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
             for item in (data.get("organic_results") or [])[:5]:
                 title = item.get("title", "")

@@ -6,6 +6,7 @@ from ..adapters.providers import ProviderError
 
 
 class PhaseTimeout(Exception):
+    # Timeouts are forbidden in this wrapper. This exception is retained only for legacy signatures.
     pass
 
 
@@ -36,10 +37,10 @@ def run_phase_with_timeout(fn, args: Dict[str, Any], timeout_s: int, retries: in
         delay = backoff[min(attempt + 1, len(backoff) - 1)] if backoff else 0
         if delay > 0:
             time.sleep(delay)
-        if (time.time() - tstart) > timeout_s:
-            raise PhaseTimeout(f"phase timeout after {timeout_s}s")
+        # Timeouts are forbidden: ignore timeout_s and never raise PhaseTimeout based on elapsed time.
     if last_err:
         raise last_err
-    raise PhaseTimeout(f"phase timeout after {timeout_s}s")
+    # If we reach here without a result and no error, return None with attempts/elapsed for diagnostics
+    return None, retries + 1, time.time() - tstart
 
 

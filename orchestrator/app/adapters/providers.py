@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+# ABSOLUTE RULE: TIMEOUTS ARE FORBIDDEN IN THIS WRAPPER.
+# Do not pass timeout values to model/tool HTTP calls.
+
 from types import SimpleNamespace
 from typing import Any, Dict, List
 import time
@@ -40,8 +43,7 @@ def classify_exc(e: Exception) -> ProviderError:
 
 def _call_provider_chat(provider, prompt: str, max_tokens: int, timeout: int | None = None):
     try:
-        if timeout is not None:
-            return provider.chat(prompt, max_tokens=max_tokens, timeout=timeout)
+        # Timeouts are forbidden; always call without timeout
         return provider.chat(prompt, max_tokens=max_tokens)
     except TypeError:
         # Providers without timeout param
@@ -54,7 +56,8 @@ def model_chat_with_retry(provider, prompt: str, max_tokens: int, timeout_s: int
     last_err: ProviderError | None = None
     for attempt in range(retries + 1):
         try:
-            resp = _call_provider_chat(provider, prompt, max_tokens, timeout=timeout_s)
+            # Always call without timeout
+            resp = _call_provider_chat(provider, prompt, max_tokens, timeout=None)
             return resp
         except Exception as e:
             perr = classify_exc(e)
