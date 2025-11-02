@@ -4,7 +4,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
 # Enable CUDA wheels channel for PyTorch; falls back to CPU if GPUs not visible
-ENV PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu121
+ENV PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu128
 
 RUN apt-get update && apt-get install -y git ffmpeg build-essential libgl1 curl && rm -rf /var/lib/apt/lists/*
 
@@ -13,7 +13,7 @@ WORKDIR /comfyui
 RUN git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git .
 
 # Pre-install CUDA-enabled torch; will still fall back to CPU if no GPU is present
-RUN pip install --no-cache-dir torch==2.3.1+cu121 torchvision==0.18.1+cu121 torchaudio==2.3.1+cu121
+RUN pip install --no-cache-dir torch==2.9.0+cu128 torchvision==0.24.0+cu128 torchaudio==2.9.0+cu128
 # Install ComfyUI requirements and common deps
 RUN pip install --no-cache-dir -r requirements.txt
 RUN pip install --no-cache-dir numpy==1.26.4 opencv-python-headless==4.9.0.80 imageio-ffmpeg==0.4.9 pillow==10.4.0 \

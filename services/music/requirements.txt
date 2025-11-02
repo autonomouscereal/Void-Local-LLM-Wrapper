@@ -1,8 +1,8 @@
 fastapi>=0.115.0,<0.200
 uvicorn[standard]>=0.31.0,<0.40
-torch==2.3.1+cu121 ; platform_system != 'Windows'
-torchaudio==2.3.1+cu121 ; platform_system != 'Windows'
---extra-index-url https://download.pytorch.org/whl/cu121
+torch==2.9.0+cu128 ; platform_system != 'Windows'
+torchaudio==2.9.0+cu128 ; platform_system != 'Windows'
+--extra-index-url https://download.pytorch.org/whl/cu128
 transformers>=4.45.0,<5
 accelerate>=0.34.0,<1
 numpy>=1.26.4,<2.0.0

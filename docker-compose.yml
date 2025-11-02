@@ -191,10 +191,12 @@ services:
     environment:
       - XTTS_MODEL_NAME=tts_models/multilingual/multi-dataset/xtts_v2
       - NVIDIA_VISIBLE_DEVICES=all
+      - PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu128
     expose:
       - "8020"
     ports:
       - "8020:8020"
+    shm_size: "1g"
     
 
   whisper:
@@ -255,10 +257,12 @@ services:
       - "nvidia.com/gpu=all"
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
+      - PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu128
     expose:
       - "8188"
     ports:
       - "8188:8188"
+    shm_size: "1g"
     volumes:
       - comfyui_models:/comfyui/models
       - comfyui_custom_nodes:/comfyui/custom_nodes
@@ -403,10 +407,12 @@ services:
     environment:
       - MUSIC_MODEL_ID=facebook/musicgen-small
       - NVIDIA_VISIBLE_DEVICES=all
+      - PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu128
     expose:
       - "7860"
     ports:
       - "7860:7860"
+    shm_size: "1g"
     
 
   vlm:
@@ -423,10 +429,12 @@ services:
         condition: service_completed_successfully
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
+      - PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu128
     expose:
       - "8050"
     ports:
       - "8050:8050"
+    shm_size: "1g"
     
 
   ocr:
