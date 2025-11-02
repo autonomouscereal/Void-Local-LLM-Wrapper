@@ -61,8 +61,8 @@ EOF
       fi
     done
   fi
-  # Restart Docker (best effort)
-  chroot "$HOST_ROOT" /usr/bin/systemctl restart docker || chroot "$HOST_ROOT" /usr/sbin/service docker restart || true
+  # Note: we DO NOT restart Docker here to avoid disrupting SSH sessions.
+  # If a restart is required, compose will proceed without it; you can restart manually later if needed.
 fi
 
 pick_target() {
