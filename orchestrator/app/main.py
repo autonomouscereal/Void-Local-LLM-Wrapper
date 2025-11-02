@@ -3774,6 +3774,31 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         return list(dict.fromkeys(urls))
 
     asset_urls = _asset_urls_from_tools(tool_results)
+    # Fallback: if no URLs surfaced from tool results (e.g. async image jobs that finished out-of-band),
+    # look up recent artifacts from multimodal memory for this conversation and attach their public URLs.
+    if (not asset_urls) and conv_cid:
+        try:
+            recents = _ctx_list(str(conv_cid), limit=5, kind_hint="image")
+            for it in recents or []:
+                u = (it or {}).get("url") or ""
+                p = (it or {}).get("path") or ""
+                if isinstance(u, str) and u.startswith("/uploads/"):
+                    asset_urls.append(u)
+                else:
+                    if isinstance(p, str) and p:
+                        # Convert filesystem paths under /workspace/uploads to public /uploads
+                        if p.startswith("/workspace/") and "/uploads/" in p:
+                            try:
+                                tail = p.split("/workspace", 1)[1]
+                                asset_urls.append(tail)
+                            except Exception:
+                                pass
+                        elif "/uploads/" in p:
+                            asset_urls.append(p)
+        except Exception:
+            pass
+        # de-dup
+        asset_urls = list(dict.fromkeys(asset_urls))
     if asset_urls:
         assets_block = "\n".join(["Assets:"] + [f"- {u}" for u in asset_urls])
         final_text = (final_text + "\n\n" + assets_block).strip()
