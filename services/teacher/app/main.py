@@ -396,7 +396,9 @@ async def teacher_ingest(body: Dict[str, Any]):
             shard_name = f"{key}_shard_{idx:05d}.jsonl"
             shard_path = os.path.join(out_dir, shard_name)
             _write_text(shard_path, "\n".join(shard) + ("\n" if shard else ""))
-            shards_meta.append({"uri": _uri_from_path(shard_path), "count": len(shard), "hash": f"sha256:{_sha256_bytes(('\n'.join(shard)+'\n').encode('utf-8'))}"})
+            _sh_text = ("\n".join(shard) + "\n").encode("utf-8") if shard else b""
+            _sh_hash = _sha256_bytes(_sh_text)
+            shards_meta.append({"uri": _uri_from_path(shard_path), "count": len(shard), "hash": f"sha256:{_sh_hash}"})
             idx += 1
 
     rr = {"ts": _now_iso(), "seed": seed, "paths": [m["uri"] for m in shards_meta]}
