@@ -1316,24 +1316,16 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         mode = (args.get("mode") or "gen").lower()
         if mode == "upscale":
             return {"name": "image.dispatch", "result": {"accepted": True, "op": "upscale", "params": {"scale": int(args.get("scale") or 2)}}}
-        if mode == "edit" and COMFYUI_API_URL and ALLOW_TOOL_EXECUTION:
+        # If a raw ComfyUI workflow graph is explicitly provided, post it in the correct shape
+        wf = args.get("workflow")
+        if isinstance(wf, dict) and COMFYUI_API_URL:
             async with httpx.AsyncClient(timeout=600) as client:
-                r = await client.post(COMFYUI_API_URL.rstrip("/") + "/prompt", json=args.get("workflow") or args)
+                r = await client.post(COMFYUI_API_URL.rstrip("/") + "/prompt", json={"prompt": wf})
                 try:
-                    r.raise_for_status()
-                    return {"name": name, "result": r.json()}
+                    r.raise_for_status(); return {"name": name, "result": r.json()}
                 except Exception:
                     return {"name": name, "error": r.text}
-        # default gen
-        if COMFYUI_API_URL and ALLOW_TOOL_EXECUTION:
-            async with httpx.AsyncClient(timeout=600) as client:
-                r = await client.post(COMFYUI_API_URL.rstrip("/") + "/prompt", json=args.get("workflow") or args)
-                try:
-                    r.raise_for_status()
-                    return {"name": name, "result": r.json()}
-                except Exception:
-                    return {"name": name, "error": r.text}
-        return {"name": name, "skipped": True, "reason": "image backend not configured"}
+        # Otherwise fall through to provider that builds a valid graph
     if name == "image.dispatch" and ALLOW_TOOL_EXECUTION:
         # Dispatch to image tools based on mode
         mode = (args.get("mode") or "gen").strip().lower()
