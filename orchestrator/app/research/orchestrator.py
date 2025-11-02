@@ -18,6 +18,7 @@ from ..jobs.state import create_job, set_state, get_job
 from ..jobs.progress import event as progress_event
 from ..jobs.partials import emit_partial
 from ..ops.timeout_retry import run_phase_with_timeout, PhaseTimeout
+from ..datasets.trace import append_sample as _trace_append
 
 
 RAG_TTL = int(os.getenv("RAG_TTL_SECONDS", "3600"))
@@ -164,6 +165,10 @@ def run_research(job: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:
         sources = []
         summary_text = ""
+    try:
+        _trace_append("research", {"cid": cid, "query": q, "summary": summary_text, "sources": sources, "artifacts": manifest.get("items", [])})
+    except Exception:
+        pass
     return {"phase": "done", "artifacts": manifest.get("items", []), "cid": cid, "report": report, "summary_text": summary_text, "sources": sources}
 
 

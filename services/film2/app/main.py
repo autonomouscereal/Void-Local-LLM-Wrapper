@@ -101,6 +101,19 @@ def _append_ndjson(path: str, obj: Any) -> None:
         f.write(json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n")
 
 
+def _trace_append(kind: str, row: Dict[str, Any]) -> None:
+    try:
+        root = os.path.join(UPLOAD_ROOT, "datasets", "trace")
+        os.makedirs(root, exist_ok=True)
+        path = os.path.join(root, f"{kind}.jsonl")
+        row = dict(row)
+        row.setdefault("ts", _now_iso())
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
+    except Exception:
+        return
+
+
 def _log_run(project_id: str, stage: str, artifacts: List[Dict[str, str]], extra: Optional[Dict[str, Any]] = None) -> None:
     entry = {
         "ts": _now_iso(),
@@ -325,7 +338,7 @@ async def film_plan(body: Dict[str, Any]):
     except Exception:
         pass
 
-    return {
+    result = {
         "project_id": project_id,
         "seed": seed,
         "beats": beats,
@@ -335,6 +348,11 @@ async def film_plan(body: Dict[str, Any]):
         "shot_budget": shot_budget,
         "outputs": outputs,
     }
+    try:
+        _trace_append("film", {"stage": "plan", "project_id": project_id, "seed": seed, "outputs": outputs, "style_refs": style_refs, "character_images": character_images})
+    except Exception:
+        pass
+    return result
 
 
 @app.post("/film/breakdown")
@@ -409,6 +427,10 @@ async def film_breakdown(body: Dict[str, Any]):
                     )
     except Exception:
         pass
+    try:
+        _trace_append("film", {"stage": "breakdown", "project_id": project_id, "shots": shots})
+    except Exception:
+        pass
     return {"shots": shots}
 
 
@@ -439,6 +461,10 @@ async def film_storyboard(body: Dict[str, Any]):
         sh_id = sb["shot_id"]
         _write_json(project_id, os.path.join("shots", sh_id, "storyboard.json"), sb)
     _log_run(project_id, "storyboard", [{"type": "json", "uri": _proj_uri(project_id, "shots", shots[0], "storyboard.json")}], {"seed": seed})
+    try:
+        _trace_append("film", {"stage": "storyboard", "project_id": project_id, "count": len(storyboards)})
+    except Exception:
+        pass
     return {"storyboards": storyboards}
 
 
@@ -460,6 +486,10 @@ async def film_animatic(body: Dict[str, Any]):
         animatics.append(obj)
         _write_json(project_id, os.path.join("shots", sh_id, "animatic.json"), obj)
     _log_run(project_id, "animatic", [{"type": "json", "uri": _proj_uri(project_id, "shots", shots[0], "animatic.json")}], {"seed": seed})
+    try:
+        _trace_append("film", {"stage": "animatic", "project_id": project_id, "count": len(animatics)})
+    except Exception:
+        pass
     return {"animatics": animatics}
 
 
@@ -622,6 +652,36 @@ async def film_final(body: Dict[str, Any]):
         nodes_obj["graph_hash"] = None
     nodes_meta = _write_json(project_id, "nodes.json", nodes_obj)
     reel = _save_bytes(f"{PROJECTS_PREFIX}/{project_id}/reel_v0.mp4", _sha256_str(f"{project_id}|{seed}|reel").encode("utf-8"))
+    # Default cleanup/stabilization pass via Orchestrator video tool (no filters; identity stabilization only)
+    try:
+        orch = os.getenv("ORCHESTRATOR_URL", "http://orchestrator:8000").rstrip("/")
+        # Parse resolution for identity-preserving upscale to same size
+        out_res = outputs.get("resolution") or outputs.get("res") or ""
+        width, height = None, None
+        try:
+            if isinstance(out_res, str) and "x" in out_res:
+                parts = out_res.lower().split("x"); width = int(parts[0]); height = int(parts[1])
+        except Exception:
+            width, height = None, None
+        import httpx  # type: ignore
+        # Prefer direct stabilization without resizing; if not supported upstream, a same-size upscale triggers stabilization
+        args = {"src": reel["uri"], "cid": project_id}
+        if width and height:
+            args.update({"width": width, "height": height})
+        payload = {"name": "video.upscale", "args": args}
+        with httpx.Client(timeout=None) as client:
+            rr = client.post(orch + "/tool.run", json=payload)
+            if rr.status_code == 200:
+                try:
+                    j = rr.json()
+                    new_path = ((j.get("result") or {}).get("path") if isinstance(j, dict) else None)
+                    if isinstance(new_path, str) and new_path:
+                        # Overwrite reel with stabilized output
+                        reel = {"uri": new_path, "hash": reel.get("hash")}
+                except Exception:
+                    pass
+    except Exception:
+        pass
     _log_run(project_id, "final", [{"type": "json", "uri": edl_meta["uri"]}, {"type": "json", "uri": nodes_meta["uri"]}, {"type": "mp4", "uri": reel["uri"], "hash": reel["hash"]}], {"seed": seed})
     # Optionally persist nodes manifest to DB
     try:
@@ -631,6 +691,10 @@ async def film_final(body: Dict[str, Any]):
             if row:
                 pid = int(row[0])
                 await db_execute("INSERT INTO film_manifest(project_id, kind, json) VALUES($1,$2,$3)", pid, "nodes", nodes_obj)
+    except Exception:
+        pass
+    try:
+        _trace_append("film", {"stage": "final", "project_id": project_id, "shots": final_shots, "cache": ("hit" if cache_hits else "miss")})
     except Exception:
         pass
     return {"final_shots": final_shots, "assembly": {"timeline_json": edl_meta["uri"], "nodes_json": nodes_meta["uri"], "reel_mp4": reel["uri"], "hash": reel["hash"], **({"cache": "hit"} if cache_hits else {})}}
@@ -778,6 +842,10 @@ async def film_export(body: Dict[str, Any]):
                 pid = int(row[0])
                 await db_execute("INSERT INTO film_manifest(project_id, kind, json) VALUES($1,$2,$3)", pid, "export", export)
                 await db_execute("UPDATE film_project SET state='exported' WHERE id=$1", pid)
+    except Exception:
+        pass
+    try:
+        _trace_append("film", {"stage": "export", "project_id": project_id, "export": export})
     except Exception:
         pass
     return export

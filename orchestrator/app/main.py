@@ -1010,6 +1010,13 @@ def get_builtin_tools_schema() -> List[Dict[str, Any]]:
         {
             "type": "function",
             "function": {
+                "name": "image.super_gen",
+                "parameters": {"type": "object", "properties": {"prompt": {"type": "string"}, "size": {"type": "string"}, "refs": {"type": "object"}, "seed": {"type": "integer"}, "cid": {"type": "string"}}, "required": ["prompt"]}
+            }
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "music.dispatch",
                 "parameters": {"type": "object", "properties": {"prompt": {"type": "string"}}, "required": []}
             }
@@ -1047,6 +1054,48 @@ def get_builtin_tools_schema() -> List[Dict[str, Any]]:
             "function": {
                 "name": "video.upscale",
                 "parameters": {"type": "object", "properties": {"src": {"type": "string"}, "scale": {"type": "integer"}, "width": {"type": "integer"}, "height": {"type": "integer"}}, "required": ["src"]}
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "image.cleanup",
+                "parameters": {"type": "object", "properties": {"src": {"type": "string"}, "denoise": {"type": "boolean"}, "sharpen": {"type": "boolean"}, "dehalo": {"type": "boolean"}, "clahe": {"type": "boolean"}, "cid": {"type": "string"}}, "required": ["src"]}
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "video.cleanup",
+                "parameters": {"type": "object", "properties": {"src": {"type": "string"}, "denoise": {"type": "boolean"}, "deband": {"type": "boolean"}, "sharpen": {"type": "boolean"}, "stabilize_faces": {"type": "boolean"}, "cid": {"type": "string"}}, "required": ["src"]}
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "image.artifact_fix",
+                "parameters": {"type": "object", "properties": {"src": {"type": "string"}, "type": {"type": "string"}, "target_time": {"type": "string"}, "region": {"type": "array", "items": {"type": "integer"}}, "cid": {"type": "string"}}, "required": ["src", "type"]}
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "video.artifact_fix",
+                "parameters": {"type": "object", "properties": {"src": {"type": "string"}, "type": {"type": "string"}, "target_time": {"type": "string"}, "region": {"type": "array", "items": {"type": "integer"}}, "cid": {"type": "string"}}, "required": ["src", "type"]}
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "image.hands.fix",
+                "parameters": {"type": "object", "properties": {"src": {"type": "string"}, "cid": {"type": "string"}}, "required": ["src"]}
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "video.hands.fix",
+                "parameters": {"type": "object", "properties": {"src": {"type": "string"}, "cid": {"type": "string"}}, "required": ["src"]}
             }
         },
         {
@@ -1834,6 +1883,125 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             return {"name": name, "result": env}
         except Exception as ex:
             return {"name": name, "error": str(ex)}
+    if name == "image.super_gen" and ALLOW_TOOL_EXECUTION:
+        # Multi-object iterative generation: base canvas + per-object refinement + global polish
+        prompt = (args.get("prompt") or "").strip()
+        if not prompt:
+            return {"name": name, "error": "missing prompt"}
+        try:
+            from PIL import Image, ImageDraw  # type: ignore
+        except Exception:
+            return {"name": name, "error": "Pillow not available"}
+        size_text = args.get("size") or "1024x1024"
+        try:
+            w, h = [int(x) for x in size_text.lower().split("x")]
+        except Exception:
+            w, h = 1024, 1024
+        import time as _tm, os as _os
+        outdir = _os.path.join(UPLOAD_DIR, "artifacts", "image", f"super-{int(_tm.time())}")
+        _os.makedirs(outdir, exist_ok=True)
+        # 1) Decompose prompt → object prompts (heuristic: split by commas/" and ")
+        objs = []
+        base_style = prompt
+        try:
+            parts = [p.strip() for p in prompt.replace(" and ", ", ").split(",") if p.strip()]
+            if len(parts) >= 3:
+                base_style = parts[0]
+                objs = parts[1:]
+            else:
+                objs = parts
+        except Exception:
+            objs = [prompt]
+        if not objs:
+            objs = [prompt]
+        # 2) Layout: grid boxes left→right, top→bottom
+        cols = max(1, int((len(objs) + 1) ** 0.5))
+        rows = max(1, (len(objs) + cols - 1) // cols)
+        cell_w = max(256, w // cols)
+        cell_h = max(256, h // rows)
+        boxes = []
+        for i, _ in enumerate(objs):
+            r = i // cols; c = i % cols
+            x0 = min(w - cell_w, c * cell_w)
+            y0 = min(h - cell_h, r * cell_h)
+            boxes.append((x0, y0, x0 + cell_w, y0 + cell_h))
+        # Heuristic signage/text extraction to prevent drift (e.g., STOP signs)
+        signage_keywords = ("sign", "stop sign", "billboard", "poster", "label", "street sign", "traffic sign")
+        wants_signage = any(kw in prompt.lower() for kw in signage_keywords)
+        exact_text = None
+        try:
+            import re as _re
+            quoted = _re.findall(r"\"([^\"]{2,})\"|'([^']{2,})'", prompt)
+            for a, b in quoted:
+                t = a or b
+                if len(t.split()) <= 4:
+                    exact_text = t
+                    break
+            if (not exact_text) and ("stop" in prompt.lower()):
+                exact_text = "STOP"
+        except Exception:
+            exact_text = None
+        # 3) Base canvas
+        base_args = {"prompt": base_style, "size": f"{w}x{h}", "seed": args.get("seed"), "refs": args.get("refs"), "cid": args.get("cid")}
+        base = await execute_tool_call({"name": "image.gen", "arguments": base_args})
+        try:
+            cid = ((base.get("result") or {}).get("meta") or {}).get("cid")
+            rid = ((base.get("result") or {}).get("tool_calls") or [{}])[0].get("result_ref")
+            base_path = _os.path.join(UPLOAD_DIR, "artifacts", "image", cid, rid) if (cid and rid) else None
+        except Exception:
+            base_path = None
+        if not base_path or not _os.path.exists(base_path):
+            return {"name": name, "error": "base generation failed"}
+        canvas = Image.open(base_path).convert("RGB")
+        # 4) Per-object refinement via tiled generations blended into canvas
+        for (obj_prompt, box) in zip(objs, boxes):
+            try:
+                refined_prompt = obj_prompt
+                if wants_signage and exact_text and any(kw in obj_prompt.lower() for kw in ("sign", "poster", "label", "billboard", "traffic sign")):
+                    refined_prompt = f"{obj_prompt}, exact signage text: {exact_text}"
+                sub_args = {"prompt": refined_prompt, "size": f"{box[2]-box[0]}x{box[3]-box[1]}", "seed": args.get("seed"), "refs": args.get("refs"), "cid": args.get("cid")}
+                sub = await execute_tool_call({"name": "image.gen", "arguments": sub_args})
+                scid = ((sub.get("result") or {}).get("meta") or {}).get("cid")
+                srid = ((sub.get("result") or {}).get("tool_calls") or [{}])[0].get("result_ref")
+                sub_path = _os.path.join(UPLOAD_DIR, "artifacts", "image", scid, srid) if (scid and srid) else None
+                if sub_path and _os.path.exists(sub_path):
+                    tile = Image.open(sub_path).convert("RGB")
+                    canvas.paste(tile.resize((box[2]-box[0], box[3]-box[1])), (box[0], box[1]))
+            except Exception:
+                continue
+        # 5) Final signage overlay (safety net) to strictly enforce text if requested
+        try:
+            if wants_signage and exact_text:
+                from PIL import ImageFont  # type: ignore
+                draw = ImageDraw.Draw(canvas)
+                # Choose a region likely to contain signage: first box with keyword, else center
+                target_box = None
+                for (obj_prompt, box) in zip(objs, boxes):
+                    if any(kw in obj_prompt.lower() for kw in ("sign", "poster", "label", "billboard", "traffic sign")):
+                        target_box = box; break
+                if not target_box:
+                    target_box = (w//4, h//4, 3*w//4, 3*h//4)
+                tx, ty = (target_box[0] + 10, target_box[1] + 10)
+                # Fallback font
+                try:
+                    font = ImageFont.truetype("arial.ttf", max(24, (target_box[3]-target_box[1])//6))
+                except Exception:
+                    font = None
+                draw.text((tx, ty), str(exact_text), fill=(220, 220, 220), font=font)
+        except Exception:
+            pass
+        final_path = _os.path.join(outdir, "final.png")
+        canvas.save(final_path)
+        url = final_path.replace("/workspace", "") if final_path.startswith("/workspace/") else final_path
+        try:
+            _ctx_add(args.get("cid") or "", "image", final_path, url, base_path, ["super_gen"], {"objects": objs, "boxes": boxes, "signage_text": exact_text})
+        except Exception:
+            pass
+        try:
+            _trace_append("image", {"cid": args.get("cid"), "tool": "image.super_gen", "prompt": prompt, "size": f"{w}x{h}", "objects": objs, "boxes": boxes, "path": final_path, "signage_text": exact_text})
+        except Exception:
+            pass
+        return {"name": name, "result": {"path": url}}
     if name == "research.run" and ALLOW_TOOL_EXECUTION:
         # Prefer local orchestrator; on failure, try DRT service if configured
         try:
@@ -2182,6 +2350,249 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         try:
             subprocess.run(ff, check=True)
             url = dst.replace("/workspace", "") if dst.startswith("/workspace/") else dst
+            return {"name": name, "result": {"path": url}}
+        except Exception as ex:
+            return {"name": name, "error": str(ex)}
+    if name == "image.cleanup":
+        src = args.get("src") or ""
+        if not src:
+            return {"name": name, "error": "missing src"}
+        try:
+            import cv2  # type: ignore
+            import numpy as np  # type: ignore
+            img = cv2.imread(src, cv2.IMREAD_COLOR)
+            if img is None:
+                return {"name": name, "error": "failed to read src"}
+            work = img.copy()
+            if bool(args.get("denoise")):
+                work = cv2.fastNlMeansDenoisingColored(work, None, 5, 5, 7, 21)
+            if bool(args.get("dehalo")):
+                # simple dehalo: bilateral + unsharp blend
+                blur = cv2.bilateralFilter(work, 9, 75, 75)
+                work = cv2.addWeighted(work, 0.6, blur, 0.4, 0)
+            if bool(args.get("sharpen")):
+                k = np.array([[0,-1,0],[-1,5,-1],[0,-1,0]])
+                work = cv2.filter2D(work, -1, k)
+            if bool(args.get("clahe")):
+                lab = cv2.cvtColor(work, cv2.COLOR_BGR2LAB)
+                l, a, b = cv2.split(lab)
+                clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+                cl = clahe.apply(l)
+                lab = cv2.merge((cl, a, b))
+                work = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+            import time as _tm
+            outdir = os.path.join(UPLOAD_DIR, "artifacts", "image", f"cleanup-{int(_tm.time())}")
+            os.makedirs(outdir, exist_ok=True)
+            dst = os.path.join(outdir, "clean.png")
+            cv2.imwrite(dst, work)
+            url = dst.replace("/workspace", "") if dst.startswith("/workspace/") else dst
+            try:
+                _ctx_add(args.get("cid") or "", "image", dst, url, src, ["cleanup"], {})
+            except Exception:
+                pass
+            try:
+                _trace_append("image", {"cid": args.get("cid"), "tool": "image.cleanup", "src": src, "path": dst})
+            except Exception:
+                pass
+            return {"name": name, "result": {"path": url}}
+        except Exception as ex:
+            return {"name": name, "error": str(ex)}
+    if name == "video.cleanup":
+        src = args.get("src") or ""
+        if not src:
+            return {"name": name, "error": "missing src"}
+        import os, subprocess, time as _tm
+        outdir = os.path.join(UPLOAD_DIR, "artifacts", "video", f"vclean-{int(_tm.time())}")
+        os.makedirs(outdir, exist_ok=True)
+        dst = os.path.join(outdir, "clean.mp4")
+        # ffmpeg filter chain
+        denoise = "hqdn3d=2.0:1.5:3.0:3.0" if bool(args.get("denoise", True)) else None
+        deband = "gradfun=20:30" if bool(args.get("deband", True)) else None
+        sharpen = "unsharp=5:5:0.8:3:3:0.4" if bool(args.get("sharpen", True)) else None
+        vf_parts = [p for p in (denoise, deband, sharpen) if p]
+        vf = ",".join(vf_parts) if vf_parts else "null"
+        ff = ["ffmpeg", "-y", "-i", src, "-vf", vf, "-c:v", "libx264", "-preset", "slow", "-crf", "18", "-c:a", "copy", dst]
+        try:
+            subprocess.run(ff, check=True)
+            url = dst.replace("/workspace", "") if dst.startswith("/workspace/") else dst
+            try:
+                _ctx_add(args.get("cid") or "", "video", dst, url, src, ["cleanup"], {"vf": vf})
+            except Exception:
+                pass
+            try:
+                _trace_append("video", {"cid": args.get("cid"), "tool": "video.cleanup", "src": src, "vf": vf, "path": dst})
+            except Exception:
+                pass
+            return {"name": name, "result": {"path": url}}
+        except Exception as ex:
+            return {"name": name, "error": str(ex)}
+    if name == "image.artifact_fix":
+        src = args.get("src") or ""; atype = (args.get("type") or "").strip().lower()
+        if not src or atype not in ("clock", "glass"):
+            return {"name": name, "error": "missing src or unsupported type"}
+        try:
+            import cv2  # type: ignore
+            import numpy as np  # type: ignore
+            img = cv2.imread(src, cv2.IMREAD_COLOR)
+            if img is None:
+                return {"name": name, "error": "failed to read src"}
+            work = img.copy()
+            h, w = work.shape[:2]
+            region = args.get("region") if isinstance(args.get("region"), list) and len(args.get("region")) == 4 else [0, 0, w, h]
+            x, y, rw, rh = [int(max(0, v)) for v in region]
+            x = min(x, w - 1); y = min(y, h - 1); rw = min(rw, w - x); rh = min(rh, h - y)
+            roi = work[y:y+rh, x:x+rw].copy()
+            if atype == "clock":
+                # Heuristic clock fix: detect circle and overlay canonical hands at target_time (default 10:10)
+                target_time = str(args.get("target_time") or "10:10")
+                try:
+                    parts = target_time.split(":"); hh = int(parts[0]) % 12; mm = int(parts[1]) % 60
+                except Exception:
+                    hh, mm = 10, 10
+                gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+                gray = cv2.medianBlur(gray, 5)
+                circles = cv2.HoughCircles(gray, cv2.HOUGH_GRADIENT, 1.2, 30, param1=80, param2=30, minRadius=int(min(rw, rh) * 0.2), maxRadius=int(min(rw, rh) * 0.5))
+                cx, cy, cr = rw // 2, rh // 2, int(min(rw, rh) * 0.4)
+                if circles is not None and len(circles[0]) > 0:
+                    c = circles[0][0]; cx, cy, cr = int(c[0]), int(c[1]), int(c[2])
+                # Draw hands
+                center = (cx, cy)
+                mm_angle = (mm / 60.0) * 2 * np.pi
+                hh_angle = ((hh % 12) / 12.0 + (mm / 60.0) / 12.0) * 2 * np.pi
+                mm_pt = (int(cx + 0.85 * cr * np.sin(mm_angle)), int(cy - 0.85 * cr * np.cos(mm_angle)))
+                hh_pt = (int(cx + 0.55 * cr * np.sin(hh_angle)), int(cy - 0.55 * cr * np.cos(hh_angle)))
+                cv2.line(roi, center, mm_pt, (0, 0, 0), 2, cv2.LINE_AA)
+                cv2.line(roi, center, hh_pt, (0, 0, 0), 3, cv2.LINE_AA)
+                cv2.circle(roi, center, 3, (0, 0, 0), -1, cv2.LINE_AA)
+            elif atype == "glass":
+                # Heuristic glass fill-level smoothing in region: equalize horizontal band color
+                band_h = max(2, rh // 8)
+                band_y = y + (rh // 2 - band_h // 2)
+                band = work[band_y:band_y+band_h, x:x+rw]
+                mean_color = band.mean(axis=(0, 1)).astype(np.uint8)
+                for yy in range(y + rh // 3, y + int(rh * 0.95)):
+                    work[yy, x:x+rw] = cv2.addWeighted(work[yy, x:x+rw], 0.6, np.full((1, rw, 3), mean_color, dtype=np.uint8), 0.4, 0)
+            work[y:y+rh, x:x+rw] = roi
+            import time as _tm, os
+            outdir = os.path.join(UPLOAD_DIR, "artifacts", "image", f"afix-{int(_tm.time())}")
+            os.makedirs(outdir, exist_ok=True)
+            dst = os.path.join(outdir, "fixed.png")
+            cv2.imwrite(dst, work)
+            url = dst.replace("/workspace", "") if dst.startswith("/workspace/") else dst
+            try:
+                _ctx_add(args.get("cid") or "", "image", dst, url, src, ["artifact_fix", atype], {"region": region, "target_time": args.get("target_time")})
+            except Exception:
+                pass
+            try:
+                _trace_append("image", {"cid": args.get("cid"), "tool": "image.artifact_fix", "src": src, "type": atype, "path": dst})
+            except Exception:
+                pass
+            return {"name": name, "result": {"path": url}}
+        except Exception as ex:
+            return {"name": name, "error": str(ex)}
+    if name == "video.artifact_fix":
+        src = args.get("src") or ""; atype = (args.get("type") or "").strip().lower()
+        if not src or atype not in ("clock", "glass"):
+            return {"name": name, "error": "missing src or unsupported type"}
+        import os, subprocess, time as _tm
+        outdir = os.path.join(UPLOAD_DIR, "artifacts", "video", f"vafix-{int(_tm.time())}")
+        frames_dir = os.path.join(outdir, "frames"); os.makedirs(frames_dir, exist_ok=True)
+        dst = os.path.join(outdir, "fixed.mp4")
+        try:
+            # Extract frames
+            subprocess.run(["ffmpeg", "-y", "-i", src, os.path.join(frames_dir, "%06d.png")], check=True)
+            # Process frames with image.artifact_fix
+            from glob import glob as _glob
+            frame_files = sorted(_glob(os.path.join(frames_dir, "*.png")))
+            for fp in frame_files:
+                _ = await execute_tool_call({"name": "image.artifact_fix", "arguments": {"src": fp, "type": atype, "target_time": args.get("target_time"), "region": args.get("region"), "cid": args.get("cid")}})
+            # Reassemble
+            subprocess.run(["ffmpeg", "-y", "-framerate", "30", "-i", os.path.join(frames_dir, "%06d.png"), "-c:v", "libx264", "-pix_fmt", "yuv420p", dst], check=True)
+            url = dst.replace("/workspace", "") if dst.startswith("/workspace/") else dst
+            try:
+                _ctx_add(args.get("cid") or "", "video", dst, url, src, ["artifact_fix", atype], {})
+            except Exception:
+                pass
+            try:
+                _trace_append("video", {"cid": args.get("cid"), "tool": "video.artifact_fix", "src": src, "type": atype, "path": dst})
+            except Exception:
+                pass
+            return {"name": name, "result": {"path": url}}
+        except Exception as ex:
+            return {"name": name, "error": str(ex)}
+    if name == "image.hands.fix":
+        src = args.get("src") or ""
+        if not src:
+            return {"name": name, "error": "missing src"}
+        try:
+            import cv2  # type: ignore
+            import numpy as np  # type: ignore
+            import mediapipe as mp  # type: ignore
+            img = cv2.imread(src, cv2.IMREAD_COLOR)
+            if img is None:
+                return {"name": name, "error": "failed to read src"}
+            h, w = img.shape[:2]
+            mask = np.zeros((h, w), dtype=np.uint8)
+            mp_hands = mp.solutions.hands
+            with mp_hands.Hands(static_image_mode=True, max_num_hands=4, min_detection_confidence=0.3) as hands:
+                rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                res = hands.process(rgb)
+                if res.multi_hand_landmarks:
+                    for hand_landmarks in res.multi_hand_landmarks:
+                        pts = []
+                        for lm in hand_landmarks.landmark:
+                            pts.append((int(lm.x * w), int(lm.y * h)))
+                        if len(pts) >= 3:
+                            hull = cv2.convexHull(np.array(pts, dtype=np.int32))
+                            cv2.fillConvexPoly(mask, hull, 255)
+            if mask.max() == 0:
+                return {"name": name, "error": "no hands detected"}
+            # Dilate mask slightly
+            mask = cv2.dilate(mask, np.ones((7,7), np.uint8), iterations=1)
+            # Inpaint within mask to remove small artifacts; then blend original with inpaint to preserve detail
+            inpaint = cv2.inpaint(img, mask, 7, cv2.INPAINT_TELEA)
+            blend = cv2.addWeighted(inpaint, 0.7, img, 0.3, 0)
+            import time as _tm, os
+            outdir = os.path.join(UPLOAD_DIR, "artifacts", "image", f"handsfix-{int(_tm.time())}")
+            os.makedirs(outdir, exist_ok=True)
+            dst = os.path.join(outdir, "fixed.png")
+            cv2.imwrite(dst, blend)
+            url = dst.replace("/workspace", "") if dst.startswith("/workspace/") else dst
+            try:
+                _ctx_add(args.get("cid") or "", "image", dst, url, src, ["hands_fix"], {})
+            except Exception:
+                pass
+            try:
+                _trace_append("image", {"cid": args.get("cid"), "tool": "image.hands.fix", "src": src, "path": dst})
+            except Exception:
+                pass
+            return {"name": name, "result": {"path": url}}
+        except Exception as ex:
+            return {"name": name, "error": str(ex)}
+    if name == "video.hands.fix":
+        src = args.get("src") or ""
+        if not src:
+            return {"name": name, "error": "missing src"}
+        import os, subprocess, time as _tm
+        outdir = os.path.join(UPLOAD_DIR, "artifacts", "video", f"vhandsfix-{int(_tm.time())}")
+        frames_dir = os.path.join(outdir, "frames"); os.makedirs(frames_dir, exist_ok=True)
+        dst = os.path.join(outdir, "fixed.mp4")
+        try:
+            subprocess.run(["ffmpeg", "-y", "-i", src, os.path.join(frames_dir, "%06d.png")], check=True)
+            from glob import glob as _glob
+            frame_files = sorted(_glob(os.path.join(frames_dir, "*.png")))
+            for fp in frame_files:
+                _ = await execute_tool_call({"name": "image.hands.fix", "arguments": {"src": fp, "cid": args.get("cid")}})
+            subprocess.run(["ffmpeg", "-y", "-framerate", "30", "-i", os.path.join(frames_dir, "%06d.png"), "-c:v", "libx264", "-pix_fmt", "yuv420p", dst], check=True)
+            url = dst.replace("/workspace", "") if dst.startswith("/workspace/") else dst
+            try:
+                _ctx_add(args.get("cid") or "", "video", dst, url, src, ["hands_fix"], {})
+            except Exception:
+                pass
+            try:
+                _trace_append("video", {"cid": args.get("cid"), "tool": "video.hands.fix", "src": src, "path": dst})
+            except Exception:
+                pass
             return {"name": name, "result": {"path": url}}
         except Exception as ex:
             return {"name": name, "error": str(ex)}
