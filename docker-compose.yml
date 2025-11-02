@@ -62,7 +62,8 @@ services:
     image: ollama/ollama:latest
     container_name: ollama_qwen
     restart: unless-stopped
-    runtime: ${OLLAMA_RUNTIME:-nvidia}
+    devices:
+      - "nvidia.com/gpu=all"
     depends_on:
       nvidia_ready:
         condition: service_completed_successfully
@@ -95,7 +96,8 @@ services:
     image: ollama/ollama:latest
     container_name: ollama_gptoss
     restart: unless-stopped
-    runtime: ${OLLAMA_RUNTIME:-nvidia}
+    devices:
+      - "nvidia.com/gpu=all"
     depends_on:
       nvidia_ready:
         condition: service_completed_successfully
@@ -186,7 +188,8 @@ services:
       dockerfile: Dockerfile
     container_name: xtts_service
     restart: unless-stopped
-    runtime: nvidia
+    devices:
+      - "nvidia.com/gpu=all"
     depends_on:
       nvidia_ready:
         condition: service_completed_successfully
@@ -206,7 +209,8 @@ services:
       dockerfile: Dockerfile
     container_name: whisper_service
     restart: unless-stopped
-    runtime: nvidia
+    devices:
+      - "nvidia.com/gpu=all"
     depends_on:
       nvidia_ready:
         condition: service_completed_successfully
@@ -227,7 +231,8 @@ services:
       dockerfile: Dockerfile
     container_name: faceid_service
     restart: unless-stopped
-    runtime: nvidia
+    devices:
+      - "nvidia.com/gpu=all"
     depends_on:
       nvidia_ready:
         condition: service_completed_successfully
@@ -251,7 +256,8 @@ services:
         condition: service_completed_successfully
       nvidia_ready:
         condition: service_completed_successfully
-    runtime: nvidia
+    devices:
+      - "nvidia.com/gpu=all"
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
     expose:
@@ -280,7 +286,8 @@ services:
         condition: service_completed_successfully
       nvidia_ready:
         condition: service_completed_successfully
-    runtime: nvidia
+    devices:
+      - "nvidia.com/gpu=all"
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
     expose:
@@ -304,7 +311,8 @@ services:
         condition: service_completed_successfully
       nvidia_ready:
         condition: service_completed_successfully
-    runtime: nvidia
+    devices:
+      - "nvidia.com/gpu=all"
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
     expose:
@@ -392,7 +400,8 @@ services:
       dockerfile: Dockerfile
     container_name: music_service
     restart: unless-stopped
-    runtime: nvidia
+    devices:
+      - "nvidia.com/gpu=all"
     depends_on:
       nvidia_ready:
         condition: service_completed_successfully
@@ -412,7 +421,8 @@ services:
       dockerfile: Dockerfile
     container_name: vlm_service
     restart: unless-stopped
-    runtime: nvidia
+    devices:
+      - "nvidia.com/gpu=all"
     depends_on:
       nvidia_ready:
         condition: service_completed_successfully
@@ -490,7 +500,8 @@ services:
       dockerfile: Dockerfile
     container_name: film2_service
     restart: unless-stopped
-    runtime: nvidia
+    devices:
+      - "nvidia.com/gpu=all"
     depends_on:
       nvidia_ready:
         condition: service_completed_successfully
