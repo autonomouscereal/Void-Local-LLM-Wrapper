@@ -40,6 +40,9 @@ if [ -x "$HOST_ROOT/usr/bin/apt-get" ]; then
   # Configure Docker to use NVIDIA runtime
   if chroot "$HOST_ROOT" /usr/bin/which nvidia-ctk >/dev/null 2>&1; then
     chroot "$HOST_ROOT" /usr/bin/nvidia-ctk runtime configure --runtime=docker --set-as-default || true
+    # Enable CDI so legacy lib bind-mounts are not required
+    chroot "$HOST_ROOT" /usr/bin/nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml || true
+    chroot "$HOST_ROOT" /usr/bin/nvidia-ctk runtime configure --runtime=docker --cdi.enabled || true
   fi
   # Optional caps: compute,utility (avoid EGL mounts)
   mkdir -p "$HOST_ROOT"/etc/nvidia-container-runtime || true
@@ -47,6 +50,17 @@ if [ -x "$HOST_ROOT/usr/bin/apt-get" ]; then
 [nvidia-container-runtime]
 environment = ["NVIDIA_VISIBLE_DEVICES=all","NVIDIA_DRIVER_CAPABILITIES=compute,utility"]
 EOF
+  # Disable problematic legacy host-file entries (e.g., libcudadebugger binds)
+  HF_DIR="$HOST_ROOT/usr/share/nvidia-container-runtime/host-files-for-container.d"
+  if [ -d "$HF_DIR" ]; then
+    mkdir -p "$HF_DIR/disabled" || true
+    for f in "$HF_DIR"/*.json; do
+      [ -e "$f" ] || continue
+      if grep -q 'libcudadebugger' "$f" 2>/dev/null; then
+        mv "$f" "$HF_DIR/disabled/" 2>/dev/null || true
+      fi
+    done
+  fi
   # Restart Docker (best effort)
   chroot "$HOST_ROOT" /usr/bin/systemctl restart docker || chroot "$HOST_ROOT" /usr/sbin/service docker restart || true
 fi
