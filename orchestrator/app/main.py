@@ -1941,7 +1941,28 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 exact_text = "STOP"
         except Exception:
             exact_text = None
-        # 3) Base canvas
+        # 3) Optional web grounding for signage: fetch references and OCR for exact text
+        web_sources = []
+        if wants_signage and not exact_text:
+            try:
+                qsig = f"{prompt} traffic signage locale"
+                fused = await execute_tool_call({"name": "metasearch.fuse", "arguments": {"q": qsig, "k": 5}})
+                web_sources = list(((fused.get("result") or {}).get("results") or [])[:3])
+                # OCR first 2 links if they look like images
+                for it in web_sources[:2]:
+                    link = it.get("link") or ""
+                    if link and (link.lower().endswith(('.png','.jpg','.jpeg','.webp'))):
+                        try:
+                            ocr = await execute_tool_call({"name": "ocr.read", "arguments": {"url": link}})
+                            txt = ((ocr.get("result") or {}).get("text") or "").strip()
+                            if txt and len(txt) <= 16:
+                                exact_text = txt
+                                break
+                        except Exception:
+                            continue
+            except Exception:
+                web_sources = []
+        # 4) Base canvas
         base_args = {"prompt": base_style, "size": f"{w}x{h}", "seed": args.get("seed"), "refs": args.get("refs"), "cid": args.get("cid")}
         base = await execute_tool_call({"name": "image.gen", "arguments": base_args})
         try:
@@ -1953,23 +1974,37 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         if not base_path or not _os.path.exists(base_path):
             return {"name": name, "error": "base generation failed"}
         canvas = Image.open(base_path).convert("RGB")
-        # 4) Per-object refinement via tiled generations blended into canvas
+        # 5) Per-object refinement via tiled generations blended into canvas with object-level CLIP constraint
         for (obj_prompt, box) in zip(objs, boxes):
             try:
                 refined_prompt = obj_prompt
                 if wants_signage and exact_text and any(kw in obj_prompt.lower() for kw in ("sign", "poster", "label", "billboard", "traffic sign")):
                     refined_prompt = f"{obj_prompt}, exact signage text: {exact_text}"
                 sub_args = {"prompt": refined_prompt, "size": f"{box[2]-box[0]}x{box[3]-box[1]}", "seed": args.get("seed"), "refs": args.get("refs"), "cid": args.get("cid")}
-                sub = await execute_tool_call({"name": "image.gen", "arguments": sub_args})
-                scid = ((sub.get("result") or {}).get("meta") or {}).get("cid")
-                srid = ((sub.get("result") or {}).get("tool_calls") or [{}])[0].get("result_ref")
-                sub_path = _os.path.join(UPLOAD_DIR, "artifacts", "image", scid, srid) if (scid and srid) else None
-                if sub_path and _os.path.exists(sub_path):
-                    tile = Image.open(sub_path).convert("RGB")
-                    canvas.paste(tile.resize((box[2]-box[0], box[3]-box[1])), (box[0], box[1]))
+                best_tile = None
+                for attempt in range(0, 3):
+                    sub = await execute_tool_call({"name": "image.gen", "arguments": sub_args})
+                    scid = ((sub.get("result") or {}).get("meta") or {}).get("cid")
+                    srid = ((sub.get("result") or {}).get("tool_calls") or [{}])[0].get("result_ref")
+                    sub_path = _os.path.join(UPLOAD_DIR, "artifacts", "image", scid, srid) if (scid and srid) else None
+                    if sub_path and _os.path.exists(sub_path):
+                        tile = Image.open(sub_path).convert("RGB")
+                        # object-level CLIP score
+                        try:
+                            from .analysis.media import analyze_image as _an_img  # type: ignore
+                            sc = float((_an_img(sub_path, refined_prompt) or {}).get("clip_score") or 0.0)
+                        except Exception:
+                            sc = 1.0
+                        best_tile = tile if (best_tile is None or sc >= 0.35) else best_tile
+                        if sc >= 0.35:
+                            break
+                        # strengthen prompt for retry
+                        sub_args["prompt"] = f"{refined_prompt}, literal, clear details, no drift"
+                if best_tile is not None:
+                    canvas.paste(best_tile.resize((box[2]-box[0], box[3]-box[1])), (box[0], box[1]))
             except Exception:
                 continue
-        # 5) Final signage overlay (safety net) to strictly enforce text if requested
+        # 6) Final signage overlay (safety net) to strictly enforce text if requested
         try:
             if wants_signage and exact_text:
                 from PIL import ImageFont  # type: ignore
@@ -1998,7 +2033,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         except Exception:
             pass
         try:
-            _trace_append("image", {"cid": args.get("cid"), "tool": "image.super_gen", "prompt": prompt, "size": f"{w}x{h}", "objects": objs, "boxes": boxes, "path": final_path, "signage_text": exact_text})
+            _trace_append("image", {"cid": args.get("cid"), "tool": "image.super_gen", "prompt": prompt, "size": f"{w}x{h}", "objects": objs, "boxes": boxes, "path": final_path, "signage_text": exact_text, "web_sources": web_sources})
         except Exception:
             pass
         return {"name": name, "result": {"path": url}}
@@ -3264,6 +3299,25 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             _trace_append("decision", {"cid": conv_cid, "trace_id": trace_id, "router": {"tool": decision.tool, "args": decision.args}})
         except Exception:
             pass
+    # Heuristic upgrade: complex image prompts → image.super_gen for higher fidelity multi-object scenes
+    try:
+        upgraded = []
+        for tc in tool_calls or []:
+            try:
+                nm = (tc.get("name") or "").strip()
+                args0 = tc.get("arguments") or {}
+                if nm == "image.gen" and isinstance(args0, dict):
+                    pr = str(args0.get("prompt") or "")
+                    # consider 3+ comma-separated or ' and ' segments as multi-entity
+                    parts = [p.strip() for p in pr.replace(" and ", ", ").split(",") if p.strip()]
+                    if len(parts) >= 3:
+                        tc = {"name": "image.super_gen", "arguments": {**args0}}
+                upgraded.append(tc)
+            except Exception:
+                upgraded.append(tc)
+        tool_calls = upgraded
+    except Exception:
+        pass
     # Surface attachments in tool arguments so downstream jobs can use user media
     if tool_calls and attachments:
         enriched: List[Dict[str, Any]] = []
