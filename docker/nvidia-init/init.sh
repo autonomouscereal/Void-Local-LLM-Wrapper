@@ -21,9 +21,9 @@ if [ -x "$HOST_ROOT/usr/bin/apt-get" ]; then
   # Keyring
   chroot "$HOST_ROOT" /usr/bin/install -m 0755 -d /etc/apt/keyrings || true
   chroot "$HOST_ROOT" /usr/bin/curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey -o /tmp/nvidia-ctk.gpg || true
-  chroot "$HOST_ROOT" /usr/bin/gpg --dearmor -o /etc/apt/keyrings/nvidia-container-toolkit.gpg /tmp/nvidia-ctk.gpg || true
+  chroot "$HOST_ROOT" /usr/bin/gpg --batch --yes --dearmor -o /etc/apt/keyrings/nvidia-container-toolkit.gpg /tmp/nvidia-ctk.gpg || true
   # Repo list (detect distro)
-  DIST_ID=$(chroot "$HOST_ROOT" /usr/bin/bash -lc ". /etc/os-release >/dev/null 2>&1; echo \"${ID}${VERSION_ID}\"")
+  DIST_ID=$(chroot "$HOST_ROOT" /usr/bin/bash -lc '. /etc/os-release >/dev/null 2>&1; echo "${ID}${VERSION_ID}"' 2>/dev/null || true)
   [ -z "$DIST_ID" ] && DIST_ID="ubuntu22.04"
   chroot "$HOST_ROOT" /usr/bin/curl -fsSL https://nvidia.github.io/libnvidia-container/${DIST_ID}/libnvidia-container.list -o /tmp/libnvidia-container.list || true
   chroot "$HOST_ROOT" /usr/bin/sed -E 's#^deb https://#deb [signed-by=/etc/apt/keyrings/nvidia-container-toolkit.gpg] https://#' /tmp/libnvidia-container.list > "$HOST_ROOT"/etc/apt/sources.list.d/nvidia-container-toolkit.list || true
