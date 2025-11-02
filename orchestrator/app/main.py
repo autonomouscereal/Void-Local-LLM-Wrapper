@@ -2645,6 +2645,86 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     synth_payload = build_ollama_payload(final_request, planner_id, DEFAULT_NUM_CTX, (body.get("temperature") or DEFAULT_TEMPERATURE))
     synth_result = await call_ollama(planner_base, synth_payload)
     final_text = synth_result.get("response", "") or qwen_text or gptoss_text
+    # Append discovered asset URLs from tool results so users see concrete outputs inline
+    def _asset_urls_from_tools(results: List[Dict[str, Any]]) -> List[str]:
+        urls: List[str] = []
+        for tr in results or []:
+            try:
+                name = (tr or {}).get("name") or ""
+                res = (tr or {}).get("result") or {}
+                # Envelope-based tools (image/tts/music) carry meta.cid and artifacts with ids
+                meta = res.get("meta") if isinstance(res, dict) else None
+                arts = res.get("artifacts") if isinstance(res, dict) else None
+                if isinstance(meta, dict) and isinstance(arts, list):
+                    cid = meta.get("cid")
+                    for a in arts:
+                        try:
+                            aid = (a or {}).get("id")
+                            kind = (a or {}).get("kind") or ""
+                            if cid and aid:
+                                if kind.startswith("image") or name.startswith("image"):
+                                    urls.append(f"/uploads/artifacts/image/{cid}/{aid}")
+                                elif kind.startswith("audio") and name.startswith("tts"):
+                                    urls.append(f"/uploads/artifacts/audio/tts/{cid}/{aid}")
+                                elif kind.startswith("audio") and name.startswith("music"):
+                                    urls.append(f"/uploads/artifacts/music/{cid}/{aid}")
+                        except Exception:
+                            continue
+                # Direct ComfyUI JSON paths: try to surface view URL if present
+                if isinstance(res, dict):
+                    hv = res.get("history_url") or res.get("view_url")
+                    if isinstance(hv, str) and hv.startswith("http"):
+                        urls.append(hv)
+                    # Film-2 and other tools: traverse result to collect media/artifact paths
+                    exts = (".mp4", ".webm", ".mov", ".mkv", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".wav", ".mp3", ".m4a", ".ogg", ".flac", ".opus", ".srt")
+                    def _walk(v):
+                        if isinstance(v, str):
+                            s = v.strip()
+                            if not s:
+                                return
+                            # public urls
+                            if s.startswith("http://") or s.startswith("https://"):
+                                urls.append(s)
+                                return
+                            # convert filesystem paths under /workspace/uploads to public /uploads
+                            if "/workspace/uploads/" in s:
+                                try:
+                                    tail = s.split("/workspace", 1)[1]
+                                    urls.append(tail)
+                                except Exception:
+                                    pass
+                                return
+                            # already-public /uploads paths
+                            if s.startswith("/uploads/"):
+                                urls.append(s)
+                                return
+                            # file-like with known extensions — if it contains /uploads, surface it
+                            lower = s.lower()
+                            if any(lower.endswith(ext) for ext in exts):
+                                if "/uploads/" in lower:
+                                    urls.append(s)
+                                elif "/workspace/uploads/" in lower:
+                                    try:
+                                        tail = s.split("/workspace", 1)[1]
+                                        urls.append(tail)
+                                    except Exception:
+                                        pass
+                        elif isinstance(v, list):
+                            for it in v:
+                                _walk(it)
+                        elif isinstance(v, dict):
+                            for it in v.values():
+                                _walk(it)
+                    _walk(res)
+            except Exception:
+                continue
+        # de-dup
+        return list(dict.fromkeys(urls))
+
+    asset_urls = _asset_urls_from_tools(tool_results)
+    if asset_urls:
+        assets_block = "\n".join(["Assets:"] + [f"- {u}" for u in asset_urls])
+        final_text = (final_text + "\n\n" + assets_block).strip()
 
     if body.get("stream"):
         # Precompute usage and planned stage events for trace

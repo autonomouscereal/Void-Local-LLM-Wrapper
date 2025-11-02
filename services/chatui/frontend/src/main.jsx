@@ -56,7 +56,8 @@ function App() {
 
   const extractMedia = (text) => {
     const urls = []
-    const re = /(https?:\/\/\S+)/g
+    // Match absolute http(s) and app-served relative assets (e.g., /uploads/...)
+    const re = /(https?:\/\/[^\s)"']+|\/uploads\/[^\s)"']+)/g
     let m
     while ((m = re.exec(text)) !== null) {
       urls.push(m[1])
@@ -449,16 +450,21 @@ function App() {
       args.image_ref = url
     }
     const resp = await callTool('image.dispatch', args)
-    if (resp && resp.result && resp.result.meta && resp.result.tool_calls) {
-      const cid = resp.result.meta.cid
-      const tc = resp.result.tool_calls[0] || {}
-      const resultRef = tc.result_ref
-      if (cid && resultRef) {
-        const url = `/uploads/artifacts/image/${cid}/${resultRef}`
-        setMsgs(prev => ([...prev, { id: nextLocalId(), role: 'assistant', content: { text: `Generated: ${url}` } }]))
-      } else {
-        setMsgs(prev => ([...prev, { id: nextLocalId(), role: 'assistant', content: { text: JSON.stringify(resp.result) } }]))
+    if (resp && resp.result) {
+      const meta = resp.result.meta || {}
+      const arts = Array.isArray(resp.result.artifacts) ? resp.result.artifacts : []
+      const cid = meta.cid
+      let lines = []
+      if (cid && arts.length > 0) {
+        for (const a of arts) {
+          const aid = a && a.id
+          if (aid) lines.push(`/uploads/artifacts/image/${cid}/${aid}`)
+        }
+      } else if (resp.result.tool_calls && resp.result.tool_calls[0] && resp.result.tool_calls[0].result_ref && cid) {
+        lines.push(`/uploads/artifacts/image/${cid}/${resp.result.tool_calls[0].result_ref}`)
       }
+      const textOut = lines.length ? ('Generated:\n' + lines.map(u => `- ${u}`).join('\n')) : JSON.stringify(resp.result)
+      setMsgs(prev => ([...prev, { id: nextLocalId(), role: 'assistant', content: { text: textOut } }]))
     } else {
       setMsgs(prev => ([...prev, { id: nextLocalId(), role: 'assistant', content: { text: JSON.stringify(resp) } }]))
     }
@@ -472,16 +478,21 @@ function App() {
     const seed = ttsSeedRef.current?.value ? Number(ttsSeedRef.current.value) : null
     const args = { text: textV, voice, voice_id, rate, pitch, seed }
     const resp = await callTool('tts.speak', args)
-    if (resp && resp.result && resp.result.meta && resp.result.tool_calls) {
-      const cid = resp.result.meta.cid
-      const tc = resp.result.tool_calls[0] || {}
-      const resultRef = tc.result_ref
-      if (cid && resultRef) {
-        const url = `/uploads/artifacts/audio/tts/${cid}/${resultRef}`
-        setMsgs(prev => ([...prev, { id: nextLocalId(), role: 'assistant', content: { text: `Spoken: ${url}` } }]))
-      } else {
-        setMsgs(prev => ([...prev, { id: nextLocalId(), role: 'assistant', content: { text: JSON.stringify(resp.result) } }]))
+    if (resp && resp.result) {
+      const meta = resp.result.meta || {}
+      const arts = Array.isArray(resp.result.artifacts) ? resp.result.artifacts : []
+      const cid = meta.cid
+      let lines = []
+      if (cid && arts.length > 0) {
+        for (const a of arts) {
+          const aid = a && a.id
+          if (aid) lines.push(`/uploads/artifacts/audio/tts/${cid}/${aid}`)
+        }
+      } else if (resp.result.tool_calls && resp.result.tool_calls[0] && resp.result.tool_calls[0].result_ref && cid) {
+        lines.push(`/uploads/artifacts/audio/tts/${cid}/${resp.result.tool_calls[0].result_ref}`)
       }
+      const textOut = lines.length ? ('Spoken:\n' + lines.map(u => `- ${u}`).join('\n')) : JSON.stringify(resp.result)
+      setMsgs(prev => ([...prev, { id: nextLocalId(), role: 'assistant', content: { text: textOut } }]))
     } else {
       setMsgs(prev => ([...prev, { id: nextLocalId(), role: 'assistant', content: { text: JSON.stringify(resp) } }]))
     }
@@ -494,16 +505,21 @@ function App() {
     const seed = musicSeedRef.current?.value ? Number(musicSeedRef.current.value) : null
     const args = { prompt, bpm, length_s, music_id: music_id || null, seed }
     const resp = await callTool('music.compose', args)
-    if (resp && resp.result && resp.result.meta && resp.result.tool_calls) {
-      const cid = resp.result.meta.cid
-      const tc = resp.result.tool_calls[0] || {}
-      const resultRef = tc.result_ref
-      if (cid && resultRef) {
-        const url = `/uploads/artifacts/music/${cid}/${resultRef}`
-        setMsgs(prev => ([...prev, { id: nextLocalId(), role: 'assistant', content: { text: `Track: ${url}` } }]))
-      } else {
-        setMsgs(prev => ([...prev, { id: nextLocalId(), role: 'assistant', content: { text: JSON.stringify(resp.result) } }]))
+    if (resp && resp.result) {
+      const meta = resp.result.meta || {}
+      const arts = Array.isArray(resp.result.artifacts) ? resp.result.artifacts : []
+      const cid = meta.cid
+      let lines = []
+      if (cid && arts.length > 0) {
+        for (const a of arts) {
+          const aid = a && a.id
+          if (aid) lines.push(`/uploads/artifacts/music/${cid}/${aid}`)
+        }
+      } else if (resp.result.tool_calls && resp.result.tool_calls[0] && resp.result.tool_calls[0].result_ref && cid) {
+        lines.push(`/uploads/artifacts/music/${cid}/${resp.result.tool_calls[0].result_ref}`)
       }
+      const textOut = lines.length ? ('Track:\n' + lines.map(u => `- ${u}`).join('\n')) : JSON.stringify(resp.result)
+      setMsgs(prev => ([...prev, { id: nextLocalId(), role: 'assistant', content: { text: textOut } }]))
     } else {
       setMsgs(prev => ([...prev, { id: nextLocalId(), role: 'assistant', content: { text: JSON.stringify(resp) } }]))
     }
@@ -729,7 +745,20 @@ function App() {
         {/* Chat input stays always visible */}
         <div style={{ padding: 12, display: 'flex', gap: 8, borderTop: '1px solid #222', flexShrink: 0 }}>
           <input ref={fileRef} type='file' onChange={uploadFile} style={{ color: '#9ca3af' }} />
-          <input value={text} onChange={e => setText(e.target.value)} placeholder='Type your prompt...' style={{ flex: 1, padding: 10, borderRadius: 6, border: '1px solid #333', background: '#0b0b0f', color: '#fff' }} />
+          <input
+            value={text}
+            onChange={e => setText(e.target.value)}
+            onKeyDown={async (e) => {
+              if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault()
+                if (!sending && text.trim()) {
+                  await send()
+                }
+              }
+            }}
+            placeholder='Type your prompt...'
+            style={{ flex: 1, padding: 10, borderRadius: 6, border: '1px solid #333', background: '#0b0b0f', color: '#fff' }}
+          />
           <select value={makeMode} onChange={e => setMakeMode(e.target.value)} style={{ padding: '10px 8px' }}>
             <option value='auto'>Auto</option>
             <option value='image'>Image</option>
