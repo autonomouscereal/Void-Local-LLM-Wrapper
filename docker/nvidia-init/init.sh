@@ -13,6 +13,37 @@ if [ -f "$MARKER" ] && [ -z "$FORCE" ]; then
 fi
 cd "$LIBDIR" || exit 0
 
+# ---- Host NVIDIA Container Toolkit setup (no pipes) ----
+if [ -x "$HOST_ROOT/usr/bin/apt-get" ]; then
+  # Prereqs
+  chroot "$HOST_ROOT" /usr/bin/apt-get update -y || true
+  chroot "$HOST_ROOT" /usr/bin/apt-get install -y ca-certificates curl gnupg || true
+  # Keyring
+  chroot "$HOST_ROOT" /usr/bin/install -m 0755 -d /etc/apt/keyrings || true
+  chroot "$HOST_ROOT" /usr/bin/curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey -o /tmp/nvidia-ctk.gpg || true
+  chroot "$HOST_ROOT" /usr/bin/gpg --dearmor -o /etc/apt/keyrings/nvidia-container-toolkit.gpg /tmp/nvidia-ctk.gpg || true
+  # Repo list (detect distro)
+  DIST_ID=$(chroot "$HOST_ROOT" /usr/bin/bash -lc ". /etc/os-release >/dev/null 2>&1; echo \"${ID}${VERSION_ID}\"")
+  [ -z "$DIST_ID" ] && DIST_ID="ubuntu22.04"
+  chroot "$HOST_ROOT" /usr/bin/curl -fsSL https://nvidia.github.io/libnvidia-container/${DIST_ID}/libnvidia-container.list -o /tmp/libnvidia-container.list || true
+  chroot "$HOST_ROOT" /usr/bin/sed -E 's#^deb https://#deb [signed-by=/etc/apt/keyrings/nvidia-container-toolkit.gpg] https://#' /tmp/libnvidia-container.list > "$HOST_ROOT"/etc/apt/sources.list.d/nvidia-container-toolkit.list || true
+  # Install/repair toolkit + runtime
+  chroot "$HOST_ROOT" /usr/bin/apt-get update -y || true
+  chroot "$HOST_ROOT" /usr/bin/apt-get install -y nvidia-container-toolkit nvidia-container-runtime || true
+  # Configure Docker to use NVIDIA runtime
+  if chroot "$HOST_ROOT" /usr/bin/which nvidia-ctk >/dev/null 2>&1; then
+    chroot "$HOST_ROOT" /usr/bin/nvidia-ctk runtime configure --runtime=docker --set-as-default || true
+  fi
+  # Optional caps: compute,utility (avoid EGL mounts)
+  mkdir -p "$HOST_ROOT"/etc/nvidia-container-runtime || true
+  cat > "$HOST_ROOT"/etc/nvidia-container-runtime/config.toml <<'EOF'
+[nvidia-container-runtime]
+environment = ["NVIDIA_VISIBLE_DEVICES=all","NVIDIA_DRIVER_CAPABILITIES=compute,utility"]
+EOF
+  # Restart Docker (best effort)
+  chroot "$HOST_ROOT" /usr/bin/systemctl restart docker || chroot "$HOST_ROOT" /usr/sbin/service docker restart || true
+fi
+
 pick_target() {
   local stem="$1"
   local t="$(ls -1 ${stem}.* 2>/dev/null | sort -rV | head -n1 || true)"
