@@ -12,6 +12,7 @@ if [ -n "$DRV_VER" ]; then
 fi
 
 mkdir -p "$LIBVOL"
+touch "$LIBVOL/.nvidia-libdir-ready" 2>/dev/null || true
 
 ensure_file() {
   local p="$1"

@@ -32,6 +32,20 @@ services:
       - ./docker/nvidia-init/volume_init.sh:/volume_init.sh:ro
     entrypoint: ["/bin/bash","-lc","cp /volume_init.sh /tmp/volume_init.sh; chmod +x /tmp/volume_init.sh; sed -i 's/\\r$//' /tmp/volume_init.sh || true; bash /tmp/volume_init.sh || true"]
 
+  nvidia_ready:
+    image: alpine:3.20
+    container_name: nvidia_ready
+    restart: unless-stopped
+    volumes:
+      - /var/run:/host/var/run:ro
+      - nvidia_libdir:/libdir:ro
+    healthcheck:
+      test: ["CMD-SHELL","[ -f /host/var/run/nvidia-init.done ] && [ -f /libdir/.nvidia-libdir-ready ]"]
+      interval: 2s
+      timeout: 2s
+      retries: 60
+      start_period: 1s
+
   pgvector:
     image: pgvector/pgvector:0.7.4-pg16
     container_name: pgvector_db
@@ -55,10 +69,8 @@ services:
     restart: unless-stopped
     runtime: ${OLLAMA_RUNTIME:-nvidia}
     depends_on:
-      nvidia_init:
-        condition: service_completed_successfully
-      nvidia_volume_init:
-        condition: service_completed_successfully
+      nvidia_ready:
+        condition: service_healthy
     ports:
       - "11434:11434"
     environment:
@@ -90,10 +102,8 @@ services:
     restart: unless-stopped
     runtime: ${OLLAMA_RUNTIME:-nvidia}
     depends_on:
-      nvidia_init:
-        condition: service_completed_successfully
-      nvidia_volume_init:
-        condition: service_completed_successfully
+      nvidia_ready:
+        condition: service_healthy
     ports:
       - "11435:11434"
     environment:
@@ -183,10 +193,8 @@ services:
     restart: unless-stopped
     runtime: nvidia
     depends_on:
-      nvidia_init:
-        condition: service_completed_successfully
-      nvidia_volume_init:
-        condition: service_completed_successfully
+      nvidia_ready:
+        condition: service_healthy
     environment:
       - XTTS_MODEL_NAME=tts_models/multilingual/multi-dataset/xtts_v2
       - NVIDIA_VISIBLE_DEVICES=all
@@ -205,10 +213,8 @@ services:
     restart: unless-stopped
     runtime: nvidia
     depends_on:
-      nvidia_init:
-        condition: service_completed_successfully
-      nvidia_volume_init:
-        condition: service_completed_successfully
+      nvidia_ready:
+        condition: service_healthy
     environment:
       - WHISPER_MODEL_NAME=large-v3
       - WHISPER_CPU_THREADS=8
@@ -228,10 +234,8 @@ services:
     restart: unless-stopped
     runtime: nvidia
     depends_on:
-      nvidia_init:
-        condition: service_completed_successfully
-      nvidia_volume_init:
-        condition: service_completed_successfully
+      nvidia_ready:
+        condition: service_healthy
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
     expose:
@@ -250,10 +254,8 @@ services:
     depends_on:
       comfyui_init:
         condition: service_completed_successfully
-      nvidia_init:
-        condition: service_completed_successfully
-      nvidia_volume_init:
-        condition: service_completed_successfully
+      nvidia_ready:
+        condition: service_healthy
     runtime: nvidia
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
@@ -281,10 +283,8 @@ services:
     depends_on:
       comfyui_init:
         condition: service_completed_successfully
-      nvidia_init:
-        condition: service_completed_successfully
-      nvidia_volume_init:
-        condition: service_completed_successfully
+      nvidia_ready:
+        condition: service_healthy
     runtime: nvidia
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
@@ -307,10 +307,8 @@ services:
     depends_on:
       comfyui_init:
         condition: service_completed_successfully
-      nvidia_init:
-        condition: service_completed_successfully
-      nvidia_volume_init:
-        condition: service_completed_successfully
+      nvidia_ready:
+        condition: service_healthy
     runtime: nvidia
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
@@ -401,10 +399,8 @@ services:
     restart: unless-stopped
     runtime: nvidia
     depends_on:
-      nvidia_init:
-        condition: service_completed_successfully
-      nvidia_volume_init:
-        condition: service_completed_successfully
+      nvidia_ready:
+        condition: service_healthy
     environment:
       - MUSIC_MODEL_ID=facebook/musicgen-small
       - NVIDIA_VISIBLE_DEVICES=all
@@ -423,10 +419,8 @@ services:
     restart: unless-stopped
     runtime: nvidia
     depends_on:
-      nvidia_init:
-        condition: service_completed_successfully
-      nvidia_volume_init:
-        condition: service_completed_successfully
+      nvidia_ready:
+        condition: service_healthy
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
     expose:
@@ -503,10 +497,8 @@ services:
     restart: unless-stopped
     runtime: nvidia
     depends_on:
-      nvidia_init:
-        condition: service_completed_successfully
-      nvidia_volume_init:
-        condition: service_completed_successfully
+      nvidia_ready:
+        condition: service_healthy
     environment:
       - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-}
       - NVIDIA_VISIBLE_DEVICES=all
