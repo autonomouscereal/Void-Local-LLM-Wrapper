@@ -54,11 +54,10 @@ EOF
   HF_DIR="$HOST_ROOT/usr/share/nvidia-container-runtime/host-files-for-container.d"
   if [ -d "$HF_DIR" ]; then
     mkdir -p "$HF_DIR/disabled" || true
+    # Disable ALL legacy host-file mounts to avoid versioned lib bind failures; CDI handles device exposure
     for f in "$HF_DIR"/*.json; do
       [ -e "$f" ] || continue
-      if grep -q 'libcudadebugger' "$f" 2>/dev/null; then
-        mv "$f" "$HF_DIR/disabled/" 2>/dev/null || true
-      fi
+      mv "$f" "$HF_DIR/disabled/" 2>/dev/null || true
     done
   fi
   # Note: we DO NOT restart Docker here to avoid disrupting SSH sessions.
