@@ -215,8 +215,6 @@ services:
     devices:
       - "nvidia.com/gpu=all"
     depends_on:
-      nvidia_volume_init:
-        condition: service_completed_successfully
       nvidia_init:
         condition: service_completed_successfully
     environment:
@@ -225,8 +223,7 @@ services:
       - "7000"
     ports:
       - "7000:7000"
-    volumes:
-      - nvidia_libdir:/usr/lib/x86_64-linux-gnu
+    
 
   comfyui:
     build:
