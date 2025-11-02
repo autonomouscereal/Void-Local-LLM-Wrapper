@@ -32,14 +32,6 @@ services:
       - ./docker/nvidia-init/volume_init.sh:/volume_init.sh:ro
     entrypoint: ["/bin/bash","-lc","cp /volume_init.sh /tmp/volume_init.sh; chmod +x /tmp/volume_init.sh; sed -i 's/\\r$//' /tmp/volume_init.sh || true; bash /tmp/volume_init.sh || true"]
 
-  nvidia_ready:
-    image: alpine:3.20
-    container_name: nvidia_ready
-    restart: "no"
-    volumes:
-      - /var/run:/host/var/run:ro
-      - nvidia_libdir:/libdir:ro
-    entrypoint: ["/bin/sh","-lc","while :; do if [ -f /host/var/run/nvidia-init.done ] && [ -f /libdir/.nvidia-libdir-ready ]; then exit 0; fi; sleep 1; done"]
 
   pgvector:
     image: pgvector/pgvector:0.7.4-pg16
@@ -65,7 +57,9 @@ services:
     devices:
       - "nvidia.com/gpu=all"
     depends_on:
-      nvidia_ready:
+      nvidia_volume_init:
+        condition: service_completed_successfully
+      nvidia_init:
         condition: service_completed_successfully
     ports:
       - "11434:11434"
@@ -99,7 +93,9 @@ services:
     devices:
       - "nvidia.com/gpu=all"
     depends_on:
-      nvidia_ready:
+      nvidia_volume_init:
+        condition: service_completed_successfully
+      nvidia_init:
         condition: service_completed_successfully
     ports:
       - "11435:11434"
@@ -191,7 +187,9 @@ services:
     devices:
       - "nvidia.com/gpu=all"
     depends_on:
-      nvidia_ready:
+      nvidia_volume_init:
+        condition: service_completed_successfully
+      nvidia_init:
         condition: service_completed_successfully
     environment:
       - XTTS_MODEL_NAME=tts_models/multilingual/multi-dataset/xtts_v2
@@ -212,7 +210,9 @@ services:
     devices:
       - "nvidia.com/gpu=all"
     depends_on:
-      nvidia_ready:
+      nvidia_volume_init:
+        condition: service_completed_successfully
+      nvidia_init:
         condition: service_completed_successfully
     environment:
       - WHISPER_MODEL_NAME=large-v3
@@ -234,7 +234,9 @@ services:
     devices:
       - "nvidia.com/gpu=all"
     depends_on:
-      nvidia_ready:
+      nvidia_volume_init:
+        condition: service_completed_successfully
+      nvidia_init:
         condition: service_completed_successfully
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
@@ -254,7 +256,9 @@ services:
     depends_on:
       comfyui_init:
         condition: service_completed_successfully
-      nvidia_ready:
+      nvidia_volume_init:
+        condition: service_completed_successfully
+      nvidia_init:
         condition: service_completed_successfully
     devices:
       - "nvidia.com/gpu=all"
@@ -284,7 +288,9 @@ services:
     depends_on:
       comfyui_init:
         condition: service_completed_successfully
-      nvidia_ready:
+      nvidia_volume_init:
+        condition: service_completed_successfully
+      nvidia_init:
         condition: service_completed_successfully
     devices:
       - "nvidia.com/gpu=all"
@@ -309,7 +315,9 @@ services:
     depends_on:
       comfyui_init:
         condition: service_completed_successfully
-      nvidia_ready:
+      nvidia_volume_init:
+        condition: service_completed_successfully
+      nvidia_init:
         condition: service_completed_successfully
     devices:
       - "nvidia.com/gpu=all"
@@ -403,7 +411,9 @@ services:
     devices:
       - "nvidia.com/gpu=all"
     depends_on:
-      nvidia_ready:
+      nvidia_volume_init:
+        condition: service_completed_successfully
+      nvidia_init:
         condition: service_completed_successfully
     environment:
       - MUSIC_MODEL_ID=facebook/musicgen-small
@@ -424,7 +434,9 @@ services:
     devices:
       - "nvidia.com/gpu=all"
     depends_on:
-      nvidia_ready:
+      nvidia_volume_init:
+        condition: service_completed_successfully
+      nvidia_init:
         condition: service_completed_successfully
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
@@ -503,7 +515,9 @@ services:
     devices:
       - "nvidia.com/gpu=all"
     depends_on:
-      nvidia_ready:
+      nvidia_volume_init:
+        condition: service_completed_successfully
+      nvidia_init:
         condition: service_completed_successfully
     environment:
       - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-}
