@@ -470,17 +470,6 @@ services:
     volumes:
       - ./:/workspace
 
-  icw:
-    build:
-      context: ./services/icw
-      dockerfile: Dockerfile
-    container_name: icw_service
-    restart: unless-stopped
-    expose:
-      - "8085"
-    ports:
-      - "8085:8085"
-
   drt:
     build:
       context: ./services/drt
