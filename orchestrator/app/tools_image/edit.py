@@ -10,6 +10,9 @@ from ..jsonio.versioning import bump_envelope, assert_envelope
 from ..refs.apply import load_refs
 from ..refs.registry import append_provenance
 from .export import append_image_sample
+from ..context.index import add_artifact as _ctx_add
+from ..context.index import resolve_reference as _ctx_resolve, resolve_global as _glob_resolve
+from ..datasets.trace import append_sample as _trace_append
 
 
 def run_image_edit(job: dict, provider, manifest: dict) -> dict:
@@ -23,6 +26,17 @@ def run_image_edit(job: dict, provider, manifest: dict) -> dict:
     size = normalize_size(job.get("size"), edge_safe=bool(job.get("edge")))
     refs = load_refs(job.get("ref_ids"), job.get("refs"))
     args = {k: job.get(k) for k in ("image_ref", "mask_ref", "prompt", "negative")}
+    if not args.get("image_ref"):
+        try:
+            rec = _ctx_resolve(cid, str(job.get("prompt") or ""), "image")
+            if rec and isinstance(rec.get("path"), str):
+                args["image_ref"] = rec.get("path")
+            if not args.get("image_ref"):
+                gre = _glob_resolve(str(job.get("prompt") or ""), "image")
+                if gre and isinstance(gre.get("path"), str):
+                    args["image_ref"] = gre.get("path")
+        except Exception:
+            pass
     args.update({"size": size, "refs": refs, "seed": job.get("seed")})
     args = stamp_tool_args("image.edit", args)
     res = provider.edit(args)
@@ -40,6 +54,24 @@ def run_image_edit(job: dict, provider, manifest: dict) -> dict:
     add_manifest_row(manifest, png_path, step_id="image.edit")
     try:
         append_image_sample(outdir, {"tool": "image.edit", "prompt": args.get("prompt"), "negative": args.get("negative"), "size": args.get("size"), "seed": int(args.get("seed") or 0), "model": model, "path": png_path, "ts": now_ts()})
+    except Exception:
+        pass
+    try:
+        _ctx_add(cid, "image", png_path, None, args.get("image_ref"), [], {"prompt": args.get("prompt")})
+    except Exception:
+        pass
+    try:
+        _trace_append("image", {
+            "cid": cid,
+            "tool": "image.edit",
+            "prompt": args.get("prompt"),
+            "negative": args.get("negative"),
+            "seed": int(args.get("seed") or 0),
+            "refs": refs,
+            "model": model,
+            "path": png_path,
+            "parent": args.get("image_ref") or None,
+        })
     except Exception:
         pass
     env = {

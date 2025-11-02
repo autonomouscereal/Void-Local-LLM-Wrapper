@@ -276,6 +276,13 @@ async def film_plan(body: Dict[str, Any]):
     _write_json(project_id, "characters.json", chars_json)
     # project catalog
     _append_ndjson(os.path.join(UPLOAD_ROOT, "projects.jsonl"), {"id": project_id, "title": title, "created_at": _now_iso(), "state": "planned"})
+    # Persist reference locks if provided
+    try:
+        locks = body.get("locks") or {}
+        if isinstance(locks, dict) and locks:
+            _write_json(project_id, "locks.json", locks)
+    except Exception:
+        pass
     _log_run(project_id, "plan", [{"type": "json", "uri": _proj_uri(project_id, "plan.json") }], {"seed": seed})
 
     # DB upserts: enforce lock-on-first-plan semantics
@@ -479,17 +486,47 @@ async def film_final(body: Dict[str, Any]):
             cache = {}
     cache.setdefault("by_input", {})
     cache_hits = False
+    reseed = body.get("reseed") or {}
+    if not isinstance(reseed, dict):
+        reseed = {}
+    # Attempt to load locks snapshot once
+    locks_snapshot: Optional[Dict[str, Any]] = None
+    try:
+        lp = _proj_dir(project_id, "locks.json")
+        if os.path.exists(lp):
+            with open(lp, "r", encoding="utf-8") as f:
+                locks_snapshot = json.load(f)
+    except Exception:
+        locks_snapshot = None
     for sh_id in shots:
-        input_sig = json.dumps({"project_id": project_id, "shot_id": sh_id, "outputs": outputs, "post": post, "seed": seed}, sort_keys=True)
+        # Per-shot seed adjustment for QA-driven re-render loops
+        adj = 0
+        try:
+            v = reseed.get(sh_id)
+            if isinstance(v, str):
+                vv = v.strip()
+                if vv.startswith("+") or vv.startswith("-"):
+                    adj = int(vv)
+                else:
+                    adj = int(v)
+            elif isinstance(v, (int, float)):
+                adj = int(v)
+        except Exception:
+            adj = 0
+        shot_seed = int(seed) + int(adj)
+        input_sig = json.dumps({"project_id": project_id, "shot_id": sh_id, "outputs": outputs, "post": post, "seed": shot_seed}, sort_keys=True)
         input_hash = f"sha256:{_sha256_bytes(input_sig.encode('utf-8'))}"
         cached = cache["by_input"].get(input_hash)
         if cached:
             cache_hits = True
             final_shots.append({"shot_id": sh_id, "mp4_uri": cached.get("artifact"), "hash": cached.get("hash"), "cache": "hit"})
             continue
-        data = _sha256_str(f"{project_id}|{seed}|{sh_id}|final").encode("utf-8")
+        data = _sha256_str(f"{project_id}|{shot_seed}|{sh_id}|final").encode("utf-8")
         asset = _save_bytes(f"{PROJECTS_PREFIX}/{project_id}/shots/{sh_id}/final.mp4", data)
-        final_obj = {"shot_id": sh_id, "mp4_uri": asset["uri"], "hash": asset["hash"], "outputs": outputs, "post": post}
+        final_obj = {"shot_id": sh_id, "mp4_uri": asset["uri"], "hash": asset["hash"], "outputs": outputs, "post": post, "seed": shot_seed}
+        # Attach locks snapshot for transparency and repro at shot level
+        if isinstance(locks_snapshot, dict) and locks_snapshot:
+            final_obj["locks"] = locks_snapshot
         final_shots.append(final_obj)
         _write_json(project_id, os.path.join("shots", sh_id, "final.json"), final_obj)
         cache["by_input"][input_hash] = {"artifact": asset["uri"], "hash": asset["hash"], "stage": "final", "shot_id": sh_id}
@@ -538,6 +575,14 @@ async def film_final(body: Dict[str, Any]):
     edl_meta = _write_json(project_id, "edl.json", edl_obj)
     # Nodes manifest: capture per-shot seed and a graph hash for determinism
     nodes_obj: Dict[str, Any] = {"project_id": project_id, "shots": []}
+    # Attach locks snapshot if present
+    try:
+        lp = _proj_dir(project_id, "locks.json")
+        if os.path.exists(lp):
+            with open(lp, "r", encoding="utf-8") as f:
+                nodes_obj["locks"] = json.load(f)
+    except Exception:
+        nodes_obj["locks"] = {}
     try:
         sp = _proj_dir(project_id, "shots.jsonl")
         if os.path.exists(sp):

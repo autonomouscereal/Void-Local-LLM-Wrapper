@@ -139,7 +139,32 @@ def run_research(job: Dict[str, Any]) -> Dict[str, Any]:
             _append_job_event(jid, progress_event("done", "done", 1.0, artifacts=[{"path": os.path.join(root, "report.json")}]))
         except Exception:
             pass
-    return {"phase": "done", "artifacts": manifest.get("items", []), "cid": cid}
+    # Inline summary for chat surfaces
+    try:
+        # Top sources by frequency
+        src_count = {}
+        for r in ledger_rows:
+            try:
+                u = (r.get("url") or r.get("link") or "").strip()
+                if u:
+                    src_count[u] = src_count.get(u, 0) + 1
+            except Exception:
+                continue
+        top_srcs = sorted(src_count.items(), key=lambda kv: kv[1], reverse=True)[:5]
+        sources = [{"url": u, "count": c} for (u, c) in top_srcs]
+        # Findings summary
+        findings = list(report.get("findings", []) or [])
+        bullets = []
+        for f in findings[:5]:
+            try:
+                bullets.append(f"- {f.get('summary','')}")
+            except Exception:
+                continue
+        summary_text = f"Research on: {q}\n\nTop Findings:\n" + ("\n".join(bullets) if bullets else "(no high-confidence findings)")
+    except Exception:
+        sources = []
+        summary_text = ""
+    return {"phase": "done", "artifacts": manifest.get("items", []), "cid": cid, "report": report, "summary_text": summary_text, "sources": sources}
 
 
 def _append_job_event(jid: str, ev: Dict[str, Any]) -> None:

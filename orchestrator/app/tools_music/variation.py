@@ -11,6 +11,9 @@ from ..jsonio.normalize import normalize_to_envelope
 from ..jsonio.versioning import bump_envelope, assert_envelope
 from ..refs.music import resolve_music_lock
 from ..refs.registry import append_provenance
+from ..context.index import add_artifact as _ctx_add
+from ..context.index import resolve_reference as _ctx_resolve, resolve_global as _glob_resolve
+from ..datasets.trace import append_sample as _trace_append
 
 
 def _read_wav(path: str):
@@ -40,8 +43,21 @@ def _apply_gain(data: bytes, sw: int, gain: float) -> bytes:
 def run_music_variation(job: dict, manifest: dict) -> dict:
     cid = job.get("cid") or f"music-{now_ts()}"; outdir = os.path.join("/workspace", "uploads", "artifacts", "music", cid); ensure_dir(outdir)
     lock = resolve_music_lock(job.get("music_id"), job.get("music_refs"))
+    base_hint = str(job.get("desc") or job.get("prompt") or "")
+    base_path = job.get("variation_of")
+    if not base_path:
+        try:
+            rec = _ctx_resolve(cid, base_hint, "audio")
+            if rec and isinstance(rec.get("path"), str):
+                base_path = rec.get("path")
+            if not base_path:
+                gre = _glob_resolve(base_hint, "audio")
+                if gre and isinstance(gre.get("path"), str):
+                    base_path = gre.get("path")
+        except Exception:
+            base_path = None
     args = {
-        "variation_of": job.get("variation_of"),
+        "variation_of": base_path,
         "n": max(1, min(int(job.get("n") or 1), 4)),
         "intensity": float(job.get("intensity") or 0.4),
         "music_lock": lock,
@@ -62,6 +78,21 @@ def run_music_variation(job: dict, manifest: dict) -> dict:
         sidecar(path, {"tool": "music.variation", **args, "variant_index": i, "gain": g})
         add_manifest_row(manifest, path, step_id="music.variation")
         artifacts.append({"id": os.path.basename(path), "kind": "audio-ref", "summary": stem})
+        try:
+            _ctx_add(cid, "audio", path, None, args.get("variation_of"), ["music", "variant"], {})
+        except Exception:
+            pass
+        try:
+            _trace_append("music", {
+                "cid": cid,
+                "tool": "music.variation",
+                "variation_of": args.get("variation_of"),
+                "index": i,
+                "seed": int(args.get("seed") or 0),
+                "path": path,
+            })
+        except Exception:
+            pass
         try:
             if job.get("music_id"):
                 append_provenance(job.get("music_id"), {"when": now_ts(), "tool": "music.variation", "artifact": path, "seed": int(args.get("seed") or 0)})

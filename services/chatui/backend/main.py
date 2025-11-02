@@ -378,7 +378,7 @@ async def chat(cid: int, request: Request, background_tasks: BackgroundTasks):
         base_hist.append({"role": r["role"], "content": decoded.get("text") or ""})
     oa_msgs = _build_openai_messages(base_hist, [dict(a) for a in atts])
     # Accept both object and string payloads for future compatibility
-    payload = {"messages": oa_msgs, "stream": False}
+    payload = {"messages": oa_msgs, "stream": False, "cid": cid}
 
     async def _proxy_stream():
         try:
@@ -481,7 +481,7 @@ async def chat_alt(body: Dict[str, Any], background_tasks: BackgroundTasks):
         await conn.execute("INSERT INTO messages (conversation_id, role, content) VALUES ($1, 'user', $2::jsonb)", cid, json.dumps({"text": user_content}))
         atts = await conn.fetch("SELECT name, url, mime FROM attachments WHERE conversation_id=$1", cid)
     oa_msgs = _build_openai_messages([{"role": "user", "content": user_content}], [dict(a) for a in atts])
-    payload = {"messages": oa_msgs, "stream": False}
+    payload = {"messages": oa_msgs, "stream": False, "cid": cid}
     async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
         url = ORCH_URL.rstrip("/") + "/v1/chat/completions"
         logging.info("proxy -> orchestrator POST %s", url)
@@ -536,7 +536,7 @@ async def call_conv(cid: int, request: Request, background_tasks: BackgroundTask
         await conn.execute("INSERT INTO messages (conversation_id, role, content) VALUES ($1, 'user', $2::jsonb)", cid, json.dumps({"text": user_content}))
         atts = await conn.fetch("SELECT name, url, mime FROM attachments WHERE conversation_id=$1", cid)
     oa_msgs = _build_openai_messages([{"role": "user", "content": user_content}], [dict(a) for a in atts])
-    payload = {"messages": oa_msgs, "stream": False}
+    payload = {"messages": oa_msgs, "stream": False, "cid": cid}
     async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
         url = ORCH_URL.rstrip("/") + "/v1/chat/completions"
         logging.info("proxy -> orchestrator POST %s", url)
@@ -842,7 +842,7 @@ async def chat_ws(websocket: WebSocket):
                 decoded = _decode_json(r["content"])
                 base_hist.append({"role": r["role"], "content": decoded.get("text") or ""})
             oa_msgs = _build_openai_messages(base_hist, [dict(a) for a in atts])
-            payload = {"messages": oa_msgs, "stream": False}
+            payload = {"messages": oa_msgs, "stream": False, "cid": cid}
             # Call orchestrator and relay normalized JSON (OpenAI-compatible envelope + simple message)
             try:
                 async with httpx.AsyncClient(timeout=None, trust_env=False) as client:

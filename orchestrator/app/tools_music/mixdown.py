@@ -10,6 +10,8 @@ from ..artifacts.manifest import add_manifest_row
 from ..jsonio.normalize import normalize_to_envelope
 from ..jsonio.versioning import bump_envelope, assert_envelope
 from ..refs.registry import append_provenance
+from ..context.index import add_artifact as _ctx_add
+from ..datasets.trace import append_sample as _trace_append
 
 
 def _read_wav(path: str):
@@ -92,6 +94,20 @@ def run_music_mixdown(job: dict, manifest: dict) -> dict:
     except Exception:
         pass
     add_manifest_row(manifest, path, step_id="music.mixdown")
+    try:
+        _ctx_add(cid, "audio", path, None, None, ["music", "mixdown"], {})
+    except Exception:
+        pass
+    try:
+        _trace_append("music", {
+            "cid": cid,
+            "tool": "music.mixdown",
+            "stems": args.get("stems"),
+            "seed": int(args.get("seed") or 0),
+            "path": path,
+        })
+    except Exception:
+        pass
     env = {
         "meta": {"model": "mix-local", "ts": now_ts(), "cid": cid, "step": 0, "state": "halt", "cont": {"present": False, "state_hash": None, "reason": None}},
         "reasoning": {"goal": "music mixdown", "constraints": ["json-only"], "decisions": ["music.mixdown done"]},

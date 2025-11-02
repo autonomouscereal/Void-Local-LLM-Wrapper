@@ -64,6 +64,7 @@ from .jsonio.versioning import bump_envelope as _env_bump, assert_envelope as _e
 from .determinism.seeds import stamp_envelope as _env_stamp, stamp_tool_args as _tool_stamp
 from .ops.health import get_capabilities as _get_caps, get_health as _get_health
 from .refs.api import post_refs_save as _refs_save, post_refs_refine as _refs_refine, get_refs_list as _refs_list, post_refs_apply as _refs_apply
+from .context.index import resolve_reference as _ctx_resolve, list_recent as _ctx_list, resolve_global as _glob_resolve, infer_audio_emotion as _infer_emotion
 from .datasets.api import post_datasets_start as _datasets_start, get_datasets_list as _datasets_list, get_datasets_versions as _datasets_versions, get_datasets_index as _datasets_index
 from .jobs.state import create_job as _orcjob_create, set_state as _orcjob_set_state
 from .admin.api import get_jobs_list as _admin_jobs_list, get_jobs_replay as _admin_jobs_replay, post_artifacts_gc as _admin_gc
@@ -80,9 +81,11 @@ from .tools_tts.sfx import run_sfx_compose
 from .tools_music.compose import run_music_compose
 from .tools_music.variation import run_music_variation
 from .tools_music.mixdown import run_music_mixdown
+from .context.index import add_artifact as _ctx_add, list_recent as _ctx_list
 from .artifacts.shard import open_shard as _art_open_shard, append_jsonl as _art_append_jsonl, _finalize_shard as _art_finalize
 from .artifacts.shard import newest_part as _art_newest_part, list_parts as _art_list_parts
 from .artifacts.manifest import add_manifest_row as _art_manifest_add, write_manifest_atomic as _art_manifest_write
+from .datasets.trace import append_sample as _trace_append
 async def _db_insert_run(trace_id: str, mode: str, seed: int, pack_hash: Optional[str], request_json: Dict[str, Any]) -> Optional[int]:
     try:
         pool = await get_pg_pool()
@@ -1035,6 +1038,20 @@ def get_builtin_tools_schema() -> List[Dict[str, Any]]:
         {
             "type": "function",
             "function": {
+                "name": "video.interpolate",
+                "parameters": {"type": "object", "properties": {"src": {"type": "string"}, "target_fps": {"type": "integer"}}, "required": ["src"]}
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "video.upscale",
+                "parameters": {"type": "object", "properties": {"src": {"type": "string"}, "scale": {"type": "integer"}, "width": {"type": "integer"}, "height": {"type": "integer"}}, "required": ["src"]}
+            }
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "tts.speak",
                 "parameters": {"type": "object", "properties": {"text": {"type": "string"}, "voice": {"type": "string"}}, "required": ["text"]}
             }
@@ -1384,7 +1401,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 positive = a.get("prompt") or ""
                 negative = a.get("negative") or ""
                 seed = int(a.get("seed") or 0)
-                g = {
+                base_graph = {
                     "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "sd_xl_base_1.0.safetensors"}},
                     "3": {"class_type": "CLIPTextEncode", "inputs": {"text": positive, "clip": ["1", 1]}},
                     "4": {"class_type": "CLIPTextEncode", "inputs": {"text": negative, "clip": ["1", 1]}},
@@ -1393,6 +1410,68 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     "9": {"class_type": "VAEDecode", "inputs": {"samples": ["8", 0], "vae": ["1", 2]}},
                     "10": {"class_type": "SaveImage", "inputs": {"filename_prefix": "image_gen", "images": ["9", 0]}},
                 }
+                g = dict(base_graph)
+                # Consistency lock: allow multiple roles (face/style/clothes) and audio emotion hint
+                refs = a.get("refs") or {}
+                def _to_ws(p: str) -> str:
+                    if p.startswith("/uploads/"):
+                        return "/workspace" + p
+                    return p
+                try:
+                    face_list = []
+                    style_list = []
+                    clothes_list = []
+                    if isinstance(refs, dict):
+                        for k in ("face_images", "faces"):
+                            if isinstance(refs.get(k), list):
+                                face_list = [_to_ws(x) for x in refs.get(k) if isinstance(x, str)]
+                                if face_list: break
+                        for k in ("style_images", "images"):
+                            if isinstance(refs.get(k), list):
+                                style_list = [_to_ws(x) for x in refs.get(k) if isinstance(x, str)]
+                                if style_list: break
+                        for k in ("clothes_images", "outfit_images"):
+                            if isinstance(refs.get(k), list):
+                                clothes_list = [_to_ws(x) for x in refs.get(k) if isinstance(x, str)]
+                                if clothes_list: break
+                    # Chain adapters: style -> clothes -> face
+                    cur_model_src = ["1", 0]
+                    if style_list:
+                        g["30"] = {"class_type": "LoadImage", "inputs": {"image": style_list[0]}}
+                        g["31"] = {"class_type": "IPAdapterApply", "inputs": {"model": cur_model_src, "image": ["30", 0], "strength": 0.60}}
+                        cur_model_src = ["31", 0]
+                    if clothes_list:
+                        g["32"] = {"class_type": "LoadImage", "inputs": {"image": clothes_list[0]}}
+                        g["33"] = {"class_type": "IPAdapterApply", "inputs": {"model": cur_model_src, "image": ["32", 0], "strength": 0.55}}
+                        cur_model_src = ["33", 0]
+                    if face_list:
+                        try:
+                            if FACEID_API_URL and isinstance(FACEID_API_URL, str):
+                                pub_url = face_list[0]
+                                if pub_url.startswith("/workspace/uploads/"):
+                                    pub_url = pub_url.replace("/workspace", "")
+                                import httpx as _hx  # type: ignore
+                                with _hx.Client() as _c:
+                                    rr = _c.post(FACEID_API_URL.rstrip("/") + "/embed", json={"image_url": pub_url})
+                                if rr.status_code == 200:
+                                    jsr = rr.json(); emb = jsr.get("embedding") or jsr.get("vec")
+                                    if emb and isinstance(emb, (list, tuple)) and len(emb) > 0:
+                                        g["34"] = {"class_type": "LoadImage", "inputs": {"image": face_list[0]}}
+                                        g["35"] = {"class_type": "InstantIDApply", "inputs": {"model": cur_model_src, "image": ["34", 0], "embedding": emb, "strength": 0.70}}
+                                        cur_model_src = ["35", 0]
+                        except Exception:
+                            pass
+                    if cur_model_src != ["1", 0]:
+                        g["8"]["inputs"]["model"] = cur_model_src
+                    # Emotion hint from audio
+                    try:
+                        emo = refs.get("music_emotion") or refs.get("audio_emotion")
+                        if isinstance(emo, str) and emo:
+                            g["3"]["inputs"]["text"] = (positive + f", {emo} mood").strip()
+                    except Exception:
+                        pass
+                except Exception:
+                    g = dict(base_graph)
                 js = self._post_prompt(g); pid = js.get("prompt_id") or js.get("uuid") or js.get("id")
                 det = self._poll(pid, timeout_s=900)
                 data = self._download_first(det)
@@ -1450,7 +1529,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             return {"name": name, "error": "XTTS_API_URL not configured"}
         class _TTSProvider:
             async def _xtts(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-                async with httpx.AsyncClient(timeout=300) as client:
+                async with httpx.AsyncClient(timeout=None) as client:
+                    # Pass through voice_lock/voice_id/seed/rate/pitch so backend can lock timbre
                     r = await client.post(XTTS_API_URL.rstrip("/") + "/tts", json=payload)
                     r.raise_for_status()
                     js = r.json()
@@ -1614,8 +1694,16 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         class _MusicProvider:
             async def _compose(self, payload: Dict[str, Any]) -> Dict[str, Any]:
                 import base64 as _b
-                async with httpx.AsyncClient(timeout=600) as client:
-                    r = await client.post(MUSIC_API_URL.rstrip("/") + "/generate", json={"prompt": payload.get("prompt"), "duration": int(payload.get("length_s") or 8)})
+                async with httpx.AsyncClient(timeout=None) as client:
+                    body = {
+                        "prompt": payload.get("prompt"),
+                        "duration": int(payload.get("length_s") or 8),
+                        # Pass through locks/refs so backends that support them can enforce consistency
+                        "music_lock": payload.get("music_lock") or (payload.get("music_refs") if isinstance(payload, dict) else None),
+                        "seed": payload.get("seed"),
+                        "refs": payload.get("refs") or payload.get("music_refs"),
+                    }
+                    r = await client.post(MUSIC_API_URL.rstrip("/") + "/generate", json=body)
                     r.raise_for_status(); js = r.json()
                     b64 = js.get("audio_wav_base64") or js.get("wav_b64")
                     wav = _b.b64decode(b64) if isinstance(b64, str) else b""
@@ -1645,18 +1733,107 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         except Exception as ex:
             return {"name": name, "error": str(ex)}
     if name in ("image.gen", "image.edit", "image.upscale") and ALLOW_TOOL_EXECUTION:
-        # Minimal local provider: returns a 1x1 PNG placeholder; replace with ComfyUI-backed provider later.
         if not COMFYUI_API_URL:
             return {"name": name, "error": "image backend not configured (COMFYUI_API_URL)"}
         class _ImageProvider:
             def __init__(self, base: str):
                 self.base = base.rstrip("/")
-            def _bytes_placeholder(self) -> bytes:
+            def _post_prompt(self, graph: Dict[str, Any]) -> Dict[str, Any]:
+                import httpx as _hx  # type: ignore
+                with _hx.Client(timeout=None) as client:
+                    r = client.post(self.base + "/prompt", json={"prompt": graph})
+                    r.raise_for_status(); return r.json()
+            def _poll(self, pid: str) -> Dict[str, Any]:
+                import httpx as _hx, time as _tm  # type: ignore
+                while True:
+                    r = _hx.get(self.base + f"/history/{pid}")
+                    if r.status_code == 200:
+                        js = r.json(); h = (js.get("history") or {}).get(pid)
+                        if h and (h.get("status", {}).get("completed") is True):
+                            return h
+                    _tm.sleep(0.8)
+            def _download_first(self, detail: Dict[str, Any]) -> bytes:
+                import httpx as _hx  # type: ignore
+                outputs = (detail.get("outputs") or {})
+                for items in outputs.values():
+                    if isinstance(items, list) and items:
+                        it = items[0]
+                        fn = it.get("filename"); tp = it.get("type") or "output"; sub = it.get("subfolder")
+                        if fn and self.base:
+                            from urllib.parse import urlencode
+                            q = {"filename": fn, "type": tp}
+                            if sub: q["subfolder"] = sub
+                            url = self.base + "/view?" + urlencode(q)
+                            r = _hx.get(url)
+                            if r.status_code == 200:
+                                return r.content
                 return b""
-            def generate(self, a): raise NotImplementedError
-            def edit(self, a): raise NotImplementedError
-            def upscale(self, a): raise NotImplementedError
-        # Provider now bound below in image.dispatch path
+            def _parse_wh(self, size: str) -> tuple[int, int]:
+                try:
+                    w, h = (size or "1024x1024").lower().split("x"); return int(w), int(h)
+                except Exception:
+                    return 1024, 1024
+            def generate(self, a: Dict[str, Any]) -> Dict[str, Any]:
+                # Reuse image.dispatch implementation by delegating via local execute call
+                g_messages = {"name": "image.dispatch", "arguments": {"mode": "gen", **(a or {})}}
+                # Directly invoke the same flow to ensure consistent graph wiring
+                # Fallback to simple SDXL graph if needed
+                w, h = self._parse_wh(a.get("size") or "1024x1024")
+                positive = a.get("prompt") or ""; negative = a.get("negative") or ""; seed = int(a.get("seed") or 0)
+                base_graph = {
+                    "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "sd_xl_base_1.0.safetensors"}},
+                    "3": {"class_type": "CLIPTextEncode", "inputs": {"text": positive, "clip": ["1", 1]}},
+                    "4": {"class_type": "CLIPTextEncode", "inputs": {"text": negative, "clip": ["1", 1]}},
+                    "7": {"class_type": "EmptyLatentImage", "inputs": {"width": w, "height": h, "batch_size": 1}},
+                    "8": {"class_type": "KSampler", "inputs": {"seed": seed, "steps": 25, "cfg": 6.5, "sampler_name": "dpmpp_2m", "scheduler": "karras", "denoise": 1.0, "model": ["1", 0], "positive": ["3", 0], "negative": ["4", 0], "latent_image": ["7", 0]}},
+                    "9": {"class_type": "VAEDecode", "inputs": {"samples": ["8", 0], "vae": ["1", 2]}},
+                    "10": {"class_type": "SaveImage", "inputs": {"filename_prefix": "image_gen", "images": ["9", 0]}},
+                }
+                js = self._post_prompt(base_graph); pid = js.get("prompt_id") or js.get("uuid") or js.get("id"); det = self._poll(pid)
+                data = self._download_first(det)
+                view_url = f"{self.base}/history/{pid}" if (self.base and pid) else None
+                return {"image_bytes": data, "model": "comfyui:sdxl", "prompt_id": pid, "history_url": view_url}
+            def edit(self, a: Dict[str, Any]) -> Dict[str, Any]:
+                positive = a.get("prompt") or ""; negative = a.get("negative") or ""; seed = int(a.get("seed") or 0)
+                w, h = self._parse_wh(a.get("size") or "1024x1024")
+                g = {
+                    "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "sd_xl_base_1.0.safetensors"}},
+                    "2": {"class_type": "LoadImage", "inputs": {"image": a.get("image_ref") or ""}},
+                    "3": {"class_type": "CLIPTextEncode", "inputs": {"text": positive, "clip": ["1", 1]}},
+                    "4": {"class_type": "CLIPTextEncode", "inputs": {"text": negative, "clip": ["1", 1]}},
+                    "5": {"class_type": "VAEEncode", "inputs": {"pixels": ["2", 0], "vae": ["1", 2]}},
+                    "6": {"class_type": "KSampler", "inputs": {"seed": seed, "steps": 20, "cfg": 6.0, "sampler_name": "dpmpp_2m", "scheduler": "karras", "denoise": 0.65, "model": ["1", 0], "positive": ["3", 0], "negative": ["4", 0], "latent_image": ["5", 0]}},
+                    "9": {"class_type": "VAEDecode", "inputs": {"samples": ["6", 0], "vae": ["1", 2]}},
+                    "10": {"class_type": "SaveImage", "inputs": {"filename_prefix": "image_edit", "images": ["9", 0]}},
+                }
+                js = self._post_prompt(g); pid = js.get("prompt_id") or js.get("uuid") or js.get("id"); det = self._poll(pid)
+                data = self._download_first(det)
+                view_url = f"{self.base}/history/{pid}" if (self.base and pid) else None
+                return {"image_bytes": data, "model": "comfyui:sdxl", "prompt_id": pid, "history_url": view_url}
+            def upscale(self, a: Dict[str, Any]) -> Dict[str, Any]:
+                scale = int(a.get("scale") or 2)
+                g = {
+                    "2": {"class_type": "LoadImage", "inputs": {"image": a.get("image_ref") or ""}},
+                    "11": {"class_type": "RealESRGANModelLoader", "inputs": {"model_name": "realesr-general-x4v3.pth"}},
+                    "12": {"class_type": "RealESRGAN", "inputs": {"image": ["2", 0], "model": ["11", 0], "scale": scale}},
+                    "10": {"class_type": "SaveImage", "inputs": {"filename_prefix": "image_upscale", "images": ["12", 0]}},
+                }
+                js = self._post_prompt(g); pid = js.get("prompt_id") or js.get("uuid") or js.get("id"); det = self._poll(pid)
+                data = self._download_first(det)
+                view_url = f"{self.base}/history/{pid}" if (self.base and pid) else None
+                return {"image_bytes": data, "model": "comfyui:realesrgan", "prompt_id": pid, "history_url": view_url}
+        provider = _ImageProvider(COMFYUI_API_URL)
+        manifest = {"items": []}
+        try:
+            if name == "image.gen":
+                env = run_image_gen(args if isinstance(args, dict) else {}, provider, manifest)
+            elif name == "image.edit":
+                env = run_image_edit(args if isinstance(args, dict) else {}, provider, manifest)
+            else:
+                env = run_image_upscale(args if isinstance(args, dict) else {}, provider, manifest)
+            return {"name": name, "result": env}
+        except Exception as ex:
+            return {"name": name, "error": str(ex)}
     if name == "research.run" and ALLOW_TOOL_EXECUTION:
         # Prefer local orchestrator; on failure, try DRT service if configured
         try:
@@ -1846,6 +2023,16 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 outputs_payload = args.get("outputs") or {"fps": refresh, "resolution": res, "codec": codec, "container": container, "bitrate": bitrate, "audio": {"sr": audio_sr, "lufs_target": lufs_target}}
                 rules_payload = args.get("rules") or {}
                 plan_payload = {"project_id": project_id, "seed": seed, "title": title, "duration_s": duration_s, "outputs": outputs_payload}
+                # Pass through reference locks if provided: {"characters":[{"id","image_ref_id","voice_ref_id","music_ref_id"}], "globals":{...}}
+                locks_payload = args.get("locks") or args.get("ref_locks") or {}
+                if not (isinstance(locks_payload, dict) and locks_payload):
+                    try:
+                        if bool(args.get("use_context_refs")) or isinstance(args.get("cid"), str):
+                            locks_payload = _build_locks_from_context(str(args.get("cid") or "")) or {}
+                    except Exception:
+                        locks_payload = {}
+                if isinstance(locks_payload, dict) and locks_payload:
+                    plan_payload["locks"] = locks_payload
                 ideas = args.get("ideas") or []
                 if ideas:
                     plan_payload["ideas"] = ideas
@@ -1866,8 +2053,48 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     shots = [f"S1_SH{i+1:02d}" for i in range(max(1, min(6, int(duration_s // 3) or 1)))]
                 await client.post(f"{base_url}/film/storyboard", json={"project_id": project_id, "shots": shots})
                 await client.post(f"{base_url}/film/animatic", json={"project_id": project_id, "shots": shots, "outputs": {"fps": outputs_payload.get("fps", 12), "res": outputs_payload.get("resolution", "512x288")}})
-                await client.post(f"{base_url}/film/final", json={"project_id": project_id, "shots": shots, "outputs": outputs_payload, "post": {"interpolate": interp, "upscale": upscale}})
-                await client.post(f"{base_url}/film/qc", json={"project_id": project_id})
+                # Include locks again for idempotency even if plan stored them
+                _locks = locks_payload if isinstance(locks_payload, dict) else {}
+                await client.post(f"{base_url}/film/final", json={"project_id": project_id, "shots": shots, "outputs": outputs_payload, "post": {"interpolate": interp, "upscale": upscale}, "locks": _locks})
+                # QA loop: evaluate, optionally reseed failing shots, retry up to 2x
+                reseed: Dict[str, int] = {}
+                for attempt in range(0, 2):
+                    qr = await client.post(f"{base_url}/film/qc", json={"project_id": project_id})
+                    try:
+                        rep = qr.json() if qr.status_code == 200 else {}
+                    except Exception:
+                        rep = {}
+                    suggested = rep.get("suggested_fixes") or []
+                    if not suggested:
+                        break
+                    # Build reseed deltas map from suggestions
+                    reseed.clear()
+                    for fix in suggested:
+                        sid = (fix or {}).get("shot_id")
+                        adj = (fix or {}).get("seed_adj")
+                        if isinstance(sid, str) and adj is not None:
+                            try:
+                                if isinstance(adj, str):
+                                    reseed[sid] = int(adj.replace("+", ""))
+                                else:
+                                    reseed[sid] = int(adj)
+                            except Exception:
+                                continue
+                    if not reseed:
+                        break
+                    # Re-render only failing shots with reseed map
+                    fail_ids = [str((fx or {}).get("shot_id")) for fx in suggested if (fx or {}).get("shot_id")]
+                    await client.post(
+                        f"{base_url}/film/final",
+                        json={
+                            "project_id": project_id,
+                            "shots": fail_ids,
+                            "outputs": outputs_payload,
+                            "post": {"interpolate": interp, "upscale": upscale},
+                            "locks": _locks,
+                            "reseed": reseed,
+                        },
+                    )
                 exp = await client.post(f"{base_url}/film/export", json={"project_id": project_id, "post": {"interpolate": interp, "upscale": upscale}, "refresh": refresh, "requested": requested_meta, "effective": effective_meta})
                 resj = exp.json() if exp.status_code == 200 else {"error": exp.text}
         except Exception as ex:
@@ -1903,6 +2130,332 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         tile = int(args.get("tile") or 512)
         overlap = int(args.get("overlap") or 16)
         return {"name": name, "result": {"accepted": True, "scale": scale, "tile": tile, "overlap": overlap}}
+    # --- Standalone FFmpeg tools ---
+    if name == "ffmpeg.trim":
+        src = args.get("src") or ""
+        start = str(args.get("start") or "0")
+        duration = str(args.get("duration") or "")
+        if not src:
+            return {"name": name, "error": "missing src"}
+        import os, subprocess, time as _tm
+        outdir = os.path.join(UPLOAD_DIR, "artifacts", "video", f"trim-{int(_tm.time())}")
+        os.makedirs(outdir, exist_ok=True)
+        dst = os.path.join(outdir, "trimmed.mp4")
+        ff = ["ffmpeg", "-y", "-i", src, "-ss", start]
+        if duration:
+            ff += ["-t", duration]
+        ff += ["-c", "copy", dst]
+        try:
+            subprocess.run(ff, check=True)
+            url = dst.replace("/workspace", "") if dst.startswith("/workspace/") else dst
+            return {"name": name, "result": {"path": url}}
+        except Exception as ex:
+            return {"name": name, "error": str(ex)}
+    if name == "ffmpeg.concat":
+        inputs = args.get("inputs") or []
+        if not isinstance(inputs, list) or not inputs:
+            return {"name": name, "error": "missing inputs"}
+        import os, subprocess, tempfile, time as _tm
+        outdir = os.path.join(UPLOAD_DIR, "artifacts", "video", f"concat-{int(_tm.time())}")
+        os.makedirs(outdir, exist_ok=True)
+        listfile = os.path.join(outdir, "list.txt")
+        with open(listfile, "w", encoding="utf-8") as f:
+            for p in inputs:
+                f.write(f"file '{p}'\n")
+        dst = os.path.join(outdir, "concat.mp4")
+        ff = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", listfile, "-c", "copy", dst]
+        try:
+            subprocess.run(ff, check=True)
+            url = dst.replace("/workspace", "") if dst.startswith("/workspace/") else dst
+            return {"name": name, "result": {"path": url}}
+        except Exception as ex:
+            return {"name": name, "error": str(ex)}
+    if name == "ffmpeg.audio_mix":
+        a = args.get("a"); b = args.get("b"); vol_a = str(args.get("vol_a") or "1.0"); vol_b = str(args.get("vol_b") or "1.0")
+        if not a or not b:
+            return {"name": name, "error": "missing a/b"}
+        import os, subprocess, time as _tm
+        outdir = os.path.join(UPLOAD_DIR, "artifacts", "audio", f"mix-{int(_tm.time())}")
+        os.makedirs(outdir, exist_ok=True)
+        dst = os.path.join(outdir, "mix.wav")
+        ff = ["ffmpeg", "-y", "-i", a, "-i", b, "-filter_complex", f"[0:a]volume={vol_a}[a0];[1:a]volume={vol_b}[a1];[a0][a1]amix=inputs=2:duration=longest", dst]
+        try:
+            subprocess.run(ff, check=True)
+            url = dst.replace("/workspace", "") if dst.startswith("/workspace/") else dst
+            return {"name": name, "result": {"path": url}}
+        except Exception as ex:
+            return {"name": name, "error": str(ex)}
+    if name == "video.interpolate":
+        src = args.get("src") or ""
+        target_fps = int(args.get("target_fps") or 60)
+        if not src:
+            return {"name": name, "error": "missing src"}
+        import os, subprocess, time as _tm
+        outdir = os.path.join(UPLOAD_DIR, "artifacts", "video", f"interp-{int(_tm.time())}")
+        os.makedirs(outdir, exist_ok=True)
+        dst = os.path.join(outdir, "interpolated.mp4")
+        vf = f"minterpolate=fps={target_fps}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1"
+        ff = ["ffmpeg", "-y", "-i", src, "-vf", vf, "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-an", dst]
+        try:
+            subprocess.run(ff, check=True)
+            # Optional face/consistency lock stabilization pass
+            try:
+                locks = args.get("locks") or {}
+                face_images: list[str] = []
+                # Resolve ref_ids -> images via refs.apply
+                if isinstance(args.get("ref_ids"), list):
+                    try:
+                        for rid in args.get("ref_ids"):
+                            try:
+                                pack, code = _refs_apply({"ref_id": rid})
+                                if isinstance(pack, dict) and pack.get("ref_pack"):
+                                    imgs = (pack.get("ref_pack") or {}).get("images") or []
+                                    for p in imgs:
+                                        if isinstance(p, str):
+                                            face_images.append(p)
+                            except Exception:
+                                continue
+                    except Exception:
+                        pass
+                # Also accept direct locks.image.images
+                try:
+                    if isinstance(locks.get("image"), dict):
+                        for k in ("face_images", "images"):
+                            for p in (locks.get("image", {}).get(k) or []):
+                                if isinstance(p, str):
+                                    face_images.append(p)
+                except Exception:
+                    pass
+                if not face_images:
+                    try:
+                        cid_val = str(args.get("cid") or "").strip()
+                        if cid_val:
+                            recents = _ctx_list(cid_val, limit=20, kind_hint="image")
+                            for it in reversed(recents):
+                                p = it.get("path")
+                                if isinstance(p, str):
+                                    face_images.append(p)
+                                    break
+                    except Exception:
+                        pass
+                if COMFYUI_API_URL and FACEID_API_URL and face_images:
+                    # 1) Extract frames
+                    frames_dir = os.path.join(outdir, "frames"); os.makedirs(frames_dir, exist_ok=True)
+                    subprocess.run(["ffmpeg", "-y", "-i", dst, os.path.join(frames_dir, "%06d.png")], check=True)
+                    # 2) Compute face embedding from first ref
+                    import httpx as _hx
+                    face_src = face_images[0]
+                    if face_src.startswith("/workspace/"):
+                        face_url = face_src.replace("/workspace", "")
+                    else:
+                        face_url = face_src if face_src.startswith("/uploads/") else face_src
+                    with _hx.Client(timeout=None) as _c:
+                        er = _c.post(FACEID_API_URL.rstrip("/") + "/embed", json={"image_url": face_url})
+                        emb = None
+                        if er.status_code == 200:
+                            ej = er.json(); emb = ej.get("embedding") or ej.get("vec")
+                    # 3) Per-frame InstantID apply with low denoise
+                    if emb and isinstance(emb, list):
+                        from glob import glob as _glob
+                        frame_files = sorted(_glob(os.path.join(frames_dir, "*.png")))
+                        for fp in frame_files:
+                            try:
+                                # Build minimal ComfyUI graph for stabilization
+                                g = {
+                                    "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "sd_xl_base_1.0.safetensors"}},
+                                    "2": {"class_type": "LoadImage", "inputs": {"image": fp}},
+                                    "5": {"class_type": "VAEEncode", "inputs": {"pixels": ["2", 0], "vae": ["1", 2]}},
+                                    "6": {"class_type": "KSampler", "inputs": {"seed": 0, "steps": 10, "cfg": 4.0, "sampler_name": "dpmpp_2m", "scheduler": "karras", "denoise": 0.15, "model": ["1", 0], "positive": ["3", 0], "negative": ["4", 0], "latent_image": ["5", 0]}},
+                                    "3": {"class_type": "CLIPTextEncode", "inputs": {"text": "stabilize face, preserve identity", "clip": ["1", 1]}},
+                                    "4": {"class_type": "CLIPTextEncode", "inputs": {"text": "", "clip": ["1", 1]}},
+                                    "7": {"class_type": "VAEDecode", "inputs": {"samples": ["6", 0], "vae": ["1", 2]}},
+                                    "8": {"class_type": "SaveImage", "inputs": {"filename_prefix": "frame_out", "images": ["7", 0]}}
+                                }
+                                # Inject InstantIDApply
+                                g["22"] = {"class_type": "InstantIDApply", "inputs": {"model": ["1", 0], "image": ["2", 0], "embedding": emb, "strength": 0.70}}
+                                g["6"]["inputs"]["model"] = ["22", 0]
+                                with _hx.Client(timeout=None) as _c2:
+                                    pr = _c2.post(COMFYUI_API_URL.rstrip("/") + "/prompt", json={"prompt": g})
+                                    if pr.status_code == 200:
+                                        pid = (pr.json().get("prompt_id") or pr.json().get("uuid") or pr.json().get("id"))
+                                        # poll for completion
+                                        while True:
+                                            hr = _c2.get(COMFYUI_API_URL.rstrip("/") + f"/history/{pid}")
+                                            if hr.status_code == 200:
+                                                h = (hr.json().get("history") or {}).get(pid)
+                                                if h and (h.get("status", {}).get("completed") is True):
+                                                    # find first output and overwrite frame
+                                                    outs = (h.get("outputs") or {})
+                                                    got = False
+                                                    for items in outs.values():
+                                                        if isinstance(items, list) and items:
+                                                            it = items[0]
+                                                            fn = it.get("filename"); sub = it.get("subfolder"); tp = it.get("type") or "output"
+                                                            if fn:
+                                                                from urllib.parse import urlencode
+                                                                q = {"filename": fn, "type": tp}
+                                                                if sub: q["subfolder"] = sub
+                                                                vr = _c2.get(COMFYUI_API_URL.rstrip("/") + "/view?" + urlencode(q))
+                                                                if vr.status_code == 200:
+                                                                    with open(fp, "wb") as wf:
+                                                                        wf.write(vr.content)
+                                                                    got = True
+                                                                    break
+                                                    break
+                                            import time as __t
+                                            __t.sleep(0.5)
+                            except Exception:
+                                continue
+                        # 4) Reassemble stabilized video
+                        dst2 = os.path.join(outdir, "interpolated_stabilized.mp4")
+                        subprocess.run(["ffmpeg", "-y", "-framerate", str(target_fps), "-i", os.path.join(frames_dir, "%06d.png"), "-c:v", "libx264", "-pix_fmt", "yuv420p", dst2], check=True)
+                        dst = dst2
+            except Exception:
+                pass
+            url = dst.replace("/workspace", "") if dst.startswith("/workspace/") else dst
+            try:
+                _ctx_add(args.get("cid") or "", "video", dst, url, src, ["interpolate"], {"target_fps": target_fps})
+            except Exception:
+                pass
+            try:
+                _trace_append("video", {"cid": args.get("cid"), "tool": "video.interpolate", "src": src, "target_fps": target_fps, "path": dst})
+            except Exception:
+                pass
+            return {"name": name, "result": {"path": url}}
+        except Exception as ex:
+            return {"name": name, "error": str(ex)}
+    if name == "video.upscale":
+        src = args.get("src") or ""
+        scale = int(args.get("scale") or 0)
+        w = args.get("width"); h = args.get("height")
+        if not src:
+            return {"name": name, "error": "missing src"}
+        import os, subprocess, time as _tm
+        outdir = os.path.join(UPLOAD_DIR, "artifacts", "video", f"upscale-{int(_tm.time())}")
+        os.makedirs(outdir, exist_ok=True)
+        dst = os.path.join(outdir, "upscaled.mp4")
+        if scale and scale > 1:
+            vf = f"scale=iw*{scale}:ih*{scale}:flags=lanczos"
+        elif w and h:
+            vf = f"scale={int(w)}:{int(h)}:flags=lanczos"
+        else:
+            vf = "scale=iw*2:ih*2:flags=lanczos"
+        ff = ["ffmpeg", "-y", "-i", src, "-vf", vf, "-c:v", "libx264", "-preset", "slow", "-crf", "18", "-an", dst]
+        try:
+            subprocess.run(ff, check=True)
+            # Optional stabilization pass via face lock
+            try:
+                locks = args.get("locks") or {}
+                face_images: list[str] = []
+                if isinstance(args.get("ref_ids"), list):
+                    try:
+                        for rid in args.get("ref_ids"):
+                            try:
+                                pack, code = _refs_apply({"ref_id": rid})
+                                if isinstance(pack, dict) and pack.get("ref_pack"):
+                                    imgs = (pack.get("ref_pack") or {}).get("images") or []
+                                    for p in imgs:
+                                        if isinstance(p, str):
+                                            face_images.append(p)
+                            except Exception:
+                                continue
+                    except Exception:
+                        pass
+                try:
+                    if isinstance(locks.get("image"), dict):
+                        for k in ("face_images", "images"):
+                            for p in (locks.get("image", {}).get(k) or []):
+                                if isinstance(p, str):
+                                    face_images.append(p)
+                except Exception:
+                    pass
+                if not face_images:
+                    try:
+                        cid_val = str(args.get("cid") or "").strip()
+                        if cid_val:
+                            recents = _ctx_list(cid_val, limit=20, kind_hint="image")
+                            for it in reversed(recents):
+                                p = it.get("path")
+                                if isinstance(p, str):
+                                    face_images.append(p)
+                                    break
+                    except Exception:
+                        pass
+                if COMFYUI_API_URL and FACEID_API_URL and face_images:
+                    frames_dir = os.path.join(outdir, "frames"); os.makedirs(frames_dir, exist_ok=True)
+                    subprocess.run(["ffmpeg", "-y", "-i", dst, os.path.join(frames_dir, "%06d.png")], check=True)
+                    import httpx as _hx
+                    face_src = face_images[0]
+                    face_url = face_src.replace("/workspace", "") if face_src.startswith("/workspace/") else (face_src if face_src.startswith("/uploads/") else face_src)
+                    with _hx.Client(timeout=None) as _c:
+                        er = _c.post(FACEID_API_URL.rstrip("/") + "/embed", json={"image_url": face_url})
+                        emb = None
+                        if er.status_code == 200:
+                            ej = er.json(); emb = ej.get("embedding") or ej.get("vec")
+                    if emb and isinstance(emb, list):
+                        from glob import glob as _glob
+                        frame_files = sorted(_glob(os.path.join(frames_dir, "*.png")))
+                        for fp in frame_files:
+                            try:
+                                g = {
+                                    "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "sd_xl_base_1.0.safetensors"}},
+                                    "2": {"class_type": "LoadImage", "inputs": {"image": fp}},
+                                    "5": {"class_type": "VAEEncode", "inputs": {"pixels": ["2", 0], "vae": ["1", 2]}},
+                                    "6": {"class_type": "KSampler", "inputs": {"seed": 0, "steps": 10, "cfg": 4.0, "sampler_name": "dpmpp_2m", "scheduler": "karras", "denoise": 0.15, "model": ["1", 0], "positive": ["3", 0], "negative": ["4", 0], "latent_image": ["5", 0]}},
+                                    "3": {"class_type": "CLIPTextEncode", "inputs": {"text": "stabilize face, preserve identity", "clip": ["1", 1]}},
+                                    "4": {"class_type": "CLIPTextEncode", "inputs": {"text": "", "clip": ["1", 1]}},
+                                    "7": {"class_type": "VAEDecode", "inputs": {"samples": ["6", 0], "vae": ["1", 2]}},
+                                    "8": {"class_type": "SaveImage", "inputs": {"filename_prefix": "frame_out", "images": ["7", 0]}}
+                                }
+                                g["22"] = {"class_type": "InstantIDApply", "inputs": {"model": ["1", 0], "image": ["2", 0], "embedding": emb, "strength": 0.70}}
+                                g["6"]["inputs"]["model"] = ["22", 0]
+                                with _hx.Client(timeout=None) as _c2:
+                                    pr = _c2.post(COMFYUI_API_URL.rstrip("/") + "/prompt", json={"prompt": g})
+                                    if pr.status_code == 200:
+                                        pid = (pr.json().get("prompt_id") or pr.json().get("uuid") or pr.json().get("id"))
+                                        while True:
+                                            hr = _c2.get(COMFYUI_API_URL.rstrip("/") + f"/history/{pid}")
+                                            if hr.status_code == 200:
+                                                h = (hr.json().get("history") or {}).get(pid)
+                                                if h and (h.get("status", {}).get("completed") is True):
+                                                    outs = (h.get("outputs") or {})
+                                                    got = False
+                                                    for items in outs.values():
+                                                        if isinstance(items, list) and items:
+                                                            it = items[0]
+                                                            fn = it.get("filename"); sub = it.get("subfolder"); tp = it.get("type") or "output"
+                                                            if fn:
+                                                                from urllib.parse import urlencode
+                                                                q = {"filename": fn, "type": tp}
+                                                                if sub: q["subfolder"] = sub
+                                                                vr = _c2.get(COMFYUI_API_URL.rstrip("/") + "/view?" + urlencode(q))
+                                                                if vr.status_code == 200:
+                                                                    with open(fp, "wb") as wf:
+                                                                        wf.write(vr.content)
+                                                                    got = True
+                                                                    break
+                                                    
+                                            import time as __t
+                                            __t.sleep(0.5)
+                            except Exception:
+                                continue
+                        dst2 = os.path.join(outdir, "upscaled_stabilized.mp4")
+                        subprocess.run(["ffmpeg", "-y", "-framerate", "30", "-i", os.path.join(frames_dir, "%06d.png"), "-c:v", "libx264", "-pix_fmt", "yuv420p", dst2], check=True)
+                        dst = dst2
+            except Exception:
+                pass
+            url = dst.replace("/workspace", "") if dst.startswith("/workspace/") else dst
+            try:
+                _ctx_add(args.get("cid") or "", "video", dst, url, src, ["upscale"], {"scale": scale, "width": w, "height": h})
+            except Exception:
+                pass
+            try:
+                _trace_append("video", {"cid": args.get("cid"), "tool": "video.upscale", "src": src, "scale": scale, "width": w, "height": h, "path": dst})
+            except Exception:
+                pass
+            return {"name": name, "result": {"path": url}}
+        except Exception as ex:
+            return {"name": name, "error": str(ex)}
     if name == "rag_index":
         res = await rag_index_dir(root=args.get("root", "/workspace"))
         return {"name": name, "result": res}
@@ -2051,6 +2604,14 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     messages = meta_prompt(normalized_msgs)
 
     # Determine mode and trace/run identifiers early
+    conv_cid = None
+    try:
+        if isinstance(body.get("cid"), (int, str)):
+            conv_cid = str(body.get("cid"))
+        elif isinstance(body.get("conversation_id"), (int, str)):
+            conv_cid = str(body.get("conversation_id"))
+    except Exception:
+        conv_cid = None
     last_user_text = ""
     for m in reversed(normalized_msgs):
         if (m.get("role") == "user") and isinstance(m.get("content"), str) and m.get("content").strip():
@@ -2069,7 +2630,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         provided_seed = None
     master_seed = provided_seed if provided_seed is not None else _derive_seed("chat", msgs_for_seed)
     import hashlib as _hl
-    trace_id = "tt_" + _hl.sha256(msgs_for_seed.encode("utf-8")).hexdigest()[:16]
+    trace_id = (f"cid_{conv_cid}" if conv_cid else None) or ("tt_" + _hl.sha256(msgs_for_seed.encode("utf-8")).hexdigest()[:16])
     try:
         _append_jsonl(os.path.join(STATE_DIR, "traces", trace_id, "requests.jsonl"), {"t": int(time.time()*1000), "trace_id": trace_id, "route_mode": "committee", "messages": normalized_msgs[:50]})
     except Exception:
@@ -2270,9 +2831,17 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 {"role": "system", "content": "Web search results follow. Use them only if relevant."},
                 {"role": "system", "content": snippets},
             ] + messages
+            try:
+                _trace_append("rag", {"cid": conv_cid, "trace_id": trace_id, "query": q0, "results": items})
+            except Exception:
+                pass
 
     # 1) Planner proposes plan + tool calls
     plan_text, tool_calls = await planner_produce_plan(messages, body.get("tools"), body.get("temperature") or DEFAULT_TEMPERATURE)
+    try:
+        _trace_append("decision", {"cid": conv_cid, "trace_id": trace_id, "plan": plan_text, "tool_calls": tool_calls})
+    except Exception:
+        pass
     # Deterministic router: if intent is recognized, override planner with a direct tool call
     try:
         decision = route_for_request({"messages": normalized_msgs})
@@ -2280,6 +2849,10 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         decision = None
     if decision and getattr(decision, "kind", None) == "tool" and getattr(decision, "tool", None):
         tool_calls = [{"name": decision.tool, "arguments": (decision.args or {})}]
+        try:
+            _trace_append("decision", {"cid": conv_cid, "trace_id": trace_id, "router": {"tool": decision.tool, "args": decision.args}})
+        except Exception:
+            pass
     # Surface attachments in tool arguments so downstream jobs can use user media
     if tool_calls and attachments:
         enriched: List[Dict[str, Any]] = []
@@ -2300,6 +2873,8 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 args.setdefault("video", vids)
             if files:
                 args.setdefault("files", files)
+            if conv_cid and isinstance(args, dict):
+                args.setdefault("cid", conv_cid)
             tc = {**tc, "arguments": args}
             enriched.append(tc)
         tool_calls = enriched
@@ -2431,6 +3006,18 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                             if isinstance(res.get(key), dict) and (res.get(key).get("uri") or res.get(key).get("hash")):
                                 artifacts[key] = {k: v for k, v in res.get(key).items() if k in ("uri", "hash")}
                 tool_exec_meta.append({"name": n, "args": args if isinstance(args, dict) else {"_raw": args}, "seed": seed_tool, "duration_ms": duration_ms, "artifacts": artifacts})
+                # Trace tool call success/failure for distillation
+                try:
+                    _trace_append("tool", {
+                        "cid": conv_cid,
+                        "trace_id": trace_id,
+                        "name": n,
+                        "args_keys": (list(args.keys()) if isinstance(args, dict) else []),
+                        "ok": (not (isinstance(tr, dict) and tr.get("error"))),
+                        "duration_ms": duration_ms,
+                    })
+                except Exception:
+                    pass
             except Exception as ex:
                 tool_results.append({"name": tc.get("name", "tool"), "error": str(ex)})
                 tool_exec_meta.append({"name": tc.get("name", "tool"), "args": tc.get("arguments") or {}, "seed": _derive_seed("tool", tc.get("name", "tool"), trace_id), "duration_ms": 0, "artifacts": {}})
@@ -3324,6 +3911,108 @@ async def refs_apply(body: Dict[str, Any]):
         return JSONResponse(status_code=400, content={"error": str(ex)})
 
 
+@app.post("/refs.resolve")
+async def refs_resolve(body: Dict[str, Any]):
+    try:
+        cid = str((body or {}).get("cid") or "").strip()
+        text = str((body or {}).get("text") or "")
+        kind = (body or {}).get("kind")
+        rec = _ctx_resolve(cid, text, kind)
+        if not rec:
+            # Fallback to global artifact memory across conversations
+            rec = _glob_resolve(text, kind)
+            if not rec:
+                try:
+                    _trace_append("memory_ref", {"cid": cid, "text": text, "kind": kind, "found": False})
+                except Exception:
+                    pass
+                return {"ok": False, "matches": []}
+        try:
+            _trace_append("memory_ref", {"cid": cid, "text": text, "kind": kind, "found": True, "path": rec.get("path"), "source": ("cid" if cid else "global")})
+        except Exception:
+            pass
+        return {"ok": True, "matches": [rec]}
+    except Exception as ex:
+        return JSONResponse(status_code=400, content={"error": str(ex)})
+
+
+def _build_locks_from_context(cid: str) -> Dict[str, Any]:
+    locks: Dict[str, Any] = {"characters": []}
+    # Pick recent artifacts
+    try:
+        last_img = _ctx_resolve(cid, "last image", "image")
+        last_voice = _ctx_resolve(cid, "last voice", "audio")
+        last_music = _ctx_resolve(cid, "last music", "audio")
+        char: Dict[str, Any] = {"id": "C_A"}
+        # Save temporary refs for each kind and wire ref_ids
+        if last_img and isinstance(last_img.get("path"), str):
+            ref = _refs_save({"kind": "image", "title": f"ctx:{cid}:image", "files": {"images": [last_img.get("path")]}, "compute_embeds": False})
+            if isinstance(ref, dict) and isinstance(ref.get("ref"), dict):
+                char["image_ref_id"] = ref["ref"].get("ref_id")
+        if last_voice and isinstance(last_voice.get("path"), str):
+            ref = _refs_save({"kind": "voice", "title": f"ctx:{cid}:voice", "files": {"voice_samples": [last_voice.get("path")]}, "compute_embeds": False})
+            if isinstance(ref, dict) and isinstance(ref.get("ref"), dict):
+                char["voice_ref_id"] = ref["ref"].get("ref_id")
+        if last_music and isinstance(last_music.get("path"), str):
+            # Collect any stems tagged in recent context
+            stems: List[str] = []
+            for it in reversed(_ctx_list(cid, limit=20, kind_hint="audio")):
+                tags = it.get("tags") or []
+                if any(str(t).startswith("stem:") for t in tags):
+                    pth = it.get("path")
+                    if isinstance(pth, str): stems.append(pth)
+            ref = _refs_save({"kind": "music", "title": f"ctx:{cid}:music", "files": {"track": last_music.get("path"), "stems": stems}, "compute_embeds": False})
+            if isinstance(ref, dict) and isinstance(ref.get("ref"), dict):
+                char["music_ref_id"] = ref["ref"].get("ref_id")
+        if len(char) > 1:
+            locks["characters"].append(char)
+    except Exception:
+        pass
+    return locks
+
+
+@app.post("/locks.from_context")
+async def locks_from_context(body: Dict[str, Any]):
+    try:
+        cid = str((body or {}).get("cid") or "").strip()
+        if not cid:
+            return JSONResponse(status_code=400, content={"error": "missing cid"})
+        locks = _build_locks_from_context(cid)
+        return {"ok": True, "locks": locks}
+    except Exception as ex:
+        return JSONResponse(status_code=400, content={"error": str(ex)})
+
+
+@app.post("/refs.compose_character")
+async def refs_compose_character(body: Dict[str, Any]):
+    try:
+        cid = str((body or {}).get("cid") or "").strip()
+        face_txt = str((body or {}).get("face") or "")
+        style_txt = str((body or {}).get("style") or "")
+        clothes_txt = str((body or {}).get("clothes") or "")
+        emotion_txt = str((body or {}).get("emotion") or "")
+        out: Dict[str, Any] = {"image": {}, "audio": {}}
+        if face_txt:
+            rec = _ctx_resolve(cid, face_txt, "image") or _glob_resolve(face_txt, "image")
+            if rec and isinstance(rec.get("path"), str):
+                out["image"]["face_images"] = [rec.get("path")]
+        if style_txt:
+            rec = _ctx_resolve(cid, style_txt, "image") or _glob_resolve(style_txt, "image")
+            if rec and isinstance(rec.get("path"), str):
+                out["image"].setdefault("style_images", []).append(rec.get("path"))
+        if clothes_txt:
+            rec = _ctx_resolve(cid, clothes_txt, "image") or _glob_resolve(clothes_txt, "image")
+            if rec and isinstance(rec.get("path"), str):
+                out["image"].setdefault("clothes_images", []).append(rec.get("path"))
+        if emotion_txt:
+            em = _infer_emotion(emotion_txt)
+            if em:
+                out["audio"]["emotion"] = em
+        return {"ok": True, "refs": out}
+    except Exception as ex:
+        return JSONResponse(status_code=400, content={"error": str(ex)})
+
+
 # ---------- Direct Tool Runner (for UI) ----------
 @app.post("/tool.run")
 async def tool_run(body: Dict[str, Any]):
@@ -3481,9 +4170,20 @@ async def tool_run(body: Dict[str, Any]):
             class _MusicProvider:
                 async def _compose(self, payload: Dict[str, Any]) -> Dict[str, Any]:
                     import base64 as _b
-                    async with httpx.AsyncClient(timeout=600) as client:
-                        r = await client.post(MUSIC_API_URL.rstrip("/") + "/generate", json={"prompt": payload.get("prompt"), "duration": int(payload.get("length_s") or 8)})
-                        r.raise_for_status(); js = r.json(); b64 = js.get("audio_wav_base64") or js.get("wav_b64"); wav = _b.b64decode(b64) if isinstance(b64, str) else b""; return {"wav_bytes": wav, "model": f"musicgen:{os.getenv('MUSIC_MODEL_ID','')}"}
+                    async with httpx.AsyncClient(timeout=None) as client:
+                        body = {
+                            "prompt": payload.get("prompt"),
+                            "duration": int(payload.get("length_s") or 8),
+                            "music_lock": payload.get("music_lock") or payload.get("music_refs"),
+                            "seed": payload.get("seed"),
+                            "refs": payload.get("refs") or payload.get("music_refs"),
+                        }
+                        r = await client.post(MUSIC_API_URL.rstrip("/") + "/generate", json=body)
+                        r.raise_for_status()
+                        js = r.json()
+                        b64 = js.get("audio_wav_base64") or js.get("wav_b64")
+                        wav = _b.b64decode(b64) if isinstance(b64, str) else b""
+                        return {"wav_bytes": wav, "model": f"musicgen:{os.getenv('MUSIC_MODEL_ID','')}"}
                 def compose(self, args: Dict[str, Any]) -> Dict[str, Any]:
                     import asyncio as _as
                     return _as.get_event_loop().run_until_complete(self._compose(args))
