@@ -3,9 +3,8 @@ FROM python:3.10-bookworm
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-# Force CPU-only execution and prevent CUDA probing
-ENV CUDA_VISIBLE_DEVICES="" \
-    PYTORCH_FORCE_CPU=1
+# Enable CUDA wheels channel for PyTorch; falls back to CPU if GPUs not visible
+ENV PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu121
 
 RUN apt-get update && apt-get install -y git ffmpeg build-essential libgl1 curl && rm -rf /var/lib/apt/lists/*
 
@@ -13,11 +12,12 @@ WORKDIR /comfyui
 
 RUN git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git .
 
+# Pre-install CUDA-enabled torch; will still fall back to CPU if no GPU is present
+RUN pip install --no-cache-dir torch==2.3.1+cu121 torchvision==0.18.1+cu121 torchaudio==2.3.1+cu121
+# Install ComfyUI requirements and common deps
 RUN pip install --no-cache-dir -r requirements.txt
-# Pin CPU-safe wheels for Python 3.10 to avoid NumPy 2 breakage and source builds
-RUN pip install --no-cache-dir numpy==1.26.4
-RUN pip install --no-cache-dir opencv-python-headless==4.9.0.80 imageio-ffmpeg==0.4.9 pillow==10.4.0 onnxruntime==1.16.3
-RUN pip install --no-cache-dir scikit-image==0.22.0 scikit-learn==1.3.2 diffusers==0.30.2 insightface==0.7.3
+RUN pip install --no-cache-dir numpy==1.26.4 opencv-python-headless==4.9.0.80 imageio-ffmpeg==0.4.9 pillow==10.4.0 \
+    onnxruntime==1.16.3 scikit-image==0.22.0 scikit-learn==1.3.2 diffusers==0.30.2 insightface==0.7.3
 ## execstack not available on Debian slim; rely on onnxruntime==1.14.1 CPU wheel which avoids execstack
 
 EXPOSE 8188

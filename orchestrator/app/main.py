@@ -1393,7 +1393,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 js = self._post_prompt(g); pid = js.get("prompt_id") or js.get("uuid") or js.get("id")
                 det = self._poll(pid, timeout_s=300)
                 data = self._download_first(det)
-                return {"image_bytes": data, "model": "comfyui:sdxl"}
+                view_url = f"{self.base}/history/{pid}" if (self.base and pid) else None
+                return {"image_bytes": data, "model": "comfyui:sdxl", "prompt_id": pid, "history_url": view_url}
             def edit(self, a: Dict[str, Any]) -> Dict[str, Any]:
                 if not self.base:
                     return self.generate(a)
@@ -1411,7 +1412,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 }
                 js = self._post_prompt(g); pid = js.get("prompt_id") or js.get("uuid") or js.get("id"); det = self._poll(pid, timeout_s=300)
                 data = self._download_first(det)
-                return {"image_bytes": data, "model": "comfyui:sdxl"}
+                view_url = f"{self.base}/history/{pid}" if (self.base and pid) else None
+                return {"image_bytes": data, "model": "comfyui:sdxl", "prompt_id": pid, "history_url": view_url}
             def upscale(self, a: Dict[str, Any]) -> Dict[str, Any]:
                 if not self.base:
                     return self.generate(a)
@@ -1424,7 +1426,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 }
                 js = self._post_prompt(g); pid = js.get("prompt_id") or js.get("uuid") or js.get("id"); det = self._poll(pid, timeout_s=300)
                 data = self._download_first(det)
-                return {"image_bytes": data, "model": "comfyui:realesrgan"}
+                view_url = f"{self.base}/history/{pid}" if (self.base and pid) else None
+                return {"image_bytes": data, "model": "comfyui:realesrgan", "prompt_id": pid, "history_url": view_url}
         provider = _ImageProvider(COMFYUI_API_URL)
         manifest = {"items": []}
         try:

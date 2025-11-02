@@ -3,8 +3,8 @@ uvicorn[standard]>=0.31.0,<0.40
 transformers>=4.45.0,<5
 accelerate>=0.34.0,<1
 sentencepiece>=0.2.0,<0.3
-torch==2.3.1+cpu ; platform_system != 'Windows'
---extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.3.1+cu121 ; platform_system != 'Windows'
+--extra-index-url https://download.pytorch.org/whl/cu121
 Pillow>=10.4.0,<11
 numpy>=1.26.4,<2.0.0
 requests>=2.32.3,<3
