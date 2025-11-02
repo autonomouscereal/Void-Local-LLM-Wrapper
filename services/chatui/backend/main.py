@@ -759,6 +759,47 @@ async def get_job(job_id: str):
         return JSONResponse(status_code=500, content={"error": str(ex)})
 
 
+# Lightweight proxies for orchestrator admin/capabilities so the frontend can hit same-origin
+@app.get("/capabilities.json")
+async def capabilities_proxy():
+    try:
+        async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
+            r = await client.get(ORCH_URL.rstrip("/") + "/capabilities.json")
+        body = r.content
+        headers = {
+            "Cache-Control": "no-store",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Private-Network": "true",
+            "Access-Control-Expose-Headers": "Content-Type, Content-Length",
+            "Connection": "close",
+            "Content-Length": str(len(body)),
+            "Content-Type": r.headers.get("content-type") or "application/json",
+        }
+        return Response(content=body, media_type=headers["Content-Type"], status_code=r.status_code, headers=headers)
+    except Exception as ex:
+        return JSONResponse(status_code=502, content={"error": str(ex)})
+
+
+@app.get("/jobs.list")
+async def jobs_list_proxy():
+    try:
+        async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
+            r = await client.get(ORCH_URL.rstrip("/") + "/jobs.list")
+        body = r.content
+        headers = {
+            "Cache-Control": "no-store",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Private-Network": "true",
+            "Access-Control-Expose-Headers": "Content-Type, Content-Length",
+            "Connection": "close",
+            "Content-Length": str(len(body)),
+            "Content-Type": r.headers.get("content-type") or "application/json",
+        }
+        return Response(content=body, media_type=headers["Content-Type"], status_code=r.status_code, headers=headers)
+    except Exception as ex:
+        return JSONResponse(status_code=502, content={"error": str(ex)})
+
+
 @app.get("/healthz")
 async def healthz():
     return {"status": "ok"}
