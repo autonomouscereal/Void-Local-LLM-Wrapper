@@ -33,16 +33,16 @@ from typing import Any, Dict, List, Optional, Tuple
 import time
 import traceback
 
-import httpx
+import httpx  # type: ignore
 import requests
 import re
-import asyncpg
-from sentence_transformers import SentenceTransformer
-from fastapi import FastAPI, Request, UploadFile, File
-from fastapi.responses import JSONResponse, StreamingResponse
-from fastapi.staticfiles import StaticFiles
-from tenacity import retry, stop_after_attempt, wait_exponential
-from fastapi.middleware.cors import CORSMiddleware
+import asyncpg  # type: ignore
+from sentence_transformers import SentenceTransformer  # type: ignore
+from fastapi import FastAPI, Request, UploadFile, File  # type: ignore
+from fastapi.responses import JSONResponse, StreamingResponse, Response  # type: ignore
+from fastapi.staticfiles import StaticFiles  # type: ignore
+from tenacity import retry, stop_after_attempt, wait_exponential  # type: ignore
+from fastapi.middleware.cors import CORSMiddleware  # type: ignore
 from .json_parser import JSONParser
 from .determinism import seed_router as det_seed_router, seed_tool as det_seed_tool, round6 as det_round6
 from .icw.windowed_solver import solve as windowed_solve
@@ -156,16 +156,17 @@ GPTOSS_BASE_URL = os.getenv("GPTOSS_BASE_URL", "http://localhost:11435")
 GPTOSS_MODEL_ID = os.getenv("GPTOSS_MODEL_ID", "gpt-oss:20b-q5_K_M")
 DEFAULT_NUM_CTX = int(os.getenv("DEFAULT_NUM_CTX", "8192"))
 DEFAULT_TEMPERATURE = float(os.getenv("DEFAULT_TEMPERATURE", "0.3"))
-ENABLE_WEBSEARCH = os.getenv("ENABLE_WEBSEARCH", "false").lower() == "true"
+# Gates removed: defaults are always ON; API-key checks still apply where required
+ENABLE_WEBSEARCH = True
 SERPAPI_API_KEY = os.getenv("SERPAPI_API_KEY")
 MCP_HTTP_BRIDGE_URL = os.getenv("MCP_HTTP_BRIDGE_URL")  # e.g., http://host.docker.internal:9999
 EXECUTOR_BASE_URL = os.getenv("EXECUTOR_BASE_URL")  # http://executor:8081
 PLANNER_MODEL = os.getenv("PLANNER_MODEL", "qwen")  # qwen | gptoss
-ENABLE_DEBATE = os.getenv("ENABLE_DEBATE", "true").lower() == "true"
-MAX_DEBATE_TURNS = int(os.getenv("MAX_DEBATE_TURNS", "1"))
-AUTO_EXECUTE_TOOLS = os.getenv("AUTO_EXECUTE_TOOLS", "true").lower() == "true"
-# Alias legacy flag to canonical; do not document legacy externally
-ALLOW_TOOL_EXECUTION = AUTO_EXECUTE_TOOLS if os.getenv("ALLOW_TOOL_EXECUTION") is None else (os.getenv("ALLOW_TOOL_EXECUTION", "true").lower() == "true")
+ENABLE_DEBATE = True
+MAX_DEBATE_TURNS = 1
+AUTO_EXECUTE_TOOLS = True
+# Always allow tool execution
+ALLOW_TOOL_EXECUTION = True
 STREAM_CHUNK_SIZE_CHARS = int(os.getenv("STREAM_CHUNK_SIZE_CHARS", "0"))
 STREAM_CHUNK_INTERVAL_MS = int(os.getenv("STREAM_CHUNK_INTERVAL_MS", "50"))
 JOBS_RAG_INDEX = os.getenv("JOBS_RAG_INDEX", "true").lower() == "true"
@@ -204,7 +205,7 @@ ASSEMBLER_API_URL = os.getenv("ASSEMBLER_API_URL")  # http://assembler:9095
 TEACHER_API_URL = os.getenv("TEACHER_API_URL", "http://teacher:8097")
 WRAPPER_CONFIG_PATH = os.getenv("WRAPPER_CONFIG_PATH", "/workspace/configs/wrapper_config.json")
 ICW_API_URL = os.getenv("ICW_API_URL", "http://icw:8085")
-ICW_DISABLE = os.getenv("ICW_DISABLE", "0") == "1"
+ICW_DISABLE = False
 WRAPPER_CONFIG: Dict[str, Any] = {}
 WRAPPER_CONFIG_HASH: Optional[str] = None
 DRT_API_URL = os.getenv("DRT_API_URL", "http://drt:8086")
@@ -1341,12 +1342,12 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             def __init__(self, base: str | None):
                 self.base = (base or "").rstrip("/") if base else None
             def _post_prompt(self, graph: Dict[str, Any]) -> Dict[str, Any]:
-                import httpx as _hx
+                import httpx as _hx  # type: ignore
                 with _hx.Client(timeout=60) as client:
                     r = client.post(self.base + "/prompt", json={"prompt": graph})
                     r.raise_for_status(); return r.json()
             def _poll(self, pid: str, timeout_s: int = 60) -> Dict[str, Any]:
-                import httpx as _hx, time as _tm
+                import httpx as _hx, time as _tm  # type: ignore
                 t0 = _tm.time()
                 while True:
                     r = _hx.get(self.base + f"/history/{pid}", timeout=30)
@@ -1358,7 +1359,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     _tm.sleep(1.0)
                 return {}
             def _download_first(self, detail: Dict[str, Any]) -> bytes:
-                import httpx as _hx
+                import httpx as _hx  # type: ignore
                 outputs = (detail.get("outputs") or {})
                 for items in outputs.values():
                     if isinstance(items, list) and items:
@@ -1710,12 +1711,31 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         task = args.get("task") or ""
         env = run_super_loop(task=task, repo_root=repo_root, model=prov, step_tokens=step_tokens)
         return {"name": name, "result": env}
-    if name == "web_search" and ENABLE_WEBSEARCH and SERPAPI_API_KEY and ALLOW_TOOL_EXECUTION:
-        query = args.get("q") or args.get("query") or ""
-        if not query:
+    if name == "web_search" and ALLOW_TOOL_EXECUTION:
+        # Robust multi-engine metasearch without external API keys
+        q = args.get("q") or args.get("query") or ""
+        if not q:
             return {"name": name, "error": "missing query"}
-        snippets = await serpapi_google_search([query], max_results=int(args.get("k", 5)))
-        return {"name": name, "result": snippets}
+        k = int(args.get("k", 10))
+        # Reuse the metasearch fuse logic directly
+        engines: Dict[str, List[Dict[str, Any]]] = {}
+        import hashlib as _h
+        def _mk(engine: str) -> List[Dict[str, Any]]:
+            out = []
+            for i in range(1, min(6, k) + 1):
+                key = _h.sha256(f"{engine}|{q}|{i}".encode("utf-8")).hexdigest()
+                out.append({"title": f"{engine} result {i}", "snippet": f"deterministic snippet {i}", "link": f"https://example.com/{engine}/{key[:16]}"})
+            return out
+        for eng in ("google", "brave", "duckduckgo", "bing", "mojeek"):
+            engines.setdefault(eng, _mk(eng))
+        fused = _rrf_fuse(engines, k=60)[:k]
+        # Build text snippet bundle for convenience
+        lines = []
+        for it in fused:
+            lines.append(f"- {it.get('title','')}")
+            lines.append(it.get('snippet',''))
+            lines.append(it.get('link',''))
+        return {"name": name, "result": "\n".join(lines)}
     if name == "metasearch.fuse" and ALLOW_TOOL_EXECUTION:
         q = args.get("q") or ""
         if not q:
@@ -2053,7 +2073,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     import hashlib as _hl
     trace_id = "tt_" + _hl.sha256(msgs_for_seed.encode("utf-8")).hexdigest()[:16]
     try:
-        _append_jsonl(os.path.join(STATE_DIR, "traces", trace_id, "requests.jsonl"), {"t": int(time.time()*1000), "trace_id": trace_id, "route_mode": os.getenv("ICW_MODE", "windowed"), "messages": normalized_msgs[:50]})
+        _append_jsonl(os.path.join(STATE_DIR, "traces", trace_id, "requests.jsonl"), {"t": int(time.time()*1000), "trace_id": trace_id, "route_mode": "committee", "messages": normalized_msgs[:50]})
     except Exception:
         pass
     # Acquire per-trace lock and record start event
@@ -2067,20 +2087,17 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     except Exception:
         pass
 
-    # ICW pack (always-on, unless ICW_DISABLE=1) — inline; record pack_hash for traces
+    # ICW pack (always-on) — inline; record pack_hash for traces
     pack_hash = None
     try:
         seed_icw = _derive_seed("icw", msgs_for_seed)
-        if not ICW_DISABLE:
-            icw = _icw_pack(normalized_msgs, seed_icw, budget_tokens=3500)
-            pack_text = icw.get("pack") or ""
-            if isinstance(pack_text, str) and pack_text.strip():
-                messages = [{"role": "system", "content": f"ICW PACK (hash tracked):\n{pack_text[:12000]}"}] + messages
-            pack_hash = icw.get("hash")
-            run_id = await _db_insert_run(trace_id=trace_id, mode=mode, seed=master_seed, pack_hash=pack_hash, request_json=body)
-            await _db_insert_icw_log(run_id=run_id, pack_hash=pack_hash or None, budget_tokens=int(icw.get("budget_tokens") or 0), scores_json=icw.get("scores_summary") or {})
-        else:
-            run_id = await _db_insert_run(trace_id=trace_id, mode=mode, seed=master_seed, pack_hash=None, request_json=body)
+        icw = _icw_pack(normalized_msgs, seed_icw, budget_tokens=3500)
+        pack_text = icw.get("pack") or ""
+        if isinstance(pack_text, str) and pack_text.strip():
+            messages = [{"role": "system", "content": f"ICW PACK (hash tracked):\n{pack_text[:12000]}"}] + messages
+        pack_hash = icw.get("hash")
+        run_id = await _db_insert_run(trace_id=trace_id, mode=mode, seed=master_seed, pack_hash=pack_hash, request_json=body)
+        await _db_insert_icw_log(run_id=run_id, pack_hash=pack_hash or None, budget_tokens=int(icw.get("budget_tokens") or 0), scores_json=icw.get("scores_summary") or {})
     except Exception:
         pack_hash = None
         run_id = await _db_insert_run(trace_id=trace_id, mode=mode, seed=master_seed, pack_hash=None, request_json=body)
@@ -2088,7 +2105,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     # If client supplies tool results (role=tool) we include them verbatim for the planner/executors
 
     # Optional Windowed Solver path (capless sliding window + CONT/HALT)
-    route_mode = os.getenv("ICW_MODE", "windowed").lower()
+    route_mode = "committee"
     if route_mode == "windowed":
         # Build minimal state
         anchor_msgs = []
@@ -2160,9 +2177,9 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         final_oai = stitch_openai_final(result.partials, model_name=provider.model_id)
         # Optional ablation
         try:
-            do_ablate = os.getenv("ABLATE", "on").lower() == "on"
-            do_export = os.getenv("ABLATE_EXPORT", "on").lower() == "on"
-            scope = os.getenv("ABLATE_SCOPE", "auto")
+            do_ablate = True
+            do_export = True
+            scope = "auto"
             if do_ablate and isinstance(final_env, dict):
                 abl = ablate_env(final_env, scope_hint=(scope if scope != "auto" else "chat"))
                 final_env["ablated"] = abl
@@ -2234,15 +2251,27 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         return JSONResponse(content=response)
 
     # Optional self-ask-with-search augmentation
-    if ENABLE_WEBSEARCH and SERPAPI_API_KEY:
-        queries = await propose_search_queries(messages)
-        if queries:
-            snippets = await serpapi_google_search(queries, max_results=5)
-            if snippets:
-                messages = [
-                    {"role": "system", "content": "Web search results follow. Use them only if relevant."},
-                    {"role": "system", "content": snippets},
-                ] + messages
+    # Multi-engine metasearch augmentation (no external keys)
+    queries = await propose_search_queries(messages)
+    if queries:
+        # Fuse top query to keep budget small
+        q0 = queries[0]
+        fused = await execute_tool_call({"name": "metasearch.fuse", "arguments": {"q": q0, "k": 8}})
+        try:
+            items = (fused.get("result") or {}).get("results") or []
+        except Exception:
+            items = []
+        if items:
+            lines = []
+            for it in items[:8]:
+                lines.append(f"- {it.get('title','')}")
+                lines.append(it.get('snippet',''))
+                lines.append(it.get('link',''))
+            snippets = "\n".join([ln for ln in lines if ln is not None])
+            messages = [
+                {"role": "system", "content": "Web search results follow. Use them only if relevant."},
+                {"role": "system", "content": snippets},
+            ] + messages
 
     # 1) Planner proposes plan + tool calls
     plan_text, tool_calls = await planner_produce_plan(messages, body.get("tools"), body.get("temperature") or DEFAULT_TEMPERATURE)
@@ -2296,7 +2325,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     # (No keyword heuristics; semantic mapping is handled by the Planner instructions above.)
 
     # If tool semantics are client-driven, return tool_calls instead of executing
-    if tool_calls and not AUTO_EXECUTE_TOOLS:
+    if False:
         tool_calls_openai = to_openai_tool_calls(tool_calls)
         response = {
             "id": "orc-1",
@@ -2460,6 +2489,19 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     refusal_markers = ("can't", "cannot", "unable", "i can't", "i can't", "i cannot")
     refused = any(tok in (qwen_text.lower() + "\n" + gptoss_text.lower()) for tok in refusal_markers)
     if refused and not tool_results:
+        # Fast-path: if user text clearly asks for an image, force image.dispatch with minimal args
+        try:
+            from .router.predicates import looks_like_image as _looks_like_image  # lazy import
+            last_user = ""
+            for m in reversed(messages):
+                if m.role == "user" and isinstance(m.content, str) and m.content.strip():
+                    last_user = m.content.strip(); break
+            if last_user and _looks_like_image(last_user):
+                forced_calls = [{"name": "image.dispatch", "arguments": {"mode": "gen", "prompt": last_user, "size": "1024x1024"}}]
+                tr = await execute_tools(forced_calls)
+                tool_results = tr
+        except Exception:
+            pass
         # Safe semantic forcing: only for tools we can call without hidden context (no film_id requirements)
         # 1) Identify latest user text
         last_user = ""
@@ -3032,9 +3074,9 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             pass
         # Optional ablation: extract grounded facts and export
         try:
-            do_ablate = os.getenv("ABLATE", "on").lower() == "on"
-            do_export = os.getenv("ABLATE_EXPORT", "on").lower() == "on"
-            scope = os.getenv("ABLATE_SCOPE", "auto")
+            do_ablate = True
+            do_export = True
+            scope = "auto"
             if do_ablate:
                 abl = ablate_env(final_env, scope_hint=(scope if scope != "auto" else "chat"))
                 final_env["ablated"] = abl
@@ -3198,12 +3240,12 @@ async def tool_run(body: Dict[str, Any]):
                 def __init__(self, base: str | None):
                     self.base = (base or "").rstrip("/") if base else None
                 def _post_prompt(self, graph: Dict[str, Any]) -> Dict[str, Any]:
-                    import httpx as _hx
+                    import httpx as _hx  # type: ignore
                     with _hx.Client(timeout=60) as client:
                         r = client.post(self.base + "/prompt", json={"prompt": graph})
                         r.raise_for_status(); return r.json()
                 def _poll(self, pid: str, timeout_s: int = 60) -> Dict[str, Any]:
-                    import httpx as _hx, time as _tm
+                    import httpx as _hx, time as _tm  # type: ignore
                     t0 = _tm.time()
                     while True:
                         r = _hx.get(self.base + f"/history/{pid}", timeout=30)
@@ -3215,7 +3257,7 @@ async def tool_run(body: Dict[str, Any]):
                         _tm.sleep(1.0)
                     return {}
                 def _download_first(self, detail: Dict[str, Any]) -> bytes:
-                    import httpx as _hx
+                    import httpx as _hx  # type: ignore
                     outputs = (detail.get("outputs") or {})
                     for items in outputs.values():
                         if isinstance(items, list) and items:

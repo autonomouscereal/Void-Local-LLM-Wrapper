@@ -16,7 +16,11 @@ RESEARCH_KEYS = [
     "investigate",
     "deep research",
 ]
-IMAGE_KEYS = ["image", "picture", "render", "upscale", "edit", "inpaint", "outpaint", "png", "jpg"]
+IMAGE_KEYS = [
+    "image", "picture", "photo", "art", "illustration", "sketch", "draw", "paint",
+    "generate an image", "make an image", "make a picture", "render", "upscale", "edit",
+    "inpaint", "outpaint", "png", "jpg", "jpeg", "webp"
+]
 TTS_KEYS = ["tts", "voiceover", "narrate", "read this", "text to speech", "voice over"]
 MUSIC_KEYS = ["music", "compose", "instrumental", "song", "track", "bpm", "stems", "variation"]
 CODE_KEYS = ["patch", "diff", "modify file", "add endpoint", "refactor", "unified diff"]
