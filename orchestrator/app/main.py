@@ -752,9 +752,7 @@ async def call_ollama(base_url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         try:
             # Keep models warm across requests
             ppayload = dict(payload)
-            opts = dict(ppayload.get("options") or {})
-            opts["keep_alive"] = opts.get("keep_alive") or "24h"
-            ppayload["options"] = opts
+            # Some Ollama versions reject the keep_alive option in the request body; rely on server env instead
             resp = await client.post(f"{base_url}/api/generate", json=ppayload)
             resp.raise_for_status()
             data = resp.json()

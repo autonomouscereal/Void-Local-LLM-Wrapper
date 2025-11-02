@@ -18,19 +18,7 @@ services:
       - ./docker/nvidia-init/init.sh:/init.sh:ro
     entrypoint: ["/bin/bash","-lc","cp /init.sh /tmp/init.sh; chmod +x /tmp/init.sh; sed -i 's/\\r$//' /tmp/init.sh || true; bash /tmp/init.sh || true"]
 
-  nvidia_volume_init:
-    image: ubuntu:22.04
-    container_name: nvidia_volume_init
-    restart: "no"
-    network_mode: host
-    environment:
-      - LIBVOL=/libdir
-    volumes:
-      - nvidia_libdir:/libdir:rw
-      - /usr/share/nvidia-container-runtime/host-files-for-container.d:/host-man:ro
-      - /proc:/host-proc:ro
-      - ./docker/nvidia-init/volume_init.sh:/volume_init.sh:ro
-    entrypoint: ["/bin/bash","-lc","cp /volume_init.sh /tmp/volume_init.sh; chmod +x /tmp/volume_init.sh; sed -i 's/\\r$//' /tmp/volume_init.sh || true; bash /tmp/volume_init.sh || true"]
+  
 
 
   pgvector:
@@ -54,11 +42,10 @@ services:
     image: ollama/ollama:latest
     container_name: ollama_qwen
     restart: unless-stopped
+    runtime: nvidia
     devices:
       - "nvidia.com/gpu=all"
     depends_on:
-      nvidia_volume_init:
-        condition: service_completed_successfully
       nvidia_init:
         condition: service_completed_successfully
     ports:
@@ -69,7 +56,6 @@ services:
       - NVIDIA_VISIBLE_DEVICES=${OLLAMA_QWEN_GPU:-all}
     volumes:
       - ollama_qwen_data:/root/.ollama
-      - nvidia_libdir:/usr/lib/x86_64-linux-gnu
     healthcheck:
       test: ["CMD", "sh", "-lc", "ollama list >/dev/null 2>&1"]
       interval: 10s
@@ -90,11 +76,10 @@ services:
     image: ollama/ollama:latest
     container_name: ollama_gptoss
     restart: unless-stopped
+    runtime: nvidia
     devices:
       - "nvidia.com/gpu=all"
     depends_on:
-      nvidia_volume_init:
-        condition: service_completed_successfully
       nvidia_init:
         condition: service_completed_successfully
     ports:
@@ -105,7 +90,6 @@ services:
       - NVIDIA_VISIBLE_DEVICES=${OLLAMA_GPTOSS_GPU:-all}
     volumes:
       - ollama_gptoss_data:/root/.ollama
-      - nvidia_libdir:/usr/lib/x86_64-linux-gnu
     healthcheck:
       test: ["CMD", "sh", "-lc", "ollama list >/dev/null 2>&1"]
       interval: 10s
@@ -184,11 +168,10 @@ services:
       dockerfile: Dockerfile
     container_name: xtts_service
     restart: unless-stopped
+    runtime: nvidia
     devices:
       - "nvidia.com/gpu=all"
     depends_on:
-      nvidia_volume_init:
-        condition: service_completed_successfully
       nvidia_init:
         condition: service_completed_successfully
     environment:
@@ -198,8 +181,7 @@ services:
       - "8020"
     ports:
       - "8020:8020"
-    volumes:
-      - nvidia_libdir:/usr/lib/x86_64-linux-gnu
+    
 
   whisper:
     build:
@@ -207,11 +189,10 @@ services:
       dockerfile: Dockerfile
     container_name: whisper_service
     restart: unless-stopped
+    runtime: nvidia
     devices:
       - "nvidia.com/gpu=all"
     depends_on:
-      nvidia_volume_init:
-        condition: service_completed_successfully
       nvidia_init:
         condition: service_completed_successfully
     environment:
@@ -222,8 +203,7 @@ services:
       - "9090"
     ports:
       - "9090:9090"
-    volumes:
-      - nvidia_libdir:/usr/lib/x86_64-linux-gnu
+    
 
   faceid:
     build:
@@ -231,6 +211,7 @@ services:
       dockerfile: Dockerfile
     container_name: faceid_service
     restart: unless-stopped
+    runtime: nvidia
     devices:
       - "nvidia.com/gpu=all"
     depends_on:
@@ -253,10 +234,9 @@ services:
       dockerfile: Dockerfile
     container_name: comfyui
     restart: unless-stopped
+    runtime: nvidia
     depends_on:
       comfyui_init:
-        condition: service_completed_successfully
-      nvidia_volume_init:
         condition: service_completed_successfully
       nvidia_init:
         condition: service_completed_successfully
@@ -271,7 +251,6 @@ services:
     volumes:
       - comfyui_models:/comfyui/models
       - comfyui_custom_nodes:/comfyui/custom_nodes
-      - nvidia_libdir:/usr/lib/x86_64-linux-gnu
     # For GPU deployments, create additional comfyui-* services and set COMFYUI_API_URLS accordingly
 
   # Optional additional ComfyUI replicas for dynamic distribution
@@ -285,10 +264,9 @@ services:
     container_name: comfyui-1
     profiles: ["comfy-replicas"]
     restart: unless-stopped
+    runtime: nvidia
     depends_on:
       comfyui_init:
-        condition: service_completed_successfully
-      nvidia_volume_init:
         condition: service_completed_successfully
       nvidia_init:
         condition: service_completed_successfully
@@ -303,7 +281,6 @@ services:
     volumes:
       - comfyui_models:/comfyui/models
       - comfyui_custom_nodes:/comfyui/custom_nodes
-      - nvidia_libdir:/usr/lib/x86_64-linux-gnu
 
   comfyui-2:
     build:
@@ -312,10 +289,9 @@ services:
     container_name: comfyui-2
     profiles: ["comfy-replicas"]
     restart: unless-stopped
+    runtime: nvidia
     depends_on:
       comfyui_init:
-        condition: service_completed_successfully
-      nvidia_volume_init:
         condition: service_completed_successfully
       nvidia_init:
         condition: service_completed_successfully
@@ -330,7 +306,6 @@ services:
     volumes:
       - comfyui_models:/comfyui/models
       - comfyui_custom_nodes:/comfyui/custom_nodes
-      - nvidia_libdir:/usr/lib/x86_64-linux-gnu
 
   comfyui_init:
     build:
@@ -408,11 +383,10 @@ services:
       dockerfile: Dockerfile
     container_name: music_service
     restart: unless-stopped
+    runtime: nvidia
     devices:
       - "nvidia.com/gpu=all"
     depends_on:
-      nvidia_volume_init:
-        condition: service_completed_successfully
       nvidia_init:
         condition: service_completed_successfully
     environment:
@@ -422,8 +396,7 @@ services:
       - "7860"
     ports:
       - "7860:7860"
-    volumes:
-      - nvidia_libdir:/usr/lib/x86_64-linux-gnu
+    
 
   vlm:
     build:
@@ -431,11 +404,10 @@ services:
       dockerfile: Dockerfile
     container_name: vlm_service
     restart: unless-stopped
+    runtime: nvidia
     devices:
       - "nvidia.com/gpu=all"
     depends_on:
-      nvidia_volume_init:
-        condition: service_completed_successfully
       nvidia_init:
         condition: service_completed_successfully
     environment:
@@ -444,8 +416,7 @@ services:
       - "8050"
     ports:
       - "8050:8050"
-    volumes:
-      - nvidia_libdir:/usr/lib/x86_64-linux-gnu
+    
 
   ocr:
     build:
@@ -512,11 +483,10 @@ services:
       dockerfile: Dockerfile
     container_name: film2_service
     restart: unless-stopped
+    runtime: nvidia
     devices:
       - "nvidia.com/gpu=all"
     depends_on:
-      nvidia_volume_init:
-        condition: service_completed_successfully
       nvidia_init:
         condition: service_completed_successfully
     environment:
@@ -528,7 +498,6 @@ services:
       - "8090:8090"
     volumes:
       - ./:/workspace
-      - nvidia_libdir:/usr/lib/x86_64-linux-gnu
 
   ablation:
     build:
@@ -589,6 +558,5 @@ volumes:
   comfyui_models: {}
   comfyui_custom_nodes: {}
   n8n_data: {}
-  nvidia_libdir: {}
 
 
