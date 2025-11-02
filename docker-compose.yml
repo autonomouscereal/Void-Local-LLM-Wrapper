@@ -377,21 +377,6 @@ services:
       - ./services/n8n/workflows:/workflows:ro
     command: sh -lc "n8n import:workflow --input /workflows/film_assemble.json --separate"
 
-  assembler:
-    build:
-      context: ./services/assembler
-      dockerfile: Dockerfile
-    container_name: film_assembler
-    restart: unless-stopped
-    environment:
-      - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-}
-    expose:
-      - "9095"
-    ports:
-      - "9095:9095"
-    volumes:
-      - ./:/workspace
-
   music:
     build:
       context: ./services/music
