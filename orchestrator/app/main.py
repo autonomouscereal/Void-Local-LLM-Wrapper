@@ -2607,8 +2607,8 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         )
         qwen_critique_msg = exec_messages + [{"role": "user", "content": critique_prompt + f"\nOther answer:\n{gptoss_text}"}]
         gptoss_critique_msg = exec_messages + [{"role": "user", "content": critique_prompt + f"\nOther answer:\n{qwen_text}"}]
-        qwen_crit_payload = build_ollama_payload(qwen_critique_msg, QWEN_MODEL_ID, DEFAULT_NUM_CTX, body.temperature or DEFAULT_TEMPERATURE)
-        gptoss_crit_payload = build_ollama_payload(gptoss_critique_msg, GPTOSS_MODEL_ID, DEFAULT_NUM_CTX, body.temperature or DEFAULT_TEMPERATURE)
+        qwen_crit_payload = build_ollama_payload(qwen_critique_msg, QWEN_MODEL_ID, DEFAULT_NUM_CTX, (body.get("temperature") or DEFAULT_TEMPERATURE))
+        gptoss_crit_payload = build_ollama_payload(gptoss_critique_msg, GPTOSS_MODEL_ID, DEFAULT_NUM_CTX, (body.get("temperature") or DEFAULT_TEMPERATURE))
         qcrit_task = asyncio.create_task(call_ollama(QWEN_BASE_URL, qwen_crit_payload))
         gcrit_task = asyncio.create_task(call_ollama(GPTOSS_BASE_URL, gptoss_crit_payload))
         qcrit_res, gcrit_res = await asyncio.gather(qcrit_task, gcrit_task)
@@ -2627,7 +2627,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
 
     planner_id = QWEN_MODEL_ID if PLANNER_MODEL.lower() == "qwen" else GPTOSS_MODEL_ID
     planner_base = QWEN_BASE_URL if PLANNER_MODEL.lower() == "qwen" else GPTOSS_BASE_URL
-    synth_payload = build_ollama_payload(final_request, planner_id, DEFAULT_NUM_CTX, body.temperature or DEFAULT_TEMPERATURE)
+    synth_payload = build_ollama_payload(final_request, planner_id, DEFAULT_NUM_CTX, (body.get("temperature") or DEFAULT_TEMPERATURE))
     synth_result = await call_ollama(planner_base, synth_payload)
     final_text = synth_result.get("response", "") or qwen_text or gptoss_text
 
@@ -3109,7 +3109,13 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     # Fire-and-forget: Teacher trace tap (if reachable)
     try:
         # Build trace payload
-        req_dict = body.dict()
+        if isinstance(body, dict):
+            req_dict = dict(body)
+        else:
+            try:
+                req_dict = body.dict()
+            except Exception:
+                req_dict = {}
         try:
             msgs_for_seed = json.dumps(req_dict.get("messages", []), ensure_ascii=False, separators=(",", ":"))
         except Exception:
