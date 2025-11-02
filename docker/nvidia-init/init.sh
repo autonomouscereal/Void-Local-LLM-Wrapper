@@ -37,9 +37,9 @@ if [ -x "$HOST_ROOT/usr/bin/apt-get" ]; then
   # Install/repair toolkit + runtime
   chroot "$HOST_ROOT" /usr/bin/apt-get update -y || true
   chroot "$HOST_ROOT" /usr/bin/apt-get install -y nvidia-container-toolkit || true
-  # Configure Docker to use NVIDIA runtime
+  # Configure Docker NVIDIA integration (do NOT set as default runtime)
   if chroot "$HOST_ROOT" /usr/bin/which nvidia-ctk >/dev/null 2>&1; then
-    chroot "$HOST_ROOT" /usr/bin/nvidia-ctk runtime configure --runtime=docker --set-as-default || true
+    chroot "$HOST_ROOT" /usr/bin/nvidia-ctk runtime configure --runtime=docker || true
     # Enable CDI so legacy lib bind-mounts are not required
     chroot "$HOST_ROOT" /usr/bin/nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml || true
     chroot "$HOST_ROOT" /usr/bin/nvidia-ctk runtime configure --runtime=docker --cdi.enabled || true
@@ -60,6 +60,28 @@ EOF
       mv "$f" "$HF_DIR/disabled/" 2>/dev/null || true
     done
   fi
+
+  # Force Docker default runtime to runc (version-agnostic CDI path)
+  chroot "$HOST_ROOT" /usr/bin/bash -lc 'python3 - <<PY
+import json, os
+p="/etc/docker/daemon.json"
+d={}
+try:
+    with open(p,"r") as f:
+        d=json.load(f)
+except Exception:
+    d={}
+# ensure runtimes.nvidia exists (non-default)
+d.setdefault("runtimes", {}).setdefault("nvidia", {"path":"nvidia-container-runtime","runtimeArgs":[]})
+# remove default-runtime or set to runc
+d["default-runtime"] = "runc"
+# ensure CDI feature on
+features = d.setdefault("features", {})
+features["cdi"] = True
+with open(p,"w") as f:
+    json.dump(d, f, indent=2)
+print("daemon.json updated: default-runtime=runc, features.cdi=true")
+PY' || true
   # Note: we DO NOT restart Docker here to avoid disrupting SSH sessions.
   # If a restart is required, compose will proceed without it; you can restart manually later if needed.
 fi
