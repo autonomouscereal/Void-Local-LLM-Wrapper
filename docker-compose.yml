@@ -39,7 +39,7 @@ services:
     volumes:
       - /var/run:/host/var/run:ro
       - nvidia_libdir:/libdir:ro
-    entrypoint: ["/bin/sh","-lc","i=0; while :; do if [ -f /host/var/run/nvidia-init.done ] && [ -f /libdir/.nvidia-libdir-ready ]; then exit 0; fi; i=$(expr $i + 1); if [ $i -ge 120 ]; then echo 'nvidia_ready timeout'; exit 1; fi; sleep 1; done"]
+    entrypoint: ["/bin/sh","-lc","n=120; while [ \"$n\" -gt 0 ]; do if [ -f /host/var/run/nvidia-init.done ] && [ -f /libdir/.nvidia-libdir-ready ]; then exit 0; fi; n=$((n-1)); sleep 1; done; echo 'nvidia_ready timeout'; exit 1"]
 
   pgvector:
     image: pgvector/pgvector:0.7.4-pg16
