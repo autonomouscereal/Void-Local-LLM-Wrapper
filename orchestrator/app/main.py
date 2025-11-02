@@ -2672,13 +2672,27 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             try:
                 # plan
                 evt = {"stage": "plan", "ok": True}
-                yield f"data: {json.dumps({"id": "orc-1", "object": "chat.completion.chunk", "created": int(time.time()), "model": model_id, "choices": [{"index": 0, "delta": {"content": json.dumps(evt)} , "finish_reason": None}]})}\n\n"
+                _chunk = json.dumps({
+                    "id": "orc-1",
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": model_id,
+                    "choices": [{"index": 0, "delta": {"content": json.dumps(evt)}, "finish_reason": None}],
+                })
+                yield "data: " + _chunk + "\n\n"
                 # breakdown/storyboard/animatic heuristics: if any film tool present, emit these scaffolding stages
                 has_film = any(isinstance(tc, dict) and str(tc.get("name", "")).startswith("film_") for tc in (tool_calls or []))
                 if has_film:
                     for st in ("breakdown", "storyboard", "animatic"):
                         ev = {"stage": st}
-                        yield f"data: {json.dumps({"id": "orc-1", "object": "chat.completion.chunk", "created": int(time.time()), "model": model_id, "choices": [{"index": 0, "delta": {"content": json.dumps(ev)} , "finish_reason": None}]})}\n\n"
+                        _chunk = json.dumps({
+                            "id": "orc-1",
+                            "object": "chat.completion.chunk",
+                            "created": int(time.time()),
+                            "model": model_id,
+                            "choices": [{"index": 0, "delta": {"content": json.dumps(ev)}, "finish_reason": None}],
+                        })
+                        yield "data: " + _chunk + "\n\n"
                 # Emit per-tool mapped events
                 for tc in (tool_calls or [])[:20]:
                     try:
@@ -2686,22 +2700,57 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                         args = tc.get("arguments") or tc.get("args") or {}
                         if name == "film_add_scene":
                             ev = {"stage": "final", "shot_id": args.get("index_num") or args.get("scene_id")}
-                            yield f"data: {json.dumps({"id": "orc-1", "object": "chat.completion.chunk", "created": int(time.time()), "model": model_id, "choices": [{"index": 0, "delta": {"content": json.dumps(ev)} , "finish_reason": None}]})}\n\n"
+                            _chunk = json.dumps({
+                                "id": "orc-1",
+                                "object": "chat.completion.chunk",
+                                "created": int(time.time()),
+                                "model": model_id,
+                                "choices": [{"index": 0, "delta": {"content": json.dumps(ev)}, "finish_reason": None}],
+                            })
+                            yield "data: " + _chunk + "\n\n"
                         if name == "frame_interpolate":
                             ev = {"stage": "post", "op": "frame_interpolate", "factor": args.get("factor")}
-                            yield f"data: {json.dumps({"id": "orc-1", "object": "chat.completion.chunk", "created": int(time.time()), "model": model_id, "choices": [{"index": 0, "delta": {"content": json.dumps(ev)} , "finish_reason": None}]})}\n\n"
+                            _chunk = json.dumps({
+                                "id": "orc-1",
+                                "object": "chat.completion.chunk",
+                                "created": int(time.time()),
+                                "model": model_id,
+                                "choices": [{"index": 0, "delta": {"content": json.dumps(ev)}, "finish_reason": None}],
+                            })
+                            yield "data: " + _chunk + "\n\n"
                         if name == "upscale":
                             ev = {"stage": "post", "op": "upscale", "scale": args.get("scale")}
-                            yield f"data: {json.dumps({"id": "orc-1", "object": "chat.completion.chunk", "created": int(time.time()), "model": model_id, "choices": [{"index": 0, "delta": {"content": json.dumps(ev)} , "finish_reason": None}]})}\n\n"
+                            _chunk = json.dumps({
+                                "id": "orc-1",
+                                "object": "chat.completion.chunk",
+                                "created": int(time.time()),
+                                "model": model_id,
+                                "choices": [{"index": 0, "delta": {"content": json.dumps(ev)}, "finish_reason": None}],
+                            })
+                            yield "data: " + _chunk + "\n\n"
                         if name == "film_compile":
                             ev = {"stage": "export"}
-                            yield f"data: {json.dumps({"id": "orc-1", "object": "chat.completion.chunk", "created": int(time.time()), "model": model_id, "choices": [{"index": 0, "delta": {"content": json.dumps(ev)} , "finish_reason": None}]})}\n\n"
+                            _chunk = json.dumps({
+                                "id": "orc-1",
+                                "object": "chat.completion.chunk",
+                                "created": int(time.time()),
+                                "model": model_id,
+                                "choices": [{"index": 0, "delta": {"content": json.dumps(ev)}, "finish_reason": None}],
+                            })
+                            yield "data: " + _chunk + "\n\n"
                     except Exception:
                         continue
                 # Optionally signal qc if present in plan text
                 if isinstance(plan_text, str) and ("qc" in plan_text.lower() or "quality" in plan_text.lower()):
                     ev = {"stage": "qc"}
-                    yield f"data: {json.dumps({"id": "orc-1", "object": "chat.completion.chunk", "created": int(time.time()), "model": model_id, "choices": [{"index": 0, "delta": {"content": json.dumps(ev)} , "finish_reason": None}]})}\n\n"
+                    _chunk = json.dumps({
+                        "id": "orc-1",
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": model_id,
+                        "choices": [{"index": 0, "delta": {"content": json.dumps(ev)}, "finish_reason": None}],
+                    })
+                    yield "data: " + _chunk + "\n\n"
             except Exception:
                 pass
             # Stream final content

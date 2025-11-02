@@ -462,7 +462,9 @@ async def trainset_ingest(body: Dict[str, Any]):
         shard_name = f"shard_{shard_idx:05d}.jsonl"
         shard_path = os.path.join(out_dir, shard_name)
         _write_text(shard_path, "\n".join(shard_lines) + ("\n" if shard_lines else ""))
-        shards_meta.append({"uri": _uri_from_path(shard_path), "count": len(shard_lines), "hash": f"sha256:{_sha256_bytes(('\n'.join(shard_lines)+'\n').encode('utf-8'))}"})
+        _sh_text = ("\n".join(shard_lines) + "\n").encode("utf-8") if shard_lines else b""
+        _sh_hash = _sha256_bytes(_sh_text)
+        shards_meta.append({"uri": _uri_from_path(shard_path), "count": len(shard_lines), "hash": f"sha256:{_sh_hash}"})
         shard_idx += 1
 
     runrec = {"ts": _now_iso(), "seed": seed, "paths": [m["uri"] for m in shards_meta]}
