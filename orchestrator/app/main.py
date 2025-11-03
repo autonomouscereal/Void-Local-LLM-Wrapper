@@ -232,6 +232,8 @@ DEMUCS_API_URL = os.getenv("DEMUCS_API_URL")            # http://demucs:9003
 RVC_API_URL = os.getenv("RVC_API_URL")                  # http://rvc:9004
 DIFFSINGER_RVC_API_URL = os.getenv("DIFFSINGER_RVC_API_URL")  # http://dsrvc:9005
 HUNYUAN_FOLEY_API_URL = os.getenv("HUNYUAN_FOLEY_API_URL")    # http://foley:9006
+HUNYUAN_VIDEO_API_URL = os.getenv("HUNYUAN_VIDEO_API_URL")    # http://hunyuan:9007
+SVD_API_URL = os.getenv("SVD_API_URL")                        # http://svd:9008
 
 
 def _sha256_bytes(b: bytes) -> str:
@@ -1125,6 +1127,27 @@ def get_builtin_tools_schema() -> List[Dict[str, Any]]:
             "function": {
                 "name": "video.interpolate",
                 "parameters": {"type": "object", "properties": {"src": {"type": "string"}, "target_fps": {"type": "integer"}}, "required": ["src"]}
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "video.hv.t2v",
+                "parameters": {"type": "object", "properties": {"prompt": {"type": "string"}, "negative": {"type": "string"}, "width": {"type": "integer"}, "height": {"type": "integer"}, "fps": {"type": "integer"}, "seconds": {"type": "integer"}, "seed": {"type": "integer"}, "locks": {"type": "object"}, "post": {"type": "object"}, "cid": {"type": "string"}}, "required": ["prompt", "width", "height", "fps", "seconds"]}
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "video.hv.i2v",
+                "parameters": {"type": "object", "properties": {"init_image": {"type": "string"}, "prompt": {"type": "string"}, "negative": {"type": "string"}, "width": {"type": "integer"}, "height": {"type": "integer"}, "fps": {"type": "integer"}, "seconds": {"type": "integer"}, "seed": {"type": "integer"}, "locks": {"type": "object"}, "post": {"type": "object"}, "cid": {"type": "string"}}, "required": ["init_image", "prompt", "width", "height", "fps", "seconds"]}
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "video.svd.i2v",
+                "parameters": {"type": "object", "properties": {"init_image": {"type": "string"}, "prompt": {"type": "string"}, "width": {"type": "integer"}, "height": {"type": "integer"}, "fps": {"type": "integer"}, "seconds": {"type": "integer"}, "seed": {"type": "integer"}, "cid": {"type": "string"}}, "required": ["init_image", "prompt", "width", "height", "fps", "seconds"]}
             }
         },
         {
@@ -3308,6 +3331,65 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             except Exception:
                 pass
             return {"name": name, "result": {"path": url}}
+        except Exception as ex:
+            return {"name": name, "error": str(ex)}
+    if name == "video.hv.t2v" and ALLOW_TOOL_EXECUTION:
+        if not HUNYUAN_VIDEO_API_URL:
+            return {"name": name, "error": "HUNYUAN_VIDEO_API_URL not configured"}
+        try:
+            payload = {
+                "prompt": args.get("prompt"),
+                "negative": args.get("negative"),
+                "video": {"width": int(args.get("width") or 1024), "height": int(args.get("height") or 576), "fps": int(args.get("fps") or 24), "seconds": int(args.get("seconds") or 6)},
+                "locks": args.get("locks") or {},
+                "seed": args.get("seed"),
+                "quality": "max",
+                "post": args.get("post") or {"interpolate": True, "upscale": True, "face_lock": True, "hand_fix": True},
+                "meta": {"trace_level": "full", "stream": True},
+            }
+            async with httpx.AsyncClient(timeout=None) as client:
+                r = await client.post(HUNYUAN_VIDEO_API_URL.rstrip("/") + "/v1/video/hv/t2v", json=payload)
+            r.raise_for_status()
+            return {"name": name, "result": r.json()}
+        except Exception as ex:
+            return {"name": name, "error": str(ex)}
+    if name == "video.hv.i2v" and ALLOW_TOOL_EXECUTION:
+        if not HUNYUAN_VIDEO_API_URL:
+            return {"name": name, "error": "HUNYUAN_VIDEO_API_URL not configured"}
+        try:
+            payload = {
+                "init_image": args.get("init_image"),
+                "prompt": args.get("prompt"),
+                "negative": args.get("negative"),
+                "video": {"width": int(args.get("width") or 1024), "height": int(args.get("height") or 1024), "fps": int(args.get("fps") or 24), "seconds": int(args.get("seconds") or 5)},
+                "locks": args.get("locks") or {},
+                "seed": args.get("seed"),
+                "quality": "max",
+                "post": args.get("post") or {"interpolate": True, "upscale": True, "face_lock": True},
+                "meta": {"trace_level": "full", "stream": True},
+            }
+            async with httpx.AsyncClient(timeout=None) as client:
+                r = await client.post(HUNYUAN_VIDEO_API_URL.rstrip("/") + "/v1/video/hv/i2v", json=payload)
+            r.raise_for_status()
+            return {"name": name, "result": r.json()}
+        except Exception as ex:
+            return {"name": name, "error": str(ex)}
+    if name == "video.svd.i2v" and ALLOW_TOOL_EXECUTION:
+        if not SVD_API_URL:
+            return {"name": name, "error": "SVD_API_URL not configured"}
+        try:
+            payload = {
+                "init_image": args.get("init_image"),
+                "prompt": args.get("prompt"),
+                "video": {"width": int(args.get("width") or 768), "height": int(args.get("height") or 768), "fps": int(args.get("fps") or 24), "seconds": int(args.get("seconds") or 4)},
+                "seed": args.get("seed"),
+                "quality": "max",
+                "meta": {"trace_level": "full", "stream": True},
+            }
+            async with httpx.AsyncClient(timeout=None) as client:
+                r = await client.post(SVD_API_URL.rstrip("/") + "/v1/video/svd/i2v", json=payload)
+            r.raise_for_status()
+            return {"name": name, "result": r.json()}
         except Exception as ex:
             return {"name": name, "error": str(ex)}
     if name == "rag_index":

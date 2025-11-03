@@ -51,6 +51,7 @@ def route_for_request(req: Dict[str, Any]) -> RouteDecision:
     if looks_like_code_task(t):
         return RouteDecision(kind="tool", tool="code.super_loop", args={"task": t, "repo_root": os.getenv("REPO_ROOT", "/workspace")}, reason="code-intent")
     if looks_like_film(t):
+        # Heuristic: if video parameters imply heavy render, prefer Hunyuan path downstream
         return RouteDecision(kind="tool", tool="film.run", args=build_film_args(t), reason="film-intent")
     if looks_like_research(t):
         return RouteDecision(kind="tool", tool="research.run", args=build_research_args(t), reason="research-intent")
