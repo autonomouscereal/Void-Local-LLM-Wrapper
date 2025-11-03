@@ -110,6 +110,7 @@ services:
     build:
       context: ./orchestrator
       dockerfile: Dockerfile
+      network: host
     container_name: void_orchestrator
     restart: unless-stopped
     depends_on:
@@ -180,6 +181,7 @@ services:
     build:
       context: ./services/xtts
       dockerfile: Dockerfile
+      network: host
     container_name: xtts_service
     restart: unless-stopped
     runtime: nvidia
@@ -203,6 +205,7 @@ services:
     build:
       context: ./services/whisper
       dockerfile: Dockerfile
+      network: host
     container_name: whisper_service
     restart: unless-stopped
     runtime: nvidia
@@ -225,6 +228,7 @@ services:
     build:
       context: ./services/faceid
       dockerfile: Dockerfile
+      network: host
     container_name: faceid_service
     restart: unless-stopped
     runtime: nvidia
@@ -245,6 +249,7 @@ services:
     build:
       context: ./services/comfyui
       dockerfile: Dockerfile
+      network: host
     container_name: comfyui
     restart: unless-stopped
     runtime: nvidia
@@ -276,6 +281,7 @@ services:
     build:
       context: ./services/comfyui
       dockerfile: Dockerfile
+      network: host
     container_name: comfyui-1
     profiles: ["comfy-replicas"]
     restart: unless-stopped
@@ -301,6 +307,7 @@ services:
     build:
       context: ./services/comfyui
       dockerfile: Dockerfile
+      network: host
     container_name: comfyui-2
     profiles: ["comfy-replicas"]
     restart: unless-stopped
@@ -326,6 +333,7 @@ services:
     build:
       context: ./services/comfyui_init
       dockerfile: Dockerfile
+      network: host
     container_name: comfyui_init
     environment:
       - HUGGINGFACE_TOKEN=${HUGGINGFACE_TOKEN:-}
@@ -381,6 +389,7 @@ services:
     build:
       context: ./services/music
       dockerfile: Dockerfile
+      network: host
     container_name: music_service
     restart: unless-stopped
     runtime: nvidia
@@ -404,6 +413,7 @@ services:
     build:
       context: ./services/vlm
       dockerfile: Dockerfile
+      network: host
     container_name: vlm_service
     restart: unless-stopped
     runtime: nvidia
@@ -426,6 +436,7 @@ services:
     build:
       context: ./services/ocr
       dockerfile: Dockerfile
+      network: host
     container_name: ocr_service
     restart: unless-stopped
     expose:
@@ -440,6 +451,7 @@ services:
     build:
       context: ./executor
       dockerfile: Dockerfile
+      network: host
     container_name: void_executor
     restart: unless-stopped
     environment:
@@ -459,6 +471,7 @@ services:
     build:
       context: ./services/drt
       dockerfile: Dockerfile
+      network: host
     container_name: deep_research_tool
     restart: unless-stopped
     environment:
@@ -474,6 +487,7 @@ services:
     build:
       context: ./services/film2
       dockerfile: Dockerfile
+      network: host
     container_name: film2_service
     restart: unless-stopped
     runtime: nvidia
@@ -496,6 +510,7 @@ services:
     build:
       context: ./services/ablation
       dockerfile: Dockerfile
+      network: host
     container_name: ablation_layer
     restart: unless-stopped
     environment:
@@ -512,6 +527,7 @@ services:
     build:
       context: ./services/teacher
       dockerfile: Dockerfile
+      network: host
     container_name: teacher_service
     restart: unless-stopped
     environment:
@@ -527,6 +543,7 @@ services:
     build:
       context: ./services/chatui
       dockerfile: Dockerfile
+      network: host
     container_name: chatui
     restart: unless-stopped
     environment:
