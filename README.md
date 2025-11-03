@@ -1,205 +1,64 @@
-Void Local LLM Committee (Qwen3-32B + GPT-OSS 20B)
-===================================================
+Void Orchestrator — Multimodal, Deterministic, Max‑Quality by Default
+====================================================================
 
-This repository brings up two Ollama services (Qwen and GPT-OSS), a sandboxed Executor, and a FastAPI orchestrator that exposes an OpenAI-compatible endpoint `/v1/chat/completions` which consults both models and synthesizes a final answer. By default the orchestrator runs a capless sliding WindowedSolver (CONT/HALT) with JSON-only normalization, deterministic routing, RAG hygiene, and an ablation step that emits training-ready facts.
+Overview
+--------
+OpenAI‑compatible orchestrator with deterministic routing, capless WindowedSolver (CONT/HALT), JSON‑only envelopes, RAG hygiene, ablation, Film‑2, Images/TTS/Music, and full traceability for distillation.
 
-Prerequisites
--------------
-- Windows 10/11 with WSL2 recommended, or native Linux
-- NVIDIA GPU drivers and CUDA compatible GPUs (2x 24GB VRAM)
-- Docker Desktop with NVIDIA Container Toolkit
-
-Quick Start
------------
-1. Configure models via environment variables (optional):
-   - `QWEN_MODEL_ID` default: `qwen3:32b-instruct-q4_K_M`
-   - `GPTOSS_MODEL_ID` default: `gpt-oss:20b`
-   - `DEFAULT_NUM_CTX` default: `8192`
-   - `DEFAULT_TEMPERATURE` default: `0.3`
-   - `PLANNER_MODEL` default: `qwen3` (values: `qwen3` | `qwen` | `gptoss`)
-   - `ENABLE_DEBATE` default: `true`
-   - `MAX_DEBATE_TURNS` default: `1`
-   - `ENABLE_WEBSEARCH` default: `true`
-   - `AUTO_EXECUTE_TOOLS` default: `true`
-   - `SERPAPI_API_KEY` set to enable web search
-   - ICW/Ablation defaults (safe):
-     - `ICW_MODE=windowed`
-     - `ICW_STEP_TOKENS=900`
-     - `ABLATE=on`
-     - `ABLATE_EXPORT=on`
-   - RAG hygiene:
-     - `RAG_TTL_SECONDS=3600`
-     - `RAG_EVIDENCE_MAX=6`
-   - Code Loop:
-     - `CODE_LOOP_STEP_TOKENS=900`
-     - `REPO_ROOT=/workspace`
-
-2. Start services:
-   ```bash
-   # Ensure Docker Desktop is running
-   docker compose up -d --build
-   ```
-
-3. Pull models in each Ollama container (first time only):
-   ```bash
-   docker exec -it ollama_qwen bash -lc "ollama pull $QWEN_MODEL_ID"
-   docker exec -it ollama_gptoss bash -lc "ollama pull $GPTOSS_MODEL_ID"
-   ```
-
-   If environment variables are not set, replace with explicit tags, e.g.:
-   ```bash
-   docker exec -it ollama_qwen bash -lc "ollama pull qwen3:32b-instruct-q4_K_M"
-   docker exec -it ollama_gptoss bash -lc "ollama pull gpt-oss:20b"
-   ```
-
-4. Test orchestrator:
-   ```bash
-   curl http://localhost:8000/healthz
-   ```
-
-OpenAI-Compatible Usage
------------------------
-Point your client (e.g., Void or OpenAI SDK) to `http://localhost:8000` and call `/v1/chat/completions`.
-- Tool-calling semantics (server executes by default):
-  - `AUTO_EXECUTE_TOOLS=true` (default) → backend executes supported tools automatically.
-  - Set `AUTO_EXECUTE_TOOLS=false` only if you want the client to receive `tool_calls` and execute tools itself.
-
-- Deterministic routing (server-side):
-  - Film → `film.run`
-  - RAG → `rag_search`
-  - Deep research → `research.run` (router decision; tool optional)
-  - Images → `image.dispatch` (gen/edit/upscale)
-  - TTS → `tts_speak`
-  - Music → `music.dispatch`
-  - Code tasks → `code.super_loop` (Architect→Implementer→Reviewer, returns `patch.diff`)
-
-
-Single‑prompt film example (server orchestrates tools automatically):
-```bash
-curl -s http://localhost:8000/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{
-        "model": "wrapper-film-orchestrator",
-        "messages": [
-          {"role": "user", "content": "Make a 3-minute 4K 60fps film about monarch butterflies with interpolation and motion smoothing. Title: Butterflies."}
-        ],
-        "tool_choice": "auto",
-        "stream": true
-      }'
-```
-
-Notes
------
-- GPU pinning: `ollama_qwen` uses GPU 0 (port 11434), `ollama_gptoss` uses GPU 1 (mapped to 11435).
-- Adjust quantization by changing `QWEN_MODEL_ID` and `GPTOSS_MODEL_ID` to quantized tags (e.g., `-q4_K_M`, `-q5_K_M`, `-q8_0`).
-- Increase `DEFAULT_NUM_CTX` if your quantization and VRAM permit.
-- Planner-Executor flow: Planner produces a plan + tool calls (semantic, not keyword-based). On refusals, the backend may force a single best-match tool with minimal args and re-synthesize, but it never overwrites the model’s content (only appends a Status/Tool Results section).
-- MCP/tool-calling: Send a `tools` array (OpenAI-style JSON schema). The planner may propose `tool_calls` which the orchestrator executes when supported.
-  - Built-in tools: `web_search` (SerpAPI), `metasearch.fuse` (multi‑engine rank fusion), `run_python`, `write_file`, `read_file` (via Executor service).
-  - Film tools: Film‑1 removed. A single internal Film‑2 orchestrator is used (`film.run`).
-  - Preferences: duration_seconds, resolution, fps, style, language, voice, quality, audio_enabled (default true), subtitles_enabled (default false), animation_enabled (default true)
-  - MCP bridge: set `MCP_HTTP_BRIDGE_URL` to forward unknown tool calls prefixed with `mcp:` to your MCP HTTP server.
-- RAG tools (pgvector): `rag_index` (index `/workspace` into Postgres+pgvector), `rag_search` (retrieve top-k chunks). RAG hygiene filters duplicates and applies TTL; an `[Evidence]` footer is appended near the end of the packed prompt.
-
-- WindowedSolver (default): Capless sliding window with CONT/HALT tags. Continuation is robust (fallback CONT, last-fragment repeat); a gentle governor adapts step size; a stall detector triggers a one-shot reframe.
-
-- JSON-only normalization & stitch: Every step/tool is normalized to a canonical envelope and stitched; the final OpenAI-compatible response includes an `envelope` field for internal use.
-
-- Ablation: After HALT, grounded facts are extracted and exported to `uploads/ablation/<trace_id>/facts_<trace_id>.jsonl`. A URI pointer is attached under `artifacts.ablation_facts`.
-
-Jobs API (ComfyUI long-running workflows)
------------------------------------------
-- POST `/jobs` with your ComfyUI `workflow` JSON to start a run. Response includes `job_id` and `prompt_id`.
-- GET `/jobs/{job_id}` returns job state: `queued | running | succeeded | failed | cancelled`, recent checkpoints, and `result` when done.
-- GET `/jobs/{job_id}/stream` streams SSE updates until completion. Optional `interval_ms` query param throttles updates.
-- GET `/jobs` supports listing with optional `status`, `limit`, `offset`.
-- POST `/jobs/{job_id}/cancel` attempts to interrupt job and marks as `cancelled`.
-
-UI progress
------------
-- The chat UI renders full Markdown for assistant replies and appends a concise "### Tool Results" section (film_id, job_id(s), errors). If job_id(s) are present, the UI auto-subscribes to `/api/jobs/{id}/stream` and shows inline progress until done, then surfaces asset links.
-
-Model keep-alive
-----------------
-- The orchestrator sends `options.keep_alive: "24h"` to Ollama so models stay resident and avoid reloading between calls. You can also set `OLLAMA_KEEP_ALIVE=24h` in the Ollama containers.
-
-Persistence & RAG
------------------
-- Jobs persist to Postgres (`jobs`, `job_checkpoints` tables). On completion, if `JOBS_RAG_INDEX=true` (default), the job workflow and result are embedded into `rag_docs` for retrieval. Additionally, append-only JSONL checkpoints under `uploads/<cid>/trace.jsonl` can be used to reconstruct solver state (resume WindowedSolver) and Film‑2 phase markers.
-
-Film‑2 pipeline (LLM-driven)
-----------------------------
-- Server uses a single internal tool `film.run` to orchestrate: `plan → breakdown → storyboard → animatic → final → post → qc → export`.
-- Per‑stage manifests are persisted (DB authoritative; JSON optional): `plan/scenes/characters`, `shots (DSL + seeds)`, per‑shot `storyboard/animatic/final/nodes`, project‑level `edl/qc/export`.
-- n8n is optional. If configured, it may be invoked at export; otherwise local assembler is used.
-- PATCH endpoints remain for refinement:
-  - PATCH `/films/{film_id}`: update film preferences (metadata)
-  - PATCH `/characters/{character_id}`: update name/description/references
-  - PATCH `/scenes/{scene_id}`: update prompt/plan
-
-Capabilities and Health
------------------------
-- `GET /capabilities.json` advertises endpoints, versions, tool allowlist, and config hash for IDE discovery.
-- `GET /healthz` includes: `{ ok, openai_compat, teacher_enabled, icw_enabled, film_enabled, ablation_enabled }`.
-
-Enhanced Streaming
-------------------
-- Chunked SSE streaming for `/v1/chat/completions` can be tuned via env vars:
-  - `STREAM_CHUNK_SIZE_CHARS` (default 0 = single chunk)
-  - `STREAM_CHUNK_INTERVAL_MS` (delay between chunks, default 50ms)
-  - `JOBS_RAG_INDEX` (default `true`) to index job metadata into RAG on success
-
-Executor service
-----------------
-- Mounted workspace: project root is available at `/workspace` in both orchestrator and executor.
-- Endpoints:
-  - POST `/run_python` { code }
-  - POST `/write_file` { path, content }
-  - POST `/read_file` { path }
-- Environment knobs: `EXEC_TIMEOUT_SEC`, `EXEC_MEMORY_MB`, `ALLOW_SHELL` (optional `/run_shell` disabled by default).
-
-Scaling & Multi‑GPU ComfyUI
----------------------------
-- Current default: single ComfyUI instance (CPU‑mode is fine for validation).
-- To scale without code changes:
-  1) Add more ComfyUI services (e.g., `comfyui-1`, `comfyui-2`) using the same image and shared volumes.
-     - For GPU pinning, set per‑service:
-       - `runtime: nvidia`
-       - `environment: [NVIDIA_VISIBLE_DEVICES=<gpu_id>, NVIDIA_DRIVER_CAPABILITIES=compute,utility]`
-  2) Set the orchestrator envs:
-     - `COMFYUI_API_URLS` to a comma‑separated list of instance URLs (e.g., `http://comfyui:8188,http://comfyui-1:8188`)
-     - `SCENE_SUBMIT_CONCURRENCY` to your desired parallelism (e.g., `4`)
-  3) Leave GPUs 0,1 reserved for `ollama_qwen` and `ollama_gptoss`. Use other GPU IDs for ComfyUI instances.
-- Behavior:
-  - The orchestrator picks the least‑loaded ComfyUI instance for each submit and pins the job’s `prompt_id` to that instance for history polling.
-  - If one instance fails, it falls back to others automatically.
-- Example `.env` for 2 ComfyUI GPUs (IDs 2 and 3):
-  ```env
-  COMFYUI_API_URLS=http://comfyui:8188,http://comfyui-1:8188
-  SCENE_SUBMIT_CONCURRENCY=4
-  # In compose override, set comfyui-1 with NVIDIA_VISIBLE_DEVICES=3 (comfyui uses 2)
+Quick Start (copy/paste)
+------------------------
+- Start everything with your env file:
+  ```bash
+  docker compose --env-file env.example.txt up -d --build
   ```
+- Health check:
+  ```bash
+  curl http://localhost:8000/healthz
+  ```
+- Chat (OpenAI‑compatible): POST `http://localhost:8000/v1/chat/completions`
 
-Inline Safety Notes
--------------------
-- Orchestrator warns against SQLAlchemy and uses asyncpg exclusively for DB access.
-- JSON parsing uses a hardened parser to survive malformed LLM outputs.
-- Film consistency: character face embeddings are computed once and propagated to each scene; seeds are deterministic for every tool call and stage.
+What’s Included (always ON)
+--------------------------
+- WindowedSolver: sliding window + CAC; CONT/HALT; checkpoints; seed registry; no inline caps.
+- Deterministic routing: Film (`film.run`), Images (`image.dispatch`), TTS (`tts.speak`), Music (song/instrumental/infinite composer), RAG, Research, Code Super‑Loop.
+- Images: super‑gen, edit, upscale; face/pose/style locks; hands/artifact fixes; inline assets.
+- Music/TTS: full songs (YuE) + instrumentals (MusicGen) + duration‑locked (SAO); infinite composer with bar‑aligned seams, seam QA/auto‑repair, mastering; XTTS voice‑lock; stems; manifests.
+- Film‑2: clarifications → storyboard/animatic/final; shot‑level locks; QA/re‑render; upscale/interp; EDL/export.
+- Research/RAG: keyless multi‑engine `metasearch.fuse`, RAG TTL/dedup/newest‑first; evidence binding.
+- Ablation: facts extraction + `facts.jsonl` export; attached to envelopes.
+- Traceability: envelopes, manifests (hashes/seeds/params/GPU), job ledger shards, dataset exports.
 
-Model defaults
---------------
-- Planner/Executors default to Qwen‑3 for the primary model (`QWEN_MODEL_ID=qwen3:32b-instruct-q4_K_M`).
-- Ablation judge/compressor is routed to Qwen‑3 (via `ABLCODER_URL`).
-- Jobs persist as failed even on submit/network errors so the UI never shows an empty queue during errors.
+Essential Commands
+------------------
+- Bring up services with a specific env file:
+  ```bash
+  docker compose --env-file env.example.txt up -d --build
+  ```
+- Tail orchestrator logs:
+  ```bash
+  docker logs -f orchestrator
+  ```
+- UI (Chat): open the Chat UI (service) and use enter‑to‑send; assets render inline.
 
-Project structure (high-level)
-------------------------------
-- `orchestrator/app/icw/` — WindowedSolver, continuation, CAC assembler, reframe
-- `orchestrator/app/jsonio/` — JSON envelope normalization & stitch
-- `orchestrator/app/router/` — deterministic intent predicates & args builders
-- `orchestrator/app/rag/` — RAG hygiene (TTL, de-dup, evidence footer)
-- `orchestrator/app/ablation/` — facts extractor + exporter
-- `orchestrator/app/film2/` — Film‑2 state machine (clarify, bibles, planner, QA, refs, resume, artifacts)
-- `orchestrator/app/code_loop/` — Coding Super‑Loop (Architect→Implementer→Reviewer)
-- `orchestrator/app/state/` — ids, locks, checkpoints (append-only), resume helpers
+Key Endpoints
+-------------
+- `GET /healthz` — health
+- `GET /capabilities.json` — live capabilities
+- `POST /v1/chat/completions` — OpenAI‑compatible chat (tools auto‑executed)
+- `POST /tool.run` — direct tool execution
+- Jobs (long ComfyUI flows): `POST /jobs`, `GET /jobs/{id}`, `GET /jobs/{id}/stream`, `POST /jobs/{id}/cancel`
+
+Determinism & Memory
+--------------------
+- Seeds: deterministic seeds per tool/model; stamped into envelopes and manifests.
+- Memory: multimodal artifact index (JSONL); cross‑conversation recall.
+
+GPU Notes
+---------
+- CUDA GPUs required; NVIDIA toolkit via Docker; CDI device exposure. Heavy models prefer RTX 8000; P40 pool used for concurrency. OOM auto‑mitigated via window sizing/retry (continuity preserved).
+
+License
+-------
+Proprietary / Internal use.
+
 
