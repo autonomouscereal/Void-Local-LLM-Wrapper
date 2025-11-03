@@ -981,10 +981,14 @@ async def chat_ws(websocket: WebSocket):
                 }
                 await websocket.send_text(json.dumps(payload_out))
             except Exception as ex:
-                await websocket.send_text(json.dumps({
-                    "error": str(ex),
-                    "message": {"role": "assistant", "content": {"text": f"Error: {str(ex)}"}},
-                }))
+                # Ensure non-empty, informative error payloads
+                err_str = (str(ex) or getattr(ex, "message", "") or ex.__class__.__name__).strip()
+                payload_err = {
+                    "ok": False,
+                    "error": err_str,
+                    "message": {"role": "assistant", "content": {"text": f"Error: {err_str}"}},
+                }
+                await websocket.send_text(json.dumps(payload_err))
     except WebSocketDisconnect:
         # Client disconnected; end session
         return

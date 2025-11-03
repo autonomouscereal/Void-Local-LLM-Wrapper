@@ -6323,28 +6323,73 @@ async def stream_job(job_id: str, interval_ms: Optional[int] = None):
 
 @app.get("/jobs")
 async def list_jobs(status: Optional[str] = None, limit: int = 50, offset: int = 0):
+    def _iso(val: Any) -> Optional[str]:
+        if val is None:
+            return None
+        iso = getattr(val, "isoformat", None)
+        return iso() if callable(iso) else str(val)
+
+    def _normalize_job(js: Dict[str, Any]) -> Dict[str, Any]:
+        jid = js.get("id") or js.get("job_id") or js.get("uuid") or ""
+        pid = js.get("prompt_id") or js.get("promptId") or None
+        st = js.get("status") or js.get("state") or "unknown"
+        ca = _iso(js.get("created_at") or js.get("createdAt"))
+        ua = _iso(js.get("updated_at") or js.get("updatedAt"))
+        out = {
+            "id": str(jid),
+            "job_id": str(jid),
+            "prompt_id": pid if (pid is None or isinstance(pid, str)) else str(pid),
+            "status": str(st),
+            "state": str(st),
+            "created_at": ca,
+            "updated_at": ua,
+        }
+        return out
+
     pool = await get_pg_pool()
     if pool is None:
         items = list(_jobs_store.values())
         if status:
-            items = [j for j in items if j.get("state") == status]
-        return {"data": items[offset: offset + limit], "total": len(items)}
+            items = [j for j in items if (j.get("state") or j.get("status")) == status]
+        norm = [_normalize_job(j) for j in items]
+        return {"data": norm[offset: offset + limit], "total": len(norm)}
     async with pool.acquire() as conn:
+        # Avoid exceptions by checking table existence first
+        exists = await conn.fetchval("SELECT to_regclass('public.jobs') IS NOT NULL")
+        if not exists:
+            items = list(_jobs_store.values())
+            if status:
+                items = [j for j in items if (j.get("state") or j.get("status")) == status]
+            norm = [_normalize_job(j) for j in items]
+            return {"data": norm[offset: offset + limit], "total": len(norm)}
+
         if status:
-            rows = await conn.fetch("SELECT id, prompt_id, status, created_at, updated_at FROM jobs WHERE status=$1 ORDER BY updated_at DESC LIMIT $2 OFFSET $3", status, limit, offset)
+            rows = await conn.fetch(
+                "SELECT id, prompt_id, status, created_at, updated_at FROM jobs WHERE status=$1 ORDER BY updated_at DESC LIMIT $2 OFFSET $3",
+                status, limit, offset,
+            )
             total = await conn.fetchval("SELECT COUNT(*) FROM jobs WHERE status=$1", status)
         else:
-            rows = await conn.fetch("SELECT id, prompt_id, status, created_at, updated_at FROM jobs ORDER BY updated_at DESC LIMIT $1 OFFSET $2", limit, offset)
+            rows = await conn.fetch(
+                "SELECT id, prompt_id, status, created_at, updated_at FROM jobs ORDER BY updated_at DESC LIMIT $1 OFFSET $2",
+                limit, offset,
+            )
             total = await conn.fetchval("SELECT COUNT(*) FROM jobs")
+
         db_items = [dict(r) for r in rows]
         # Union with in-memory items to avoid empty UI when DB insert fails
         db_ids = {it.get("id") for it in db_items}
         mem_items = list(_jobs_store.values())
         if status:
-            mem_items = [j for j in mem_items if j.get("state") == status]
-        mem_only = [j for j in mem_items if j.get("id") not in db_ids]
-        all_items = db_items + mem_only
-        return {"data": all_items, "total": int(total) + len([1 for j in mem_only])}
+            mem_items = [j for j in mem_items if (j.get("state") or j.get("status")) == status]
+        mem_only = [j for j in mem_items if (j.get("id") or j.get("job_id")) not in db_ids]
+        all_items = [
+            _normalize_job(j) for j in db_items
+        ] + [
+            _normalize_job(j) for j in mem_only
+        ]
+        safe_total = int(total or 0) + len(mem_only)
+        return {"data": all_items, "total": safe_total}
 
 
 @app.post("/jobs/{job_id}/cancel")
