@@ -122,7 +122,7 @@ async def _nli_contradiction(text_a: str, text_b: str) -> Tuple[bool, float, str
         "seed": 0,
     }
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient() as client:
             r = await client.post(ABLCODER_URL.rstrip("/") + "/nli", json=payload)
             r.raise_for_status()
             data = r.json()
@@ -333,7 +333,7 @@ async def ablate(body: Dict[str, Any]):
             c["train_payload"] = {"input": cached_comp.get("input"), "output": cached_comp.get("output"), "metadata": {"mode": c.get("mode"), "seed": seed}}
         elif ABLCODER_URL:
             try:
-                async with httpx.AsyncClient(timeout=30) as client:
+                async with httpx.AsyncClient() as client:
                     payload = {"model_route": "qwen3-ablation-coder", "deterministic": True, "system": "Ablation Compressor. Output strict JSON only.", "seed": 0, "text": text, "citations": citations, "policy": comp_policy}
                     r = await client.post(ABLCODER_URL.rstrip("/") + "/compress", json=payload)
                     r.raise_for_status()

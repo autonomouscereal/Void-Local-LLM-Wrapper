@@ -73,7 +73,7 @@ def run_image_gen(job: dict, provider, manifest: dict) -> dict:
                 with open(png_path, "rb") as f:
                     b64 = base64.b64encode(f.read()).decode("ascii")
                 vlm_url = os.getenv("VLM_API_URL").rstrip("/") + "/analyze"
-                with httpx.Client(timeout=None) as client:
+                with httpx.Client() as client:
                     r = client.post(vlm_url, json={"b64": b64, "ext": ".png"})
                     if r.status_code == 200 and isinstance(r.json(), dict):
                         cap = (r.json().get("caption") or r.json().get("text") or "").strip()

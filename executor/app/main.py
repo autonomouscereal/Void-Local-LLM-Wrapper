@@ -39,12 +39,8 @@ def run_subprocess(cmd: list[str], cwd: Optional[str] = None, timeout: int = EXE
         stderr=subprocess.PIPE,
         text=True,
     )
-    try:
-        out, err = proc.communicate(timeout=timeout)
-        return {"returncode": proc.returncode, "stdout": out, "stderr": err}
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        return {"returncode": -1, "stdout": "", "stderr": "timeout"}
+    out, err = proc.communicate()
+    return {"returncode": proc.returncode, "stdout": out, "stderr": err}
 
 
 def _banned_reason_from_code(code: str) -> Optional[str]:

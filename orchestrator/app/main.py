@@ -35,6 +35,9 @@ from typing import Any, Dict, List, Optional, Tuple
 import time
 import traceback
 
+from .ops.policy import enforce_core_policy
+enforce_core_policy()
+
 import httpx  # type: ignore
 import requests
 import re
@@ -765,7 +768,7 @@ async def rag_search(query: str, k: int = 8) -> List[Dict[str, Any]]:
 
 @retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=0.5, max=2))
 async def call_ollama(base_url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    async with httpx.AsyncClient(timeout=45) as client:
+    async with httpx.AsyncClient() as client:
         try:
             # Keep models warm across requests
             ppayload = dict(payload)
@@ -789,7 +792,7 @@ async def serpapi_google_search(queries: List[str], max_results: int = 5) -> str
     if not SERPAPI_API_KEY:
         return ""
     aggregate = []
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with httpx.AsyncClient() as client:
         for q in queries:
             try:
                 params = {
@@ -846,7 +849,7 @@ async def call_mcp_tool(name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
     if not MCP_HTTP_BRIDGE_URL:
         return {"error": "MCP bridge URL not configured"}
     try:
-        async with httpx.AsyncClient(timeout=60) as client:
+        async with httpx.AsyncClient() as client:
             r = await client.post(
                 MCP_HTTP_BRIDGE_URL.rstrip("/") + "/call",
                 json={"name": name, "arguments": arguments or {}},
@@ -936,6 +939,23 @@ def build_tools_section(tools: Optional[List[Dict[str, Any]]]) -> str:
 
 def get_builtin_tools_schema() -> List[Dict[str, Any]]:
     return [
+        {
+            "type": "function",
+            "function": {
+                "name": "math.eval",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "expr": {"type": "string"},
+                        "task": {"type": "string"},
+                        "var": {"type": "string"},
+                        "point": {"type": "number"},
+                        "order": {"type": "integer"}
+                    },
+                    "required": ["expr"]
+                }
+            }
+        },
         {
             "type": "function",
             "function": {
@@ -1132,15 +1152,22 @@ def get_builtin_tools_schema() -> List[Dict[str, Any]]:
         {
             "type": "function",
             "function": {
+                "name": "video.flow.derive",
+                "parameters": {"type": "object", "properties": {"src": {"type": "string"}, "frame_a": {"type": "string"}, "frame_b": {"type": "string"}, "step": {"type": "integer"}, "cid": {"type": "string"}}, "required": []}
+            }
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "video.hv.t2v",
-                "parameters": {"type": "object", "properties": {"prompt": {"type": "string"}, "negative": {"type": "string"}, "width": {"type": "integer"}, "height": {"type": "integer"}, "fps": {"type": "integer"}, "seconds": {"type": "integer"}, "seed": {"type": "integer"}, "locks": {"type": "object"}, "post": {"type": "object"}, "cid": {"type": "string"}}, "required": ["prompt", "width", "height", "fps", "seconds"]}
+                "parameters": {"type": "object", "properties": {"prompt": {"type": "string"}, "negative": {"type": "string"}, "width": {"type": "integer"}, "height": {"type": "integer"}, "fps": {"type": "integer"}, "seconds": {"type": "integer"}, "seed": {"type": "integer"}, "locks": {"type": "object"}, "post": {"type": "object"}, "latent_reinit_every": {"type": "integer"}, "cid": {"type": "string"}}, "required": ["prompt", "width", "height", "fps", "seconds"]}
             }
         },
         {
             "type": "function",
             "function": {
                 "name": "video.hv.i2v",
-                "parameters": {"type": "object", "properties": {"init_image": {"type": "string"}, "prompt": {"type": "string"}, "negative": {"type": "string"}, "width": {"type": "integer"}, "height": {"type": "integer"}, "fps": {"type": "integer"}, "seconds": {"type": "integer"}, "seed": {"type": "integer"}, "locks": {"type": "object"}, "post": {"type": "object"}, "cid": {"type": "string"}}, "required": ["init_image", "prompt", "width", "height", "fps", "seconds"]}
+                "parameters": {"type": "object", "properties": {"init_image": {"type": "string"}, "prompt": {"type": "string"}, "negative": {"type": "string"}, "width": {"type": "integer"}, "height": {"type": "integer"}, "fps": {"type": "integer"}, "seconds": {"type": "integer"}, "seed": {"type": "integer"}, "locks": {"type": "object"}, "post": {"type": "object"}, "latent_reinit_every": {"type": "integer"}, "cid": {"type": "string"}}, "required": ["init_image", "prompt", "width", "height", "fps", "seconds"]}
             }
         },
         {
@@ -1155,6 +1182,13 @@ def get_builtin_tools_schema() -> List[Dict[str, Any]]:
             "function": {
                 "name": "video.upscale",
                 "parameters": {"type": "object", "properties": {"src": {"type": "string"}, "scale": {"type": "integer"}, "width": {"type": "integer"}, "height": {"type": "integer"}}, "required": ["src"]}
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "video.text.overlay",
+                "parameters": {"type": "object", "properties": {"src": {"type": "string"}, "texts": {"type": "array", "items": {"type": "object"}}, "cid": {"type": "string"}}, "required": ["src", "texts"]}
             }
         },
         {
@@ -1489,7 +1523,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         # If a raw ComfyUI workflow graph is explicitly provided, post it in the correct shape
         wf = args.get("workflow")
         if isinstance(wf, dict) and COMFYUI_API_URL:
-            async with httpx.AsyncClient(timeout=600) as client:
+            async with httpx.AsyncClient() as client:
                 r = await client.post(COMFYUI_API_URL.rstrip("/") + "/prompt", json={"prompt": wf})
                 try:
                     r.raise_for_status(); return {"name": name, "result": r.json()}
@@ -1508,18 +1542,15 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 with _hx.Client() as client:
                     r = client.post(self.base + "/prompt", json={"prompt": graph})
                     r.raise_for_status(); return r.json()
-            def _poll(self, pid: str, timeout_s: int = 60) -> Dict[str, Any]:
+            def _poll(self, pid: str) -> Dict[str, Any]:
                 import httpx as _hx, time as _tm  # type: ignore
-                t0 = _tm.time()
                 while True:
                     r = _hx.get(self.base + f"/history/{pid}")
                     if r.status_code == 200:
                         js = r.json(); h = (js.get("history") or {}).get(pid)
                         if h and (h.get("status", {}).get("completed") is True):
                             return h
-                    if (_tm.time() - t0) > timeout_s: break
                     _tm.sleep(1.0)
-                return {}
             def _download_first(self, detail: Dict[str, Any]) -> bytes:
                 import httpx as _hx  # type: ignore
                 outputs = (detail.get("outputs") or {})
@@ -1623,7 +1654,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 except Exception:
                     g = dict(base_graph)
                 js = self._post_prompt(g); pid = js.get("prompt_id") or js.get("uuid") or js.get("id")
-                det = self._poll(pid, timeout_s=900)
+                det = self._poll(pid)
                 data = self._download_first(det)
                 view_url = f"{self.base}/history/{pid}" if (self.base and pid) else None
                 return {"image_bytes": data, "model": "comfyui:sdxl", "prompt_id": pid, "history_url": view_url}
@@ -1642,7 +1673,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     "9": {"class_type": "VAEDecode", "inputs": {"samples": ["8", 0], "vae": ["1", 2]}},
                     "10": {"class_type": "SaveImage", "inputs": {"filename_prefix": "image_edit", "images": ["9", 0]}},
                 }
-                js = self._post_prompt(g); pid = js.get("prompt_id") or js.get("uuid") or js.get("id"); det = self._poll(pid, timeout_s=900)
+                js = self._post_prompt(g); pid = js.get("prompt_id") or js.get("uuid") or js.get("id"); det = self._poll(pid)
                 data = self._download_first(det)
                 view_url = f"{self.base}/history/{pid}" if (self.base and pid) else None
                 return {"image_bytes": data, "model": "comfyui:sdxl", "prompt_id": pid, "history_url": view_url}
@@ -1656,7 +1687,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     "12": {"class_type": "RealESRGAN", "inputs": {"image": ["2", 0], "model": ["11", 0], "scale": scale}},
                     "10": {"class_type": "SaveImage", "inputs": {"filename_prefix": "image_upscale", "images": ["12", 0]}},
                 }
-                js = self._post_prompt(g); pid = js.get("prompt_id") or js.get("uuid") or js.get("id"); det = self._poll(pid, timeout_s=900)
+                js = self._post_prompt(g); pid = js.get("prompt_id") or js.get("uuid") or js.get("id"); det = self._poll(pid)
                 data = self._download_first(det)
                 view_url = f"{self.base}/history/{pid}" if (self.base and pid) else None
                 return {"image_bytes": data, "model": "comfyui:realesrgan", "prompt_id": pid, "history_url": view_url}
@@ -1679,7 +1710,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             return {"name": name, "error": "XTTS_API_URL not configured"}
         class _TTSProvider:
             async def _xtts(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-                async with httpx.AsyncClient(timeout=None) as client:
+                async with httpx.AsyncClient() as client:
                     # Pass through voice_lock/voice_id/seed/rate/pitch so backend can lock timbre
                     r = await client.post(XTTS_API_URL.rstrip("/") + "/tts", json=payload)
                     r.raise_for_status()
@@ -1721,7 +1752,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             b64 = args.get("b64").strip()
         elif isinstance(args.get("url"), str) and args.get("url").strip():
             try:
-                async with httpx.AsyncClient(timeout=60) as client:
+                async with httpx.AsyncClient() as client:
                     rr = await client.get(args.get("url").strip())
                     rr.raise_for_status()
                     import base64 as _b
@@ -1750,7 +1781,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         else:
             return {"name": name, "error": "missing b64|url|path"}
         try:
-            async with httpx.AsyncClient(timeout=180) as client:
+            async with httpx.AsyncClient() as client:
                 r = await client.post(OCR_API_URL.rstrip("/") + "/ocr", json={"b64": b64, "ext": ext})
                 r.raise_for_status()
                 js = r.json()
@@ -1766,7 +1797,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             b64 = args.get("b64").strip()
         elif isinstance(args.get("url"), str) and args.get("url").strip():
             try:
-                async with httpx.AsyncClient(timeout=60) as client:
+                async with httpx.AsyncClient() as client:
                     rr = await client.get(args.get("url").strip())
                     rr.raise_for_status()
                     import base64 as _b
@@ -1795,7 +1826,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         else:
             return {"name": name, "error": "missing b64|url|path"}
         try:
-            async with httpx.AsyncClient(timeout=60) as client:
+            async with httpx.AsyncClient() as client:
                 r = await client.post(VLM_API_URL.rstrip("/") + "/analyze", json={"b64": b64, "ext": ext})
                 r.raise_for_status()
                 js = r.json()
@@ -1810,7 +1841,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             class _MusicProvider:
                 async def _compose(self, payload: Dict[str, Any]) -> Dict[str, Any]:
                     import base64 as _b
-                    async with httpx.AsyncClient(timeout=600) as client:
+                    async with httpx.AsyncClient() as client:
                         r = await client.post(MUSIC_API_URL.rstrip("/") + "/generate", json={"prompt": payload.get("prompt"), "duration": int(payload.get("length_s") or 8)})
                         r.raise_for_status(); js = r.json(); b64 = js.get("audio_wav_base64") or js.get("wav_b64"); wav = _b.b64decode(b64) if isinstance(b64, str) else b""; return {"wav_bytes": wav, "model": f"musicgen:{os.getenv('MUSIC_MODEL_ID','')}"}
                 def compose(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -1844,7 +1875,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         class _MusicProvider:
             async def _compose(self, payload: Dict[str, Any]) -> Dict[str, Any]:
                 import base64 as _b
-                async with httpx.AsyncClient(timeout=None) as client:
+                async with httpx.AsyncClient() as client:
                     body = {
                         "prompt": payload.get("prompt"),
                         "duration": int(payload.get("length_s") or 8),
@@ -2069,7 +2100,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         if not YUE_API_URL:
             return {"name": name, "error": "YUE_API_URL not configured"}
         try:
-            async with httpx.AsyncClient(timeout=None) as client:
+            async with httpx.AsyncClient() as client:
                 body = {
                     "lyrics": args.get("lyrics"),
                     "style_tags": args.get("style_tags") or [],
@@ -2089,7 +2120,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         if not MUSIC_API_URL:
             return {"name": name, "error": "MUSIC_API_URL not configured"}
         try:
-            async with httpx.AsyncClient(timeout=None) as client:
+            async with httpx.AsyncClient() as client:
                 payload = {
                     "text": args.get("text"),
                     "melody_wav": args.get("melody_wav"),
@@ -2110,7 +2141,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         if not SAO_API_URL:
             return {"name": name, "error": "SAO_API_URL not configured"}
         try:
-            async with httpx.AsyncClient(timeout=None) as client:
+            async with httpx.AsyncClient() as client:
                 payload = {
                     "text": args.get("text"),
                     "seconds": int(args.get("seconds") or args.get("duration_sec") or 8),
@@ -2128,7 +2159,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         if not DEMUCS_API_URL:
             return {"name": name, "error": "DEMUCS_API_URL not configured"}
         try:
-            async with httpx.AsyncClient(timeout=None) as client:
+            async with httpx.AsyncClient() as client:
                 payload = {
                     "mix_wav": args.get("mix_wav") or args.get("src"),
                     "stems": args.get("stems") or ["vocals","drums","bass","other"],
@@ -2142,7 +2173,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         if not RVC_API_URL:
             return {"name": name, "error": "RVC_API_URL not configured"}
         try:
-            async with httpx.AsyncClient(timeout=None) as client:
+            async with httpx.AsyncClient() as client:
                 payload = {
                     "source_vocal_wav": args.get("source_vocal_wav") or args.get("src"),
                     "target_voice_ref": args.get("target_voice_ref") or args.get("voice_ref"),
@@ -2156,7 +2187,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         if not DIFFSINGER_RVC_API_URL:
             return {"name": name, "error": "DIFFSINGER_RVC_API_URL not configured"}
         try:
-            async with httpx.AsyncClient(timeout=None) as client:
+            async with httpx.AsyncClient() as client:
                 payload = {
                     "lyrics": args.get("lyrics"),
                     "notes_midi": args.get("notes_midi"),
@@ -2173,7 +2204,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         if not HUNYUAN_FOLEY_API_URL:
             return {"name": name, "error": "HUNYUAN_FOLEY_API_URL not configured"}
         try:
-            async with httpx.AsyncClient(timeout=None) as client:
+            async with httpx.AsyncClient() as client:
                 payload = {
                     "video_ref": args.get("video_ref") or args.get("src"),
                     "cue_regions": args.get("cue_regions") or [],
@@ -2192,7 +2223,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 self.base = base.rstrip("/")
             def _post_prompt(self, graph: Dict[str, Any]) -> Dict[str, Any]:
                 import httpx as _hx  # type: ignore
-                with _hx.Client(timeout=None) as client:
+                with _hx.Client() as client:
                     r = client.post(self.base + "/prompt", json={"prompt": graph})
                     r.raise_for_status(); return r.json()
             def _poll(self, pid: str) -> Dict[str, Any]:
@@ -2458,7 +2489,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             if not base:
                 return {"name": name, "error": str(ex)}
             try:
-                async with httpx.AsyncClient(timeout=900) as client:
+                async with httpx.AsyncClient() as client:
                     r = await client.post(base + "/research/run", json=args)
                     r.raise_for_status()
                     return {"name": name, "result": r.json()}
@@ -2480,7 +2511,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 # reuse async call_ollama via blocking run
                 import requests as _rq
                 try:
-                    r = _rq.post(self.base_url.rstrip("/") + "/api/generate", json=payload, timeout=60)
+                    r = _rq.post(self.base_url.rstrip("/") + "/api/generate", json=payload)
                     r.raise_for_status()
                     js = r.json()
                     return SimpleNamespace(text=str(js.get("response", "")), model_name=self.model_name)
@@ -2624,7 +2655,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         # Plan → Final → QC → Export
         project_id = f"prj_{seed}"
         try:
-            async with httpx.AsyncClient(timeout=1200) as client:
+            async with httpx.AsyncClient() as client:
                 base_url = os.getenv("FILM2_API_URL","http://film2:8090")
                 outputs_payload = args.get("outputs") or {"fps": refresh, "resolution": res, "codec": codec, "container": container, "bitrate": bitrate, "audio": {"sr": audio_sr, "lufs_target": lufs_target}}
                 rules_payload = args.get("rules") or {}
@@ -2711,7 +2742,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         if not url:
             return {"name": name, "error": "missing url"}
         try:
-            async with httpx.AsyncClient(timeout=20) as client:
+            async with httpx.AsyncClient() as client:
                 r = await client.get(url)
             ct = r.headers.get("content-type", "")
             data = r.content or b""
@@ -3126,7 +3157,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                         face_url = face_src.replace("/workspace", "")
                     else:
                         face_url = face_src if face_src.startswith("/uploads/") else face_src
-                    with _hx.Client(timeout=None) as _c:
+                    with _hx.Client() as _c:
                         er = _c.post(FACEID_API_URL.rstrip("/") + "/embed", json={"image_url": face_url})
                         emb = None
                         if er.status_code == 200:
@@ -3151,7 +3182,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                                 # Inject InstantIDApply
                                 g["22"] = {"class_type": "InstantIDApply", "inputs": {"model": ["1", 0], "image": ["2", 0], "embedding": emb, "strength": 0.70}}
                                 g["6"]["inputs"]["model"] = ["22", 0]
-                                with _hx.Client(timeout=None) as _c2:
+                                with _hx.Client() as _c2:
                                     pr = _c2.post(COMFYUI_API_URL.rstrip("/") + "/prompt", json={"prompt": g})
                                     if pr.status_code == 200:
                                         pid = (pr.json().get("prompt_id") or pr.json().get("uuid") or pr.json().get("id"))
@@ -3196,6 +3227,77 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 pass
             try:
                 _trace_append("video", {"cid": args.get("cid"), "tool": "video.interpolate", "src": src, "target_fps": target_fps, "path": dst})
+            except Exception:
+                pass
+            return {"name": name, "result": {"path": url}}
+        except Exception as ex:
+            return {"name": name, "error": str(ex)}
+    if name == "video.flow.derive":
+        import os, time as _tm
+        try:
+            import cv2  # type: ignore
+            import numpy as np  # type: ignore
+        except Exception as ex:
+            return {"name": name, "error": f"opencv_missing: {str(ex)}"}
+        frame_a = args.get("frame_a") or ""
+        frame_b = args.get("frame_b") or ""
+        src = args.get("src") or ""
+        a_img = None
+        b_img = None
+        # Helper to read image regardless of /uploads vs /workspace pathing
+        def _read_any(p: str):
+            if not p:
+                return None
+            pp = p
+            if pp.startswith("/uploads/"):
+                pp = "/workspace" + pp
+            return cv2.imread(pp, cv2.IMREAD_COLOR)
+        try:
+            if frame_a and frame_b:
+                a_img = _read_any(frame_a)
+                b_img = _read_any(frame_b)
+            elif src:
+                # Grab two frames step apart from the tail
+                cap = cv2.VideoCapture(src)
+                if not cap.isOpened():
+                    return {"name": name, "error": "failed to open src"}
+                total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+                step = max(1, int(args.get("step") or 1))
+                idx_b = max(0, total - 1)
+                idx_a = max(0, idx_b - step)
+                cap.set(cv2.CAP_PROP_POS_FRAMES, idx_a)
+                ok_a, a_img = cap.read()
+                cap.set(cv2.CAP_PROP_POS_FRAMES, idx_b)
+                ok_b, b_img = cap.read()
+                cap.release()
+                if not ok_a or not ok_b:
+                    a_img = None; b_img = None
+            if a_img is None or b_img is None:
+                return {"name": name, "error": "missing frames"}
+            # Convert to gray
+            a_gray = cv2.cvtColor(a_img, cv2.COLOR_BGR2GRAY)
+            b_gray = cv2.cvtColor(b_img, cv2.COLOR_BGR2GRAY)
+            # Try TV-L1 if available; fallback to Farneback
+            flow = None
+            try:
+                tvl1 = cv2.optflow.DualTVL1OpticalFlow_create()  # type: ignore
+                flow = tvl1.calc(a_gray, b_gray, None)
+            except Exception:
+                flow = cv2.calcOpticalFlowFarneback(a_gray, b_gray, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+            fx = flow[..., 0].astype(np.float32)
+            fy = flow[..., 1].astype(np.float32)
+            mag = np.sqrt(fx * fx + fy * fy)
+            outdir = os.path.join(UPLOAD_DIR, "artifacts", "video", f"flow-{int(_tm.time())}")
+            os.makedirs(outdir, exist_ok=True)
+            npz_path = os.path.join(outdir, "flow.npz")
+            np.savez_compressed(npz_path, fx=fx, fy=fy, mag=mag)
+            url = npz_path.replace("/workspace", "") if npz_path.startswith("/workspace/") else npz_path
+            try:
+                _ctx_add(args.get("cid") or "", "video", npz_path, url, src or (frame_a + "," + frame_b), ["flow"], {})
+            except Exception:
+                pass
+            try:
+                _trace_append("video", {"cid": args.get("cid"), "tool": "video.flow.derive", "src": src, "frame_a": frame_a, "frame_b": frame_b, "path": npz_path})
             except Exception:
                 pass
             return {"name": name, "result": {"path": url}}
@@ -3264,7 +3366,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     import httpx as _hx
                     face_src = face_images[0]
                     face_url = face_src.replace("/workspace", "") if face_src.startswith("/workspace/") else (face_src if face_src.startswith("/uploads/") else face_src)
-                    with _hx.Client(timeout=None) as _c:
+                    with _hx.Client() as _c:
                         er = _c.post(FACEID_API_URL.rstrip("/") + "/embed", json={"image_url": face_url})
                         emb = None
                         if er.status_code == 200:
@@ -3286,7 +3388,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                                 }
                                 g["22"] = {"class_type": "InstantIDApply", "inputs": {"model": ["1", 0], "image": ["2", 0], "embedding": emb, "strength": 0.70}}
                                 g["6"]["inputs"]["model"] = ["22", 0]
-                                with _hx.Client(timeout=None) as _c2:
+                                with _hx.Client() as _c2:
                                     pr = _c2.post(COMFYUI_API_URL.rstrip("/") + "/prompt", json={"prompt": g})
                                     if pr.status_code == 200:
                                         pid = (pr.json().get("prompt_id") or pr.json().get("uuid") or pr.json().get("id"))
@@ -3333,10 +3435,68 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             return {"name": name, "result": {"path": url}}
         except Exception as ex:
             return {"name": name, "error": str(ex)}
+    if name == "video.text.overlay":
+        src = args.get("src") or ""
+        texts = args.get("texts") or []
+        if not src or not isinstance(texts, list) or not texts:
+            return {"name": name, "error": "missing src|texts"}
+        try:
+            import os, subprocess, time as _tm
+            from PIL import Image, ImageDraw, ImageFont  # type: ignore
+            # Extract frames
+            outdir = os.path.join(UPLOAD_DIR, "artifacts", "video", f"txtov-{int(_tm.time())}")
+            frames_dir = os.path.join(outdir, "frames")
+            os.makedirs(frames_dir, exist_ok=True)
+            subprocess.run(["ffmpeg", "-y", "-i", src, os.path.join(frames_dir, "%06d.png")], check=True)
+            from glob import glob as _glob
+            frame_files = sorted(_glob(os.path.join(frames_dir, "*.png")))
+            # Helper to draw text on a PIL image
+            def _draw_on(im: Image.Image, spec: dict) -> Image.Image:
+                draw = ImageDraw.Draw(im)
+                content = str(spec.get("content") or spec.get("text") or "")
+                rgb = spec.get("color") or (255, 255, 255)
+                if isinstance(rgb, list):
+                    color = tuple(int(c) for c in rgb[:3])
+                else:
+                    color = (255, 255, 255)
+                size = int(spec.get("font_size") or 48)
+                try:
+                    font = ImageFont.truetype(spec.get("font") or "arial.ttf", size)
+                except Exception:
+                    font = ImageFont.load_default()
+                x = int(spec.get("x") or im.width // 2)
+                y = int(spec.get("y") or int(im.height * 0.9))
+                anchor = spec.get("anchor") or "mm"
+                draw.text((x, y), content, fill=color, font=font, anchor=anchor)
+                return im
+            for fp in frame_files:
+                try:
+                    im = Image.open(fp).convert("RGB")
+                    for spec in texts:
+                        im = _draw_on(im, spec)
+                    im.save(fp)
+                except Exception:
+                    continue
+            # Re-encode
+            dst = os.path.join(outdir, "overlay.mp4")
+            subprocess.run(["ffmpeg", "-y", "-framerate", "30", "-i", os.path.join(frames_dir, "%06d.png"), "-c:v", "libx264", "-pix_fmt", "yuv420p", dst], check=True)
+            url = dst.replace("/workspace", "") if dst.startswith("/workspace/") else dst
+            try:
+                _ctx_add(args.get("cid") or "", "video", dst, url, src, ["text_overlay"], {"count": len(texts)})
+            except Exception:
+                pass
+            try:
+                _trace_append("video", {"cid": args.get("cid"), "tool": "video.text.overlay", "src": src, "path": dst, "texts": texts})
+            except Exception:
+                pass
+            return {"name": name, "result": {"path": url}}
+        except Exception as ex:
+            return {"name": name, "error": str(ex)}
     if name == "video.hv.t2v" and ALLOW_TOOL_EXECUTION:
         if not HUNYUAN_VIDEO_API_URL:
             return {"name": name, "error": "HUNYUAN_VIDEO_API_URL not configured"}
         try:
+            lr_every = int(args.get("latent_reinit_every") or 48)
             payload = {
                 "prompt": args.get("prompt"),
                 "negative": args.get("negative"),
@@ -3345,9 +3505,10 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 "seed": args.get("seed"),
                 "quality": "max",
                 "post": args.get("post") or {"interpolate": True, "upscale": True, "face_lock": True, "hand_fix": True},
+                "latent_reinit": {"every_n_frames": lr_every},
                 "meta": {"trace_level": "full", "stream": True},
             }
-            async with httpx.AsyncClient(timeout=None) as client:
+            async with httpx.AsyncClient() as client:
                 r = await client.post(HUNYUAN_VIDEO_API_URL.rstrip("/") + "/v1/video/hv/t2v", json=payload)
             r.raise_for_status()
             return {"name": name, "result": r.json()}
@@ -3357,6 +3518,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         if not HUNYUAN_VIDEO_API_URL:
             return {"name": name, "error": "HUNYUAN_VIDEO_API_URL not configured"}
         try:
+            lr_every = int(args.get("latent_reinit_every") or 48)
             payload = {
                 "init_image": args.get("init_image"),
                 "prompt": args.get("prompt"),
@@ -3366,9 +3528,10 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 "seed": args.get("seed"),
                 "quality": "max",
                 "post": args.get("post") or {"interpolate": True, "upscale": True, "face_lock": True},
+                "latent_reinit": {"every_n_frames": lr_every},
                 "meta": {"trace_level": "full", "stream": True},
             }
-            async with httpx.AsyncClient(timeout=None) as client:
+            async with httpx.AsyncClient() as client:
                 r = await client.post(HUNYUAN_VIDEO_API_URL.rstrip("/") + "/v1/video/hv/i2v", json=payload)
             r.raise_for_status()
             return {"name": name, "result": r.json()}
@@ -3386,10 +3549,72 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 "quality": "max",
                 "meta": {"trace_level": "full", "stream": True},
             }
-            async with httpx.AsyncClient(timeout=None) as client:
+            async with httpx.AsyncClient() as client:
                 r = await client.post(SVD_API_URL.rstrip("/") + "/v1/video/svd/i2v", json=payload)
             r.raise_for_status()
             return {"name": name, "result": r.json()}
+        except Exception as ex:
+            return {"name": name, "error": str(ex)}
+    if name == "math.eval":
+        expr = args.get("expr") or ""
+        task = (args.get("task") or "").strip().lower()
+        var = (args.get("var") or "x").strip() or "x"
+        point = args.get("point")
+        order = int(args.get("order") or 6)
+        try:
+            # Prefer SymPy for exact math; fallback to safe math eval
+            try:
+                import sympy as _sp  # type: ignore
+                from sympy.parsing.sympy_parser import parse_expr as _parse  # type: ignore
+                x = _sp.symbols(var)
+                scope = {str(x): x, 'E': _sp.E, 'pi': _sp.pi}
+                e = _parse(str(expr), local_dict=scope, evaluate=True)
+                res = {}
+                if task in ("diff", "differentiate", "derivative"):
+                    de = _sp.diff(e, x)
+                    res["exact"] = _sp.sstr(de)
+                    res["latex"] = _sp.latex(de)
+                elif task in ("integrate", "int", "antiderivative"):
+                    ie = _sp.integrate(e, x)
+                    res["exact"] = _sp.sstr(ie)
+                    res["latex"] = _sp.latex(ie)
+                elif task in ("limit",):
+                    if point is None:
+                        raise ValueError("point required for limit")
+                    le = _sp.limit(e, x, point)
+                    res["exact"] = _sp.sstr(le)
+                    res["latex"] = _sp.latex(le)
+                elif task in ("series",):
+                    pe = e.series(x, 0 if point is None else point, order)
+                    res["exact"] = _sp.sstr(pe)
+                    res["latex"] = _sp.latex(pe.removeO())
+                elif task in ("solve",):
+                    sol = _sp.solve(_sp.Eq(e, 0), x, dict=True)
+                    res["solutions"] = [_sp.sstr(s) for s in sol]
+                    res["latex_solutions"] = [_sp.latex(s) for s in sol]
+                elif task in ("factor",):
+                    fe = _sp.factor(e)
+                    res["exact"] = _sp.sstr(fe)
+                    res["latex"] = _sp.latex(fe)
+                elif task in ("expand",):
+                    ex = _sp.expand(e)
+                    res["exact"] = _sp.sstr(ex)
+                    res["latex"] = _sp.latex(ex)
+                else:
+                    se = _sp.simplify(e)
+                    res["exact"] = _sp.sstr(se)
+                    res["latex"] = _sp.latex(se)
+                try:
+                    res["approx"] = float(_sp.N(e, 20))
+                except Exception:
+                    pass
+                return {"name": name, "result": res}
+            except Exception:
+                import math as _m
+                allowed = {k: getattr(_m, k) for k in dir(_m) if not k.startswith("_")}
+                allowed.update({"__builtins__": {}})
+                val = eval(str(expr), allowed, {})  # noqa: S307 (safe namespace)
+                return {"name": name, "result": {"approx": float(val)}}
         except Exception as ex:
             return {"name": name, "error": str(ex)}
     if name == "rag_index":
@@ -3405,7 +3630,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
     # --- Multimodal external services (optional; enable via env URLs) ---
     if name == "tts_speak" and XTTS_API_URL and ALLOW_TOOL_EXECUTION:
         payload = {"text": args.get("text", ""), "voice": args.get("voice")}
-        async with httpx.AsyncClient(timeout=120) as client:
+        async with httpx.AsyncClient() as client:
             r = await client.post(XTTS_API_URL.rstrip("/") + "/tts", json=payload)
             try:
                 r.raise_for_status()
@@ -3413,7 +3638,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             except Exception:
                 return {"name": name, "error": r.text}
     if name == "asr_transcribe" and WHISPER_API_URL and ALLOW_TOOL_EXECUTION:
-        async with httpx.AsyncClient(timeout=300) as client:
+        async with httpx.AsyncClient() as client:
             r = await client.post(WHISPER_API_URL.rstrip("/") + "/transcribe", json={"audio_url": args.get("audio_url"), "language": args.get("language")})
             try:
                 r.raise_for_status()
@@ -3422,7 +3647,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 return {"name": name, "error": r.text}
     if name == "image_generate" and COMFYUI_API_URL and ALLOW_TOOL_EXECUTION:
         # expects a ComfyUI workflow graph or minimal prompt params passed through
-        async with httpx.AsyncClient(timeout=600) as client:
+        async with httpx.AsyncClient() as client:
             r = await client.post(COMFYUI_API_URL.rstrip("/") + "/prompt", json=args.get("workflow") or args)
             try:
                 r.raise_for_status()
@@ -3430,7 +3655,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             except Exception:
                 return {"name": name, "error": r.text}
     if name == "controlnet" and COMFYUI_API_URL and ALLOW_TOOL_EXECUTION:
-        async with httpx.AsyncClient(timeout=600) as client:
+        async with httpx.AsyncClient() as client:
             r = await client.post(COMFYUI_API_URL.rstrip("/") + "/prompt", json=args.get("workflow") or args)
             try:
                 r.raise_for_status()
@@ -3438,7 +3663,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             except Exception:
                 return {"name": name, "error": r.text}
     if name == "video_generate" and COMFYUI_API_URL and ALLOW_TOOL_EXECUTION:
-        async with httpx.AsyncClient(timeout=1800) as client:
+        async with httpx.AsyncClient() as client:
             r = await client.post(COMFYUI_API_URL.rstrip("/") + "/prompt", json=args.get("workflow") or args)
             try:
                 r.raise_for_status()
@@ -3446,7 +3671,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             except Exception:
                 return {"name": name, "error": r.text}
     if name == "face_embed" and FACEID_API_URL and ALLOW_TOOL_EXECUTION:
-        async with httpx.AsyncClient(timeout=60) as client:
+        async with httpx.AsyncClient() as client:
             r = await client.post(FACEID_API_URL.rstrip("/") + "/embed", json={"image_url": args.get("image_url")})
             try:
                 r.raise_for_status()
@@ -3454,7 +3679,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             except Exception:
                 return {"name": name, "error": r.text}
     if name == "music_generate" and MUSIC_API_URL and ALLOW_TOOL_EXECUTION:
-        async with httpx.AsyncClient(timeout=1200) as client:
+        async with httpx.AsyncClient() as client:
             r = await client.post(MUSIC_API_URL.rstrip("/") + "/generate", json=args)
             try:
                 r.raise_for_status()
@@ -3462,7 +3687,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             except Exception:
                 return {"name": name, "error": r.text}
     if name == "vlm_analyze" and VLM_API_URL and ALLOW_TOOL_EXECUTION:
-        async with httpx.AsyncClient(timeout=60) as client:
+        async with httpx.AsyncClient() as client:
             r = await client.post(VLM_API_URL.rstrip("/") + "/analyze", json={"image_url": args.get("image_url"), "prompt": args.get("prompt")})
             try:
                 r.raise_for_status()
@@ -3471,7 +3696,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 return {"name": name, "error": r.text}
     # --- Film tools (LLM-driven, simple UI) ---
     if name == "run_python" and EXECUTOR_BASE_URL and ALLOW_TOOL_EXECUTION:
-        async with httpx.AsyncClient(timeout=120) as client:
+        async with httpx.AsyncClient() as client:
             r = await client.post(EXECUTOR_BASE_URL.rstrip("/") + "/run_python", json={"code": args.get("code", "")})
             try:
                 r.raise_for_status()
@@ -3486,7 +3711,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             banned = ("pydantic", "sqlalchemy", "pandas", "pyarrow", "fastparquet", "polars")
             if any(b in content_val.lower() for b in banned):
                 return {"name": name, "error": "forbidden_library", "detail": "banned library in dependency file"}
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient() as client:
             r = await client.post(EXECUTOR_BASE_URL.rstrip("/") + "/write_file", json={"path": args.get("path"), "content": content_val})
             try:
                 r.raise_for_status()
@@ -3494,7 +3719,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             except Exception:
                 return {"name": name, "error": r.text}
     if name == "read_file" and EXECUTOR_BASE_URL and ALLOW_TOOL_EXECUTION:
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient() as client:
             r = await client.post(EXECUTOR_BASE_URL.rstrip("/") + "/read_file", json={"path": args.get("path")})
             try:
                 r.raise_for_status()
@@ -3639,7 +3864,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                     },
                 }
                 try:
-                    r = requests.post(self.base_url + "/api/generate", json=payload, timeout=60)
+                    r = requests.post(self.base_url + "/api/generate", json=payload)
                     r.raise_for_status()
                     js = r.json()
                     return SimpleNamespace(text=str(js.get("response", "")), model_name=self.model_id)
@@ -4273,11 +4498,8 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                                     urls.append(f"/uploads/artifacts/music/{cid}/{aid}")
                         except Exception:
                             continue
-                # Direct ComfyUI JSON paths: try to surface view URL if present
+                # Traverse result to collect media/artifact paths (same-origin only)
                 if isinstance(res, dict):
-                    hv = res.get("history_url") or res.get("view_url")
-                    if isinstance(hv, str) and hv.startswith("http"):
-                        urls.append(hv)
                     # Film-2 and other tools: traverse result to collect media/artifact paths
                     exts = (".mp4", ".webm", ".mov", ".mkv", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".wav", ".mp3", ".m4a", ".ogg", ".flac", ".opus", ".srt")
                     def _walk(v):
@@ -4417,7 +4639,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             }
             async def _send_trace_stream():
                 try:
-                    async with httpx.AsyncClient(timeout=5) as client:
+                    async with httpx.AsyncClient() as client:
                         await client.post(TEACHER_API_URL.rstrip("/") + "/teacher/trace.append", json=trace_payload_stream)
                 except Exception:
                     return
@@ -4755,38 +4977,8 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         pass
     # Evaluate fallback after footer creation, but using main-only flags
     if looks_empty or looks_refusal:
-        # Build a constructive status from tool_results
-        film_id = None
-        errors = []
-        if isinstance(tool_results, list):
-            for tr in tool_results:
-                if isinstance(tr, dict):
-                    # Safely normalize result to a dict before any .get
-                    res_field = tr.get("result")
-                    if isinstance(res_field, str):
-                        try:
-                            res_field = JSONParser().parse(res_field, {"film_id": str})
-                        except Exception:
-                            res_field = {}
-                    if not isinstance(res_field, dict):
-                        res_field = {}
-                    if not film_id:
-                        film_id = res_field.get("film_id")
-                    if tr.get("error"):
-                        errors.append(str(tr.get("error")))
-        summary_lines = []
-        if film_id:
-            summary_lines.append(f"Film ID: {film_id}")
-        if errors:
-            summary_lines.append("Errors: " + "; ".join(errors)[:800])
-        summary = ("\n" + "\n".join(summary_lines)) if summary_lines else ""
-        status_block = (
-            "\n\n### Status\n"
-            "Initiated tool-based generation flow." + summary + "\n"
-            "Use `film_status` to track progress and `/api/jobs` for live status."
-        )
-        # Always append status; never replace footer/body
-        display_content = (display_content or "") + status_block
+        # Suppress status blocks entirely; do not append any status text
+        pass
     # Build artifacts block from tool_results (prefer film.run)
     artifacts: Dict[str, Any] = {}
     try:
@@ -4953,7 +5145,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         }
         async def _send_trace():
             try:
-                async with httpx.AsyncClient(timeout=5) as client:
+                async with httpx.AsyncClient() as client:
                     await client.post(TEACHER_API_URL.rstrip("/") + "/teacher/trace.append", json=trace_payload)
             except Exception:
                 return
@@ -5154,21 +5346,18 @@ async def tool_run(body: Dict[str, Any]):
                     self.base = (base or "").rstrip("/") if base else None
                 def _post_prompt(self, graph: Dict[str, Any]) -> Dict[str, Any]:
                     import httpx as _hx  # type: ignore
-                    with _hx.Client(timeout=60) as client:
+                    with _hx.Client() as client:
                         r = client.post(self.base + "/prompt", json={"prompt": graph})
                         r.raise_for_status(); return r.json()
-                def _poll(self, pid: str, timeout_s: int = 60) -> Dict[str, Any]:
+                def _poll(self, pid: str) -> Dict[str, Any]:
                     import httpx as _hx, time as _tm  # type: ignore
-                    t0 = _tm.time()
                     while True:
-                        r = _hx.get(self.base + f"/history/{pid}", timeout=30)
+                        r = _hx.get(self.base + f"/history/{pid}")
                         if r.status_code == 200:
                             js = r.json(); h = (js.get("history") or {}).get(pid)
                             if h and (h.get("status", {}).get("completed") is True):
                                 return h
-                        if (_tm.time() - t0) > timeout_s: break
                         _tm.sleep(1.0)
-                    return {}
                 def _download_first(self, detail: Dict[str, Any]) -> bytes:
                     import httpx as _hx  # type: ignore
                     outputs = (detail.get("outputs") or {})
@@ -5181,7 +5370,7 @@ async def tool_run(body: Dict[str, Any]):
                                 q = {"filename": fn, "type": tp}
                                 if sub: q["subfolder"] = sub
                                 url = self.base + "/view?" + urlencode(q)
-                                r = _hx.get(url, timeout=60)
+                                r = _hx.get(url)
                                 if r.status_code == 200:
                                     return r.content
                     return b""
@@ -5205,7 +5394,7 @@ async def tool_run(body: Dict[str, Any]):
                         "10": {"class_type": "SaveImage", "inputs": {"filename_prefix": "image_gen", "images": ["9", 0]}},
                     }
                     js = self._post_prompt(g); pid = js.get("prompt_id") or js.get("uuid") or js.get("id")
-                    det = self._poll(pid, timeout_s=300)
+                    det = self._poll(pid)
                     data = self._download_first(det)
                     return {"image_bytes": data, "model": "comfyui:sdxl"}
                 def edit(self, a: Dict[str, Any]) -> Dict[str, Any]:
@@ -5223,7 +5412,7 @@ async def tool_run(body: Dict[str, Any]):
                         "9": {"class_type": "VAEDecode", "inputs": {"samples": ["8", 0], "vae": ["1", 2]}},
                         "10": {"class_type": "SaveImage", "inputs": {"filename_prefix": "image_edit", "images": ["9", 0]}},
                     }
-                    js = self._post_prompt(g); pid = js.get("prompt_id") or js.get("uuid") or js.get("id"); det = self._poll(pid, timeout_s=300)
+                    js = self._post_prompt(g); pid = js.get("prompt_id") or js.get("uuid") or js.get("id"); det = self._poll(pid)
                     data = self._download_first(det)
                     return {"image_bytes": data, "model": "comfyui:sdxl"}
                 def upscale(self, a: Dict[str, Any]) -> Dict[str, Any]:
@@ -5236,7 +5425,7 @@ async def tool_run(body: Dict[str, Any]):
                         "12": {"class_type": "RealESRGAN", "inputs": {"image": ["2", 0], "model": ["11", 0], "scale": scale}},
                         "10": {"class_type": "SaveImage", "inputs": {"filename_prefix": "image_upscale", "images": ["12", 0]}},
                     }
-                    js = self._post_prompt(g); pid = js.get("prompt_id") or js.get("uuid") or js.get("id"); det = self._poll(pid, timeout_s=300)
+                    js = self._post_prompt(g); pid = js.get("prompt_id") or js.get("uuid") or js.get("id"); det = self._poll(pid)
                     data = self._download_first(det)
                     return {"image_bytes": data, "model": "comfyui:realesrgan"}
             provider = _ImageProvider(COMFYUI_API_URL)
@@ -5262,7 +5451,7 @@ async def tool_run(body: Dict[str, Any]):
                 return JSONResponse(status_code=400, content={"error": "XTTS_API_URL not configured"})
             class _TTSProvider:
                 async def _xtts(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-                    async with httpx.AsyncClient(timeout=300) as client:
+                    async with httpx.AsyncClient() as client:
                         r = await client.post(XTTS_API_URL.rstrip("/") + "/tts", json=payload)
                         r.raise_for_status(); js = r.json()
                         wav = b""
@@ -5293,7 +5482,7 @@ async def tool_run(body: Dict[str, Any]):
             class _MusicProvider:
                 async def _compose(self, payload: Dict[str, Any]) -> Dict[str, Any]:
                     import base64 as _b
-                    async with httpx.AsyncClient(timeout=None) as client:
+                    async with httpx.AsyncClient() as client:
                         body = {
                             "prompt": payload.get("prompt"),
                             "duration": int(payload.get("length_s") or 8),
@@ -5327,26 +5516,26 @@ async def tool_run(body: Dict[str, Any]):
                 return JSONResponse(status_code=400, content={"error": "OCR_API_URL not configured"})
             ext = (args.get("ext") or "").strip().lower(); b64 = args.get("b64")
             if not b64 and isinstance(args.get("url"), str):
-                async with httpx.AsyncClient(timeout=60) as client:
+                async with httpx.AsyncClient() as client:
                     rr = await client.get(args.get("url").strip()); rr.raise_for_status(); import base64 as _b; b64 = _b.b64encode(rr.content).decode("ascii")
             if not b64 and isinstance(args.get("path"), str):
                 rel = args.get("path").strip(); full = os.path.abspath(os.path.join(UPLOAD_DIR, rel)) if not os.path.isabs(rel) else rel
                 with open(full, "rb") as f: import base64 as _b; b64 = _b.b64encode(f.read()).decode("ascii");
                 if not ext and "." in rel: ext = "." + rel.split(".")[-1].lower()
-            async with httpx.AsyncClient(timeout=180) as client:
+            async with httpx.AsyncClient() as client:
                 r = await client.post(OCR_API_URL.rstrip("/") + "/ocr", json={"b64": b64, "ext": ext}); r.raise_for_status(); js = r.json(); return {"ok": True, "name": name, "result": {"text": js.get("text") or "", "ext": ext}}
         if name == "vlm.analyze" and ALLOW_TOOL_EXECUTION:
             if not VLM_API_URL:
                 return JSONResponse(status_code=400, content={"error": "VLM_API_URL not configured"})
             ext = (args.get("ext") or "").strip().lower(); b64 = args.get("b64")
             if not b64 and isinstance(args.get("url"), str):
-                async with httpx.AsyncClient(timeout=60) as client:
+                async with httpx.AsyncClient() as client:
                     rr = await client.get(args.get("url").strip()); rr.raise_for_status(); import base64 as _b; b64 = _b.b64encode(rr.content).decode("ascii")
             if not b64 and isinstance(args.get("path"), str):
                 rel = args.get("path").strip(); full = os.path.abspath(os.path.join(UPLOAD_DIR, rel)) if not os.path.isabs(rel) else rel
                 with open(full, "rb") as f: import base64 as _b; b64 = _b.b64encode(f.read()).decode("ascii");
                 if not ext and "." in rel: ext = "." + rel.split(".")[-1].lower()
-            async with httpx.AsyncClient(timeout=60) as client:
+            async with httpx.AsyncClient() as client:
                 r = await client.post(VLM_API_URL.rstrip("/") + "/analyze", json={"b64": b64, "ext": ext}); r.raise_for_status(); js = r.json(); return {"ok": True, "name": name, "result": js}
         return JSONResponse(status_code=400, content={"error": f"unsupported tool: {name}"})
     except Exception as ex:
@@ -5640,7 +5829,7 @@ async def ws_chat(websocket: WebSocket):
                 body = {}
             payload = {"messages": body.get("messages") or [], "stream": False, "cid": body.get("cid")}
             try:
-                async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
+                async with httpx.AsyncClient(trust_env=False) as client:
                     rr = await client.post((PUBLIC_BASE_URL.rstrip("/") if PUBLIC_BASE_URL else "http://127.0.0.1:8000") + "/v1/chat/completions", json=payload)
                 ct = rr.headers.get("content-type") or "application/json"
                 if ct.startswith("application/json"):
@@ -5748,7 +5937,7 @@ async def _comfy_submit_workflow(workflow: Dict[str, Any]) -> Dict[str, Any]:
         ordered = sorted(candidates, key=lambda u: _comfy_load.get(u, 0))
         for base in ordered:
             try:
-                async with httpx.AsyncClient(timeout=60) as client:
+                async with httpx.AsyncClient() as client:
                     if _comfy_sem is not None:
                         async with _comfy_sem:
                             _comfy_load[base] = _comfy_load.get(base, 0) + 1
@@ -5782,7 +5971,7 @@ async def _comfy_history(prompt_id: str) -> Dict[str, Any]:
     base = _job_endpoint.get(prompt_id) or (await _pick_comfy_base())
     if not base:
         return {"error": "COMFYUI_API_URL(S) not configured"}
-    async with httpx.AsyncClient(timeout=60) as client:
+    async with httpx.AsyncClient() as client:
         r = await client.get(base.rstrip("/") + f"/history/{prompt_id}")
         try:
             r.raise_for_status()
@@ -6172,7 +6361,7 @@ async def cancel_job(job_id: str):
         await conn.execute("UPDATE jobs SET status='cancelling', updated_at=NOW() WHERE id=$1", job_id)
     try:
         if COMFYUI_API_URL:
-            async with httpx.AsyncClient(timeout=10) as client:
+            async with httpx.AsyncClient() as client:
                 await client.post(COMFYUI_API_URL.rstrip("/") + "/interrupt")
     except Exception:
         pass
@@ -6327,12 +6516,12 @@ async def _update_scene_from_job(job_id: str, detail: Dict[str, Any] | str, fail
             except Exception:
                 pass
             if XTTS_API_URL and ALLOW_TOOL_EXECUTION and scene_text and audio_enabled:
-                async with httpx.AsyncClient(timeout=180) as client:
+                async with httpx.AsyncClient() as client:
                     tr = await client.post(XTTS_API_URL.rstrip("/") + "/tts", json={"text": scene_text, "voice": voice, "language": language})
                     if tr.status_code == 200:
                         scene_tts = tr.json()
             if MUSIC_API_URL and ALLOW_TOOL_EXECUTION and audio_enabled:
-                async with httpx.AsyncClient(timeout=600) as client:
+                async with httpx.AsyncClient() as client:
                     mr = await client.post(MUSIC_API_URL.rstrip("/") + "/generate", json={"prompt": "cinematic background score", "duration": duration})
                     if mr.status_code == 200:
                         scene_music = mr.json()
@@ -6415,7 +6604,7 @@ async def _maybe_compile_film(film_id: str) -> None:
     # Prefer local assembler if available
     if ASSEMBLER_API_URL:
         try:
-            async with httpx.AsyncClient(timeout=1200) as client:
+            async with httpx.AsyncClient() as client:
                 r = await client.post(ASSEMBLER_API_URL.rstrip("/") + "/assemble", json=payload)
                 r.raise_for_status()
                 assembly_result = r.json()
@@ -6423,7 +6612,7 @@ async def _maybe_compile_film(film_id: str) -> None:
             assembly_result = {"error": True}
     elif N8N_WEBHOOK_URL and ENABLE_N8N:
         try:
-            async with httpx.AsyncClient(timeout=600) as client:
+            async with httpx.AsyncClient() as client:
                 r = await client.post(N8N_WEBHOOK_URL, json=payload)
                 r.raise_for_status()
                 assembly_result = r.json()
@@ -6434,7 +6623,7 @@ async def _maybe_compile_film(film_id: str) -> None:
     try:
         manifest = json.dumps(payload)
         if EXECUTOR_BASE_URL:
-            async with httpx.AsyncClient(timeout=15) as client:
+            async with httpx.AsyncClient() as client:
                 res = await client.post(EXECUTOR_BASE_URL.rstrip("/") + "/write_file", json={"path": "uploads/film_" + film_id + "_manifest.json", "content": manifest})
                 res.raise_for_status()
                 # Build public URL

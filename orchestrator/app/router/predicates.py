@@ -24,6 +24,10 @@ IMAGE_KEYS = [
 TTS_KEYS = ["tts", "voiceover", "narrate", "read this", "text to speech", "voice over"]
 MUSIC_KEYS = ["music", "compose", "instrumental", "song", "track", "bpm", "stems", "variation"]
 CODE_KEYS = ["patch", "diff", "modify file", "add endpoint", "refactor", "unified diff"]
+MATH_KEYS = [
+    "integrate", "derivative", "differentiate", "limit", "solve", "simplify", "factor", "expand",
+    "∫", "d/dx", "Σ", "sum", "product", "matrix", "det", "+", "-", "*", "/", "^", "sin(", "cos(", "tan(",
+]
 
 
 def _contains_any(text: str, keys: list[str]) -> bool:
@@ -60,5 +64,8 @@ def looks_like_music(req_text: str) -> bool:
 
 def looks_like_code_task(req_text: str) -> bool:
     return _contains_any(req_text, CODE_KEYS)
+def looks_like_math(req_text: str) -> bool:
+    return _contains_any(req_text, MATH_KEYS)
+
 
 

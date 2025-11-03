@@ -669,7 +669,7 @@ async def film_final(body: Dict[str, Any]):
         if width and height:
             args.update({"width": width, "height": height})
         payload = {"name": "video.upscale", "args": args}
-        with httpx.Client(timeout=None) as client:
+        with httpx.Client() as client:
             rr = client.post(orch + "/tool.run", json=payload)
             if rr.status_code == 200:
                 try:

@@ -3,8 +3,13 @@ uvicorn[standard]>=0.31.0,<0.40
 transformers>=4.45.0,<5
 accelerate>=0.34.0,<1
 sentencepiece>=0.2.0,<0.3
-torch==2.9.0+cu128 ; platform_system != 'Windows'
---extra-index-url https://download.pytorch.org/whl/cu128
+
+# Pin to Pascal-safe PyTorch (P40, sm_61): 2.8.x built for CUDA 12.6
+--index-url https://download.pytorch.org/whl/cu126
+torch==2.8.* ; platform_system != 'Windows'
+torchvision ; platform_system != 'Windows'
+torchaudio ; platform_system != 'Windows'
+
 Pillow>=10.4.0,<11
 numpy>=1.26.4,<2.0.0
 requests>=2.32.3,<3

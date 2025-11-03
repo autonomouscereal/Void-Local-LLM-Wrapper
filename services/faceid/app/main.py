@@ -40,7 +40,7 @@ async def embed(body: Dict[str, Any]):
     if not image_url:
         return JSONResponse(status_code=400, content={"error": "missing image_url"})
     import requests
-    r = requests.get(image_url, timeout=30)
+    r = requests.get(image_url)
     r.raise_for_status()
     img = Image.open(io.BytesIO(r.content)).convert("RGB")
     img = np.array(img)

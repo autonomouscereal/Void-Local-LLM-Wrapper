@@ -236,6 +236,10 @@ async def global_cors_middleware(request: Request, call_next):
     resp.headers["Access-Control-Expose-Headers"] = "*"
     resp.headers["Access-Control-Max-Age"] = "86400"
     resp.headers["Access-Control-Allow-Private-Network"] = "true"
+    # Help browsers load media without ORB/CORP issues when proxied through this backend
+    if request.url.path.startswith("/uploads/") or request.url.path.endswith(".mp4") or request.url.path.endswith(".png"):
+        resp.headers.setdefault("Cross-Origin-Resource-Policy", "cross-origin")
+        resp.headers.setdefault("Timing-Allow-Origin", "*")
     return resp
 
 
@@ -268,7 +272,7 @@ async def upload(conversation_id: int = Form(...), file: UploadFile = File(...))
     try:
         # Read file and send to orchestrator's upload endpoint
         content = await file.read()
-        async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
+        async with httpx.AsyncClient(trust_env=False) as client:
             files = {"file": (file.filename, content, file.content_type)}
             r = await client.post(ORCH_URL.rstrip("/") + "/upload", files=files)
             r.raise_for_status()
@@ -382,7 +386,7 @@ async def chat(cid: int, request: Request, background_tasks: BackgroundTasks):
 
     async def _proxy_stream():
         try:
-            async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
+            async with httpx.AsyncClient(trust_env=False) as client:
                 url = ORCH_URL.rstrip("/") + "/v1/chat/completions"
                 logging.info("proxy -> orchestrator POST %s", url)
                 async with client.stream("POST", url, json=payload) as r:
@@ -400,7 +404,7 @@ async def chat(cid: int, request: Request, background_tasks: BackgroundTasks):
 
     # Keepalive streaming: periodically yield whitespace while waiting for upstream, then yield body
     t2 = time.perf_counter()
-    async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
+    async with httpx.AsyncClient(trust_env=False) as client:
         url = ORCH_URL.rstrip("/") + "/v1/chat/completions"
         logging.info("proxy -> orchestrator POST %s", url)
         rr = await client.post(url, json=payload)
@@ -482,7 +486,7 @@ async def chat_alt(body: Dict[str, Any], background_tasks: BackgroundTasks):
         atts = await conn.fetch("SELECT name, url, mime FROM attachments WHERE conversation_id=$1", cid)
     oa_msgs = _build_openai_messages([{"role": "user", "content": user_content}], [dict(a) for a in atts])
     payload = {"messages": oa_msgs, "stream": False, "cid": cid}
-    async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
+    async with httpx.AsyncClient(trust_env=False) as client:
         url = ORCH_URL.rstrip("/") + "/v1/chat/completions"
         logging.info("proxy -> orchestrator POST %s", url)
         rr = await client.post(url, json=payload)
@@ -537,7 +541,7 @@ async def call_conv(cid: int, request: Request, background_tasks: BackgroundTask
         atts = await conn.fetch("SELECT name, url, mime FROM attachments WHERE conversation_id=$1", cid)
     oa_msgs = _build_openai_messages([{"role": "user", "content": user_content}], [dict(a) for a in atts])
     payload = {"messages": oa_msgs, "stream": False, "cid": cid}
-    async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
+    async with httpx.AsyncClient(trust_env=False) as client:
         url = ORCH_URL.rstrip("/") + "/v1/chat/completions"
         logging.info("proxy -> orchestrator POST %s", url)
         rr = await client.post(url, json=payload)
@@ -583,7 +587,7 @@ async def call_alt(body: Dict[str, Any], background_tasks: BackgroundTasks):
         atts = await conn.fetch("SELECT name, url, mime FROM attachments WHERE conversation_id=$1", cid)
     oa_msgs = _build_openai_messages([{"role": "user", "content": user_content}], [dict(a) for a in atts])
     payload = {"messages": oa_msgs, "stream": False}
-    async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
+    async with httpx.AsyncClient(trust_env=False) as client:
         rr = await client.post(ORCH_URL.rstrip("/") + "/v1/chat/completions", json=payload)
     # best-effort assistant persistence without affecting response
     def _persist_from_response(conv_id: int, status_code: int, content_type: str, text_body: str) -> None:
@@ -647,7 +651,7 @@ async def passthrough(body: Dict[str, Any]):
     user_content = (body or {}).get("content") or ""
     payload = {"messages": [{"role": "user", "content": user_content}], "stream": False}
     try:
-        async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
+        async with httpx.AsyncClient(trust_env=False) as client:
             rr = await client.post(ORCH_URL.rstrip("/") + "/v1/chat/completions", json=payload)
     except Exception as ex:
         logging.exception("/api/passthrough proxy error")
@@ -679,7 +683,7 @@ async def chat_alt_preflight():
 async def orch_diag():
     out: Dict[str, Any] = {}
     try:
-        async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
+        async with httpx.AsyncClient(trust_env=False) as client:
             h = await client.get(ORCH_URL.rstrip("/") + "/healthz")
             out["healthz_status"] = h.status_code
             # Diagnostics: return raw text to avoid parser coupling
@@ -687,7 +691,7 @@ async def orch_diag():
     except Exception as ex:
         out["healthz_error"] = str(ex)
     try:
-        async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
+        async with httpx.AsyncClient(trust_env=False) as client:
             d = await client.get(ORCH_URL.rstrip("/") + "/debug")
             out["debug_status"] = d.status_code
             out["debug_body"] = d.text
@@ -710,7 +714,7 @@ async def chat_get(cid: int, content: str = ""):
         atts = await conn.fetch("SELECT name, url, mime FROM attachments WHERE conversation_id=$1", cid)
     oa_msgs = _build_openai_messages([{"role": "user", "content": user_content}], [dict(a) for a in atts])
     payload = {"messages": oa_msgs, "stream": False}
-    async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
+    async with httpx.AsyncClient(trust_env=False) as client:
         rr = await client.post(ORCH_URL.rstrip("/") + "/v1/chat/completions", json=payload)
         expected_response = {
             "choices": [
@@ -737,7 +741,7 @@ async def list_jobs(status: Optional[str] = None, limit: int = 50, offset: int =
     if status:
         params["status"] = status
     try:
-        async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
+        async with httpx.AsyncClient(trust_env=False) as client:
             r = await client.get(ORCH_URL.rstrip("/") + "/jobs", params=params)
             if r.status_code >= 400:
                 return JSONResponse(status_code=r.status_code, content={"error": r.text})
@@ -750,7 +754,7 @@ async def list_jobs(status: Optional[str] = None, limit: int = 50, offset: int =
 @app.get("/api/jobs/{job_id}")
 async def get_job(job_id: str):
     try:
-        async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
+        async with httpx.AsyncClient(trust_env=False) as client:
             r = await client.get(ORCH_URL.rstrip("/") + f"/jobs/{job_id}")
             if r.status_code >= 400:
                 return JSONResponse(status_code=r.status_code, content={"error": r.text})
@@ -763,7 +767,7 @@ async def get_job(job_id: str):
 @app.get("/capabilities.json")
 async def capabilities_proxy():
     try:
-        async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
+        async with httpx.AsyncClient(trust_env=False) as client:
             r = await client.get(ORCH_URL.rstrip("/") + "/capabilities.json")
         body = r.content
         headers = {
@@ -783,7 +787,7 @@ async def capabilities_proxy():
 @app.get("/jobs.list")
 async def jobs_list_proxy():
     try:
-        async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
+        async with httpx.AsyncClient(trust_env=False) as client:
             r = await client.get(ORCH_URL.rstrip("/") + "/jobs.list")
         body = r.content
         headers = {
@@ -803,6 +807,35 @@ async def jobs_list_proxy():
 @app.get("/healthz")
 async def healthz():
     return {"status": "ok"}
+
+
+@app.get("/uploads/{path:path}")
+async def uploads_proxy(path: str, request: Request):
+    # Proxy orchestrator uploads as same-origin to avoid ORB and CORS complexity
+    try:
+        upstream = ORCH_URL.rstrip("/") + "/uploads/" + path
+        headers = {}
+        rng = request.headers.get("range")
+        if rng:
+            headers["Range"] = rng
+        async with httpx.AsyncClient(trust_env=False) as client:
+            r = await client.get(upstream, headers=headers)
+        body = r.content
+        out_headers = {
+            "Content-Type": r.headers.get("content-type", "application/octet-stream"),
+            "Content-Length": r.headers.get("content-length", str(len(body))),
+            "Accept-Ranges": r.headers.get("accept-ranges", "bytes"),
+            "Cache-Control": r.headers.get("cache-control", "no-store"),
+            "Access-Control-Allow-Origin": "*",
+            "Cross-Origin-Resource-Policy": "cross-origin",
+        }
+        cr = r.headers.get("content-range")
+        status = r.status_code
+        if cr:
+            out_headers["Content-Range"] = cr
+        return Response(content=body, status_code=status, headers=out_headers, media_type=out_headers["Content-Type"]) 
+    except Exception as ex:
+        return JSONResponse(status_code=502, content={"error": str(ex)})
 
 
 @app.websocket("/api/ws")
@@ -828,15 +861,21 @@ async def chat_ws(websocket: WebSocket):
             if not cid:
                 await websocket.send_text(json.dumps({"error": "missing conversation_id"}))
                 continue
-            # Persist user message and fetch attachments
-            async with _pool().acquire() as conn:
-                await conn.execute(
-                    "INSERT INTO messages (conversation_id, role, content) VALUES ($1, 'user', $2::jsonb)",
-                    cid,
-                    json.dumps({"text": user_content}),
-                )
-                atts = await conn.fetch("SELECT name, url, mime FROM attachments WHERE conversation_id=$1", cid)
-                hist_rows = await conn.fetch("SELECT role, content FROM messages WHERE conversation_id=$1 ORDER BY id ASC", cid)
+            # Persist user message and fetch attachments (tolerate DB outages)
+            atts = []
+            hist_rows = []
+            try:
+                async with _pool().acquire() as conn:
+                    await conn.execute(
+                        "INSERT INTO messages (conversation_id, role, content) VALUES ($1, 'user', $2::jsonb)",
+                        cid,
+                        json.dumps({"text": user_content}),
+                    )
+                    atts = await conn.fetch("SELECT name, url, mime FROM attachments WHERE conversation_id=$1", cid)
+                    hist_rows = await conn.fetch("SELECT role, content FROM messages WHERE conversation_id=$1 ORDER BY id ASC", cid)
+            except Exception:
+                atts = []
+                hist_rows = []
             base_hist: List[Dict[str, Any]] = []
             for r in hist_rows:
                 decoded = _decode_json(r["content"])
@@ -845,7 +884,7 @@ async def chat_ws(websocket: WebSocket):
             payload = {"messages": oa_msgs, "stream": False, "cid": cid}
             # Call orchestrator and relay normalized JSON (OpenAI-compatible envelope + simple message)
             try:
-                async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
+                async with httpx.AsyncClient(trust_env=False) as client:
                     rr = await client.post(ORCH_URL.rstrip("/") + "/v1/chat/completions", json=payload)
                 ct = rr.headers.get("content-type") or "application/json"
                 if ct.startswith("application/json"):
@@ -856,12 +895,15 @@ async def chat_ws(websocket: WebSocket):
                     obj = {"text": rr.text}
                 assistant_text = ((obj.get("choices") or [{}])[0].get("message") or {}).get("content") or obj.get("text") or ""
                 if assistant_text:
-                    async with _pool().acquire() as c2:
-                        await c2.execute(
-                            "INSERT INTO messages (conversation_id, role, content) VALUES ($1, 'assistant', $2::jsonb)",
-                            cid,
-                            json.dumps({"text": assistant_text}),
-                        )
+                    try:
+                        async with _pool().acquire() as c2:
+                            await c2.execute(
+                                "INSERT INTO messages (conversation_id, role, content) VALUES ($1, 'assistant', $2::jsonb)",
+                                cid,
+                                json.dumps({"text": assistant_text}),
+                            )
+                    except Exception:
+                        pass
                 # Build OpenAI-compatible response envelope and a simple normalized message
                 completion = {
                     "id": "ws-orc-1",

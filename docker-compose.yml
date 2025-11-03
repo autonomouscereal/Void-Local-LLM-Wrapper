@@ -191,7 +191,7 @@ services:
     environment:
       - XTTS_MODEL_NAME=tts_models/multilingual/multi-dataset/xtts_v2
       - NVIDIA_VISIBLE_DEVICES=all
-      - PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu128
+      - PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu126
     expose:
       - "8020"
     ports:
@@ -257,7 +257,7 @@ services:
       - "nvidia.com/gpu=all"
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
-      - PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu128
+      - PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu126
     expose:
       - "8188"
     ports:
@@ -392,7 +392,7 @@ services:
     environment:
       - MUSIC_MODEL_ID=facebook/musicgen-small
       - NVIDIA_VISIBLE_DEVICES=all
-      - PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu128
+      - PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu126
     expose:
       - "7860"
     ports:
@@ -414,7 +414,7 @@ services:
         condition: service_completed_successfully
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
-      - PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu128
+      - PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu126
     expose:
       - "8050"
     ports:

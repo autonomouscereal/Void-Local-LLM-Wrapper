@@ -48,7 +48,7 @@ def dl(repo: str, filename: str, target_dir: str, rename: Optional[str] = None, 
     try:
         url = f"https://huggingface.co/{repo}/resolve/main/{filename}"
         headers = {"Authorization": f"Bearer {token}"} if token else None
-        r = requests.get(url, timeout=120, headers=headers)
+        r = requests.get(url, headers=headers)
         r.raise_for_status()
         with open(dst, "wb") as f:
             f.write(r.content)
@@ -76,7 +76,7 @@ def download_with_retries(url: str, dst: str, timeout: int = 300, max_retries: i
     last_err: Optional[Exception] = None
     for attempt in range(1, max_retries + 1):
         try:
-            r = requests.get(url, timeout=timeout, headers=headers)
+            r = requests.get(url, headers=headers)
             r.raise_for_status()
             with open(dst, "wb") as f:
                 f.write(r.content)
@@ -220,7 +220,6 @@ def main() -> None:
             download_with_retries(
                 "https://huggingface.co/deepinsight/insightface/resolve/main/models/antelopev2.zip",
                 tmp_zip,
-                timeout=600,
                 max_retries=3,
                 backoff_seconds=3,
                 headers=headers,

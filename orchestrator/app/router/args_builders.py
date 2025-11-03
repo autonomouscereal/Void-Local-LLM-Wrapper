@@ -69,3 +69,7 @@ def build_dsrvc_args(req_text: str) -> Dict[str, Any]:
     return {"lyrics": req_text, "notes_midi": None, "melody_wav": None, "target_voice_ref": None, "seed": None}
 
 
+def build_math_args(req_text: str) -> Dict[str, Any]:
+    return {"expr": req_text}
+
+

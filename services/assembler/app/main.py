@@ -71,7 +71,7 @@ def _ffmpeg_mux(
 
 
 def _download(url: str, dest_path: str, timeout: int = 60) -> None:
-    r = requests.get(url, timeout=timeout)
+    r = requests.get(url)
     r.raise_for_status()
     with open(dest_path, "wb") as f:
         f.write(r.content)

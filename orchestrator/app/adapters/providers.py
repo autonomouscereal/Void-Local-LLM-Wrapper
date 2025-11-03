@@ -41,7 +41,7 @@ def classify_exc(e: Exception) -> ProviderError:
     return ProviderError("permanent", None, s)
 
 
-def _call_provider_chat(provider, prompt: str, max_tokens: int, timeout: int | None = None):
+def _call_provider_chat(provider, prompt: str, max_tokens: int):
     try:
         # Timeouts are forbidden; always call without timeout
         return provider.chat(prompt, max_tokens=max_tokens)
@@ -57,7 +57,7 @@ def model_chat_with_retry(provider, prompt: str, max_tokens: int, timeout_s: int
     for attempt in range(retries + 1):
         try:
             # Always call without timeout
-            resp = _call_provider_chat(provider, prompt, max_tokens, timeout=None)
+            resp = _call_provider_chat(provider, prompt, max_tokens)
             return resp
         except Exception as e:
             perr = classify_exc(e)

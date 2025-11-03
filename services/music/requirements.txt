@@ -1,8 +1,11 @@
 fastapi>=0.115.0,<0.200
 uvicorn[standard]>=0.31.0,<0.40
-torch==2.9.0+cu128 ; platform_system != 'Windows'
-torchaudio==2.9.0+cu128 ; platform_system != 'Windows'
---extra-index-url https://download.pytorch.org/whl/cu128
+
+# Pin to Pascal-safe PyTorch (P40, sm_61): 2.8.x built for CUDA 12.6
+--index-url https://download.pytorch.org/whl/cu126
+torch==2.8.* ; platform_system != 'Windows'
+torchaudio ; platform_system != 'Windows'
+
 transformers>=4.45.0,<5
 accelerate>=0.34.0,<1
 numpy>=1.26.4,<2.0.0

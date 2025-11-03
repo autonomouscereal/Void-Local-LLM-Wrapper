@@ -11,6 +11,7 @@ from .predicates import (
     looks_like_tts,
     looks_like_music,
     looks_like_code_task,
+    looks_like_math,
 )
 from .args_builders import (
     build_film_args,
@@ -24,6 +25,7 @@ from .args_builders import (
     build_sao_args,
     build_demucs_args,
     build_dsrvc_args,
+    build_math_args,
 )
 
 
@@ -77,6 +79,8 @@ def route_for_request(req: Dict[str, Any]) -> RouteDecision:
             return RouteDecision(kind="tool", tool="music.melody.musicgen", args=build_musicgen_args(t), reason="music-melody")
         # Default to full song (YuE) for best-quality audio by default
         return RouteDecision(kind="tool", tool="music.song.yue", args=build_yue_args(t), reason="music-default-yue")
+    if looks_like_math(t):
+        return RouteDecision(kind="tool", tool="math.eval", args=build_math_args(t), reason="math-intent")
     return RouteDecision(kind="planner", tool=None, args=None, reason="fallback-planner")
 
 
