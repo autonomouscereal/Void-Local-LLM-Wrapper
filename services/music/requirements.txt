@@ -1,7 +1,9 @@
 fastapi>=0.115.0,<0.200
 uvicorn[standard]>=0.31.0,<0.40
 
-# Pin to Pascal-safe PyTorch (P40, sm_61): 2.8.x built for CUDA 12.6
+# Pin to Pascal-safe PyTorch (Tesla P40, sm_61): 2.8.x built for CUDA 12.6.
+# Maxwell (sm_52) is older; official wheels may not target it. This pin + cu126
+# channel avoids unintended 2.9+/cu128 pulls and maximizes compatibility.
 torch==2.8.* ; platform_system != 'Windows'
 torchaudio ; platform_system != 'Windows'
 

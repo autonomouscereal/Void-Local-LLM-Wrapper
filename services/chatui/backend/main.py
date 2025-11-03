@@ -745,8 +745,37 @@ async def list_jobs(status: Optional[str] = None, limit: int = 50, offset: int =
             r = await client.get(ORCH_URL.rstrip("/") + "/jobs", params=params)
             if r.status_code >= 400:
                 return JSONResponse(status_code=r.status_code, content={"error": r.text})
-            # Diagnostics: return raw text to avoid parser coupling
-            return r.text
+            # Robust handling: prefer JSON, but support raw text/binary passthrough
+            upstream_ct = (r.headers.get("content-type") or "").lower()
+            if "application/json" in upstream_ct or "/json" in upstream_ct:
+                body = r.content
+                headers = {
+                    "Cache-Control": "no-store",
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Private-Network": "true",
+                    "Access-Control-Expose-Headers": "Content-Type, Content-Length",
+                    "Connection": "close",
+                    "Content-Length": str(len(body)),
+                    "Content-Type": r.headers.get("content-type") or "application/json",
+                }
+                return Response(content=body, media_type=headers["Content-Type"], status_code=r.status_code, headers=headers)
+            # Try to coerce to JSON if upstream forgot headers
+            try:
+                data = JSONParser().parse(r.text, {})
+                return JSONResponse(status_code=r.status_code, content=data)
+            except Exception:
+                body = r.content
+                headers = {
+                    "Cache-Control": "no-store",
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Private-Network": "true",
+                    "Access-Control-Expose-Headers": "Content-Type, Content-Length",
+                    "Connection": "close",
+                    "Content-Length": str(len(body)),
+                    "Content-Type": r.headers.get("content-type") or "text/plain; charset=utf-8",
+                    "X-Upstream-Content-Type": r.headers.get("content-type") or "",
+                }
+                return Response(content=body, media_type=headers["Content-Type"], status_code=r.status_code, headers=headers)
     except Exception as ex:
         return JSONResponse(status_code=500, content={"error": str(ex)})
 
@@ -758,7 +787,35 @@ async def get_job(job_id: str):
             r = await client.get(ORCH_URL.rstrip("/") + f"/jobs/{job_id}")
             if r.status_code >= 400:
                 return JSONResponse(status_code=r.status_code, content={"error": r.text})
-            return r.text
+            upstream_ct = (r.headers.get("content-type") or "").lower()
+            if "application/json" in upstream_ct or "/json" in upstream_ct:
+                body = r.content
+                headers = {
+                    "Cache-Control": "no-store",
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Private-Network": "true",
+                    "Access-Control-Expose-Headers": "Content-Type, Content-Length",
+                    "Connection": "close",
+                    "Content-Length": str(len(body)),
+                    "Content-Type": r.headers.get("content-type") or "application/json",
+                }
+                return Response(content=body, media_type=headers["Content-Type"], status_code=r.status_code, headers=headers)
+            try:
+                data = JSONParser().parse(r.text, {})
+                return JSONResponse(status_code=r.status_code, content=data)
+            except Exception:
+                body = r.content
+                headers = {
+                    "Cache-Control": "no-store",
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Private-Network": "true",
+                    "Access-Control-Expose-Headers": "Content-Type, Content-Length",
+                    "Connection": "close",
+                    "Content-Length": str(len(body)),
+                    "Content-Type": r.headers.get("content-type") or "text/plain; charset=utf-8",
+                    "X-Upstream-Content-Type": r.headers.get("content-type") or "",
+                }
+                return Response(content=body, media_type=headers["Content-Type"], status_code=r.status_code, headers=headers)
     except Exception as ex:
         return JSONResponse(status_code=500, content={"error": str(ex)})
 

@@ -1,3 +1,7 @@
+x-build-args:
+  &cu126_args
+  PIP_EXTRA_INDEX_URL: https://download.pytorch.org/whl/cu126
+
 services:
   nvidia_init:
     image: ubuntu:22.04
@@ -111,6 +115,8 @@ services:
       context: ./orchestrator
       dockerfile: Dockerfile
       network: host
+      args:
+        <<: *cu126_args
     container_name: void_orchestrator
     restart: unless-stopped
     depends_on:
@@ -182,6 +188,8 @@ services:
       context: ./services/xtts
       dockerfile: Dockerfile
       network: host
+      args:
+        <<: *cu126_args
     container_name: xtts_service
     restart: unless-stopped
     runtime: nvidia
@@ -250,6 +258,8 @@ services:
       context: ./services/comfyui
       dockerfile: Dockerfile
       network: host
+      args:
+        <<: *cu126_args
     container_name: comfyui
     restart: unless-stopped
     runtime: nvidia
@@ -282,6 +292,8 @@ services:
       context: ./services/comfyui
       dockerfile: Dockerfile
       network: host
+      args:
+        <<: *cu126_args
     container_name: comfyui-1
     profiles: ["comfy-replicas"]
     restart: unless-stopped
@@ -308,6 +320,8 @@ services:
       context: ./services/comfyui
       dockerfile: Dockerfile
       network: host
+      args:
+        <<: *cu126_args
     container_name: comfyui-2
     profiles: ["comfy-replicas"]
     restart: unless-stopped
@@ -390,6 +404,8 @@ services:
       context: ./services/music
       dockerfile: Dockerfile
       network: host
+      args:
+        <<: *cu126_args
     container_name: music_service
     restart: unless-stopped
     runtime: nvidia
@@ -414,6 +430,8 @@ services:
       context: ./services/vlm
       dockerfile: Dockerfile
       network: host
+      args:
+        <<: *cu126_args
     container_name: vlm_service
     restart: unless-stopped
     runtime: nvidia

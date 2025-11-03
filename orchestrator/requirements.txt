@@ -10,4 +10,8 @@ asyncpg>=0.29.0,<1
 pgvector>=0.2.5,<0.3
 sentence-transformers>=3.0.1,<4
 xxhash>=3.4.1,<4
+# Pin to Pascal-safe PyTorch (Tesla P40, sm_61): 2.8.x built for CUDA 12.6.
+# Maxwell (sm_52) is older; official wheels may not target it. This pin + cu126
+# channel avoids unintended 2.9+/cu128 pulls and maximizes compatibility.
+torch==2.8.*
 
