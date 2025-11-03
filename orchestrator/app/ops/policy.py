@@ -6,7 +6,7 @@ from typing import Optional
 
 
 _BANNED_MODULES = {
-    "pydantic": "BANNED: pydantic is forbidden. Use plain dicts + validators.",
+    # Allow pydantic imports (FastAPI depends on it); avoid using it in our code instead
     "sqlalchemy": "BANNED: sqlalchemy/ORM is forbidden. Use asyncpg + raw SQL.",
 }
 
@@ -27,10 +27,11 @@ class _BannedFinder:
     def find_spec(self, fullname: str, path: Optional[list[str]], target=None):  # type: ignore[no-untyped-def]
         base = fullname.split(".", 1)[0]
         if base in _BANNED_MODULES:
-            reason = _BANNED_MODULES[base]
-            spec = types.SimpleNamespace()
-            spec.loader = _BannedLoader(base, reason)  # type: ignore[attr-defined]
-            return spec  # type: ignore[return-value]
+            try:
+                from importlib.machinery import ModuleSpec  # type: ignore
+                return ModuleSpec(fullname, _BannedLoader(fullname, _BANNED_MODULES[base]))
+            except Exception:
+                return None
         return None
 
 
@@ -74,6 +75,22 @@ def _patch_http_clients() -> None:
 
 
 def enforce_core_policy() -> None:
+    # Sanitize any broken meta_path entries left by prior runs/hooks
+    try:
+        sanitized: list[object] = []
+        for finder in list(sys.meta_path):
+            try:
+                if isinstance(finder, types.SimpleNamespace):
+                    continue
+                if not (hasattr(finder, "find_spec") or hasattr(finder, "find_module")):
+                    continue
+                sanitized.append(finder)
+            except Exception:
+                continue
+        sys.meta_path[:] = sanitized
+    except Exception:
+        pass
+
     # Install import guard once
     try:
         if not any(isinstance(f, _BannedFinder) for f in sys.meta_path):
