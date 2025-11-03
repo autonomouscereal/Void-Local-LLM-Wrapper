@@ -3695,7 +3695,68 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     # If backends errored but we have tool results (e.g., image job still running/finishing), degrade gracefully
     if qwen_result.get("error") or gptoss_result.get("error"):
         if tool_results:
-            final_text = ""
+            # Build a minimal assets block so the UI can render generated media even if models errored
+            def _asset_urls_from_tools(results: List[Dict[str, Any]]) -> List[str]:
+                urls: List[str] = []
+                for tr in results or []:
+                    try:
+                        res = (tr or {}).get("result") or {}
+                        if isinstance(res, dict):
+                            # envelope-based tools
+                            meta = res.get("meta")
+                            arts = res.get("artifacts")
+                            if isinstance(meta, dict) and isinstance(arts, list):
+                                cid = meta.get("cid")
+                                for a in arts:
+                                    aid = (a or {}).get("id"); kind = (a or {}).get("kind") or ""
+                                    if cid and aid:
+                                        if kind.startswith("image"):
+                                            urls.append(f"/uploads/artifacts/image/{cid}/{aid}")
+                                        elif kind.startswith("audio"):
+                                            # allow both tts and music paths
+                                            urls.append(f"/uploads/artifacts/audio/tts/{cid}/{aid}")
+                                            urls.append(f"/uploads/artifacts/music/{cid}/{aid}")
+                            # generic path scraping
+                            exts = (".mp4", ".webm", ".mov", ".mkv", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".wav", ".mp3", ".m4a", ".ogg", ".flac", ".opus", ".srt")
+                            def _walk(v):
+                                if isinstance(v, str):
+                                    s = v.strip().lower()
+                                    if not s:
+                                        return
+                                    if s.startswith("http://") or s.startswith("https://"):
+                                        urls.append(v)
+                                        return
+                                    if "/workspace/uploads/" in v:
+                                        try:
+                                            tail = v.split("/workspace", 1)[1]
+                                            urls.append(tail)
+                                        except Exception:
+                                            pass
+                                        return
+                                    if v.startswith("/uploads/"):
+                                        urls.append(v)
+                                        return
+                                    if any(s.endswith(ext) for ext in exts) and ("/uploads/" in s or "/workspace/uploads/" in s):
+                                        if "/workspace/uploads/" in v:
+                                            try:
+                                                tail = v.split("/workspace", 1)[1]
+                                                urls.append(tail)
+                                            except Exception:
+                                                pass
+                                        else:
+                                            urls.append(v)
+                                elif isinstance(v, list):
+                                    for it in v:
+                                        _walk(it)
+                                elif isinstance(v, dict):
+                                    for it in v.values():
+                                        _walk(it)
+                            _walk(res)
+                    except Exception:
+                        continue
+                return list(dict.fromkeys(urls))
+            asset_urls = _asset_urls_from_tools(tool_results)
+            final_text = "\n".join(["Assets:"] + [f"- {u}" for u in asset_urls]) if asset_urls else ""
             usage = estimate_usage(messages, final_text)
             response = {
                 "id": "orc-1",
