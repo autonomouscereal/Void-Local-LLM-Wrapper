@@ -225,6 +225,14 @@ EVENT_BUFFER_MAX = int(os.getenv("EVENT_BUFFER_MAX", "100"))
 ARTIFACT_SHARD_BYTES = int(os.getenv("ARTIFACT_SHARD_BYTES", "200000"))
 ARTIFACT_LATEST_ONLY = os.getenv("ARTIFACT_LATEST_ONLY", "true").lower() == "true"
 
+# Music/Audio extended services (spec Step 18/Instruction Set)
+YUE_API_URL = os.getenv("YUE_API_URL")                  # http://yue:9001
+SAO_API_URL = os.getenv("SAO_API_URL")                  # http://sao:9002
+DEMUCS_API_URL = os.getenv("DEMUCS_API_URL")            # http://demucs:9003
+RVC_API_URL = os.getenv("RVC_API_URL")                  # http://rvc:9004
+DIFFSINGER_RVC_API_URL = os.getenv("DIFFSINGER_RVC_API_URL")  # http://dsrvc:9005
+HUNYUAN_FOLEY_API_URL = os.getenv("HUNYUAN_FOLEY_API_URL")    # http://foley:9006
+
 
 def _sha256_bytes(b: bytes) -> str:
     import hashlib as _hl
@@ -949,6 +957,55 @@ def get_builtin_tools_schema() -> List[Dict[str, Any]]:
                     },
                     "required": []
                 }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "music.song.yue",
+                "parameters": {"type": "object", "properties": {"lyrics": {"type": "string"}, "style_tags": {"type": "array", "items": {"type": "string"}}, "bpm": {"type": "integer"}, "key": {"type": "string"}, "seed": {"type": "integer"}, "reference_song": {"type": "string"}, "infinite": {"type": "boolean"}}, "required": ["lyrics"]}
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "music.melody.musicgen",
+                "parameters": {"type": "object", "properties": {"text": {"type": "string"}, "melody_wav": {"type": "string"}, "bpm": {"type": "integer"}, "key": {"type": "string"}, "seed": {"type": "integer"}, "style_tags": {"type": "array", "items": {"type": "string"}}, "length_s": {"type": "integer"}, "infinite": {"type": "boolean"}}, "required": []}
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "music.timed.sao",
+                "parameters": {"type": "object", "properties": {"text": {"type": "string"}, "seconds": {"type": "integer"}, "bpm": {"type": "integer"}, "seed": {"type": "integer"}, "genre_tags": {"type": "array", "items": {"type": "string"}}}, "required": ["text", "seconds"]}
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "voice.sing.diffsinger.rvc",
+                "parameters": {"type": "object", "properties": {"lyrics": {"type": "string"}, "notes_midi": {"type": "string"}, "melody_wav": {"type": "string"}, "target_voice_ref": {"type": "string"}, "seed": {"type": "integer"}}, "required": ["lyrics"]}
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "audio.stems.demucs",
+                "parameters": {"type": "object", "properties": {"mix_wav": {"type": "string"}, "stems": {"type": "array", "items": {"type": "string"}}}, "required": ["mix_wav"]}
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "audio.vc.rvc",
+                "parameters": {"type": "object", "properties": {"source_vocal_wav": {"type": "string"}, "target_voice_ref": {"type": "string"}}, "required": ["source_vocal_wav", "target_voice_ref"]}
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "audio.foley.hunyuan",
+                "parameters": {"type": "object", "properties": {"video_ref": {"type": "string"}, "cue_regions": {"type": "array", "items": {"type": "object"}}, "style_tags": {"type": "array", "items": {"type": "string"}}}, "required": ["video_ref"]}
             }
         },
         {
@@ -1779,6 +1836,126 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         try:
             env = run_music_mixdown(args if isinstance(args, dict) else {}, manifest)
             return {"name": name, "result": env}
+        except Exception as ex:
+            return {"name": name, "error": str(ex)}
+    # --- Extended Music/Audio tools ---
+    if name == "music.song.yue" and ALLOW_TOOL_EXECUTION:
+        if not YUE_API_URL:
+            return {"name": name, "error": "YUE_API_URL not configured"}
+        try:
+            async with httpx.AsyncClient(timeout=None) as client:
+                body = {
+                    "lyrics": args.get("lyrics"),
+                    "style_tags": args.get("style_tags") or [],
+                    "bpm": args.get("bpm"),
+                    "key": args.get("key"),
+                    "seed": args.get("seed"),
+                    "reference_song": args.get("reference_song"),
+                    "quality": "max",
+                    "infinite": True,
+                }
+                r = await client.post(YUE_API_URL.rstrip("/") + "/v1/music/song", json=body)
+                r.raise_for_status()
+                return {"name": name, "result": r.json()}
+        except Exception as ex:
+            return {"name": name, "error": str(ex)}
+    if name == "music.melody.musicgen" and ALLOW_TOOL_EXECUTION:
+        if not MUSIC_API_URL:
+            return {"name": name, "error": "MUSIC_API_URL not configured"}
+        try:
+            async with httpx.AsyncClient(timeout=None) as client:
+                payload = {
+                    "text": args.get("text"),
+                    "melody_wav": args.get("melody_wav"),
+                    "bpm": args.get("bpm"),
+                    "key": args.get("key"),
+                    "seed": args.get("seed"),
+                    "style_tags": args.get("style_tags") or [],
+                    "length_s": args.get("length_s"),
+                    "quality": "max",
+                    "infinite": True,
+                }
+                r = await client.post(MUSIC_API_URL.rstrip("/") + "/generate", json=payload)
+                r.raise_for_status()
+                return {"name": name, "result": r.json()}
+        except Exception as ex:
+            return {"name": name, "error": str(ex)}
+    if name == "music.timed.sao" and ALLOW_TOOL_EXECUTION:
+        if not SAO_API_URL:
+            return {"name": name, "error": "SAO_API_URL not configured"}
+        try:
+            async with httpx.AsyncClient(timeout=None) as client:
+                payload = {
+                    "text": args.get("text"),
+                    "seconds": int(args.get("seconds") or args.get("duration_sec") or 8),
+                    "bpm": args.get("bpm"),
+                    "seed": args.get("seed"),
+                    "genre_tags": args.get("genre_tags") or [],
+                    "quality": "max",
+                }
+                r = await client.post(SAO_API_URL.rstrip("/") + "/v1/music/timed", json=payload)
+                r.raise_for_status()
+                return {"name": name, "result": r.json()}
+        except Exception as ex:
+            return {"name": name, "error": str(ex)}
+    if name == "audio.stems.demucs" and ALLOW_TOOL_EXECUTION:
+        if not DEMUCS_API_URL:
+            return {"name": name, "error": "DEMUCS_API_URL not configured"}
+        try:
+            async with httpx.AsyncClient(timeout=None) as client:
+                payload = {
+                    "mix_wav": args.get("mix_wav") or args.get("src"),
+                    "stems": args.get("stems") or ["vocals","drums","bass","other"],
+                }
+                r = await client.post(DEMUCS_API_URL.rstrip("/") + "/v1/audio/stems", json=payload)
+                r.raise_for_status()
+                return {"name": name, "result": r.json()}
+        except Exception as ex:
+            return {"name": name, "error": str(ex)}
+    if name == "audio.vc.rvc" and ALLOW_TOOL_EXECUTION:
+        if not RVC_API_URL:
+            return {"name": name, "error": "RVC_API_URL not configured"}
+        try:
+            async with httpx.AsyncClient(timeout=None) as client:
+                payload = {
+                    "source_vocal_wav": args.get("source_vocal_wav") or args.get("src"),
+                    "target_voice_ref": args.get("target_voice_ref") or args.get("voice_ref"),
+                }
+                r = await client.post(RVC_API_URL.rstrip("/") + "/v1/audio/convert", json=payload)
+                r.raise_for_status()
+                return {"name": name, "result": r.json()}
+        except Exception as ex:
+            return {"name": name, "error": str(ex)}
+    if name == "voice.sing.diffsinger.rvc" and ALLOW_TOOL_EXECUTION:
+        if not DIFFSINGER_RVC_API_URL:
+            return {"name": name, "error": "DIFFSINGER_RVC_API_URL not configured"}
+        try:
+            async with httpx.AsyncClient(timeout=None) as client:
+                payload = {
+                    "lyrics": args.get("lyrics"),
+                    "notes_midi": args.get("notes_midi"),
+                    "melody_wav": args.get("melody_wav"),
+                    "target_voice_ref": args.get("target_voice_ref") or args.get("voice_ref"),
+                    "seed": args.get("seed"),
+                }
+                r = await client.post(DIFFSINGER_RVC_API_URL.rstrip("/") + "/v1/voice/sing", json=payload)
+                r.raise_for_status()
+                return {"name": name, "result": r.json()}
+        except Exception as ex:
+            return {"name": name, "error": str(ex)}
+    if name == "audio.foley.hunyuan" and ALLOW_TOOL_EXECUTION:
+        if not HUNYUAN_FOLEY_API_URL:
+            return {"name": name, "error": "HUNYUAN_FOLEY_API_URL not configured"}
+        try:
+            async with httpx.AsyncClient(timeout=None) as client:
+                payload = {
+                    "video_ref": args.get("video_ref") or args.get("src"),
+                    "cue_regions": args.get("cue_regions") or [],
+                    "style_tags": args.get("style_tags") or [],
+                }
+                r = await client.post(HUNYUAN_FOLEY_API_URL.rstrip("/") + "/v1/audio/foley", json=payload)
+                r.raise_for_status()
+                return {"name": name, "result": r.json()}
         except Exception as ex:
             return {"name": name, "error": str(ex)}
     if name in ("image.gen", "image.edit", "image.upscale") and ALLOW_TOOL_EXECUTION:

@@ -19,6 +19,11 @@ from .args_builders import (
     build_image_args,
     build_tts_args,
     build_music_args,
+    build_yue_args,
+    build_musicgen_args,
+    build_sao_args,
+    build_demucs_args,
+    build_dsrvc_args,
 )
 
 
@@ -56,7 +61,21 @@ def route_for_request(req: Dict[str, Any]) -> RouteDecision:
     if looks_like_tts(t):
         return RouteDecision(kind="tool", tool="tts.speak", args=build_tts_args(t), reason="tts-intent")
     if looks_like_music(t):
-        return RouteDecision(kind="tool", tool="music.dispatch", args=build_music_args(t), reason="music-intent")
+        # Fine-grained deterministic routing among music/audio tools
+        tl = (t or "").lower()
+        import re
+        if any(k in tl for k in ["lyrics", "chorus", "verse"]):
+            return RouteDecision(kind="tool", tool="music.song.yue", args=build_yue_args(t), reason="music-lyrics")
+        if any(k in tl for k in ["duration", "seconds", "sec", "sfx", "sound effect", "foley clip"]):
+            return RouteDecision(kind="tool", tool="music.timed.sao", args=build_sao_args(t), reason="music-duration")
+        if any(k in tl for k in ["stems", "separate", "split tracks"]):
+            return RouteDecision(kind="tool", tool="audio.stems.demucs", args=build_demucs_args(t), reason="music-stems")
+        if any(k in tl for k in ["sing", "timbre", "convert voice", "voice convert", "rvc"]):
+            return RouteDecision(kind="tool", tool="voice.sing.diffsinger.rvc", args=build_dsrvc_args(t), reason="music-sing")
+        if any(k in tl for k in ["melody", "hum", "humming", "whistle"]):
+            return RouteDecision(kind="tool", tool="music.melody.musicgen", args=build_musicgen_args(t), reason="music-melody")
+        # Default to full song (YuE) for best-quality audio by default
+        return RouteDecision(kind="tool", tool="music.song.yue", args=build_yue_args(t), reason="music-default-yue")
     return RouteDecision(kind="planner", tool=None, args=None, reason="fallback-planner")
 
 
