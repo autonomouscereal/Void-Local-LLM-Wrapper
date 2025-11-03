@@ -57,14 +57,19 @@ function App() {
   // WS retry helper: reconnect and resend payload until one message arrives
   const wsSendWithRetry = async (payload, onMessage) => {
     let attempt = 0
-    let closedBeforeMessage = true
+    let gotRealMessage = false
     const sendOnce = () => new Promise((resolve) => {
       const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/api/ws')
       ws.onopen = () => {
         try { ws.send(JSON.stringify(payload)) } catch {}
       }
       ws.onmessage = (ev) => {
-        closedBeforeMessage = false
+        const raw = ev?.data || ''
+        let obj = null
+        try { obj = raw ? JSON.parse(raw) : null } catch { obj = null }
+        // Ignore keepalive frames
+        if (obj && obj.keepalive === true) return
+        gotRealMessage = true
         try { onMessage(ev) } catch {}
         try { ws.close() } catch {}
         resolve()
@@ -80,8 +85,7 @@ function App() {
     while (true) {
       attempt += 1
       await sendOnce()
-      if (!closedBeforeMessage) break
-      // Exponential backoff with cap; no hard timeout overall per policy
+      if (gotRealMessage) break
       const delayMs = Math.min(5000, 500 * Math.pow(2, Math.max(0, attempt - 1)))
       await new Promise(r => setTimeout(r, delayMs))
     }

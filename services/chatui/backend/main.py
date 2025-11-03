@@ -963,6 +963,18 @@ async def chat_ws(websocket: WebSocket):
             payload = {"messages": oa_msgs, "stream": False, "cid": cid}
             # Call orchestrator and relay normalized JSON (OpenAI-compatible envelope + simple message)
             try:
+                # Periodic keepalive to prevent intermediary/proxy idle disconnects
+                live = True
+                async def _keepalive() -> None:
+                    import asyncio as _asyncio
+                    while live:
+                        try:
+                            await websocket.send_text(json.dumps({"keepalive": True }))
+                        except Exception:
+                            break
+                        await _asyncio.sleep(10)
+                import asyncio as _asyncio
+                ka_task = _asyncio.create_task(_keepalive())
                 async with httpx.AsyncClient(trust_env=False, timeout=None) as client:
                     rr = await client.post(ORCH_URL.rstrip("/") + "/v1/chat/completions", json=payload)
                 ct = rr.headers.get("content-type") or "application/json"
@@ -1001,8 +1013,14 @@ async def chat_ws(websocket: WebSocket):
                     "data": completion,
                     "message": {"role": "assistant", "content": {"text": assistant_text}},
                 }
+                live = False
+                try: ka_task.cancel()
+                except Exception: pass
                 await websocket.send_text(json.dumps(payload_out))
             except Exception as ex:
+                live = False
+                try: ka_task.cancel()
+                except Exception: pass
                 # Ensure non-empty, informative error payloads
                 err_str = (str(ex) or getattr(ex, "message", "") or ex.__class__.__name__).strip()
                 payload_err = {
