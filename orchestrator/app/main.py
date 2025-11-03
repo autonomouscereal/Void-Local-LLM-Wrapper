@@ -609,6 +609,65 @@ async def get_pg_pool() -> Optional[asyncpg.pool.Pool]:
     )
     async with pg_pool.acquire() as conn:
         await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
+        # Core tables for tracing/distillation (no ORM)
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS run (
+              id            BIGSERIAL PRIMARY KEY,
+              trace_id      TEXT UNIQUE NOT NULL,
+              workspace     TEXT NOT NULL DEFAULT 'default',
+              mode          TEXT NOT NULL,
+              seed          BIGINT NOT NULL,
+              pack_hash     TEXT,
+              request_json  JSONB NOT NULL,
+              response_json JSONB,
+              metrics_json  JSONB,
+              created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+            """
+        )
+        await conn.execute("CREATE INDEX IF NOT EXISTS run_mode_created_idx ON run(mode, created_at DESC);")
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS artifact (
+              id          BIGSERIAL PRIMARY KEY,
+              sha256      TEXT NOT NULL UNIQUE,
+              uri         TEXT NOT NULL,
+              kind        TEXT NOT NULL,
+              bytes       BIGINT,
+              meta_json   JSONB,
+              created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+            """
+        )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tool_call (
+              id          BIGSERIAL PRIMARY KEY,
+              run_id      BIGINT NOT NULL REFERENCES run(id) ON DELETE CASCADE,
+              name        TEXT NOT NULL,
+              seed        BIGINT NOT NULL,
+              args_json   JSONB NOT NULL,
+              result_json JSONB,
+              artifact_id BIGINT REFERENCES artifact(id),
+              duration_ms INTEGER,
+              created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+            """
+        )
+        await conn.execute("CREATE INDEX IF NOT EXISTS tool_run_name_idx ON tool_call(run_id, name);")
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS icw_log (
+              id            BIGSERIAL PRIMARY KEY,
+              run_id        BIGINT NOT NULL REFERENCES run(id) ON DELETE CASCADE,
+              pack_hash     TEXT NOT NULL,
+              budget_tokens INTEGER NOT NULL,
+              scores_json   JSONB,
+              created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+            """
+        )
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS rag_docs (
