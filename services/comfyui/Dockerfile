@@ -3,8 +3,8 @@ FROM python:3.10-bookworm
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-# Enable CUDA wheels channel for PyTorch cu118 (Pascal sm_61 P40 + RTX8000)
-ENV PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu118
+# Enable CUDA wheels channel for PyTorch cu126 (Pascal sm_61 P40 + RTX8000)
+ENV PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu126
 
 RUN apt-get update && apt-get install -y git ffmpeg build-essential libgl1 curl && rm -rf /var/lib/apt/lists/*
 
@@ -12,8 +12,8 @@ WORKDIR /comfyui
 
 RUN git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git .
 
-# Pre-install CUDA-enabled torch (cu118) compatible with P40 (sm_61) and RTX 8000
-RUN pip install --no-cache-dir torch==2.0.1+cu118 torchvision==0.15.2+cu118 torchaudio==2.0.2+cu118
+# Pre-install CUDA-enabled torch (cu126) compatible with P40 (sm_61) and RTX 8000
+RUN pip install --no-cache-dir torch==2.8.* torchvision torchaudio
 # Install ComfyUI requirements and common deps
 RUN pip install --no-cache-dir -r requirements.txt
 RUN pip install --no-cache-dir numpy==1.26.4 opencv-python-headless==4.9.0.80 imageio-ffmpeg==0.4.9 pillow==10.4.0 \
