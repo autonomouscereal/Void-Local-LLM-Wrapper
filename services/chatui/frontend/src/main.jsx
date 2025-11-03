@@ -54,6 +54,39 @@ function App() {
     return n
   }
 
+  // WS retry helper: reconnect and resend payload until one message arrives
+  const wsSendWithRetry = async (payload, onMessage) => {
+    let attempt = 0
+    let closedBeforeMessage = true
+    const sendOnce = () => new Promise((resolve) => {
+      const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/api/ws')
+      ws.onopen = () => {
+        try { ws.send(JSON.stringify(payload)) } catch {}
+      }
+      ws.onmessage = (ev) => {
+        closedBeforeMessage = false
+        try { onMessage(ev) } catch {}
+        try { ws.close() } catch {}
+        resolve()
+      }
+      ws.onerror = () => {
+        try { ws.close() } catch {}
+        resolve()
+      }
+      ws.onclose = () => {
+        resolve()
+      }
+    })
+    while (true) {
+      attempt += 1
+      await sendOnce()
+      if (!closedBeforeMessage) break
+      // Exponential backoff with cap; no hard timeout overall per policy
+      const delayMs = Math.min(5000, 500 * Math.pow(2, Math.max(0, attempt - 1)))
+      await new Promise(r => setTimeout(r, delayMs))
+    }
+  }
+
   const extractMedia = (text) => {
     const urls = []
     // Match absolute http(s) and app-served relative assets (e.g., /uploads/...)
@@ -281,18 +314,13 @@ function App() {
       // Persistent WebSocket: send chat message and await the server push
       const t0 = performance.now()
       console.log('[ui] ws connect')
-      const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/api/ws')
       // Insert a temporary assistant placeholder to show thinking state
       const thinkingId = nextLocalId()
       const showThinking = () => {
         setMsgs(prev => ([...prev, { id: thinkingId, role: 'assistant', content: { text: 'Thinking…' } }]))
       }
-      ws.onopen = () => {
-        console.log('[ui] ws open')
-        showThinking()
-        ws.send(JSON.stringify({ conversation_id: conversationId, content: userText }))
-      }
-      ws.onmessage = (ev) => {
+      showThinking()
+      await wsSendWithRetry({ conversation_id: conversationId, content: userText }, (ev) => {
         const t1 = performance.now()
         const raw = ev.data || ''
         console.log('[ui] ws message', { bytes: raw.length, dt_ms: (t1 - t0).toFixed(1) })
@@ -301,7 +329,6 @@ function App() {
         if (data && data.error) {
           // Replace thinking bubble with error
           setMsgs(prev => (prev.map(m => m.id === thinkingId ? { ...m, content: { text: `Error: ${data.error}` } } : m)))
-          ws.close()
           setSending(false)
           return
         }
@@ -331,22 +358,8 @@ function App() {
         // Scan for job IDs and start live progress streams
         const jobIds = parseJobIdsFromText(finalText)
         jobIds.forEach(startJobStream)
-        ws.close()
         setSending(false)
-      }
-      ws.onerror = () => {
-        console.error('[ui] ws error')
-        // Replace thinking bubble with error if present; else append error
-        setMsgs(prev => {
-          const hasThinking = prev.some(m => m.id === thinkingId)
-          if (hasThinking) return prev.map(m => m.id === thinkingId ? { ...m, content: { text: 'Error: Network error' } } : m)
-          return ([...prev, { id: Date.now(), role: 'assistant', content: { text: 'Error: Network error' } }])
-        })
-        setSending(false)
-      }
-      ws.onclose = () => {
-        console.log('[ui] ws closed')
-      }
+      })
       return
     } catch (err) {
       // Catch network-level errors so they don’t manifest as unhandled promise rejections.
@@ -650,6 +663,10 @@ function App() {
                 <div style={{ fontSize: 12, color: '#9ca3af' }}>{j.status || 'unknown'}</div>
                 <div style={{ fontSize: 12 }}>job: {j.id || j.job_id}</div>
                 {j.updated_at && <div style={{ fontSize: 11, color: '#6b7280' }}>{new Date(j.updated_at).toLocaleString()}</div>}
+                <div style={{ marginTop: 6, display: 'flex', gap: 8 }}>
+                  <button onClick={() => startJobStream(j.id || j.job_id)} style={{ padding: '4px 8px' }}>Resume</button>
+                  <button onClick={async () => { try { await fetch(`/api/jobs/${encodeURIComponent(j.id || j.job_id)}/cancel`, { method: 'POST' }) } catch {} }} style={{ padding: '4px 8px' }}>Cancel</button>
+                </div>
               </div>
             ))}
           </div>

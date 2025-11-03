@@ -820,6 +820,28 @@ async def get_job(job_id: str):
         return JSONResponse(status_code=500, content={"error": str(ex)})
 
 
+@app.post("/api/jobs/{job_id}/cancel")
+async def cancel_job_proxy(job_id: str):
+    try:
+        async with httpx.AsyncClient(trust_env=False, timeout=None) as client:
+            r = await client.post(ORCH_URL.rstrip("/") + f"/jobs/{job_id}/cancel")
+            if r.status_code >= 400:
+                return JSONResponse(status_code=r.status_code, content={"error": r.text})
+            body = r.content
+            headers = {
+                "Cache-Control": "no-store",
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Private-Network": "true",
+                "Access-Control-Expose-Headers": "Content-Type, Content-Length",
+                "Connection": "close",
+                "Content-Length": str(len(body)),
+                "Content-Type": r.headers.get("content-type") or "application/json",
+            }
+            return Response(content=body, media_type=headers["Content-Type"], status_code=r.status_code, headers=headers)
+    except Exception as ex:
+        return JSONResponse(status_code=500, content={"error": str(ex)})
+
+
 # Lightweight proxies for orchestrator admin/capabilities so the frontend can hit same-origin
 @app.get("/capabilities.json")
 async def capabilities_proxy():
