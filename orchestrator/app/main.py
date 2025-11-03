@@ -5888,7 +5888,19 @@ async def ws_chat(websocket: WebSocket):
                 body = {}
             payload = {"messages": body.get("messages") or [], "stream": False, "cid": body.get("cid")}
             try:
-                async with httpx.AsyncClient(trust_env=False) as client:
+                # Periodic keepalive so committee/debate long phases do not drop WS
+                live = True
+                async def _keepalive() -> None:
+                    import asyncio as _asyncio
+                    while live:
+                        try:
+                            await websocket.send_text(json.dumps({"keepalive": True}))
+                        except Exception:
+                            break
+                        await _asyncio.sleep(10)
+                import asyncio as _asyncio
+                ka_task = _asyncio.create_task(_keepalive())
+                async with httpx.AsyncClient(trust_env=False, timeout=None) as client:
                     rr = await client.post((PUBLIC_BASE_URL.rstrip("/") if PUBLIC_BASE_URL else "http://127.0.0.1:8000") + "/v1/chat/completions", json=payload)
                 ct = rr.headers.get("content-type") or "application/json"
                 if ct.startswith("application/json"):
@@ -5901,8 +5913,16 @@ async def ws_chat(websocket: WebSocket):
                     "data": obj,
                     "message": {"role": "assistant", "content": {"text": assistant_text}},
                 }
+                live = False
+                try: ka_task.cancel()
+                except Exception: pass
                 await websocket.send_text(json.dumps(out))
             except Exception as ex:
+                try:
+                    live = False
+                    ka_task.cancel()
+                except Exception:
+                    pass
                 await websocket.send_text(json.dumps({"error": str(ex)}))
     except WebSocketDisconnect:
         return
@@ -5924,7 +5944,22 @@ async def ws_tool(websocket: WebSocket):
                 await websocket.send_text(json.dumps({"error": "missing tool name"}))
                 continue
             try:
+                # Keepalive while long tools run
+                live = True
+                async def _keepalive() -> None:
+                    import asyncio as _asyncio
+                    while live:
+                        try:
+                            await websocket.send_text(json.dumps({"keepalive": True}))
+                        except Exception:
+                            break
+                        await _asyncio.sleep(10)
+                import asyncio as _asyncio
+                ka_task = _asyncio.create_task(_keepalive())
                 res = await execute_tool_call({"name": name, "arguments": args})
+                live = False
+                try: ka_task.cancel()
+                except Exception: pass
                 await websocket.send_text(json.dumps({"ok": True, "result": res}))
             except Exception as ex:
                 await websocket.send_text(json.dumps({"error": str(ex)}))

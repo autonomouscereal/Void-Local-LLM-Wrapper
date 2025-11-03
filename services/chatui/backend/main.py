@@ -23,7 +23,7 @@ import os
 import json
 from typing import Any, Dict, List, Optional
 import time
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 from fastapi import FastAPI, UploadFile, File, Form, Request, BackgroundTasks, WebSocket, WebSocketDisconnect
@@ -33,6 +33,7 @@ import asyncpg
 from fastapi.middleware.cors import CORSMiddleware
 from .json_parser import JSONParser
 import logging
+import websockets  # type: ignore
 
 # Create app BEFORE any decorators use it
 app = FastAPI(title="Chat UI Backend", version="0.1.0")
@@ -779,6 +780,30 @@ async def list_jobs(status: Optional[str] = None, limit: int = 50, offset: int =
     except Exception as ex:
         return JSONResponse(status_code=500, content={"error": str(ex)})
 
+
+@app.websocket("/api/tool.ws")
+async def tool_ws_proxy(websocket: WebSocket):
+    await websocket.accept()
+    def _orch_ws_url() -> str:
+        p = urlparse(ORCH_URL)
+        scheme = 'wss' if p.scheme == 'https' else 'ws'
+        base = p._replace(scheme=scheme).geturl().rstrip('/')
+        return base + '/tool.ws'
+    try:
+        while True:
+            raw = await websocket.receive_text()
+            upstream_url = _orch_ws_url()
+            async with websockets.connect(upstream_url, ping_interval=20, ping_timeout=None, close_timeout=None, max_queue=None) as upstream:
+                await upstream.send(raw)
+                async for msg in upstream:
+                    try:
+                        await websocket.send_text(msg)
+                    except Exception:
+                        break
+    except WebSocketDisconnect:
+        return
+    except Exception as ex:
+        await websocket.send_text(json.dumps({"error": str(ex)}))
 
 @app.get("/api/jobs/{job_id}")
 async def get_job(job_id: str):
