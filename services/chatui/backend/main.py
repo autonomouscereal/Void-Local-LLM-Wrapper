@@ -1045,7 +1045,7 @@ async def chat_ws(websocket: WebSocket):
             async with websockets.connect(upstream_url, ping_interval=20, ping_timeout=None, close_timeout=None, max_queue=None) as upstream:
                 # Idempotency key prevents double work if a later POST fallback occurs
                 import uuid as _uuid
-                payload_up = json.dumps({"messages": oa_msgs, "cid": str(cid or ""), "stream": False, "idempotency_key": _uuid.uuid4().hex})
+                payload_up = json.dumps({"messages": oa_msgs, "cid": str(cid or ""), "stream": True, "idempotency_key": _uuid.uuid4().hex})
                 await upstream.send(payload_up)
                 relayed = False
                 async for msg in upstream:

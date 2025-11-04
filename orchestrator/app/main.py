@@ -109,6 +109,21 @@ def _log(event: str, **fields: Any) -> None:
         logging.info(f"{event} " + json.dumps(fields, ensure_ascii=False))
     except Exception:
         pass
+
+# CPU/GPU adaptive mode for ComfyUI graphs
+COMFY_CPU_MODE = (os.getenv("COMFY_CPU_MODE", "").strip().lower() in ("1", "true", "yes", "on"))
+
+def _comfy_is_completed(detail: Dict[str, Any]) -> bool:
+    st = detail.get("status") or {}
+    if st.get("completed") is True:
+        return True
+    s = (st.get("status") or "").lower()
+    if s in ("completed", "success", "succeeded", "done", "finished"):
+        return True
+    outs = detail.get("outputs")
+    if isinstance(outs, dict) and any(isinstance(v, list) and len(v) > 0 for v in outs.values()):
+        return True
+    return False
 from .db.pool import get_pg_pool
 from .db.tracing import db_insert_run as _db_insert_run, db_update_run_response as _db_update_run_response, db_insert_icw_log as _db_insert_icw_log, db_insert_tool_call as _db_insert_tool_call
 ## db helpers moved to .db.tracing
@@ -1324,7 +1339,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     r = _hx.get(self.base + f"/history/{pid}")
                     if r.status_code == 200:
                         js = _resp_json(r, {"history": dict}); h = (js.get("history") or {}).get(pid)
-                        if h and (h.get("status", {}).get("completed") is True):
+                        if h and _comfy_is_completed(h):
                             emit_progress({"stage": "completed", "prompt_id": pid})
                             return h
                     _tm.sleep(1.0)
@@ -1359,14 +1374,15 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     return {"image_bytes": png, "model": "placeholder"}
                 w, h = self._parse_wh(a.get("size") or "1024x1024")
                 positive = a.get("prompt") or ""
-                negative = a.get("negative") or ""
+                neg_fix = ", bad hands, extra fingers, deformed, low quality, blown highlights, text, watermark"
+                negative = (a.get("negative") or "") + neg_fix
                 seed = int(a.get("seed") or 0)
                 base_graph = {
                     "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "sd_xl_base_1.0.safetensors"}},
                     "3": {"class_type": "CLIPTextEncode", "inputs": {"text": positive, "clip": ["1", 1]}},
                     "4": {"class_type": "CLIPTextEncode", "inputs": {"text": negative, "clip": ["1", 1]}},
                     "7": {"class_type": "EmptyLatentImage", "inputs": {"width": w, "height": h, "batch_size": 1}},
-                    "8": {"class_type": "KSampler", "inputs": {"seed": seed, "steps": 25, "cfg": 6.5, "sampler_name": "dpmpp_2m", "scheduler": "karras", "denoise": 1.0, "model": ["1", 0], "positive": ["3", 0], "negative": ["4", 0], "latent_image": ["7", 0]}},
+                    "8": {"class_type": "KSampler", "inputs": {"seed": seed, "steps": (20 if COMFY_CPU_MODE else 28), "cfg": 6.2, "sampler_name": "dpmpp_2m", "scheduler": "karras", "denoise": (0.9 if COMFY_CPU_MODE else 1.0), "model": ["1", 0], "positive": ["3", 0], "negative": ["4", 0], "latent_image": ["7", 0]}},
                     "9": {"class_type": "VAEDecode", "inputs": {"samples": ["8", 0], "vae": ["1", 2]}},
                     "10": {"class_type": "SaveImage", "inputs": {"filename_prefix": "image_gen", "images": ["9", 0]}},
                 }
@@ -2014,7 +2030,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     r = _hx.get(self.base + f"/history/{pid}")
                     if r.status_code == 200:
                         js = _resp_json(r, {"history": dict}); h = (js.get("history") or {}).get(pid)
-                        if h and (h.get("status", {}).get("completed") is True):
+                        if h and _comfy_is_completed(h):
                             return h
                     _tm.sleep(0.8)
             def _download_first(self, detail: Dict[str, Any]) -> bytes:
@@ -2960,7 +2976,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                                             if hr.status_code == 200:
                                                 hj = _resp_json(hr, {"history": dict})
                                                 h = (hj.get("history") or {}).get(pid)
-                                                if h and (h.get("status", {}).get("completed") is True):
+                                                if h and _comfy_is_completed(h):
                                                     # find first output and overwrite frame
                                                     outs = (h.get("outputs") or {})
                                                     got = False
@@ -3167,7 +3183,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                                             if hr.status_code == 200:
                                                 hj = _resp_json(hr, {"history": dict})
                                                 h = (hj.get("history") or {}).get(pid)
-                                                if h and (h.get("status", {}).get("completed") is True):
+                                                if h and _comfy_is_completed(h):
                                                     outs = (h.get("outputs") or {})
                                                     got = False
                                                     for items in outs.values():
@@ -3834,6 +3850,54 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     _log("planner.call", trace_id=trace_id)
     plan_text, tool_calls = await planner_produce_plan(messages, body.get("tools"), body.get("temperature") or DEFAULT_TEMPERATURE)
     _log("planner.done", trace_id=trace_id, tool_count=len(tool_calls or []))
+    # Normalize planner tool calls into orchestrator internal schema {name, arguments}
+    def _normalize_tool_calls(calls: Any) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        if not isinstance(calls, list):
+            return out
+        parser = JSONParser()
+        for c in calls:
+            if not isinstance(c, dict):
+                continue
+            if c.get("name"):
+                # already normalized
+                args = c.get("arguments")
+                if isinstance(args, str):
+                    try:
+                        args = parser.parse(args, {})
+                    except Exception:
+                        args = {"_raw": args}
+                out.append({"name": str(c.get("name")), "arguments": (args or {})})
+                continue
+            if c.get("type") == "function":
+                fn = c.get("function") or {}
+                nm = fn.get("name")
+                args = fn.get("arguments")
+                if isinstance(args, str):
+                    try:
+                        args = parser.parse(args, {})
+                    except Exception:
+                        args = {"_raw": args}
+                if nm:
+                    out.append({"name": str(nm), "arguments": (args or {})})
+        return out
+    tool_calls = _normalize_tool_calls(tool_calls)
+    _log("planner.tools.normalized", trace_id=trace_id, tool_count=len(tool_calls))
+    # If planner returned no tools, synthesize a sensible default for image prompts
+    if not tool_calls:
+        last_user = ""
+        for m in reversed(messages):
+            try:
+                if m.get("role") == "user" and isinstance(m.get("content"), str) and m.get("content").strip():
+                    last_user = m.get("content").strip(); break
+            except Exception:
+                continue
+        if last_user:
+            kw = last_user.lower()
+            if any(x in kw for x in ("image", "draw", "generate", "picture", "photo", "render")):
+                # Use image.gen to leverage committee review/quality passes
+                tool_calls = [{"name": "image.gen", "arguments": {"prompt": last_user, "size": "1024x1024"}}]
+                _log("planner.fallback", trace_id=trace_id, tool="image.gen")
     try:
         _trace_append("decision", {"cid": conv_cid, "trace_id": trace_id, "plan": plan_text, "tool_calls": tool_calls})
     except Exception:
@@ -3849,6 +3913,12 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             _trace_append("decision", {"cid": conv_cid, "trace_id": trace_id, "router": {"tool": decision.tool, "args": decision.args}})
         except Exception:
             pass
+    # Execute planner/router tool calls immediately when present
+    tool_results: List[Dict[str, Any]] = []
+    if tool_calls:
+        _log("tools.exec.start", trace_id=trace_id, count=len(tool_calls))
+        tool_results = await execute_tools(tool_calls)
+        _log("tools.exec.done", trace_id=trace_id, count=len(tool_results))
     # Heuristic upgrade: complex image prompts → image.super_gen for higher fidelity multi-object scenes
     try:
         upgraded = []
