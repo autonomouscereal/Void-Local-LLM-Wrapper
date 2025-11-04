@@ -3801,31 +3801,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         if route_mode == "windowed":
             response = locals().get("response", {"id": "orc-1"})
             resp_id = (response.get("id") if isinstance(response, dict) else "orc-1") or "orc-1"
-    if body.get("stream"):
-        stream_text = str(locals().get("final_text", ""))
-        response_obj = locals().get("response", {"id": "orc-1"})
-        resp_id = (response_obj.get("id") if isinstance(response_obj, dict) else "orc-1") or "orc-1"
-        async def _stream_once(resp_id: str = resp_id, stream_text: str = stream_text):
-            # Immediately let the UI know we're working
-            pre = json.dumps({"id": resp_id, "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]})
-            yield f"data: {pre}\n\n"
-            # Final content (may be empty if no content was produced)
-            chunk = json.dumps({"id": resp_id, "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"role": "assistant", "content": stream_text}, "finish_reason": None}]})
-            yield f"data: {chunk}\n\n"
-            yield "data: [DONE]\n\n"
-        try:
-            if _lock_token:
-                _release_lock(STATE_DIR, trace_id)
-        except Exception:
-            pass
-        return StreamingResponse(_stream_once(), media_type="text/event-stream")
-    else:
-        try:
-            if _lock_token:
-                _release_lock(STATE_DIR, trace_id)
-        except Exception:
-            pass
-        return JSONResponse(content=response)
+    # No early returns: continue to planner/tools; responses emitted only after work completes
 
     # Optional self-ask-with-search augmentation
     # Multi-engine metasearch augmentation (no external keys)
