@@ -1338,7 +1338,11 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     emit_progress({"stage": "poll", "prompt_id": pid})
                     r = _hx.get(self.base + f"/history/{pid}")
                     if r.status_code == 200:
-                        js = _resp_json(r, {"history": dict}); h = (js.get("history") or {}).get(pid)
+                        js = _resp_json(r, {});
+                        hist = js.get("history") if isinstance(js, dict) else {}
+                        if not isinstance(hist, dict):
+                            hist = js if isinstance(js, dict) else {}
+                        h = hist.get(pid)
                         if h and _comfy_is_completed(h):
                             emit_progress({"stage": "completed", "prompt_id": pid})
                             return h
@@ -2974,8 +2978,11 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                                         while True:
                                             hr = _c2.get(COMFYUI_API_URL.rstrip("/") + f"/history/{pid}")
                                             if hr.status_code == 200:
-                                                hj = _resp_json(hr, {"history": dict})
-                                                h = (hj.get("history") or {}).get(pid)
+                                                hj = _resp_json(hr, {})
+                                                hist = hj.get("history") if isinstance(hj, dict) else {}
+                                                if not isinstance(hist, dict):
+                                                    hist = hj if isinstance(hj, dict) else {}
+                                                h = hist.get(pid)
                                                 if h and _comfy_is_completed(h):
                                                     # find first output and overwrite frame
                                                     outs = (h.get("outputs") or {})
@@ -6180,7 +6187,7 @@ async def _comfy_history(prompt_id: str) -> Dict[str, Any]:
         r = await client.get(base.rstrip("/") + f"/history/{prompt_id}")
         try:
             r.raise_for_status()
-            return _resp_json(r, {"history": dict})
+            return _resp_json(r, {})
         except Exception:
             return {"error": r.text}
 
@@ -6396,6 +6403,10 @@ async def _track_comfy_job(job_id: str, prompt_id: str) -> None:
         _jobs_store[job_id]["updated_at"] = time.time()
         _jobs_store[job_id]["last_history"] = data
         history = (data or {}).get("history", {})
+        if not isinstance(history, dict):
+            # Some ComfyUI builds return {<pid>:{...}} at the top level
+            if isinstance(data, dict):
+                history = data
         detail = history.get(prompt_id) if isinstance(history, dict) else None
         if isinstance(detail, dict):
             outputs = detail.get("outputs", {}) or {}
