@@ -4109,22 +4109,22 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         except Exception:
             pass
     if body.get("stream"):
-            async def _stream_once():
-                chunk = json.dumps({"id": response["id"], "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"role": "assistant", "content": final_text}, "finish_reason": None}]})
-                yield f"data: {chunk}\n\n"
-                yield "data: [DONE]\n\n"
-            try:
-                if _lock_token:
-                    _release_lock(STATE_DIR, trace_id)
-            except Exception:
-                pass
-            return StreamingResponse(_stream_once(), media_type="text/event-stream")
+        async def _stream_once():
+            chunk = json.dumps({"id": response["id"], "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"role": "assistant", "content": final_text}, "finish_reason": None}]})
+            yield f"data: {chunk}\n\n"
+            yield "data: [DONE]\n\n"
         try:
             if _lock_token:
                 _release_lock(STATE_DIR, trace_id)
         except Exception:
             pass
-        return JSONResponse(content=response)
+        return StreamingResponse(_stream_once(), media_type="text/event-stream")
+    try:
+        if _lock_token:
+            _release_lock(STATE_DIR, trace_id)
+    except Exception:
+        pass
+    return JSONResponse(content=response)
 
     # Optional self-ask-with-search augmentation
     # Multi-engine metasearch augmentation (no external keys)
