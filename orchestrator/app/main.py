@@ -28,6 +28,7 @@ from __future__ import annotations
 #   All requests must wait for completion; backoff/retry is allowed, but never hard time caps.
 
 import os
+import logging
 from types import SimpleNamespace
 import asyncio
 import hashlib as _hl
@@ -97,6 +98,17 @@ from .artifacts.shard import newest_part as _art_newest_part, list_parts as _art
 from .artifacts.manifest import add_manifest_row as _art_manifest_add, write_manifest_atomic as _art_manifest_write
 from .datasets.trace import append_sample as _trace_append
 from .embeddings.core import build_embeddings_response as _build_embeddings_response
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+try:
+    logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO), format="%(levelname)s:%(message)s")
+except Exception:
+    pass
+
+def _log(event: str, **fields: Any) -> None:
+    try:
+        logging.info(f"{event} " + json.dumps(fields, ensure_ascii=False))
+    except Exception:
+        pass
 from .db.pool import get_pg_pool
 from .db.tracing import db_insert_run as _db_insert_run, db_update_run_response as _db_update_run_response, db_insert_icw_log as _db_insert_icw_log, db_insert_tool_call as _db_insert_tool_call
 ## db helpers moved to .db.tracing
@@ -259,6 +271,10 @@ except Exception:
     pass
 @app.middleware("http")
 async def global_cors_middleware(request: Request, call_next):
+    try:
+        _log("http.req", method=request.method, path=request.url.path)
+    except Exception:
+        pass
     if request.method == "OPTIONS":
         return StreamingResponse(content=iter(()), status_code=204, headers={
             "Access-Control-Allow-Origin": (request.headers.get("origin") or "*"),
@@ -272,6 +288,10 @@ async def global_cors_middleware(request: Request, call_next):
             "Vary": "Origin",
         })
     resp = await call_next(request)
+    try:
+        _log("http.res", method=request.method, path=request.url.path, status=getattr(resp, "status_code", None))
+    except Exception:
+        pass
     resp.headers["Access-Control-Allow-Origin"] = request.headers.get("origin") or "*"
     resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
     resp.headers["Access-Control-Allow-Headers"] = "*"
@@ -3489,10 +3509,13 @@ async def execute_tools(tool_calls: List[Dict[str, Any]]) -> List[Dict[str, Any]
     results: List[Dict[str, Any]] = []
     for call in tool_calls[:5]:
         try:
+            _log("tool.exec.start", name=call.get("name"))
             res = await execute_tool_call(call)
             results.append(res)
+            _log("tool.exec.done", name=call.get("name"), status=("error" if res.get("error") else "ok"))
         except Exception as ex:
             results.append({"name": call.get("name", "unknown"), "error": str(ex), "traceback": traceback.format_exc()})
+            _log("tool.exec.fail", name=call.get("name"), error=str(ex))
     return results
 
 
@@ -3554,6 +3577,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         _append_jsonl(os.path.join(STATE_DIR, "traces", trace_id, "requests.jsonl"), {"t": int(time.time()*1000), "trace_id": trace_id, "route_mode": "committee", "messages": normalized_msgs[:50]})
     except Exception:
         pass
+    _log("chat.start", trace_id=trace_id, mode=mode, stream=bool(body.get("stream")), cid=conv_cid)
     # Acquire per-trace lock and record start event
     _lock_token = None
     try:
@@ -3774,11 +3798,16 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             _append_event(STATE_DIR, trace_id, "halt", {"kind": "windowed", "chars": len(final_text)})
         except Exception:
             pass
-    response = locals().get("response", {"id": "orc-1"})
-    resp_id = (response.get("id") if isinstance(response, dict) else "orc-1") or "orc-1"
+        if route_mode == "windowed":
+            response = locals().get("response", {"id": "orc-1"})
+            resp_id = (response.get("id") if isinstance(response, dict) else "orc-1") or "orc-1"
     if body.get("stream"):
         stream_text = str(locals().get("final_text", ""))
         async def _stream_once():
+            # Immediately let the UI know we're working
+            pre = json.dumps({"id": resp_id, "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]})
+            yield f"data: {pre}\n\n"
+            # Final content (may be empty if no content was produced)
             chunk = json.dumps({"id": resp_id, "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"role": "assistant", "content": stream_text}, "finish_reason": None}]})
             yield f"data: {chunk}\n\n"
             yield "data: [DONE]\n\n"
@@ -3788,12 +3817,13 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         except Exception:
             pass
         return StreamingResponse(_stream_once(), media_type="text/event-stream")
-    try:
-        if _lock_token:
-            _release_lock(STATE_DIR, trace_id)
-    except Exception:
-        pass
-    return JSONResponse(content=response)
+    else:
+        try:
+            if _lock_token:
+                _release_lock(STATE_DIR, trace_id)
+        except Exception:
+            pass
+        return JSONResponse(content=response)
 
     # Optional self-ask-with-search augmentation
     # Multi-engine metasearch augmentation (no external keys)
@@ -3823,7 +3853,9 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 pass
 
     # 1) Planner proposes plan + tool calls
+    _log("planner.call", trace_id=trace_id)
     plan_text, tool_calls = await planner_produce_plan(messages, body.get("tools"), body.get("temperature") or DEFAULT_TEMPERATURE)
+    _log("planner.done", trace_id=trace_id, tool_count=len(tool_calls or []))
     try:
         _trace_append("decision", {"cid": conv_cid, "trace_id": trace_id, "plan": plan_text, "tool_calls": tool_calls})
     except Exception:
