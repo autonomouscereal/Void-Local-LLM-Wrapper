@@ -3803,7 +3803,9 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             resp_id = (response.get("id") if isinstance(response, dict) else "orc-1") or "orc-1"
     if body.get("stream"):
         stream_text = str(locals().get("final_text", ""))
-        async def _stream_once():
+        response_obj = locals().get("response", {"id": "orc-1"})
+        resp_id = (response_obj.get("id") if isinstance(response_obj, dict) else "orc-1") or "orc-1"
+        async def _stream_once(resp_id: str = resp_id, stream_text: str = stream_text):
             # Immediately let the UI know we're working
             pre = json.dumps({"id": resp_id, "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]})
             yield f"data: {pre}\n\n"
