@@ -293,7 +293,7 @@ except Exception:
 async def global_cors_middleware(request: Request, call_next):
     if request.method == "OPTIONS":
         return StreamingResponse(content=iter(()), status_code=204, headers={
-            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Origin": (request.headers.get("origin") or "*"),
             "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
             "Access-Control-Allow-Headers": "*",
             "Access-Control-Allow-Credentials": "false",
@@ -301,15 +301,25 @@ async def global_cors_middleware(request: Request, call_next):
             "Access-Control-Max-Age": "86400",
             "Access-Control-Allow-Private-Network": "true",
             "Connection": "close",
+            "Vary": "Origin",
         })
     resp = await call_next(request)
-    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Origin"] = request.headers.get("origin") or "*"
     resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
     resp.headers["Access-Control-Allow-Headers"] = "*"
     resp.headers["Access-Control-Allow-Credentials"] = "false"
     resp.headers["Access-Control-Expose-Headers"] = "*"
     resp.headers["Access-Control-Max-Age"] = "86400"
     resp.headers["Access-Control-Allow-Private-Network"] = "true"
+    resp.headers["Vary"] = "Origin"
+    # Help browsers load media without ORB/CORP issues if accessed cross-origin
+    try:
+        path = request.url.path or ""
+        if path.startswith("/uploads/") or path.endswith(".mp4") or path.endswith(".png") or path.endswith(".jpg") or path.endswith(".jpeg") or path.endswith(".webm"):
+            resp.headers.setdefault("Cross-Origin-Resource-Policy", "cross-origin")
+            resp.headers.setdefault("Timing-Allow-Origin", "*")
+    except Exception:
+        pass
     return resp
 
 
@@ -590,6 +600,16 @@ def extract_attachments_from_messages(messages: List[Dict[str, Any]]) -> Tuple[L
 pg_pool: Optional[asyncpg.pool.Pool] = None
 _embedder: Optional[SentenceTransformer] = None
 _rag_cache: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
+
+# Tool streaming progress hook (set by streaming endpoints)
+_tool_progress_q: Optional[asyncio.Queue] = None
+def _tool_progress_emit(event: Dict[str, Any]) -> None:
+    q = _tool_progress_q
+    if q is not None and isinstance(event, dict):
+        try:
+            q.put_nowait(event)
+        except Exception:
+            pass
 
 
 async def get_pg_pool() -> Optional[asyncpg.pool.Pool]:
@@ -1599,15 +1619,18 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             def _post_prompt(self, graph: Dict[str, Any]) -> Dict[str, Any]:
                 import httpx as _hx  # type: ignore
                 with _hx.Client() as client:
+                    _tool_progress_emit({"stage": "submit", "target": "comfyui"})
                     r = client.post(self.base + "/prompt", json={"prompt": graph})
                     r.raise_for_status(); return r.json()
             def _poll(self, pid: str) -> Dict[str, Any]:
                 import httpx as _hx, time as _tm  # type: ignore
                 while True:
+                    _tool_progress_emit({"stage": "poll", "prompt_id": pid})
                     r = _hx.get(self.base + f"/history/{pid}")
                     if r.status_code == 200:
                         js = r.json(); h = (js.get("history") or {}).get(pid)
                         if h and (h.get("status", {}).get("completed") is True):
+                            _tool_progress_emit({"stage": "completed", "prompt_id": pid})
                             return h
                     _tm.sleep(1.0)
             def _download_first(self, detail: Dict[str, Any]) -> bytes:
@@ -1622,8 +1645,10 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                             q = {"filename": fn, "type": tp}
                             if sub: q["subfolder"] = sub
                             url = self.base + "/view?" + urlencode(q)
+                            _tool_progress_emit({"stage": "download", "file": fn})
                             r = _hx.get(url)
                             if r.status_code == 200:
+                                _tool_progress_emit({"stage": "downloaded", "bytes": len(r.content)})
                                 return r.content
                 return b""
             def _parse_wh(self, size: str) -> tuple[int, int]:
@@ -1770,6 +1795,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         class _TTSProvider:
             async def _xtts(self, payload: Dict[str, Any]) -> Dict[str, Any]:
                 async with httpx.AsyncClient() as client:
+                    _tool_progress_emit({"stage": "request", "target": "xtts"})
                     # Pass through voice_lock/voice_id/seed/rate/pitch so backend can lock timbre
                     r = await client.post(XTTS_API_URL.rstrip("/") + "/tts", json=payload)
                     r.raise_for_status()
@@ -1783,6 +1809,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                         rr = await client.get(js.get("url"))
                         if rr.status_code == 200:
                             wav = rr.content
+                    _tool_progress_emit({"stage": "received", "bytes": len(wav)})
                     return {"wav_bytes": wav, "duration_s": float(js.get("duration_s") or 0.0), "model": js.get("model") or "xtts"}
             def speak(self, args: Dict[str, Any]) -> Dict[str, Any]:
                 # Bridge sync to async
@@ -1901,6 +1928,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 async def _compose(self, payload: Dict[str, Any]) -> Dict[str, Any]:
                     import base64 as _b
                     async with httpx.AsyncClient() as client:
+                    _tool_progress_emit({"stage": "request", "target": "music"})
                         r = await client.post(MUSIC_API_URL.rstrip("/") + "/generate", json={"prompt": payload.get("prompt"), "duration": int(payload.get("length_s") or 8)})
                         r.raise_for_status(); js = r.json(); b64 = js.get("audio_wav_base64") or js.get("wav_b64"); wav = _b.b64decode(b64) if isinstance(b64, str) else b""; return {"wav_bytes": wav, "model": f"musicgen:{os.getenv('MUSIC_MODEL_ID','')}"}
                 def compose(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -3851,6 +3879,13 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     master_seed = provided_seed if provided_seed is not None else _derive_seed("chat", msgs_for_seed)
     import hashlib as _hl
     trace_id = (f"cid_{conv_cid}" if conv_cid else None) or ("tt_" + _hl.sha256(msgs_for_seed.encode("utf-8")).hexdigest()[:16])
+    # Allow client-provided idempotency key to override trace_id for deduplication
+    try:
+        ikey = body.get("idempotency_key")
+        if isinstance(ikey, str) and len(ikey) >= 8:
+            trace_id = ikey.strip()
+    except Exception:
+        pass
     try:
         _append_jsonl(os.path.join(STATE_DIR, "traces", trace_id, "requests.jsonl"), {"t": int(time.time()*1000), "trace_id": trace_id, "route_mode": "committee", "messages": normalized_msgs[:50]})
     except Exception:
@@ -3987,7 +4022,67 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         except Exception:
             pass
         # Build response wrapper compatible with our existing format
-        final_text = (final_oai.get("choices", [{}])[0].get("message", {}) or {}).get("content", "")
+        base_text = (final_oai.get("choices", [{}])[0].get("message", {}) or {}).get("content", "")
+        # Build omnicontext markdown (planner plan, tool trace, assets)
+        omni_sections: list[str] = []
+        if isinstance(plan_text, str) and plan_text.strip():
+            omni_sections.append("### Plan\n" + plan_text.strip())
+        # Summarize tool execs
+        try:
+            if tool_exec_meta:
+                lines: list[str] = []
+                for m in tool_exec_meta[:20]:
+                    nm = str(m.get("name") or "tool")
+                    dur = int(m.get("duration_ms") or 0)
+                    ak = ", ".join((m.get("args") or {}).keys()) if isinstance(m.get("args"), dict) else ""
+                    lines.append(f"- {nm} ({dur} ms){' — ' + ak if ak else ''}")
+                if lines:
+                    omni_sections.append("### Tools\n" + "\n".join(lines))
+        except Exception:
+            pass
+        # Extract asset URLs from tool results if any
+        try:
+            if tool_results:
+                def _asset_urls_from_tools(results: List[Dict[str, Any]]) -> List[str]:
+                    urls: List[str] = []
+                    exts = (".mp4", ".webm", ".mov", ".mkv", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".wav", ".mp3", ".m4a", ".ogg", ".flac", ".opus", ".srt")
+                    for tr in results or []:
+                        res = (tr or {}).get("result") or {}
+                        if isinstance(res, dict):
+                            meta = res.get("meta"); arts = res.get("artifacts")
+                            if isinstance(meta, dict) and isinstance(arts, list):
+                                cid = meta.get("cid")
+                                for a in arts:
+                                    aid = (a or {}).get("id"); kind = (a or {}).get("kind") or ""
+                                    if cid and aid:
+                                        if kind.startswith("image"):
+                                            urls.append(f"/uploads/artifacts/image/{cid}/{aid}")
+                                        elif kind.startswith("audio"):
+                                            urls.append(f"/uploads/artifacts/audio/tts/{cid}/{aid}")
+                                            urls.append(f"/uploads/artifacts/music/{cid}/{aid}")
+                            def _walk(v):
+                                if isinstance(v, str):
+                                    s = v.strip().lower()
+                                    if s.startswith("http://") or s.startswith("https://") or s.startswith("/uploads/") or "/workspace/uploads/" in s or any(s.endswith(ext) for ext in exts):
+                                        if "/workspace/uploads/" in v:
+                                            try:
+                                                v = v.split("/workspace", 1)[1]
+                                            except Exception:
+                                                pass
+                                        urls.append(v)
+                                elif isinstance(v, list):
+                                    for it in v: _walk(it)
+                                elif isinstance(v, dict):
+                                    for it in v.values(): _walk(it)
+                            _walk(res)
+                    return list(dict.fromkeys(urls))
+                urls = _asset_urls_from_tools(tool_results)
+                if urls:
+                    omni_sections.append("### Assets\n" + "\n".join([f"- {u}" for u in urls]))
+        except Exception:
+            pass
+        omni_md = ("\n\n" + "\n\n".join(omni_sections)) if omni_sections else ""
+        final_text = (base_text or "") + omni_md
         usage = estimate_usage(messages, final_text)
         response = {
             "id": final_oai.get("id", "orc-1"),
@@ -3995,6 +4090,8 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             "model": final_oai.get("model") or f"{QWEN_MODEL_ID}",
             "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": final_text}}],
             "usage": usage,
+            "created": int(time.time()),
+            "system_fingerprint": _hl.sha256((str(QWEN_MODEL_ID) + "+" + str(GPTOSS_MODEL_ID)).encode("utf-8")).hexdigest()[:16],
             "seed": master_seed,
         }
         if isinstance(final_env, dict):
@@ -4011,7 +4108,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             _append_event(STATE_DIR, trace_id, "halt", {"kind": "windowed", "chars": len(final_text)})
         except Exception:
             pass
-        if body.get("stream"):
+    if body.get("stream"):
             async def _stream_once():
                 chunk = json.dumps({"id": response["id"], "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"role": "assistant", "content": final_text}, "finish_reason": None}]})
                 yield f"data: {chunk}\n\n"
@@ -4262,6 +4359,79 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 tool_exec_meta.append({"name": tc.get("name", "tool"), "args": tc.get("arguments") or {}, "seed": _derive_seed("tool", tc.get("name", "tool"), trace_id), "duration_ms": 0, "artifacts": {}})
         if tool_results:
             messages = [{"role": "system", "content": "Tool results:\n" + json.dumps(tool_results, indent=2)}] + messages
+            # If tools produced media artifacts, return them immediately (skip waiting on models)
+            def _asset_urls_from_tools(results: List[Dict[str, Any]]) -> List[str]:
+                urls: List[str] = []
+                for tr in results or []:
+                    try:
+                        res = (tr or {}).get("result") or {}
+                        if isinstance(res, dict):
+                            meta = res.get("meta")
+                            arts = res.get("artifacts")
+                            if isinstance(meta, dict) and isinstance(arts, list):
+                                cid = meta.get("cid")
+                                for a in arts:
+                                    aid = (a or {}).get("id"); kind = (a or {}).get("kind") or ""
+                                    if cid and aid:
+                                        if kind.startswith("image"):
+                                            urls.append(f"/uploads/artifacts/image/{cid}/{aid}")
+                                        elif kind.startswith("audio"):
+                                            urls.append(f"/uploads/artifacts/audio/tts/{cid}/{aid}")
+                                            urls.append(f"/uploads/artifacts/music/{cid}/{aid}")
+                            exts = (".mp4", ".webm", ".mov", ".mkv", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".wav", ".mp3", ".m4a", ".ogg", ".flac", ".opus", ".srt")
+                            def _walk(v):
+                                if isinstance(v, str):
+                                    s = v.strip().lower()
+                                    if not s:
+                                        return
+                                    if s.startswith("http://") or s.startswith("https://"):
+                                        urls.append(v); return
+                                    if "/workspace/uploads/" in v:
+                                        try:
+                                            tail = v.split("/workspace", 1)[1]
+                                            urls.append(tail)
+                                        except Exception:
+                                            pass
+                                        return
+                                    if v.startswith("/uploads/"):
+                                        urls.append(v); return
+                                    if any(s.endswith(ext) for ext in exts) and ("/uploads/" in s or "/workspace/uploads/" in s):
+                                        if "/workspace/uploads/" in v:
+                                            try:
+                                                tail = v.split("/workspace", 1)[1]
+                                                urls.append(tail)
+                                            except Exception:
+                                                pass
+                                        else:
+                                            urls.append(v)
+                                elif isinstance(v, list):
+                                    for it in v: _walk(it)
+                                elif isinstance(v, dict):
+                                    for it in v.values(): _walk(it)
+                            _walk(res)
+                    except Exception:
+                        continue
+                return list(dict.fromkeys(urls))
+            asset_urls = _asset_urls_from_tools(tool_results)
+            if asset_urls:
+                final_text = "\n".join(["Assets:"] + [f"- {u}" for u in asset_urls])
+                usage = estimate_usage(messages, final_text)
+                response = {
+                    "id": "orc-1",
+                    "object": "chat.completion",
+                    "model": f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}",
+                    "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": final_text}}],
+                    "usage": usage,
+                    "created": int(time.time()),
+                    "system_fingerprint": _hl.sha256((str(QWEN_MODEL_ID) + "+" + str(GPTOSS_MODEL_ID)).encode("utf-8")).hexdigest()[:16],
+                    "seed": master_seed,
+                }
+                try:
+                    if _lock_token:
+                        _release_lock(STATE_DIR, trace_id)
+                except Exception:
+                    pass
+                return JSONResponse(content=response)
 
     # 3) Executors respond independently using plan + evidence
     evidence_blocks: List[Dict[str, Any]] = []
@@ -4278,6 +4448,23 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         exec_messages = exec_messages + [{"role": "system", "content": (
             "If the tool results above contain errors that block the user's goal, include a short 'Suggestions' section (max 2 bullets) with specific, on-topic fixes (e.g., missing parameter defaults, retry guidance). Keep it brief and avoid scope creep."
         )}]
+
+    # Idempotency fast-path: if an identical run has already completed, return cached response
+    try:
+        pool = await get_pg_pool()
+        if pool is not None:
+            async with pool.acquire() as conn:
+                cached = await conn.fetchrow("SELECT response_json FROM run WHERE trace_id=$1 AND response_json IS NOT NULL", trace_id)
+            if cached and cached[0]:
+                resp = cached[0]
+                try:
+                    if _lock_token:
+                        _release_lock(STATE_DIR, trace_id)
+                except Exception:
+                    pass
+                return JSONResponse(content=resp)
+    except Exception:
+        pass
 
     qwen_payload = build_ollama_payload(
         messages=exec_messages, model=QWEN_MODEL_ID, num_ctx=DEFAULT_NUM_CTX, temperature=body.get("temperature") or DEFAULT_TEMPERATURE
@@ -5392,6 +5579,39 @@ async def refs_compose_character(body: Dict[str, Any]):
 async def tool_run(body: Dict[str, Any]):
     name = (body or {}).get("name")
     args = (body or {}).get("args") or {}
+    stream = bool((body or {}).get("stream") or False)
+    if stream:
+        async def _gen():
+            # Start event
+            yield ("data: " + json.dumps({"event": "start", "name": name or "tool"}) + "\n\n").encode("utf-8")
+            # Set up progress queue and execution task
+            global _tool_progress_q
+            q: asyncio.Queue = asyncio.Queue()
+            _tool_progress_q = q
+            exec_task = asyncio.create_task(execute_tool_call({"name": name, "arguments": args}))
+            last_ka = 0.0
+            try:
+                while True:
+                    now = time.time()
+                    sent_any = False
+                    # Drain progress queue quickly
+                    while not q.empty():
+                        ev = await q.get()
+                        yield ("data: " + json.dumps({"event": "progress", **(ev if isinstance(ev, dict) else {"msg": str(ev)})}) + "\n\n").encode("utf-8")
+                        sent_any = True
+                    if exec_task.done():
+                        res = await exec_task
+                        payload = {"event": "result", "ok": (not (isinstance(res, dict) and res.get("error"))), "result": res}
+                        yield ("data: " + json.dumps(payload) + "\n\n").encode("utf-8")
+                        break
+                    if (now - last_ka) >= 10.0 and not sent_any:
+                        yield b"data: {\"keepalive\": true}\n\n"
+                        last_ka = now
+                    await asyncio.sleep(0.25)
+            finally:
+                _tool_progress_q = None
+            yield b"data: [DONE]\n\n"
+        return StreamingResponse(_gen(), media_type="text/event-stream")
     try:
         try:
             _append_jsonl(os.path.join(STATE_DIR, "tools", "tools.jsonl"), {"t": int(time.time()*1000), "event": "start", "tool": name, "args": args})
@@ -5875,6 +6095,127 @@ async def list_models():
     }
 
 
+@app.post("/v1/embeddings")
+async def embeddings(body: Dict[str, Any]):
+    # OpenAI-compatible embeddings endpoint
+    model_name = str((body or {}).get("model") or EMBEDDING_MODEL_NAME)
+    inputs = (body or {}).get("input")
+    texts: List[str] = []
+    if isinstance(inputs, str):
+        texts = [inputs]
+    elif isinstance(inputs, list):
+        def _collect(v):
+            if isinstance(v, str):
+                texts.append(v)
+            elif isinstance(v, list):
+                for it in v: _collect(it)
+        _collect(inputs)
+    else:
+        texts = [json.dumps(inputs, ensure_ascii=False)]
+    if not texts:
+        texts = [""]
+    emb = get_embedder()
+    vecs = emb.encode(texts)
+    data = []
+    for i, v in enumerate(vecs):
+        data.append({"object": "embedding", "index": i, "embedding": [float(x) for x in list(v)]})
+    out = {
+        "object": "list",
+        "data": data,
+        "model": model_name,
+        "created": int(time.time()),
+    }
+    return JSONResponse(content=out)
+
+
+@app.post("/v1/completions")
+async def completions_legacy(body: Dict[str, Any]):
+    # Adapter to OpenAI legacy text completions using chat/completions under the hood
+    prompt = (body or {}).get("prompt")
+    stream = bool((body or {}).get("stream"))
+    temperature = (body or {}).get("temperature") or DEFAULT_TEMPERATURE
+    idempotency_key = (body or {}).get("idempotency_key")
+    # Normalize prompt(s) into messages
+    messages: List[Dict[str, Any]] = []
+    if isinstance(prompt, str):
+        messages = [{"role": "user", "content": prompt}]
+    elif isinstance(prompt, list):
+        parts: List[str] = []
+        for p in prompt:
+            if isinstance(p, str): parts.append(p)
+        messages = [{"role": "user", "content": "\n".join(parts)}] if parts else [{"role": "user", "content": ""}]
+    else:
+        messages = [{"role": "user", "content": str(prompt)}]
+    payload = {"messages": messages, "stream": bool(stream), "temperature": temperature}
+    if isinstance(idempotency_key, str):
+        payload["idempotency_key"] = idempotency_key
+    # Streaming: relay a single final chunk transformed to completions shape
+    if stream:
+        async def _gen():
+            import httpx as _hx  # type: ignore
+            async with _hx.AsyncClient(trust_env=False, timeout=None) as client:
+                async with client.stream("POST", (PUBLIC_BASE_URL.rstrip("/") if PUBLIC_BASE_URL else "http://127.0.0.1:8000") + "/v1/chat/completions", json=payload) as r:
+                    async for line in r.aiter_lines():
+                        if not line:
+                            continue
+                        if line.startswith("data: "):
+                            data_str = line[6:].strip()
+                            if data_str == "[DONE]":
+                                yield "data: [DONE]\n\n"
+                                break
+                            try:
+                                obj = json.loads(data_str)
+                                # Extract assistant text (final-only chunk in our impl)
+                                txt = ""
+                                try:
+                                    txt = (((obj.get("choices") or [{}])[0].get("delta") or {}).get("content") or "")
+                                    if not txt:
+                                        txt = (((obj.get("choices") or [{}])[0].get("message") or {}).get("content") or "")
+                                except Exception:
+                                    txt = ""
+                                chunk = {
+                                    "id": obj.get("id") or "orc-1",
+                                    "object": "text_completion.chunk",
+                                    "model": obj.get("model") or QWEN_MODEL_ID,
+                                    "choices": [
+                                        {"index": 0, "delta": {"text": txt}, "finish_reason": None}
+                                    ],
+                                }
+                                yield f"data: {json.dumps(chunk)}\n\n"
+                            except Exception:
+                                # pass through unknown data
+                                yield line + "\n"
+        return StreamingResponse(_gen(), media_type="text/event-stream")
+
+    # Non-streaming: call locally and map envelope
+    import httpx as _hx  # type: ignore
+    async with _hx.AsyncClient(trust_env=False, timeout=None) as client:
+        rr = await client.post((PUBLIC_BASE_URL.rstrip("/") if PUBLIC_BASE_URL else "http://127.0.0.1:8000") + "/v1/chat/completions", json=payload)
+    ct = rr.headers.get("content-type") or "application/json"
+    if not ct.startswith("application/json"):
+        # Fallback: wrap text
+        txt = rr.text
+        out = {
+            "id": "orc-1",
+            "object": "text_completion",
+            "model": QWEN_MODEL_ID,
+            "choices": [{"index": 0, "finish_reason": "stop", "text": txt}],
+            "created": int(time.time()),
+        }
+        return JSONResponse(content=out)
+    obj = rr.json()
+    content_txt = (((obj.get("choices") or [{}])[0].get("message") or {}).get("content") or obj.get("text") or "")
+    out = {
+        "id": obj.get("id") or "orc-1",
+        "object": "text_completion",
+        "model": obj.get("model") or QWEN_MODEL_ID,
+        "choices": [{"index": 0, "finish_reason": "stop", "text": content_txt}],
+        "usage": obj.get("usage") or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "created": obj.get("created") or int(time.time()),
+        "system_fingerprint": obj.get("system_fingerprint") or _hl.sha256((str(QWEN_MODEL_ID) + "+" + str(GPTOSS_MODEL_ID)).encode("utf-8")).hexdigest()[:16],
+    }
+    return JSONResponse(content=out)
+
 @app.websocket("/ws")
 async def ws_chat(websocket: WebSocket):
     await websocket.accept()
@@ -5886,7 +6227,7 @@ async def ws_chat(websocket: WebSocket):
                 body = JSONParser().parse(raw, {"messages": [{"role": str, "content": str}], "cid": (str)})
             except Exception:
                 body = {}
-            payload = {"messages": body.get("messages") or [], "stream": False, "cid": body.get("cid")}
+            payload = {"messages": body.get("messages") or [], "stream": False, "cid": body.get("cid"), "idempotency_key": body.get("idempotency_key")}
             try:
                 # Periodic keepalive so committee/debate long phases do not drop WS
                 live = True
@@ -5900,23 +6241,36 @@ async def ws_chat(websocket: WebSocket):
                         await _asyncio.sleep(10)
                 import asyncio as _asyncio
                 ka_task = _asyncio.create_task(_keepalive())
+                # Stream from chat/completions and forward chunks over WS
                 async with httpx.AsyncClient(trust_env=False, timeout=None) as client:
-                    rr = await client.post((PUBLIC_BASE_URL.rstrip("/") if PUBLIC_BASE_URL else "http://127.0.0.1:8000") + "/v1/chat/completions", json=payload)
-                ct = rr.headers.get("content-type") or "application/json"
-                if ct.startswith("application/json"):
-                    obj = rr.json()
-                else:
-                    obj = {"text": rr.text}
-                assistant_text = ((obj.get("choices") or [{}])[0].get("message") or {}).get("content") or obj.get("text") or ""
-                out = {
-                    "ok": True,
-                    "data": obj,
-                    "message": {"role": "assistant", "content": {"text": assistant_text}},
-                }
+                    if payload.get("stream") is not True:
+                        payload["stream"] = True
+                    async with client.stream("POST", (PUBLIC_BASE_URL.rstrip("/") if PUBLIC_BASE_URL else "http://127.0.0.1:8000") + "/v1/chat/completions", json=payload) as r:
+                        async for line in r.aiter_lines():
+                            if not line:
+                                continue
+                            if line.startswith("data: "):
+                                data_str = line[6:].strip()
+                                if data_str == "[DONE]":
+                                    await websocket.send_text(json.dumps({"done": True}))
+                                    break
+                                try:
+                                    obj = json.loads(data_str)
+                                except Exception:
+                                    await websocket.send_text(json.dumps({"stream": True, "delta": ""}))
+                                    continue
+                                # Derive a text delta from chunk
+                                delta_txt = ""
+                                try:
+                                    delta_txt = (((obj.get("choices") or [{}])[0].get("delta") or {}).get("content") or "")
+                                    if not delta_txt:
+                                        delta_txt = (((obj.get("choices") or [{}])[0].get("message") or {}).get("content") or "")
+                                except Exception:
+                                    delta_txt = ""
+                                await websocket.send_text(json.dumps({"stream": True, "delta": delta_txt}))
                 live = False
                 try: ka_task.cancel()
                 except Exception: pass
-                await websocket.send_text(json.dumps(out))
             except Exception as ex:
                 try:
                     live = False
@@ -5944,7 +6298,7 @@ async def ws_tool(websocket: WebSocket):
                 await websocket.send_text(json.dumps({"error": "missing tool name"}))
                 continue
             try:
-                # Keepalive while long tools run
+                # Keepalive while long tools run and stream start/result/done frames
                 live = True
                 async def _keepalive() -> None:
                     import asyncio as _asyncio
@@ -5956,11 +6310,29 @@ async def ws_tool(websocket: WebSocket):
                         await _asyncio.sleep(10)
                 import asyncio as _asyncio
                 ka_task = _asyncio.create_task(_keepalive())
-                res = await execute_tool_call({"name": name, "arguments": args})
+                await websocket.send_text(json.dumps({"event": "start", "name": name}))
+                # Progress queue wiring
+                global _tool_progress_q
+                q: asyncio.Queue = asyncio.Queue()
+                _tool_progress_q = q
+                exec_task = _asyncio.create_task(execute_tool_call({"name": name, "arguments": args}))
+                while True:
+                    sent = False
+                    while not q.empty():
+                        ev = await q.get()
+                        await websocket.send_text(json.dumps({"event": "progress", **(ev if isinstance(ev, dict) else {"msg": str(ev)})}))
+                        sent = True
+                    if exec_task.done():
+                        res = await exec_task
+                        break
+                    if not sent:
+                        await _asyncio.sleep(0.25)
                 live = False
                 try: ka_task.cancel()
                 except Exception: pass
-                await websocket.send_text(json.dumps({"ok": True, "result": res}))
+                await websocket.send_text(json.dumps({"event": "result", "ok": True, "result": res}))
+                _tool_progress_q = None
+                await websocket.send_text(json.dumps({"done": True}))
             except Exception as ex:
                 await websocket.send_text(json.dumps({"error": str(ex)}))
     except WebSocketDisconnect:

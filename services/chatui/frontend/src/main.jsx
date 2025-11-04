@@ -48,6 +48,7 @@ function App() {
   const knownDoneJobsRef = useRef(new Set())
   const jobsTimerRef = useRef(null)
   const progressStreamsRef = useRef({})
+  const streamBufRef = useRef('')
   const nextLocalId = () => {
     const n = localIdRef.current
     localIdRef.current = n + 1
@@ -55,7 +56,8 @@ function App() {
   }
 
   // WS retry helper: reconnect and resend payload until one message arrives
-  const wsSendWithRetry = async (payload, onMessage) => {
+  const wsSendWithRetry = async (payload, onMessage, opts = {}) => {
+    const maxAttempts = Number(opts.maxAttempts || 5)
     let attempt = 0
     let gotRealMessage = false
     const sendOnce = () => new Promise((resolve) => {
@@ -86,6 +88,13 @@ function App() {
       attempt += 1
       await sendOnce()
       if (gotRealMessage) break
+      if (attempt >= maxAttempts) {
+        // Fallback to POST path after several failed WS attempts
+        if (typeof opts.onExhausted === 'function') {
+          await opts.onExhausted()
+        }
+        break
+      }
       const delayMs = Math.min(5000, 500 * Math.pow(2, Math.max(0, attempt - 1)))
       await new Promise(r => setTimeout(r, delayMs))
     }
@@ -330,6 +339,19 @@ function App() {
         console.log('[ui] ws message', { bytes: raw.length, dt_ms: (t1 - t0).toFixed(1) })
         let data
         try { data = raw ? JSON.parse(raw) : {} } catch { data = { error: raw } }
+        if (data && data.stream === true) {
+          const d = (typeof data.delta === 'string') ? data.delta : ''
+          streamBufRef.current = (streamBufRef.current || '') + d
+          setMsgs(prev => (prev.map(m => m.id === thinkingId ? { ...m, content: { text: (streamBufRef.current || 'Thinking…') } } : m)))
+          return
+        }
+        if (data && data.done === true) {
+          const finalText = String(streamBufRef.current || '').trim()
+          setMsgs(prev => (prev.map(m => m.id === thinkingId ? { ...m, content: { text: finalText || '(no content)' } } : m)))
+          streamBufRef.current = ''
+          setSending(false)
+          return
+        }
         if (data && data.error) {
           // Replace thinking bubble with error
           setMsgs(prev => (prev.map(m => m.id === thinkingId ? { ...m, content: { text: `Error: ${data.error}` } } : m)))
@@ -348,8 +370,9 @@ function App() {
           finalContent = msgObj.content || data.text || data.error || raw
         }
         // Replace thinking bubble with final assistant content (never leave it empty)
-        const finalText = String(finalContent || '').trim()
+        const finalText = String(finalContent || streamBufRef.current || '').trim()
         setMsgs(prev => (prev.map(m => m.id === thinkingId ? { ...m, content: { text: finalText } } : m)))
+        streamBufRef.current = ''
         // If voice mode is on, speak the assistant reply via Web Speech
         if (voiceOn && finalText) {
           try {
@@ -363,6 +386,34 @@ function App() {
         const jobIds = parseJobIdsFromText(finalText)
         jobIds.forEach(startJobStream)
         setSending(false)
+      }, {
+        maxAttempts: 5,
+        onExhausted: async () => {
+          // POST fallback to ensure we always complete a request
+          try {
+            const rr = await fetch(`/api/conversations/${encodeURIComponent(conversationId)}/chat`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ messages: [{ role: 'user', content: userText }] })
+            })
+            const ct = rr.headers.get('content-type') || 'application/json'
+            if (ct.startsWith('application/json')) {
+              const obj = await rr.json()
+              const msgObj = (obj && obj.choices && obj.choices[0] && obj.choices[0].message) || {}
+              const finalText = String(msgObj.content || obj.text || '').trim()
+              setMsgs(prev => (prev.map(m => m.id === thinkingId ? { ...m, content: { text: finalText || '(no content)' } } : m)))
+            } else {
+              const textBody = await rr.text()
+              const finalText = String(textBody || '').trim()
+              setMsgs(prev => (prev.map(m => m.id === thinkingId ? { ...m, content: { text: finalText || '(no content)' } } : m)))
+            }
+          } catch (e) {
+            const emsg = e?.message || 'Network error'
+            setMsgs(prev => (prev.map(m => m.id === thinkingId ? { ...m, content: { text: `Error: ${emsg}` } } : m)))
+          } finally {
+            setSending(false)
+          }
+        }
       })
       return
     } catch (err) {

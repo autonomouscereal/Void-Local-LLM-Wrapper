@@ -218,7 +218,7 @@ async def global_cors_middleware(request: Request, call_next):
     # Preflight short-circuit for any path: respond quickly and add permissive headers
     if request.method == "OPTIONS":
         return Response(status_code=204, headers={
-            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Origin": (request.headers.get("origin") or "*"),
             "Access-Control-Allow-Methods": "*",
             "Access-Control-Allow-Headers": "*",
             "Access-Control-Allow-Credentials": "false",
@@ -226,17 +226,19 @@ async def global_cors_middleware(request: Request, call_next):
             "Access-Control-Max-Age": "86400",
             "Access-Control-Allow-Private-Network": "true",
             "Connection": "close",
+            "Vary": "Origin",
         })
     resp = await call_next(request)
     logging.info("RES %s %s %s", request.method, request.url.path, getattr(resp, 'status_code', ''))
     # Inject permissive CORS headers on every response
-    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Origin"] = request.headers.get("origin") or "*"
     resp.headers["Access-Control-Allow-Methods"] = "*"
     resp.headers["Access-Control-Allow-Headers"] = "*"
     resp.headers["Access-Control-Allow-Credentials"] = "false"
     resp.headers["Access-Control-Expose-Headers"] = "*"
     resp.headers["Access-Control-Max-Age"] = "86400"
     resp.headers["Access-Control-Allow-Private-Network"] = "true"
+    resp.headers["Vary"] = "Origin"
     # Help browsers load media without ORB/CORP issues when proxied through this backend
     if request.url.path.startswith("/uploads/") or request.url.path.endswith(".mp4") or request.url.path.endswith(".png"):
         resp.headers.setdefault("Cross-Origin-Resource-Policy", "cross-origin")
@@ -669,6 +671,33 @@ async def passthrough(body: Dict[str, Any]):
     return Response(content=rr.content, media_type=ct, status_code=rr.status_code, headers=headers)
 
 
+@app.get("/api/tool.stream")
+async def tool_stream(name: str, request: Request):
+    # SSE proxy to orchestrator tool.run with stream=true
+    try:
+        async def _gen():
+            params = {}
+            async with httpx.AsyncClient(trust_env=False, timeout=None) as client:
+                # Body comes from query or request body JSON
+                body = {"name": name, "args": {}, "stream": True}
+                if request.method in ("POST", "PUT", "PATCH"):
+                    try:
+                        raw = await request.body()
+                        decoded = raw.decode("utf-8", errors="replace")
+                        j = JSONParser().parse(decoded, {"args": dict})
+                        if isinstance(j.get("args"), dict):
+                            body["args"] = j.get("args")
+                    except Exception:
+                        pass
+                async with client.stream("POST", ORCH_URL.rstrip("/") + "/tool.run", params=params, json=body) as r:
+                    async for chunk in r.aiter_bytes():
+                        if not chunk:
+                            continue
+                        yield chunk
+        return StreamingResponse(_gen(), media_type="text/event-stream")
+    except Exception as ex:
+        return JSONResponse(status_code=502, content={"error": str(ex)})
+
 @app.options("/api/chat")
 async def chat_alt_preflight():
     return Response(status_code=204, headers={
@@ -795,11 +824,18 @@ async def tool_ws_proxy(websocket: WebSocket):
             upstream_url = _orch_ws_url()
             async with websockets.connect(upstream_url, ping_interval=20, ping_timeout=None, close_timeout=None, max_queue=None) as upstream:
                 await upstream.send(raw)
+                relayed = False
                 async for msg in upstream:
                     try:
                         await websocket.send_text(msg)
+                        relayed = True
                     except Exception:
                         break
+                if not relayed:
+                    try:
+                        await websocket.send_text(json.dumps({"error": "upstream_closed_without_message"}))
+                    except Exception:
+                        pass
     except WebSocketDisconnect:
         return
     except Exception as ex:
@@ -844,6 +880,26 @@ async def get_job(job_id: str):
     except Exception as ex:
         return JSONResponse(status_code=500, content={"error": str(ex)})
 
+
+@app.get("/api/jobs/{job_id}/stream")
+async def stream_job_proxy(job_id: str, interval_ms: Optional[int] = None):
+    params = {}
+    if interval_ms is not None:
+        params["interval_ms"] = interval_ms
+    async def _gen():
+        try:
+            async with httpx.AsyncClient(trust_env=False, timeout=None) as client:
+                async with client.stream("GET", ORCH_URL.rstrip("/") + f"/jobs/{job_id}/stream", params=params) as r:
+                    async for chunk in r.aiter_bytes():
+                        if not chunk:
+                            continue
+                        yield chunk
+        except Exception as ex:
+            # Emit an SSE error frame so the frontend can close gracefully
+            err = json.dumps({"error": str(ex)})
+            yield ("data: " + err + "\n\n").encode("utf-8")
+            yield b"data: [DONE]\n\n"
+    return StreamingResponse(_gen(), media_type="text/event-stream")
 
 @app.post("/api/jobs/{job_id}/cancel")
 async def cancel_job_proxy(job_id: str):
@@ -944,118 +1000,66 @@ async def uploads_proxy(path: str, request: Request):
 
 @app.websocket("/api/ws")
 async def chat_ws(websocket: WebSocket):
-    # WebSocket chat channel: client sends { conversation_id, content } and receives normalized JSON result
+    # WS → WS proxy: relay client messages to orchestrator /ws and stream responses back
     await websocket.accept()
     parser = JSONParser()
+    def _orch_ws_url() -> str:
+        p = urlparse(ORCH_URL)
+        scheme = 'wss' if p.scheme == 'https' else 'ws'
+        base = p._replace(scheme=scheme).geturl().rstrip('/')
+        return base + '/ws'
     try:
         while True:
             raw = await websocket.receive_text()
-            # Normalize client payload
-            expected_request = {
-                "conversation_id": int,
-                "content": str,
-                "messages": [ {"role": str, "content": str} ],
-            }
+            # Best-effort persist of the user message into DB so history shows up
             try:
-                body = parser.parse(raw, expected_request)
+                body = parser.parse(raw, {"conversation_id": int, "content": str})
             except Exception:
-                body = {"conversation_id": 0, "content": raw, "messages": []}
+                body = {"conversation_id": 0, "content": raw}
             cid = int((body or {}).get("conversation_id") or 0)
-            user_content = (body or {}).get("content") or ""
-            if not cid:
-                await websocket.send_text(json.dumps({"error": "missing conversation_id"}))
-                continue
-            # Persist user message and fetch attachments (tolerate DB outages)
-            atts = []
-            hist_rows = []
+            user_text = (body or {}).get("content") or ""
+            if cid and user_text:
+                try:
+                    async with _pool().acquire() as conn:
+                        await conn.execute("INSERT INTO messages (conversation_id, role, content) VALUES ($1, 'user', $2::jsonb)", cid, json.dumps({"text": user_text}))
+                except Exception:
+                    pass
+            # Build OpenAI-style messages from DB history + attachments so upstream has full context
+            oa_msgs: List[Dict[str, Any]] = []
             try:
-                async with _pool().acquire() as conn:
-                    await conn.execute(
-                        "INSERT INTO messages (conversation_id, role, content) VALUES ($1, 'user', $2::jsonb)",
-                        cid,
-                        json.dumps({"text": user_content}),
-                    )
-                    atts = await conn.fetch("SELECT name, url, mime FROM attachments WHERE conversation_id=$1", cid)
-                    hist_rows = await conn.fetch("SELECT role, content FROM messages WHERE conversation_id=$1 ORDER BY id ASC", cid)
-            except Exception:
                 atts = []
                 hist_rows = []
-            base_hist: List[Dict[str, Any]] = []
-            for r in hist_rows:
-                decoded = _decode_json(r["content"])
-                base_hist.append({"role": r["role"], "content": decoded.get("text") or ""})
-            oa_msgs = _build_openai_messages(base_hist, [dict(a) for a in atts])
-            payload = {"messages": oa_msgs, "stream": False, "cid": cid}
-            # Call orchestrator and relay normalized JSON (OpenAI-compatible envelope + simple message)
-            try:
-                # Periodic keepalive to prevent intermediary/proxy idle disconnects
-                live = True
-                async def _keepalive() -> None:
-                    import asyncio as _asyncio
-                    while live:
-                        try:
-                            await websocket.send_text(json.dumps({"keepalive": True }))
-                        except Exception:
-                            break
-                        await _asyncio.sleep(10)
-                import asyncio as _asyncio
-                ka_task = _asyncio.create_task(_keepalive())
-                async with httpx.AsyncClient(trust_env=False, timeout=None) as client:
-                    rr = await client.post(ORCH_URL.rstrip("/") + "/v1/chat/completions", json=payload)
-                ct = rr.headers.get("content-type") or "application/json"
-                if ct.startswith("application/json"):
-                    expected_response = {"choices": [{"message": {"content": str}}]}
-                    obj = parser.parse(rr.text, expected_response)
-                else:
-                    # Wrap raw
-                    obj = {"text": rr.text}
-                assistant_text = ((obj.get("choices") or [{}])[0].get("message") or {}).get("content") or obj.get("text") or ""
-                if assistant_text:
+                if cid:
+                    async with _pool().acquire() as conn:
+                        atts = await conn.fetch("SELECT name, url, mime FROM attachments WHERE conversation_id=$1", cid)
+                        hist_rows = await conn.fetch("SELECT role, content FROM messages WHERE conversation_id=$1 ORDER BY id ASC", cid)
+                base_hist: List[Dict[str, Any]] = []
+                for r in hist_rows:
+                    decoded = _decode_json(r["content"])
+                    base_hist.append({"role": r["role"], "content": decoded.get("text") or ""})
+                oa_msgs = _build_openai_messages(base_hist, [dict(a) for a in atts])
+            except Exception:
+                oa_msgs = [{"role": "user", "content": user_text }]
+            # Open upstream orchestrator WS and relay frames; no timeouts
+            upstream_url = _orch_ws_url()
+            async with websockets.connect(upstream_url, ping_interval=20, ping_timeout=None, close_timeout=None, max_queue=None) as upstream:
+                # Idempotency key prevents double work if a later POST fallback occurs
+                import uuid as _uuid
+                payload_up = json.dumps({"messages": oa_msgs, "cid": str(cid or ""), "stream": False, "idempotency_key": _uuid.uuid4().hex})
+                await upstream.send(payload_up)
+                relayed = False
+                async for msg in upstream:
                     try:
-                        async with _pool().acquire() as c2:
-                            await c2.execute(
-                                "INSERT INTO messages (conversation_id, role, content) VALUES ($1, 'assistant', $2::jsonb)",
-                                cid,
-                                json.dumps({"text": assistant_text}),
-                            )
+                        await websocket.send_text(msg)
+                        relayed = True
+                    except Exception:
+                        break
+                if not relayed:
+                    try:
+                        await websocket.send_text(json.dumps({"error": "upstream_closed_without_message"}))
                     except Exception:
                         pass
-                # Build OpenAI-compatible response envelope and a simple normalized message
-                completion = {
-                    "id": "ws-orc-1",
-                    "object": "chat.completion",
-                    "model": "orchestrator",
-                    "choices": [
-                        {
-                            "index": 0,
-                            "finish_reason": "stop",
-                            "message": {"role": "assistant", "content": assistant_text},
-                        }
-                    ],
-                }
-                payload_out = {
-                    "ok": True,
-                    "data": completion,
-                    "message": {"role": "assistant", "content": {"text": assistant_text}},
-                }
-                live = False
-                try: ka_task.cancel()
-                except Exception: pass
-                await websocket.send_text(json.dumps(payload_out))
-            except Exception as ex:
-                live = False
-                try: ka_task.cancel()
-                except Exception: pass
-                # Ensure non-empty, informative error payloads
-                err_str = (str(ex) or getattr(ex, "message", "") or ex.__class__.__name__).strip()
-                payload_err = {
-                    "ok": False,
-                    "error": err_str,
-                    "message": {"role": "assistant", "content": {"text": f"Error: {err_str}"}},
-                }
-                await websocket.send_text(json.dumps(payload_err))
     except WebSocketDisconnect:
-        # Client disconnected; end session
         return
 
 
