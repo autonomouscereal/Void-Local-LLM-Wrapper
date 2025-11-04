@@ -55,8 +55,9 @@ def append_sample(kind: str, row: Dict[str, Any]) -> str:
         idx = {}
         if os.path.exists(idx_path):
             try:
-                with open(idx_path, "r", encoding="utf-8") as f:
-                    idx = json.load(f)
+            with open(idx_path, "r", encoding="utf-8") as f:
+                from ..jsonio.helpers import parse_json_text as _parse_json_text
+                idx = _parse_json_text(f.read(), {})
             except Exception:
                 idx = {}
         sz = os.path.getsize(path) if os.path.exists(path) else 0

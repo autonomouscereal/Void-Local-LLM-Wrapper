@@ -30,6 +30,7 @@ from __future__ import annotations
 import os
 from types import SimpleNamespace
 import asyncio
+import hashlib as _hl
 import json
 from typing import Any, Dict, List, Optional, Tuple
 import time
@@ -52,14 +53,20 @@ from .json_parser import JSONParser
 from .determinism import seed_router as det_seed_router, seed_tool as det_seed_tool, round6 as det_round6
 from .icw.windowed_solver import solve as windowed_solve
 from .jsonio.normalize import normalize_to_envelope
+from .jsonio.helpers import parse_json_text as _parse_json_text, resp_json as _resp_json
+from .search.meta import rrf_fuse as _rrf_fuse
+from .tools.progress import emit_progress, set_progress_queue, get_progress_queue
+from .tools.mcp_bridge import call_mcp_tool as _call_mcp_tool
+from .omni.context import build_omni_context
 from .jsonio.stitch import merge_envelopes as stitch_merge_envelopes, stitch_openai as stitch_openai_final
 from .router.route import route_for_request
+from .rag.core import get_embedder as _rag_get_embedder
 from .ablation.core import ablate as ablate_env
 from .ablation.export import write_facts_jsonl as ablate_write_facts
 from .code_loop.super_loop import run_super_loop
 from .state.checkpoints import append_event as _append_event
 from .state.lock import acquire_lock as _acquire_lock, release_lock as _release_lock
-from .artifacts.manifest import add_manifest_row as _manifest_add_row, write_manifest_atomic as _manifest_write
+# manifest helpers imported below as _art_manifest_add/_art_manifest_write
 from .state.ids import step_id as _step_id
 from .research.orchestrator import run_research
 from .jobs.state import get_job as _get_orcjob, request_cancel as _orcjob_cancel
@@ -84,66 +91,15 @@ from .tools_tts.sfx import run_sfx_compose
 from .tools_music.compose import run_music_compose
 from .tools_music.variation import run_music_variation
 from .tools_music.mixdown import run_music_mixdown
-from .context.index import add_artifact as _ctx_add, list_recent as _ctx_list
+from .context.index import add_artifact as _ctx_add
 from .artifacts.shard import open_shard as _art_open_shard, append_jsonl as _art_append_jsonl, _finalize_shard as _art_finalize
 from .artifacts.shard import newest_part as _art_newest_part, list_parts as _art_list_parts
 from .artifacts.manifest import add_manifest_row as _art_manifest_add, write_manifest_atomic as _art_manifest_write
 from .datasets.trace import append_sample as _trace_append
-async def _db_insert_run(trace_id: str, mode: str, seed: int, pack_hash: Optional[str], request_json: Dict[str, Any]) -> Optional[int]:
-    try:
-        pool = await get_pg_pool()
-        if pool is None:
-            return None
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "INSERT INTO run(trace_id, mode, seed, pack_hash, request_json) VALUES($1,$2,$3,$4,$5) ON CONFLICT (trace_id) DO UPDATE SET mode=EXCLUDED.mode RETURNING id",
-                trace_id, mode, int(seed), pack_hash, json.dumps(request_json, ensure_ascii=False),
-            )
-            return int(row[0]) if row else None
-    except Exception:
-        return None
-
-async def _db_update_run_response(run_id: Optional[int], response_json: Dict[str, Any], metrics_json: Dict[str, Any]) -> None:
-    if not run_id:
-        return
-    try:
-        pool = await get_pg_pool()
-        if pool is None:
-            return
-        async with pool.acquire() as conn:
-            await conn.execute("UPDATE run SET response_json=$1, metrics_json=$2 WHERE id=$3", json.dumps(response_json, ensure_ascii=False), json.dumps(metrics_json, ensure_ascii=False), int(run_id))
-    except Exception:
-        return
-
-async def _db_insert_icw_log(run_id: Optional[int], pack_hash: Optional[str], budget_tokens: int, scores_json: Dict[str, Any]) -> None:
-    if not (run_id and pack_hash):
-        return
-    try:
-        pool = await get_pg_pool()
-        if pool is None:
-            return
-        async with pool.acquire() as conn:
-            await conn.execute(
-                "INSERT INTO icw_log(run_id, pack_hash, budget_tokens, scores_json) VALUES($1,$2,$3,$4)",
-                int(run_id), pack_hash, int(budget_tokens), json.dumps(scores_json, ensure_ascii=False),
-            )
-    except Exception:
-        return
-
-async def _db_insert_tool_call(run_id: Optional[int], name: str, seed: int, args_json: Dict[str, Any], result_json: Optional[Dict[str, Any]], duration_ms: Optional[int] = None) -> None:
-    if not run_id:
-        return
-    try:
-        pool = await get_pg_pool()
-        if pool is None:
-            return
-        async with pool.acquire() as conn:
-            await conn.execute(
-                "INSERT INTO tool_call(run_id, name, seed, args_json, result_json, duration_ms) VALUES($1,$2,$3,$4,$5,$6)",
-                int(run_id), name, int(seed), json.dumps(args_json, ensure_ascii=False), json.dumps(result_json or {}, ensure_ascii=False), duration_ms,
-            )
-    except Exception:
-        return
+from .embeddings.core import build_embeddings_response as _build_embeddings_response
+from .db.pool import get_pg_pool
+from .db.tracing import db_insert_run as _db_insert_run, db_update_run_response as _db_update_run_response, db_insert_icw_log as _db_insert_icw_log, db_insert_tool_call as _db_insert_tool_call
+## db helpers moved to .db.tracing
 def _normalize_dict_body(body: Any, expected_schema: Dict[str, Any]) -> Dict[str, Any]:
     """Accept either a dict or a JSON string and return a dict shaped by expected_schema.
     Never raise on bad input; return {} as a safe default.
@@ -166,7 +122,6 @@ DEFAULT_NUM_CTX = int(os.getenv("DEFAULT_NUM_CTX", "8192"))
 DEFAULT_TEMPERATURE = float(os.getenv("DEFAULT_TEMPERATURE", "0.3"))
 # Gates removed: defaults are always ON; API-key checks still apply where required
 ENABLE_WEBSEARCH = True
-SERPAPI_API_KEY = os.getenv("SERPAPI_API_KEY")
 MCP_HTTP_BRIDGE_URL = os.getenv("MCP_HTTP_BRIDGE_URL")  # e.g., http://host.docker.internal:9999
 EXECUTOR_BASE_URL = os.getenv("EXECUTOR_BASE_URL")  # http://executor:8081
 PLANNER_MODEL = os.getenv("PLANNER_MODEL", "qwen")  # qwen | gptoss
@@ -241,6 +196,19 @@ SVD_API_URL = os.getenv("SVD_API_URL")                        # http://svd:9008
 
 def _sha256_bytes(b: bytes) -> str:
     import hashlib as _hl
+def _parse_json_text(text: str, expected: Any) -> Any:
+    try:
+        return JSONParser().parse(text, expected if expected is not None else {})
+    except Exception:
+        # As a last resort, return empty of same shape
+        if isinstance(expected, dict):
+            return {}
+        if isinstance(expected, list):
+            return []
+        return {}
+
+def _resp_json(resp, expected: Any) -> Any:
+    return _parse_json_text(getattr(resp, "text", "") or "", expected)
     return _hl.sha256(b).hexdigest()
 
 
@@ -252,7 +220,7 @@ def _load_wrapper_config() -> None:
                 data = f.read()
             WRAPPER_CONFIG_HASH = f"sha256:{_sha256_bytes(data)}"
             try:
-                WRAPPER_CONFIG = json.loads(data.decode("utf-8"))
+                WRAPPER_CONFIG = JSONParser().parse(data.decode("utf-8"), {})
             except Exception:
                 WRAPPER_CONFIG = {}
         else:
@@ -597,252 +565,21 @@ def extract_attachments_from_messages(messages: List[Dict[str, Any]]) -> Tuple[L
 
 
 # ---------- RAG (pgvector) ----------
-pg_pool: Optional[asyncpg.pool.Pool] = None
 _embedder: Optional[SentenceTransformer] = None
 _rag_cache: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
 
 # Tool streaming progress hook (set by streaming endpoints)
-_tool_progress_q: Optional[asyncio.Queue] = None
-def _tool_progress_emit(event: Dict[str, Any]) -> None:
-    q = _tool_progress_q
-    if q is not None and isinstance(event, dict):
-        try:
-            q.put_nowait(event)
-        except Exception:
-            pass
-
-
-async def get_pg_pool() -> Optional[asyncpg.pool.Pool]:
-    global pg_pool
-    if pg_pool is not None:
-        return pg_pool
-    if not (POSTGRES_HOST and POSTGRES_DB and POSTGRES_USER and POSTGRES_PASSWORD):
-        return None
-    pg_pool = await asyncpg.create_pool(
-        user=POSTGRES_USER,
-        password=POSTGRES_PASSWORD,
-        database=POSTGRES_DB,
-        host=POSTGRES_HOST,
-        port=POSTGRES_PORT,
-        min_size=1,
-        max_size=10,
-    )
-    async with pg_pool.acquire() as conn:
-        await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
-        # Core tables for tracing/distillation (no ORM)
-        await conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS run (
-              id            BIGSERIAL PRIMARY KEY,
-              trace_id      TEXT UNIQUE NOT NULL,
-              workspace     TEXT NOT NULL DEFAULT 'default',
-              mode          TEXT NOT NULL,
-              seed          BIGINT NOT NULL,
-              pack_hash     TEXT,
-              request_json  JSONB NOT NULL,
-              response_json JSONB,
-              metrics_json  JSONB,
-              created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
-            );
-            """
-        )
-        await conn.execute("CREATE INDEX IF NOT EXISTS run_mode_created_idx ON run(mode, created_at DESC);")
-        await conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS artifact (
-              id          BIGSERIAL PRIMARY KEY,
-              sha256      TEXT NOT NULL UNIQUE,
-              uri         TEXT NOT NULL,
-              kind        TEXT NOT NULL,
-              bytes       BIGINT,
-              meta_json   JSONB,
-              created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
-            );
-            """
-        )
-        await conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS tool_call (
-              id          BIGSERIAL PRIMARY KEY,
-              run_id      BIGINT NOT NULL REFERENCES run(id) ON DELETE CASCADE,
-              name        TEXT NOT NULL,
-              seed        BIGINT NOT NULL,
-              args_json   JSONB NOT NULL,
-              result_json JSONB,
-              artifact_id BIGINT REFERENCES artifact(id),
-              duration_ms INTEGER,
-              created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
-            );
-            """
-        )
-        await conn.execute("CREATE INDEX IF NOT EXISTS tool_run_name_idx ON tool_call(run_id, name);")
-        await conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS icw_log (
-              id            BIGSERIAL PRIMARY KEY,
-              run_id        BIGINT NOT NULL REFERENCES run(id) ON DELETE CASCADE,
-              pack_hash     TEXT NOT NULL,
-              budget_tokens INTEGER NOT NULL,
-              scores_json   JSONB,
-              created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
-            );
-            """
-        )
-        await conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS rag_docs (
-              id BIGSERIAL PRIMARY KEY,
-              path TEXT,
-              chunk TEXT,
-              embedding vector(384)
-            );
-            """
-        )
-        # Ensure pgvector extension and indexes exist (safe to run if extension already installed)
-        try:
-            await conn.execute("CREATE EXTENSION IF NOT EXISTS vector;")
-        except Exception:
-            pass
-        try:
-            # pgvector opclass names differ by version: use *_ops form
-            await conn.execute("CREATE INDEX IF NOT EXISTS rag_docs_embedding_idx ON rag_docs USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);")
-        except Exception:
-            # Fallback: HNSW with L2 opclass
-            try:
-                await conn.execute("CREATE INDEX IF NOT EXISTS rag_docs_embedding_hnsw_idx ON rag_docs USING hnsw (embedding vector_l2_ops);")
-            except Exception:
-                pass
-        await conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS jobs (
-              id TEXT PRIMARY KEY,
-              prompt_id TEXT,
-              status TEXT,
-              created_at TIMESTAMPTZ DEFAULT NOW(),
-              updated_at TIMESTAMPTZ DEFAULT NOW(),
-              workflow JSONB,
-              result JSONB,
-              error TEXT
-            );
-            """
-        )
-        await conn.execute("CREATE INDEX IF NOT EXISTS jobs_status_updated_idx ON jobs (status, updated_at DESC);")
-        await conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS job_checkpoints (
-              id BIGSERIAL PRIMARY KEY,
-              job_id TEXT REFERENCES jobs(id) ON DELETE CASCADE,
-              created_at TIMESTAMPTZ DEFAULT NOW(),
-              data JSONB
-            );
-            """
-        )
-        await conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS films (
-              id TEXT PRIMARY KEY,
-              title TEXT,
-              synopsis TEXT,
-              created_at TIMESTAMPTZ DEFAULT NOW(),
-              updated_at TIMESTAMPTZ DEFAULT NOW(),
-              metadata JSONB
-            );
-            """
-        )
-        await conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS characters (
-              id TEXT PRIMARY KEY,
-              film_id TEXT REFERENCES films(id) ON DELETE CASCADE,
-              name TEXT,
-              description TEXT,
-              reference_data JSONB,
-              created_at TIMESTAMPTZ DEFAULT NOW(),
-              updated_at TIMESTAMPTZ DEFAULT NOW()
-            );
-            """
-        )
-        await conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS scenes (
-              id TEXT PRIMARY KEY,
-              film_id TEXT REFERENCES films(id) ON DELETE CASCADE,
-              index_num INT,
-              prompt TEXT,
-              plan JSONB,
-              status TEXT,
-              job_id TEXT,
-              assets JSONB,
-              created_at TIMESTAMPTZ DEFAULT NOW(),
-              updated_at TIMESTAMPTZ DEFAULT NOW()
-            );
-            """
-        )
-    return pg_pool
 
 
 def get_embedder() -> SentenceTransformer:
-    global _embedder
-    if _embedder is None:
-        _embedder = SentenceTransformer(EMBEDDING_MODEL_NAME)
-    return _embedder
+    # Delegate to rag.core to keep a single embedder
+    return _rag_get_embedder()
 
 
-async def rag_index_dir(root: str = "/workspace", glob_exts: Optional[List[str]] = None, chunk_size: int = 1000, chunk_overlap: int = 200) -> Dict[str, Any]:
-    import glob as _glob
-    import os as _os
-    pool = await get_pg_pool()
-    if pool is None:
-        return {"error": "pgvector not configured"}
-    exts = glob_exts or ["*.md", "*.py", "*.ts", "*.tsx", "*.js", "*.json", "*.txt"]
-    files: List[str] = []
-    for ext in exts:
-        files.extend(_glob.glob(_os.path.join(root, "**", ext), recursive=True))
-    embedder = get_embedder()
-    total_chunks = 0
-    async with pool.acquire() as conn:
-        for fp in files[:5000]:
-            try:
-                with open(fp, "r", encoding="utf-8", errors="ignore") as f:
-                    content = f.read()
-            except Exception:
-                continue
-            i = 0
-            length = len(content)
-            while i < length:
-                chunk = content[i : i + chunk_size]
-                i += max(1, chunk_size - chunk_overlap)
-                vec = embedder.encode([chunk])[0]
-                await conn.execute("INSERT INTO rag_docs (path, chunk, embedding) VALUES ($1, $2, $3)", fp.replace(root + "/", ""), chunk, list(vec))
-                total_chunks += 1
-    return {"indexed_files": len(files), "chunks": total_chunks}
+from .rag.core import rag_index_dir  # re-exported for backwards-compat
 
 
-async def rag_search(query: str, k: int = 8) -> List[Dict[str, Any]]:
-    now = time.time()
-    key = f"{query}::{k}"
-    cached = _rag_cache.get(key)
-    if cached and (now - cached[0] <= RAG_CACHE_TTL_SEC):
-        return cached[1]
-    pool = await get_pg_pool()
-    if pool is None:
-        return []
-    vec = get_embedder().encode([query])[0]
-    async with pool.acquire() as conn:
-        rows = await conn.fetch("SELECT path, chunk FROM rag_docs ORDER BY embedding <=> $1 LIMIT $2", list(vec), k)
-        results = [{"path": r["path"], "chunk": r["chunk"]} for r in rows]
-        # Apply hygiene: de-dup and newest-first (ts may be absent)
-        try:
-            from .rag.hygiene import rag_filter as _rf
-            # map to {title,text,ts,url}
-            mapped = [{"title": it.get("path"), "text": it.get("chunk"), "ts": 0, "url": it.get("path")} for it in results]
-            clean = _rf(mapped)
-            # map back to original structure but keep order
-            results = [{"path": c.get("title"), "chunk": c.get("text") } for c in clean]
-        except Exception:
-            pass
-        _rag_cache[key] = (now, results)
-        return results
+from .rag.core import rag_search  # re-exported for backwards-compat
 
 
 @retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=0.5, max=2))
@@ -854,7 +591,8 @@ async def call_ollama(base_url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
             # Some Ollama versions reject the keep_alive option in the request body; rely on server env instead
             resp = await client.post(f"{base_url}/api/generate", json=ppayload)
             resp.raise_for_status()
-            data = resp.json()
+            # Expected minimal Ollama generate response
+            data = _resp_json(resp, {"response": str, "prompt_eval_count": int, "eval_count": int})
             if isinstance(data, dict) and ("prompt_eval_count" in data or "eval_count" in data):
                 usage = {
                     "prompt_tokens": int(data.get("prompt_eval_count", 0) or 0),
@@ -867,76 +605,13 @@ async def call_ollama(base_url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
             return {"error": str(e), "_base_url": base_url}
 
 
-async def serpapi_google_search(queries: List[str], max_results: int = 5) -> str:
-    if not SERPAPI_API_KEY:
-        return ""
-    aggregate = []
-    async with httpx.AsyncClient() as client:
-        for q in queries:
-            try:
-                params = {
-                    "engine": "google",
-                    "q": q,
-                    "num": max_results,
-                    "api_key": SERPAPI_API_KEY,
-                }
-                r = await client.get("https://serpapi.com/search.json", params=params)
-                r.raise_for_status()
-                data = r.json()
-                organic = data.get("organic_results", [])
-                for item in organic[:max_results]:
-                    title = item.get("title", "")
-                    snippet = item.get("snippet", "")
-                    link = item.get("link", "")
-                    aggregate.append(f"- {title}\n{snippet}\n{link}")
-            except Exception:
-                continue
-    return "\n".join(aggregate[: max_results * max(1, len(queries))])
+## serpapi removed — use metasearch.fuse/web_search exclusively
 
 
-def _rrf_fuse(results_by_engine: Dict[str, List[Dict[str, Any]]], k: int = 60) -> List[Dict[str, Any]]:
-    # Reciprocal Rank Fusion + CombMNZ with stable tie-break
-    scores: Dict[str, float] = {}
-    freq: Dict[str, int] = {}
-    meta: Dict[str, Dict[str, Any]] = {}
-    for eng, items in results_by_engine.items():
-        for rank, it in enumerate(items, start=1):
-            key = it.get("link") or it.get("url") or it.get("id") or f"{eng}:{rank}"
-            rr = 1.0 / float(k + rank)
-            scores[key] = scores.get(key, 0.0) + rr
-            freq[key] = freq.get(key, 0) + 1
-            if key not in meta:
-                meta[key] = {"title": it.get("title"), "link": it.get("link") or it.get("url"), "snippet": it.get("snippet")}
-    # Combine: CombMNZ = (sum of scores) * freq; round to 1e-6 and tie-break deterministically
-    def _auth(x: Dict[str, Any]) -> float:
-        return 0.0
-    def _rec(x: Dict[str, Any]) -> float:
-        return 0.0
-    def _sha(x: str) -> str:
-        import hashlib as _h
-        return _h.sha256(x.encode("utf-8")).hexdigest()
-    items: List[Dict[str, Any]] = []
-    for key, sc in scores.items():
-        m = meta.get(key) or {}
-        comb = float(f"{(sc * float(freq.get(key, 1))):.6f}")
-        items.append({"key": key, "score": comb, "rrf": float(f"{sc:.6f}"), "freq": int(freq.get(key, 1)), **m})
-    items.sort(key=lambda r: (-r["score"], -_auth(r), -_rec(r), _sha(r.get("key") or "")))
-    return items
+## rrf_fuse moved to .search.meta
 
 
-async def call_mcp_tool(name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
-    if not MCP_HTTP_BRIDGE_URL:
-        return {"error": "MCP bridge URL not configured"}
-    try:
-        async with httpx.AsyncClient() as client:
-            r = await client.post(
-                MCP_HTTP_BRIDGE_URL.rstrip("/") + "/call",
-                json={"name": name, "arguments": arguments or {}},
-            )
-            r.raise_for_status()
-            return r.json()
-    except Exception as ex:
-        return {"error": str(ex)}
+## moved to .tools.mcp_bridge
 
 
 def to_openai_tool_calls(tool_calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -1605,7 +1280,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             async with httpx.AsyncClient() as client:
                 r = await client.post(COMFYUI_API_URL.rstrip("/") + "/prompt", json={"prompt": wf})
                 try:
-                    r.raise_for_status(); return {"name": name, "result": r.json()}
+                    r.raise_for_status(); return {"name": name, "result": _resp_json(r, {})}
                 except Exception:
                     return {"name": name, "error": r.text}
         # Otherwise fall through to provider that builds a valid graph
@@ -1619,18 +1294,18 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             def _post_prompt(self, graph: Dict[str, Any]) -> Dict[str, Any]:
                 import httpx as _hx  # type: ignore
                 with _hx.Client() as client:
-                    _tool_progress_emit({"stage": "submit", "target": "comfyui"})
+                    emit_progress({"stage": "submit", "target": "comfyui"})
                     r = client.post(self.base + "/prompt", json={"prompt": graph})
-                    r.raise_for_status(); return r.json()
+                    r.raise_for_status(); return _resp_json(r, {"prompt_id": str})
             def _poll(self, pid: str) -> Dict[str, Any]:
                 import httpx as _hx, time as _tm  # type: ignore
                 while True:
-                    _tool_progress_emit({"stage": "poll", "prompt_id": pid})
+                    emit_progress({"stage": "poll", "prompt_id": pid})
                     r = _hx.get(self.base + f"/history/{pid}")
                     if r.status_code == 200:
-                        js = r.json(); h = (js.get("history") or {}).get(pid)
+                        js = _resp_json(r, {"history": dict}); h = (js.get("history") or {}).get(pid)
                         if h and (h.get("status", {}).get("completed") is True):
-                            _tool_progress_emit({"stage": "completed", "prompt_id": pid})
+                            emit_progress({"stage": "completed", "prompt_id": pid})
                             return h
                     _tm.sleep(1.0)
             def _download_first(self, detail: Dict[str, Any]) -> bytes:
@@ -1645,10 +1320,10 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                             q = {"filename": fn, "type": tp}
                             if sub: q["subfolder"] = sub
                             url = self.base + "/view?" + urlencode(q)
-                            _tool_progress_emit({"stage": "download", "file": fn})
+                            emit_progress({"stage": "download", "file": fn})
                             r = _hx.get(url)
                             if r.status_code == 200:
-                                _tool_progress_emit({"stage": "downloaded", "bytes": len(r.content)})
+                                emit_progress({"stage": "downloaded", "bytes": len(r.content)})
                                 return r.content
                 return b""
             def _parse_wh(self, size: str) -> tuple[int, int]:
@@ -1719,7 +1394,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                                 with _hx.Client() as _c:
                                     rr = _c.post(FACEID_API_URL.rstrip("/") + "/embed", json={"image_url": pub_url})
                                 if rr.status_code == 200:
-                                    jsr = rr.json(); emb = jsr.get("embedding") or jsr.get("vec")
+                                    jsr = _resp_json(rr, {"embedding": list, "vec": list}); emb = jsr.get("embedding") or jsr.get("vec")
                                     if emb and isinstance(emb, (list, tuple)) and len(emb) > 0:
                                         g["34"] = {"class_type": "LoadImage", "inputs": {"image": face_list[0]}}
                                         g["35"] = {"class_type": "InstantIDApply", "inputs": {"model": cur_model_src, "image": ["34", 0], "embedding": emb, "strength": 0.70}}
@@ -1795,11 +1470,11 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         class _TTSProvider:
             async def _xtts(self, payload: Dict[str, Any]) -> Dict[str, Any]:
                 async with httpx.AsyncClient() as client:
-                    _tool_progress_emit({"stage": "request", "target": "xtts"})
+                    emit_progress({"stage": "request", "target": "xtts"})
                     # Pass through voice_lock/voice_id/seed/rate/pitch so backend can lock timbre
                     r = await client.post(XTTS_API_URL.rstrip("/") + "/tts", json=payload)
                     r.raise_for_status()
-                    js = r.json()
+                    js = _resp_json(r, {"wav_b64": str, "url": str, "duration_s": (float), "model": str})
                     # Expected: wav_b64 or url
                     wav = b""
                     if isinstance(js.get("wav_b64"), str):
@@ -1809,7 +1484,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                         rr = await client.get(js.get("url"))
                         if rr.status_code == 200:
                             wav = rr.content
-                    _tool_progress_emit({"stage": "received", "bytes": len(wav)})
+                    emit_progress({"stage": "received", "bytes": len(wav)})
                     return {"wav_bytes": wav, "duration_s": float(js.get("duration_s") or 0.0), "model": js.get("model") or "xtts"}
             def speak(self, args: Dict[str, Any]) -> Dict[str, Any]:
                 # Bridge sync to async
@@ -1870,7 +1545,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             async with httpx.AsyncClient() as client:
                 r = await client.post(OCR_API_URL.rstrip("/") + "/ocr", json={"b64": b64, "ext": ext})
                 r.raise_for_status()
-                js = r.json()
+                js = _resp_json(r, {"text": str})
                 return {"name": name, "result": {"text": js.get("text") or "", "ext": ext}}
         except Exception as ex:
             return {"name": name, "error": str(ex)}
@@ -1915,7 +1590,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             async with httpx.AsyncClient() as client:
                 r = await client.post(VLM_API_URL.rstrip("/") + "/analyze", json={"b64": b64, "ext": ext})
                 r.raise_for_status()
-                js = r.json()
+                js = _resp_json(r, {})
                 return {"name": name, "result": js}
         except Exception as ex:
             return {"name": name, "error": str(ex)}
@@ -1928,9 +1603,9 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 async def _compose(self, payload: Dict[str, Any]) -> Dict[str, Any]:
                     import base64 as _b
                     async with httpx.AsyncClient() as client:
-                        _tool_progress_emit({"stage": "request", "target": "music"})
+                        emit_progress({"stage": "request", "target": "music"})
                         r = await client.post(MUSIC_API_URL.rstrip("/") + "/generate", json={"prompt": payload.get("prompt"), "duration": int(payload.get("length_s") or 8)})
-                        r.raise_for_status(); js = r.json(); b64 = js.get("audio_wav_base64") or js.get("wav_b64"); wav = _b.b64decode(b64) if isinstance(b64, str) else b""; return {"wav_bytes": wav, "model": f"musicgen:{os.getenv('MUSIC_MODEL_ID','')}"}
+                        r.raise_for_status(); js = _resp_json(r, {"audio_wav_base64": str, "wav_b64": str}); b64 = js.get("audio_wav_base64") or js.get("wav_b64"); wav = _b.b64decode(b64) if isinstance(b64, str) else b""; return {"wav_bytes": wav, "model": f"musicgen:{os.getenv('MUSIC_MODEL_ID','')}"}
                 def compose(self, args: Dict[str, Any]) -> Dict[str, Any]:
                     import asyncio as _as
                     return _as.get_event_loop().run_until_complete(self._compose(args))
@@ -1972,7 +1647,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                         "refs": payload.get("refs") or payload.get("music_refs"),
                     }
                     r = await client.post(MUSIC_API_URL.rstrip("/") + "/generate", json=body)
-                    r.raise_for_status(); js = r.json()
+                    r.raise_for_status(); js = _resp_json(r, {"audio_wav_base64": str, "wav_b64": str})
                     b64 = js.get("audio_wav_base64") or js.get("wav_b64")
                     wav = _b.b64decode(b64) if isinstance(b64, str) else b""
                     return {"wav_bytes": wav, "model": f"musicgen:{os.getenv('MUSIC_MODEL_ID','')}"}
@@ -2200,7 +1875,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 }
                 r = await client.post(YUE_API_URL.rstrip("/") + "/v1/music/song", json=body)
                 r.raise_for_status()
-                return {"name": name, "result": r.json()}
+                return {"name": name, "result": _resp_json(r, {})}
         except Exception as ex:
             return {"name": name, "error": str(ex)}
     if name == "music.melody.musicgen" and ALLOW_TOOL_EXECUTION:
@@ -2221,7 +1896,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 }
                 r = await client.post(MUSIC_API_URL.rstrip("/") + "/generate", json=payload)
                 r.raise_for_status()
-                return {"name": name, "result": r.json()}
+                return {"name": name, "result": _resp_json(r, {})}
         except Exception as ex:
             return {"name": name, "error": str(ex)}
     if name == "music.timed.sao" and ALLOW_TOOL_EXECUTION:
@@ -2239,7 +1914,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 }
                 r = await client.post(SAO_API_URL.rstrip("/") + "/v1/music/timed", json=payload)
                 r.raise_for_status()
-                return {"name": name, "result": r.json()}
+                return {"name": name, "result": _resp_json(r, {})}
         except Exception as ex:
             return {"name": name, "error": str(ex)}
     if name == "audio.stems.demucs" and ALLOW_TOOL_EXECUTION:
@@ -2253,7 +1928,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 }
                 r = await client.post(DEMUCS_API_URL.rstrip("/") + "/v1/audio/stems", json=payload)
                 r.raise_for_status()
-                return {"name": name, "result": r.json()}
+                return {"name": name, "result": _resp_json(r, {})}
         except Exception as ex:
             return {"name": name, "error": str(ex)}
     if name == "audio.vc.rvc" and ALLOW_TOOL_EXECUTION:
@@ -2267,7 +1942,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 }
                 r = await client.post(RVC_API_URL.rstrip("/") + "/v1/audio/convert", json=payload)
                 r.raise_for_status()
-                return {"name": name, "result": r.json()}
+                return {"name": name, "result": _resp_json(r, {})}
         except Exception as ex:
             return {"name": name, "error": str(ex)}
     if name == "voice.sing.diffsinger.rvc" and ALLOW_TOOL_EXECUTION:
@@ -2284,7 +1959,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 }
                 r = await client.post(DIFFSINGER_RVC_API_URL.rstrip("/") + "/v1/voice/sing", json=payload)
                 r.raise_for_status()
-                return {"name": name, "result": r.json()}
+                return {"name": name, "result": _resp_json(r, {})}
         except Exception as ex:
             return {"name": name, "error": str(ex)}
     if name == "audio.foley.hunyuan" and ALLOW_TOOL_EXECUTION:
@@ -2299,7 +1974,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 }
                 r = await client.post(HUNYUAN_FOLEY_API_URL.rstrip("/") + "/v1/audio/foley", json=payload)
                 r.raise_for_status()
-                return {"name": name, "result": r.json()}
+                return {"name": name, "result": _resp_json(r, {})}
         except Exception as ex:
             return {"name": name, "error": str(ex)}
     if name in ("image.gen", "image.edit", "image.upscale") and ALLOW_TOOL_EXECUTION:
@@ -2312,13 +1987,13 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 import httpx as _hx  # type: ignore
                 with _hx.Client() as client:
                     r = client.post(self.base + "/prompt", json={"prompt": graph})
-                    r.raise_for_status(); return r.json()
+                    r.raise_for_status(); return _resp_json(r, {"prompt_id": str, "uuid": str, "id": str})
             def _poll(self, pid: str) -> Dict[str, Any]:
                 import httpx as _hx, time as _tm  # type: ignore
                 while True:
                     r = _hx.get(self.base + f"/history/{pid}")
                     if r.status_code == 200:
-                        js = r.json(); h = (js.get("history") or {}).get(pid)
+                        js = _resp_json(r, {"history": dict}); h = (js.get("history") or {}).get(pid)
                         if h and (h.get("status", {}).get("completed") is True):
                             return h
                     _tm.sleep(0.8)
@@ -2579,7 +2254,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 async with httpx.AsyncClient() as client:
                     r = await client.post(base + "/research/run", json=args)
                     r.raise_for_status()
-                    return {"name": name, "result": r.json()}
+                    return {"name": name, "result": _resp_json(r, {})}
             except Exception as ex2:
                 return {"name": name, "error": str(ex2)}
     if name == "code.super_loop" and ALLOW_TOOL_EXECUTION:
@@ -2600,7 +2275,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 try:
                     r = _rq.post(self.base_url.rstrip("/") + "/api/generate", json=payload)
                     r.raise_for_status()
-                    js = r.json()
+                    js = _resp_json(r, {"response": str})
                     return SimpleNamespace(text=str(js.get("response", "")), model_name=self.model_name)
                 except Exception:
                     return SimpleNamespace(text="{}", model_name=self.model_name)
@@ -2640,23 +2315,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         if not q:
             return {"name": name, "error": "missing q"}
         k = int(args.get("k", 10))
-        # Deterministic multi-engine placeholder. If SERPAPI available, use it to seed one engine; others are deterministic transforms
+        # Deterministic multi-engine placeholder only; SERPAPI removed in favor of internal metasearch
         engines: Dict[str, List[Dict[str, Any]]] = {}
-        # google via serpapi (optional)
-        if SERPAPI_API_KEY and ENABLE_WEBSEARCH:
-            txt = await serpapi_google_search([q], max_results=min(5, k))
-            # parse into lines → items
-            lines = [ln for ln in (txt or "").splitlines() if ln.strip()]
-            google_items: List[Dict[str, Any]] = []
-            for i in range(0, len(lines), 3):
-                try:
-                    title = lines[i]
-                    snippet = lines[i+1] if i+1 < len(lines) else ""
-                    link = lines[i+2] if i+2 < len(lines) else ""
-                    google_items.append({"title": title, "snippet": snippet, "link": link})
-                except Exception:
-                    break
-            engines["google"] = google_items[:k]
         # deterministic synthetic engines
         import hashlib as _h
         def _mk(engine: str) -> List[Dict[str, Any]]:
@@ -3248,7 +2908,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                         er = _c.post(FACEID_API_URL.rstrip("/") + "/embed", json={"image_url": face_url})
                         emb = None
                         if er.status_code == 200:
-                            ej = er.json(); emb = ej.get("embedding") or ej.get("vec")
+                            ej = _resp_json(er, {"embedding": list, "vec": list}); emb = ej.get("embedding") or ej.get("vec")
                     # 3) Per-frame InstantID apply with low denoise
                     if emb and isinstance(emb, list):
                         from glob import glob as _glob
@@ -3272,12 +2932,14 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                                 with _hx.Client() as _c2:
                                     pr = _c2.post(COMFYUI_API_URL.rstrip("/") + "/prompt", json={"prompt": g})
                                     if pr.status_code == 200:
-                                        pid = (pr.json().get("prompt_id") or pr.json().get("uuid") or pr.json().get("id"))
+                                        pj = _resp_json(pr, {"prompt_id": str, "uuid": str, "id": str})
+                                        pid = (pj.get("prompt_id") or pj.get("uuid") or pj.get("id"))
                                         # poll for completion
                                         while True:
                                             hr = _c2.get(COMFYUI_API_URL.rstrip("/") + f"/history/{pid}")
                                             if hr.status_code == 200:
-                                                h = (hr.json().get("history") or {}).get(pid)
+                                                hj = _resp_json(hr, {"history": dict})
+                                                h = (hj.get("history") or {}).get(pid)
                                                 if h and (h.get("status", {}).get("completed") is True):
                                                     # find first output and overwrite frame
                                                     outs = (h.get("outputs") or {})
@@ -3457,7 +3119,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                         er = _c.post(FACEID_API_URL.rstrip("/") + "/embed", json={"image_url": face_url})
                         emb = None
                         if er.status_code == 200:
-                            ej = er.json(); emb = ej.get("embedding") or ej.get("vec")
+                            ej = _resp_json(er, {"embedding": list, "vec": list}); emb = ej.get("embedding") or ej.get("vec")
                     if emb and isinstance(emb, list):
                         from glob import glob as _glob
                         frame_files = sorted(_glob(os.path.join(frames_dir, "*.png")))
@@ -3478,11 +3140,13 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                                 with _hx.Client() as _c2:
                                     pr = _c2.post(COMFYUI_API_URL.rstrip("/") + "/prompt", json={"prompt": g})
                                     if pr.status_code == 200:
-                                        pid = (pr.json().get("prompt_id") or pr.json().get("uuid") or pr.json().get("id"))
+                                        pj = _resp_json(pr, {"prompt_id": str, "uuid": str, "id": str})
+                                        pid = (pj.get("prompt_id") or pj.get("uuid") or pj.get("id"))
                                         while True:
                                             hr = _c2.get(COMFYUI_API_URL.rstrip("/") + f"/history/{pid}")
                                             if hr.status_code == 200:
-                                                h = (hr.json().get("history") or {}).get(pid)
+                                                hj = _resp_json(hr, {"history": dict})
+                                                h = (hj.get("history") or {}).get(pid)
                                                 if h and (h.get("status", {}).get("completed") is True):
                                                     outs = (h.get("outputs") or {})
                                                     got = False
@@ -3598,7 +3262,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             async with httpx.AsyncClient() as client:
                 r = await client.post(HUNYUAN_VIDEO_API_URL.rstrip("/") + "/v1/video/hv/t2v", json=payload)
             r.raise_for_status()
-            return {"name": name, "result": r.json()}
+            return {"name": name, "result": _resp_json(r, {})}
         except Exception as ex:
             return {"name": name, "error": str(ex)}
     if name == "video.hv.i2v" and ALLOW_TOOL_EXECUTION:
@@ -3621,7 +3285,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             async with httpx.AsyncClient() as client:
                 r = await client.post(HUNYUAN_VIDEO_API_URL.rstrip("/") + "/v1/video/hv/i2v", json=payload)
             r.raise_for_status()
-            return {"name": name, "result": r.json()}
+            return {"name": name, "result": _resp_json(r, {})}
         except Exception as ex:
             return {"name": name, "error": str(ex)}
     if name == "video.svd.i2v" and ALLOW_TOOL_EXECUTION:
@@ -3639,7 +3303,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             async with httpx.AsyncClient() as client:
                 r = await client.post(SVD_API_URL.rstrip("/") + "/v1/video/svd/i2v", json=payload)
             r.raise_for_status()
-            return {"name": name, "result": r.json()}
+            return {"name": name, "result": _resp_json(r, {})}
         except Exception as ex:
             return {"name": name, "error": str(ex)}
     if name == "math.eval":
@@ -3721,7 +3385,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             r = await client.post(XTTS_API_URL.rstrip("/") + "/tts", json=payload)
             try:
                 r.raise_for_status()
-                return {"name": name, "result": r.json()}
+                return {"name": name, "result": _resp_json(r, {})}
             except Exception:
                 return {"name": name, "error": r.text}
     if name == "asr_transcribe" and WHISPER_API_URL and ALLOW_TOOL_EXECUTION:
@@ -3729,7 +3393,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             r = await client.post(WHISPER_API_URL.rstrip("/") + "/transcribe", json={"audio_url": args.get("audio_url"), "language": args.get("language")})
             try:
                 r.raise_for_status()
-                return {"name": name, "result": r.json()}
+                return {"name": name, "result": _resp_json(r, {})}
             except Exception:
                 return {"name": name, "error": r.text}
     if name == "image_generate" and COMFYUI_API_URL and ALLOW_TOOL_EXECUTION:
@@ -3738,7 +3402,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             r = await client.post(COMFYUI_API_URL.rstrip("/") + "/prompt", json=args.get("workflow") or args)
             try:
                 r.raise_for_status()
-                return {"name": name, "result": r.json()}
+                return {"name": name, "result": _resp_json(r, {})}
             except Exception:
                 return {"name": name, "error": r.text}
     if name == "controlnet" and COMFYUI_API_URL and ALLOW_TOOL_EXECUTION:
@@ -3746,7 +3410,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             r = await client.post(COMFYUI_API_URL.rstrip("/") + "/prompt", json=args.get("workflow") or args)
             try:
                 r.raise_for_status()
-                return {"name": name, "result": r.json()}
+                return {"name": name, "result": _resp_json(r, {})}
             except Exception:
                 return {"name": name, "error": r.text}
     if name == "video_generate" and COMFYUI_API_URL and ALLOW_TOOL_EXECUTION:
@@ -3754,7 +3418,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             r = await client.post(COMFYUI_API_URL.rstrip("/") + "/prompt", json=args.get("workflow") or args)
             try:
                 r.raise_for_status()
-                return {"name": name, "result": r.json()}
+                return {"name": name, "result": _resp_json(r, {})}
             except Exception:
                 return {"name": name, "error": r.text}
     if name == "face_embed" and FACEID_API_URL and ALLOW_TOOL_EXECUTION:
@@ -3762,7 +3426,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             r = await client.post(FACEID_API_URL.rstrip("/") + "/embed", json={"image_url": args.get("image_url")})
             try:
                 r.raise_for_status()
-                return {"name": name, "result": r.json()}
+                return {"name": name, "result": _resp_json(r, {})}
             except Exception:
                 return {"name": name, "error": r.text}
     if name == "music_generate" and MUSIC_API_URL and ALLOW_TOOL_EXECUTION:
@@ -3770,7 +3434,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             r = await client.post(MUSIC_API_URL.rstrip("/") + "/generate", json=args)
             try:
                 r.raise_for_status()
-                return {"name": name, "result": r.json()}
+                return {"name": name, "result": _resp_json(r, {})}
             except Exception:
                 return {"name": name, "error": r.text}
     if name == "vlm_analyze" and VLM_API_URL and ALLOW_TOOL_EXECUTION:
@@ -3778,7 +3442,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             r = await client.post(VLM_API_URL.rstrip("/") + "/analyze", json={"image_url": args.get("image_url"), "prompt": args.get("prompt")})
             try:
                 r.raise_for_status()
-                return {"name": name, "result": r.json()}
+                return {"name": name, "result": _resp_json(r, {})}
             except Exception:
                 return {"name": name, "error": r.text}
     # --- Film tools (LLM-driven, simple UI) ---
@@ -3787,7 +3451,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             r = await client.post(EXECUTOR_BASE_URL.rstrip("/") + "/run_python", json={"code": args.get("code", "")})
             try:
                 r.raise_for_status()
-                return {"name": name, "result": r.json()}
+                return {"name": name, "result": _resp_json(r, {})}
             except Exception:
                 return {"name": name, "error": r.text}
     if name == "write_file" and EXECUTOR_BASE_URL and ALLOW_TOOL_EXECUTION:
@@ -3802,7 +3466,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             r = await client.post(EXECUTOR_BASE_URL.rstrip("/") + "/write_file", json={"path": args.get("path"), "content": content_val})
             try:
                 r.raise_for_status()
-                return {"name": name, "result": r.json()}
+                return {"name": name, "result": _resp_json(r, {})}
             except Exception:
                 return {"name": name, "error": r.text}
     if name == "read_file" and EXECUTOR_BASE_URL and ALLOW_TOOL_EXECUTION:
@@ -3810,12 +3474,12 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             r = await client.post(EXECUTOR_BASE_URL.rstrip("/") + "/read_file", json={"path": args.get("path")})
             try:
                 r.raise_for_status()
-                return {"name": name, "result": r.json()}
+                return {"name": name, "result": _resp_json(r, {})}
             except Exception:
                 return {"name": name, "error": r.text}
     # MCP tool forwarding (HTTP bridge)
     if name and (name.startswith("mcp:") or args.get("mcpTool") is True) and ALLOW_TOOL_EXECUTION:
-        res = await call_mcp_tool(name.replace("mcp:", "", 1), args)
+        res = await _call_mcp_tool(MCP_HTTP_BRIDGE_URL, name.replace("mcp:", "", 1), args)
         return {"name": name, "result": res}
     # Unknown tool - return as unexecuted
     return {"name": name or "unknown", "skipped": True, "reason": "unsupported tool in orchestrator"}
@@ -3960,7 +3624,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 try:
                     r = requests.post(self.base_url + "/api/generate", json=payload)
                     r.raise_for_status()
-                    js = r.json()
+                    js = JSONParser().parse(r.text, {"response": str})
                     return SimpleNamespace(text=str(js.get("response", "")), model_name=self.model_id)
                 except Exception as ex:
                     return SimpleNamespace(text=f"", model_name=self.model_id)
@@ -4009,12 +3673,12 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                             if os.path.exists(mpath):
                                 try:
                                     with open(mpath, "r", encoding="utf-8") as _mf:
-                                        existing = json.load(_mf)
+                                        existing = _parse_json_text(_mf.read(), {})
                                 except Exception:
                                     existing = {}
                             sid = _step_id()
-                            _manifest_add_row(existing, facts_path, sid)
-                            _manifest_write(mdir, existing)
+                            _art_manifest_add(existing, facts_path, sid)
+                            _art_manifest_write(mdir, existing)
                         except Exception:
                             pass
                     except Exception:
@@ -4025,62 +3689,64 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         base_text = (final_oai.get("choices", [{}])[0].get("message", {}) or {}).get("content", "")
         # Build omnicontext markdown (planner plan, tool trace, assets)
         omni_sections: list[str] = []
-        if isinstance(plan_text, str) and plan_text.strip():
-            omni_sections.append("### Plan\n" + plan_text.strip())
+        _pl_obj = locals().get("plan_text", None)
+        pl_text = _pl_obj if isinstance(_pl_obj, str) else ""
+        if pl_text.strip():
+            omni_sections.append("### Plan\n" + pl_text.strip())
         # Summarize tool execs
-        try:
-            if tool_exec_meta:
-                lines: list[str] = []
-                for m in tool_exec_meta[:20]:
-                    nm = str(m.get("name") or "tool")
-                    dur = int(m.get("duration_ms") or 0)
-                    ak = ", ".join((m.get("args") or {}).keys()) if isinstance(m.get("args"), dict) else ""
-                    lines.append(f"- {nm} ({dur} ms){' — ' + ak if ak else ''}")
-                if lines:
-                    omni_sections.append("### Tools\n" + "\n".join(lines))
-        except Exception:
-            pass
+        _tem_obj = locals().get("tool_exec_meta", None)
+        tem = _tem_obj if isinstance(_tem_obj, list) else []
+        if tem:
+            lines: list[str] = []
+            for m in tem[:20]:
+                nm = str((m or {}).get("name") or "tool")
+                dur = int((m or {}).get("duration_ms") or 0)
+                ak = ", ".join(((m or {}).get("args") or {}).keys()) if isinstance((m or {}).get("args"), dict) else ""
+                lines.append(f"- {nm} ({dur} ms){' — ' + ak if ak else ''}")
+            if lines:
+                omni_sections.append("### Tools\n" + "\n".join(lines))
         # Extract asset URLs from tool results if any
-        try:
-            if tool_results:
-                def _asset_urls_from_tools(results: List[Dict[str, Any]]) -> List[str]:
-                    urls: List[str] = []
-                    exts = (".mp4", ".webm", ".mov", ".mkv", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".wav", ".mp3", ".m4a", ".ogg", ".flac", ".opus", ".srt")
-                    for tr in results or []:
-                        res = (tr or {}).get("result") or {}
-                        if isinstance(res, dict):
-                            meta = res.get("meta"); arts = res.get("artifacts")
-                            if isinstance(meta, dict) and isinstance(arts, list):
-                                cid = meta.get("cid")
-                                for a in arts:
-                                    aid = (a or {}).get("id"); kind = (a or {}).get("kind") or ""
-                                    if cid and aid:
-                                        if kind.startswith("image"):
-                                            urls.append(f"/uploads/artifacts/image/{cid}/{aid}")
-                                        elif kind.startswith("audio"):
-                                            urls.append(f"/uploads/artifacts/audio/tts/{cid}/{aid}")
-                                            urls.append(f"/uploads/artifacts/music/{cid}/{aid}")
-                            def _walk(v):
-                                if isinstance(v, str):
-                                    s = v.strip().lower()
-                                    if s.startswith("http://") or s.startswith("https://") or s.startswith("/uploads/") or "/workspace/uploads/" in s or any(s.endswith(ext) for ext in exts):
-                                        if "/workspace/uploads/" in v:
-                                            try:
-                                                v = v.split("/workspace", 1)[1]
-                                            except Exception:
-                                                pass
+        _trs_obj = locals().get("tool_results", None)
+        trs = _trs_obj if isinstance(_trs_obj, list) else []
+        if trs:
+            def _asset_urls_from_tools(results: List[Dict[str, Any]]) -> List[str]:
+                urls: List[str] = []
+                exts = (".mp4", ".webm", ".mov", ".mkv", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".wav", ".mp3", ".m4a", ".ogg", ".flac", ".opus", ".srt")
+                for tr in results or []:
+                    res = (tr or {}).get("result") or {}
+                    if isinstance(res, dict):
+                        meta = res.get("meta"); arts = res.get("artifacts")
+                        if isinstance(meta, dict) and isinstance(arts, list):
+                            cid = meta.get("cid")
+                            for a in arts:
+                                aid = (a or {}).get("id"); kind = (a or {}).get("kind") or ""
+                                if cid and aid:
+                                    if kind.startswith("image"):
+                                        urls.append(f"/uploads/artifacts/image/{cid}/{aid}")
+                                    elif kind.startswith("audio"):
+                                        urls.append(f"/uploads/artifacts/audio/tts/{cid}/{aid}")
+                                        urls.append(f"/uploads/artifacts/music/{cid}/{aid}")
+                        def _walk(v):
+                            if isinstance(v, str):
+                                s = v.strip().lower()
+                                if s.startswith("http://") or s.startswith("https://") or s.startswith("/uploads/") or "/workspace/uploads/" in s or any(s.endswith(ext) for ext in exts):
+                                    if "/workspace/uploads/" in v:
+                                        v2 = v
+                                        if "/workspace" in v2:
+                                            parts = v2.split("/workspace", 1)
+                                            v2 = parts[1] if len(parts) > 1 else v2
+                                        urls.append(v2)
+                                    else:
                                         urls.append(v)
-                                elif isinstance(v, list):
-                                    for it in v: _walk(it)
-                                elif isinstance(v, dict):
-                                    for it in v.values(): _walk(it)
-                            _walk(res)
-                    return list(dict.fromkeys(urls))
-                urls = _asset_urls_from_tools(tool_results)
-                if urls:
-                    omni_sections.append("### Assets\n" + "\n".join([f"- {u}" for u in urls]))
-        except Exception:
-            pass
+                            elif isinstance(v, list):
+                                for it in v: _walk(it)
+                            elif isinstance(v, dict):
+                                for it in v.values(): _walk(it)
+                        _walk(res)
+                return list(dict.fromkeys(urls))
+            urls = _asset_urls_from_tools(trs)
+            if urls:
+                omni_sections.append("### Assets\n" + "\n".join([f"- {u}" for u in urls]))
         omni_md = ("\n\n" + "\n\n".join(omni_sections)) if omni_sections else ""
         final_text = (base_text or "") + omni_md
         usage = estimate_usage(messages, final_text)
@@ -4108,9 +3774,10 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             _append_event(STATE_DIR, trace_id, "halt", {"kind": "windowed", "chars": len(final_text)})
         except Exception:
             pass
+    resp_id = response["id"]
     if body.get("stream"):
         async def _stream_once():
-            chunk = json.dumps({"id": response["id"], "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"role": "assistant", "content": final_text}, "finish_reason": None}]})
+            chunk = json.dumps({"id": resp_id, "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"role": "assistant", "content": final_text}, "finish_reason": None}]})
             yield f"data: {chunk}\n\n"
             yield "data: [DONE]\n\n"
         try:
@@ -4253,8 +3920,9 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             ],
         }
         if body.get("stream"):
+            resp_id2 = response["id"]
             async def _stream_once():
-                chunk = json.dumps({"id": response["id"], "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": tool_calls_openai}, "finish_reason": None}]})
+                chunk = json.dumps({"id": resp_id2, "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": tool_calls_openai}, "finish_reason": None}]})
                 yield f"data: {chunk}\n\n"
                 yield "data: [DONE]\n\n"
             try:
@@ -5585,9 +5253,8 @@ async def tool_run(body: Dict[str, Any]):
             # Start event
             yield ("data: " + json.dumps({"event": "start", "name": name or "tool"}) + "\n\n").encode("utf-8")
             # Set up progress queue and execution task
-            global _tool_progress_q
             q: asyncio.Queue = asyncio.Queue()
-            _tool_progress_q = q
+            set_progress_queue(q)
             exec_task = asyncio.create_task(execute_tool_call({"name": name, "arguments": args}))
             last_ka = 0.0
             try:
@@ -5609,7 +5276,7 @@ async def tool_run(body: Dict[str, Any]):
                         last_ka = now
                     await asyncio.sleep(0.25)
             finally:
-                _tool_progress_q = None
+                set_progress_queue(None)
             yield b"data: [DONE]\n\n"
         return StreamingResponse(_gen(), media_type="text/event-stream")
     try:
@@ -5627,13 +5294,13 @@ async def tool_run(body: Dict[str, Any]):
                     import httpx as _hx  # type: ignore
                     with _hx.Client() as client:
                         r = client.post(self.base + "/prompt", json={"prompt": graph})
-                        r.raise_for_status(); return r.json()
+                        r.raise_for_status(); return _resp_json(r, {"prompt_id": str, "uuid": str, "id": str})
                 def _poll(self, pid: str) -> Dict[str, Any]:
                     import httpx as _hx, time as _tm  # type: ignore
                     while True:
                         r = _hx.get(self.base + f"/history/{pid}")
                         if r.status_code == 200:
-                            js = r.json(); h = (js.get("history") or {}).get(pid)
+                            js = _resp_json(r, {"history": dict}); h = (js.get("history") or {}).get(pid)
                             if h and (h.get("status", {}).get("completed") is True):
                                 return h
                         _tm.sleep(1.0)
@@ -5732,7 +5399,7 @@ async def tool_run(body: Dict[str, Any]):
                 async def _xtts(self, payload: Dict[str, Any]) -> Dict[str, Any]:
                     async with httpx.AsyncClient() as client:
                         r = await client.post(XTTS_API_URL.rstrip("/") + "/tts", json=payload)
-                        r.raise_for_status(); js = r.json()
+                        r.raise_for_status(); js = _resp_json(r, {"wav_b64": str, "url": str, "duration_s": (float), "model": str})
                         wav = b""
                         if isinstance(js.get("wav_b64"), str):
                             import base64 as _b
@@ -5771,7 +5438,7 @@ async def tool_run(body: Dict[str, Any]):
                         }
                         r = await client.post(MUSIC_API_URL.rstrip("/") + "/generate", json=body)
                         r.raise_for_status()
-                        js = r.json()
+                        js = _resp_json(r, {"audio_wav_base64": str, "wav_b64": str})
                         b64 = js.get("audio_wav_base64") or js.get("wav_b64")
                         wav = _b.b64decode(b64) if isinstance(b64, str) else b""
                         return {"wav_bytes": wav, "model": f"musicgen:{os.getenv('MUSIC_MODEL_ID','')}"}
@@ -5802,7 +5469,7 @@ async def tool_run(body: Dict[str, Any]):
                 with open(full, "rb") as f: import base64 as _b; b64 = _b.b64encode(f.read()).decode("ascii");
                 if not ext and "." in rel: ext = "." + rel.split(".")[-1].lower()
             async with httpx.AsyncClient() as client:
-                r = await client.post(OCR_API_URL.rstrip("/") + "/ocr", json={"b64": b64, "ext": ext}); r.raise_for_status(); js = r.json(); return {"ok": True, "name": name, "result": {"text": js.get("text") or "", "ext": ext}}
+                r = await client.post(OCR_API_URL.rstrip("/") + "/ocr", json={"b64": b64, "ext": ext}); r.raise_for_status(); js = _resp_json(r, {"text": str}); return {"ok": True, "name": name, "result": {"text": js.get("text") or "", "ext": ext}}
         if name == "vlm.analyze" and ALLOW_TOOL_EXECUTION:
             if not VLM_API_URL:
                 return JSONResponse(status_code=400, content={"error": "VLM_API_URL not configured"})
@@ -5815,7 +5482,7 @@ async def tool_run(body: Dict[str, Any]):
                 with open(full, "rb") as f: import base64 as _b; b64 = _b.b64encode(f.read()).decode("ascii");
                 if not ext and "." in rel: ext = "." + rel.split(".")[-1].lower()
             async with httpx.AsyncClient() as client:
-                r = await client.post(VLM_API_URL.rstrip("/") + "/analyze", json={"b64": b64, "ext": ext}); r.raise_for_status(); js = r.json(); return {"ok": True, "name": name, "result": js}
+                r = await client.post(VLM_API_URL.rstrip("/") + "/analyze", json={"b64": b64, "ext": ext}); r.raise_for_status(); js = _resp_json(r, {}); return {"ok": True, "name": name, "result": js}
         return JSONResponse(status_code=400, content={"error": f"unsupported tool: {name}"})
     except Exception as ex:
         return JSONResponse(status_code=400, content={"error": str(ex)})
@@ -6115,16 +5782,7 @@ async def embeddings(body: Dict[str, Any]):
     if not texts:
         texts = [""]
     emb = get_embedder()
-    vecs = emb.encode(texts)
-    data = []
-    for i, v in enumerate(vecs):
-        data.append({"object": "embedding", "index": i, "embedding": [float(x) for x in list(v)]})
-    out = {
-        "object": "list",
-        "data": data,
-        "model": model_name,
-        "created": int(time.time()),
-    }
+    out = _build_embeddings_response(emb, texts, model_name)
     return JSONResponse(content=out)
 
 
@@ -6164,7 +5822,7 @@ async def completions_legacy(body: Dict[str, Any]):
                                 yield "data: [DONE]\n\n"
                                 break
                             try:
-                                obj = json.loads(data_str)
+                                obj = _parse_json_text(data_str, {})
                                 # Extract assistant text (final-only chunk in our impl)
                                 txt = ""
                                 try:
@@ -6203,7 +5861,7 @@ async def completions_legacy(body: Dict[str, Any]):
             "created": int(time.time()),
         }
         return JSONResponse(content=out)
-    obj = rr.json()
+    obj = _resp_json(rr, {"choices": [{"message": {"content": str}}], "usage": dict, "created": int, "system_fingerprint": str, "model": str, "id": str})
     content_txt = (((obj.get("choices") or [{}])[0].get("message") or {}).get("content") or obj.get("text") or "")
     out = {
         "id": obj.get("id") or "orc-1",
@@ -6255,7 +5913,7 @@ async def ws_chat(websocket: WebSocket):
                                     await websocket.send_text(json.dumps({"done": True}))
                                     break
                                 try:
-                                    obj = json.loads(data_str)
+                                    obj = _parse_json_text(data_str, {})
                                 except Exception:
                                     await websocket.send_text(json.dumps({"stream": True, "delta": ""}))
                                     continue
@@ -6312,9 +5970,8 @@ async def ws_tool(websocket: WebSocket):
                 ka_task = _asyncio.create_task(_keepalive())
                 await websocket.send_text(json.dumps({"event": "start", "name": name}))
                 # Progress queue wiring
-                global _tool_progress_q
                 q: asyncio.Queue = asyncio.Queue()
-                _tool_progress_q = q
+                set_progress_queue(q)
                 exec_task = _asyncio.create_task(execute_tool_call({"name": name, "arguments": args}))
                 while True:
                     sent = False
@@ -6331,7 +5988,7 @@ async def ws_tool(websocket: WebSocket):
                 try: ka_task.cancel()
                 except Exception: pass
                 await websocket.send_text(json.dumps({"event": "result", "ok": True, "result": res}))
-                _tool_progress_q = None
+                set_progress_queue(None)
                 await websocket.send_text(json.dumps({"done": True}))
             except Exception as ex:
                 await websocket.send_text(json.dumps({"error": str(ex)}))
@@ -6413,7 +6070,7 @@ async def _comfy_submit_workflow(workflow: Dict[str, Any]) -> Dict[str, Any]:
                         r = await client.post(base.rstrip("/") + "/prompt", json=workflow)
                     try:
                         r.raise_for_status()
-                        res = r.json()
+                        res = _resp_json(r, {"prompt_id": str, "uuid": str, "id": str})
                         pid = res.get("prompt_id") or res.get("uuid") or res.get("id")
                         if isinstance(pid, str):
                             _job_endpoint[pid] = base
@@ -6441,7 +6098,7 @@ async def _comfy_history(prompt_id: str) -> Dict[str, Any]:
         r = await client.get(base.rstrip("/") + f"/history/{prompt_id}")
         try:
             r.raise_for_status()
-            return r.json()
+            return _resp_json(r, {"history": dict})
         except Exception:
             return {"error": r.text}
 
@@ -7118,7 +6775,7 @@ async def _maybe_compile_film(film_id: str) -> None:
             async with httpx.AsyncClient() as client:
                 r = await client.post(ASSEMBLER_API_URL.rstrip("/") + "/assemble", json=payload)
                 r.raise_for_status()
-                assembly_result = r.json()
+                assembly_result = _resp_json(r, {})
         except Exception:
             assembly_result = {"error": True}
     elif N8N_WEBHOOK_URL and ENABLE_N8N:
@@ -7126,7 +6783,7 @@ async def _maybe_compile_film(film_id: str) -> None:
             async with httpx.AsyncClient() as client:
                 r = await client.post(N8N_WEBHOOK_URL, json=payload)
                 r.raise_for_status()
-                assembly_result = r.json()
+                assembly_result = _resp_json(r, {})
         except Exception:
             assembly_result = {"error": True}
     # Always write a manifest to uploads for convenience

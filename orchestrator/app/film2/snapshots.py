@@ -23,7 +23,8 @@ def load_shot_snapshot(cid: str, shot_id: str) -> Optional[Dict[str, Any]]:
     p = os.path.join(_dir(cid), f"{shot_id}.json")
     try:
         with open(p, "r", encoding="utf-8") as f:
-            return json.loads(f.read())
+            from ..jsonio.helpers import parse_json_text as _parse_json_text
+            return _parse_json_text(f.read(), {})
     except FileNotFoundError:
         return None
 

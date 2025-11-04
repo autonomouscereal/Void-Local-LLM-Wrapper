@@ -17,6 +17,7 @@ from ..analysis.media import analyze_image
 from ..datasets.trace import append_sample as _trace_append
 import base64
 import httpx  # type: ignore
+from ..jsonio.helpers import resp_json as _resp_json
 
 
 def run_image_gen(job: dict, provider, manifest: dict) -> dict:
@@ -75,11 +76,13 @@ def run_image_gen(job: dict, provider, manifest: dict) -> dict:
                 vlm_url = os.getenv("VLM_API_URL").rstrip("/") + "/analyze"
                 with httpx.Client() as client:
                     r = client.post(vlm_url, json={"b64": b64, "ext": ".png"})
-                    if r.status_code == 200 and isinstance(r.json(), dict):
-                        cap = (r.json().get("caption") or r.json().get("text") or "").strip()
+                    if r.status_code == 200:
+                        js = _resp_json(r, {"caption": str, "text": str})
+                        cap = (js.get("caption") or js.get("text") or "").strip()
                         at = [t for t in prompt_text.lower().split() if len(t) > 3]
                         bt = cap.lower()
-                        if not at: return 0.0
+                        if not at:
+                            return 0.0
                         hits = sum(1 for t in at if t in bt)
                         return hits / max(1, len(at))
             except Exception:

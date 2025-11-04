@@ -4,6 +4,7 @@ import os
 import base64
 import mimetypes
 from typing import Dict, Any, List
+from ..jsonio.helpers import resp_json as _resp_json
 
 
 TEXT_EXTS = {".txt", ".md", ".csv", ".json", ".yaml", ".yml", ".xml", ".html", ".htm", ".toml", ".ini", ".cfg", ".log"}
@@ -54,7 +55,7 @@ def ingest_file(path: str, vlm_url: str | None = None, whisper_url: str | None =
                 with httpx.Client() as client:
                     r = client.post(ocr_url.rstrip("/") + "/ocr", json={"b64": b64, "ext": ext})
                     r.raise_for_status()
-                    js = r.json()
+                    js = _resp_json(r, {"text": str})
                     txt = (js.get("text") or "").strip()
                     if txt:
                         texts.append(txt)
@@ -75,7 +76,7 @@ def ingest_file(path: str, vlm_url: str | None = None, whisper_url: str | None =
                 with httpx.Client() as client:
                     r = client.post(vlm_url.rstrip("/") + "/analyze", json={"b64": b64})
                     r.raise_for_status()
-                    js = r.json()
+                    js = _resp_json(r, {"caption": str, "text": str})
                     cap = (js.get("caption") or js.get("text") or "").strip()
                     if cap:
                         texts.append(f"[image] {os.path.basename(path)}\n{cap}")
@@ -89,7 +90,7 @@ def ingest_file(path: str, vlm_url: str | None = None, whisper_url: str | None =
                 with httpx.Client() as client:
                     r = client.post(ocr_url.rstrip("/") + "/ocr", json={"b64": b64, "ext": ext})
                     r.raise_for_status()
-                    js = r.json()
+                    js = _resp_json(r, {"text": str})
                     tx = (js.get("text") or "").strip()
                     if tx:
                         texts.append(f"[ocr] {tx}")
@@ -106,7 +107,7 @@ def ingest_file(path: str, vlm_url: str | None = None, whisper_url: str | None =
                 with httpx.Client() as client:
                     r = client.post(whisper_url.rstrip("/") + "/transcribe", json={"b64": b64})
                     r.raise_for_status()
-                    js = r.json()
+                    js = _resp_json(r, {"text": str, "transcript": str})
                     tx = (js.get("text") or js.get("transcript") or "").strip()
                     if tx:
                         texts.append(f"[audio] {os.path.basename(path)}\n{tx}")

@@ -5,6 +5,7 @@ import json
 import hashlib
 import time
 from typing import Optional, Dict, Any, List
+from ..jsonio.helpers import parse_json_text as _parse_json_text
 
 
 def _sha256_bytes(b: bytes) -> str:
@@ -31,7 +32,7 @@ def _part_path(root: str, name: str, i: int) -> str:
 def _read_json(path: str) -> Optional[dict]:
     try:
         with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+            return _parse_json_text(f.read(), {})
     except FileNotFoundError:
         return None
     except Exception:

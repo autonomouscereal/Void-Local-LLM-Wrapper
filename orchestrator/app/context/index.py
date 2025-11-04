@@ -221,7 +221,8 @@ def resolve_global(text: str, kind_hint: Optional[str] = None, search_limit: int
             if not ln:
                 continue
             try:
-                obj = json.loads(ln)
+                from ..jsonio.helpers import parse_json_text as _parse_json_text
+                obj = _parse_json_text(ln, {})
             except Exception:
                 continue
             if kind_hint and not str(obj.get("kind", "")).startswith(kind_hint):

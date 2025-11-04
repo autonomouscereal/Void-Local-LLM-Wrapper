@@ -16,31 +16,10 @@ def discover_sources(query: str, scope: str, since: Optional[str], until: Option
     """
     out: List[Dict] = []
     now = int(time.time())
-    # SERPAPI (if enabled via env) — synchronous minimal client to avoid circular imports
+    # SERPAPI removed; rely on metasearch and local RAG
+    # Local RAG hits — import from rag.core to avoid circular deps
     try:
-        api_key = os.getenv("SERPAPI_API_KEY")
-        if api_key:
-            params = {
-                "engine": "google",
-                "q": query,
-                "num": 5,
-                "api_key": api_key,
-            }
-            url = "https://serpapi.com/search.json?" + urllib.parse.urlencode(params)
-            # TIMEOUTS FORBIDDEN: never pass timeout; allow long-running networks to complete
-            with urllib.request.urlopen(url) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-            for item in (data.get("organic_results") or [])[:5]:
-                title = item.get("title", "")
-                snippet = item.get("snippet", "")
-                link = item.get("link", "")
-                if link:
-                    out.append({"url": link, "title": title, "text": snippet, "ts": now})
-    except Exception:
-        pass
-    # Local RAG hits — call async function from main lazily to avoid circular import at module import time
-    try:
-        from ..main import rag_search as _rag_search  # type: ignore
+        from ..rag.core import rag_search as _rag_search  # type: ignore
         try:
             rag = asyncio.run(_rag_search(query, k=8))  # if no running loop
         except RuntimeError:

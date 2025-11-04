@@ -5,6 +5,7 @@ import os
 from typing import Any, Dict, List
 import time
 from .ids import step_id
+from ..jsonio.helpers import parse_json_text as _parse_json_text
 
 
 def _append_atomic(path: str, text: str) -> None:
@@ -36,7 +37,7 @@ def read_tail(path: str, n: int = 10) -> List[Dict[str, Any]]:
             if not ln:
                 continue
             try:
-                out.append(json.loads(ln))
+                out.append(_parse_json_text(ln, {}))
             except Exception:
                 continue
     except Exception:
@@ -72,7 +73,7 @@ def append_event(root: str, key: str, kind: str, data: Dict[str, Any]) -> None:
 def read_all(root: str, key: str) -> List[Dict[str, Any]]:
     try:
         with open(_path(root, key), "r", encoding="utf-8") as f:
-            return [json.loads(line) for line in f if line.strip()]
+            return [_parse_json_text(line, {}) for line in f if line.strip()]
     except FileNotFoundError:
         return []
 
