@@ -3777,8 +3777,9 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     response = locals().get("response", {"id": "orc-1"})
     resp_id = (response.get("id") if isinstance(response, dict) else "orc-1") or "orc-1"
     if body.get("stream"):
+        stream_text = str(locals().get("final_text", ""))
         async def _stream_once():
-            chunk = json.dumps({"id": resp_id, "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"role": "assistant", "content": final_text}, "finish_reason": None}]})
+            chunk = json.dumps({"id": resp_id, "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"role": "assistant", "content": stream_text}, "finish_reason": None}]})
             yield f"data: {chunk}\n\n"
             yield "data: [DONE]\n\n"
         try:
