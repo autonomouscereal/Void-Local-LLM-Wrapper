@@ -1928,7 +1928,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 async def _compose(self, payload: Dict[str, Any]) -> Dict[str, Any]:
                     import base64 as _b
                     async with httpx.AsyncClient() as client:
-                    _tool_progress_emit({"stage": "request", "target": "music"})
+                        _tool_progress_emit({"stage": "request", "target": "music"})
                         r = await client.post(MUSIC_API_URL.rstrip("/") + "/generate", json={"prompt": payload.get("prompt"), "duration": int(payload.get("length_s") or 8)})
                         r.raise_for_status(); js = r.json(); b64 = js.get("audio_wav_base64") or js.get("wav_b64"); wav = _b.b64decode(b64) if isinstance(b64, str) else b""; return {"wav_bytes": wav, "model": f"musicgen:{os.getenv('MUSIC_MODEL_ID','')}"}
                 def compose(self, args: Dict[str, Any]) -> Dict[str, Any]:
