@@ -84,37 +84,69 @@ except Exception as e:
     print('[insightface preload] skipped:', e)
 PY
 
-# Ensure ComfyUI-InstantID has a package __init__.py pointing to the node module that defines NODE_CLASS_MAPPINGS
+# Ensure ComfyUI-InstantID has a robust __init__.py that imports by relative name or absolute file path
 RUN python - <<'PY'
-import os, sys
+import os, sys, json, importlib.util
 root = "/comfyui/custom_nodes/ComfyUI-InstantID"
+os.makedirs(root, exist_ok=True)
 init_path = os.path.join(root, "__init__.py")
-if not os.path.isdir(root):
-    sys.exit(0)
-def find_node_module() -> str | None:
-    for d, _, fs in os.walk(root):
+
+TEMPLATE = '''
+import os, importlib.util
+
+def _load_rel():
+    try:
+        from .InstantIDNode import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS  # type: ignore
+        return NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
+    except Exception as e:
+        return None
+
+def _load_by_path(filename: str):
+    here = os.path.dirname(__file__)
+    node_path = os.path.join(here, filename)
+    if not os.path.exists(node_path):
+        return None
+    spec = importlib.util.spec_from_file_location("ComfyUI_InstantID_Node", node_path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)  # type: ignore
+    return getattr(mod, 'NODE_CLASS_MAPPINGS', None), getattr(mod, 'NODE_DISPLAY_NAME_MAPPINGS', None)
+
+def _scan_any():
+    here = os.path.dirname(__file__)
+    for d, _, fs in os.walk(here):
         for f in fs:
-            if not f.endswith('.py'): continue
+            if not f.endswith('.py'):
+                continue
             p = os.path.join(d, f)
             try:
                 with open(p, 'r', encoding='utf-8', errors='ignore') as fh:
                     txt = fh.read()
                 if ('NODE_CLASS_MAPPINGS' in txt) and ('NODE_DISPLAY_NAME_MAPPINGS' in txt):
-                    rel = os.path.relpath(p, root).replace('\\', '/').removesuffix('.py')
-                    return rel
+                    spec = importlib.util.spec_from_file_location("ComfyUI_InstantID_Node_any", p)
+                    mod = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(mod)  # type: ignore
+                    ncm = getattr(mod, 'NODE_CLASS_MAPPINGS', None)
+                    ndm = getattr(mod, 'NODE_DISPLAY_NAME_MAPPINGS', None)
+                    if ncm and ndm:
+                        return ncm, ndm
             except Exception:
                 continue
     return None
-mod = find_node_module()
-if (not os.path.isfile(init_path)) and mod:
-    with open(init_path, 'w', encoding='utf-8') as f:
-        f.write(f"from .{mod.replace('/', '.')} import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS\n")
-    print('[instantid] created __init__.py ->', mod)
-elif not os.path.isfile(init_path):
-    # Fallback to common filename
-    with open(init_path, 'w', encoding='utf-8') as f:
-        f.write("from .InstantIDNode import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS\n")
-    print('[instantid] created fallback __init__.py')
+
+_res = _load_rel()
+if not _res:
+    _res = _load_by_path('InstantIDNode.py')
+if not _res:
+    _res = _scan_any()
+if not _res:
+    raise RuntimeError('[ComfyUI-InstantID] Unable to locate NODE_CLASS_MAPPINGS in InstantIDNode. Check repository layout.')
+
+NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS = _res
+'''
+
+with open(init_path, 'w', encoding='utf-8') as f:
+    f.write(TEMPLATE)
+print('[instantid] wrote robust __init__.py')
 PY
 
 # Ensure PyYAML is in ComfyUI requirements and install via requirements.txt (respects constraints)
