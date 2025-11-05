@@ -13,6 +13,7 @@ services:
       - TRANSFORMERS_CACHE=/opt/models/.hf
       - TORCH_HOME=/opt/models/.torch
       - HF_HUB_ENABLE_HF_TRANSFER=1
+      - SKIP_SVD=1
     volumes:
       - film2_models:/opt/models
       - ./bootstrap:/bootstrap:ro
@@ -228,6 +229,8 @@ services:
       - "nvidia.com/gpu=all"
     depends_on:
       nvidia_init:
+        condition: service_completed_successfully
+      film2_bootstrap:
         condition: service_completed_successfully
     environment:
       - XTTS_MODEL_NAME=tts_models/multilingual/multi-dataset/xtts_v2
@@ -464,6 +467,8 @@ services:
     depends_on:
       nvidia_init:
         condition: service_completed_successfully
+      film2_bootstrap:
+        condition: service_completed_successfully
     environment:
       - MUSIC_MODEL_ID=facebook/musicgen-small
       - NVIDIA_VISIBLE_DEVICES=all
@@ -502,6 +507,8 @@ services:
     depends_on:
       nvidia_init:
         condition: service_completed_successfully
+      film2_bootstrap:
+        condition: service_completed_successfully
     environment:
       - YUE_MODEL_ID=${YUE_MODEL_ID:-facebook/musicgen-large}
       - NVIDIA_VISIBLE_DEVICES=all
@@ -534,6 +541,9 @@ services:
         <<: *cu126_args
     container_name: demucs_service
     restart: unless-stopped
+    depends_on:
+      film2_bootstrap:
+        condition: service_completed_successfully
     environment:
       - PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu126
       - TORCH_HOME=/models/torch
@@ -564,6 +574,8 @@ services:
       - "nvidia.com/gpu=all"
     depends_on:
       nvidia_init:
+        condition: service_completed_successfully
+      film2_bootstrap:
         condition: service_completed_successfully
     environment:
       - SAO_MODEL_ID=${SAO_MODEL_ID:-facebook/musicgen-large}
@@ -602,6 +614,8 @@ services:
       - "nvidia.com/gpu=all"
     depends_on:
       nvidia_init:
+        condition: service_completed_successfully
+      film2_bootstrap:
         condition: service_completed_successfully
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
@@ -689,6 +703,8 @@ services:
       - "nvidia.com/gpu=all"
     depends_on:
       nvidia_init:
+        condition: service_completed_successfully
+      film2_bootstrap:
         condition: service_completed_successfully
     environment:
       - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-}
