@@ -101,6 +101,167 @@ from .embeddings.core import build_embeddings_response as _build_embeddings_resp
 from .analysis.media import analyze_image as _analyze_image, analyze_audio as _analyze_audio
 from .review.referee import build_delta_plan as _build_delta_plan
 from .review.ledger_writer import append_ledger as _append_ledger
+from .comfy.dispatcher import load_workflow as _comfy_load_wf, patch_workflow as _comfy_patch_wf, submit as _comfy_submit
+from .tools_image.common import ensure_dir as _ensure_dir, sidecar as _sidecar, make_outpaths as _make_outpaths, now_ts as _now_ts
+from .analysis.media import analyze_image as _analyze_image
+from .artifacts.manifest import add_manifest_row as _man_add, write_manifest_atomic as _man_write
+from .datasets.trace import append_sample as _trace_append
+from .review.referee import build_delta_plan as _committee
+from .context.index import add_artifact as _ctx_add
+async def _image_dispatch_run(prompt: str, negative: Optional[str], seed: Optional[int], width: Optional[int], height: Optional[int], size: Optional[str], assets: Dict[str, Any]) -> Dict[str, Any]:
+    assert isinstance(prompt, str) and prompt.strip()
+    # size normalization
+    w = None; h = None
+    if isinstance(size, str) and "x" in size:
+        try:
+            parts = size.lower().split("x"); w = int(parts[0]); h = int(parts[1])
+        except Exception:
+            w = None; h = None
+    if isinstance(width, int) and width > 0: w = width
+    if isinstance(height, int) and height > 0: h = height
+    wf = _comfy_load_wf()
+    graph = _comfy_patch_wf(wf, prompt=prompt, negative=(negative or None), seed=seed, width=w, height=h, assets=(assets or {}))
+    _append_ledger({
+        "phase": "image.dispatch.start",
+        "request": {"prompt": prompt, "negative": (negative or None), "seed": (int(seed) if isinstance(seed, int) else None), "width": (int(w) if isinstance(w, int) else None), "height": (int(h) if isinstance(h, int) else None)},
+    })
+    out = await _comfy_submit(graph)
+    pid = out.get("prompt_id")
+    hist = out.get("history") or {}
+    base = (os.getenv("COMFYUI_API_URL", "http://comfyui:8188").rstrip("/"))
+    files: List[Dict[str, str]] = []
+    if isinstance(hist, dict):
+        for _, entry in hist.items():
+            outs = entry.get("outputs") or {}
+            if isinstance(outs, dict):
+                for v in outs.values():
+                    imgs = v.get("images") or []
+                    for img in imgs:
+                        fn = img.get("filename"); sf = img.get("subfolder", ""); ty = img.get("type", "output")
+                        assert isinstance(fn, str) and fn, "image filename missing"
+                        url = f"{base}/view?filename={fn}&subfolder={sf}&type={ty}"
+                        files.append({"filename": fn, "url": url, "subfolder": sf, "type": ty})
+    assert files, "no images returned from comfy history"
+    # Persist and score (with committee loop)
+    cid = "img-" + str(_now_ts())
+    outdir = os.path.join(UPLOAD_DIR, "artifacts", "image", cid)
+    _ensure_dir(outdir)
+    manifest = {"items": []}
+    saved: List[Dict[str, Any]] = []
+    import httpx as _hx
+    with _hx.Client() as client:
+        def _save_batch(batch_files: List[Dict[str, str]], pass_idx: int, pr_text: str, pr_neg: Optional[str], pr_seed: Optional[int]) -> None:
+            for idx, f in enumerate(batch_files):
+                u = f.get("url"); assert isinstance(u, str) and u
+                r = client.get(u)
+                r.raise_for_status()
+                stem = f"dispatch_{pass_idx:02d}_{idx:02d}"
+                png_path, meta_path = _make_outpaths(outdir, stem)
+                with open(png_path, "wb") as _f:
+                    _f.write(r.content)
+                _sidecar(png_path, {
+                    "tool": "image.dispatch",
+                    "prompt": pr_text,
+                    "negative": (pr_neg or None),
+                    "seed": (int(pr_seed) if isinstance(pr_seed, int) else None),
+                    "width": (int(w) if isinstance(w, int) else None),
+                    "height": (int(h) if isinstance(h, int) else None),
+                    "prompt_id": pid,
+                    "comfy_view": u,
+                })
+                _man_add(manifest, png_path, step_id="image.dispatch")
+                ai = _analyze_image(png_path, prompt=str(pr_text))
+                clip_s = float(ai.get("clip_score") or 0.0)
+                _trace_append("image", {"cid": cid, "tool": "image.dispatch", "prompt": pr_text, "path": png_path, "clip_score": clip_s, "tags": ai.get("tags") or []})
+                _ctx_add(cid, "image", png_path, _uri_from_upload_path(png_path), None, [], {"prompt": pr_text, "clip_score": clip_s})
+                saved.append({"path": png_path, "clip_score": clip_s, "url": u})
+
+        # pass 0
+        _save_batch(files, 0, prompt, negative, seed)
+    _man_write(outdir, manifest)
+    # index into RAG (text embedding of prompt)
+    pool = await get_pg_pool()
+    if pool is not None and isinstance(prompt, str) and prompt.strip():
+        emb = get_embedder()
+        vec = emb.encode([prompt])[0]
+        async with pool.acquire() as conn:
+            for s in saved:
+                rel = os.path.relpath(s.get("path"), UPLOAD_DIR).replace("\\", "/")
+                await conn.execute("INSERT INTO rag_docs (path, chunk, embedding) VALUES ($1, $2, $3)", rel, prompt, list(vec))
+    scores = {"image": {"clip": max([s.get("clip_score") or 0.0 for s in saved] or [0.0])}}
+    decision = _committee(scores)
+    # committee loop: revise and re-dispatch until accept or max loops
+    max_loops = int(os.getenv("IMAGING_MAX_LOOPS", "2") or 2)
+    base_prompt = str(prompt)
+    loop_idx = 0
+    while (not bool(decision.get("accept"))) and (loop_idx < max_loops):
+        loop_idx += 1
+        hint = ", sharper, clearer subject, better focus"
+        pr2 = (base_prompt + hint).strip()
+        sd2 = (int(seed) + loop_idx) if isinstance(seed, int) else None
+        wf2 = _comfy_load_wf()
+        graph2 = _comfy_patch_wf(wf2, prompt=pr2, negative=(negative or None), seed=sd2, width=w, height=h, assets=(assets or {}))
+        out2 = await _comfy_submit(graph2)
+        hist2 = out2.get("history") or {}
+        files2: List[Dict[str, str]] = []
+        if isinstance(hist2, dict):
+            for _, entry in hist2.items():
+                outs = entry.get("outputs") or {}
+                if isinstance(outs, dict):
+                    for v in outs.values():
+                        imgs = v.get("images") or []
+                        for img in imgs:
+                            fn = img.get("filename"); sf = img.get("subfolder", ""); ty = img.get("type", "output")
+                            assert isinstance(fn, str) and fn, "image filename missing"
+                            url = f"{base}/view?filename={fn}&subfolder={sf}&type={ty}"
+                            files2.append({"filename": fn, "url": url, "subfolder": sf, "type": ty})
+        assert files2, "no images returned from comfy history (revise)"
+        with _hx.Client() as client:
+            def _save_batch2(batch_files: List[Dict[str, str]], pass_idx: int) -> None:
+                for idx, f in enumerate(batch_files):
+                    u = f.get("url"); assert isinstance(u, str) and u
+                    r = client.get(u)
+                    r.raise_for_status()
+                    stem = f"dispatch_{pass_idx:02d}_{idx:02d}"
+                    png_path, meta_path = _make_outpaths(outdir, stem)
+                    with open(png_path, "wb") as _f:
+                        _f.write(r.content)
+                    _sidecar(png_path, {
+                        "tool": "image.dispatch",
+                        "prompt": pr2,
+                        "negative": (negative or None),
+                        "seed": (int(sd2) if isinstance(sd2, int) else None),
+                        "width": (int(w) if isinstance(w, int) else None),
+                        "height": (int(h) if isinstance(h, int) else None),
+                        "prompt_id": out2.get("prompt_id"),
+                        "comfy_view": u,
+                    })
+                    _man_add(manifest, png_path, step_id="image.dispatch")
+                    ai = _analyze_image(png_path, prompt=str(pr2))
+                    clip_s = float(ai.get("clip_score") or 0.0)
+                    _trace_append("image", {"cid": cid, "tool": "image.dispatch", "prompt": pr2, "path": png_path, "clip_score": clip_s, "tags": ai.get("tags") or []})
+                    _ctx_add(cid, "image", png_path, _uri_from_upload_path(png_path), None, [], {"prompt": pr2, "clip_score": clip_s})
+                    saved.append({"path": png_path, "clip_score": clip_s, "url": u})
+            _save_batch2(files2, loop_idx)
+        _man_write(outdir, manifest)
+        if pool is not None and isinstance(pr2, str) and pr2.strip():
+            emb2 = get_embedder()
+            vec2 = emb2.encode([pr2])[0]
+            async with pool.acquire() as conn:
+                for s in saved:
+                    rel = os.path.relpath(s.get("path"), UPLOAD_DIR).replace("\\", "/")
+                    await conn.execute("INSERT INTO rag_docs (path, chunk, embedding) VALUES ($1, $2, $3)", rel, pr2, list(vec2))
+        scores = {"image": {"clip": max([s.get("clip_score") or 0.0 for s in saved] or [0.0])}}
+        decision = _committee(scores)
+    _append_ledger({
+        "phase": "image.dispatch.finish",
+        "prompt_id": pid,
+        "cid": cid,
+        "scores": scores,
+        "decision": decision,
+        "artifacts": [{"path": s.get("path"), "url": s.get("url"), "clip_score": s.get("clip_score")} for s in saved],
+    })
+    return {"ok": True, "prompt_id": pid, "cid": cid, "files": files, "saved": saved, "scores": scores, "committee": decision}
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 try:
     logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO), format="%(levelname)s:%(message)s")
@@ -323,45 +484,65 @@ try:
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 except Exception:
     pass
+def _origin_norm(s: str) -> str:
+    s = (s or "").strip()
+    if s.startswith("ws://"): s = "http://" + s[5:]
+    if s.startswith("wss://"): s = "https://" + s[6:]
+    return s.rstrip("/")
+
+def _same_origin(origin: str, request: Request) -> bool:
+    base = _origin_norm(str(request.base_url))
+    return _origin_norm(origin) == base.rstrip("/")
+
+_CORS_EXTRA = [x.strip() for x in (os.getenv("CORS_EXTRA_ORIGINS", "").split(",")) if x.strip()]
+
+def _allowed_cross(origin: str, request: Request) -> bool:
+    o = _origin_norm(origin)
+    if not o:
+        return False
+    if _same_origin(o, request):
+        return True
+    if o.startswith("http://localhost") or o.startswith("http://127.0.0.1") or o.startswith("https://localhost") or o.startswith("https://127.0.0.1"):
+        return True
+    pb = (os.getenv("PUBLIC_BASE_URL", "").strip())
+    if pb and _origin_norm(pb) == o:
+        return True
+    for extra in _CORS_EXTRA:
+        if _origin_norm(extra) == o:
+            return True
+    return False
+
 @app.middleware("http")
 async def global_cors_middleware(request: Request, call_next):
-    try:
-        _log("http.req", method=request.method, path=request.url.path)
-    except Exception:
-        pass
+    origin = request.headers.get("origin") or ""
+    same = _same_origin(origin, request) if origin else False
+    allowed = same or (origin and _allowed_cross(origin, request))
     if request.method == "OPTIONS":
-        return StreamingResponse(content=iter(()), status_code=204, headers={
-            "Access-Control-Allow-Origin": (request.headers.get("origin") or "*"),
+        hdrs = {
+            "Access-Control-Allow-Origin": (origin if allowed else "*"),
             "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
-            "Access-Control-Allow-Headers": "*",
-            "Access-Control-Allow-Credentials": "false",
+            "Access-Control-Allow-Headers": request.headers.get("access-control-request-headers") or "*",
+            "Access-Control-Allow-Credentials": ("true" if allowed else "false"),
             "Access-Control-Expose-Headers": "*",
             "Access-Control-Max-Age": "86400",
             "Access-Control-Allow-Private-Network": "true",
             "Connection": "close",
             "Vary": "Origin",
-        })
+        }
+        return StreamingResponse(content=iter(()), status_code=204, headers=hdrs)
     resp = await call_next(request)
-    try:
-        _log("http.res", method=request.method, path=request.url.path, status=getattr(resp, "status_code", None))
-    except Exception:
-        pass
-    resp.headers["Access-Control-Allow-Origin"] = request.headers.get("origin") or "*"
+    resp.headers["Access-Control-Allow-Origin"] = origin if allowed else "*"
     resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
     resp.headers["Access-Control-Allow-Headers"] = "*"
-    resp.headers["Access-Control-Allow-Credentials"] = "false"
+    resp.headers["Access-Control-Allow-Credentials"] = ("true" if allowed else "false")
     resp.headers["Access-Control-Expose-Headers"] = "*"
     resp.headers["Access-Control-Max-Age"] = "86400"
     resp.headers["Access-Control-Allow-Private-Network"] = "true"
     resp.headers["Vary"] = "Origin"
-    # Help browsers load media without ORB/CORP issues if accessed cross-origin
-    try:
-        path = request.url.path or ""
-        if path.startswith("/uploads/") or path.endswith(".mp4") or path.endswith(".png") or path.endswith(".jpg") or path.endswith(".jpeg") or path.endswith(".webm"):
-            resp.headers.setdefault("Cross-Origin-Resource-Policy", "cross-origin")
-            resp.headers.setdefault("Timing-Allow-Origin", "*")
-    except Exception:
-        pass
+    path = request.url.path or ""
+    if path.startswith("/uploads/") or path.endswith(".mp4") or path.endswith(".png") or path.endswith(".jpg") or path.endswith(".jpeg") or path.endswith(".webm"):
+        resp.headers.setdefault("Cross-Origin-Resource-Policy", "cross-origin")
+        resp.headers.setdefault("Timing-Allow-Origin", "*")
     return resp
 
 
@@ -377,6 +558,34 @@ try:
 except Exception:
     _comfy_sem = None
 _films_mem: Dict[str, Dict[str, Any]] = {}
+
+
+@app.post("/v1/image/dispatch")
+async def post_image_dispatch(request: Request):
+    body = await request.json()
+    parser = JSONParser()
+    expected = {
+        "prompt": (str),
+        "negative": (str),
+        "seed": (int),
+        "width": (int),
+        "height": (int),
+        "size": (str),
+        "assets": (dict),
+    }
+    obj = parser.parse(body, expected)
+    # core fields
+    prompt = obj.get("prompt")
+    negative = obj.get("negative")
+    seed = obj.get("seed")
+    width = obj.get("width")
+    height = obj.get("height")
+    size = obj.get("size")
+    assert isinstance(prompt, str) and len(prompt.strip()) > 0, "prompt must be non-empty string"
+    if negative is not None: assert isinstance(negative, str)
+    if seed is not None: assert isinstance(seed, int) and seed >= 0
+    assets = obj.get("assets") if isinstance(obj.get("assets"), dict) else {}
+    return await _image_dispatch_run(prompt, negative, seed, width, height, size, assets)
 _characters_mem: Dict[str, Dict[str, Any]] = {}
 _scenes_mem: Dict[str, Dict[str, Any]] = {}
 
@@ -4184,9 +4393,8 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         if last_user:
             kw = last_user.lower()
             if any(x in kw for x in ("image", "draw", "generate", "picture", "photo", "render")):
-                # Use image.gen to leverage committee review/quality passes
-                tool_calls = [{"name": "image.gen", "arguments": {"prompt": last_user, "size": "1024x1024"}}]
-                _log("planner.fallback", trace_id=trace_id, tool="image.gen")
+                tool_calls = [{"name": "image.dispatch", "arguments": {"prompt": last_user, "size": "1024x1024"}}]
+                _log("planner.fallback", trace_id=trace_id, tool="image.dispatch")
             elif any(x in kw for x in ("song", "lyrics", "music")):
                 # Enforce YuE only (no fallbacks)
                 tool_calls = [{"name": "music.song.yue", "arguments": {"lyrics": last_user, "style_tags": []}}]
@@ -6728,6 +6936,13 @@ async def completions_legacy(body: Dict[str, Any]):
 
 @app.websocket("/ws")
 async def ws_chat(websocket: WebSocket):
+    origin = websocket.headers.get("origin") or ""
+    server_base = (os.getenv("PUBLIC_BASE_URL", "").strip()) or ""
+    same = (_origin_norm(origin) == _origin_norm(server_base)) if origin and server_base else True if not origin else False
+    allowed = same or origin.startswith("http://localhost") or origin.startswith("http://127.0.0.1") or origin.startswith("https://localhost") or origin.startswith("https://127.0.0.1")
+    if not allowed:
+        await websocket.close(code=1008)
+        return
     await websocket.accept()
     try:
         while True:
@@ -6794,6 +7009,13 @@ async def ws_chat(websocket: WebSocket):
 
 @app.websocket("/tool.ws")
 async def ws_tool(websocket: WebSocket):
+    origin = websocket.headers.get("origin") or ""
+    server_base = (os.getenv("PUBLIC_BASE_URL", "").strip()) or ""
+    same = (_origin_norm(origin) == _origin_norm(server_base)) if origin and server_base else True if not origin else False
+    allowed = same or origin.startswith("http://localhost") or origin.startswith("http://127.0.0.1") or origin.startswith("https://localhost") or origin.startswith("https://127.0.0.1")
+    if not allowed:
+        await websocket.close(code=1008)
+        return
     await websocket.accept()
     try:
         while True:

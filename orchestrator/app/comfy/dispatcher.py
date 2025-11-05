@@ -102,7 +102,7 @@ def patch_assets(graph: Dict[str, Any], assets: Dict[str, Any]) -> None:
 
 async def submit(graph: Dict[str, Any]) -> Dict[str, Any]:
     payload = {"prompt": graph, "client_id": "wrapper-001"}
-    async with httpx.AsyncClient(timeout=120) as client:
+    async with httpx.AsyncClient() as client:
         r = await client.post(COMFY_BASE + "/api/prompt", json=payload)
         r.raise_for_status()
         j = JSONParser().parse(r.text, {"prompt_id": (str), "uuid": (str), "id": (str)})
@@ -118,7 +118,7 @@ async def submit(graph: Dict[str, Any]) -> Dict[str, Any]:
             if isinstance(d, dict) and d.get("type") == "executed" and (d.get("data") or {}).get("prompt_id") == pid:
                 break
     # History
-    async with httpx.AsyncClient(timeout=60) as client:
+    async with httpx.AsyncClient() as client:
         hr = await client.get(COMFY_BASE + f"/api/history/{pid}")
         if hr.status_code == 200:
             return {"prompt_id": pid, "history": JSONParser().parse(hr.text, {})}

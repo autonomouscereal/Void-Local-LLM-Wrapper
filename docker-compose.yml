@@ -441,7 +441,6 @@ services:
     volumes:
       - comfyui_models:/comfyui/models
       - ./assets/comfyui/models/upscale:/comfyui/models/upscale
-      - comfyui_custom_nodes:/comfyui/custom_nodes
       - ./assets/comfyui/input:/comfyui/input
       - ./assets/comfyui/output:/comfyui/output
     # For GPU deployments, create additional comfyui-* services and set COMFYUI_API_URLS accordingly
@@ -475,7 +474,6 @@ services:
     volumes:
       - comfyui_models:/comfyui/models
       - ./assets/comfyui/models/upscale:/comfyui/models/upscale
-      - comfyui_custom_nodes:/comfyui/custom_nodes
       - ./assets/comfyui/input:/comfyui/input
       - ./assets/comfyui/output:/comfyui/output
 
@@ -504,7 +502,6 @@ services:
     volumes:
       - comfyui_models:/comfyui/models
       - ./assets/comfyui/models/upscale:/comfyui/models/upscale
-      - comfyui_custom_nodes:/comfyui/custom_nodes
       - ./assets/comfyui/input:/comfyui/input
       - ./assets/comfyui/output:/comfyui/output
 
@@ -520,7 +517,7 @@ services:
       - COMFYUI_GPU_DEVICES=${COMFYUI_GPU_DEVICES:-}
     volumes:
       - comfyui_models:/comfyui/models
-      - comfyui_custom_nodes:/comfyui/custom_nodes
+      # Do not mount host or named custom_nodes to avoid resurrecting Real-ESRGAN
     command: ["python", "/app/init_assets.py"]
 
   n8n:
