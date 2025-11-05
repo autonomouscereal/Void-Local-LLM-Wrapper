@@ -13,10 +13,7 @@ from ..json_parser import JSONParser
 
 def _parse_json(text: str) -> dict:
     parser = JSONParser()
-    try:
-        return parser.parse(text or "{}", {})
-    except Exception:
-        return {}
+    return parser.parse(text or "{}", {})
 
 
 def run_super_loop(task: str, repo_root: str, model, step_tokens: int = 900) -> dict:
@@ -36,10 +33,7 @@ def run_super_loop(task: str, repo_root: str, model, step_tokens: int = 900) -> 
         f = p.get("file")
         if not f:
             continue
-        try:
-            txt = read_text(os.path.join(repo_root, f))
-        except Exception:
-            txt = ""
+        txt = read_text(os.path.join(repo_root, f))
         excerpts.append({"file": f, "head": txt[:4000]})
     # Phase 2: Implementer
     impl_in = build_implementer_input(plan, excerpts)

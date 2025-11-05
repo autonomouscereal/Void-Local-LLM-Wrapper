@@ -444,7 +444,8 @@ async def audio_lyrics_to_song(req: Request):
         if lyrics:
             try:
                 r = await client.post(f"{MELODY_API_URL}/score", json={"lyrics": lyrics, "bpm": 140, "key": "E minor"})
-                score = r.json()
+                score_resp = JSONParser().parse(r.text, {"ok": (bool), "score_json": dict})
+                score = score_resp.get("score_json") or score_resp
             except Exception:
                 score = None
 
@@ -452,7 +453,7 @@ async def audio_lyrics_to_song(req: Request):
         if score and lyrics:
             try:
                 r = await client.post(f"{PROSODY_API_URL}/suggest", json={"lyrics": lyrics, "score_json": score, "style_tags": None})
-                pros = r.json() or {}
+                pros = JSONParser().parse(r.text, {}) or {}
                 score["prosody_deltas"] = pros
             except Exception:
                 pass
@@ -461,7 +462,7 @@ async def audio_lyrics_to_song(req: Request):
         backing_b64 = None
         try:
             r = await client.post(f"{MUSIC_API_URL}/generate", json={"prompt": prompt or lyrics, "seconds": seconds, "seed": seed})
-            backing_b64 = (r.json() or {}).get("audio_wav_base64")
+            backing_b64 = (JSONParser().parse(r.text, {}) or {}).get("audio_wav_base64")
         except Exception:
             backing_b64 = None
 
@@ -470,7 +471,7 @@ async def audio_lyrics_to_song(req: Request):
         if score:
             try:
                 r = await client.post(f"{DSINGER_API_URL}/sing", json={"score_json": score, "seconds": seconds, "seed": seed})
-                vocal_b64 = (r.json() or {}).get("audio_wav_base64")
+                vocal_b64 = (JSONParser().parse(r.text, {}) or {}).get("audio_wav_base64")
             except Exception:
                 vocal_b64 = None
 
@@ -479,7 +480,7 @@ async def audio_lyrics_to_song(req: Request):
         if vocal_b64 and lyrics:
             try:
                 r = await client.post(f"{MFA_API_URL}/align", json={"lyrics": lyrics, "wav_bytes": vocal_b64})
-                mfa = r.json() or {}
+                mfa = JSONParser().parse(r.text, {}) or {}
             except Exception:
                 mfa = None
 
@@ -487,7 +488,7 @@ async def audio_lyrics_to_song(req: Request):
         if vocal_b64 and score:
             try:
                 r = await client.post(f"{VOCAL_FIXER_API_URL}/vocal_fix", json={"wav_bytes": vocal_b64, "score_json": score, "key": "E minor"})
-                vocal_b64 = (r.json() or {}).get("audio_wav_base64") or vocal_b64
+                vocal_b64 = (JSONParser().parse(r.text, {}) or {}).get("audio_wav_base64") or vocal_b64
             except Exception:
                 pass
 
@@ -495,7 +496,7 @@ async def audio_lyrics_to_song(req: Request):
         if vocal_b64 and voice_lock_id:
             try:
                 r = await client.post(f"{RVC_API_URL}/convert", json={"wav_bytes": vocal_b64, "voice_lock_id": voice_lock_id})
-                vocal_b64 = (r.json() or {}).get("audio_wav_base64") or vocal_b64
+                vocal_b64 = (JSONParser().parse(r.text, {}) or {}).get("audio_wav_base64") or vocal_b64
             except Exception:
                 pass
 
@@ -504,7 +505,7 @@ async def audio_lyrics_to_song(req: Request):
         if sfx_prompt:
             try:
                 r = await client.post(f"{SFX_API_URL}/sfx", json={"prompt": sfx_prompt, "len_s": min(8, seconds)})
-                j = r.json() or {}
+                j = JSONParser().parse(r.text, {}) or {}
                 if isinstance(j.get("audio_wav_base64"), str):
                     sfx_items.append(j["audio_wav_base64"])
             except Exception:
@@ -515,7 +516,7 @@ async def audio_lyrics_to_song(req: Request):
     try:
         if backing_b64:
             r = await httpx.AsyncClient().post(f"{MASTERING_API_URL}/master", json={"wav_bytes": backing_b64, "lufs_target": -14.0, "tp_ceiling_db": -1.0})
-            mastered_b64 = (r.json() or {}).get("audio_wav_base64")
+            mastered_b64 = (JSONParser().parse(r.text, {}) or {}).get("audio_wav_base64")
     except Exception:
         mastered_b64 = None
 
@@ -868,6 +869,10 @@ def meta_prompt(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         "You execute tools yourself. Never ask the user to run code or call tools; do not output scripts for the user to execute. "
         "Be precise, show working when non-trivial, and when a tool can fulfill the request, invoke it directly. "
         "Absolute rule: Never use SQLAlchemy; use asyncpg with pooling and raw SQL for PostgreSQL. "
+        "Absolute rule: Do NOT use Pydantic (no models). Use plain dicts and the project JSONParser. "
+        "Absolute rule: Do NOT add try/except blocks unless the user explicitly requests it or an external API contract strictly requires it. Let errors surface. "
+        "Absolute rule: Do NOT set client timeouts in generated code unless the user explicitly requests it. "
+        "Absolute rule: Do NOT introduce or use any new library without: (1) performing a LIVE web search to the OFFICIAL documentation for the latest stable version (no memory/RAG), (2) reviewing constraints/APIs, and (3) obtaining explicit user permission to add the dependency (this applies to uvicorn/fastapi/etc.). Include the doc URL. "
         "Critically: choose tools SEMANTICALLY by mapping the user's requested outcome to tool capabilities (no keyword triggers). "
         "If any available tool can directly produce the requested artifact, invoke that tool; otherwise provide a concrete solution or plan. "
         "Never refuse actionable requests. Do not apologize, do not say you can't or that it's not supported. If something seems constrained, state constraints briefly and proceed with best-effort steps using reasonable defaults. "
@@ -1330,7 +1335,7 @@ async def planner_produce_plan(messages: List[Dict[str, Any]], tools: Optional[L
         "Ask 1-3 clarifying questions ONLY if blocking details are missing (e.g., duration, style, language, target resolution).\n"
         "If not blocked, proceed and choose reasonable defaults: duration<=10s for short clips, 1920x1080, 24fps, language=en, neutral voice.\n"
         "Return strict JSON with keys: plan (string), tool_calls (array of {name: string, arguments: object}).\n"
-        "Absolute rule: Never propose or use SQLAlchemy in code or tools. Use asyncpg with pooled connections and raw SQL for PostgreSQL."
+        "Absolute rules: Do NOT use try/except unless explicitly asked; let errors surface. Do NOT set client timeouts unless asked. Do NOT use Pydantic. Never propose or use SQLAlchemy; use asyncpg with pooled connections and raw SQL for PostgreSQL."
     )
     all_tools = merge_tool_schemas(tools)
     tool_info = build_tools_section(all_tools)
@@ -1493,7 +1498,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         wf = args.get("workflow")
         if isinstance(wf, dict) and COMFYUI_API_URL:
             async with httpx.AsyncClient() as client:
-                r = await client.post(COMFYUI_API_URL.rstrip("/") + "/prompt", json={"prompt": wf})
+                payload = {"prompt": wf, "client_id": "wrapper-001"}
+                r = await client.post(COMFYUI_API_URL.rstrip("/") + "/api/prompt", json=payload)
                 try:
                     r.raise_for_status(); return {"name": name, "result": _resp_json(r, {})}
                 except Exception:
@@ -1510,13 +1516,13 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 import httpx as _hx  # type: ignore
                 with _hx.Client() as client:
                     emit_progress({"stage": "submit", "target": "comfyui"})
-                    r = client.post(self.base + "/prompt", json={"prompt": graph})
+                    r = client.post(self.base + "/api/prompt", json={"prompt": graph, "client_id": "wrapper-001"})
                     r.raise_for_status(); return _resp_json(r, {"prompt_id": str})
             def _poll(self, pid: str) -> Dict[str, Any]:
                 import httpx as _hx, time as _tm  # type: ignore
                 while True:
                     emit_progress({"stage": "poll", "prompt_id": pid})
-                    r = _hx.get(self.base + f"/history/{pid}")
+                    r = _hx.get(self.base + f"/api/history/{pid}")
                     if r.status_code == 200:
                         js = _resp_json(r, {});
                         hist = js.get("history") if isinstance(js, dict) else {}
@@ -1687,7 +1693,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 js = self._post_prompt(g); pid = js.get("prompt_id") or js.get("uuid") or js.get("id")
                 det = self._poll(pid)
                 data = self._download_first(det)
-                view_url = f"{self.base}/history/{pid}" if (self.base and pid) else None
+                view_url = f"{self.base}/api/history/{pid}" if (self.base and pid) else None
                 return {"image_bytes": data, "model": "comfyui:sdxl", "prompt_id": pid, "history_url": view_url}
             def edit(self, a: Dict[str, Any]) -> Dict[str, Any]:
                 if not self.base:
@@ -1706,7 +1712,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 }
                 js = self._post_prompt(g); pid = js.get("prompt_id") or js.get("uuid") or js.get("id"); det = self._poll(pid)
                 data = self._download_first(det)
-                view_url = f"{self.base}/history/{pid}" if (self.base and pid) else None
+                view_url = f"{self.base}/api/history/{pid}" if (self.base and pid) else None
                 return {"image_bytes": data, "model": "comfyui:sdxl", "prompt_id": pid, "history_url": view_url}
             def upscale(self, a: Dict[str, Any]) -> Dict[str, Any]:
                 if not self.base:
@@ -1720,7 +1726,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 }
                 js = self._post_prompt(g); pid = js.get("prompt_id") or js.get("uuid") or js.get("id"); det = self._poll(pid)
                 data = self._download_first(det)
-                view_url = f"{self.base}/history/{pid}" if (self.base and pid) else None
+                view_url = f"{self.base}/api/history/{pid}" if (self.base and pid) else None
                 return {"image_bytes": data, "model": "comfyui:realesrgan", "prompt_id": pid, "history_url": view_url}
         provider = _ImageProvider(COMFYUI_API_URL)
         manifest = {"items": []}
@@ -2270,12 +2276,12 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             def _post_prompt(self, graph: Dict[str, Any]) -> Dict[str, Any]:
                 import httpx as _hx  # type: ignore
                 with _hx.Client() as client:
-                    r = client.post(self.base + "/prompt", json={"prompt": graph})
+                    r = client.post(self.base + "/api/prompt", json={"prompt": graph, "client_id": "wrapper-001"})
                     r.raise_for_status(); return _resp_json(r, {"prompt_id": str, "uuid": str, "id": str})
             def _poll(self, pid: str) -> Dict[str, Any]:
                 import httpx as _hx, time as _tm  # type: ignore
                 while True:
-                    r = _hx.get(self.base + f"/history/{pid}")
+                    r = _hx.get(self.base + f"/api/history/{pid}")
                     if r.status_code == 200:
                         js = _resp_json(r, {"history": dict}); h = (js.get("history") or {}).get(pid)
                         if h and _comfy_is_completed(h):
@@ -2329,7 +2335,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     pass
                 js = self._post_prompt(g); pid = js.get("prompt_id") or js.get("uuid") or js.get("id"); det = self._poll(pid)
                 data = self._download_first(det)
-                view_url = f"{self.base}/history/{pid}" if (self.base and pid) else None
+                view_url = f"{self.base}/api/history/{pid}" if (self.base and pid) else None
                 return {"image_bytes": data, "model": "comfyui:sdxl", "prompt_id": pid, "history_url": view_url}
             def edit(self, a: Dict[str, Any]) -> Dict[str, Any]:
                 positive = a.get("prompt") or ""; negative = a.get("negative") or ""; seed = int(a.get("seed") or 0)
@@ -2346,7 +2352,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 }
                 js = self._post_prompt(g); pid = js.get("prompt_id") or js.get("uuid") or js.get("id"); det = self._poll(pid)
                 data = self._download_first(det)
-                view_url = f"{self.base}/history/{pid}" if (self.base and pid) else None
+                view_url = f"{self.base}/api/history/{pid}" if (self.base and pid) else None
                 return {"image_bytes": data, "model": "comfyui:sdxl", "prompt_id": pid, "history_url": view_url}
             def upscale(self, a: Dict[str, Any]) -> Dict[str, Any]:
                 scale = int(a.get("scale") or 2)
@@ -2358,7 +2364,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 }
                 js = self._post_prompt(g); pid = js.get("prompt_id") or js.get("uuid") or js.get("id"); det = self._poll(pid)
                 data = self._download_first(det)
-                view_url = f"{self.base}/history/{pid}" if (self.base and pid) else None
+                view_url = f"{self.base}/api/history/{pid}" if (self.base and pid) else None
                 return {"image_bytes": data, "model": "comfyui:realesrgan", "prompt_id": pid, "history_url": view_url}
         provider = _ImageProvider(COMFYUI_API_URL)
         manifest = {"items": []}
@@ -2734,7 +2740,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 br = await client.post(f"{base_url}/film/breakdown", json={"project_id": project_id, "rules": rules_payload})
                 shots = []
                 try:
-                    js = br.json() if br.status_code == 200 else {}
+                    js = JSONParser().parse(br.text, {}) if br.status_code == 200 else {}
                     shots = [s.get("id") for s in (js.get("shots") or []) if isinstance(s, dict) and s.get("id")]
                 except Exception:
                     shots = []
@@ -2751,7 +2757,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 for attempt in range(0, 2):
                     qr = await client.post(f"{base_url}/film/qc", json={"project_id": project_id})
                     try:
-                        rep = qr.json() if qr.status_code == 200 else {}
+                        rep = JSONParser().parse(qr.text, {}) if qr.status_code == 200 else {}
                     except Exception:
                         rep = {}
                     suggested = rep.get("suggested_fixes") or []
@@ -2786,7 +2792,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                         },
                     )
                 exp = await client.post(f"{base_url}/film/export", json={"project_id": project_id, "post": {"interpolate": interp, "upscale": upscale}, "refresh": refresh, "requested": requested_meta, "effective": effective_meta})
-                resj = exp.json() if exp.status_code == 200 else {"error": exp.text}
+                resj = JSONParser().parse(exp.text, {}) if exp.status_code == 200 else {"error": exp.text}
         except Exception as ex:
             return {"name": name, "error": str(ex)}
         return {"name": name, "result": resj}
@@ -3236,13 +3242,13 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                                 g["22"] = {"class_type": "InstantIDApply", "inputs": {"model": ["1", 0], "image": ["2", 0], "embedding": emb, "strength": 0.70}}
                                 g["6"]["inputs"]["model"] = ["22", 0]
                                 with _hx.Client() as _c2:
-                                    pr = _c2.post(COMFYUI_API_URL.rstrip("/") + "/prompt", json={"prompt": g})
+                                    pr = _c2.post(COMFYUI_API_URL.rstrip("/") + "/api/prompt", json={"prompt": g, "client_id": "wrapper-001"})
                                     if pr.status_code == 200:
                                         pj = _resp_json(pr, {"prompt_id": str, "uuid": str, "id": str})
                                         pid = (pj.get("prompt_id") or pj.get("uuid") or pj.get("id"))
                                         # poll for completion
                                         while True:
-                                            hr = _c2.get(COMFYUI_API_URL.rstrip("/") + f"/history/{pid}")
+                                            hr = _c2.get(COMFYUI_API_URL.rstrip("/") + f"/api/history/{pid}")
                                             if hr.status_code == 200:
                                                 hj = _resp_json(hr, {})
                                                 hist = hj.get("history") if isinstance(hj, dict) else {}
@@ -3447,12 +3453,12 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                                 g["22"] = {"class_type": "InstantIDApply", "inputs": {"model": ["1", 0], "image": ["2", 0], "embedding": emb, "strength": 0.70}}
                                 g["6"]["inputs"]["model"] = ["22", 0]
                                 with _hx.Client() as _c2:
-                                    pr = _c2.post(COMFYUI_API_URL.rstrip("/") + "/prompt", json={"prompt": g})
+                                    pr = _c2.post(COMFYUI_API_URL.rstrip("/") + "/api/prompt", json={"prompt": g, "client_id": "wrapper-001"})
                                     if pr.status_code == 200:
                                         pj = _resp_json(pr, {"prompt_id": str, "uuid": str, "id": str})
                                         pid = (pj.get("prompt_id") or pj.get("uuid") or pj.get("id"))
                                         while True:
-                                            hr = _c2.get(COMFYUI_API_URL.rstrip("/") + f"/history/{pid}")
+                                            hr = _c2.get(COMFYUI_API_URL.rstrip("/") + f"/api/history/{pid}")
                                             if hr.status_code == 200:
                                                 hj = _resp_json(hr, {"history": dict})
                                                 h = (hj.get("history") or {}).get(pid)
@@ -3708,7 +3714,11 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
     if name == "image_generate" and COMFYUI_API_URL and ALLOW_TOOL_EXECUTION:
         # expects a ComfyUI workflow graph or minimal prompt params passed through
         async with httpx.AsyncClient() as client:
-            r = await client.post(COMFYUI_API_URL.rstrip("/") + "/prompt", json=args.get("workflow") or args)
+            wf_payload = args.get("workflow") or args
+            if isinstance(wf_payload, dict) and "prompt" not in wf_payload:
+                wf_payload = {"prompt": wf_payload}
+            wf_payload = {**(wf_payload or {}), "client_id": "wrapper-001"}
+            r = await client.post(COMFYUI_API_URL.rstrip("/") + "/api/prompt", json=wf_payload)
             try:
                 r.raise_for_status()
                 return {"name": name, "result": _resp_json(r, {})}
@@ -3716,7 +3726,11 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 return {"name": name, "error": r.text}
     if name == "controlnet" and COMFYUI_API_URL and ALLOW_TOOL_EXECUTION:
         async with httpx.AsyncClient() as client:
-            r = await client.post(COMFYUI_API_URL.rstrip("/") + "/prompt", json=args.get("workflow") or args)
+            wf_payload = args.get("workflow") or args
+            if isinstance(wf_payload, dict) and "prompt" not in wf_payload:
+                wf_payload = {"prompt": wf_payload}
+            wf_payload = {**(wf_payload or {}), "client_id": "wrapper-001"}
+            r = await client.post(COMFYUI_API_URL.rstrip("/") + "/api/prompt", json=wf_payload)
             try:
                 r.raise_for_status()
                 return {"name": name, "result": _resp_json(r, {})}
@@ -3724,7 +3738,11 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 return {"name": name, "error": r.text}
     if name == "video_generate" and COMFYUI_API_URL and ALLOW_TOOL_EXECUTION:
         async with httpx.AsyncClient() as client:
-            r = await client.post(COMFYUI_API_URL.rstrip("/") + "/prompt", json=args.get("workflow") or args)
+            wf_payload = args.get("workflow") or args
+            if isinstance(wf_payload, dict) and "prompt" not in wf_payload:
+                wf_payload = {"prompt": wf_payload}
+            wf_payload = {**(wf_payload or {}), "client_id": "wrapper-001"}
+            r = await client.post(COMFYUI_API_URL.rstrip("/") + "/api/prompt", json=wf_payload)
             try:
                 r.raise_for_status()
                 return {"name": name, "result": _resp_json(r, {})}
@@ -4461,7 +4479,13 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 return JSONResponse(content=response)
 
     # 3) Executors respond independently using plan + evidence
-    evidence_blocks: List[Dict[str, Any]] = []
+    evidence_blocks: List[Dict[str, Any]] = [
+        {"role": "system", "content": (
+            "Policy: Do NOT use try/except unless explicitly requested or required by an external API; let errors surface. "
+            "Do NOT set client timeouts unless explicitly requested. Do NOT use Pydantic. Do NOT use SQLAlchemy/ORM; use asyncpg + raw SQL. "
+            "Do NOT introduce or use any new library (including uvicorn/fastapi/etc.) without a LIVE web search of the OFFICIAL docs for the latest stable version (no memory/RAG), and explicit user permission. Include the doc URL."
+        )}
+    ]
     if plan_text:
         evidence_blocks.append({"role": "system", "content": f"Planner plan:\n{plan_text}"})
     if tool_results:
@@ -4736,10 +4760,17 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         ]
 
     # 5) Final synthesis by Planner
-    final_request = exec_messages_current + [{"role": "user", "content": (
+    final_request = (
+        [{"role": "system", "content": (
+            "Policy: Do NOT use try/except unless explicitly requested or required by an external API; let errors surface. "
+            "Do NOT set client timeouts unless explicitly requested. Do NOT use Pydantic. Do NOT use SQLAlchemy/ORM; use asyncpg + raw SQL. "
+            "Do NOT introduce or use any new library (including uvicorn/fastapi/etc.) without a LIVE web search of the OFFICIAL docs for the latest stable version (no memory/RAG), and explicit user permission. Include the doc URL."
+        )}] +
+        exec_messages_current + [{"role": "user", "content": (
         "Produce the final, corrected answer, incorporating critiques and evidence. "
         "Be unambiguous, include runnable code when requested, and prefer specific citations to tool results."
     )}]
+    )
 
     planner_id = QWEN_MODEL_ID if PLANNER_MODEL.lower() == "qwen" else GPTOSS_MODEL_ID
     planner_base = QWEN_BASE_URL if PLANNER_MODEL.lower() == "qwen" else GPTOSS_BASE_URL
@@ -5652,12 +5683,12 @@ async def tool_run(body: Dict[str, Any]):
                 def _post_prompt(self, graph: Dict[str, Any]) -> Dict[str, Any]:
                     import httpx as _hx  # type: ignore
                     with _hx.Client() as client:
-                        r = client.post(self.base + "/prompt", json={"prompt": graph})
+                        r = client.post(self.base + "/api/prompt", json={"prompt": graph, "client_id": "wrapper-001"})
                         r.raise_for_status(); return _resp_json(r, {"prompt_id": str, "uuid": str, "id": str})
                 def _poll(self, pid: str) -> Dict[str, Any]:
                     import httpx as _hx, time as _tm  # type: ignore
                     while True:
-                        r = _hx.get(self.base + f"/history/{pid}")
+                        r = _hx.get(self.base + f"/api/history/{pid}")
                         if r.status_code == 200:
                             js = _resp_json(r, {})
                             hist = js.get("history") if isinstance(js, dict) else {}
@@ -6887,17 +6918,37 @@ async def _comfy_submit_workflow(workflow: Dict[str, Any]) -> Dict[str, Any]:
                     if _comfy_sem is not None:
                         async with _comfy_sem:
                             _comfy_load[base] = _comfy_load.get(base, 0) + 1
-                            r = await client.post(base.rstrip("/") + "/prompt", json=workflow)
+                            payload = workflow if isinstance(workflow, dict) else {"prompt": workflow}
+                            if "prompt" not in payload and isinstance(workflow, dict):
+                                payload = {"prompt": workflow}
+                            payload = {**payload, "client_id": "wrapper-001"}
+                            r = await client.post(base.rstrip("/") + "/api/prompt", json=payload)
                     else:
                         _comfy_load[base] = _comfy_load.get(base, 0) + 1
-                        r = await client.post(base.rstrip("/") + "/prompt", json=workflow)
+                        payload = workflow if isinstance(workflow, dict) else {"prompt": workflow}
+                        if "prompt" not in payload and isinstance(workflow, dict):
+                            payload = {"prompt": workflow}
+                        payload = {**payload, "client_id": "wrapper-001"}
+                        r = await client.post(base.rstrip("/") + "/api/prompt", json=payload)
                     try:
                         r.raise_for_status()
                         res = _resp_json(r, {"prompt_id": str, "uuid": str, "id": str})
                         pid = res.get("prompt_id") or res.get("uuid") or res.get("id")
                         if isinstance(pid, str):
                             _job_endpoint[pid] = base
-                        return res
+                            # Wait for execution via WS
+                            ws_url = base.replace("http", "ws").rstrip("/") + f"/ws?clientId=wrapper-001"
+                            import websockets as _ws
+                            async with _ws.connect(ws_url, ping_interval=None) as ws:
+                                # Drain until executed message for our pid
+                                while True:
+                                    msg = await ws.recv()
+                                    jd = JSONParser().parse(msg, {"type": str, "data": dict}) if isinstance(msg, (str, bytes)) else {}
+                                    if isinstance(jd, dict) and jd.get("type") == "executed":
+                                        d = jd.get("data") or {}
+                                        if d.get("prompt_id") == pid:
+                                            break
+                            return res
                     except Exception:
                         last_err = r.text
             except Exception as ex:
@@ -6918,7 +6969,7 @@ async def _comfy_history(prompt_id: str) -> Dict[str, Any]:
     if not base:
         return {"error": "COMFYUI_API_URL(S) not configured"}
     async with httpx.AsyncClient() as client:
-        r = await client.get(base.rstrip("/") + f"/history/{prompt_id}")
+        r = await client.get(base.rstrip("/") + f"/api/history/{prompt_id}")
         try:
             r.raise_for_status()
             return _resp_json(r, {})
@@ -7514,12 +7565,12 @@ async def _update_scene_from_job(job_id: str, detail: Dict[str, Any] | str, fail
                 async with httpx.AsyncClient() as client:
                     tr = await client.post(XTTS_API_URL.rstrip("/") + "/tts", json={"text": scene_text, "voice": voice, "language": language})
                     if tr.status_code == 200:
-                        scene_tts = tr.json()
+                        scene_tts = JSONParser().parse(tr.text, {})
             if MUSIC_API_URL and ALLOW_TOOL_EXECUTION and audio_enabled:
                 async with httpx.AsyncClient() as client:
                     mr = await client.post(MUSIC_API_URL.rstrip("/") + "/generate", json={"prompt": "cinematic background score", "duration": duration})
                     if mr.status_code == 200:
-                        scene_music = mr.json()
+                        scene_music = JSONParser().parse(mr.text, {})
             # simple SRT creation from scene_text if enabled
             if scene_text and subs_enabled:
                 srt = _text_to_simple_srt(scene_text, duration)

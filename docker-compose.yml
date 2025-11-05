@@ -222,8 +222,8 @@ services:
     depends_on:
       - ollama_qwen
     environment:
-      - QWEN_MODEL_ID=${QWEN_MODEL_ID:-qwen3:32b-instruct-q4_K_M}
-    command: ["sh","-lc","until curl -s http://ollama_qwen:11434/api/tags >/dev/null; do sleep 2; done; curl -s -X POST http://ollama_qwen:11434/api/pull -H 'Content-Type: application/json' -d '{\"name\":\"${QWEN_MODEL_ID}\"}'"]
+      - QWEN_MODEL_ID=${QWEN_MODEL_ID:-qwen3:30b-a3b-instruct-2507-q4_K_M}
+    command: ["sh","-lc","until curl -sf http://ollama_qwen:11434/api/tags >/dev/null; do sleep 2; done; echo Pulling $QWEN_MODEL_ID; curl -sf -X POST http://ollama_qwen:11434/api/pull -H 'Content-Type: application/json' -d '{\"name\":\"${QWEN_MODEL_ID}\"}'; echo Pulled $QWEN_MODEL_ID"]
 
   ollama_gptoss:
     image: ollama/ollama:latest
@@ -253,6 +253,15 @@ services:
       - GPTOSS_MODEL_ID=${GPTOSS_MODEL_ID}
     command: ["sh","-lc","until curl -s http://ollama_gptoss:11434/api/tags >/dev/null; do sleep 2; done; curl -s -X POST http://ollama_gptoss:11434/api/pull -H 'Content-Type: application/json' -d '{\"name\":\"${GPTOSS_MODEL_ID}\"}'"]
 
+  init_qwen_vl:
+    image: curlimages/curl:8.7.1
+    container_name: init_qwen_vl
+    depends_on:
+      - ollama_qwen
+    environment:
+      - QWEN_VL_MODEL_ID=${QWEN_VL_MODEL_ID:-qwen3-vl:8b}
+    command: ["sh","-lc","until curl -sf http://ollama_qwen:11434/api/tags >/dev/null; do sleep 2; done; echo Pulling $QWEN_VL_MODEL_ID; curl -sf -X POST http://ollama_qwen:11434/api/pull -H 'Content-Type: application/json' -d '{\"name\":\"${QWEN_VL_MODEL_ID}\"}'; echo Pulled $QWEN_VL_MODEL_ID"]
+
   orchestrator:
     build:
       context: ./orchestrator
@@ -268,7 +277,7 @@ services:
       - FILM2_MODELS=/opt/models
       - FILM2_DATA=/srv/film2
       - QWEN_BASE_URL=http://ollama_qwen:11434
-      - QWEN_MODEL_ID=${QWEN_MODEL_ID:-qwen3:32b-instruct-q4_K_M}
+      - QWEN_MODEL_ID=${QWEN_MODEL_ID:-qwen3:30b-a3b-instruct-2507-q4_K_M}
       - GPTOSS_BASE_URL=http://ollama_gptoss:11434
       - GPTOSS_MODEL_ID=${GPTOSS_MODEL_ID}
       # Enable ICW + Committee + Tools by default
@@ -326,6 +335,7 @@ services:
       - ./:/workspace
       - film2_models:/opt/models:ro
       - film2_data:/srv/film2
+      - comfyui_input:/comfyui/input
 
   xtts:
     build:
@@ -431,6 +441,7 @@ services:
     volumes:
       - comfyui_models:/comfyui/models
       - comfyui_custom_nodes:/comfyui/custom_nodes
+      - comfyui_input:/comfyui/input
     # For GPU deployments, create additional comfyui-* services and set COMFYUI_API_URLS accordingly
 
   # Optional additional ComfyUI replicas for dynamic distribution
@@ -462,6 +473,7 @@ services:
     volumes:
       - comfyui_models:/comfyui/models
       - comfyui_custom_nodes:/comfyui/custom_nodes
+      - comfyui_input:/comfyui/input
 
   comfyui-2:
     build:
@@ -488,6 +500,7 @@ services:
     volumes:
       - comfyui_models:/comfyui/models
       - comfyui_custom_nodes:/comfyui/custom_nodes
+      - comfyui_input:/comfyui/input
 
   comfyui_init:
     build:
@@ -777,5 +790,6 @@ volumes:
   demucs_cache: {}
   film2_models: {}
   film2_data: {}
+  comfyui_input: {}
 
 
