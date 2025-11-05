@@ -12,6 +12,9 @@ services:
       - HF_HOME=/opt/models/.hf
       - TRANSFORMERS_CACHE=/opt/models/.hf
       - TORCH_HOME=/opt/models/.torch
+      - HF_HUB_ENABLE_PROGRESS_BARS=1
+      - HF_HUB_ENABLE_XET=0
+      - HF_MAX_WORKERS=4
       - SKIP_SVD=1
     volumes:
       - film2_models:/opt/models

@@ -2,6 +2,8 @@ import os
 import sys
 import json
 import subprocess
+import threading
+import time
 
 
 MODELS_DIR = os.environ.get("FILM2_MODELS", "/opt/models")
@@ -12,6 +14,19 @@ os.makedirs(HF_HOME, exist_ok=True)
 os.environ["HF_HOME"] = HF_HOME
 os.environ["TRANSFORMERS_CACHE"] = HF_HOME
 os.environ["TORCH_HOME"] = os.path.join(MODELS_DIR, ".torch")
+os.environ.setdefault("HF_HUB_ENABLE_PROGRESS_BARS", "1")
+os.environ.setdefault("HF_HUB_VERBOSITY", "info")
+os.environ.setdefault("HF_HUB_ENABLE_XET", "0")
+HF_MAX_WORKERS = int(os.environ.get("HF_MAX_WORKERS", "4"))
+
+# status tracking
+STATUS_PATH = os.path.join(MODELS_DIR, "manifests", "bootstrap_status.json")
+STATUS: dict[str, dict[str, dict[str, str]]] = {"hf": {}, "git": {}}
+
+def write_status() -> None:
+    os.makedirs(os.path.dirname(STATUS_PATH), exist_ok=True)
+    with open(STATUS_PATH, "w", encoding="utf-8") as f:
+        json.dump(STATUS, f, indent=2)
 
 
 HF_MODELS = [
@@ -45,6 +60,48 @@ def log(*a: object) -> None:
     print("[bootstrap]", *a, flush=True)
 
 
+def human(n: float) -> str:
+    units = ["B", "KB", "MB", "GB", "TB"]
+    v = float(n)
+    for u in units:
+        if v < 1024.0:
+            return f"{v:.1f}{u}"
+        v /= 1024.0
+    return f"{v:.1f}PB"
+
+
+class SizeBeat:
+    def __init__(self, path: str, label: str, interval: float = 5.0) -> None:
+        self.path = path
+        self.label = label
+        self.interval = interval
+        self._stop = False
+        self.t = threading.Thread(target=self._run, daemon=True)
+
+    def _run(self) -> None:
+        while not self._stop:
+            total = 0
+            for root, _, files in os.walk(self.path):
+                for f in files:
+                    fp = os.path.join(root, f)
+                    try:
+                        total += os.path.getsize(fp)
+                    except Exception:
+                        pass
+            log(f"PROGRESS {self.label}", human(total))
+            time.sleep(self.interval)
+
+    def start(self) -> None:
+        self.t.start()
+
+    def stop(self) -> None:
+        self._stop = True
+        try:
+            self.t.join(timeout=2)
+        except Exception:
+            pass
+
+
 def ensure_pkg() -> None:
     try:
         import huggingface_hub  # noqa: F401
@@ -56,23 +113,53 @@ def snapshot(repo_id: str, local_key: str, allow_patterns: list[str] | None = No
     from huggingface_hub import snapshot_download
     tgt = os.path.join(MODELS_DIR, local_key)
     if os.path.isdir(tgt) and os.listdir(tgt):
-        log("exists", tgt)
+        log("exists", local_key, "->", tgt)
         return
+    log("START-HF", repo_id, "->", tgt)
     os.makedirs(tgt, exist_ok=True)
-    kw = dict(repo_id=repo_id, local_dir=tgt, local_dir_use_symlinks=False, resume_download=True)
-    if allow_patterns:
-        kw["allow_patterns"] = allow_patterns
-    snapshot_download(**kw)
-    log("dl-ok", repo_id, "->", tgt)
+    STATUS.setdefault("hf", {})[local_key] = {"repo": repo_id, "state": "downloading"}
+    write_status()
+    beat = SizeBeat(tgt, f"HF:{local_key}")
+    beat.start()
+    try:
+        kw = dict(
+            repo_id=repo_id,
+            local_dir=tgt,
+            local_dir_use_symlinks=False,
+            resume_download=True,
+            max_workers=HF_MAX_WORKERS,
+        )
+        if allow_patterns:
+            kw["allow_patterns"] = allow_patterns
+        try:
+            snapshot_download(**kw)
+        except RuntimeError as e:
+            msg = str(e).lower()
+            if ("xet" in msg) or ("cas service" in msg):
+                os.environ["HF_HUB_ENABLE_XET"] = "0"
+                kw["max_workers"] = 2
+                snapshot_download(**kw)
+            else:
+                raise
+    finally:
+        beat.stop()
+    STATUS["hf"][local_key]["state"] = "done"
+    write_status()
+    log("DONE-HF", repo_id, "->", tgt)
 
 
 def git_clone(url: str, local_key: str) -> None:
     tgt = os.path.join(MODELS_DIR, local_key)
-    if os.path.exists(os.path.join(tgt, ".git")) or os.path.isdir(tgt):
-        log("exists", tgt)
+    if os.path.exists(os.path.join(tgt, ".git")) or (os.path.isdir(tgt) and os.listdir(tgt)):
+        log("exists", local_key, "->", tgt)
         return
+    log("START-GIT", url, "->", tgt)
+    STATUS.setdefault("git", {})[local_key] = {"repo": url, "state": "cloning"}
+    write_status()
     subprocess.check_call(["git", "clone", "--depth=1", url, tgt])  # noqa: S603,S607
-    log("git-ok", url, "->", tgt)
+    STATUS["git"][local_key]["state"] = "done"
+    write_status()
+    log("DONE-GIT", url, "->", tgt)
 
 
 def main() -> None:
@@ -89,6 +176,13 @@ def main() -> None:
     os.makedirs(mpath, exist_ok=True)
     with open(os.path.join(mpath, "model_manifest.json"), "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
+    # Summary
+    pending = {k: v for k, v in STATUS.get("hf", {}).items() if v.get("state") != "done"}
+    pending.update({f"git:{k}": v for k, v in STATUS.get("git", {}).items() if v.get("state") != "done"})
+    if pending:
+        log("SUMMARY: PENDING/MISSING", sorted(pending.keys()))
+    else:
+        log("SUMMARY: ALL MODELS DOWNLOADED")
     log("✅ bootstrap complete into", MODELS_DIR)
 
 
