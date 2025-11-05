@@ -21,6 +21,9 @@ RUN python -V && pip -V && \
     pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cu118 \
       "torch==2.7.1+cu118" "torchvision==0.22.1+cu118" "torchaudio==2.7.1+cu118"
 
+# Explicitly install modules required by custom nodes (constrained by PIP_CONSTRAINT)
+RUN pip install --no-cache-dir opencv-python-headless diffusers imageio-ffmpeg
+
 # Core libs under constraints
 RUN pip install --no-cache-dir --no-deps -r /constraints.txt && \
     pip install --no-cache-dir --requirement /constraints.txt && \
@@ -31,8 +34,19 @@ WORKDIR /comfyui
 RUN curl -fL https://codeload.github.com/comfyanonymous/ComfyUI/tar.gz/master \
     | tar -xzf - --strip-components=1 -C /comfyui
 
-# Ensure no leftover Real-ESRGAN custom node remains in the image
-RUN rm -rf /comfyui/custom_nodes/ComfyUI-Real-ESRGAN || true
+# Ensure no leftover Real-ESRGAN custom node remains in the image (two common names)
+RUN rm -rf /comfyui/custom_nodes/ComfyUI-Real-ESRGAN /comfyui/custom_nodes/comfyui-RealESRGAN || true
+
+# Install only the custom nodes we actually use (no Real-ESRGAN)
+RUN mkdir -p /comfyui/custom_nodes/ComfyUI_IPAdapter_plus && \
+    curl -fL https://codeload.github.com/cubiq/ComfyUI_IPAdapter_plus/tar.gz/main \
+      | tar -xzf - --strip-components=1 -C /comfyui/custom_nodes/ComfyUI_IPAdapter_plus
+RUN mkdir -p /comfyui/custom_nodes/ComfyUI-InstantID && \
+    curl -fL https://codeload.github.com/cubiq/ComfyUI-InstantID/tar.gz/main \
+      | tar -xzf - --strip-components=1 -C /comfyui/custom_nodes/ComfyUI-InstantID || true
+RUN mkdir -p /comfyui/custom_nodes/ComfyUI-VideoHelperSuite && \
+    curl -fL https://codeload.github.com/Kosinkadink/ComfyUI-VideoHelperSuite/tar.gz/main \
+      | tar -xzf - --strip-components=1 -C /comfyui/custom_nodes/ComfyUI-VideoHelperSuite
 
 # Ensure PyYAML is in ComfyUI requirements and install via requirements.txt (respects constraints)
 RUN if [ -f /comfyui/requirements.txt ]; then \
