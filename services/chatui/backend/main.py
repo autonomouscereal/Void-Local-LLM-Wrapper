@@ -271,22 +271,20 @@ async def list_messages(cid: int):
 
 @app.post("/api/upload")
 async def upload(conversation_id: int = Form(...), file: UploadFile = File(...)):
-    # Forward to orchestrator /upload to get a URL, then store attachment
-    try:
-        # Read file and send to orchestrator's upload endpoint
-        content = await file.read()
-        async with httpx.AsyncClient(trust_env=False, timeout=None) as client:
-            files = {"file": (file.filename, content, file.content_type)}
-            r = await client.post(ORCH_URL.rstrip("/") + "/upload", files=files)
-            r.raise_for_status()
-            # Parse upstream JSON safely
-            parser = JSONParser()
-            data = parser.parse(r.text or "", {"url": str, "name": str})
-    except Exception as ex:
-        return JSONResponse(status_code=500, content={"error": str(ex)})
+    return JSONResponse(status_code=410, content={"error": "proxy disabled; use orchestrator /upload directly"})
+
+
+@app.post("/api/attachments.add")
+async def attachments_add(body: Dict[str, Any]):
+    cid = int((body or {}).get("conversation_id") or 0)
+    name = (body or {}).get("name") or ""
+    url = (body or {}).get("url") or ""
+    mime = (body or {}).get("mime") or "application/octet-stream"
+    if not cid or not url:
+        return JSONResponse(status_code=400, content={"error": "missing conversation_id or url"})
     async with _pool().acquire() as conn:
-        await conn.execute("INSERT INTO attachments (conversation_id, name, url, mime) VALUES ($1, $2, $3, $4)", conversation_id, file.filename, (data.get("url") if isinstance(data, dict) else None), file.content_type)
-    return {"ok": True, "url": (data.get("url") if isinstance(data, dict) else None), "name": (data.get("name") if isinstance(data, dict) else file.filename)}
+        await conn.execute("INSERT INTO attachments (conversation_id, name, url, mime) VALUES ($1, $2, $3, $4)", cid, name, url, mime)
+    return {"ok": True}
 
 
 @app.get("/api/conversations/{cid}/attachments")
@@ -315,143 +313,7 @@ def _build_openai_messages(base: List[Dict[str, Any]], attachments: List[Dict[st
 
 @app.post("/api/conversations/{cid}/chat")
 async def chat(cid: int, request: Request, background_tasks: BackgroundTasks):
-    t0 = time.perf_counter()
-    logging.info("/api/conversations/%s/chat: start", cid)
-    # Request body parsing:
-    # - Accept JSON, raw text, or x-www-form-urlencoded
-    # - Prefer framework JSON parsing when available; fallback to custom parser
-    ct = (request.headers.get("content-type") or "").lower()
-    body: Dict[str, Any] = {}
-    parser = JSONParser()
-    # Expected request shape for normalization – parser will ensure defaults
-    expected_request = {
-        "conversation_id": int,
-        "content": str,
-        "messages": [
-            {"role": str, "content": str}
-        ],
-    }
-    if "application/json" in ct:
-        raw_bytes = await request.body()
-        decoded = raw_bytes.decode("utf-8", errors="replace")
-        try:
-            body = parser.parse(decoded, expected_request)
-        except Exception:
-            # Never let parsing kill the request path; degrade gracefully
-            body = {"content": decoded}
-    else:
-        raw_bytes = await request.body()
-        raw_text = raw_bytes.decode("utf-8", errors="replace")
-        if "application/x-www-form-urlencoded" in ct:
-            form = parse_qs(raw_text, keep_blank_values=True)
-            if "content" in form and len(form["content"]) > 0:
-                candidate = form["content"][0]
-                # Attempt full parse/normalize; if not JSON, fall back to treating as raw content
-                try:
-                    body = parser.parse(candidate, expected_request)
-                except Exception:
-                    body = {"content": candidate}
-            elif len(form) == 1:
-                first_key = next(iter(form))
-                vals = form.get(first_key) or [raw_text]
-                candidate = vals[0]
-                try:
-                    body = parser.parse(candidate, expected_request)
-                except Exception:
-                    body = {"content": candidate}
-            else:
-                body = {"content": raw_text}
-        else:
-            # Treat as raw text
-            body = {"content": raw_text}
-    logging.info("chat request cid=%s ct=%s keys=%s", cid, ct, list(body.keys()))
-    user_content = (body or {}).get("content") or ""
-    messages = (body or {}).get("messages") or []
-    # Streaming is disabled here; we proxy non-stream to simplify the browser path
-    stream = False
-    # Store user message in JSONB; ALWAYS json.dumps(... )::jsonb to match DB types
-    t1 = time.perf_counter()
-    async with _pool().acquire() as conn:
-        await conn.execute("INSERT INTO messages (conversation_id, role, content) VALUES ($1, 'user', $2::jsonb)", cid, json.dumps({"text": user_content}))
-        atts = await conn.fetch("SELECT name, url, mime FROM attachments WHERE conversation_id=$1", cid)
-        # Load full conversation history (user/assistant) so the orchestrator has full context
-        hist_rows = await conn.fetch("SELECT role, content FROM messages WHERE conversation_id=$1 ORDER BY id ASC", cid)
-    logging.info("db:user_insert+attachments cid=%s ms=%.2f", cid, (time.perf_counter() - t1) * 1000)
-
-    # Build messages for orchestrator using DB history
-    base_hist = []
-    for r in hist_rows:
-        decoded = _decode_json(r["content"])
-        base_hist.append({"role": r["role"], "content": decoded.get("text") or ""})
-    oa_msgs = _build_openai_messages(base_hist, [dict(a) for a in atts])
-    # Accept both object and string payloads for future compatibility
-    payload = {"messages": oa_msgs, "stream": False, "cid": cid}
-
-    async def _proxy_stream():
-        try:
-            async with httpx.AsyncClient(trust_env=False, timeout=None) as client:
-                url = ORCH_URL.rstrip("/") + "/v1/chat/completions"
-                logging.info("proxy -> orchestrator POST %s", url)
-                async with client.stream("POST", url, json=payload) as r:
-                    ct = r.headers.get("content-type", "")
-                    if stream and ct.startswith("text/event-stream"):
-                        async for chunk in r.aiter_text():
-                            # pass through SSE chunks unchanged
-                            yield chunk
-                    else:
-                        # Non-SSE: forward raw bytes exactly to avoid browser/client quirks
-                        body = await r.aread()
-                        yield body
-        except Exception as ex:
-            yield json.dumps({"error": str(ex)})
-
-    # Keepalive streaming: periodically yield whitespace while waiting for upstream, then yield body
-    t2 = time.perf_counter()
-    async with httpx.AsyncClient(trust_env=False, timeout=None) as client:
-        url = ORCH_URL.rstrip("/") + "/v1/chat/completions"
-        logging.info("proxy -> orchestrator POST %s", url)
-        rr = await client.post(url, json=payload)
-    t3 = time.perf_counter()
-    ct = rr.headers.get("content-type") or "application/octet-stream"
-    status = rr.status_code
-    if ct.startswith("application/json"):
-        try:
-            expected_response = {"choices": [{"message": {"content": str}}]}
-            obj = JSONParser().parse(rr.text, expected_response)
-            assistant_text = ((obj.get("choices") or [{}])[0].get("message") or {}).get("content")
-            if assistant_text:
-                async with _pool().acquire() as c2:
-                    await c2.execute(
-                        "INSERT INTO messages (conversation_id, role, content) VALUES ($1, 'assistant', $2::jsonb)",
-                        cid,
-                        json.dumps({"text": assistant_text}),
-                    )
-        except Exception:
-            pass
-        body_bytes = rr.content
-        headers = {
-            "Cache-Control": "no-store",
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Private-Network": "true",
-            "Access-Control-Expose-Headers": "Content-Type, Content-Length",
-            "Connection": "close",
-            "Content-Length": str(len(body_bytes)),
-            "Content-Type": ct if ct else "application/json; charset=utf-8",
-        }
-        logging.info("/api/conversations/%s/chat: done status=%s ct=%s t_orch_ms=%.2f t_total_ms=%.2f", cid, status, ct, (t3 - t2) * 1000, (time.perf_counter() - t0) * 1000)
-        return Response(content=body_bytes, media_type="application/json", status_code=status, headers=headers)
-    raw = rr.content
-    headers = {
-        "Cache-Control": "no-store",
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Private-Network": "true",
-        "Access-Control-Expose-Headers": "Content-Type, Content-Length",
-        "Connection": "close",
-        "Content-Length": str(len(raw)),
-        "Content-Type": ct,
-    }
-    logging.info("/api/conversations/%s/chat: done status=%s ct=%s t_orch_ms=%.2f t_total_ms=%.2f", cid, status, ct, (t3 - t2) * 1000, (time.perf_counter() - t0) * 1000)
-    return Response(content=raw, media_type=ct, status_code=status, headers=headers)
+    return JSONResponse(status_code=410, content={"error": "proxy disabled; call orchestrator directly"})
 
 
 @app.options("/api/conversations/{cid}/chat")
@@ -522,114 +384,12 @@ async def chat_alt(body: Dict[str, Any], background_tasks: BackgroundTasks):
 # Neutral path versions (avoid filters on "chat")
 @app.post("/api/conversations/{cid}/call")
 async def call_conv(cid: int, request: Request, background_tasks: BackgroundTasks):
-    logging.info("/api/conversations/%s/call: start", cid)
-    parser = JSONParser()
-    try:
-        # Per policy use parser, not request.json()
-        raw_bytes = await request.body()
-        decoded = raw_bytes.decode("utf-8", errors="replace")
-        expected_request = {"content": str}
-        payload_in = parser.parse(decoded, expected_request)
-    except Exception:
-        raw_bytes = await request.body()
-        decoded = raw_bytes.decode("utf-8", errors="replace")
-        try:
-            payload_in = parser.method_json_loads(decoded)
-        except Exception:
-            repaired = parser.attempt_repair(decoded)
-            payload_in = parser.method_json_loads(repaired)
-    user_content = (payload_in or {}).get("content") or ""
-    async with _pool().acquire() as conn:
-        await conn.execute("INSERT INTO messages (conversation_id, role, content) VALUES ($1, 'user', $2::jsonb)", cid, json.dumps({"text": user_content}))
-        atts = await conn.fetch("SELECT name, url, mime FROM attachments WHERE conversation_id=$1", cid)
-    oa_msgs = _build_openai_messages([{"role": "user", "content": user_content}], [dict(a) for a in atts])
-    payload = {"messages": oa_msgs, "stream": False, "cid": cid}
-    async with httpx.AsyncClient(trust_env=False, timeout=None) as client:
-        url = ORCH_URL.rstrip("/") + "/v1/chat/completions"
-        logging.info("proxy -> orchestrator POST %s", url)
-        rr = await client.post(url, json=payload)
-        try:
-            expected_response = {
-                "choices": [
-                    {"message": {"content": str}}
-                ]
-            }
-            data = JSONParser().parse(rr.text, expected_response)
-        except Exception:
-            data = {"choices": [{"message": {"content": ""}}]}
-    assistant = ((data.get("choices") or [{}])[0].get("message") or {}).get("content")
-    async def _persist_assistant_message(conv_id: int, text_value: str) -> None:
-        try:
-            async with _pool().acquire() as c2:
-                await c2.execute("INSERT INTO messages (conversation_id, role, content) VALUES ($1, 'assistant', $2::jsonb)", conv_id, json.dumps({"text": text_value}))
-        except Exception:
-            logging.exception("persist assistant failed cid=%s", conv_id)
-    background_tasks.add_task(_persist_assistant_message, cid, assistant)
-    body = json.dumps(data)
-    headers = {
-        "Cache-Control": "no-store",
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Private-Network": "true",
-        "Access-Control-Expose-Headers": "*",
-        "Connection": "close",
-        "Content-Length": str(len(body.encode("utf-8"))),
-    }
-    logging.info("/api/conversations/%s/call: done", cid)
-    return Response(content=body, media_type="application/json", headers=headers)
+    return JSONResponse(status_code=410, content={"error": "proxy disabled; call orchestrator directly"})
 
 
 @app.post("/api/call")
 async def call_alt(body: Dict[str, Any], background_tasks: BackgroundTasks):
-    cid = int((body or {}).get("conversation_id") or 0)
-    logging.info("/api/call: start cid=%s", cid)
-    user_content = (body or {}).get("content") or ""
-    if not cid:
-        return JSONResponse(status_code=400, content={"error": "missing conversation_id"})
-    async with _pool().acquire() as conn:
-        await conn.execute("INSERT INTO messages (conversation_id, role, content) VALUES ($1, 'user', $2::jsonb)", cid, json.dumps({"text": user_content}))
-        atts = await conn.fetch("SELECT name, url, mime FROM attachments WHERE conversation_id=$1", cid)
-    oa_msgs = _build_openai_messages([{"role": "user", "content": user_content}], [dict(a) for a in atts])
-    payload = {"messages": oa_msgs, "stream": False}
-    async with httpx.AsyncClient(trust_env=False, timeout=None) as client:
-        rr = await client.post(ORCH_URL.rstrip("/") + "/v1/chat/completions", json=payload)
-    # best-effort assistant persistence without affecting response
-    def _persist_from_response(conv_id: int, status_code: int, content_type: str, text_body: str) -> None:
-        if content_type.startswith("application/json") and status_code < 500 and (text_body.strip().startswith('{') or text_body.strip().startswith('[')):
-            parser = JSONParser()
-            expected_response = {
-                "choices": [
-                    {"message": {"content": str}}
-                ]
-            }
-            obj = parser.parse(text_body, expected_response)
-            assistant_text = ((obj.get("choices") or [{}])[0].get("message") or {}).get("content")
-            if assistant_text:
-                import asyncio
-                async def _save() -> None:
-                    async with _pool().acquire() as c2:
-                        await c2.execute(
-                            "INSERT INTO messages (conversation_id, role, content) VALUES ($1, 'assistant', $2::jsonb)",
-                            conv_id,
-                            json.dumps({"text": assistant_text}),
-                        )
-                asyncio.get_event_loop().create_task(_save())
-    ct = rr.headers.get("content-type") or "application/json"
-    logging.info("/api/call: upstream status=%s ct=%s", rr.status_code, ct)
-    background_tasks.add_task(_persist_from_response, cid, rr.status_code, ct, rr.text)
-    # Relay response; for JSON use framework JSONResponse (lets Starlette set headers)
-    # Always return explicit length and close connection
-    body = rr.content
-    headers = {
-        "Cache-Control": "no-store",
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Private-Network": "true",
-        "Access-Control-Expose-Headers": "Content-Type, Content-Length",
-        "Connection": "close",
-        "Content-Length": str(len(body)),
-        "Content-Type": ct,
-    }
-    logging.info("/api/call: done cid=%s", cid)
-    return Response(content=body, media_type=ct, status_code=rr.status_code, headers=headers)
+    return JSONResponse(status_code=410, content={"error": "proxy disabled; call orchestrator directly"})
 
 
 @app.post("/api/echo")
@@ -649,54 +409,12 @@ async def echo(body: Dict[str, Any]):
 
 @app.post("/api/passthrough")
 async def passthrough(body: Dict[str, Any]):
-    # Minimal proxy: no DB, no mutation; just relay to orchestrator and return raw
-    logging.info("/api/passthrough: start")
-    user_content = (body or {}).get("content") or ""
-    payload = {"messages": [{"role": "user", "content": user_content}], "stream": False}
-    try:
-        async with httpx.AsyncClient(trust_env=False, timeout=None) as client:
-            rr = await client.post(ORCH_URL.rstrip("/") + "/v1/chat/completions", json=payload)
-    except Exception as ex:
-        logging.exception("/api/passthrough proxy error")
-        return JSONResponse(status_code=502, content={"error": str(ex)})
-    ct = rr.headers.get("content-type") or "application/json"
-    headers = {
-        "Cache-Control": "no-store",
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Private-Network": "true",
-        "Access-Control-Expose-Headers": "*",
-        "Connection": "close",
-    }
-    logging.info("/api/passthrough: done status=%s", rr.status_code)
-    return Response(content=rr.content, media_type=ct, status_code=rr.status_code, headers=headers)
+    return JSONResponse(status_code=410, content={"error": "proxy disabled; call orchestrator directly"})
 
 
 @app.get("/api/tool.stream")
 async def tool_stream(name: str, request: Request):
-    # SSE proxy to orchestrator tool.run with stream=true
-    try:
-        async def _gen():
-            params = {}
-            async with httpx.AsyncClient(trust_env=False, timeout=None) as client:
-                # Body comes from query or request body JSON
-                body = {"name": name, "args": {}, "stream": True}
-                if request.method in ("POST", "PUT", "PATCH"):
-                    try:
-                        raw = await request.body()
-                        decoded = raw.decode("utf-8", errors="replace")
-                        j = JSONParser().parse(decoded, {"args": dict})
-                        if isinstance(j.get("args"), dict):
-                            body["args"] = j.get("args")
-                    except Exception:
-                        pass
-                async with client.stream("POST", ORCH_URL.rstrip("/") + "/tool.run", params=params, json=body) as r:
-                    async for chunk in r.aiter_bytes():
-                        if not chunk:
-                            continue
-                        yield chunk
-        return StreamingResponse(_gen(), media_type="text/event-stream")
-    except Exception as ex:
-        return JSONResponse(status_code=502, content={"error": str(ex)})
+    return JSONResponse(status_code=410, content={"error": "proxy disabled; call orchestrator directly"})
 
 @app.options("/api/chat")
 async def chat_alt_preflight():
@@ -711,23 +429,7 @@ async def chat_alt_preflight():
 
 @app.get("/api/orchestrator/diagnostics")
 async def orch_diag():
-    out: Dict[str, Any] = {}
-    try:
-        async with httpx.AsyncClient(trust_env=False, timeout=None) as client:
-            h = await client.get(ORCH_URL.rstrip("/") + "/healthz")
-            out["healthz_status"] = h.status_code
-            # Diagnostics: return raw text to avoid parser coupling
-            out["healthz_body"] = h.text
-    except Exception as ex:
-        out["healthz_error"] = str(ex)
-    try:
-        async with httpx.AsyncClient(trust_env=False, timeout=None) as client:
-            d = await client.get(ORCH_URL.rstrip("/") + "/debug")
-            out["debug_status"] = d.status_code
-            out["debug_body"] = d.text
-    except Exception as ex:
-        out["debug_error"] = str(ex)
-    return out
+    return JSONResponse(status_code=410, content={"error": "proxy disabled; call orchestrator directly"})
 
 
 @app.get("/favicon.ico")
@@ -767,160 +469,25 @@ async def chat_get(cid: int, content: str = ""):
 
 @app.get("/api/jobs")
 async def list_jobs(status: Optional[str] = None, limit: int = 50, offset: int = 0):
-    params = {"limit": limit, "offset": offset}
-    if status:
-        params["status"] = status
-    try:
-        async with httpx.AsyncClient(trust_env=False, timeout=None) as client:
-            r = await client.get(ORCH_URL.rstrip("/") + "/jobs", params=params)
-            if r.status_code >= 400:
-                return JSONResponse(status_code=r.status_code, content={"error": r.text})
-            # Robust handling: prefer JSON, but support raw text/binary passthrough
-            upstream_ct = (r.headers.get("content-type") or "").lower()
-            if "application/json" in upstream_ct or "/json" in upstream_ct:
-                body = r.content
-                headers = {
-                    "Cache-Control": "no-store",
-                    "Access-Control-Allow-Origin": "*",
-                    "Access-Control-Allow-Private-Network": "true",
-                    "Access-Control-Expose-Headers": "Content-Type, Content-Length",
-                    "Connection": "close",
-                    "Content-Length": str(len(body)),
-                    "Content-Type": r.headers.get("content-type") or "application/json",
-                }
-                return Response(content=body, media_type=headers["Content-Type"], status_code=r.status_code, headers=headers)
-            # Try to coerce to JSON if upstream forgot headers
-            try:
-                data = JSONParser().parse(r.text, {})
-                return JSONResponse(status_code=r.status_code, content=data)
-            except Exception:
-                body = r.content
-                headers = {
-                    "Cache-Control": "no-store",
-                    "Access-Control-Allow-Origin": "*",
-                    "Access-Control-Allow-Private-Network": "true",
-                    "Access-Control-Expose-Headers": "Content-Type, Content-Length",
-                    "Connection": "close",
-                    "Content-Length": str(len(body)),
-                    "Content-Type": r.headers.get("content-type") or "text/plain; charset=utf-8",
-                    "X-Upstream-Content-Type": r.headers.get("content-type") or "",
-                }
-                return Response(content=body, media_type=headers["Content-Type"], status_code=r.status_code, headers=headers)
-    except Exception as ex:
-        return JSONResponse(status_code=500, content={"error": str(ex)})
+    return JSONResponse(status_code=410, content={"error": "proxy disabled; call orchestrator directly"})
 
 
 @app.websocket("/api/tool.ws")
 async def tool_ws_proxy(websocket: WebSocket):
-    await websocket.accept()
-    def _orch_ws_url() -> str:
-        p = urlparse(ORCH_URL)
-        scheme = 'wss' if p.scheme == 'https' else 'ws'
-        base = p._replace(scheme=scheme).geturl().rstrip('/')
-        return base + '/tool.ws'
-    try:
-        while True:
-            raw = await websocket.receive_text()
-            upstream_url = _orch_ws_url()
-            async with websockets.connect(upstream_url, ping_interval=20, ping_timeout=None, close_timeout=None, max_queue=None) as upstream:
-                await upstream.send(raw)
-                relayed = False
-                async for msg in upstream:
-                    try:
-                        await websocket.send_text(msg)
-                        relayed = True
-                    except Exception:
-                        break
-                if not relayed:
-                    try:
-                        await websocket.send_text(json.dumps({"error": "upstream_closed_without_message"}))
-                    except Exception:
-                        pass
-    except WebSocketDisconnect:
-        return
-    except Exception as ex:
-        await websocket.send_text(json.dumps({"error": str(ex)}))
+    await websocket.close(code=1008)
 
 @app.get("/api/jobs/{job_id}")
 async def get_job(job_id: str):
-    try:
-        async with httpx.AsyncClient(trust_env=False, timeout=None) as client:
-            r = await client.get(ORCH_URL.rstrip("/") + f"/jobs/{job_id}")
-            if r.status_code >= 400:
-                return JSONResponse(status_code=r.status_code, content={"error": r.text})
-            upstream_ct = (r.headers.get("content-type") or "").lower()
-            if "application/json" in upstream_ct or "/json" in upstream_ct:
-                body = r.content
-                headers = {
-                    "Cache-Control": "no-store",
-                    "Access-Control-Allow-Origin": "*",
-                    "Access-Control-Allow-Private-Network": "true",
-                    "Access-Control-Expose-Headers": "Content-Type, Content-Length",
-                    "Connection": "close",
-                    "Content-Length": str(len(body)),
-                    "Content-Type": r.headers.get("content-type") or "application/json",
-                }
-                return Response(content=body, media_type=headers["Content-Type"], status_code=r.status_code, headers=headers)
-            try:
-                data = JSONParser().parse(r.text, {})
-                return JSONResponse(status_code=r.status_code, content=data)
-            except Exception:
-                body = r.content
-                headers = {
-                    "Cache-Control": "no-store",
-                    "Access-Control-Allow-Origin": "*",
-                    "Access-Control-Allow-Private-Network": "true",
-                    "Access-Control-Expose-Headers": "Content-Type, Content-Length",
-                    "Connection": "close",
-                    "Content-Length": str(len(body)),
-                    "Content-Type": r.headers.get("content-type") or "text/plain; charset=utf-8",
-                    "X-Upstream-Content-Type": r.headers.get("content-type") or "",
-                }
-                return Response(content=body, media_type=headers["Content-Type"], status_code=r.status_code, headers=headers)
-    except Exception as ex:
-        return JSONResponse(status_code=500, content={"error": str(ex)})
+    return JSONResponse(status_code=410, content={"error": "proxy disabled; call orchestrator directly"})
 
 
 @app.get("/api/jobs/{job_id}/stream")
 async def stream_job_proxy(job_id: str, interval_ms: Optional[int] = None):
-    params = {}
-    if interval_ms is not None:
-        params["interval_ms"] = interval_ms
-    async def _gen():
-        try:
-            async with httpx.AsyncClient(trust_env=False, timeout=None) as client:
-                async with client.stream("GET", ORCH_URL.rstrip("/") + f"/jobs/{job_id}/stream", params=params) as r:
-                    async for chunk in r.aiter_bytes():
-                        if not chunk:
-                            continue
-                        yield chunk
-        except Exception as ex:
-            # Emit an SSE error frame so the frontend can close gracefully
-            err = json.dumps({"error": str(ex)})
-            yield ("data: " + err + "\n\n").encode("utf-8")
-            yield b"data: [DONE]\n\n"
-    return StreamingResponse(_gen(), media_type="text/event-stream")
+    return JSONResponse(status_code=410, content={"error": "proxy disabled; call orchestrator directly"})
 
 @app.post("/api/jobs/{job_id}/cancel")
 async def cancel_job_proxy(job_id: str):
-    try:
-        async with httpx.AsyncClient(trust_env=False, timeout=None) as client:
-            r = await client.post(ORCH_URL.rstrip("/") + f"/jobs/{job_id}/cancel")
-            if r.status_code >= 400:
-                return JSONResponse(status_code=r.status_code, content={"error": r.text})
-            body = r.content
-            headers = {
-                "Cache-Control": "no-store",
-                "Access-Control-Allow-Origin": "*",
-                "Access-Control-Allow-Private-Network": "true",
-                "Access-Control-Expose-Headers": "Content-Type, Content-Length",
-                "Connection": "close",
-                "Content-Length": str(len(body)),
-                "Content-Type": r.headers.get("content-type") or "application/json",
-            }
-            return Response(content=body, media_type=headers["Content-Type"], status_code=r.status_code, headers=headers)
-    except Exception as ex:
-        return JSONResponse(status_code=500, content={"error": str(ex)})
+    return JSONResponse(status_code=410, content={"error": "proxy disabled; call orchestrator directly"})
 
 
 # Lightweight proxies for orchestrator admin/capabilities so the frontend can hit same-origin
@@ -971,99 +538,15 @@ async def healthz():
 
 @app.get("/uploads/{path:path}")
 async def uploads_proxy(path: str, request: Request):
-    # Proxy orchestrator uploads as same-origin to avoid ORB and CORS complexity
-    try:
-        upstream = ORCH_URL.rstrip("/") + "/uploads/" + path
-        headers = {}
-        rng = request.headers.get("range")
-        if rng:
-            headers["Range"] = rng
-        async with httpx.AsyncClient(trust_env=False) as client:
-            r = await client.get(upstream, headers=headers)
-        body = r.content
-        out_headers = {
-            "Content-Type": r.headers.get("content-type", "application/octet-stream"),
-            "Content-Length": r.headers.get("content-length", str(len(body))),
-            "Accept-Ranges": r.headers.get("accept-ranges", "bytes"),
-            "Cache-Control": r.headers.get("cache-control", "no-store"),
-            "Access-Control-Allow-Origin": "*",
-            "Cross-Origin-Resource-Policy": "cross-origin",
-        }
-        cr = r.headers.get("content-range")
-        status = r.status_code
-        if cr:
-            out_headers["Content-Range"] = cr
-        return Response(content=body, status_code=status, headers=out_headers, media_type=out_headers["Content-Type"]) 
-    except Exception as ex:
-        return JSONResponse(status_code=502, content={"error": str(ex)})
+    return JSONResponse(status_code=410, content={"error": "proxy disabled; use orchestrator /uploads directly"})
 
 
 @app.websocket("/api/ws")
 async def chat_ws(websocket: WebSocket):
-    # WS → WS proxy: relay client messages to orchestrator /ws and stream responses back
-    await websocket.accept()
-    parser = JSONParser()
-    def _orch_ws_url() -> str:
-        p = urlparse(ORCH_URL)
-        scheme = 'wss' if p.scheme == 'https' else 'ws'
-        base = p._replace(scheme=scheme).geturl().rstrip('/')
-        return base + '/ws'
-    try:
-        while True:
-            raw = await websocket.receive_text()
-            # Best-effort persist of the user message into DB so history shows up
-            try:
-                body = parser.parse(raw, {"conversation_id": int, "content": str})
-            except Exception:
-                body = {"conversation_id": 0, "content": raw}
-            cid = int((body or {}).get("conversation_id") or 0)
-            user_text = (body or {}).get("content") or ""
-            if cid and user_text:
-                try:
-                    async with _pool().acquire() as conn:
-                        await conn.execute("INSERT INTO messages (conversation_id, role, content) VALUES ($1, 'user', $2::jsonb)", cid, json.dumps({"text": user_text}))
-                except Exception:
-                    pass
-            # Build OpenAI-style messages from DB history + attachments so upstream has full context
-            oa_msgs: List[Dict[str, Any]] = []
-            try:
-                atts = []
-                hist_rows = []
-                if cid:
-                    async with _pool().acquire() as conn:
-                        atts = await conn.fetch("SELECT name, url, mime FROM attachments WHERE conversation_id=$1", cid)
-                        hist_rows = await conn.fetch("SELECT role, content FROM messages WHERE conversation_id=$1 ORDER BY id ASC", cid)
-                base_hist: List[Dict[str, Any]] = []
-                for r in hist_rows:
-                    decoded = _decode_json(r["content"])
-                    base_hist.append({"role": r["role"], "content": decoded.get("text") or ""})
-                oa_msgs = _build_openai_messages(base_hist, [dict(a) for a in atts])
-            except Exception:
-                oa_msgs = [{"role": "user", "content": user_text }]
-            # Open upstream orchestrator WS and relay frames; no timeouts
-            upstream_url = _orch_ws_url()
-            async with websockets.connect(upstream_url, ping_interval=20, ping_timeout=None, close_timeout=None, max_queue=None) as upstream:
-                # Idempotency key prevents double work if a later POST fallback occurs
-                import uuid as _uuid
-                payload_up = json.dumps({"messages": oa_msgs, "cid": str(cid or ""), "stream": True, "idempotency_key": _uuid.uuid4().hex})
-                await upstream.send(payload_up)
-                relayed = False
-                async for msg in upstream:
-                    try:
-                        await websocket.send_text(msg)
-                        relayed = True
-                    except Exception:
-                        break
-                if not relayed:
-                    try:
-                        await websocket.send_text(json.dumps({"error": "upstream_closed_without_message"}))
-                    except Exception:
-                        pass
-    except WebSocketDisconnect:
-        return
+    await websocket.close(code=1008)
 
 
 app.mount("/", StaticFiles(directory="/app/frontend_dist", html=True), name="static")
-# Static assets are mounted at root, AFTER API routes are declared to avoid intercepting /api/*.
+# Static assets are mounted at root, AFTER API routes are declared to avoid intercepting /api/*. 
 
 

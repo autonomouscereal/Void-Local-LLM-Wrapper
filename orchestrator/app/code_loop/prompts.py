@@ -6,6 +6,7 @@ import json
 POLICY = (
     "Policy: Do NOT use try/except unless explicitly requested or strictly required by an external API; let errors surface. "
     "Do NOT set client timeouts unless explicitly requested. Do NOT use Pydantic. Do NOT use SQLAlchemy/ORM; use asyncpg + raw SQL. "
+    "Do NOT design or implement HTTP proxies, reverse proxies, pass-through/relay endpoints, or WS relays under ANY circumstances unless the user explicitly grants permission in the current prompt. Always call direct service endpoints. "
     "Do NOT introduce or use any new library (including uvicorn/fastapi/etc.) without first performing a LIVE web search to the OFFICIAL docs for the latest stable version (no memory/RAG), reviewing constraints/APIs, and obtaining explicit user permission. Include the doc URL."
 )
 ARCH_PREAMBLE = """You are the Architect.

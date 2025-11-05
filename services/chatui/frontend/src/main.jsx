@@ -12,6 +12,7 @@ import AdminTab from './Admin.jsx'
 // - We keep the full assistant response and only append status/IDs; nothing is overwritten.
 
 function App() {
+  const ORCH_BASE = ((window.__ORCH_BASE__ || window.localStorage.getItem('ORCH_BASE') || (window.location.protocol + '//' + window.location.hostname + ':8000')) + '').replace(/\/$/, '')
   const [convos, setConvos] = useState([])
   const [cid, setCid] = useState(null)
   const [msgs, setMsgs] = useState([])
@@ -61,7 +62,8 @@ function App() {
     let attempt = 0
     let gotRealMessage = false
     const sendOnce = () => new Promise((resolve) => {
-      const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/api/ws')
+      const wsUrl = (ORCH_BASE.startsWith('https:') ? ORCH_BASE.replace(/^https:/, 'wss:') : ORCH_BASE.replace(/^http:/, 'ws:')) + '/ws'
+      const ws = new WebSocket(wsUrl)
       ws.onopen = () => {
         try { ws.send(JSON.stringify(payload)) } catch {}
       }
@@ -102,11 +104,12 @@ function App() {
 
   const extractMedia = (text) => {
     const urls = []
+    const normalizeUrl = (u) => (typeof u === 'string' && u.startsWith('/uploads/') ? `${ORCH_BASE}${u}` : u)
     // Match absolute http(s) and app-served relative assets (e.g., /uploads/...)
     const re = /(https?:\/\/[^\s)"']+|\/uploads\/[^\s)"']+)/g
     let m
     while ((m = re.exec(text)) !== null) {
-      urls.push(m[1])
+      urls.push(normalizeUrl(m[1]))
     }
     const uniq = Array.from(new Set(urls))
     const toMeta = (u) => {
@@ -127,8 +130,11 @@ function App() {
 
   const renderChatContent = (text) => {
     const raw = String(text || '')
-    const html = marked.parse(raw)
-    const { images, videos, audios } = extractMedia(text || '')
+    const normalizeUploadsInText = (t) => t.replace(/\]\(\s*\/uploads\//g, "](${ORCH_BASE}/uploads/")
+                                            .replace(/\(\s*\/uploads\//g, `(${ORCH_BASE}/uploads/`)
+    const normalized = normalizeUploadsInText(raw)
+    const html = marked.parse(normalized)
+    const { images, videos, audios } = extractMedia(normalized || '')
     const hasText = raw.trim().length > 0
     const htmlLooksEmpty = (String(html || '').replace(/<[^>]*>/g, '').trim().length === 0)
     return (
@@ -195,7 +201,7 @@ function App() {
     const placeholderId = nextLocalId()
     setMsgs(prev => ([...prev, { id: placeholderId, role: 'assistant', content: { text: `Job ${jobId} queued…` } }]))
     try {
-      const src = new EventSource(`/api/jobs/${encodeURIComponent(jobId)}/stream?interval_ms=1000`)
+      const src = new EventSource(`${ORCH_BASE}/jobs/${encodeURIComponent(jobId)}/stream?interval_ms=1000`)
       progressStreamsRef.current[jobId] = { src, msgId: placeholderId }
       src.onmessage = (ev) => {
         if (!ev?.data) return
@@ -285,7 +291,7 @@ function App() {
           const resp = await callTool('image.dispatch', { mode: 'gen', prompt: text.trim(), size: '1024x1024' })
           const cid = resp?.result?.meta?.cid
           const id = resp?.result?.tool_calls?.[0]?.result_ref
-          const url = (cid && id) ? `/uploads/artifacts/image/${cid}/${id}` : ''
+          const url = (cid && id) ? (ORCH_BASE + `/uploads/artifacts/image/${cid}/${id}`) : ''
           setMsgs(prev => ([...prev, { id: nextLocalId(), role: 'assistant', content: { text: url || JSON.stringify(resp) } }]))
           setText('')
           return
@@ -294,7 +300,7 @@ function App() {
           const resp = await callTool('tts.speak', { text: text.trim() })
           const cid = resp?.result?.meta?.cid
           const id = resp?.result?.tool_calls?.[0]?.result_ref
-          const url = (cid && id) ? `/uploads/artifacts/audio/tts/${cid}/${id}` : ''
+          const url = (cid && id) ? (ORCH_BASE + `/uploads/artifacts/audio/tts/${cid}/${id}`) : ''
           setMsgs(prev => ([...prev, { id: nextLocalId(), role: 'assistant', content: { text: url || JSON.stringify(resp) } }]))
           setText('')
           return
@@ -303,7 +309,7 @@ function App() {
           const resp = await callTool('music.compose', { prompt: text.trim(), length_s: 30 })
           const cid = resp?.result?.meta?.cid
           const id = resp?.result?.tool_calls?.[0]?.result_ref
-          const url = (cid && id) ? `/uploads/artifacts/music/${cid}/${id}` : ''
+          const url = (cid && id) ? (ORCH_BASE + `/uploads/artifacts/music/${cid}/${id}`) : ''
           setMsgs(prev => ([...prev, { id: nextLocalId(), role: 'assistant', content: { text: url || JSON.stringify(resp) } }]))
           setText('')
           return
@@ -333,7 +339,8 @@ function App() {
         setMsgs(prev => ([...prev, { id: thinkingId, role: 'assistant', content: { text: 'Thinking…' } }]))
       }
       showThinking()
-      await wsSendWithRetry({ conversation_id: conversationId, content: userText }, (ev) => {
+      try { await fetch(`/api/conversations/${encodeURIComponent(conversationId)}/message`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ role: 'user', content: userText }) }) } catch {}
+      await wsSendWithRetry({ conversation_id: conversationId, content: userText }, async (ev) => {
         const t1 = performance.now()
         const raw = ev.data || ''
         console.log('[ui] ws message', { bytes: raw.length, dt_ms: (t1 - t0).toFixed(1) })
@@ -348,6 +355,7 @@ function App() {
         if (data && data.done === true) {
           const finalText = String(streamBufRef.current || '').trim()
           setMsgs(prev => (prev.map(m => m.id === thinkingId ? { ...m, content: { text: finalText || '(no content)' } } : m)))
+          try { await fetch(`/api/conversations/${encodeURIComponent(conversationId)}/message`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ role: 'assistant', content: finalText }) }) } catch {}
           streamBufRef.current = ''
           setSending(false)
           return
@@ -372,6 +380,7 @@ function App() {
         // Replace thinking bubble with final assistant content (never leave it empty)
         const finalText = String(finalContent || streamBufRef.current || '').trim()
         setMsgs(prev => (prev.map(m => m.id === thinkingId ? { ...m, content: { text: finalText } } : m)))
+        try { await fetch(`/api/conversations/${encodeURIComponent(conversationId)}/message`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ role: 'assistant', content: finalText }) }) } catch {}
         streamBufRef.current = ''
         // If voice mode is on, speak the assistant reply via Web Speech
         if (voiceOn && finalText) {
@@ -391,10 +400,10 @@ function App() {
         onExhausted: async () => {
           // POST fallback to ensure we always complete a request
           try {
-            const rr = await fetch(`/api/conversations/${encodeURIComponent(conversationId)}/chat`, {
+            const rr = await fetch(ORCH_BASE + '/v1/chat/completions', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ messages: [{ role: 'user', content: userText }] })
+              body: JSON.stringify({ messages: [{ role: 'user', content: userText }], stream: false })
             })
             const ct = rr.headers.get('content-type') || 'application/json'
             if (ct.startsWith('application/json')) {
@@ -402,10 +411,12 @@ function App() {
               const msgObj = (obj && obj.choices && obj.choices[0] && obj.choices[0].message) || {}
               const finalText = String(msgObj.content || obj.text || '').trim()
               setMsgs(prev => (prev.map(m => m.id === thinkingId ? { ...m, content: { text: finalText || '(no content)' } } : m)))
+              try { await fetch(`/api/conversations/${encodeURIComponent(conversationId)}/message`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ role: 'assistant', content: finalText }) }) } catch {}
             } else {
               const textBody = await rr.text()
               const finalText = String(textBody || '').trim()
               setMsgs(prev => (prev.map(m => m.id === thinkingId ? { ...m, content: { text: finalText || '(no content)' } } : m)))
+              try { await fetch(`/api/conversations/${encodeURIComponent(conversationId)}/message`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ role: 'assistant', content: finalText }) }) } catch {}
             }
           } catch (e) {
             const emsg = e?.message || 'Network error'
@@ -473,9 +484,10 @@ function App() {
     if (!cid || !fileRef.current?.files?.length) return
     const f = fileRef.current.files[0]
     const fd = new FormData()
-    fd.append('conversation_id', cid)
     fd.append('file', f)
-    await fetch('/api/upload', { method: 'POST', body: fd })
+    const rr = await fetch(ORCH_BASE + '/upload', { method: 'POST', body: fd })
+    const info = await rr.json()
+    try { await fetch('/api/attachments.add', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ conversation_id: cid, name: info?.name || f.name, url: info?.url || '', mime: f.type || 'application/octet-stream' }) }) } catch {}
     fileRef.current.value = ''
     alert('Uploaded! The orchestrator will see it in conversation context.')
   }
@@ -484,12 +496,13 @@ function App() {
   async function uploadOne(file) {
     const fd = new FormData()
     fd.append('file', file)
-    const r = await fetch('/api/upload', { method: 'POST', body: fd })
+    const r = await fetch(ORCH_BASE + '/upload', { method: 'POST', body: fd })
     const j = await r.json()
-    // Prefer URL if provided, else construct uploads path
-    if (j && typeof j.url === 'string' && j.url.includes('/uploads/')) return j.url
-    if (j && typeof j.name === 'string') return '/uploads/' + j.name
-    return ''
+    const url = (j && typeof j.url === 'string') ? j.url : ''
+    if (url) {
+      try { await fetch('/api/attachments.add', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ conversation_id: cid, name: j?.name || file.name, url, mime: file.type || 'application/octet-stream' }) }) } catch {}
+    }
+    return url
   }
   async function uploadMany(fileList) {
     const out = []
@@ -500,7 +513,7 @@ function App() {
     return out
   }
   async function callTool(name, args) {
-    const r = await fetch('/api/tool.run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, args }) })
+    const r = await fetch(ORCH_BASE + '/tool.run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, args }) })
     const j = await r.json()
     return j
   }
@@ -659,7 +672,7 @@ function App() {
     }
     const tick = async () => {
       try {
-        const r = await fetch('/api/jobs')
+        const r = await fetch(ORCH_BASE + '/jobs')
         const j = await r.json()
         const list = Array.isArray(j) ? j : (j.data || [])
         setJobs(list)
@@ -673,7 +686,7 @@ function App() {
             // Try to fetch job detail for URLs
             let detailText = ''
             try {
-              const dr = await fetch(`/api/jobs/${encodeURIComponent(jid)}`)
+              const dr = await fetch(ORCH_BASE + `/jobs/${encodeURIComponent(jid)}`)
               const dj = await dr.json()
               const urls = extractUrls(dj)
               if (urls.length) {
@@ -721,7 +734,7 @@ function App() {
                 {j.updated_at && <div style={{ fontSize: 11, color: '#6b7280' }}>{new Date(j.updated_at).toLocaleString()}</div>}
                 <div style={{ marginTop: 6, display: 'flex', gap: 8 }}>
                   <button onClick={() => startJobStream(j.id || j.job_id)} style={{ padding: '4px 8px' }}>Resume</button>
-                  <button onClick={async () => { try { await fetch(`/api/jobs/${encodeURIComponent(j.id || j.job_id)}/cancel`, { method: 'POST' }) } catch {} }} style={{ padding: '4px 8px' }}>Cancel</button>
+                  <button onClick={async () => { try { await fetch(`${ORCH_BASE}/jobs/${encodeURIComponent(j.id || j.job_id)}/cancel`, { method: 'POST' }) } catch {} }} style={{ padding: '4px 8px' }}>Cancel</button>
                 </div>
               </div>
             ))}

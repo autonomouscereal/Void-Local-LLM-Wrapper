@@ -102,7 +102,7 @@ from .analysis.media import analyze_image as _analyze_image, analyze_audio as _a
 from .review.referee import build_delta_plan as _build_delta_plan
 from .review.ledger_writer import append_ledger as _append_ledger
 from .comfy.dispatcher import load_workflow as _comfy_load_wf, patch_workflow as _comfy_patch_wf, submit as _comfy_submit
-from .comfy.client_aio import comfy_submit as _comfy_submit_aio, comfy_history as _comfy_history_aio, comfy_upload_image as _comfy_upload_image, comfy_upload_mask as _comfy_upload_mask, comfy_view as _comfy_view
+from .comfy.client_aio import comfy_submit as _comfy_submit_aio, comfy_history as _comfy_history_aio, comfy_upload_image as _comfy_upload_image, comfy_upload_mask as _comfy_upload_mask, comfy_view as _comfy_view, choose_sampler_name as _choose_sampler_name
 from .image.graph_builder import build_full_graph as _build_full_graph
 from .tools_image.common import ensure_dir as _ensure_dir, sidecar as _sidecar, make_outpaths as _make_outpaths, now_ts as _now_ts
 from .analysis.media import analyze_image as _analyze_image
@@ -111,7 +111,8 @@ from .datasets.trace import append_sample as _trace_append
 from .review.referee import build_delta_plan as _committee
 from .context.index import add_artifact as _ctx_add
 async def _image_dispatch_run(prompt: str, negative: Optional[str], seed: Optional[int], width: Optional[int], height: Optional[int], size: Optional[str], assets: Dict[str, Any]) -> Dict[str, Any]:
-    assert isinstance(prompt, str) and prompt.strip()
+    if not isinstance(prompt, str):
+        prompt = ""
     # size normalization
     w = None; h = None
     if isinstance(size, str) and "x" in size:
@@ -148,12 +149,21 @@ async def _image_dispatch_run(prompt: str, negative: Optional[str], seed: Option
         if isinstance(b64p, str) and b64p:
             uploaded[f"pose_{i}"] = await _comfy_upload_image(f"pose{i}", b64p)
 
+    # Resolve a valid sampler from this Comfy instance
+    try:
+        import aiohttp  # type: ignore
+        async with aiohttp.ClientSession() as _s:
+            sampler_name = await _choose_sampler_name(_s)
+    except Exception:
+        sampler_name = "euler"
+
     graph_req: Dict[str, Any] = {
         "prompt": prompt,
         "negative_prompt": (negative or None),
         "seed": (int(seed) if isinstance(seed, int) else None),
         "width": (int(w) if isinstance(w, int) else None),
         "height": (int(h) if isinstance(h, int) else None),
+        "sampler": sampler_name,
         "locks": locks,
     }
     graph = _build_full_graph(graph_req, uploaded)
@@ -184,7 +194,8 @@ async def _image_dispatch_run(prompt: str, negative: Optional[str], seed: Option
         if files:
             break
         await asyncio.sleep(1)
-    assert files, "no images returned from comfy history"
+    if not files:
+        raise RuntimeError("no images returned from comfy history")
 
     cid = "img-" + str(_now_ts())
     outdir = os.path.join(UPLOAD_DIR, "artifacts", "image", cid)
@@ -1191,6 +1202,7 @@ def meta_prompt(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         "Absolute rule: Do NOT use Pydantic (no models). Use plain dicts and the project JSONParser. "
         "Absolute rule: Do NOT add try/except blocks unless the user explicitly requests it or an external API contract strictly requires it. Let errors surface. "
         "Absolute rule: Do NOT set client timeouts in generated code unless the user explicitly requests it. "
+        "Absolute rule: Do NOT design or implement HTTP proxies, reverse proxies, pass-through/relay endpoints, or WebSocket relays under ANY circumstances unless the user explicitly grants permission in the current prompt. Always call direct service endpoints. "
         "Absolute rule: Do NOT introduce or use any new library without: (1) performing a LIVE web search to the OFFICIAL documentation for the latest stable version (no memory/RAG), (2) reviewing constraints/APIs, and (3) obtaining explicit user permission to add the dependency (this applies to uvicorn/fastapi/etc.). Include the doc URL. "
         "Critically: choose tools SEMANTICALLY by mapping the user's requested outcome to tool capabilities (no keyword triggers). "
         "If any available tool can directly produce the requested artifact, invoke that tool; otherwise provide a concrete solution or plan. "

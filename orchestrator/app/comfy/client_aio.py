@@ -12,40 +12,44 @@ import aiohttp  # type: ignore
 from ..json_parser import JSONParser
 
 
-BASE = os.getenv("COMFYUI_API_URL", "http://comfyui:8188").rstrip("/")
+BASE = (
+    os.getenv("COMFYUI_BASE_URL")
+    or os.getenv("COMFYUI_API_URL")
+    or "http://comfyui:8188"
+).rstrip("/")
 
 
-async def comfy_submit(graph: Dict[str, Any], client_id: Optional[str] = None) -> Dict[str, Any]:
+async def comfy_submit(graph: Dict[str, Any], client_id: Optional[str] = None, ws=None) -> Dict[str, Any]:
     cid = client_id or str(uuid.uuid4())
     payload = {"prompt": graph.get("prompt") or graph, "client_id": cid}
     # Validate/shape payload with project JSON parser
-    shaped = JSONParser().ensure_structure(payload, {"prompt": dict, "client_id": str})
-    body_text = json.dumps(shaped, ensure_ascii=False, separators=(",", ":"))
-    logging.info(f"[comfy.submit] bytes={len(body_text.encode('utf-8'))}")
+    body_bytes = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    logging.info(f"[comfy.submit] bytes={len(body_bytes)}")
     try:
-        Path("/tmp/last_comfy_payload.json").write_bytes(body_text.encode("utf-8"))
+        Path("/tmp/last_comfy_payload.json").write_bytes(body_bytes)
     except Exception:
         pass
-    async with aiohttp.ClientSession() as s:
-        async with s.post(
-            f"{BASE}/prompt",
-            data=body_text.encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-        ) as r:
+    async with aiohttp.ClientSession(trust_env=False) as s:
+        async with s.post(f"{BASE}/prompt", data=body_bytes, headers={"Content-Type": "application/json"}) as r:
             text = await r.text()
             if r.status != 200:
+                if ws:
+                    try:
+                        await ws.send_json({"type": "error", "source": "comfy", "body": text[:500]})
+                        await ws.close(code=1000)
+                    except Exception:
+                        pass
                 raise RuntimeError(f"/prompt {r.status}: {text[:500]}")
-            # Parse response via JSONParser for safety
-            return JSONParser().parse(text, {"prompt_id": str, "history": dict, "node_errors": dict})
+            return JSONParser().parse(text, {})
 
 
 async def comfy_history(prompt_id: str) -> Dict[str, Any]:
-    async with aiohttp.ClientSession() as s:
+    async with aiohttp.ClientSession(trust_env=False) as s:
         async with s.get(f"{BASE}/history/{prompt_id}") as r:
             text = await r.text()
             if r.status != 200:
                 raise RuntimeError(f"/history {r.status}: {text[:500]}")
-            return JSONParser().parse(text, {prompt_id: dict})
+            return JSONParser().parse(text, {})
 
 
 async def comfy_upload_image(name_hint: str, b64_png: str) -> str:
@@ -53,12 +57,12 @@ async def comfy_upload_image(name_hint: str, b64_png: str) -> str:
     filename = f"{name_hint or 'ref'}_{uuid.uuid4().hex[:8]}.png"
     form = aiohttp.FormData()
     form.add_field("image", data, filename=filename, content_type="image/png")
-    async with aiohttp.ClientSession() as s:
+    async with aiohttp.ClientSession(trust_env=False) as s:
         async with s.post(f"{BASE}/upload/image", data=form) as r:
             text = await r.text()
             if r.status != 200:
                 raise RuntimeError(f"/upload/image {r.status}: {text[:500]}")
-            obj = JSONParser().parse(text, {"name": str})
+            obj = JSONParser().parse(text, {})
             stored = obj.get("name") or filename
             return stored
 
@@ -68,23 +72,51 @@ async def comfy_upload_mask(name_hint: str, b64_png: str) -> str:
     filename = f"{name_hint or 'mask'}_{uuid.uuid4().hex[:8]}.png"
     form = aiohttp.FormData()
     form.add_field("image", data, filename=filename, content_type="image/png")
-    async with aiohttp.ClientSession() as s:
+    async with aiohttp.ClientSession(trust_env=False) as s:
         async with s.post(f"{BASE}/upload/mask", data=form) as r:
             text = await r.text()
             if r.status != 200:
                 raise RuntimeError(f"/upload/mask {r.status}: {text[:500]}")
-            obj = JSONParser().parse(text, {"name": str})
+            obj = JSONParser().parse(text, {})
             return obj.get("name") or filename
 
 
 async def comfy_view(filename: str) -> Tuple[bytes, str]:
     # Returns (bytes, content_type)
-    async with aiohttp.ClientSession() as s:
+    async with aiohttp.ClientSession(trust_env=False) as s:
         async with s.get(f"{BASE}/view", params={"filename": filename}) as r:
             data = await r.read()
             if r.status != 200:
                 body = (await r.text()) if data else ""
                 raise RuntimeError(f"/view {r.status}: {body[:500]}")
             return data, r.headers.get("content-type", "application/octet-stream")
+
+
+async def comfy_object_info(session: aiohttp.ClientSession, node_class: str) -> Dict[str, Any]:
+    async with session.get(f"{BASE}/object_info/{node_class}") as r:
+        text = await r.text()
+        if r.status != 200:
+            return {}
+        try:
+            return JSONParser().parse(text, {})
+        except Exception:
+            return {}
+
+
+def _norm(name: str) -> str:
+    return name.lower().replace(" ", "").replace("_", "").replace("+", "")
+
+
+async def choose_sampler_name(session: aiohttp.ClientSession) -> str:
+    info = await comfy_object_info(session, "KSampler")
+    try:
+        choices = ((info.get("inputs") or {}).get("sampler_name") or {}).get("choices") or []
+        norm_map = {_norm(c): c for c in choices}
+        for want in ("dpmpp2m", "dpmppsde", "euler", "eulera"):
+            if want in norm_map:
+                return norm_map[want]
+        return choices[0] if choices else "euler"
+    except Exception:
+        return "euler"
 
 

@@ -146,3 +146,40 @@ def build_full_graph(req: Dict[str, Any], uploaded: Dict[str, str]) -> Dict[str,
     return {"prompt": nodes}
 
 
+def build_min_sdxl_graph(req: Dict[str, Any], sampler_name: str) -> Dict[str, Any]:
+    prompt = _default(req.get("prompt"), "")
+    negative = _default(req.get("negative_prompt"), "extra fingers, deformed hands, lowres")
+    steps = int(_default(req.get("steps"), 28))
+    cfg = float(_default(req.get("cfg"), 5.6))
+    seed = int(_default(req.get("seed"), int(time.time()) & 0x7FFFFFFF))
+    width = int(_default(req.get("width"), 1024))
+    height = int(_default(req.get("height"), 1536))
+    sampler = sampler_name or "euler"
+    fname = _default(req.get("filename_prefix"), f"job_{uuid.uuid4().hex[:8]}")
+
+    g: Dict[str, Any] = {
+        "ckpt": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "sd_xl_base_1.0.safetensors"}},
+        "pos": {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": ["ckpt", 1]}},
+        "neg": {"class_type": "CLIPTextEncode", "inputs": {"text": negative, "clip": ["ckpt", 1]}},
+        "lat": {"class_type": "EmptyLatentImage", "inputs": {"width": width, "height": height, "batch_size": 1}},
+        "sam": {
+            "class_type": "KSampler",
+            "inputs": {
+                "seed": seed,
+                "steps": steps,
+                "cfg": cfg,
+                "sampler_name": sampler,
+                "scheduler": "normal",
+                "denoise": 1.0,
+                "model": ["ckpt", 0],
+                "positive": ["pos", 0],
+                "negative": ["neg", 0],
+                "latent_image": ["lat", 0],
+            },
+        },
+        "vae": {"class_type": "VAEDecode", "inputs": {"samples": ["sam", 0], "vae": ["ckpt", 2]}},
+        "save": {"class_type": "SaveImage", "inputs": {"images": ["vae", 0], "filename_prefix": fname}},
+    }
+    return g
+
+
