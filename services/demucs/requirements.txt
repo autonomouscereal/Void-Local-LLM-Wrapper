@@ -1,0 +1,7 @@
+fastapi==0.115.0
+uvicorn==0.30.6
+demucs==4.0.1
+soundfile==0.12.1
+numpy==1.26.4
+httpx==0.27.2
+

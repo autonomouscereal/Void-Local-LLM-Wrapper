@@ -11,8 +11,9 @@ from fastapi.responses import JSONResponse
 
 try:
     from TTS.api import TTS
-except Exception as ex:  # model will be downloaded at first run
+except Exception:
     TTS = None
+import torch
 
 
 MODEL_NAME = os.getenv("XTTS_MODEL_NAME", "tts_models/multilingual/multi-dataset/xtts_v2")
@@ -27,7 +28,17 @@ def get_tts():
     if _tts is None:
         if TTS is None:
             raise RuntimeError("coqui-tts not available")
-        _tts = TTS(MODEL_NAME)
+        use_cuda = torch.cuda.is_available()
+        try:
+            _tts = TTS(MODEL_NAME)
+            if use_cuda:
+                # Some TTS models expose .to(); ignore if unsupported
+                try:
+                    _tts.to('cuda')  # type: ignore
+                except Exception:
+                    pass
+        except Exception:
+            _tts = TTS(MODEL_NAME)
     return _tts
 
 

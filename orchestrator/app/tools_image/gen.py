@@ -64,7 +64,7 @@ def run_image_gen(job: dict, provider, manifest: dict) -> dict:
     add_manifest_row(manifest, png_path, step_id="image.gen")
     # Committee review: VLM caption and CLIP scoring with enforced thresholds and multi-pass revisions
     try:
-        max_passes = 2
+        max_passes = 4
         base_prompt = str(args.get("prompt") or "")
         last_bytes = None
         def _caption_score(prompt_text: str) -> float:
@@ -102,12 +102,16 @@ def run_image_gen(job: dict, provider, manifest: dict) -> dict:
                 rev["prompt"] = f"{base_prompt}, literal match, centered subject, high detail, clean background"
             return rev
         # Evaluate and revise up to max_passes until both scores cross thresholds
+        from ..tools.progress import emit_progress as _emit
         for i in range(max_passes + 1):
             cap_s = _caption_score(base_prompt)
             clip_s = _clip_score(base_prompt)
-            # thresholds
-            ok = (cap_s >= 0.35) and (clip_s >= 0.30)
+            ok = (cap_s >= 0.40) and (clip_s >= 0.32)
             sidecar(png_path, {"tool": "image.gen.committee", "scores": {"caption": cap_s, "clip": clip_s}, "pass": i, "ok": ok})
+            try:
+                _emit({"stage": "review", "pass": i, "scores": {"caption": cap_s, "clip": clip_s}, "ok": ok})
+            except Exception:
+                pass
             if ok:
                 break
             if i < max_passes:

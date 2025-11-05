@@ -3,6 +3,19 @@ x-build-args:
   PIP_EXTRA_INDEX_URL: https://download.pytorch.org/whl/cu126
 
 services:
+  film2_bootstrap:
+    image: python:3.11-slim
+    container_name: film2_bootstrap
+    command: ["/bin/bash","-lc","chmod +x /bootstrap/bootstrap_models.sh && /bootstrap/bootstrap_models.sh"]
+    environment:
+      - FILM2_MODELS=/opt/models
+      - HF_HOME=/opt/models/.hf
+      - TRANSFORMERS_CACHE=/opt/models/.hf
+      - TORCH_HOME=/opt/models/.torch
+    volumes:
+      - film2_models:/opt/models
+      - ./bootstrap:/bootstrap:ro
+    restart: "no"
   nvidia_init:
     image: ubuntu:22.04
     container_name: nvidia_init
@@ -126,7 +139,19 @@ services:
         condition: service_healthy
       ollama_gptoss:
         condition: service_healthy
+      yue:
+        condition: service_healthy
+      sao:
+        condition: service_healthy
+      demucs:
+        condition: service_healthy
+      xtts:
+        condition: service_healthy
+      film2_bootstrap:
+        condition: service_completed_successfully
     environment:
+      - FILM2_MODELS=/opt/models
+      - FILM2_DATA=/srv/film2
       - QWEN_BASE_URL=http://ollama_qwen:11434
       - QWEN_MODEL_ID=${QWEN_MODEL_ID:-qwen3:32b-instruct-q4_K_M}
       - GPTOSS_BASE_URL=http://ollama_gptoss:11434
@@ -164,12 +189,15 @@ services:
       - POSTGRES_DB=ragdb
       - POSTGRES_USER=rag
       - POSTGRES_PASSWORD=ragpass
-      - EMBEDDING_MODEL_NAME=${EMBEDDING_MODEL_NAME:-sentence-transformers/all-MiniLM-L6-v2}
+      - EMBEDDING_MODEL_NAME=${EMBEDDING_MODEL_NAME:-BAAI/bge-large-en-v1.5}
       - RAG_CACHE_TTL_SEC=${RAG_CACHE_TTL_SEC:-300}
       - XTTS_API_URL=http://xtts:8020
       - WHISPER_API_URL=http://whisper:9090
       - FACEID_API_URL=http://faceid:7000
       - MUSIC_API_URL=http://music:7860
+      - YUE_API_URL=http://yue:9001
+      - SAO_API_URL=http://sao:9002
+      - DEMUCS_API_URL=http://demucs:9101
       - COMFYUI_API_URL=${COMFYUI_API_URL:-http://comfyui:8188}
       - COMFYUI_API_URLS=${COMFYUI_API_URLS:-}
       - COMFYUI_REPLICAS=${COMFYUI_REPLICAS:-1}
@@ -182,6 +210,8 @@ services:
       - "8000:8000"
     volumes:
       - ./:/workspace
+      - film2_models:/opt/models:ro
+      - film2_data:/srv/film2
 
   xtts:
     build:
@@ -207,6 +237,24 @@ services:
     ports:
       - "8020:8020"
     shm_size: "1g"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8020/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    environment:
+      - XTTS_MODEL_NAME=tts_models/multilingual/multi-dataset/xtts_v2
+      - NVIDIA_VISIBLE_DEVICES=all
+      - PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu126
+      - HF_HOME=/models/hf
+      - TRANSFORMERS_CACHE=/models/hf
+      - TORCH_HOME=/models/torch
+    volumes:
+      - hf_cache:/models/hf
+      - torch_cache:/models/torch
+      - tts_cache:/root/.local/share/tts
+      - film2_models:/opt/models:ro
+      - film2_data:/srv/film2
     
 
   whisper:
@@ -428,7 +476,124 @@ services:
     ports:
       - "7860:7860"
     shm_size: "1g"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:7860/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    environment:
+      - HF_HOME=/models/hf
+      - TRANSFORMERS_CACHE=/models/hf
+      - TORCH_HOME=/models/torch
+    volumes:
+      - hf_cache:/models/hf
+      - torch_cache:/models/torch
+      - film2_models:/opt/models:ro
+      - film2_data:/srv/film2
     
+  yue:
+    build:
+      context: ./services/yue
+      dockerfile: Dockerfile
+      network: host
+      args:
+        <<: *cu126_args
+    container_name: yue_service
+    restart: unless-stopped
+    runtime: nvidia
+    devices:
+      - "nvidia.com/gpu=all"
+    depends_on:
+      nvidia_init:
+        condition: service_completed_successfully
+    environment:
+      - YUE_MODEL_ID=${YUE_MODEL_ID:-facebook/musicgen-large}
+      - NVIDIA_VISIBLE_DEVICES=all
+      - PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu126
+    expose:
+      - "9001"
+    ports:
+      - "9001:9001"
+    shm_size: "1g"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9001/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    environment:
+      - HF_HOME=/models/hf
+      - TRANSFORMERS_CACHE=/models/hf
+      - TORCH_HOME=/models/torch
+    volumes:
+      - hf_cache:/models/hf
+      - torch_cache:/models/torch
+      - film2_models:/opt/models:ro
+      - film2_data:/srv/film2
+
+  demucs:
+    build:
+      context: ./services/demucs
+      dockerfile: Dockerfile
+      network: host
+      args:
+        <<: *cu126_args
+    container_name: demucs_service
+    restart: unless-stopped
+    environment:
+      - PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu126
+    expose:
+      - "9101"
+    ports:
+      - "9101:9101"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9101/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    environment:
+      - TORCH_HOME=/models/torch
+    volumes:
+      - torch_cache:/models/torch
+      - demucs_cache:/root/.cache/demucs
+      - film2_models:/opt/models:ro
+      - film2_data:/srv/film2
+
+  sao:
+    build:
+      context: ./services/sao
+      dockerfile: Dockerfile
+      network: host
+    container_name: sao_service
+    restart: unless-stopped
+    runtime: nvidia
+    devices:
+      - "nvidia.com/gpu=all"
+    depends_on:
+      nvidia_init:
+        condition: service_completed_successfully
+    environment:
+      - SAO_MODEL_ID=${SAO_MODEL_ID:-facebook/musicgen-large}
+      - NVIDIA_VISIBLE_DEVICES=all
+      - PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu126
+    expose:
+      - "9002"
+    ports:
+      - "9002:9002"
+    shm_size: "1g"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9002/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    environment:
+      - HF_HOME=/models/hf
+      - TRANSFORMERS_CACHE=/models/hf
+      - TORCH_HOME=/models/torch
+    volumes:
+      - hf_cache:/models/hf
+      - torch_cache:/models/torch
+      - film2_models:/opt/models:ro
+      - film2_data:/srv/film2
 
   vlm:
     build:
@@ -453,6 +618,20 @@ services:
     ports:
       - "8050:8050"
     shm_size: "1g"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8050/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    environment:
+      - HF_HOME=/models/hf
+      - TRANSFORMERS_CACHE=/models/hf
+      - TORCH_HOME=/models/torch
+    volumes:
+      - hf_cache:/models/hf
+      - torch_cache:/models/torch
+      - film2_models:/opt/models:ro
+      - film2_data:/srv/film2
     
 
   ocr:
@@ -591,5 +770,11 @@ volumes:
   comfyui_models: {}
   comfyui_custom_nodes: {}
   n8n_data: {}
+  hf_cache: {}
+  torch_cache: {}
+  tts_cache: {}
+  demucs_cache: {}
+  film2_models: {}
+  film2_data: {}
 
 

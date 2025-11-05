@@ -13,6 +13,49 @@ WORKDIR /comfyui
 
 RUN git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git .
 
+# Refresh or install common custom nodes (stable API levels) and remove deprecated frontend widget
+RUN set -eux; \
+    mkdir -p /comfyui/custom_nodes; \
+    if [ -d /comfyui/custom_nodes/ComfyUI-IPAdapter_plus ]; then \
+      git -C /comfyui/custom_nodes/ComfyUI-IPAdapter_plus pull --rebase; \
+    else \
+      git -C /comfyui/custom_nodes clone --depth 1 https://github.com/cubiq/ComfyUI_IPAdapter_plus.git ComfyUI-IPAdapter_plus; \
+    fi; \
+    if [ -d /comfyui/custom_nodes/ComfyUI-AnimateDiff-Evolved ]; then \
+      git -C /comfyui/custom_nodes/ComfyUI-AnimateDiff-Evolved pull --rebase; \
+    else \
+      git -C /comfyui/custom_nodes clone --depth 1 https://github.com/Kosinkadink/ComfyUI-AnimateDiff-Evolved.git; \
+    fi; \
+    if [ -d /comfyui/custom_nodes/ComfyUI-VideoHelperSuite ]; then \
+      git -C /comfyui/custom_nodes/ComfyUI-VideoHelperSuite pull --rebase; \
+    else \
+      git -C /comfyui/custom_nodes clone --depth 1 https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git; \
+    fi; \
+    if [ -d /comfyui/custom_nodes/ComfyUI-InstantID ]; then \
+      git -C /comfyui/custom_nodes/ComfyUI-InstantID pull --rebase; \
+    elif [ -d /comfyui/custom_nodes/ComfyUI-InstantIDContext ]; then \
+      git -C /comfyui/custom_nodes/ComfyUI-InstantIDContext pull --rebase; \
+    else \
+      git -C /comfyui/custom_nodes clone --depth 1 https://github.com/cubiq/ComfyUI_InstantID.git ComfyUI-InstantID; \
+    fi; \
+    # Install/refresh ADetailer and SVDiffusion Relight nodes (best-effort; ignore failures)
+    if [ -d /comfyui/custom_nodes/ComfyUI-ADetailer ]; then \
+      git -C /comfyui/custom_nodes/ComfyUI-ADetailer pull --rebase || true; \
+    else \
+      git -C /comfyui/custom_nodes clone --depth 1 https://github.com/Okipol/ComfyUI-ADetailer.git || true; \
+    fi; \
+    if [ -d /comfyui/custom_nodes/ComfyUI-SVDiffusion ]; then \
+      git -C /comfyui/custom_nodes/ComfyUI-SVDiffusion pull --rebase || true; \
+    else \
+      git -C /comfyui/custom_nodes clone --depth 1 https://github.com/kijai/ComfyUI-SVDiffusion.git ComfyUI-SVDiffusion || true; \
+    fi; \
+    if [ -d /comfyui/custom_nodes/ComfyUI-SVDiffusion-Relight ]; then \
+      git -C /comfyui/custom_nodes/ComfyUI-SVDiffusion-Relight pull --rebase || true; \
+    else \
+      git -C /comfyui/custom_nodes clone --depth 1 https://github.com/kijai/ComfyUI-SVDiffusion-Relight.git ComfyUI-SVDiffusion-Relight || true; \
+    fi; \
+    rm -f /comfyui/web/extensions/core/widgetInputs.js || true
+
 # Pre-install CUDA-enabled torch (cu126) compatible with P40 (sm_61) and RTX 8000.
 # This ensures Pascal coverage; Maxwell nodes are not primary targets for torch wheels.
 RUN pip install --no-cache-dir torch==2.8.* torchvision torchaudio

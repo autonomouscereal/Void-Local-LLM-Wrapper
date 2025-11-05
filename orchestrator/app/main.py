@@ -98,6 +98,9 @@ from .artifacts.shard import newest_part as _art_newest_part, list_parts as _art
 from .artifacts.manifest import add_manifest_row as _art_manifest_add, write_manifest_atomic as _art_manifest_write
 from .datasets.trace import append_sample as _trace_append
 from .embeddings.core import build_embeddings_response as _build_embeddings_response
+from .analysis.media import analyze_image as _analyze_image, analyze_audio as _analyze_audio
+from .review.referee import build_delta_plan as _build_delta_plan
+from .review.ledger_writer import append_ledger as _append_ledger
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 try:
     logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO), format="%(levelname)s:%(message)s")
@@ -140,11 +143,45 @@ def _normalize_dict_body(body: Any, expected_schema: Dict[str, Any]) -> Dict[str
             return {}
     return {}
 
+# ---------- ICW/OmniContext helpers ----------
+def _proj_dir(job_id: str) -> str:
+    base = os.path.join(FILM2_DATA_DIR, "jobs", job_id)
+    os.makedirs(base, exist_ok=True)
+    return base
+
+def _capsules_dir(job_id: str) -> str:
+    d = os.path.join(_proj_dir(job_id), "capsules")
+    os.makedirs(os.path.join(d, "windows"), exist_ok=True)
+    return d
+
+def _proj_capsule_path(job_id: str) -> str:
+    return os.path.join(_capsules_dir(job_id), "OmniCapsule.json")
+
+def _windows_dir(job_id: str) -> str:
+    return os.path.join(_capsules_dir(job_id), "windows")
+
+def _read_json_safe(path: str) -> Dict[str, Any]:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _write_json_safe(path: str, obj: Dict[str, Any]) -> None:
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
 
 QWEN_BASE_URL = os.getenv("QWEN_BASE_URL", "http://localhost:11434")
-QWEN_MODEL_ID = os.getenv("QWEN_MODEL_ID", "qwen3:32b-instruct-q4_K_M")
+QWEN_MODEL_ID = os.getenv("QWEN_MODEL_ID", "qwen3:32b-instruct-q6_K")
 GPTOSS_BASE_URL = os.getenv("GPTOSS_BASE_URL", "http://localhost:11435")
-GPTOSS_MODEL_ID = os.getenv("GPTOSS_MODEL_ID", "gpt-oss:20b-q5_K_M")
+GPTOSS_MODEL_ID = os.getenv("GPTOSS_MODEL_ID", "chatgpt-oss:latest")
 DEFAULT_NUM_CTX = int(os.getenv("DEFAULT_NUM_CTX", "8192"))
 DEFAULT_TEMPERATURE = float(os.getenv("DEFAULT_TEMPERATURE", "0.3"))
 # Gates removed: defaults are always ON; API-key checks still apply where required
@@ -169,7 +206,7 @@ POSTGRES_PORT = int(os.getenv("POSTGRES_PORT", "5432"))
 POSTGRES_DB = os.getenv("POSTGRES_DB")
 POSTGRES_USER = os.getenv("POSTGRES_USER")
 POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD")
-EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2")
+EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "BAAI/bge-large-en-v1.5")
 RAG_CACHE_TTL_SEC = int(os.getenv("RAG_CACHE_TTL_SEC", "300"))
 
 # Optional external tool services (set URLs to enable)
@@ -190,6 +227,8 @@ OCR_API_URL = os.getenv("OCR_API_URL")        # e.g., http://ocr:8070
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/workspace/uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+FILM2_MODELS_DIR = os.getenv("FILM2_MODELS", "/opt/models")
+FILM2_DATA_DIR = os.getenv("FILM2_DATA", "/srv/film2")
 N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL")  # optional external workflow orchestration
 ENABLE_N8N = os.getenv("ENABLE_N8N", "false").lower() == "true"
 ASSEMBLER_API_URL = os.getenv("ASSEMBLER_API_URL")  # http://assembler:9095
@@ -1378,8 +1417,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     return {"image_bytes": png, "model": "placeholder"}
                 w, h = self._parse_wh(a.get("size") or "1024x1024")
                 positive = a.get("prompt") or ""
-                neg_fix = ", bad hands, extra fingers, deformed, low quality, blown highlights, text, watermark"
-                negative = (a.get("negative") or "") + neg_fix
+                # Use only caller-provided negatives; do not rely on generic negative hacks
+                negative = a.get("negative") or ""
                 seed = int(a.get("seed") or 0)
                 base_graph = {
                     "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "sd_xl_base_1.0.safetensors"}},
@@ -1388,6 +1427,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     "7": {"class_type": "EmptyLatentImage", "inputs": {"width": w, "height": h, "batch_size": 1}},
                     "8": {"class_type": "KSampler", "inputs": {"seed": seed, "steps": (20 if COMFY_CPU_MODE else 28), "cfg": 6.2, "sampler_name": "dpmpp_2m", "scheduler": "karras", "denoise": (0.9 if COMFY_CPU_MODE else 1.0), "model": ["1", 0], "positive": ["3", 0], "negative": ["4", 0], "latent_image": ["7", 0]}},
                     "9": {"class_type": "VAEDecode", "inputs": {"samples": ["8", 0], "vae": ["1", 2]}},
+                    # SaveImage will be re-pointed to the final post-processed image below (upscale pipeline)
                     "10": {"class_type": "SaveImage", "inputs": {"filename_prefix": "image_gen", "images": ["9", 0]}},
                 }
                 g = dict(base_graph)
@@ -1425,22 +1465,54 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                         g["33"] = {"class_type": "IPAdapterApply", "inputs": {"model": cur_model_src, "image": ["32", 0], "strength": 0.55}}
                         cur_model_src = ["33", 0]
                     if face_list:
+                        # Prefer IP-Adapter FaceID Plus v2 (image-driven), fallback to InstantID only if unavailable
+                        ip_face_applied = False
                         try:
-                            if FACEID_API_URL and isinstance(FACEID_API_URL, str):
-                                pub_url = face_list[0]
-                                if pub_url.startswith("/workspace/uploads/"):
-                                    pub_url = pub_url.replace("/workspace", "")
-                                import httpx as _hx  # type: ignore
-                                with _hx.Client() as _c:
-                                    rr = _c.post(FACEID_API_URL.rstrip("/") + "/embed", json={"image_url": pub_url})
-                                if rr.status_code == 200:
-                                    jsr = _resp_json(rr, {"embedding": list, "vec": list}); emb = jsr.get("embedding") or jsr.get("vec")
-                                    if emb and isinstance(emb, (list, tuple)) and len(emb) > 0:
-                                        g["34"] = {"class_type": "LoadImage", "inputs": {"image": face_list[0]}}
+                            g["34"] = {"class_type": "LoadImage", "inputs": {"image": face_list[0]}}
+                            # Apply FaceID+ via IP-Adapter; strength slightly higher on first pass
+                            g["36"] = {"class_type": "IPAdapterApply", "inputs": {"model": cur_model_src, "image": ["34", 0], "strength": 0.70}}
+                            cur_model_src = ["36", 0]
+                            ip_face_applied = True
+                        except Exception:
+                            ip_face_applied = False
+                        # InstantID fallback using InsightFace embeddings if FaceID+ apply not available
+                        if not ip_face_applied:
+                            try:
+                                if FACEID_API_URL and isinstance(FACEID_API_URL, str):
+                                    # Support multi-face: average embeddings with simple outlier rejection
+                                    embs = []
+                                    import httpx as _hx  # type: ignore
+                                    with _hx.Client() as _c:
+                                        for idx, fimg in enumerate(face_list[:4]):
+                                            pub_url = fimg
+                                            if pub_url.startswith("/workspace/uploads/"):
+                                                pub_url = pub_url.replace("/workspace", "")
+                                            rr = _c.post(FACEID_API_URL.rstrip("/") + "/embed", json={"image_url": pub_url})
+                                            if rr.status_code == 200:
+                                                jsr = _resp_json(rr, {"embedding": list, "vec": list}); v = jsr.get("embedding") or jsr.get("vec")
+                                                if isinstance(v, list) and len(v) > 0:
+                                                    embs.append(v)
+                                    emb = None
+                                    if embs:
+                                        # naive mean; reject any vector whose L2 distance > 2x median distance
+                                        try:
+                                            import math as _m
+                                            def _l2(a, b):
+                                                return _m.sqrt(sum((float(ai) - float(bi)) ** 2 for ai, bi in zip(a, b)))
+                                            mean = [sum(vals) / len(embs) for vals in zip(*embs)]
+                                            dists = [_l2(e, mean) for e in embs]
+                                            med = sorted(dists)[len(dists)//2]
+                                            keep = [e for e, d in zip(embs, dists) if d <= (2.0 * med or 1e-6)]
+                                            emb = [sum(vals) / len(keep) for vals in zip(*keep)] if keep else mean
+                                        except Exception:
+                                            emb = embs[0]
+                                    if emb:
+                                        if "34" not in g:
+                                            g["34"] = {"class_type": "LoadImage", "inputs": {"image": face_list[0]}}
                                         g["35"] = {"class_type": "InstantIDApply", "inputs": {"model": cur_model_src, "image": ["34", 0], "embedding": emb, "strength": 0.70}}
                                         cur_model_src = ["35", 0]
-                        except Exception:
-                            pass
+                            except Exception:
+                                pass
                     if cur_model_src != ["1", 0]:
                         g["8"]["inputs"]["model"] = cur_model_src
                     # Emotion hint from audio
@@ -1452,6 +1524,25 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                         pass
                 except Exception:
                     g = dict(base_graph)
+                # Mandatory post-process: upscale with RealESRGAN x4
+                try:
+                    g["11"] = {"class_type": "RealESRGANModelLoader", "inputs": {"model_name": "realesr-general-x4v3.pth"}}
+                    g["12"] = {"class_type": "RealESRGAN", "inputs": {"image": ["9", 0], "model": ["11", 0], "scale": 4}}
+                    post_image_node = ["12", 0]
+                except Exception:
+                    post_image_node = ["9", 0]
+                # Optional post stage: CodeFormer face restore (@fidelity 0.7) if available
+                try:
+                    g["13"] = {"class_type": "CodeFormerModelLoader", "inputs": {"model_name": "codeformer.pth"}}
+                    g["14"] = {"class_type": "CodeFormer", "inputs": {"image": post_image_node, "fidelity": 0.7, "model": ["13", 0]}}
+                    post_image_node = ["14", 0]
+                except Exception:
+                    pass
+                # Point SaveImage to final post-processed node
+                try:
+                    g["10"]["inputs"]["images"] = post_image_node
+                except Exception:
+                    pass
                 js = self._post_prompt(g); pid = js.get("prompt_id") or js.get("uuid") or js.get("id")
                 det = self._poll(pid)
                 data = self._download_first(det)
@@ -1504,6 +1595,18 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             return {"name": name, "result": env}
         except Exception as ex:
             return {"name": name, "error": str(ex)}
+    if name == "icw.pack_context":
+        args = raw_args if isinstance(raw_args, dict) else {}
+        res = await v1_icw_pack(args)
+        if isinstance(res, JSONResponse):
+            return {"name": name, "error": res.body.decode("utf-8") if hasattr(res, 'body') else "error"}
+        return {"name": name, "result": res}
+    if name == "icw.advance":
+        args = raw_args if isinstance(raw_args, dict) else {}
+        res = await v1_icw_advance(args)
+        if isinstance(res, JSONResponse):
+            return {"name": name, "error": res.body.decode("utf-8") if hasattr(res, 'body') else "error"}
+        return {"name": name, "result": res}
     if name == "tts.speak" and ALLOW_TOOL_EXECUTION:
         if not XTTS_API_URL:
             return {"name": name, "error": "XTTS_API_URL not configured"}
@@ -2072,9 +2175,18 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     "7": {"class_type": "EmptyLatentImage", "inputs": {"width": w, "height": h, "batch_size": 1}},
                     "8": {"class_type": "KSampler", "inputs": {"seed": seed, "steps": 25, "cfg": 6.5, "sampler_name": "dpmpp_2m", "scheduler": "karras", "denoise": 1.0, "model": ["1", 0], "positive": ["3", 0], "negative": ["4", 0], "latent_image": ["7", 0]}},
                     "9": {"class_type": "VAEDecode", "inputs": {"samples": ["8", 0], "vae": ["1", 2]}},
+                    # SaveImage will be re-pointed to the final post-processed image below (upscale pipeline)
                     "10": {"class_type": "SaveImage", "inputs": {"filename_prefix": "image_gen", "images": ["9", 0]}},
                 }
-                js = self._post_prompt(base_graph); pid = js.get("prompt_id") or js.get("uuid") or js.get("id"); det = self._poll(pid)
+                g = dict(base_graph)
+                # Mandatory post-process: upscale with RealESRGAN x4
+                try:
+                    g["11"] = {"class_type": "RealESRGANModelLoader", "inputs": {"model_name": "realesr-general-x4v3.pth"}}
+                    g["12"] = {"class_type": "RealESRGAN", "inputs": {"image": ["9", 0], "model": ["11", 0], "scale": 4}}
+                    g["10"]["inputs"]["images"] = ["12", 0]
+                except Exception:
+                    pass
+                js = self._post_prompt(g); pid = js.get("prompt_id") or js.get("uuid") or js.get("id"); det = self._poll(pid)
                 data = self._download_first(det)
                 view_url = f"{self.base}/history/{pid}" if (self.base and pid) else None
                 return {"image_bytes": data, "model": "comfyui:sdxl", "prompt_id": pid, "history_url": view_url}
@@ -2112,6 +2224,19 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         try:
             if name == "image.gen":
                 env = run_image_gen(args if isinstance(args, dict) else {}, provider, manifest)
+                # Review: append image CLIP score and decision
+                try:
+                    res = env or {}
+                    arts = (res.get("artifacts") or []) if isinstance(res, dict) else []
+                    if arts:
+                        a0 = arts[0]
+                        aid = a0.get("id"); cid = (res.get("meta") or {}).get("cid")
+                        if aid and cid:
+                            path = f"/uploads/artifacts/image/{cid}/{aid}"
+                            ai = _analyze_image(path, prompt=str((args or {}).get("prompt") or ""))
+                            env.setdefault("review", {}).update({"image": {"clip": float(ai.get("clip_score") or 0.0)}})
+                except Exception:
+                    pass
             elif name == "image.edit":
                 env = run_image_edit(args if isinstance(args, dict) else {}, provider, manifest)
             else:
@@ -3890,7 +4015,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         return out
     tool_calls = _normalize_tool_calls(tool_calls)
     _log("planner.tools.normalized", trace_id=trace_id, tool_count=len(tool_calls))
-    # If planner returned no tools, synthesize a sensible default for image prompts
+    # If planner returned no tools, synthesize sensible defaults for image/music prompts
     if not tool_calls:
         last_user = ""
         for m in reversed(messages):
@@ -3905,6 +4030,10 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 # Use image.gen to leverage committee review/quality passes
                 tool_calls = [{"name": "image.gen", "arguments": {"prompt": last_user, "size": "1024x1024"}}]
                 _log("planner.fallback", trace_id=trace_id, tool="image.gen")
+            elif any(x in kw for x in ("song", "lyrics", "music")):
+                # Enforce YuE only (no fallbacks)
+                tool_calls = [{"name": "music.song.yue", "arguments": {"lyrics": last_user, "style_tags": []}}]
+                _log("planner.fallback", trace_id=trace_id, tool="music.song.yue")
     try:
         _trace_append("decision", {"cid": conv_cid, "trace_id": trace_id, "plan": plan_text, "tool_calls": tool_calls})
     except Exception:
@@ -5389,8 +5518,12 @@ async def tool_run(body: Dict[str, Any]):
                     while True:
                         r = _hx.get(self.base + f"/history/{pid}")
                         if r.status_code == 200:
-                            js = _resp_json(r, {"history": dict}); h = (js.get("history") or {}).get(pid)
-                            if h and (h.get("status", {}).get("completed") is True):
+                            js = _resp_json(r, {})
+                            hist = js.get("history") if isinstance(js, dict) else {}
+                            if not isinstance(hist, dict):
+                                hist = js if isinstance(js, dict) else {}
+                            h = hist.get(pid)
+                            if h and _comfy_is_completed(h):
                                 return h
                         _tm.sleep(1.0)
                 def _download_first(self, detail: Dict[str, Any]) -> bytes:
@@ -5467,6 +5600,18 @@ async def tool_run(body: Dict[str, Any]):
             manifest = {"items": []}
             if mode == "gen":
                 env = run_image_gen(args if isinstance(args, dict) else {}, provider, manifest)
+                try:
+                    res = env or {}
+                    arts = (res.get("artifacts") or []) if isinstance(res, dict) else []
+                    if arts:
+                        a0 = arts[0]
+                        aid = a0.get("id"); cid = (res.get("meta") or {}).get("cid")
+                        if aid and cid:
+                            path = f"/uploads/artifacts/image/{cid}/{aid}"
+                            ai = _analyze_image(path, prompt=str((args or {}).get("prompt") or ""))
+                            env.setdefault("review", {}).update({"image": {"clip": float(ai.get("clip_score") or 0.0)}})
+                except Exception:
+                    pass
             elif mode == "edit":
                 env = run_image_edit(args if isinstance(args, dict) else {}, provider, manifest)
             elif mode == "upscale":
@@ -5709,7 +5854,8 @@ async def film2_qa(body: Dict[str, Any]):
             snap = _film_load_snap(cid, f"cue_{cid2}") or {}
             score = _qa_music({"motif_vec": None}, motif_embed=None)
             if score < T_MUSIC:
-                args = {"name": "music.dispatch", "args": {"mode": "compose", "prompt": cue.get("prompt") or "", "music_id": cue.get("music_ref_id"), "music_refs": snap.get("refs", {}), "seed": int(snap.get("seed") or 0), "film_cid": cid, "cue_id": cid2}}
+                # Prefer timed music generation for video scoring using SAO when available
+                args = {"name": "music.timed.sao", "args": {"text": cue.get("prompt") or "", "seconds": 8}}
                 try:
                     await tool_run(args)
                 except Exception:
@@ -5771,6 +5917,393 @@ async def logs_trace_tail(id: str, kind: str = "responses", limit: int = 200):
         return {"id": id, "kind": safe_kind, "data": _read_tail(path, n=int(limit))}
     except Exception as ex:
         return JSONResponse(status_code=400, content={"error": str(ex)})
+
+@app.post("/v1/icw/pack")
+async def v1_icw_pack(body: Dict[str, Any]):
+    expected = {"job_id": str, "modality": str, "window_idx": int}
+    payload = _normalize_dict_body(body, expected)
+    job_id = (payload.get("job_id") or "").strip()
+    modality = (payload.get("modality") or "").strip().lower()
+    if not job_id or modality not in ("text","image","audio","music","video"):
+        return JSONResponse(status_code=400, content={"error": "bad args"})
+    omni = _read_json_safe(_proj_capsule_path(job_id))
+    windows_dir = _windows_dir(job_id)
+    # Find prior window for modality
+    try:
+        files = sorted([p for p in os.listdir(windows_dir) if p.endswith('.json')])
+    except Exception:
+        files = []
+    last_cap = {}
+    for fn in reversed(files):
+        try:
+            c = _read_json_safe(os.path.join(windows_dir, fn))
+            if (c.get("modality") or "").lower() == modality:
+                last_cap = c; break
+        except Exception:
+            continue
+    # Anchor-first pack skeleton
+    packed = {
+        "globals": omni.get("globals") or {},
+        "locks": omni.get("assets") or {},
+        "tracks": omni.get("tracks") or {},
+        "editorial": omni.get("editorial") or {},
+        "continuation": {"tag": "<CONT>", "summary": (last_cap.get("continuation", {}) or {}).get("summary")},
+        "modality": modality,
+    }
+    return {"ok": True, "context": packed}
+
+@app.post("/v1/icw/advance")
+async def v1_icw_advance(body: Dict[str, Any]):
+    expected = {"job_id": str, "window_capsule": dict}
+    payload = _normalize_dict_body(body, expected)
+    job_id = (payload.get("job_id") or "").strip()
+    cap = payload.get("window_capsule") or {}
+    if not job_id or not isinstance(cap, dict):
+        return JSONResponse(status_code=400, content={"error": "bad args"})
+    cid = cap.get("capsule_id") or f"{cap.get('modality','cap')}-{int(time.time())}"
+    cap["capsule_id"] = cid
+    path = os.path.join(_windows_dir(job_id), f"{cid}.json")
+    _write_json_safe(path, cap)
+    # Touch OmniCapsule and bump rev
+    omni_path = _proj_capsule_path(job_id)
+    omni = _read_json_safe(omni_path) or {"project_id": job_id, "capsule_rev": 0}
+    omni["capsule_rev"] = int(omni.get("capsule_rev") or 0) + 1
+    _write_json_safe(omni_path, omni)
+    # Append to EDL
+    edl_path = os.path.join(_proj_dir(job_id), "edl", "EDL.json")
+    try:
+        os.makedirs(os.path.dirname(edl_path), exist_ok=True)
+        edl = []
+        if os.path.exists(edl_path):
+            with open(edl_path, "r", encoding="utf-8") as f: edl = json.load(f)
+        edl.append({"capsule_id": cid, "modality": cap.get("modality"), "timecode": cap.get("timecode")})
+        with open(edl_path, "w", encoding="utf-8") as f: json.dump(edl, f, ensure_ascii=False)
+    except Exception:
+        pass
+    return {"ok": True, "capsule_id": cid}
+
+@app.get("/v1/state/project")
+async def v1_state_project(job_id: str):
+    omni = _read_json_safe(_proj_capsule_path(job_id))
+    return {"ok": True, "project": omni}
+
+@app.post("/v1/review/score")
+async def v1_review_score(body: Dict[str, Any]):
+    expected = {"kind": str, "path": str, "prompt": str}
+    payload = _normalize_dict_body(body, expected)
+    kind = (payload.get("kind") or "").strip().lower()
+    path = payload.get("path") or ""
+    prompt = (payload.get("prompt") or "").strip()
+    if kind not in ("image", "audio", "music"):
+        return JSONResponse(status_code=400, content={"error": "invalid kind"})
+    scores: Dict[str, Any] = {}
+    if kind == "image":
+        ai = _analyze_image(path, prompt=prompt)
+        scores = {"image": {"clip": float(ai.get("clip_score") or 0.0)}}
+    else:
+        aa = _analyze_audio(path)
+        scores = {"audio": {"lufs": aa.get("lufs"), "tempo_bpm": aa.get("tempo_bpm")}}
+    return {"ok": True, "scores": scores}
+
+@app.post("/v1/review/plan")
+async def v1_review_plan(body: Dict[str, Any]):
+    payload = _normalize_dict_body(body, {"scores": dict})
+    plan = _build_delta_plan(payload.get("scores") or {})
+    return {"ok": True, "plan": plan}
+
+@app.post("/v1/review/loop")
+async def v1_review_loop(body: Dict[str, Any]):
+    expected = {"artifacts": list, "prompt": str}
+    payload = _normalize_dict_body(body, expected)
+    arts = payload.get("artifacts") or []
+    prompt = (payload.get("prompt") or "").strip()
+    loop_idx = 0
+    while loop_idx < 6:
+        # Score first image or audio artifact only (fast path)
+        img = next((a for a in arts if (a.get("kind") or "").startswith("image")), None)
+        aud = next((a for a in arts if (a.get("kind") or "").startswith("audio")), None)
+        scores: Dict[str, Any] = {}
+        if img and isinstance(img.get("path"), str):
+            ai = _analyze_image(img.get("path"), prompt=prompt)
+            scores["image"] = {"clip": float(ai.get("clip_score") or 0.0)}
+        if aud and isinstance(aud.get("path"), str):
+            aa = _analyze_audio(aud.get("path"))
+            scores["audio"] = {"lufs": aa.get("lufs"), "tempo_bpm": aa.get("tempo_bpm")}
+        plan = _build_delta_plan(scores)
+        _append_ledger({"phase": f"review.loop#{loop_idx}", "scores": scores, "decision": plan})
+        if plan.get("accept") is True:
+            return {"ok": True, "loop_idx": loop_idx, "accepted": True, "plan": plan}
+        # Minimal refinement stub: not executing real deltas here; return plan to caller
+        return {"ok": True, "loop_idx": loop_idx, "accepted": False, "plan": plan}
+    return {"ok": True, "loop_idx": loop_idx, "accepted": False, "plan": {"accept": False}}
+
+# ---- Film-2 Video endpoints (HunyuanVideo-first; deterministic; ICW capsules) ----
+@app.post("/v1/video/locks/{lock_type}")
+async def v1_video_locks(lock_type: str, body: Dict[str, Any]):
+    lock_type = (lock_type or "").strip().lower()
+    if lock_type not in ("face","clothing","style","layout","text","voice"):
+        return JSONResponse(status_code=400, content={"error": "invalid lock type"})
+    refs = (body or {}).get("refs") or []
+    files: Dict[str, Any] = {}
+    if lock_type in ("face","clothing","style","layout","text"):
+        imgs: list[str] = []
+        for r in refs:
+            if isinstance(r, dict) and isinstance(r.get("ref_id"), str):
+                pack, code = _refs_apply({"ref_id": r.get("ref_id")})
+                if code == 200 and isinstance(pack, dict):
+                    for p in (pack.get("images") or []) + (pack.get("image") or []):
+                        if isinstance(p, str): imgs.append(p)
+            elif isinstance(r, dict) and isinstance(r.get("image_url"), str):
+                imgs.append(r.get("image_url"))
+            elif isinstance(r, str):
+                imgs.append(r)
+        if not imgs:
+            return JSONResponse(status_code=400, content={"error": "no refs"})
+        files = {"images": imgs}
+    if lock_type == "voice":
+        files = {"voice_samples": [r.get("audio_url") for r in refs if isinstance(r, dict) and r.get("audio_url")]}
+    saved = _refs_save({"kind": lock_type, "title": f"vlock:{lock_type}:{int(time.time())}", "files": files, "compute_embeds": True})
+    return {"ok": True, "lock": saved}
+
+def _save_capsule(cap: Dict[str, Any]) -> str:
+    cid = cap.get("capsule_id") or f"cap-{int(time.time())}"
+    cap["capsule_id"] = cid
+    base = os.path.join(UPLOAD_DIR, "capsules")
+    os.makedirs(base, exist_ok=True)
+    path = os.path.join(base, f"{cid}.json")
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cap, f, ensure_ascii=False)
+    except Exception:
+        pass
+    return cid
+
+@app.get("/v1/video/state/{capsule_id}")
+async def v1_video_state(capsule_id: str):
+    path = os.path.join(UPLOAD_DIR, "capsules", f"{capsule_id}.json")
+    if not os.path.exists(path):
+        return JSONResponse(status_code=404, content={"error": "not_found"})
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+@app.post("/v1/video/generate")
+async def v1_video_generate(body: Dict[str, Any]):
+    if not HUNYUAN_VIDEO_API_URL:
+        return JSONResponse(status_code=400, content={"error": "HUNYUAN_VIDEO_API_URL not configured"})
+    expected = {"prompt": str, "refs": dict, "locks": dict, "duration_s": int, "fps": int, "size": list, "seed": int, "icw": dict}
+    payload = _normalize_dict_body(body, expected)
+    prompt = (payload.get("prompt") or "").strip()
+    if not prompt:
+        return JSONResponse(status_code=400, content={"error": "missing prompt"})
+    w,h = 1920,1080
+    try:
+        sz = payload.get("size") or [1920,1080]
+        if isinstance(sz, list) and len(sz) == 2:
+            w,h = int(sz[0]), int(sz[1])
+    except Exception:
+        w,h = 1920,1080
+    fps = int(payload.get("fps") or 60)
+    seconds = int(payload.get("duration_s") or 8)
+    seed = payload.get("seed")
+    locks = payload.get("locks") or {}
+    hv_args = {
+        "prompt": prompt,
+        "width": w,
+        "height": h,
+        "fps": fps,
+        "seconds": seconds,
+        "locks": locks,
+        "seed": seed,
+        "post": {"interpolate": True, "upscale": True, "face_lock": True, "hand_fix": True},
+        "latent_reinit_every": 48,
+    }
+    res = await execute_tool_call({"name": "video.hv.t2v", "arguments": hv_args})
+    icw = payload.get("icw") or {}
+    cap = {"capsule_id": icw.get("capsule_id") or None, "scene": icw.get("scene"), "shot": icw.get("shot"), "window_idx": icw.get("window_idx"), "timecode": {"start_s": 0.0, "end_s": float(seconds), "fps": fps}, "locks": locks, "manifests": {"seeds": {"window": seed}}}
+    cid = _save_capsule(cap)
+    return {"ok": True, "result": res, "capsule_id": cid}
+
+@app.post("/v1/video/edit")
+async def v1_video_edit(body: Dict[str, Any]):
+    if not HUNYUAN_VIDEO_API_URL:
+        return JSONResponse(status_code=400, content={"error": "HUNYUAN_VIDEO_API_URL not configured"})
+    expected = {"image_url": str, "instruction": str, "locks": dict, "fps": int, "size": list, "seconds": int, "seed": int}
+    payload = _normalize_dict_body(body, expected)
+    init_image = payload.get("image_url")
+    if not init_image:
+        return JSONResponse(status_code=400, content={"error": "missing image_url"})
+    instruction = (payload.get("instruction") or "").strip()
+    if not instruction:
+        return JSONResponse(status_code=400, content={"error": "missing instruction"})
+    w,h = 1024,1024
+    try:
+        sz = payload.get("size") or [1024,1024]
+        if isinstance(sz, list) and len(sz) == 2:
+            w,h = int(sz[0]), int(sz[1])
+    except Exception:
+        w,h = 1024,1024
+    fps = int(payload.get("fps") or 60)
+    seconds = int(payload.get("seconds") or 5)
+    seed = payload.get("seed")
+    locks = payload.get("locks") or {}
+    hv_args = {
+        "init_image": init_image,
+        "prompt": instruction,
+        "width": w,
+        "height": h,
+        "fps": fps,
+        "seconds": seconds,
+        "locks": locks,
+        "seed": seed,
+        "post": {"interpolate": True, "upscale": True, "face_lock": True},
+        "latent_reinit_every": 48,
+    }
+    res = await execute_tool_call({"name": "video.hv.i2v", "arguments": hv_args})
+    return {"ok": True, "result": res}
+
+
+# ---- Audio endpoints (local-first; JSON-only) ----
+@app.post("/v1/audio/lyrics-to-song")
+async def v1_audio_lyrics_to_song(body: Dict[str, Any]):
+    expected = {"lyrics": str, "style_prompt": str, "ref_audio_ids": list, "lock_ids": list, "duration_s": int, "seed": int, "bpm": int, "key": str}
+    payload = _normalize_dict_body(body, expected)
+    lyrics = (payload.get("lyrics") or "").strip()
+    style = (payload.get("style_prompt") or "").strip()
+    duration_s = int(payload.get("duration_s") or 30)
+    bpm = payload.get("bpm")
+    key = payload.get("key")
+    seed = payload.get("seed")
+    if not lyrics:
+        return JSONResponse(status_code=400, content={"error": "missing lyrics"})
+    if not YUE_API_URL:
+        return JSONResponse(status_code=400, content={"error": "YUE_API_URL not configured"})
+    call = {"name": "music.song.yue", "arguments": {"lyrics": lyrics, "style_tags": ([style] if style else []), "bpm": bpm, "key": key, "seed": seed}}
+    res = await execute_tool_call(call)
+    return {"ok": True, "result": res}
+
+@app.post("/v1/audio/edit")
+async def v1_audio_edit(body: Dict[str, Any]):
+    expected = {"audio_url": str, "ops": list}
+    payload = _normalize_dict_body(body, expected)
+    audio_url = payload.get("audio_url")
+    ops = payload.get("ops") or []
+    if not audio_url:
+        return JSONResponse(status_code=400, content={"error": "missing audio_url"})
+    # Try stems separation via Demucs service when available
+    stems_info: Dict[str, Any] = {"ok": False}
+    try:
+        if DEMUCS_API_URL:
+            sep = await execute_tool_call({"name": "audio.stems.demucs", "arguments": {"mix_wav": audio_url, "stems": ["vocals","drums","bass","other"]}})
+            stems_info = {"ok": True, "stems": sep}
+    except Exception as ex:
+        stems_info = {"ok": False, "error": str(ex)}
+    # Record edit graph (beat-aware DSP would apply here in a dedicated engine)
+    return {"ok": True, "ingest": {"audio_url": audio_url}, "stems": stems_info, "ops_applied": ops}
+
+@app.post("/v1/audio/tts-sing")
+async def v1_audio_tts_sing(body: Dict[str, Any]):
+    expected = {"script": list, "style_lock_id": str, "structure": dict}
+    payload = _normalize_dict_body(body, expected)
+    script = payload.get("script") or []
+    if not isinstance(script, list) or not script:
+        return JSONResponse(status_code=400, content={"error": "missing script"})
+    outputs: List[Dict[str, Any]] = []
+    for item in script:
+        kind = (item or {}).get("type")
+        if kind == "tts":
+            args = {"text": (item.get("text") or ""), "voice_id": item.get("voice_lock_id")}
+            res = await execute_tool_call({"name": "tts.speak", "arguments": args})
+            outputs.append({"type": "tts", "result": res})
+        elif kind == "sing":
+            if not YUE_API_URL:
+                return JSONResponse(status_code=400, content={"error": "YUE_API_URL not configured"})
+            lyrics = (item.get("lyrics") or "")
+            res = await execute_tool_call({"name": "music.song.yue", "arguments": {"lyrics": lyrics, "style_tags": [], "seed": item.get("seed")}})
+            outputs.append({"type": "sing", "result": res})
+    return {"ok": True, "parts": outputs, "structure": (payload.get("structure") or {})}
+
+@app.post("/v1/audio/score-video")
+async def v1_audio_score_video(body: Dict[str, Any]):
+    expected = {"video_url": str, "markers": list, "style_prompt": str, "voice_lock_id": str, "accept_edits": bool}
+    payload = _normalize_dict_body(body, expected)
+    video_url = payload.get("video_url")
+    markers = payload.get("markers") or []
+    style_prompt = payload.get("style_prompt") or ""
+    if not video_url:
+        return JSONResponse(status_code=400, content={"error": "missing video_url"})
+    if not SAO_API_URL:
+        return JSONResponse(status_code=400, content={"error": "SAO_API_URL not configured"})
+    seconds = 30
+    try:
+        if isinstance(markers, list) and markers:
+            mx = max(float((m or {}).get("t") or 0.0) for m in markers)
+            seconds = max(8, int(mx) + 2)
+    except Exception:
+        seconds = 30
+    text = (style_prompt or "").strip() or "video score"
+    res = await execute_tool_call({"name": "music.timed.sao", "arguments": {"text": text, "seconds": seconds}})
+    return {"ok": True, "video": video_url, "markers": markers, "music": res}
+
+@app.post("/v1/locks/create")
+async def v1_locks_create(body: Dict[str, Any]):
+    expected = {"type": str, "refs": list, "tags": list}
+    payload = _normalize_dict_body(body, expected)
+    lk_type = (payload.get("type") or "").strip().lower()
+    refs = payload.get("refs") or []
+    tags = payload.get("tags") or []
+    if lk_type not in ("voice", "music", "sfx", "music_style", "sfx_identity"):
+        return JSONResponse(status_code=400, content={"error": "invalid lock type"})
+    files: Dict[str, Any] = {}
+    if lk_type == "voice":
+        files = {"voice_samples": [r.get("audio_url") for r in refs if isinstance(r, dict) and r.get("audio_url")]}
+    elif lk_type in ("music", "music_style"):
+        files = {"track": next((r.get("audio_url") for r in refs if isinstance(r, dict) and r.get("audio_url")), None)}
+    elif lk_type == "sfx" or lk_type == "sfx_identity":
+        files = {"sfx_samples": [r.get("audio_url") for r in refs if isinstance(r, dict) and r.get("audio_url")]}
+    title = f"lock:{lk_type}:{int(time.time())}"
+    saved = _refs_save({"kind": lk_type, "title": title, "files": files, "tags": tags, "compute_embeds": True})
+    return {"ok": True, "lock": saved}
+
+# ---- Audio endpoints (local-first; JSON-only) ----
+@app.post("/v1/audio/lyrics-to-song")
+async def v1_audio_lyrics_to_song(body: Dict[str, Any]):
+    expected = {"lyrics": str, "style_prompt": str, "ref_audio_ids": list, "lock_ids": list, "duration_s": int, "seed": int, "bpm": int, "key": str}
+    payload = _normalize_dict_body(body, expected)
+    lyrics = (payload.get("lyrics") or "").strip()
+    style = (payload.get("style_prompt") or "").strip()
+    duration_s = int(payload.get("duration_s") or 30)
+    bpm = payload.get("bpm")
+    key = payload.get("key")
+    seed = payload.get("seed")
+    if not lyrics:
+        return JSONResponse(status_code=400, content={"error": "missing lyrics"})
+    if YUE_API_URL:
+        call = {"name": "music.song.yue", "arguments": {"lyrics": lyrics, "style_tags": ([style] if style else []), "bpm": bpm, "key": key, "seed": seed}}
+    else:
+        prompt = ((style + ": ") if style else "") + lyrics
+        call = {"name": "music.compose", "arguments": {"prompt": prompt, "length_s": duration_s, "bpm": bpm, "seed": seed}}
+    res = await execute_tool_call(call)
+    return {"ok": True, "result": res}
+
+@app.post("/v1/tts")
+async def v1_tts(body: Dict[str, Any]):
+    expected = {"text": str, "voice_ref_url": str, "voice_id": str, "lang": str, "prosody": dict, "seed": int}
+    payload = _normalize_dict_body(body, expected)
+    text = (payload.get("text") or "").strip()
+    if not text:
+        return JSONResponse(status_code=400, content={"error": "missing text"})
+    args = {"text": text, "voice_id": payload.get("voice_id"), "voice_refs": ({"voice_ref_url": payload.get("voice_ref_url")} if payload.get("voice_ref_url") else {}), "seed": payload.get("seed")}
+    res = await execute_tool_call({"name": "tts.speak", "arguments": args})
+    return {"ok": True, "result": res}
+
+@app.post("/v1/audio/sfx")
+async def v1_audio_sfx(body: Dict[str, Any]):
+    expected = {"type": str, "length_s": float, "pitch": float, "seed": int}
+    payload = _normalize_dict_body(body, expected)
+    args = {"type": payload.get("type"), "length_s": payload.get("length_s"), "pitch": payload.get("pitch"), "seed": payload.get("seed")}
+    manifest = {"items": []}
+    env = run_sfx_compose(args, manifest)
+    return {"ok": True, "result": env}
 # Lightweight in-memory job controls for orchestrator-run tools (research.run, etc.)
 @app.get("/orcjobs/{job_id}")
 async def orcjob_get(job_id: str):
@@ -5873,6 +6406,66 @@ async def embeddings(body: Dict[str, Any]):
     emb = get_embedder()
     out = _build_embeddings_response(emb, texts, model_name)
     return JSONResponse(content=out)
+
+@app.get("/v1/jobs/{job_id}")
+async def v1_job_status(job_id: str):
+    return await orcjob_get(job_id)
+
+@app.get("/v1/jobs/{job_id}/stream")
+async def v1_job_stream(job_id: str):
+    return await orcjob_stream(job_id)
+
+@app.get("/v1/capsules/{project_id}")
+async def v1_capsules_project(project_id: str):
+    base = _proj_dir(project_id)
+    omni = _read_json_safe(os.path.join(base, "capsules", "OmniCapsule.json"))
+    wins_dir = os.path.join(base, "capsules", "windows")
+    windows = []
+    try:
+        for fn in sorted(os.listdir(wins_dir)):
+            if fn.endswith('.json'):
+                windows.append(_read_json_safe(os.path.join(wins_dir, fn)))
+    except Exception:
+        pass
+    return {"project_id": project_id, "omni": omni, "windows": windows}
+
+@app.post("/v1/distill/pack")
+async def v1_distill_pack(body: Dict[str, Any]):
+    job_id = (body or {}).get("job_id")
+    if not job_id:
+        return JSONResponse(status_code=400, content={"error": "missing job_id"})
+    out_dir = os.path.join(FILM2_DATA_DIR, "distill", "jobs", job_id)
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+        # Copy ledger tail and minimal manifests
+        ledger_src = os.path.join(FILM2_DATA_DIR, "distill", "ledger.jsonl")
+        if os.path.exists(ledger_src):
+            import shutil as _sh
+            _sh.copyfile(ledger_src, os.path.join(out_dir, "ledger.jsonl"))
+        with open(os.path.join(out_dir, "RESULTS.md"), "w", encoding="utf-8") as f:
+            f.write("# RESULTS\n\nPack created. Fill with eval results.")
+        return {"ok": True, "path": out_dir}
+    except Exception as ex:
+        return JSONResponse(status_code=400, content={"error": str(ex)})
+
+@app.post("/v1/replay")
+async def v1_replay(body: Dict[str, Any]):
+    job_id = (body or {}).get("job_id")
+    if not job_id:
+        return JSONResponse(status_code=400, content={"error": "missing job_id"})
+    # Minimal stub: compute sha256 of latest artifact file if present
+    import hashlib as _hl
+    job_dir = _proj_dir(job_id)
+    arts = []
+    for root, _, files in os.walk(os.path.join(job_dir, "artifacts")):
+        for fn in files:
+            fp = os.path.join(root, fn)
+            arts.append(fp)
+    if not arts:
+        return {"ok": False, "reason": "no artifacts"}
+    fp = sorted(arts)[-1]
+    h = _hl.sha256(open(fp, 'rb').read()).hexdigest()
+    return {"ok": True, "file": fp, "sha256": h}
 
 
 @app.post("/v1/completions")

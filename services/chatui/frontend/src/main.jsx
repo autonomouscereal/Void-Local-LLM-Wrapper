@@ -517,7 +517,8 @@ function App() {
       // Map to path if needed
       args.image_ref = url
     }
-    const resp = await callTool('image.dispatch', args)
+    const toolName = (mode === 'gen') ? 'image.gen' : 'image.dispatch'
+    const resp = await callTool(toolName, args)
     if (resp && resp.result) {
       const meta = resp.result.meta || {}
       const arts = Array.isArray(resp.result.artifacts) ? resp.result.artifacts : []

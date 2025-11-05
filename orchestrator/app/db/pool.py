@@ -95,7 +95,7 @@ async def get_pg_pool() -> Optional[asyncpg.pool.Pool]:
               id BIGSERIAL PRIMARY KEY,
               path TEXT,
               chunk TEXT,
-              embedding vector(384)
+              embedding vector(1024)
             );
             """
         )

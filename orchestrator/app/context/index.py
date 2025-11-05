@@ -10,7 +10,7 @@ from typing import Dict, Any, List, Optional, Tuple
 _LOCK = threading.RLock()
 _CTX: Dict[str, List[Dict[str, Any]]] = {}
 _GLOBAL_PATH = os.getenv("ARTIFACTS_INDEX_PATH", os.path.join("/workspace", "uploads", "artifacts", "index.jsonl"))
-_TEXT_EMB_MODEL = os.getenv("EMBEDDING_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2")
+_TEXT_EMB_MODEL = os.getenv("EMBEDDING_MODEL_NAME", "BAAI/bge-large-en-v1.5")
 _TEXT_EMB = None
 
 
