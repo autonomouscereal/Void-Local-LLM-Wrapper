@@ -56,11 +56,33 @@ RUN mkdir -p /comfyui/custom_nodes/ComfyUI_IPAdapter_plus && \
     curl -fL https://codeload.github.com/cubiq/ComfyUI_IPAdapter_plus/tar.gz/main \
       | tar -xzf - --strip-components=1 -C /comfyui/custom_nodes/ComfyUI_IPAdapter_plus
 RUN mkdir -p /comfyui/custom_nodes/ComfyUI-InstantID && \
-    curl -fL https://codeload.github.com/cubiq/ComfyUI-InstantID/tar.gz/main \
-      | tar -xzf - --strip-components=1 -C /comfyui/custom_nodes/ComfyUI-InstantID || true
+    (curl -fL https://codeload.github.com/cubiq/ComfyUI-InstantID/tar.gz/main \
+      | tar -xzf - --strip-components=1 -C /comfyui/custom_nodes/ComfyUI-InstantID || true) && \
+    if [ ! -f /comfyui/custom_nodes/ComfyUI-InstantID/__init__.py ]; then \
+      (curl -fL https://codeload.github.com/InstantX/ComfyUI-InstantID/tar.gz/main \
+        | tar -xzf - --strip-components=1 -C /comfyui/custom_nodes/ComfyUI-InstantID || true); \
+    fi && \
+    if [ ! -f /comfyui/custom_nodes/ComfyUI-InstantID/__init__.py ] && [ -f /comfyui/custom_nodes/ComfyUI-InstantID/InstantIDNode.py ]; then \
+      echo 'from .InstantIDNode import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS' > /comfyui/custom_nodes/ComfyUI-InstantID/__init__.py; \
+    fi
 RUN mkdir -p /comfyui/custom_nodes/ComfyUI-VideoHelperSuite && \
     curl -fL https://codeload.github.com/Kosinkadink/ComfyUI-VideoHelperSuite/tar.gz/main \
       | tar -xzf - --strip-components=1 -C /comfyui/custom_nodes/ComfyUI-VideoHelperSuite
+
+# Preload InsightFace models so InstantID works out-of-the-box
+ENV INSIGHTFACE_HOME=/comfyui/models/insightface
+RUN mkdir -p "$INSIGHTFACE_HOME" && \
+    python - <<'PY'
+import os
+os.environ.setdefault('INSIGHTFACE_HOME', '/comfyui/models/insightface')
+try:
+    from insightface.app import FaceAnalysis  # type: ignore
+    app = FaceAnalysis(name='buffalo_l')
+    # Use CPU at build; runtime may switch to GPU
+    app.prepare(ctx_id=-1)
+except Exception as e:
+    print('[insightface preload] skipped:', e)
+PY
 
 # Ensure PyYAML is in ComfyUI requirements and install via requirements.txt (respects constraints)
 RUN if [ -f /comfyui/requirements.txt ]; then \

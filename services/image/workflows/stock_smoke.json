@@ -1,0 +1,14 @@
+{
+  "prompt": {
+    "3": { "class_type": "CheckpointLoaderSimple", "inputs": { "ckpt_name": "sd_xl_base_1.0.safetensors" } },
+    "4": { "class_type": "EmptyLatentImage", "inputs": { "width": 512, "height": 512, "batch_size": 1 } },
+    "5": { "class_type": "KSampler", "inputs": {
+      "seed": 123456789, "steps": 10, "cfg": 5.0, "sampler_name": "euler",
+      "scheduler": "normal", "denoise": 1.0, "model": ["3", 0], "latent_image": ["4", 0]
+    } },
+    "6": { "class_type": "VAEDecode", "inputs": { "samples": ["5", 0], "vae": ["3", 2] } },
+    "7": { "class_type": "SaveImage", "inputs": { "images": ["6", 0] } }
+  }
+}
+
+

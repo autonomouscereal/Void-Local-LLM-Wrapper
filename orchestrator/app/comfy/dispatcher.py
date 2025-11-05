@@ -103,7 +103,10 @@ def patch_assets(graph: Dict[str, Any], assets: Dict[str, Any]) -> None:
 async def submit(graph: Dict[str, Any]) -> Dict[str, Any]:
     payload = {"prompt": graph, "client_id": "wrapper-001"}
     async with httpx.AsyncClient() as client:
-        r = await client.post(COMFY_BASE + "/api/prompt", json=payload)
+        url = COMFY_BASE + "/api/prompt"
+        preview = json.dumps(payload, ensure_ascii=False)
+        print(f"[comfy.submit] POST {url} bytes={len(preview)}")
+        r = await client.post(url, json=payload)
         r.raise_for_status()
         j = JSONParser().parse(r.text, {"prompt_id": (str), "uuid": (str), "id": (str)})
         pid = j.get("prompt_id") or j.get("uuid") or j.get("id")
@@ -119,7 +122,9 @@ async def submit(graph: Dict[str, Any]) -> Dict[str, Any]:
                 break
     # History
     async with httpx.AsyncClient() as client:
-        hr = await client.get(COMFY_BASE + f"/api/history/{pid}")
+        hurl = COMFY_BASE + f"/api/history/{pid}"
+        print(f"[comfy.history] GET {hurl}")
+        hr = await client.get(hurl)
         if hr.status_code == 200:
             return {"prompt_id": pid, "history": JSONParser().parse(hr.text, {})}
         return {"prompt_id": pid, "history_error": hr.text}
