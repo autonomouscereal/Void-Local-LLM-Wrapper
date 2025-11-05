@@ -1671,13 +1671,14 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                         pass
                 except Exception:
                     g = dict(base_graph)
-                # Mandatory post-process: upscale with RealESRGAN x4
-                try:
-                    g["11"] = {"class_type": "RealESRGANModelLoader", "inputs": {"model_name": "realesr-general-x4v3.pth"}}
-                    g["12"] = {"class_type": "RealESRGAN", "inputs": {"image": ["9", 0], "model": ["11", 0], "scale": 4}}
-                    post_image_node = ["12", 0]
-                except Exception:
-                    post_image_node = ["9", 0]
+                # Mandatory post-process: upscale with RealESRGAN x4 (class names env-configurable)
+                ESR_LOADER = os.getenv("COMFY_REALESRGAN_LOADER_CLASS", "RealESRGANModelLoader")
+                ESR_APPLY = os.getenv("COMFY_REALESRGAN_APPLY_CLASS", "RealESRGAN")
+                ESR_MODEL_FIELD = os.getenv("COMFY_REALESRGAN_MODEL_FIELD", "model_name")
+                ESR_MODEL_NAME = os.getenv("COMFY_REALESRGAN_MODEL_NAME", "RealESRGAN_x4plus.pth")
+                g["11"] = {"class_type": ESR_LOADER, "inputs": {ESR_MODEL_FIELD: ESR_MODEL_NAME}}
+                g["12"] = {"class_type": ESR_APPLY, "inputs": {"image": ["9", 0], "model": ["11", 0], "scale": 4}}
+                post_image_node = ["12", 0]
                 # Optional post stage: CodeFormer face restore (@fidelity 0.7) if available
                 try:
                     g["13"] = {"class_type": "CodeFormerModelLoader", "inputs": {"model_name": "codeformer.pth"}}
@@ -1718,10 +1719,14 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 if not self.base:
                     return self.generate(a)
                 scale = int(a.get("scale") or 2)
+                ESR_LOADER = os.getenv("COMFY_REALESRGAN_LOADER_CLASS", "RealESRGANModelLoader")
+                ESR_APPLY = os.getenv("COMFY_REALESRGAN_APPLY_CLASS", "RealESRGAN")
+                ESR_MODEL_FIELD = os.getenv("COMFY_REALESRGAN_MODEL_FIELD", "model_name")
+                ESR_MODEL_NAME = os.getenv("COMFY_REALESRGAN_MODEL_NAME", "RealESRGAN_x4plus.pth")
                 g = {
                     "2": {"class_type": "LoadImage", "inputs": {"image": a.get("image_ref") or ""}},
-                    "11": {"class_type": "RealESRGANModelLoader", "inputs": {"model_name": "realesr-general-x4v3.pth"}},
-                    "12": {"class_type": "RealESRGAN", "inputs": {"image": ["2", 0], "model": ["11", 0], "scale": scale}},
+                    "11": {"class_type": ESR_LOADER, "inputs": {ESR_MODEL_FIELD: ESR_MODEL_NAME}},
+                    "12": {"class_type": ESR_APPLY, "inputs": {"image": ["2", 0], "model": ["11", 0], "scale": scale}},
                     "10": {"class_type": "SaveImage", "inputs": {"filename_prefix": "image_upscale", "images": ["12", 0]}},
                 }
                 js = self._post_prompt(g); pid = js.get("prompt_id") or js.get("uuid") or js.get("id"); det = self._poll(pid)
@@ -7158,8 +7163,12 @@ def build_animated_scene_workflow(
     last_image_node = "9"
     # Optional Real-ESRGAN upscale
     if upscale_enabled and upscale_scale in (2, 3, 4):
-        g["11"] = {"class_type": "RealESRGANModelLoader", "inputs": {"model_name": "realesr-general-x4v3.pth"}}
-        g["12"] = {"class_type": "RealESRGAN", "inputs": {"image": [last_image_node, 0], "model": ["11", 0], "scale": upscale_scale}}
+        ESR_LOADER = os.getenv("COMFY_REALESRGAN_LOADER_CLASS", "RealESRGANModelLoader")
+        ESR_APPLY = os.getenv("COMFY_REALESRGAN_APPLY_CLASS", "RealESRGAN")
+        ESR_MODEL_FIELD = os.getenv("COMFY_REALESRGAN_MODEL_FIELD", "model_name")
+        ESR_MODEL_NAME = os.getenv("COMFY_REALESRGAN_MODEL_NAME", "RealESRGAN_x4plus.pth")
+        g["11"] = {"class_type": ESR_LOADER, "inputs": {ESR_MODEL_FIELD: ESR_MODEL_NAME}}
+        g["12"] = {"class_type": ESR_APPLY, "inputs": {"image": [last_image_node, 0], "model": ["11", 0], "scale": upscale_scale}}
         last_image_node = "12"
     # Optional RIFE interpolation (VideoHelperSuite)
     if interpolation_enabled and interpolation_multiplier and interpolation_multiplier > 1:

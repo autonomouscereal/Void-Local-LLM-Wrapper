@@ -69,10 +69,15 @@ RUN set -eux; \
 # This ensures Pascal coverage; Maxwell nodes are not primary targets for torch wheels.
 RUN pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cu118 \
     "torch==2.7.1+cu118" "torchvision==0.22.1+cu118" "torchaudio==2.7.1+cu118"
-# Install ComfyUI requirements and common deps
-RUN pip install --no-cache-dir -r requirements.txt
-RUN pip install --no-cache-dir numpy==1.26.4 opencv-python-headless==4.9.0.80 imageio-ffmpeg==0.4.9 pillow==10.4.0 \
-    onnxruntime==1.16.3 scikit-image==0.22.0 scikit-learn==1.3.2 diffusers==0.30.2 insightface==0.7.3
+# Pin NumPy ABI FIRST, then install ComfyUI requirements without upgrading pins
+RUN pip install --no-cache-dir --upgrade "numpy==1.26.4"
+RUN pip install --no-cache-dir --upgrade-strategy only-if-needed -r requirements.txt
+# Pinned runtime libs compatible with NumPy 1.26.x and py3.10/3.11
+RUN pip install --no-cache-dir \
+    opencv-python-headless==4.9.0.80 imageio-ffmpeg==0.4.9 pillow==10.4.0 \
+    onnxruntime==1.17.3 scikit-image==0.22.0 scikit-learn==1.4.2 \
+    diffusers==0.30.2 transformers==4.44.2 accelerate==0.34.2 safetensors>=0.4.3 \
+    kornia==0.7.2 insightface==0.7.3
 # Real-ESRGAN runtime deps (GPU optional)
 RUN pip install --no-cache-dir realesrgan==0.3.0 basicsr==1.4.2 facexlib==0.3.0 filterpy
 RUN mkdir -p /comfyui/models/upscale
