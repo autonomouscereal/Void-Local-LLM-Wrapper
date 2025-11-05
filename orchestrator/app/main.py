@@ -102,6 +102,8 @@ from .analysis.media import analyze_image as _analyze_image, analyze_audio as _a
 from .review.referee import build_delta_plan as _build_delta_plan
 from .review.ledger_writer import append_ledger as _append_ledger
 from .comfy.dispatcher import load_workflow as _comfy_load_wf, patch_workflow as _comfy_patch_wf, submit as _comfy_submit
+from .comfy.client_aio import comfy_submit as _comfy_submit_aio, comfy_history as _comfy_history_aio, comfy_upload_image as _comfy_upload_image, comfy_upload_mask as _comfy_upload_mask, comfy_view as _comfy_view
+from .image.graph_builder import build_full_graph as _build_full_graph
 from .tools_image.common import ensure_dir as _ensure_dir, sidecar as _sidecar, make_outpaths as _make_outpaths, now_ts as _now_ts
 from .analysis.media import analyze_image as _analyze_image
 from .artifacts.manifest import add_manifest_row as _man_add, write_manifest_atomic as _man_write
@@ -119,6 +121,114 @@ async def _image_dispatch_run(prompt: str, negative: Optional[str], seed: Option
             w = None; h = None
     if isinstance(width, int) and width > 0: w = width
     if isinstance(height, int) and height > 0: h = height
+    # New lock-rich pipeline: upload refs → build full graph → submit → poll → save
+    uploaded: Dict[str, str] = {}
+    locks = assets.get("locks") if isinstance(assets.get("locks"), dict) else {}
+    # faces
+    for i, f in enumerate(locks.get("faces") or []):
+        b64p = f.get("ref_b64")
+        if isinstance(b64p, str) and b64p:
+            uploaded[f"face_{i}"] = await _comfy_upload_image(f"face{i}", b64p)
+    # styles
+    for i, s in enumerate(locks.get("clothes_styles") or []):
+        b64p = s.get("ref_b64")
+        if isinstance(b64p, str) and b64p:
+            uploaded[f"style_{i}"] = await _comfy_upload_image(f"style{i}", b64p)
+    # layout/depth/pose maps
+    for i, l in enumerate(locks.get("layouts") or []):
+        b64p = l.get("image_b64") or l.get("ref_b64")
+        if isinstance(b64p, str) and b64p:
+            uploaded[f"layout_{i}"] = await _comfy_upload_image(f"layout{i}", b64p)
+    for i, d in enumerate(locks.get("depths") or []):
+        b64p = d.get("image_b64") or d.get("ref_b64")
+        if isinstance(b64p, str) and b64p:
+            uploaded[f"depth_{i}"] = await _comfy_upload_image(f"depth{i}", b64p)
+    for i, p in enumerate(locks.get("poses") or []):
+        b64p = p.get("image_b64") or p.get("ref_b64")
+        if isinstance(b64p, str) and b64p:
+            uploaded[f"pose_{i}"] = await _comfy_upload_image(f"pose{i}", b64p)
+
+    graph_req: Dict[str, Any] = {
+        "prompt": prompt,
+        "negative_prompt": (negative or None),
+        "seed": (int(seed) if isinstance(seed, int) else None),
+        "width": (int(w) if isinstance(w, int) else None),
+        "height": (int(h) if isinstance(h, int) else None),
+        "locks": locks,
+    }
+    graph = _build_full_graph(graph_req, uploaded)
+    # Log payload size and write last prompt for debugging
+    try:
+        _write_text_atomic(os.path.join(UPLOAD_DIR, "last_prompt.json"), json.dumps({"client_id":"orc", "prompt": graph.get("prompt") or graph}, ensure_ascii=False))
+    except Exception:
+        pass
+    _append_ledger({
+        "phase": "image.dispatch.start",
+        "request": {"prompt": prompt, "negative": (negative or None), "seed": (int(seed) if isinstance(seed, int) else None), "width": (int(w) if isinstance(w, int) else None), "height": (int(h) if isinstance(h, int) else None)},
+    })
+    out = await _comfy_submit_aio(graph)
+    pid = out.get("prompt_id")
+    assert isinstance(pid, str) and pid
+
+    files: List[Dict[str, str]] = []
+    for _ in range(600):
+        hist = await _comfy_history_aio(pid)
+        entry = hist.get(pid) or {}
+        outs = entry.get("outputs") or {}
+        if isinstance(outs, dict):
+            for v in outs.values():
+                for img in (v.get("images") or []):
+                    fn = img.get("filename"); sf = img.get("subfolder", ""); ty = img.get("type", "output")
+                    if isinstance(fn, str) and fn:
+                        files.append({"filename": fn, "subfolder": sf, "type": ty})
+        if files:
+            break
+        await asyncio.sleep(1)
+    assert files, "no images returned from comfy history"
+
+    cid = "img-" + str(_now_ts())
+    outdir = os.path.join(UPLOAD_DIR, "artifacts", "image", cid)
+    _ensure_dir(outdir)
+    manifest = {"items": []}
+    saved: List[Dict[str, Any]] = []
+    base = (os.getenv("COMFYUI_API_URL", "http://comfyui:8188").rstrip("/"))
+    for idx, f in enumerate(files):
+        fn = f.get("filename"); assert isinstance(fn, str) and fn
+        data, ctype = await _comfy_view(fn)
+        stem = f"dispatch_00_{idx:02d}"
+        png_path, meta_path = _make_outpaths(outdir, stem)
+        with open(png_path, "wb") as _f:
+            _f.write(data)
+        _sidecar(png_path, {
+            "tool": "image.dispatch",
+            "prompt": prompt,
+            "negative": (negative or None),
+            "seed": (int(seed) if isinstance(seed, int) else None),
+            "width": (int(w) if isinstance(w, int) else None),
+            "height": (int(h) if isinstance(h, int) else None),
+            "prompt_id": pid,
+            "comfy_view": f"{base}/view?filename={fn}",
+        })
+        _man_add(manifest, png_path, step_id="image.dispatch")
+        ai = _analyze_image(png_path, prompt=str(prompt))
+        clip_s = float(ai.get("clip_score") or 0.0)
+        _trace_append("image", {"cid": cid, "tool": "image.dispatch", "prompt": prompt, "path": png_path, "clip_score": clip_s, "tags": ai.get("tags") or []})
+        _ctx_add(cid, "image", png_path, _uri_from_upload_path(png_path), None, [], {"prompt": prompt, "clip_score": clip_s})
+        saved.append({"path": png_path, "clip_score": clip_s})
+    _man_write(outdir, manifest)
+
+    # RAG index
+    pool = await get_pg_pool()
+    if pool is not None and isinstance(prompt, str) and prompt.strip():
+        emb = get_embedder()
+        vec = emb.encode([prompt])[0]
+        async with pool.acquire() as conn:
+            for s in saved:
+                rel = os.path.relpath(s.get("path"), UPLOAD_DIR).replace("\\", "/")
+                await conn.execute("INSERT INTO rag_docs (path, chunk, embedding) VALUES ($1, $2, $3)", rel, prompt, list(vec))
+
+    scores = {"image": {"clip": max([s.get("clip_score") or 0.0 for s in saved] or [0.0])}}
+    return {"cid": cid, "paths": [s.get("path") for s in saved], "scores": scores}
     wf = _comfy_load_wf()
     graph = _comfy_patch_wf(wf, prompt=prompt, negative=(negative or None), seed=seed, width=w, height=h, assets=(assets or {}))
     _append_ledger({
