@@ -736,7 +736,8 @@ def meta_prompt(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         "Do NOT reuse source media as-is unless explicitly instructed; transform or condition on them to match style, timing/beat, or visual attributes (e.g., hair/face), respecting the user's constraints. "
         "Always surface IDs and errors produced by tools: include film_id, job_id(s), prompt_id(s) when available, and concise error/traceback summaries. "
         "Return the complete Markdown answer; do not omit the main body when tools are used. "
-        "If you clearly see a small, relevant fix or improvement (e.g., a failing tool parameter or obvious config issue), you may add a short 'Suggestions' section with up to 2 concise bullet points at the end. Do not scope creep."
+        "If you clearly see a small, relevant fix or improvement (e.g., a failing tool parameter or obvious config issue), you may add a short 'Suggestions' section with up to 2 concise bullet points at the end. Do not scope creep. "
+        "MANDATORY CODE EDIT POLICY: Before making any code change or fix, ALWAYS re-read the entire target file from disk in this session. Do not rely on memory or cached content; perform a 100% fresh read every time."
     )
     out = [{"role": "system", "content": system_preface + "\nHARD BAN: Never import or recommend pydantic, sqlalchemy, or any ORM/CSV/Parquet libs; use asyncpg + JSON/NDJSON only."}]
     # Provide additional guidance for high-fidelity video preferences without relying on keywords at routing time
