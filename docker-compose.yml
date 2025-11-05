@@ -1,5 +1,5 @@
 x-build-args:
-  &cu126_args
+  &cu118_args
   PIP_EXTRA_INDEX_URL: https://download.pytorch.org/whl/cu118
 
 services:
@@ -312,7 +312,7 @@ services:
       dockerfile: Dockerfile
       network: host
       args:
-        <<: *cu126_args
+        <<: *cu118_args
     container_name: void_orchestrator
     restart: unless-stopped
     depends_on:
@@ -339,10 +339,6 @@ services:
       mfa:
         condition: service_healthy
       prosody:
-        condition: service_healthy
-      yue:
-        condition: service_healthy
-      sao:
         condition: service_healthy
       demucs:
         condition: service_healthy
@@ -399,8 +395,6 @@ services:
       - WHISPER_API_URL=http://whisper:9090
       - FACEID_API_URL=http://faceid:7000
       - MUSIC_API_URL=http://music:7860
-      - YUE_API_URL=http://yue:9001
-      - SAO_API_URL=http://sao:9002
       - DEMUCS_API_URL=http://demucs:9101
       - COMFYUI_API_URL=${COMFYUI_API_URL:-http://comfyui:8188}
       - COMFYUI_API_URLS=${COMFYUI_API_URLS:-}
@@ -424,7 +418,7 @@ services:
       dockerfile: Dockerfile
       network: host
       args:
-        <<: *cu126_args
+        <<: *cu118_args
     container_name: xtts_service
     restart: unless-stopped
     runtime: nvidia
@@ -509,7 +503,7 @@ services:
       dockerfile: Dockerfile
       network: host
       args:
-        <<: *cu126_args
+        <<: *cu118_args
     container_name: comfyui
     restart: unless-stopped
     runtime: nvidia
@@ -543,7 +537,7 @@ services:
       dockerfile: Dockerfile
       network: host
       args:
-        <<: *cu126_args
+        <<: *cu118_args
     container_name: comfyui-1
     profiles: ["comfy-replicas"]
     restart: unless-stopped
@@ -571,7 +565,7 @@ services:
       dockerfile: Dockerfile
       network: host
       args:
-        <<: *cu126_args
+        <<: *cu118_args
     container_name: comfyui-2
     profiles: ["comfy-replicas"]
     restart: unless-stopped
@@ -659,7 +653,7 @@ services:
       dockerfile: Dockerfile
       network: host
       args:
-        <<: *cu126_args
+        <<: *cu118_args
     container_name: music_service
     restart: unless-stopped
     runtime: nvidia
@@ -691,44 +685,7 @@ services:
       - film2_models:/opt/models:ro
       - film2_data:/srv/film2
     
-  yue:
-    build:
-      context: ./services/yue
-      dockerfile: Dockerfile
-      network: host
-      args:
-        <<: *cu126_args
-    container_name: yue_service
-    restart: unless-stopped
-    runtime: nvidia
-    devices:
-      - "nvidia.com/gpu=all"
-    depends_on:
-      nvidia_init:
-        condition: service_completed_successfully
-      film2_bootstrap:
-        condition: service_completed_successfully
-    environment:
-      - YUE_MODEL_ID=${YUE_MODEL_ID:-facebook/musicgen-large}
-      - NVIDIA_VISIBLE_DEVICES=all
-      
-      - HF_HOME=/models/hf
-      - TRANSFORMERS_CACHE=/models/hf
-      - TORCH_HOME=/models/torch
-    expose:
-      - "9001"
-    ports:
-      - "9001:9001"
-    shm_size: "1g"
-    healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:9001/healthz"]
-      interval: 10s
-      timeout: 5s
-    volumes:
-      - hf_cache:/models/hf
-      - torch_cache:/models/torch
-      - film2_models:/opt/models:ro
-      - film2_data:/srv/film2
+  
 
   demucs:
     build:
@@ -736,7 +693,7 @@ services:
       dockerfile: Dockerfile
       network: host
       args:
-        <<: *cu126_args
+        <<: *cu118_args
     container_name: demucs_service
     restart: unless-stopped
     depends_on:
@@ -759,42 +716,7 @@ services:
       - film2_models:/opt/models:ro
       - film2_data:/srv/film2
 
-  sao:
-    build:
-      context: ./services/sao
-      dockerfile: Dockerfile
-      network: host
-    container_name: sao_service
-    restart: unless-stopped
-    runtime: nvidia
-    devices:
-      - "nvidia.com/gpu=all"
-    depends_on:
-      nvidia_init:
-        condition: service_completed_successfully
-      film2_bootstrap:
-        condition: service_completed_successfully
-    environment:
-      - SAO_MODEL_ID=${SAO_MODEL_ID:-facebook/musicgen-large}
-      - NVIDIA_VISIBLE_DEVICES=all
-      
-      - HF_HOME=/models/hf
-      - TRANSFORMERS_CACHE=/models/hf
-      - TORCH_HOME=/models/torch
-    expose:
-      - "9002"
-    ports:
-      - "9002:9002"
-    shm_size: "1g"
-    healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:9002/healthz"]
-      interval: 10s
-      timeout: 5s
-    volumes:
-      - hf_cache:/models/hf
-      - torch_cache:/models/torch
-      - film2_models:/opt/models:ro
-      - film2_data:/srv/film2
+  
 
   vlm:
     build:
@@ -802,7 +724,7 @@ services:
       dockerfile: Dockerfile
       network: host
       args:
-        <<: *cu126_args
+        <<: *cu118_args
     container_name: vlm_service
     restart: unless-stopped
     runtime: nvidia

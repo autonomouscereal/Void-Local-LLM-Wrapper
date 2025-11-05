@@ -5,7 +5,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 RUN apt-get update && apt-get install -y git ffmpeg && rm -rf /var/lib/apt/lists/*
 
-# Compose controls PyTorch wheel channel (e.g., cu126 for Pascal P40)
+# Compose controls PyTorch wheel channel (e.g., cu118 for Pascal P40)
 ARG PIP_EXTRA_INDEX_URL
 ENV PIP_EXTRA_INDEX_URL=${PIP_EXTRA_INDEX_URL}
 

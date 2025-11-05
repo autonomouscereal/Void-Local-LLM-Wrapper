@@ -3,7 +3,7 @@ FROM python:3.10-bookworm
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-# Compose controls CUDA wheels channel for PyTorch (e.g., cu126 for Pascal P40)
+# Compose controls CUDA wheels channel for PyTorch (e.g., cu118 for Pascal P40)
 ARG PIP_EXTRA_INDEX_URL
 ENV PIP_EXTRA_INDEX_URL=${PIP_EXTRA_INDEX_URL}
 
@@ -56,7 +56,7 @@ RUN set -eux; \
     fi; \
     rm -f /comfyui/web/extensions/core/widgetInputs.js || true
 
-# Pre-install CUDA-enabled torch (cu126) compatible with P40 (sm_61) and RTX 8000.
+# Pre-install CUDA-enabled torch (cu118) compatible with P40 (sm_61) and RTX 8000.
 # This ensures Pascal coverage; Maxwell nodes are not primary targets for torch wheels.
 RUN pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cu118 \
     "torch==2.7.1+cu118" "torchvision==0.22.1+cu118" "torchaudio==2.7.1+cu118"

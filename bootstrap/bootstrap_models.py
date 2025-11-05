@@ -4,6 +4,7 @@ import json
 import subprocess
 import threading
 import time
+from pathlib import Path
 
 
 MODELS_DIR = os.environ.get("FILM2_MODELS", "/opt/models")
@@ -50,8 +51,7 @@ HF_MODELS = [
     ("cvssp/audioldm2-large",                  "audioldm2-large", None),
 ]
 
-if YUE_REPO:
-    HF_MODELS.append((YUE_REPO, "yue", None))
+# Never append YuE dynamically in bootstrap; YuE is handled as a local artifact if used.
 
 
 GIT_REPOS = [
@@ -79,7 +79,7 @@ MANDATORY_DIRS = [
     "blip2",
     "whisper",
 ]
-MANDATORY_DIRS.append("yue")
+# Do not require 'yue' as mandatory; removed from bootstrap scope
 
 
 def log(*a: object) -> None:
@@ -141,6 +141,10 @@ def snapshot(repo_id: str, local_key: str, allow_patterns: list[str] | None = No
     if os.path.isdir(tgt) and os.listdir(tgt):
         log("exists", local_key, "->", tgt)
         return
+    # Guard: skip invalid repo ids (paths/env-like assignments)
+    if not isinstance(repo_id, str) or "=" in repo_id or repo_id.strip().startswith(("/", "./", "../")):
+        log("skip-invalid-repo-id", repo_id, "->", tgt)
+        return
     log("START-HF", repo_id, "->", tgt)
     os.makedirs(tgt, exist_ok=True)
     STATUS.setdefault("hf", {})[local_key] = {"repo": repo_id, "state": "downloading"}
@@ -190,36 +194,15 @@ def git_clone(url: str, local_key: str) -> None:
 
 def main() -> None:
     ensure_pkg()
-    for rid, key, allow in HF_MODELS:
-        snapshot(rid, key, allow)
-    for url, key in GIT_REPOS:
-        git_clone(url, key)
-    # Custom YuE fetch path if not using HF
-    if not YUE_REPO:
-        # Optional tarball fetch for YuE
-        import tarfile
-        import urllib.request
-        import tempfile
-
-        def custom_fetch_yue(local_key: str = "yue") -> None:
-            tgt = os.path.join(MODELS_DIR, local_key)
-            if os.path.isdir(tgt) and os.listdir(tgt):
-                log("exists", tgt)
-                return
-            url = os.environ.get("YUE_TARBALL_URL")
-            if not url:
-                # No URL provided; leave directory check to mandatory guard
-                return
-            log("start-fetch (YuE)", url, "->", tgt)
-            os.makedirs(tgt, exist_ok=True)
-            with tempfile.TemporaryDirectory() as td:
-                fp = os.path.join(td, "yue.tar.gz")
-                urllib.request.urlretrieve(url, fp)
-                with tarfile.open(fp, "r:gz") as tar:
-                    tar.extractall(tgt)
-            log("dl-ok (YuE) ->", tgt)
-
-        custom_fetch_yue()
+    # Early exit if done marker exists
+    done_marker = os.path.join(MODELS_DIR, "manifests", ".bootstrap_done")
+    if os.path.exists(done_marker):
+        log("marker-present", done_marker, "— skipping downloads")
+    else:
+        for rid, key, allow in HF_MODELS:
+            snapshot(rid, key, allow)
+        for url, key in GIT_REPOS:
+            git_clone(url, key)
     manifest = {
         "hf": {rid: key for rid, key, _ in HF_MODELS},
         "git": {url: key for url, key in GIT_REPOS},
@@ -244,6 +227,13 @@ def main() -> None:
         log("ERROR: Missing mandatory models:", missing)
         sys.exit(3)
     log("SUMMARY: ALL MANDATORY MODELS DOWNLOADED")
+    # Write done marker
+    try:
+        os.makedirs(os.path.dirname(done_marker), exist_ok=True)
+        with open(done_marker, "w", encoding="utf-8") as f:
+            f.write(str(int(time.time())))
+    except Exception:
+        pass
     log("✅ bootstrap complete into", MODELS_DIR)
 
 
