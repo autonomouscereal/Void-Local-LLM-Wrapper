@@ -6798,8 +6798,16 @@ async def ws_tool(websocket: WebSocket):
                 await websocket.send_text(json.dumps({"done": True}))
             except Exception as ex:
                 await websocket.send_text(json.dumps({"error": str(ex)}))
+                try:
+                    await websocket.close(code=1000)
+                except Exception:
+                    pass
     except WebSocketDisconnect:
         return
+    try:
+        await websocket.close(code=1000)
+    except Exception:
+        pass
 
 @app.post("/upload")
 async def upload(file: UploadFile = File(...)):

@@ -6,6 +6,7 @@ import uuid
 import base64
 from typing import Dict, Any, Optional, Tuple
 import logging
+from pathlib import Path
 
 import aiohttp  # type: ignore
 from ..json_parser import JSONParser
@@ -21,6 +22,10 @@ async def comfy_submit(graph: Dict[str, Any], client_id: Optional[str] = None) -
     shaped = JSONParser().ensure_structure(payload, {"prompt": dict, "client_id": str})
     body_text = json.dumps(shaped, ensure_ascii=False, separators=(",", ":"))
     logging.info(f"[comfy.submit] bytes={len(body_text.encode('utf-8'))}")
+    try:
+        Path("/tmp/last_comfy_payload.json").write_bytes(body_text.encode("utf-8"))
+    except Exception:
+        pass
     async with aiohttp.ClientSession() as s:
         async with s.post(
             f"{BASE}/prompt",
