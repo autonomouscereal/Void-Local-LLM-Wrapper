@@ -3,21 +3,23 @@ FROM python:3.11-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-RUN apt-get update && apt-get install -y ffmpeg git && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg git && rm -rf /var/lib/apt/lists/*
 
-# Compose controls PyTorch wheel channel (e.g., cu126 for Pascal P40)
-ARG PIP_EXTRA_INDEX_URL
-ENV PIP_EXTRA_INDEX_URL=${PIP_EXTRA_INDEX_URL}
+# Torch cu118 (P40 + RTX 8000)
+RUN pip install --no-cache-dir --upgrade pip \
+ && pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cu118 \
+    "torch==2.7.1+cu118" "torchaudio==2.7.1+cu118" "torchvision==0.22.1+cu118" \
+ && pip install --no-cache-dir fastapi uvicorn soundfile librosa numpy scipy
+
+ENV HF_HOME=/models/hf TRANSFORMERS_CACHE=/models/hf TORCH_HOME=/models/torch
+ENV TORCH_CUDA_ARCH_LIST="6.1;7.5;8.0;8.6;8.9"
 
 WORKDIR /app
-
-COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY app /app/app
 
 EXPOSE 7860
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "7860"]
+CMD ["python","-m","app.main"]
 
 

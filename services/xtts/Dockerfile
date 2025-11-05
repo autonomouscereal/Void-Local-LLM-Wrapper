@@ -12,7 +12,8 @@ WORKDIR /app
 
 COPY requirements.txt /app/requirements.txt
 # Pre-install CUDA torch cu126 compatible with P40 and RTX 8000
-RUN pip install --no-cache-dir torch==2.8.* torchaudio torchvision
+RUN pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cu118 \
+    "torch==2.7.1+cu118" "torchvision==0.22.1+cu118" "torchaudio==2.7.1+cu118"
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY app /app/app

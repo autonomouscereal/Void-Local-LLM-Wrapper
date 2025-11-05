@@ -29,6 +29,8 @@ def write_status() -> None:
         json.dump(STATUS, f, indent=2)
 
 
+YUE_REPO = os.environ.get("YUE_REPO", "").strip()
+
 HF_MODELS = [
     ("tencent/HunyuanVideo",                  "hunyuan",        None),
     ("Lightricks/LTX-Video",                  "ltx_video",      None),
@@ -41,7 +43,15 @@ HF_MODELS = [
     ("laion/clap-htsat-unfused",              "clap",           None),
     ("Salesforce/blip2-flan-t5-xl",           "blip2",          None),
     ("openai/whisper-large-v3",               "whisper",        None),
+    # Audio composition/variation (optional pre-warm)
+    ("facebook/musicgen-large",                "musicgen-large", None),
+    ("facebook/musicgen-melody",               "musicgen-melody", None),
+    ("facebook/audiogen-medium",               "audiogen-medium", None),
+    ("cvssp/audioldm2-large",                  "audioldm2-large", None),
 ]
+
+if YUE_REPO:
+    HF_MODELS.append((YUE_REPO, "yue", None))
 
 
 GIT_REPOS = [
@@ -54,6 +64,22 @@ GIT_REPOS = [
     ("https://github.com/MegEngine/ECCV2022-RIFE.git",               "rife"),
     ("https://github.com/CMU-Perceptual-Computing-Lab/openpose.git", "openpose"),
 ]
+
+# Mandatory model directories must exist (non-empty) after bootstrap
+MANDATORY_DIRS = [
+    "hunyuan",
+    "ltx_video",
+    "instantid",
+    "ip_adapter",
+    "controlnet",
+    "sam",
+    "depth_anything",
+    "clip",
+    "clap",
+    "blip2",
+    "whisper",
+]
+MANDATORY_DIRS.append("yue")
 
 
 def log(*a: object) -> None:
@@ -168,6 +194,32 @@ def main() -> None:
         snapshot(rid, key, allow)
     for url, key in GIT_REPOS:
         git_clone(url, key)
+    # Custom YuE fetch path if not using HF
+    if not YUE_REPO:
+        # Optional tarball fetch for YuE
+        import tarfile
+        import urllib.request
+        import tempfile
+
+        def custom_fetch_yue(local_key: str = "yue") -> None:
+            tgt = os.path.join(MODELS_DIR, local_key)
+            if os.path.isdir(tgt) and os.listdir(tgt):
+                log("exists", tgt)
+                return
+            url = os.environ.get("YUE_TARBALL_URL")
+            if not url:
+                # No URL provided; leave directory check to mandatory guard
+                return
+            log("start-fetch (YuE)", url, "->", tgt)
+            os.makedirs(tgt, exist_ok=True)
+            with tempfile.TemporaryDirectory() as td:
+                fp = os.path.join(td, "yue.tar.gz")
+                urllib.request.urlretrieve(url, fp)
+                with tarfile.open(fp, "r:gz") as tar:
+                    tar.extractall(tgt)
+            log("dl-ok (YuE) ->", tgt)
+
+        custom_fetch_yue()
     manifest = {
         "hf": {rid: key for rid, key, _ in HF_MODELS},
         "git": {url: key for url, key in GIT_REPOS},
@@ -183,6 +235,15 @@ def main() -> None:
         log("SUMMARY: PENDING/MISSING", sorted(pending.keys()))
     else:
         log("SUMMARY: ALL MODELS DOWNLOADED")
+    # Hard fail if any mandatory directory is missing or empty
+    missing = [
+        k for k in MANDATORY_DIRS
+        if not (os.path.isdir(os.path.join(MODELS_DIR, k)) and os.listdir(os.path.join(MODELS_DIR, k)))
+    ]
+    if missing:
+        log("ERROR: Missing mandatory models:", missing)
+        sys.exit(3)
+    log("SUMMARY: ALL MANDATORY MODELS DOWNLOADED")
     log("✅ bootstrap complete into", MODELS_DIR)
 
 

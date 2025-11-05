@@ -11,7 +11,8 @@ ENV PIP_EXTRA_INDEX_URL=${PIP_EXTRA_INDEX_URL}
 WORKDIR /app
 
 COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir torch==2.8.* torchaudio torchvision
+RUN pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cu118 \
+    "torch==2.7.1+cu118" "torchvision==0.22.1+cu118" "torchaudio==2.7.1+cu118"
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY app /app/app

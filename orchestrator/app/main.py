@@ -397,6 +397,135 @@ def _write_json_atomic(path: str, obj: Any) -> Dict[str, Any]:
     return _write_text_atomic(path, _j.dumps(obj, ensure_ascii=False, separators=(",", ":")))
 
 
+# -------------------- Audio Router API (minimal hands-off pipeline) --------------------
+
+MUSIC_API_URL = os.getenv("MUSIC_API_URL", "http://music:7860").rstrip("/")
+MELODY_API_URL = os.getenv("MELODY_API_URL", "http://melody:7861").rstrip("/")
+DSINGER_API_URL = os.getenv("DSINGER_API_URL", "http://dsinger:7862").rstrip("/")
+RVC_API_URL = os.getenv("RVC_API_URL", "http://rvc:7863").rstrip("/")
+SFX_API_URL = os.getenv("SFX_API_URL", "http://sfx:7866").rstrip("/")
+VOCAL_FIXER_API_URL = os.getenv("VOCAL_FIXER_API_URL", "http://vocalfix:7864").rstrip("/")
+MASTERING_API_URL = os.getenv("MASTERING_API_URL", "http://master:7865").rstrip("/")
+MFA_API_URL = os.getenv("MFA_API_URL", "http://mfa:7867").rstrip("/")
+PROSODY_API_URL = os.getenv("PROSODY_API_URL", "http://prosody:7868").rstrip("/")
+
+
+@app.post("/v1/audio/lyrics-to-song")
+async def audio_lyrics_to_song(req: Request):
+    body = await req.json()
+    expected = {
+        "prompt": "",
+        "lyrics": "",
+        "seconds": 30,
+        "seed": None,
+        "voice_lock_id": None,
+        "sfx_prompt": None,
+    }
+    data = JSONParser().parse(body, expected) if isinstance(body, (str, bytes)) else {**expected, **(body or {})}
+    prompt = str(data.get("prompt") or "").strip()
+    lyrics = str(data.get("lyrics") or "").strip()
+    seconds = int(data.get("seconds") or 30)
+    seed = data.get("seed")
+    voice_lock_id = data.get("voice_lock_id")
+    sfx_prompt = data.get("sfx_prompt")
+    if not prompt and not lyrics:
+        return JSONResponse(status_code=400, content={"error": "missing prompt or lyrics"})
+
+    async with httpx.AsyncClient() as client:
+        # 1) Melody/score from lyrics
+        score = None
+        if lyrics:
+            try:
+                r = await client.post(f"{MELODY_API_URL}/score", json={"lyrics": lyrics, "bpm": 140, "key": "E minor"})
+                score = r.json()
+            except Exception:
+                score = None
+
+        # 1b) Prosody deltas
+        if score and lyrics:
+            try:
+                r = await client.post(f"{PROSODY_API_URL}/suggest", json={"lyrics": lyrics, "score_json": score, "style_tags": None})
+                pros = r.json() or {}
+                score["prosody_deltas"] = pros
+            except Exception:
+                pass
+
+        # 2) Backing track (Music service)
+        backing_b64 = None
+        try:
+            r = await client.post(f"{MUSIC_API_URL}/generate", json={"prompt": prompt or lyrics, "seconds": seconds, "seed": seed})
+            backing_b64 = (r.json() or {}).get("audio_wav_base64")
+        except Exception:
+            backing_b64 = None
+
+        # 3) Sing (DiffSinger) → dry vocal
+        vocal_b64 = None
+        if score:
+            try:
+                r = await client.post(f"{DSINGER_API_URL}/sing", json={"score_json": score, "seconds": seconds, "seed": seed})
+                vocal_b64 = (r.json() or {}).get("audio_wav_base64")
+            except Exception:
+                vocal_b64 = None
+
+        # 3b) MFA alignment
+        mfa = None
+        if vocal_b64 and lyrics:
+            try:
+                r = await client.post(f"{MFA_API_URL}/align", json={"lyrics": lyrics, "wav_bytes": vocal_b64})
+                mfa = r.json() or {}
+            except Exception:
+                mfa = None
+
+        # 4) Vocal fixer (auto-tune/align/de-ess)
+        if vocal_b64 and score:
+            try:
+                r = await client.post(f"{VOCAL_FIXER_API_URL}/vocal_fix", json={"wav_bytes": vocal_b64, "score_json": score, "key": "E minor"})
+                vocal_b64 = (r.json() or {}).get("audio_wav_base64") or vocal_b64
+            except Exception:
+                pass
+
+        # 5) Voice convert (RVC)
+        if vocal_b64 and voice_lock_id:
+            try:
+                r = await client.post(f"{RVC_API_URL}/convert", json={"wav_bytes": vocal_b64, "voice_lock_id": voice_lock_id})
+                vocal_b64 = (r.json() or {}).get("audio_wav_base64") or vocal_b64
+            except Exception:
+                pass
+
+        # 6) Optional SFX
+        sfx_items = []
+        if sfx_prompt:
+            try:
+                r = await client.post(f"{SFX_API_URL}/sfx", json={"prompt": sfx_prompt, "len_s": min(8, seconds)})
+                j = r.json() or {}
+                if isinstance(j.get("audio_wav_base64"), str):
+                    sfx_items.append(j["audio_wav_base64"])
+            except Exception:
+                sfx_items = []
+
+    # 7) Mastering (apply on backing as placeholder)
+    mastered_b64 = None
+    try:
+        if backing_b64:
+            r = await httpx.AsyncClient().post(f"{MASTERING_API_URL}/master", json={"wav_bytes": backing_b64, "lufs_target": -14.0, "tp_ceiling_db": -1.0})
+            mastered_b64 = (r.json() or {}).get("audio_wav_base64")
+    except Exception:
+        mastered_b64 = None
+
+    # Return components (mixing node can be added later)
+    resp = {
+        "backing_audio_wav_base64": backing_b64,
+        "mastered_backing_wav_base64": mastered_b64,
+        "vocal_audio_wav_base64": vocal_b64,
+        "score": score or {},
+        "sfx": sfx_items,
+        "seconds": seconds,
+    }
+    if 'mfa' in locals() and mfa:
+        resp["mfa_alignment"] = mfa
+    return resp
+
+
 @app.get("/capabilities.json")
 async def capabilities():
     try:

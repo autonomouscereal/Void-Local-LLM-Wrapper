@@ -58,7 +58,8 @@ RUN set -eux; \
 
 # Pre-install CUDA-enabled torch (cu126) compatible with P40 (sm_61) and RTX 8000.
 # This ensures Pascal coverage; Maxwell nodes are not primary targets for torch wheels.
-RUN pip install --no-cache-dir torch==2.8.* torchvision torchaudio
+RUN pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cu118 \
+    "torch==2.7.1+cu118" "torchvision==0.22.1+cu118" "torchaudio==2.7.1+cu118"
 # Install ComfyUI requirements and common deps
 RUN pip install --no-cache-dir -r requirements.txt
 RUN pip install --no-cache-dir numpy==1.26.4 opencv-python-headless==4.9.0.80 imageio-ffmpeg==0.4.9 pillow==10.4.0 \

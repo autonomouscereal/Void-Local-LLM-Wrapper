@@ -2,52 +2,55 @@ from __future__ import annotations
 
 import io
 import os
+import base64
 from typing import Dict, Any
 
 import numpy as np
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
-from transformers import AutoProcessor, MusicgenForConditionalGeneration
+from common.torch_guard import ensure_cuda_safe
+from .yue_engine import load_yue, generate_song
 
 
-MODEL_ID = os.getenv("MUSIC_MODEL_ID", "facebook/musicgen-small")
+YUE_DIR = os.getenv("YUE_MODEL_ID", "/opt/models/yue")
 
-app = FastAPI(title="MusicGen Service", version="0.1.0")
+app = FastAPI(title="YuE Music Service", version="0.2.0")
 
 _model = None
-_proc = None
+_device = None
 
 
 def get_model():
-    global _model, _proc
+    global _model, _device
     if _model is None:
-        _model = MusicgenForConditionalGeneration.from_pretrained(MODEL_ID)
-        _proc = AutoProcessor.from_pretrained(MODEL_ID)
-    return _model, _proc
+        _device = ensure_cuda_safe()
+        _model = load_yue(YUE_DIR, device=_device)
+    return _model, _device
 
 
 @app.get("/healthz")
 async def healthz():
-    return {"status": "ok"}
+    ok = os.path.isdir(YUE_DIR) and bool(os.listdir(YUE_DIR))
+    return {"status": "ok" if ok else "missing_yue", "yue_dir": YUE_DIR}
 
 
 @app.post("/generate")
 async def generate(body: Dict[str, Any]):
     prompt = body.get("prompt") or ""
-    duration = int(body.get("duration", 8))
+    seconds = int(body.get("seconds", 8))
     if not prompt:
         return JSONResponse(status_code=400, content={"error": "missing prompt"})
-    model, proc = get_model()
-    inputs = proc(text=[prompt], padding=True, return_tensors="pt")
-    audio_values = model.generate(**inputs, do_sample=True, guidance_scale=3.0, max_new_tokens=duration * 50)
-    audio = audio_values[0, 0].cpu().numpy()
-    import soundfile as sf
-    buf = io.BytesIO()
-    sf.write(buf, audio, 32000, format="WAV")
-    buf.seek(0)
-    import base64
-    b64 = base64.b64encode(buf.read()).decode("utf-8")
+    model, device = get_model()
+    wav = generate_song(model, prompt=prompt, seconds=seconds, seed=body.get("seed"), refs=body.get("refs"), device=device)
+    if not isinstance(wav, (bytes, bytearray)):
+        # Expecting raw WAV bytes; if ndarray, encode to wav
+        import soundfile as sf
+        buf = io.BytesIO()
+        arr = np.asarray(wav, dtype=np.float32)
+        sf.write(buf, arr, 32000, format="WAV")
+        wav = buf.getvalue()
+    b64 = base64.b64encode(wav).decode("utf-8")
     return {"audio_wav_base64": b64, "sample_rate": 32000}
 
 
