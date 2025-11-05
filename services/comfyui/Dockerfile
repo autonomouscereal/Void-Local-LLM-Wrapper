@@ -9,7 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     rm -rf /var/lib/apt/lists/*
 
 # Constraints (lock numpy<2 and friends)
-COPY services/comfyui/constraints.txt /constraints.txt
+COPY constraints.txt /constraints.txt
 ENV PIP_CONSTRAINT=/constraints.txt
 ENV GIT_TERMINAL_PROMPT=0
 
