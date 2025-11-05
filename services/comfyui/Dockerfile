@@ -54,6 +54,15 @@ RUN set -eux; \
     else \
       git -C /comfyui/custom_nodes clone --depth 1 https://github.com/kijai/ComfyUI-SVDiffusion-Relight.git ComfyUI-SVDiffusion-Relight || true; \
     fi; \
+    # Real-ESRGAN custom node(s)
+    if [ -d /comfyui/custom_nodes/ComfyUI-Real-ESRGAN ]; then \
+      git -C /comfyui/custom_nodes/ComfyUI-Real-ESRGAN pull --rebase || true; \
+    else \
+      git -C /comfyui/custom_nodes clone --depth 1 https://github.com/pythongosssss/ComfyUI-Real-ESRGAN.git ComfyUI-Real-ESRGAN || true; \
+    fi; \
+    if [ ! -d /comfyui/custom_nodes/ComfyUI-Real-ESRGAN ] && [ ! -d /comfyui/custom_nodes/comfyui-RealESRGAN ]; then \
+      git -C /comfyui/custom_nodes clone --depth 1 https://github.com/Acly/comfyui-RealESRGAN.git comfyui-RealESRGAN || true; \
+    fi; \
     rm -f /comfyui/web/extensions/core/widgetInputs.js || true
 
 # Pre-install CUDA-enabled torch (cu118) compatible with P40 (sm_61) and RTX 8000.
@@ -64,6 +73,9 @@ RUN pip install --no-cache-dir --extra-index-url https://download.pytorch.org/wh
 RUN pip install --no-cache-dir -r requirements.txt
 RUN pip install --no-cache-dir numpy==1.26.4 opencv-python-headless==4.9.0.80 imageio-ffmpeg==0.4.9 pillow==10.4.0 \
     onnxruntime==1.16.3 scikit-image==0.22.0 scikit-learn==1.3.2 diffusers==0.30.2 insightface==0.7.3
+# Real-ESRGAN runtime deps (GPU optional)
+RUN pip install --no-cache-dir realesrgan==0.3.0 basicsr==1.4.2 facexlib==0.3.0 filterpy
+RUN mkdir -p /comfyui/models/upscale
 ## execstack not available on Debian slim; rely on onnxruntime==1.14.1 CPU wheel which avoids execstack
 
 EXPOSE 8188

@@ -440,6 +440,7 @@ services:
     shm_size: "1g"
     volumes:
       - comfyui_models:/comfyui/models
+      - ./assets/comfyui/models/upscale:/comfyui/models/upscale
       - comfyui_custom_nodes:/comfyui/custom_nodes
       - comfyui_input:/comfyui/input
     # For GPU deployments, create additional comfyui-* services and set COMFYUI_API_URLS accordingly
@@ -472,6 +473,7 @@ services:
       - "8189:8188"
     volumes:
       - comfyui_models:/comfyui/models
+      - ./assets/comfyui/models/upscale:/comfyui/models/upscale
       - comfyui_custom_nodes:/comfyui/custom_nodes
       - comfyui_input:/comfyui/input
 
@@ -499,6 +501,7 @@ services:
       - "8190:8188"
     volumes:
       - comfyui_models:/comfyui/models
+      - ./assets/comfyui/models/upscale:/comfyui/models/upscale
       - comfyui_custom_nodes:/comfyui/custom_nodes
       - comfyui_input:/comfyui/input
 
