@@ -56,7 +56,6 @@ services:
       test: ["CMD","curl","-sf","http://localhost:7861/healthz"]
       interval: 10s
       timeout: 5s
-      retries: 12
 
   dsinger:
     build:
@@ -81,7 +80,6 @@ services:
       test: ["CMD","curl","-sf","http://localhost:7862/healthz"]
       interval: 10s
       timeout: 5s
-      retries: 12
 
   rvc:
     build:
@@ -106,7 +104,6 @@ services:
       test: ["CMD","curl","-sf","http://localhost:7863/healthz"]
       interval: 10s
       timeout: 5s
-      retries: 12
 
   vocalfix:
     build:
@@ -131,7 +128,6 @@ services:
       test: ["CMD","curl","-sf","http://localhost:7864/healthz"]
       interval: 10s
       timeout: 5s
-      retries: 12
 
   master:
     build:
@@ -148,7 +144,6 @@ services:
       test: ["CMD","curl","-sf","http://localhost:7865/healthz"]
       interval: 10s
       timeout: 5s
-      retries: 12
 
   mfa:
     build:
@@ -165,7 +160,7 @@ services:
       test: ["CMD","curl","-sf","http://localhost:7867/healthz"]
       interval: 10s
       timeout: 5s
-    retries: 12
+    
 
   prosody:
     build:
@@ -182,7 +177,7 @@ services:
       test: ["CMD","curl","-sf","http://localhost:7868/healthz"]
       interval: 10s
       timeout: 5s
-      retries: 12
+      
   sfx:
     build:
       context: ./services/sfx
@@ -206,7 +201,7 @@ services:
       test: ["CMD","curl","-sf","http://localhost:7866/healthz"]
       interval: 10s
       timeout: 5s
-      retries: 12
+      
   nvidia_init:
     image: ubuntu:22.04
     container_name: nvidia_init
@@ -245,7 +240,6 @@ services:
       test: ["CMD-SHELL", "pg_isready -U rag -d ragdb"]
       interval: 10s
       timeout: 5s
-      retries: 12
   ollama_qwen:
     image: ollama/ollama:latest
     container_name: ollama_qwen
@@ -268,7 +262,6 @@ services:
       test: ["CMD", "sh", "-lc", "ollama list >/dev/null 2>&1"]
       interval: 10s
       timeout: 5s
-      retries: 12
 
   init_qwen:
     image: curlimages/curl:8.7.1
@@ -302,7 +295,6 @@ services:
       test: ["CMD", "sh", "-lc", "ollama list >/dev/null 2>&1"]
       interval: 10s
       timeout: 5s
-      retries: 12
 
   init_gptoss:
     image: curlimages/curl:8.7.1
@@ -459,7 +451,6 @@ services:
       test: ["CMD", "curl", "-sf", "http://localhost:8020/healthz"]
       interval: 10s
       timeout: 5s
-      retries: 12
     volumes:
       - hf_cache:/models/hf
       - torch_cache:/models/torch
@@ -644,7 +635,6 @@ services:
       test: ["CMD", "curl", "-sf", "http://localhost:5678/healthz"]
       interval: 10s
       timeout: 5s
-      retries: 12
 
   n8n_init:
     image: n8nio/n8n:latest
@@ -695,7 +685,6 @@ services:
       test: ["CMD", "curl", "-sf", "http://localhost:7860/healthz"]
       interval: 10s
       timeout: 5s
-      retries: 12
     volumes:
       - hf_cache:/models/hf
       - torch_cache:/models/torch
@@ -735,7 +724,6 @@ services:
       test: ["CMD", "curl", "-sf", "http://localhost:9001/healthz"]
       interval: 10s
       timeout: 5s
-      retries: 12
     volumes:
       - hf_cache:/models/hf
       - torch_cache:/models/torch
@@ -765,7 +753,6 @@ services:
       test: ["CMD", "curl", "-sf", "http://localhost:9101/healthz"]
       interval: 10s
       timeout: 5s
-      retries: 12
     volumes:
       - torch_cache:/models/torch
       - demucs_cache:/root/.cache/demucs
@@ -803,7 +790,6 @@ services:
       test: ["CMD", "curl", "-sf", "http://localhost:9002/healthz"]
       interval: 10s
       timeout: 5s
-      retries: 12
     volumes:
       - hf_cache:/models/hf
       - torch_cache:/models/torch
@@ -842,7 +828,6 @@ services:
       test: ["CMD", "curl", "-sf", "http://localhost:8050/healthz"]
       interval: 10s
       timeout: 5s
-      retries: 12
     volumes:
       - hf_cache:/models/hf
       - torch_cache:/models/torch
