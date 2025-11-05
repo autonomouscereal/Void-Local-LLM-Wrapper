@@ -33,10 +33,8 @@ RUN curl -fL https://codeload.github.com/comfyanonymous/ComfyUI/tar.gz/master \
 # No custom node tarball pulls; rely on ComfyUI core only
 
 RUN mkdir -p /comfyui/models/upscale /comfyui/input /comfyui/output
-COPY services/comfyui/comfy-start.sh /usr/local/bin/comfy-start.sh
-RUN chmod +x /usr/local/bin/comfy-start.sh
 
 EXPOSE 8188
-CMD ["/usr/local/bin/comfy-start.sh"]
+CMD ["python","-m","ComfyUI.main","--listen","--port","8188"]
 
 
