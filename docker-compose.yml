@@ -232,6 +232,9 @@ services:
       - XTTS_MODEL_NAME=tts_models/multilingual/multi-dataset/xtts_v2
       - NVIDIA_VISIBLE_DEVICES=all
       - PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu126
+      - HF_HOME=/models/hf
+      - TRANSFORMERS_CACHE=/models/hf
+      - TORCH_HOME=/models/torch
     expose:
       - "8020"
     ports:
@@ -242,13 +245,6 @@ services:
       interval: 10s
       timeout: 5s
       retries: 12
-    environment:
-      - XTTS_MODEL_NAME=tts_models/multilingual/multi-dataset/xtts_v2
-      - NVIDIA_VISIBLE_DEVICES=all
-      - PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu126
-      - HF_HOME=/models/hf
-      - TRANSFORMERS_CACHE=/models/hf
-      - TORCH_HOME=/models/torch
     volumes:
       - hf_cache:/models/hf
       - torch_cache:/models/torch
