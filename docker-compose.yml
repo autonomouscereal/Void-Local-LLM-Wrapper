@@ -321,6 +321,7 @@ services:
       - MUSIC_API_URL=http://music:7860
       - DEMUCS_API_URL=http://demucs:9101
       - COMFYUI_API_URL=${COMFYUI_API_URL:-http://comfyui:8188}
+      - COMFY_WORKFLOW_PATH=/workspace/services/image/workflows/stock_smoke.json
       - COMFYUI_API_URLS=${COMFYUI_API_URLS:-}
       - COMFYUI_REPLICAS=${COMFYUI_REPLICAS:-1}
       - SCENE_SUBMIT_CONCURRENCY=${SCENE_SUBMIT_CONCURRENCY:-4}

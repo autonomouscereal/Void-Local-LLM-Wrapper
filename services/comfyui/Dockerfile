@@ -84,6 +84,39 @@ except Exception as e:
     print('[insightface preload] skipped:', e)
 PY
 
+# Ensure ComfyUI-InstantID has a package __init__.py pointing to the node module that defines NODE_CLASS_MAPPINGS
+RUN python - <<'PY'
+import os, sys
+root = "/comfyui/custom_nodes/ComfyUI-InstantID"
+init_path = os.path.join(root, "__init__.py")
+if not os.path.isdir(root):
+    sys.exit(0)
+def find_node_module() -> str | None:
+    for d, _, fs in os.walk(root):
+        for f in fs:
+            if not f.endswith('.py'): continue
+            p = os.path.join(d, f)
+            try:
+                with open(p, 'r', encoding='utf-8', errors='ignore') as fh:
+                    txt = fh.read()
+                if ('NODE_CLASS_MAPPINGS' in txt) and ('NODE_DISPLAY_NAME_MAPPINGS' in txt):
+                    rel = os.path.relpath(p, root).replace('\\', '/').removesuffix('.py')
+                    return rel
+            except Exception:
+                continue
+    return None
+mod = find_node_module()
+if (not os.path.isfile(init_path)) and mod:
+    with open(init_path, 'w', encoding='utf-8') as f:
+        f.write(f"from .{mod.replace('/', '.')} import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS\n")
+    print('[instantid] created __init__.py ->', mod)
+elif not os.path.isfile(init_path):
+    # Fallback to common filename
+    with open(init_path, 'w', encoding='utf-8') as f:
+        f.write("from .InstantIDNode import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS\n")
+    print('[instantid] created fallback __init__.py')
+PY
+
 # Ensure PyYAML is in ComfyUI requirements and install via requirements.txt (respects constraints)
 RUN if [ -f /comfyui/requirements.txt ]; then \
       (grep -qi '^PyYAML' /comfyui/requirements.txt || echo 'PyYAML==6.0.1' >> /comfyui/requirements.txt); \
