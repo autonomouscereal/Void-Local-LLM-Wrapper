@@ -27,32 +27,32 @@ RUN pip install --no-cache-dir \
 
 # ComfyUI via codeload tarball (no git)
 WORKDIR /comfyui
-RUN curl -sSL https://codeload.github.com/comfyanonymous/ComfyUI/tar.gz/refs/heads/master \
-    | tar -xz --strip-components=1 -C /comfyui
+RUN curl -fL https://codeload.github.com/comfyanonymous/ComfyUI/tar.gz/master \
+    | tar -xzf - --strip-components=1 -C /comfyui
 
 # Custom nodes via codeload tarballs
 RUN mkdir -p /comfyui/custom_nodes/ComfyUI-Real-ESRGAN && \
-    curl -sSL https://codeload.github.com/pythongosssss/ComfyUI-Real-ESRGAN/tar.gz/refs/heads/main \
-      | tar -xz --strip-components=1 -C /comfyui/custom_nodes/ComfyUI-Real-ESRGAN || \
+    curl -fL https://codeload.github.com/pythongosssss/ComfyUI-Real-ESRGAN/tar.gz/main \
+      | tar -xzf - --strip-components=1 -C /comfyui/custom_nodes/ComfyUI-Real-ESRGAN || \
     ( mkdir -p /comfyui/custom_nodes/comfyui-RealESRGAN && \
-      curl -sSL https://codeload.github.com/Acly/comfyui-RealESRGAN/tar.gz/refs/heads/main \
-        | tar -xz --strip-components=1 -C /comfyui/custom_nodes/comfyui-RealESRGAN )
+      curl -fL https://codeload.github.com/Acly/comfyui-RealESRGAN/tar.gz/main \
+        | tar -xzf - --strip-components=1 -C /comfyui/custom_nodes/comfyui-RealESRGAN )
 
 RUN mkdir -p /comfyui/custom_nodes/ComfyUI_IPAdapter_plus && \
-    curl -sSL https://codeload.github.com/cubiq/ComfyUI_IPAdapter_plus/tar.gz/refs/heads/main \
-      | tar -xz --strip-components=1 -C /comfyui/custom_nodes/ComfyUI_IPAdapter_plus
+    curl -fL https://codeload.github.com/cubiq/ComfyUI_IPAdapter_plus/tar.gz/main \
+      | tar -xzf - --strip-components=1 -C /comfyui/custom_nodes/ComfyUI_IPAdapter_plus
 
 RUN mkdir -p /comfyui/custom_nodes/ComfyUI-InstantID && \
-    curl -sSL https://codeload.github.com/cubiq/ComfyUI-InstantID/tar.gz/refs/heads/main \
-      | tar -xz --strip-components=1 -C /comfyui/custom_nodes/ComfyUI-InstantID
+    curl -fL https://codeload.github.com/cubiq/ComfyUI-InstantID/tar.gz/main \
+      | tar -xzf - --strip-components=1 -C /comfyui/custom_nodes/ComfyUI-InstantID
 
 RUN mkdir -p /comfyui/custom_nodes/ComfyUI-VideoHelperSuite && \
-    curl -sSL https://codeload.github.com/Kosinkadink/ComfyUI-VideoHelperSuite/tar.gz/refs/heads/main \
-      | tar -xz --strip-components=1 -C /comfyui/custom_nodes/ComfyUI-VideoHelperSuite
+    curl -fL https://codeload.github.com/Kosinkadink/ComfyUI-VideoHelperSuite/tar.gz/main \
+      | tar -xzf - --strip-components=1 -C /comfyui/custom_nodes/ComfyUI-VideoHelperSuite
 
 RUN mkdir -p /comfyui/custom_nodes/ComfyUI-AnimateDiff-Evolved && \
-    curl -sSL https://codeload.github.com/ArtVentureX/comfyui-animatediff/tar.gz/refs/heads/main \
-      | tar -xz --strip-components=1 -C /comfyui/custom_nodes/ComfyUI-AnimateDiff-Evolved
+    curl -fL https://codeload.github.com/ArtVentureX/comfyui-animatediff/tar.gz/main \
+      | tar -xzf - --strip-components=1 -C /comfyui/custom_nodes/ComfyUI-AnimateDiff-Evolved
 
 # Real-ESRGAN runtime deps (respect constraints)
 RUN pip install --no-cache-dir realesrgan basicsr facexlib filterpy
