@@ -29,6 +29,29 @@ PROJECTS_PREFIX = "projects"
 
 app = FastAPI(title="Film 2.0", version=FILM_VERSION)
 
+# Model presence guard
+MODEL_ROOT = os.getenv("FILM2_MODELS", "/opt/models").rstrip("/")
+REQUIRED_MODELS = [s.strip() for s in os.getenv("FILM2_REQUIRED_MODELS", "hunyuan,clip,whisper").split(",") if s.strip()]
+_MODEL_HEALTH = {"ok": True, "missing": []}  # mutated at startup
+
+def _check_models_exist(model_root: str, keys: List[str]) -> List[str]:
+    missing: List[str] = []
+    for k in keys:
+        if not os.path.exists(os.path.join(model_root, k)):
+            missing.append(k)
+    return missing
+
+@app.on_event("startup")
+async def _startup_model_guard():
+    try:
+        missing = _check_models_exist(MODEL_ROOT, REQUIRED_MODELS)
+        if missing:
+            _MODEL_HEALTH["ok"] = False
+            _MODEL_HEALTH["missing"] = missing
+    except Exception:
+        _MODEL_HEALTH["ok"] = False
+        _MODEL_HEALTH["missing"] = REQUIRED_MODELS
+
 
 # -------------------- Helpers --------------------
 
@@ -853,6 +876,8 @@ async def film_export(body: Dict[str, Any]):
 
 @app.get("/healthz")
 async def healthz():
-    return {"status": "ok"}
+    if _MODEL_HEALTH.get("ok", True):
+        return {"status": "ok"}
+    return {"status": "degraded", "missing_models": list(_MODEL_HEALTH.get("missing", []))}
 
 

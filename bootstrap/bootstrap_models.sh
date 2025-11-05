@@ -15,11 +15,44 @@ if [ "$need_cli" -eq 1 ]; then
   pip install -U "huggingface_hub[cli]" git-lfs >/dev/null 2>&1 || true
 fi
 
+# Ensure huggingface_hub is importable for Python snapshot_download
+python3 - <<'PY' >/dev/null 2>&1 || (
+  pip install -U huggingface_hub >/dev/null 2>&1 || true
+)
+import sys
+try:
+    import huggingface_hub  # noqa: F401
+except Exception:
+    sys.exit(1)
+PY
+
+py_snapshot() { # $1=repo  $2=local_dir
+  python3 - "$1" "$2" <<'PY'
+import os, sys
+from huggingface_hub import snapshot_download
+repo_id, local_dir = sys.argv[1], sys.argv[2]
+os.makedirs(local_dir, exist_ok=True)
+snapshot_download(
+    repo_id=repo_id,
+    local_dir=local_dir,
+    local_dir_use_symlinks=False,
+)
+print(f"[dl-ok] {repo_id} -> {local_dir}")
+PY
+}
+
+git_clone() { # $1=url $2=dir
+  local url="$1"; local dir="$2"
+  if [ -d "$dir/.git" ] || [ -d "$dir" ]; then log "exists $dir"; return 0; fi
+  git clone --depth=1 "$url" "$dir" >/dev/null 2>&1 || return 1
+  log "[git-ok] $url -> $dir"
+}
+
 hf_snap() { # $1=repo  $2=subdir
   local repo="$1"; local sub="$2"; local tgt="$MODELS_DIR/$sub"
   if [ -d "$tgt" ]; then log "exists $tgt"; return 0; fi
   log "download $repo -> $tgt"
-  if ! huggingface-cli download "$repo" --local-dir "$tgt" --resume-download --exclude "*.md"; then
+  if ! py_snapshot "$repo" "$tgt"; then
     log "FAILED to download $repo (see above)."
     echo "$repo" >> "$MODELS_DIR/manifests/failed.txt"
     return 0
@@ -28,7 +61,8 @@ hf_snap() { # $1=repo  $2=subdir
 
 # Core video gen/edit
 hf_snap "tencent/HunyuanVideo"                          "hunyuan"
-hf_snap "OpenMotionLab/Open-Sora"                        "opensora"
+# Prefer GitHub clone for Open-Sora code
+git_clone "https://github.com/hpcaitech/Open-Sora.git"   "$MODELS_DIR/opensora" || echo "hpcaitech/Open-Sora" >> "$MODELS_DIR/manifests/failed.txt"
 hf_snap "NUS-Tim/LTX-Video"                              "ltx_video"
 # Optional: Stable Video Diffusion (disabled when SKIP_SVD=1)
 if [ "${SKIP_SVD:-0}" != "1" ]; then
@@ -43,17 +77,20 @@ hf_snap "facebook/sam2-hiera-large"                      "sam"
 hf_snap "tryon/tryondiffusion"                           "tryon"
 
 # Temporal/geometry
-hf_snap "princeton-vl/RAFT"                              "raft"
+# Prefer GitHub clone for RAFT code
+git_clone "https://github.com/princeton-vl/RAFT.git"     "$MODELS_DIR/raft" || echo "princeton-vl/RAFT" >> "$MODELS_DIR/manifests/failed.txt"
 hf_snap "LiheYoung/Depth-Anything-V2-base"               "depth_anything"
-hf_snap "CMU/openpose"                                   "openpose"
+# Prefer GitHub clone for OpenPose code
+git_clone "https://github.com/CMU-Perceptual-Computing-Lab/openpose.git" "$MODELS_DIR/openpose" || echo "CMU/openpose" >> "$MODELS_DIR/manifests/failed.txt"
 
 # Relight/restore/SR/interp
 hf_snap "lllyasviel/IC-Light"                            "ic_light"
-hf_snap "ckpt/BasicVSR-PP"                               "basicvsrpp" || true
-hf_snap "ckpt/EDVR"                                      "edvr" || true
-hf_snap "TencentARC/GFPGAN"                              "gfpgan"
-hf_snap "sczhou/CodeFormer"                              "codeformer"
-hf_snap "megvii-research/ECCV2022-RIFE"                  "rife"
+# Prefer GitHub clones for SR/restore/interp libs
+git_clone "https://github.com/ckkelvinchan/BasicVSR_PlusPlus.git" "$MODELS_DIR/basicvsrpp" || echo "ckkelvinchan/BasicVSR_PlusPlus" >> "$MODELS_DIR/manifests/failed.txt"
+git_clone "https://github.com/xinntao/EDVR.git"                   "$MODELS_DIR/edvr"       || echo "xinntao/EDVR" >> "$MODELS_DIR/manifests/failed.txt"
+git_clone "https://github.com/TencentARC/GFPGAN.git"              "$MODELS_DIR/gfpgan"     || echo "TencentARC/GFPGAN" >> "$MODELS_DIR/manifests/failed.txt"
+git_clone "https://github.com/sczhou/CodeFormer.git"              "$MODELS_DIR/codeformer"  || echo "sczhou/CodeFormer" >> "$MODELS_DIR/manifests/failed.txt"
+git_clone "https://github.com/MegEngine/ECCV2022-RIFE.git"        "$MODELS_DIR/rife"        || echo "MegEngine/ECCV2022-RIFE" >> "$MODELS_DIR/manifests/failed.txt"
 
 # Caption/score
 hf_snap "laion/CLIP-ViT-L-14-336"                        "clip"
