@@ -1,0 +1,21 @@
+# numpy 1.x ABI locks (avoid the crash you saw)
+numpy==1.26.4
+scipy<1.13
+
+# core stack pinned for py3.10/3.11 + torch 2.7.1 + numpy 1.26
+kornia==0.7.2
+onnxruntime==1.17.3
+scikit-learn==1.4.2
+opencv-python-headless==4.9.0.80
+safetensors>=0.4.3
+accelerate==0.34.2
+transformers==4.44.2
+diffusers==0.30.2
+insightface==0.7.3
+
+# Real-ESRGAN runtime
+basicsr==1.4.2
+facexlib==0.3.0
+realesrgan==0.3.0
+filterpy
+

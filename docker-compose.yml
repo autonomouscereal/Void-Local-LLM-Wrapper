@@ -335,7 +335,7 @@ services:
       - ./:/workspace
       - film2_models:/opt/models:ro
       - film2_data:/srv/film2
-      - comfyui_input:/comfyui/input
+      - ./assets/comfyui/input:/comfyui/input
 
   xtts:
     build:
@@ -442,7 +442,8 @@ services:
       - comfyui_models:/comfyui/models
       - ./assets/comfyui/models/upscale:/comfyui/models/upscale
       - comfyui_custom_nodes:/comfyui/custom_nodes
-      - comfyui_input:/comfyui/input
+      - ./assets/comfyui/input:/comfyui/input
+      - ./assets/comfyui/output:/comfyui/output
     # For GPU deployments, create additional comfyui-* services and set COMFYUI_API_URLS accordingly
 
   # Optional additional ComfyUI replicas for dynamic distribution
@@ -475,7 +476,8 @@ services:
       - comfyui_models:/comfyui/models
       - ./assets/comfyui/models/upscale:/comfyui/models/upscale
       - comfyui_custom_nodes:/comfyui/custom_nodes
-      - comfyui_input:/comfyui/input
+      - ./assets/comfyui/input:/comfyui/input
+      - ./assets/comfyui/output:/comfyui/output
 
   comfyui-2:
     build:
@@ -503,7 +505,8 @@ services:
       - comfyui_models:/comfyui/models
       - ./assets/comfyui/models/upscale:/comfyui/models/upscale
       - comfyui_custom_nodes:/comfyui/custom_nodes
-      - comfyui_input:/comfyui/input
+      - ./assets/comfyui/input:/comfyui/input
+      - ./assets/comfyui/output:/comfyui/output
 
   comfyui_init:
     build:
