@@ -55,16 +55,7 @@ RUN rm -rf /comfyui/custom_nodes/ComfyUI-Real-ESRGAN /comfyui/custom_nodes/comfy
 RUN mkdir -p /comfyui/custom_nodes/ComfyUI_IPAdapter_plus && \
     curl -fL https://codeload.github.com/cubiq/ComfyUI_IPAdapter_plus/tar.gz/main \
       | tar -xzf - --strip-components=1 -C /comfyui/custom_nodes/ComfyUI_IPAdapter_plus
-RUN mkdir -p /comfyui/custom_nodes/ComfyUI-InstantID && \
-    (curl -fL https://codeload.github.com/cubiq/ComfyUI-InstantID/tar.gz/main \
-      | tar -xzf - --strip-components=1 -C /comfyui/custom_nodes/ComfyUI-InstantID || true) && \
-    if [ ! -f /comfyui/custom_nodes/ComfyUI-InstantID/__init__.py ]; then \
-      (curl -fL https://codeload.github.com/InstantX/ComfyUI-InstantID/tar.gz/main \
-        | tar -xzf - --strip-components=1 -C /comfyui/custom_nodes/ComfyUI-InstantID || true); \
-    fi && \
-    if [ ! -f /comfyui/custom_nodes/ComfyUI-InstantID/__init__.py ] && [ -f /comfyui/custom_nodes/ComfyUI-InstantID/InstantIDNode.py ]; then \
-      echo 'from .InstantIDNode import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS' > /comfyui/custom_nodes/ComfyUI-InstantID/__init__.py; \
-    fi
+## Intentionally NOT installing ComfyUI-InstantID; use IPAdapter FaceID path instead
 RUN mkdir -p /comfyui/custom_nodes/ComfyUI-VideoHelperSuite && \
     curl -fL https://codeload.github.com/Kosinkadink/ComfyUI-VideoHelperSuite/tar.gz/main \
       | tar -xzf - --strip-components=1 -C /comfyui/custom_nodes/ComfyUI-VideoHelperSuite
@@ -84,70 +75,8 @@ except Exception as e:
     print('[insightface preload] skipped:', e)
 PY
 
-# Ensure ComfyUI-InstantID has a robust __init__.py that imports by relative name or absolute file path
-RUN python - <<'PY'
-import os, sys, json, importlib.util
-root = "/comfyui/custom_nodes/ComfyUI-InstantID"
-os.makedirs(root, exist_ok=True)
-init_path = os.path.join(root, "__init__.py")
-
-TEMPLATE = '''
-import os, importlib.util
-
-def _load_rel():
-    try:
-        from .InstantIDNode import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS  # type: ignore
-        return NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
-    except Exception as e:
-        return None
-
-def _load_by_path(filename: str):
-    here = os.path.dirname(__file__)
-    node_path = os.path.join(here, filename)
-    if not os.path.exists(node_path):
-        return None
-    spec = importlib.util.spec_from_file_location("ComfyUI_InstantID_Node", node_path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)  # type: ignore
-    return getattr(mod, 'NODE_CLASS_MAPPINGS', None), getattr(mod, 'NODE_DISPLAY_NAME_MAPPINGS', None)
-
-def _scan_any():
-    here = os.path.dirname(__file__)
-    for d, _, fs in os.walk(here):
-        for f in fs:
-            if not f.endswith('.py'):
-                continue
-            p = os.path.join(d, f)
-            try:
-                with open(p, 'r', encoding='utf-8', errors='ignore') as fh:
-                    txt = fh.read()
-                if ('NODE_CLASS_MAPPINGS' in txt) and ('NODE_DISPLAY_NAME_MAPPINGS' in txt):
-                    spec = importlib.util.spec_from_file_location("ComfyUI_InstantID_Node_any", p)
-                    mod = importlib.util.module_from_spec(spec)
-                    spec.loader.exec_module(mod)  # type: ignore
-                    ncm = getattr(mod, 'NODE_CLASS_MAPPINGS', None)
-                    ndm = getattr(mod, 'NODE_DISPLAY_NAME_MAPPINGS', None)
-                    if ncm and ndm:
-                        return ncm, ndm
-            except Exception:
-                continue
-    return None
-
-_res = _load_rel()
-if not _res:
-    _res = _load_by_path('InstantIDNode.py')
-if not _res:
-    _res = _scan_any()
-if not _res:
-    raise RuntimeError('[ComfyUI-InstantID] Unable to locate NODE_CLASS_MAPPINGS in InstantIDNode. Check repository layout.')
-
-NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS = _res
-'''
-
-with open(init_path, 'w', encoding='utf-8') as f:
-    f.write(TEMPLATE)
-print('[instantid] wrote robust __init__.py')
-PY
+# Ensure model dirs for IPAdapter+ exist
+RUN mkdir -p /comfyui/models/ipadapter /comfyui/models/clip_vision /comfyui/models/loras /comfyui/models/insightface
 
 # Ensure PyYAML is in ComfyUI requirements and install via requirements.txt (respects constraints)
 RUN if [ -f /comfyui/requirements.txt ]; then \
