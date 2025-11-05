@@ -14,11 +14,7 @@ diffusers==0.30.2
 insightface==0.7.3
 imageio-ffmpeg==0.5.1
 
-# Real-ESRGAN runtime
-basicsr==1.4.2
-facexlib==0.3.0
-realesrgan==0.3.0
-filterpy
+# (removed Real-ESRGAN runtime; using built-in Upscale nodes)
 
 # ComfyUI base runtime imports
 PyYAML==6.0.1
@@ -27,4 +23,12 @@ tqdm==4.66.4
 einops==0.7.0
 packaging>=23
 filelock>=3.12
+
+# InstantID and runtime deps
+onnx==1.19.1
+scikit-image==0.22.0
+matplotlib==3.10.7
+easydict==1.13
+prettytable==3.16.0
+requests>=2.31
 

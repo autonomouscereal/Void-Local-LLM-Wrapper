@@ -22,7 +22,17 @@ RUN python -V && pip -V && \
       "torch==2.7.1+cu118" "torchvision==0.22.1+cu118" "torchaudio==2.7.1+cu118"
 
 # Explicitly install modules required by custom nodes (constrained by PIP_CONSTRAINT)
-RUN pip install --no-cache-dir opencv-python-headless diffusers imageio-ffmpeg
+RUN pip install --no-cache-dir \
+      opencv-python-headless \
+      diffusers \
+      imageio-ffmpeg \
+      insightface \
+      onnx \
+      scikit-image \
+      matplotlib \
+      easydict \
+      prettytable \
+      requests
 
 # Core libs under constraints
 RUN pip install --no-cache-dir --no-deps -r /constraints.txt && \
@@ -35,7 +45,8 @@ RUN curl -fL https://codeload.github.com/comfyanonymous/ComfyUI/tar.gz/master \
     | tar -xzf - --strip-components=1 -C /comfyui
 
 # Ensure no leftover Real-ESRGAN custom node remains in the image (two common names)
-RUN rm -rf /comfyui/custom_nodes/ComfyUI-Real-ESRGAN /comfyui/custom_nodes/comfyui-RealESRGAN || true
+RUN rm -rf /comfyui/custom_nodes/ComfyUI-Real-ESRGAN /comfyui/custom_nodes/comfyui-RealESRGAN || true && \
+    find /comfyui/custom_nodes -maxdepth 1 -type d -iname "*real*esrgan*" -exec rm -rf {} + || true
 
 # Install only the custom nodes we actually use (no Real-ESRGAN)
 RUN mkdir -p /comfyui/custom_nodes/ComfyUI_IPAdapter_plus && \
