@@ -535,6 +535,7 @@ services:
     restart: unless-stopped
     environment:
       - PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu126
+      - TORCH_HOME=/models/torch
     expose:
       - "9101"
     ports:
@@ -544,8 +545,6 @@ services:
       interval: 10s
       timeout: 5s
       retries: 12
-    environment:
-      - TORCH_HOME=/models/torch
     volumes:
       - torch_cache:/models/torch
       - demucs_cache:/root/.cache/demucs
@@ -569,6 +568,9 @@ services:
       - SAO_MODEL_ID=${SAO_MODEL_ID:-facebook/musicgen-large}
       - NVIDIA_VISIBLE_DEVICES=all
       - PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu126
+      - HF_HOME=/models/hf
+      - TRANSFORMERS_CACHE=/models/hf
+      - TORCH_HOME=/models/torch
     expose:
       - "9002"
     ports:
@@ -579,10 +581,6 @@ services:
       interval: 10s
       timeout: 5s
       retries: 12
-    environment:
-      - HF_HOME=/models/hf
-      - TRANSFORMERS_CACHE=/models/hf
-      - TORCH_HOME=/models/torch
     volumes:
       - hf_cache:/models/hf
       - torch_cache:/models/torch
@@ -607,6 +605,9 @@ services:
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu126
+      - HF_HOME=/models/hf
+      - TRANSFORMERS_CACHE=/models/hf
+      - TORCH_HOME=/models/torch
     expose:
       - "8050"
     ports:
@@ -617,10 +618,6 @@ services:
       interval: 10s
       timeout: 5s
       retries: 12
-    environment:
-      - HF_HOME=/models/hf
-      - TRANSFORMERS_CACHE=/models/hf
-      - TORCH_HOME=/models/torch
     volumes:
       - hf_cache:/models/hf
       - torch_cache:/models/torch
