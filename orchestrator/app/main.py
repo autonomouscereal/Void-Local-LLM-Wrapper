@@ -2244,12 +2244,12 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             def _post_prompt(self, graph: Dict[str, Any]) -> Dict[str, Any]:
                 import httpx as _hx  # type: ignore
                 with _hx.Client() as client:
-                    r = client.post(self.base + "/api/prompt", json={"prompt": graph, "client_id": "wrapper-001"})
+                    r = client.post(self.base + "/prompt", json={"prompt": graph, "client_id": "wrapper-001"})
                     r.raise_for_status(); return _resp_json(r, {"prompt_id": str, "uuid": str, "id": str})
             def _poll(self, pid: str) -> Dict[str, Any]:
                 import httpx as _hx, time as _tm  # type: ignore
                 while True:
-                    r = _hx.get(self.base + f"/api/history/{pid}")
+                    r = _hx.get(self.base + f"/history/{pid}")
                     if r.status_code == 200:
                         js = _resp_json(r, {"history": dict}); h = (js.get("history") or {}).get(pid)
                         if h and _comfy_is_completed(h):
@@ -3210,13 +3210,13 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                                 g["22"] = {"class_type": "InstantIDApply", "inputs": {"model": ["1", 0], "image": ["2", 0], "embedding": emb, "strength": 0.70}}
                                 g["6"]["inputs"]["model"] = ["22", 0]
                                 with _hx.Client() as _c2:
-                                    pr = _c2.post(COMFYUI_API_URL.rstrip("/") + "/api/prompt", json={"prompt": g, "client_id": "wrapper-001"})
+                                    pr = _c2.post(COMFYUI_API_URL.rstrip("/") + "/prompt", json={"prompt": g, "client_id": "wrapper-001"})
                                     if pr.status_code == 200:
                                         pj = _resp_json(pr, {"prompt_id": str, "uuid": str, "id": str})
                                         pid = (pj.get("prompt_id") or pj.get("uuid") or pj.get("id"))
                                         # poll for completion
                                         while True:
-                                            hr = _c2.get(COMFYUI_API_URL.rstrip("/") + f"/api/history/{pid}")
+                                            hr = _c2.get(COMFYUI_API_URL.rstrip("/") + f"/history/{pid}")
                                             if hr.status_code == 200:
                                                 hj = _resp_json(hr, {})
                                                 hist = hj.get("history") if isinstance(hj, dict) else {}
@@ -3421,12 +3421,12 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                                 g["22"] = {"class_type": "InstantIDApply", "inputs": {"model": ["1", 0], "image": ["2", 0], "embedding": emb, "strength": 0.70}}
                                 g["6"]["inputs"]["model"] = ["22", 0]
                                 with _hx.Client() as _c2:
-                                    pr = _c2.post(COMFYUI_API_URL.rstrip("/") + "/api/prompt", json={"prompt": g, "client_id": "wrapper-001"})
+                                    pr = _c2.post(COMFYUI_API_URL.rstrip("/") + "/prompt", json={"prompt": g, "client_id": "wrapper-001"})
                                     if pr.status_code == 200:
                                         pj = _resp_json(pr, {"prompt_id": str, "uuid": str, "id": str})
                                         pid = (pj.get("prompt_id") or pj.get("uuid") or pj.get("id"))
                                         while True:
-                                            hr = _c2.get(COMFYUI_API_URL.rstrip("/") + f"/api/history/{pid}")
+                                            hr = _c2.get(COMFYUI_API_URL.rstrip("/") + f"/history/{pid}")
                                             if hr.status_code == 200:
                                                 hj = _resp_json(hr, {"history": dict})
                                                 h = (hj.get("history") or {}).get(pid)
@@ -3686,7 +3686,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             if isinstance(wf_payload, dict) and "prompt" not in wf_payload:
                 wf_payload = {"prompt": wf_payload}
             wf_payload = {**(wf_payload or {}), "client_id": "wrapper-001"}
-            r = await client.post(COMFYUI_API_URL.rstrip("/") + "/api/prompt", json=wf_payload)
+            r = await client.post(COMFYUI_API_URL.rstrip("/") + "/prompt", json=wf_payload)
             try:
                 r.raise_for_status()
                 return {"name": name, "result": _resp_json(r, {})}
@@ -3698,7 +3698,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             if isinstance(wf_payload, dict) and "prompt" not in wf_payload:
                 wf_payload = {"prompt": wf_payload}
             wf_payload = {**(wf_payload or {}), "client_id": "wrapper-001"}
-            r = await client.post(COMFYUI_API_URL.rstrip("/") + "/api/prompt", json=wf_payload)
+            r = await client.post(COMFYUI_API_URL.rstrip("/") + "/prompt", json=wf_payload)
             try:
                 r.raise_for_status()
                 return {"name": name, "result": _resp_json(r, {})}
@@ -3710,7 +3710,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             if isinstance(wf_payload, dict) and "prompt" not in wf_payload:
                 wf_payload = {"prompt": wf_payload}
             wf_payload = {**(wf_payload or {}), "client_id": "wrapper-001"}
-            r = await client.post(COMFYUI_API_URL.rstrip("/") + "/api/prompt", json=wf_payload)
+            r = await client.post(COMFYUI_API_URL.rstrip("/") + "/prompt", json=wf_payload)
             try:
                 r.raise_for_status()
                 return {"name": name, "result": _resp_json(r, {})}
@@ -5633,12 +5633,12 @@ async def tool_run(body: Dict[str, Any]):
                 def _post_prompt(self, graph: Dict[str, Any]) -> Dict[str, Any]:
                     import httpx as _hx  # type: ignore
                     with _hx.Client() as client:
-                        r = client.post(self.base + "/api/prompt", json={"prompt": graph, "client_id": "wrapper-001"})
+                        r = client.post(self.base + "/prompt", json={"prompt": graph, "client_id": "wrapper-001"})
                         r.raise_for_status(); return _resp_json(r, {"prompt_id": str, "uuid": str, "id": str})
                 def _poll(self, pid: str) -> Dict[str, Any]:
                     import httpx as _hx, time as _tm  # type: ignore
                     while True:
-                        r = _hx.get(self.base + f"/api/history/{pid}")
+                        r = _hx.get(self.base + f"/history/{pid}")
                         if r.status_code == 200:
                             js = _resp_json(r, {})
                             hist = js.get("history") if isinstance(js, dict) else {}
@@ -6886,14 +6886,14 @@ async def _comfy_submit_workflow(workflow: Dict[str, Any]) -> Dict[str, Any]:
                             if "prompt" not in payload and isinstance(workflow, dict):
                                 payload = {"prompt": workflow}
                             payload = {**payload, "client_id": "wrapper-001"}
-                            r = await client.post(base.rstrip("/") + "/api/prompt", json=payload)
+                            r = await client.post(base.rstrip("/") + "/prompt", json=payload)
                     else:
                         _comfy_load[base] = _comfy_load.get(base, 0) + 1
                         payload = workflow if isinstance(workflow, dict) else {"prompt": workflow}
                         if "prompt" not in payload and isinstance(workflow, dict):
                             payload = {"prompt": workflow}
                         payload = {**payload, "client_id": "wrapper-001"}
-                        r = await client.post(base.rstrip("/") + "/api/prompt", json=payload)
+                        r = await client.post(base.rstrip("/") + "/prompt", json=payload)
                     try:
                         r.raise_for_status()
                         res = _resp_json(r, {"prompt_id": str, "uuid": str, "id": str})
@@ -6933,7 +6933,7 @@ async def _comfy_history(prompt_id: str) -> Dict[str, Any]:
     if not base:
         return {"error": "COMFYUI_API_URL(S) not configured"}
     async with httpx.AsyncClient() as client:
-        r = await client.get(base.rstrip("/") + f"/api/history/{prompt_id}")
+    r = await client.get(base.rstrip("/") + f"/history/{prompt_id}")
         try:
             r.raise_for_status()
             return _resp_json(r, {})
