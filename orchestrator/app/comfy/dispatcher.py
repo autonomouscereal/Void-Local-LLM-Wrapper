@@ -130,16 +130,25 @@ def patch_workflow(base_graph: Dict[str, Any], *, prompt: Optional[str] = None, 
     _patch_text_prompts(g, prompt, negative)
     _patch_seeds(g, seed)
     _patch_size(g, width, height)
-    # Optional: remap RealESRGAN class names to match installed node impls
-    loader_cls = os.getenv("COMFY_REALESRGAN_LOADER_CLASS", "")
-    apply_cls = os.getenv("COMFY_REALESRGAN_APPLY_CLASS", "")
-    if loader_cls or apply_cls:
-        for node in (g.get("prompt") or {}).values():
-            ct = node.get("class_type")
-            if loader_cls and ct == "RealESRGANModelLoader":
-                node["class_type"] = loader_cls
-            if apply_cls and ct == "RealESRGAN":
-                node["class_type"] = apply_cls
+    # Remap any RealESRGAN nodes in incoming workflows to ComfyUI core upscaler nodes
+    for node in (g.get("prompt") or {}).values():
+        ct = node.get("class_type")
+        if ct == "RealESRGANModelLoader":
+            node["class_type"] = "UpscaleModelLoader"
+            inp = node.setdefault("inputs", {})
+            if "model_name" not in inp:
+                # Use configured default if not present
+                inp["model_name"] = os.getenv("COMFY_UPSCALE_MODEL", "4x-UltraSharp.pth")
+        if ct == "RealESRGAN":
+            node["class_type"] = "ImageUpscaleWithModel"
+            inp = node.setdefault("inputs", {})
+            # Map 'model' -> 'upscale_model' if present
+            if "model" in inp and "upscale_model" not in inp:
+                inp["upscale_model"] = inp.pop("model")
+            # 'image' key is already correct for core node
+            # Remove obsolete 'scale' if present; core node doesn't need it
+            if "scale" in inp:
+                inp.pop("scale", None)
     if assets:
         patch_assets(g, assets)
     return g
