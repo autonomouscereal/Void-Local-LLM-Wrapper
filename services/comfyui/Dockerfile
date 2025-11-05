@@ -5,7 +5,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates curl tar ffmpeg && \
+    ca-certificates curl tar ffmpeg build-essential g++ && \
     rm -rf /var/lib/apt/lists/*
 
 # Constraints (lock numpy<2 and friends)
@@ -20,6 +20,9 @@ RUN python -V && pip -V && \
     pip install --no-cache-dir --upgrade "PyYAML==6.0.1" && \
     pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cu118 \
       "torch==2.7.1+cu118" "torchvision==0.22.1+cu118" "torchaudio==2.7.1+cu118"
+
+# Build helpers for packages that may fall back to sdist (e.g., insightface)
+RUN pip install --no-cache-dir "setuptools<70" wheel "cython==3.0.10" "pybind11>=2.12"
 
 # Explicitly install modules required by custom nodes (constrained by PIP_CONSTRAINT)
 RUN pip install --no-cache-dir \
