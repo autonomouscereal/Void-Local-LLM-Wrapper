@@ -24,17 +24,6 @@ services:
       - ./bootstrap:/bootstrap:ro
     restart: "no"
 
-  preflight:
-    image: python:3.11-slim
-    container_name: preflight
-    depends_on:
-      film2_bootstrap:
-        condition: service_completed_successfully
-    command: ["python","/common/model_guard.py"]
-    volumes:
-      - film2_models:/opt/models:ro
-      - ./:/common:ro
-    restart: "no"
 
   melody:
     build:
@@ -44,18 +33,14 @@ services:
     container_name: melody_service
     restart: unless-stopped
     depends_on:
-      film2_bootstrap:
-        condition: service_completed_successfully
+      - film2_bootstrap
     environment:
       - NVIDIA_VISIBLE_DEVICES=${MUSIC_GPU:-all}
     expose:
       - "7861"
     ports:
       - "7861:7861"
-    healthcheck:
-      test: ["CMD","curl","-sf","http://localhost:7861/healthz"]
-      interval: 10s
-      timeout: 5s
+    
 
   dsinger:
     build:
@@ -68,18 +53,14 @@ services:
     devices:
       - "nvidia.com/gpu=all"
     depends_on:
-      nvidia_init:
-        condition: service_completed_successfully
+      - nvidia_init
     environment:
       - NVIDIA_VISIBLE_DEVICES=${MUSIC_GPU:-all}
     expose:
       - "7862"
     ports:
       - "7862:7862"
-    healthcheck:
-      test: ["CMD","curl","-sf","http://localhost:7862/healthz"]
-      interval: 10s
-      timeout: 5s
+    
 
   rvc:
     build:
@@ -92,18 +73,14 @@ services:
     devices:
       - "nvidia.com/gpu=all"
     depends_on:
-      nvidia_init:
-        condition: service_completed_successfully
+      - nvidia_init
     environment:
       - NVIDIA_VISIBLE_DEVICES=${MUSIC_GPU:-all}
     expose:
       - "7863"
     ports:
       - "7863:7863"
-    healthcheck:
-      test: ["CMD","curl","-sf","http://localhost:7863/healthz"]
-      interval: 10s
-      timeout: 5s
+    
 
   vocalfix:
     build:
@@ -116,18 +93,14 @@ services:
     devices:
       - "nvidia.com/gpu=all"
     depends_on:
-      nvidia_init:
-        condition: service_completed_successfully
+      - nvidia_init
     environment:
       - NVIDIA_VISIBLE_DEVICES=${MUSIC_GPU:-all}
     expose:
       - "7864"
     ports:
       - "7864:7864"
-    healthcheck:
-      test: ["CMD","curl","-sf","http://localhost:7864/healthz"]
-      interval: 10s
-      timeout: 5s
+    
 
   master:
     build:
@@ -140,10 +113,7 @@ services:
       - "7865"
     ports:
       - "7865:7865"
-    healthcheck:
-      test: ["CMD","curl","-sf","http://localhost:7865/healthz"]
-      interval: 10s
-      timeout: 5s
+    
 
   mfa:
     build:
@@ -156,10 +126,7 @@ services:
       - "7867"
     ports:
       - "7867:7867"
-    healthcheck:
-      test: ["CMD","curl","-sf","http://localhost:7867/healthz"]
-      interval: 10s
-      timeout: 5s
+    
     
 
   prosody:
@@ -173,10 +140,7 @@ services:
       - "7868"
     ports:
       - "7868:7868"
-    healthcheck:
-      test: ["CMD","curl","-sf","http://localhost:7868/healthz"]
-      interval: 10s
-      timeout: 5s
+    
       
   sfx:
     build:
@@ -189,18 +153,14 @@ services:
     devices:
       - "nvidia.com/gpu=all"
     depends_on:
-      nvidia_init:
-        condition: service_completed_successfully
+      - nvidia_init
     environment:
       - NVIDIA_VISIBLE_DEVICES=${MUSIC_GPU:-all}
     expose:
       - "7866"
     ports:
       - "7866:7866"
-    healthcheck:
-      test: ["CMD","curl","-sf","http://localhost:7866/healthz"]
-      interval: 10s
-      timeout: 5s
+    
       
   nvidia_init:
     image: ubuntu:22.04
@@ -236,10 +196,7 @@ services:
       - "5432:5432"
     volumes:
       - pgvector_data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U rag -d ragdb"]
-      interval: 10s
-      timeout: 5s
+    
   ollama_qwen:
     image: ollama/ollama:latest
     container_name: ollama_qwen
@@ -248,8 +205,7 @@ services:
     devices:
       - "nvidia.com/gpu=all"
     depends_on:
-      nvidia_init:
-        condition: service_completed_successfully
+      - nvidia_init
     ports:
       - "11434:11434"
     environment:
@@ -258,17 +214,13 @@ services:
       - NVIDIA_VISIBLE_DEVICES=${OLLAMA_QWEN_GPU:-all}
     volumes:
       - ollama_qwen_data:/root/.ollama
-    healthcheck:
-      test: ["CMD", "sh", "-lc", "ollama list >/dev/null 2>&1"]
-      interval: 10s
-      timeout: 5s
+    
 
   init_qwen:
     image: curlimages/curl:8.7.1
     container_name: init_qwen
     depends_on:
-      ollama_qwen:
-        condition: service_started
+      - ollama_qwen
     environment:
       - QWEN_MODEL_ID=${QWEN_MODEL_ID:-qwen3:32b-instruct-q4_K_M}
     command: ["sh","-lc","until curl -s http://ollama_qwen:11434/api/tags >/dev/null; do sleep 2; done; curl -s -X POST http://ollama_qwen:11434/api/pull -H 'Content-Type: application/json' -d '{\"name\":\"${QWEN_MODEL_ID}\"}'"]
@@ -281,8 +233,7 @@ services:
     devices:
       - "nvidia.com/gpu=all"
     depends_on:
-      nvidia_init:
-        condition: service_completed_successfully
+      - nvidia_init
     ports:
       - "11435:11434"
     environment:
@@ -291,17 +242,13 @@ services:
       - NVIDIA_VISIBLE_DEVICES=${OLLAMA_GPTOSS_GPU:-all}
     volumes:
       - ollama_gptoss_data:/root/.ollama
-    healthcheck:
-      test: ["CMD", "sh", "-lc", "ollama list >/dev/null 2>&1"]
-      interval: 10s
-      timeout: 5s
+    
 
   init_gptoss:
     image: curlimages/curl:8.7.1
     container_name: init_gptoss
     depends_on:
-      ollama_gptoss:
-        condition: service_started
+      - ollama_gptoss
     environment:
       - GPTOSS_MODEL_ID=${GPTOSS_MODEL_ID}
     command: ["sh","-lc","until curl -s http://ollama_gptoss:11434/api/tags >/dev/null; do sleep 2; done; curl -s -X POST http://ollama_gptoss:11434/api/pull -H 'Content-Type: application/json' -d '{\"name\":\"${GPTOSS_MODEL_ID}\"}'"]
@@ -315,41 +262,9 @@ services:
         <<: *cu118_args
     container_name: void_orchestrator
     restart: unless-stopped
-    depends_on:
-      pgvector:
-        condition: service_healthy
-      ollama_qwen:
-        condition: service_healthy
-      ollama_gptoss:
-        condition: service_healthy
-      music:
-        condition: service_healthy
-      melody:
-        condition: service_healthy
-      dsinger:
-        condition: service_healthy
-      rvc:
-        condition: service_healthy
-      sfx:
-        condition: service_healthy
-      vocalfix:
-        condition: service_healthy
-      master:
-        condition: service_healthy
-      mfa:
-        condition: service_healthy
-      prosody:
-        condition: service_healthy
-      demucs:
-        condition: service_healthy
-      xtts:
-        condition: service_healthy
-      film2_bootstrap:
-        condition: service_completed_successfully
-      preflight:
-        condition: service_completed_successfully
+    
     environment:
-      - REQUIRED_SERVICES=music,melody,dsinger,rvc,sfx,vocalfix,master,mfa,prosody,xtts,demucs,film2
+      
       - FILM2_MODELS=/opt/models
       - FILM2_DATA=/srv/film2
       - QWEN_BASE_URL=http://ollama_qwen:11434
@@ -404,7 +319,7 @@ services:
       - UPLOAD_DIR=/workspace/uploads
       - VLM_API_URL=http://vlm:8050
       - OCR_API_URL=http://ocr:8070
-    command: ["/bin/bash","-lc","/app/app/gate.sh && uvicorn app.main:app --host 0.0.0.0 --port 8000"]
+    command: ["/bin/bash","-lc","uvicorn app.main:app --host 0.0.0.0 --port 8000"]
     ports:
       - "8000:8000"
     volumes:
@@ -425,10 +340,8 @@ services:
     devices:
       - "nvidia.com/gpu=all"
     depends_on:
-      nvidia_init:
-        condition: service_completed_successfully
-      film2_bootstrap:
-        condition: service_completed_successfully
+      - nvidia_init
+      - film2_bootstrap
     environment:
       - XTTS_MODEL_NAME=tts_models/multilingual/multi-dataset/xtts_v2
       - NVIDIA_VISIBLE_DEVICES=all
@@ -441,10 +354,7 @@ services:
     ports:
       - "8020:8020"
     shm_size: "1g"
-    healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8020/healthz"]
-      interval: 10s
-      timeout: 5s
+    
     volumes:
       - hf_cache:/models/hf
       - torch_cache:/models/torch
@@ -464,8 +374,7 @@ services:
     devices:
       - "nvidia.com/gpu=all"
     depends_on:
-      nvidia_init:
-        condition: service_completed_successfully
+      - nvidia_init
     environment:
       - WHISPER_MODEL_NAME=large-v3
       - WHISPER_CPU_THREADS=8
@@ -487,8 +396,7 @@ services:
     devices:
       - "nvidia.com/gpu=all"
     depends_on:
-      nvidia_init:
-        condition: service_completed_successfully
+      - nvidia_init
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
     expose:
@@ -508,10 +416,8 @@ services:
     restart: unless-stopped
     runtime: nvidia
     depends_on:
-      comfyui_init:
-        condition: service_completed_successfully
-      nvidia_init:
-        condition: service_completed_successfully
+      - comfyui_init
+      - nvidia_init
     devices:
       - "nvidia.com/gpu=all"
     environment:
@@ -543,10 +449,8 @@ services:
     restart: unless-stopped
     runtime: nvidia
     depends_on:
-      comfyui_init:
-        condition: service_completed_successfully
-      nvidia_init:
-        condition: service_completed_successfully
+      - comfyui_init
+      - nvidia_init
     devices:
       - "nvidia.com/gpu=all"
     environment:
@@ -571,10 +475,8 @@ services:
     restart: unless-stopped
     runtime: nvidia
     depends_on:
-      comfyui_init:
-        condition: service_completed_successfully
-      nvidia_init:
-        condition: service_completed_successfully
+      - comfyui_init
+      - nvidia_init
     devices:
       - "nvidia.com/gpu=all"
     environment:
@@ -625,17 +527,13 @@ services:
       - "5678:5678"
     volumes:
       - n8n_data:/home/node/.n8n
-    healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:5678/healthz"]
-      interval: 10s
-      timeout: 5s
+    
 
   n8n_init:
     image: n8nio/n8n:latest
     container_name: n8n_init
     depends_on:
-      n8n:
-        condition: service_started
+      - n8n
     environment:
       - N8N_HOST=n8n
       - N8N_PROTOCOL=http
@@ -660,25 +558,20 @@ services:
     devices:
       - "nvidia.com/gpu=all"
     depends_on:
-      nvidia_init:
-        condition: service_completed_successfully
-      film2_bootstrap:
-        condition: service_completed_successfully
+      - nvidia_init
+      - film2_bootstrap
     environment:
       - NVIDIA_VISIBLE_DEVICES=${MUSIC_GPU:-all}
       - HF_HOME=/models/hf
       - TRANSFORMERS_CACHE=/models/hf
       - TORCH_HOME=/models/torch
-      - YUE_MODEL_ID=/opt/models/yue
+      
     expose:
       - "7860"
     ports:
       - "7860:7860"
     shm_size: "1g"
-    healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:7860/healthz"]
-      interval: 10s
-      timeout: 5s
+    
     volumes:
       - hf_cache:/models/hf
       - torch_cache:/models/torch
@@ -697,8 +590,7 @@ services:
     container_name: demucs_service
     restart: unless-stopped
     depends_on:
-      film2_bootstrap:
-        condition: service_completed_successfully
+      - film2_bootstrap
     environment:
       
       - TORCH_HOME=/models/torch
@@ -706,10 +598,7 @@ services:
       - "9101"
     ports:
       - "9101:9101"
-    healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:9101/healthz"]
-      interval: 10s
-      timeout: 5s
+    
     volumes:
       - torch_cache:/models/torch
       - demucs_cache:/root/.cache/demucs
@@ -731,10 +620,8 @@ services:
     devices:
       - "nvidia.com/gpu=all"
     depends_on:
-      nvidia_init:
-        condition: service_completed_successfully
-      film2_bootstrap:
-        condition: service_completed_successfully
+      - nvidia_init
+      - film2_bootstrap
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       
@@ -746,10 +633,7 @@ services:
     ports:
       - "8050:8050"
     shm_size: "1g"
-    healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8050/healthz"]
-      interval: 10s
-      timeout: 5s
+    
     volumes:
       - hf_cache:/models/hf
       - torch_cache:/models/torch
@@ -770,9 +654,7 @@ services:
       - "8070:8070"
 
   executor:
-    depends_on:
-      orchestrator:
-        condition: service_started
+    
     build:
       context: ./executor
       dockerfile: Dockerfile
@@ -819,10 +701,8 @@ services:
     devices:
       - "nvidia.com/gpu=all"
     depends_on:
-      nvidia_init:
-        condition: service_completed_successfully
-      film2_bootstrap:
-        condition: service_completed_successfully
+      - nvidia_init
+      - film2_bootstrap
     environment:
       - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-}
       - NVIDIA_VISIBLE_DEVICES=all
@@ -880,11 +760,7 @@ services:
       - POSTGRES_DB=ragdb
       - POSTGRES_USER=rag
       - POSTGRES_PASSWORD=ragpass
-    depends_on:
-      orchestrator:
-        condition: service_started
-      pgvector:
-        condition: service_healthy
+    
     ports:
       - "3000:3000"
 

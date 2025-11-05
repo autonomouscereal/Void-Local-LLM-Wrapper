@@ -16,6 +16,7 @@ import httpx
 from bs4 import BeautifulSoup
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
+from .media_resolver import resolve_media
 
 
 DRT_VERSION = "1.0.0"
@@ -39,6 +40,33 @@ def _sha256_bytes(data: bytes) -> str:
 
 def _sha256_str(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
+# -------------------- Media Resolver wiring --------------------
+
+WHISPER_URL = os.getenv("WHISPER_API_URL", "http://whisper:9090") + "/transcribe"
+OCR_URL = os.getenv("OCR_API_URL", "http://ocr:8070") + "/ocr"
+
+def _transcribe_with_whisper(wav_path: str) -> str:
+    try:
+        with open(wav_path, "rb") as f:
+            r = httpx.post(WHISPER_URL, files={"file": ("a.wav", f, "audio/wav")}, timeout=120)
+        r.raise_for_status()
+        return (r.json() or {}).get("text", "")
+    except Exception:
+        return ""
+
+async def _ocr_images(paths: list[str]) -> list[dict]:
+    out = []
+    try:
+        async with httpx.AsyncClient(timeout=60) as cli:
+            for p in paths or []:
+                with open(p, "rb") as f:
+                    r = await cli.post(OCR_URL, files={"file": ("f.png", f, "image/png")})
+                if r.status_code == 200:
+                    out.append(r.json())
+    except Exception:
+        return out
+    return out
+
 
 
 def _safe_get(d: Dict[str, Any], k: str, default: Any = None) -> Any:
@@ -569,21 +597,62 @@ async def research_collect(body: Dict[str, Any]):
         if block and dom in set([d.lower() for d in block]):
             blocked_count += 1
             continue
+        # Unified media-aware fetch: try media resolver first, fall back to HTTP fetch
+        text = ""
+        tables: List[Dict[str, str]] = []
+        raw: bytes = b""
+        ctype: str = "application/octet-stream"
         try:
-            raw, ctype = await FetcherParser.fetch(url)
+            mres = resolve_media(url)
+            kind = mres.get("type")
+            if kind in ("video", "media"):
+                wav_path = mres.get("audio_wav")
+                t = _transcribe_with_whisper(wav_path) if wav_path else ""
+                text, tables = (t or ""), []
+                raw = (text or "").encode("utf-8")
+                ctype = "text/plain; charset=utf-8"
+            elif kind == "pdf":
+                try:
+                    with open(mres.get("pdf_path"), "rb") as f:
+                        raw = f.read()
+                    ctype = "application/pdf"
+                    text, tables = FetcherParser.parse_pdf(raw)
+                except Exception:
+                    raw, ctype = await FetcherParser.fetch(url)
+            elif kind == "image":
+                try:
+                    with open(mres.get("image_path"), "rb") as f:
+                        raw = f.read()
+                    ctype = "image/octet-stream"
+                    # optional OCR: enable by modes["ocr"]
+                    if bool(modes.get("ocr", False)):
+                        o = await _ocr_images([mres.get("image_path")])
+                        text = json.dumps(o) if o else ""
+                except Exception:
+                    raw, ctype = await FetcherParser.fetch(url)
+            elif kind == "html":
+                html = str(mres.get("html") or "")
+                raw = html.encode("utf-8")
+                ctype = "text/html; charset=utf-8"
+                text, tables = FetcherParser.parse_html(raw)
+            else:
+                # unknown kind: fallback
+                raw, ctype = await FetcherParser.fetch(url)
         except Exception:
-            continue
+            try:
+                raw, ctype = await FetcherParser.fetch(url)
+            except Exception:
+                continue
         size = len(raw)
         bytes_total += size
         if (bytes_total / (1024 * 1024)) > max_fetch_mb:
             break
         sha_hex = _sha256_bytes(raw)
-        text = ""
-        tables: List[Dict[str, str]] = []
-        if "pdf" in ctype.lower() and modes.get("pdf", True):
-            text, tables = FetcherParser.parse_pdf(raw)
-        elif modes.get("web", True):
-            text, tables = FetcherParser.parse_html(raw)
+        if not text:
+            if "pdf" in ctype.lower() and modes.get("pdf", True):
+                text, tables = FetcherParser.parse_pdf(raw)
+            elif modes.get("web", True):
+                text, tables = FetcherParser.parse_html(raw)
         # naive title extraction
         title = (text.strip().split("\n")[0] if text else url)[:200]
         # scoring features
@@ -772,5 +841,23 @@ async def research_run(body: Dict[str, Any]):
 @app.get("/healthz")
 async def healthz():
     return {"status": "ok"}
+
+
+@app.post("/media/resolve")
+async def media_resolve(body: Dict[str, Any]):
+    url = str(_safe_get(body, "url", ""))
+    if not url:
+        return JSONResponse(status_code=400, content={"error": "missing url"})
+    res = resolve_media(url)
+    # If audio extracted but no text, run Whisper
+    if res.get("type") in ("video", "media") and (not res.get("text")) and res.get("audio_wav"):
+        txt = _transcribe_with_whisper(res.get("audio_wav"))
+        if txt:
+            res["text"] = txt
+    # If image, optionally OCR (off by default; enable via flag if needed)
+    if res.get("type") == "image" and body.get("ocr", False):
+        out = await _ocr_images([res.get("image_path")])
+        res["ocr"] = out
+    return res
 
 

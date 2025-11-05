@@ -412,6 +412,7 @@ PROSODY_API_URL = os.getenv("PROSODY_API_URL", "http://prosody:7868").rstrip("/"
 
 @app.post("/v1/audio/lyrics-to-song")
 async def audio_lyrics_to_song(req: Request):
+    import uuid as _uuid
     body = await req.json()
     expected = {
         "prompt": "",
@@ -428,6 +429,12 @@ async def audio_lyrics_to_song(req: Request):
     seed = data.get("seed")
     voice_lock_id = data.get("voice_lock_id")
     sfx_prompt = data.get("sfx_prompt")
+    # minimal tracing: job start
+    try:
+        _job_id = str(_uuid.uuid4())
+        _append_ledger({"phase": "job.start", "job_id": _job_id, "route": "audio.lyrics_to_song", "inputs": {"prompt": prompt, "lyrics_len": len(lyrics or ""), "seconds": seconds, "seed": seed}})
+    except Exception:
+        _job_id = None
     if not prompt and not lyrics:
         return JSONResponse(status_code=400, content={"error": "missing prompt or lyrics"})
 
@@ -523,6 +530,10 @@ async def audio_lyrics_to_song(req: Request):
     }
     if 'mfa' in locals() and mfa:
         resp["mfa_alignment"] = mfa
+    try:
+        _append_ledger({"phase": "job.finish", "job_id": _job_id, "route": "audio.lyrics_to_song", "outputs": {"has_backing": bool(backing_b64), "has_vocal": bool(vocal_b64), "has_sfx": bool(resp.get("sfx"))}})
+    except Exception:
+        pass
     return resp
 
 
