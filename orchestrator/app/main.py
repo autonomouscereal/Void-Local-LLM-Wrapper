@@ -6933,7 +6933,7 @@ async def _comfy_history(prompt_id: str) -> Dict[str, Any]:
     if not base:
         return {"error": "COMFYUI_API_URL(S) not configured"}
     async with httpx.AsyncClient() as client:
-    r = await client.get(base.rstrip("/") + f"/history/{prompt_id}")
+        r = await client.get(base.rstrip("/") + f"/history/{prompt_id}")
         try:
             r.raise_for_status()
             return _resp_json(r, {})
