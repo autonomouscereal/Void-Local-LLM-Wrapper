@@ -17,6 +17,7 @@ ENV GIT_TERMINAL_PROMPT=0
 RUN python -V && pip -V && \
     pip install --no-cache-dir --upgrade "pip<24" && \
     pip install --no-cache-dir --upgrade "numpy==1.26.4" && \
+    pip install --no-cache-dir --upgrade "PyYAML==6.0.1" && \
     pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cu118 \
       "torch==2.7.1+cu118" "torchvision==0.22.1+cu118" "torchaudio==2.7.1+cu118"
 
@@ -29,6 +30,14 @@ RUN pip install --no-cache-dir --no-deps -r /constraints.txt && \
 WORKDIR /comfyui
 RUN curl -fL https://codeload.github.com/comfyanonymous/ComfyUI/tar.gz/master \
     | tar -xzf - --strip-components=1 -C /comfyui
+
+# Ensure PyYAML is in ComfyUI requirements and install via requirements.txt (respects constraints)
+RUN if [ -f /comfyui/requirements.txt ]; then \
+      (grep -qi '^PyYAML' /comfyui/requirements.txt || echo 'PyYAML==6.0.1' >> /comfyui/requirements.txt); \
+      pip install --no-cache-dir -r /comfyui/requirements.txt; \
+    else \
+      echo 'PyYAML==6.0.1' > /comfyui/requirements.txt && pip install --no-cache-dir -r /comfyui/requirements.txt; \
+    fi
 
 # No custom node tarball pulls; rely on ComfyUI core only
 
