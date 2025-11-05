@@ -31,6 +31,9 @@ WORKDIR /comfyui
 RUN curl -fL https://codeload.github.com/comfyanonymous/ComfyUI/tar.gz/master \
     | tar -xzf - --strip-components=1 -C /comfyui
 
+# Ensure no leftover Real-ESRGAN custom node remains in the image
+RUN rm -rf /comfyui/custom_nodes/ComfyUI-Real-ESRGAN || true
+
 # Ensure PyYAML is in ComfyUI requirements and install via requirements.txt (respects constraints)
 RUN if [ -f /comfyui/requirements.txt ]; then \
       (grep -qi '^PyYAML' /comfyui/requirements.txt || echo 'PyYAML==6.0.1' >> /comfyui/requirements.txt); \
