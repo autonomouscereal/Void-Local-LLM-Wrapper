@@ -35,6 +35,6 @@ RUN curl -fL https://codeload.github.com/comfyanonymous/ComfyUI/tar.gz/master \
 RUN mkdir -p /comfyui/models/upscale /comfyui/input /comfyui/output
 
 EXPOSE 8188
-CMD ["python","-m","ComfyUI.main","--listen","--port","8188"]
+CMD ["python","-u","main.py","--listen","--port","8188"]
 
 
