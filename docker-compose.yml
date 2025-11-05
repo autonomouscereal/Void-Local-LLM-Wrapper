@@ -6,12 +6,13 @@ services:
   film2_bootstrap:
     image: python:3.11-slim
     container_name: film2_bootstrap
-    command: ["/bin/bash","-lc","/bin/bash /bootstrap/bootstrap_models.sh"]
+    command: ["/bin/bash","-lc","apt-get update && apt-get install -y --no-install-recommends git git-lfs ca-certificates && rm -rf /var/lib/apt/lists/* && pip install -q --no-cache-dir 'huggingface_hub[cli]' 'hf-transfer' && export HF_HUB_ENABLE_HF_TRANSFER=1 && /bin/bash /bootstrap/bootstrap_models.sh"]
     environment:
       - FILM2_MODELS=/opt/models
       - HF_HOME=/opt/models/.hf
       - TRANSFORMERS_CACHE=/opt/models/.hf
       - TORCH_HOME=/opt/models/.torch
+      - HF_HUB_ENABLE_HF_TRANSFER=1
     volumes:
       - film2_models:/opt/models
       - ./bootstrap:/bootstrap:ro

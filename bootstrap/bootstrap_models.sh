@@ -18,8 +18,18 @@ fi
 hf_snap() { # $1=repo  $2=subdir
   local repo="$1"; local sub="$2"; local tgt="$MODELS_DIR/$sub"
   if [ -d "$tgt" ]; then log "exists $tgt"; return 0; fi
+  # Preflight: check access (helps flag gated repos without hard failing the job)
+  if ! huggingface-cli repo info "$repo" >/dev/null 2>&1; then
+    log "ACCESS REQUIRED (possibly gated/private): $repo"
+    echo "$repo" >> "$MODELS_DIR/manifests/gated.txt"
+    return 0
+  fi
   log "download $repo -> $tgt"
-  huggingface-cli download "$repo" --local-dir "$tgt" --resume-download --exclude "*.md" || true
+  if ! huggingface-cli download "$repo" --local-dir "$tgt" --resume-download --exclude "*.md"; then
+    log "FAILED to download $repo (see above)."
+    echo "$repo" >> "$MODELS_DIR/manifests/failed.txt"
+    return 0
+  fi
 }
 
 # Core video gen/edit
@@ -84,6 +94,16 @@ cat > "$MODELS_DIR/manifests/model_manifest.json" <<'JSON'
   "luts":"v1"
 }
 JSON
+
+if [ -f "$MODELS_DIR/manifests/gated.txt" ]; then
+  log "GATED or ACCESS-RESTRICTED repositories detected:"
+  cat "$MODELS_DIR/manifests/gated.txt" | sed 's/^/[bootstrap]   - /'
+fi
+
+if [ -f "$MODELS_DIR/manifests/failed.txt" ]; then
+  log "FAILED downloads:"
+  cat "$MODELS_DIR/manifests/failed.txt" | sed 's/^/[bootstrap]   - /'
+fi
 
 log "✅ Models bootstrapped into $MODELS_DIR"
 
