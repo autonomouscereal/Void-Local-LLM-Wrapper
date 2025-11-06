@@ -7,6 +7,8 @@ import soundfile as sf
 import pyloudnorm as pl
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
+import logging, sys
+logging.basicConfig(level=logging.INFO, stream=sys.stdout, format="%(levelname)s:%(name)s:%(message)s")
 
 
 def lufs(y: np.ndarray, sr: int) -> float:

@@ -128,6 +128,70 @@ function App() {
     return { images, videos, audios }
   }
 
+  // Orchestrator E2E run (no proxy): POST /v1/run then WS /ws.run?rid=...
+  const runOrchestratorFlow = async (userText, thinkingId) => {
+    try {
+      const r = await fetch(`${ORCH_BASE}/v1/run`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text: userText }) })
+      const js = await r.json()
+      const rid = (js && (js.data && js.data.request_id)) || js.request_id || js.rid
+      if (!rid) throw new Error('missing request_id')
+      const wsUrl = (ORCH_BASE.startsWith('https:') ? ORCH_BASE.replace(/^https:/, 'wss:') : ORCH_BASE.replace(/^http:/, 'ws:')) + `/ws.run?rid=${encodeURIComponent(rid)}`
+      const ws = new WebSocket(wsUrl)
+      const updateThinking = (text) => setMsgs(prev => (prev.map(m => m.id === thinkingId ? { ...m, content: { text } } : m)))
+      ws.onmessage = (ev) => {
+        let obj = null
+        try { obj = ev?.data ? JSON.parse(ev.data) : null } catch { obj = null }
+        if (!obj) return
+        if (obj.type === 'status' && obj.status === 'running') {
+          updateThinking('Running…')
+          return
+        }
+        if (obj.type === 'progress') {
+          // optional: show step progress
+          return
+        }
+        if (obj.type === 'done') {
+          const produced = obj.result || {}
+          const urls = []
+          const collect = (v) => {
+            if (!v) return
+            if (typeof v === 'string') { if (/\/view\?filename=/.test(v)) urls.push(v); return }
+            if (Array.isArray(v)) { v.forEach(collect); return }
+            if (typeof v === 'object') {
+              if (v.view_url) urls.push(v.view_url)
+              Object.values(v).forEach(collect)
+            }
+          }
+          try { Object.values(produced).forEach(collect) } catch {}
+          let md = 'Done.'
+          if (urls.length) {
+            const unique = Array.from(new Set(urls))
+            md += '\n\n' + unique.map(u => `![image](${u})`).join('\n')
+          }
+          updateThinking(md)
+          setSending(false)
+          try { ws.close() } catch {}
+          return
+        }
+        if (obj.type === 'error') {
+          const tb = (obj && typeof obj.traceback === 'string') ? (`\n\n\`\`\`\n${obj.traceback}\n\`\`\``) : ''
+          updateThinking(`Error: ${String(obj.message || 'unknown')}${tb}`)
+          setSending(false)
+          try { ws.close() } catch {}
+          return
+        }
+      }
+      ws.onerror = () => {
+        updateThinking('Error: websocket')
+        setSending(false)
+        try { ws.close() } catch {}
+      }
+    } catch (e) {
+      setMsgs(prev => (prev.map(m => m.id === thinkingId ? { ...m, content: { text: `Error: ${String(e && e.message || e)}` } } : m)))
+      setSending(false)
+    }
+  }
+
   const renderChatContent = (text) => {
     const raw = String(text || '')
     const normalizeUploadsInText = (t) => t.replace(/\]\(\s*\/uploads\//g, "](${ORCH_BASE}/uploads/")
@@ -330,15 +394,14 @@ function App() {
     setText('')
     setSending(true)
     try {
-      // Persistent WebSocket: send chat message and await the server push
+      // Orchestrator-first path: POST /v1/run then WS /ws.run?rid=...
+      const thinkingId = nextLocalId()
+      setMsgs(prev => ([...prev, { id: thinkingId, role: 'assistant', content: { text: 'Thinking…' } }]))
+      await runOrchestratorFlow(userText, thinkingId)
+      return
+      // Legacy path (kept as fallback): send chat message and await server push
       const t0 = performance.now()
       console.log('[ui] ws connect')
-      // Insert a temporary assistant placeholder to show thinking state
-      const thinkingId = nextLocalId()
-      const showThinking = () => {
-        setMsgs(prev => ([...prev, { id: thinkingId, role: 'assistant', content: { text: 'Thinking…' } }]))
-      }
-      showThinking()
       try { await fetch(`/api/conversations/${encodeURIComponent(conversationId)}/message`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ role: 'user', content: userText }) }) } catch {}
       await wsSendWithRetry({ conversation_id: conversationId, content: userText }, async (ev) => {
         const t1 = performance.now()

@@ -93,6 +93,8 @@ from .tools_music.compose import run_music_compose
 from .tools_music.variation import run_music_variation
 from .tools_music.mixdown import run_music_mixdown
 from .context.index import add_artifact as _ctx_add
+from .routes.run_all import router as _run_all_router
+from .routes.run_all import ws_run as _ws_run
 from .artifacts.shard import open_shard as _art_open_shard, append_jsonl as _art_append_jsonl, _finalize_shard as _art_finalize
 from .artifacts.shard import newest_part as _art_newest_part, list_parts as _art_list_parts
 from .artifacts.manifest import add_manifest_row as _art_manifest_add, write_manifest_atomic as _art_manifest_write
@@ -110,7 +112,7 @@ from .artifacts.manifest import add_manifest_row as _man_add, write_manifest_ato
 from .datasets.trace import append_sample as _trace_append
 from .review.referee import build_delta_plan as _committee
 from .context.index import add_artifact as _ctx_add
-async def _image_dispatch_run(prompt: str, negative: Optional[str], seed: Optional[int], width: Optional[int], height: Optional[int], size: Optional[str], assets: Dict[str, Any]) -> Dict[str, Any]:
+async def _image_dispatch_run(prompt: str, negative: Optional[str], seed: Optional[int], width: Optional[int], height: Optional[int], size: Optional[str], assets: Dict[str, Any], trace_id: Optional[str] = None) -> Dict[str, Any]:
     if not isinstance(prompt, str):
         prompt = ""
     # size normalization
@@ -150,12 +152,9 @@ async def _image_dispatch_run(prompt: str, negative: Optional[str], seed: Option
             uploaded[f"pose_{i}"] = await _comfy_upload_image(f"pose{i}", b64p)
 
     # Resolve a valid sampler from this Comfy instance
-    try:
-        import aiohttp  # type: ignore
-        async with aiohttp.ClientSession() as _s:
-            sampler_name = await _choose_sampler_name(_s)
-    except Exception:
-        sampler_name = "euler"
+    import aiohttp  # type: ignore
+    async with aiohttp.ClientSession() as _s:
+        sampler_name = await _choose_sampler_name(_s)
 
     graph_req: Dict[str, Any] = {
         "prompt": prompt,
@@ -168,10 +167,7 @@ async def _image_dispatch_run(prompt: str, negative: Optional[str], seed: Option
     }
     graph = _build_full_graph(graph_req, uploaded)
     # Log payload size and write last prompt for debugging
-    try:
-        _write_text_atomic(os.path.join(UPLOAD_DIR, "last_prompt.json"), json.dumps({"client_id":"orc", "prompt": graph.get("prompt") or graph}, ensure_ascii=False))
-    except Exception:
-        pass
+    _write_text_atomic(os.path.join(UPLOAD_DIR, "last_prompt.json"), json.dumps({"client_id":"orc", "prompt": graph.get("prompt") or graph}, ensure_ascii=False))
     _append_ledger({
         "phase": "image.dispatch.start",
         "request": {"prompt": prompt, "negative": (negative or None), "seed": (int(seed) if isinstance(seed, int) else None), "width": (int(w) if isinstance(w, int) else None), "height": (int(h) if isinstance(h, int) else None)},
@@ -203,9 +199,24 @@ async def _image_dispatch_run(prompt: str, negative: Optional[str], seed: Option
     manifest = {"items": []}
     saved: List[Dict[str, Any]] = []
     base = (os.getenv("COMFYUI_API_URL", "http://comfyui:8188").rstrip("/"))
+    comfy_items: List[Dict[str, Any]] = []
     for idx, f in enumerate(files):
         fn = f.get("filename"); assert isinstance(fn, str) and fn
+        sf = f.get("subfolder") or ""
+        ty = f.get("type") or "output"
+        view_url = f"{base}/view?filename={fn}" + (f"&subfolder={sf}&type={ty}" if sf or ty else "")
         data, ctype = await _comfy_view(fn)
+        # Build capped inline preview (<=512px) for immediate UI render
+        from io import BytesIO
+        from PIL import Image  # type: ignore
+        import base64 as _b64
+        _src = BytesIO(data)
+        _im = Image.open(_src).convert("RGBA")
+        _im.thumbnail((512, 512))
+        _buf = BytesIO()
+        _im.save(_buf, format="PNG", optimize=True)
+        _img_b64 = _b64.b64encode(_buf.getvalue()).decode("ascii")
+        data_url = f"data:image/png;base64,{_img_b64}"
         stem = f"dispatch_00_{idx:02d}"
         png_path, meta_path = _make_outpaths(outdir, stem)
         with open(png_path, "wb") as _f:
@@ -218,14 +229,33 @@ async def _image_dispatch_run(prompt: str, negative: Optional[str], seed: Option
             "width": (int(w) if isinstance(w, int) else None),
             "height": (int(h) if isinstance(h, int) else None),
             "prompt_id": pid,
-            "comfy_view": f"{base}/view?filename={fn}",
+            "filename": fn,
+            "subfolder": sf,
+            "type": ty,
+            "comfy_view": view_url,
         })
         _man_add(manifest, png_path, step_id="image.dispatch")
         ai = _analyze_image(png_path, prompt=str(prompt))
         clip_s = float(ai.get("clip_score") or 0.0)
         _trace_append("image", {"cid": cid, "tool": "image.dispatch", "prompt": prompt, "path": png_path, "clip_score": clip_s, "tags": ai.get("tags") or []})
         _ctx_add(cid, "image", png_path, _uri_from_upload_path(png_path), None, [], {"prompt": prompt, "clip_score": clip_s})
-        saved.append({"path": png_path, "clip_score": clip_s})
+        if isinstance(trace_id, str) and trace_id:
+            try:
+                rel = os.path.relpath(png_path, UPLOAD_DIR).replace("\\", "/")
+                _append_jsonl(os.path.join(STATE_DIR, "traces", trace_id, "artifacts.jsonl"), {
+                    "t": int(time.time()*1000),
+                    "event": "artifact",
+                    "kind": "image",
+                    "path": rel,
+                    "prompt_id": pid,
+                    "filename": fn,
+                    "subfolder": sf,
+                    "view_url": view_url,
+                })
+            except Exception:
+                pass
+        comfy_items.append({"filename": fn, "subfolder": sf, "type": ty, "view_url": view_url, "data_url": data_url})
+        saved.append({"path": png_path, "clip_score": clip_s, "filename": fn, "subfolder": sf, "type": ty, "comfy_view": view_url})
     _man_write(outdir, manifest)
 
     # RAG index
@@ -239,7 +269,33 @@ async def _image_dispatch_run(prompt: str, negative: Optional[str], seed: Option
                 await conn.execute("INSERT INTO rag_docs (path, chunk, embedding) VALUES ($1, $2, $3)", rel, prompt, list(vec))
 
     scores = {"image": {"clip": max([s.get("clip_score") or 0.0 for s in saved] or [0.0])}}
-    return {"cid": cid, "prompt_id": pid, "paths": [s.get("path") for s in saved], "scores": scores}
+    # Provide direct IDs and view_url for UI convenience (first image)
+    ids_obj: Dict[str, Any] = {}
+    meta_obj: Dict[str, Any] = {"prompt_id": pid}
+    if comfy_items:
+        first = comfy_items[0]
+        try:
+            sub = (first.get("subfolder") or "").strip("/")
+            fnm = first.get("filename")
+            if isinstance(fnm, str):
+                image_id = (f"{sub}/{fnm}" if sub else fnm)
+                ids_obj["image_id"] = image_id
+        except Exception:
+            pass
+        if isinstance(first.get("view_url"), str):
+            meta_obj["view_url"] = first.get("view_url")
+        if isinstance(first.get("data_url"), str):
+            meta_obj["data_url"] = first.get("data_url")
+        meta_obj["filename"] = first.get("filename")
+        meta_obj["subfolder"] = first.get("subfolder")
+    # Also expose an orchestrator-served URL (for CORS-safe fetch from UI)
+    try:
+        if saved:
+            rel0 = os.path.relpath(saved[0].get("path"), UPLOAD_DIR).replace("\\", "/")
+            meta_obj["orch_view_url"] = f"/{rel0}"
+    except Exception:
+        pass
+    return {"cid": cid, "prompt_id": pid, "ids": ids_obj, "meta": meta_obj, "paths": [s.get("path") for s in saved], "images": comfy_items, "scores": scores}
     wf = _comfy_load_wf()
     graph = _comfy_patch_wf(wf, prompt=prompt, negative=(negative or None), seed=seed, width=w, height=h, assets=(assets or {}))
     _append_ledger({
@@ -622,6 +678,7 @@ try:
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 except Exception:
     pass
+app.include_router(_run_all_router)
 
 # Stamp permissive headers on every HTTP response to avoid any CORS/CORP issues
 @app.middleware("http")
@@ -1767,6 +1824,10 @@ async def planner_produce_plan(messages: List[Dict[str, Any]], tools: Optional[L
 async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
     name = call.get("name")
     raw_args = call.get("arguments") or {}
+    # Enforce Film-2 unification: block direct video.* from external plans
+    # Allow only when explicitly invoked by Film-2 internals (flag __film2_internal=true)
+    if isinstance(name, str) and name.startswith("video.") and not bool((raw_args or {}).get("__film2_internal")):
+        return {"name": name, "error": "use film2.run", "traceback": "adapter blocked: use film2.run"}
     # Hard-disable legacy Film-1 tools to enforce Film-2-only orchestration
     if name in ("film_create", "film_add_character", "film_add_scene", "film_status", "film_compile", "make_movie"):
         return {"name": name, "skipped": True, "reason": "film1_disabled"}
@@ -1886,8 +1947,150 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         width = a.get("width")
         height = a.get("height")
         assets = a.get("assets") if isinstance(a.get("assets"), dict) else {}
-        res = await _image_dispatch_run(str(prompt), negative if isinstance(negative, str) else None, seed if isinstance(seed, int) else None, width if isinstance(width, int) else None, height if isinstance(height, int) else None, size if isinstance(size, str) else None, assets)
+        res = await _image_dispatch_run(str(prompt), negative if isinstance(negative, str) else None, seed if isinstance(seed, int) else None, width if isinstance(width, int) else None, height if isinstance(height, int) else None, size if isinstance(size, str) else None, assets, a.get("trace_id") if isinstance(a.get("trace_id"), str) else None)
         return {"name": name, "result": res}
+    if name == "film2.run" and ALLOW_TOOL_EXECUTION:
+        # Unified Film-2 shot runner. Executes internal video passes and writes distilled traces/artifacts.
+        a = raw_args if isinstance(raw_args, dict) else {}
+        prompt = (a.get("prompt") or "").strip()
+        trace_id = a.get("trace_id") if isinstance(a.get("trace_id"), str) else None
+        cid = a.get("cid") or ""
+        clips = a.get("clips") if isinstance(a.get("clips"), list) else []
+        images = a.get("images") if isinstance(a.get("images"), list) else []
+        do_interpolate = bool(a.get("interpolate") or False)
+        target_scale = a.get("scale")  # optional
+        result: Dict[str, Any] = {"ids": {}, "meta": {"shots": []}}
+        def _ev(e: Dict[str, Any]) -> None:
+            if trace_id:
+                row = {"t": int(time.time()*1000), **e}
+                _append_jsonl(os.path.join(STATE_DIR, "traces", trace_id, "events.jsonl"), row)
+        _ev({"event": "film2.shot_start", "prompt": prompt})
+        try:
+            # Helper to append distilled artifact rows when a path is produced
+            def _artifact_video(path: str) -> None:
+                if not (trace_id and isinstance(path, str) and path):
+                    return
+                rel = os.path.relpath(path, UPLOAD_DIR).replace("\\", "/")
+                _append_jsonl(os.path.join(STATE_DIR, "traces", trace_id, "artifacts.jsonl"), {"t": int(time.time()*1000), "event": "artifact", "kind": "video", "path": rel})
+            # Enhance/cleanup path with provided clips
+            if clips:
+                for i, src in enumerate(clips):
+                    shot_meta: Dict[str, Any] = {"index": i, "source": src}
+                    # Cleanup
+                    _ev({"event": "film2.pass_cleanup_start", "src": src})
+                    cc = await execute_tool_call({"name": "video.cleanup", "arguments": {"__film2_internal": True, "src": src, "cid": cid, "trace_id": trace_id}})
+                    ccr = (cc.get("result") or {}) if isinstance(cc, dict) else {}
+                    clean_path = ccr.get("path") if isinstance(ccr, dict) else None
+                    if isinstance(clean_path, str):
+                        _artifact_video(clean_path)
+                        shot_meta["clean_path"] = clean_path
+                    _ev({"event": "film2.pass_cleanup_finish"})
+                    # Temporal interpolate (optional)
+                    current = clean_path or src
+                    if do_interpolate and isinstance(current, str):
+                        _ev({"event": "film2.pass_interpolate_start"})
+                        ic = await execute_tool_call({"name": "video.interpolate", "arguments": {"__film2_internal": True, "src": current, "cid": cid, "trace_id": trace_id}})
+                        icr = (ic.get("result") or {}) if isinstance(ic, dict) else {}
+                        interp_path = icr.get("path") if isinstance(icr, dict) else None
+                        if isinstance(interp_path, str):
+                            _artifact_video(interp_path)
+                            shot_meta["interp_path"] = interp_path
+                        current = interp_path or current
+                        _ev({"event": "film2.pass_interpolate_finish"})
+                    # Upscale
+                    if isinstance(current, str):
+                        _ev({"event": "film2.pass_upscale_start"})
+                        uc_args = {"__film2_internal": True, "src": current, "cid": cid, "trace_id": trace_id}
+                        if target_scale: uc_args["scale"] = target_scale
+                        uc = await execute_tool_call({"name": "video.upscale", "arguments": uc_args})
+                        up = (uc.get("result") or {}) if isinstance(uc, dict) else {}
+                        up_path = up.get("path") if isinstance(up, dict) else None
+                        if isinstance(up_path, str):
+                            _artifact_video(up_path)
+                            shot_meta["upscaled_path"] = up_path
+                        _ev({"event": "film2.pass_upscale_finish"})
+                    result["meta"]["shots"].append(shot_meta)
+            # Image-to-video path via SVD (if images provided)
+            elif images:
+                for i, img in enumerate(images):
+                    _ev({"event": "film2.pass_gen_start", "adapter": "svd.i2v", "image": img})
+                    gv = await execute_tool_call({"name": "video.svd.i2v", "arguments": {"__film2_internal": True, "src": img, "cid": cid, "trace_id": trace_id}})
+                    gvr = (gv.get("result") or {}) if isinstance(gv, dict) else {}
+                    gen_path = gvr.get("path") if isinstance(gvr, dict) else None
+                    shot_meta: Dict[str, Any] = {"index": i, "gen_path": gen_path}
+                    if isinstance(gen_path, str):
+                        _artifact_video(gen_path)
+                        current = gen_path
+                        # Optional temporal/interpolate
+                        if do_interpolate:
+                            _ev({"event": "film2.pass_interpolate_start"})
+                            ic = await execute_tool_call({"name": "video.interpolate", "arguments": {"__film2_internal": True, "src": current, "cid": cid, "trace_id": trace_id}})
+                            icr = (ic.get("result") or {}) if isinstance(ic, dict) else {}
+                            interp_path = icr.get("path") if isinstance(icr, dict) else None
+                            if isinstance(interp_path, str):
+                                _artifact_video(interp_path)
+                                shot_meta["interp_path"] = interp_path
+                            current = interp_path or current
+                            _ev({"event": "film2.pass_interpolate_finish"})
+                        # Upscale
+                        _ev({"event": "film2.pass_upscale_start"})
+                        uc = await execute_tool_call({"name": "video.upscale", "arguments": {"__film2_internal": True, "src": current, "cid": cid, "trace_id": trace_id}})
+                        up = (uc.get("result") or {}) if isinstance(uc, dict) else {}
+                        up_path = up.get("path") if isinstance(up, dict) else None
+                        if isinstance(up_path, str):
+                            _artifact_video(up_path)
+                            shot_meta["upscaled_path"] = up_path
+                        _ev({"event": "film2.pass_upscale_finish"})
+                    _ev({"event": "film2.pass_gen_finish"})
+                    result["meta"].setdefault("shots", []).append(shot_meta)
+            else:
+                # Nothing to do without sources; later we can add HV t2v when proper inputs provided
+                result["meta"]["note"] = "no clips/images supplied; generation adapters are internal only"
+        except Exception as ex:
+            _tb = traceback.format_exc()
+            logging.error(_tb)
+            return {"name": name, "error": str(ex), "traceback": _tb}
+        finally:
+            _ev({"event": "film2.shot_finish"})
+        # Select a final video output and expose as ids/meta for UI
+        final_path = None
+        for sh in reversed(result.get("meta", {}).get("shots", [])):
+            for key in ("upscaled_path", "interp_path", "clean_path"):
+                p = sh.get(key)
+                if isinstance(p, str) and p:
+                    final_path = p
+                    break
+            if final_path:
+                break
+        if final_path:
+            if trace_id:
+                rel = final_path
+                if os.path.isabs(final_path):
+                    rel = os.path.relpath(final_path, UPLOAD_DIR).replace("\\", "/")
+                _append_jsonl(os.path.join(STATE_DIR, "traces", trace_id, "artifacts.jsonl"), {
+                    "t": int(time.time()*1000), "event": "artifact", "kind": "video", "path": rel
+                })
+                result.setdefault("ids", {})["video_id"] = rel
+                view_rel = rel if rel.startswith("uploads/") else f"uploads/{rel.lstrip('/')}"
+                result.setdefault("meta", {})["view_url"] = f"/{view_rel}"
+                # Best-effort poster preview (log and surface error if fails)
+                try:
+                    import imageio.v3 as iio  # type: ignore
+                    from PIL import Image  # type: ignore
+                    from io import BytesIO
+                    import base64 as _b64
+                    final_abs = final_path if os.path.isabs(final_path) else os.path.join(UPLOAD_DIR, rel)
+                    frame0 = iio.imread(final_abs, index=0)
+                    img = Image.fromarray(frame0).convert("RGB")
+                    img.thumbnail((512, 512))
+                    buf = BytesIO()
+                    img.save(buf, format="JPEG", quality=70, optimize=True)
+                    poster_b64 = _b64.b64encode(buf.getvalue()).decode("ascii")
+                    result.setdefault("meta", {})["poster_data_url"] = f"data:image/jpeg;base64,{poster_b64}"
+                except Exception:
+                    _tb = traceback.format_exc()
+                    logging.error(_tb)
+        return {"name": name, "result": result}
     if name == "icw.pack_context":
         args = raw_args if isinstance(raw_args, dict) else {}
         res = await v1_icw_pack(args)
@@ -1929,17 +2132,137 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         provider = _TTSProvider()
         manifest = {"items": []}
         try:
-            env = run_tts_speak(args if isinstance(args, dict) else {}, provider, manifest)
-            return {"name": name, "result": env}
+            a = args if isinstance(args, dict) else {}
+            env = run_tts_speak(a, provider, manifest)
+            # Persist audio artifact to memory + RAG; distilled artifact row
+            wav = env.get("wav_bytes") if isinstance(env, dict) else None
+            if isinstance(wav, (bytes, bytearray)) and len(wav) > 0:
+                cid = "aud-" + str(_now_ts())
+                outdir = os.path.join(UPLOAD_DIR, "artifacts", "audio", "tts", cid)
+                _ensure_dir(outdir)
+                stem = "tts_00_00"
+                wav_path = os.path.join(outdir, stem + ".wav")
+                with open(wav_path, "wb") as _wf:
+                    _wf.write(wav)
+                # Sidecar metadata (minimal)
+                _sidecar(wav_path, {
+                    "tool": "tts.speak",
+                    "text": a.get("text"),
+                    "duration_s": float(env.get("duration_s") or 0.0),
+                    "model": env.get("model") or "xtts",
+                })
+                # Add to multimodal memory
+                _ctx_add(cid, "audio", wav_path, _uri_from_upload_path(wav_path), None, [], {"text": a.get("text"), "duration_s": float(env.get("duration_s") or 0.0)})
+                # Distilled artifact
+                tr = (a.get("trace_id") if isinstance(a.get("trace_id"), str) else None)
+                if tr:
+                    try:
+                        rel = os.path.relpath(wav_path, UPLOAD_DIR).replace("\\", "/")
+                        _append_jsonl(os.path.join(STATE_DIR, "traces", tr, "artifacts.jsonl"), {
+                            "t": int(time.time()*1000),
+                            "event": "artifact",
+                            "kind": "audio",
+                            "path": rel,
+                            "bytes": int(len(wav)),
+                            "duration_s": float(env.get("duration_s") or 0.0),
+                        })
+                    except Exception:
+                        pass
+                # Optional: embed transcript text into RAG
+                pool = await get_pg_pool()
+                txt = a.get("text") if isinstance(a.get("text"), str) else None
+                if pool is not None and txt and txt.strip():
+                    emb = get_embedder()
+                    vec = emb.encode([txt])[0]
+                    async with pool.acquire() as conn:
+                        rel = os.path.relpath(wav_path, UPLOAD_DIR).replace("\\", "/")
+                        await conn.execute("INSERT INTO rag_docs (path, chunk, embedding) VALUES ($1, $2, $3)", rel, txt, list(vec))
+            # Shape result with ids/meta when file persisted
+            out_res = dict(env or {})
+            if isinstance(wav, (bytes, bytearray)) and len(wav) > 0:
+                rel = os.path.relpath(wav_path, UPLOAD_DIR).replace("\\", "/")
+                out_res.setdefault("ids", {})["audio_id"] = rel
+                out_res.setdefault("meta", {})["url"] = f"/{rel}"
+                out_res["meta"]["mime"] = "audio/wav"
+                # Build ~12s mono 22.05kHz preview data_url
+                import io, wave, audioop, base64 as _b64
+                r = wave.open(io.BytesIO(wav))
+                nch = r.getnchannels(); sw = r.getsampwidth(); fr = r.getframerate()
+                frames = r.readframes(r.getnframes()); r.close()
+                if nch > 1:
+                    frames = audioop.tomono(frames, sw, 0.5, 0.5)
+                if fr != 22050:
+                    frames, _ = audioop.ratecv(frames, sw, 1, fr, 22050, None)
+                    fr = 22050
+                max_frames = 12 * fr
+                frames = frames[:max_frames * sw]
+                b2 = io.BytesIO()
+                w2 = wave.open(b2, "wb")
+                w2.setnchannels(1); w2.setsampwidth(sw); w2.setframerate(fr)
+                w2.writeframes(frames); w2.close()
+                out_res["meta"]["data_url"] = "data:audio/wav;base64," + _b64.b64encode(b2.getvalue()).decode("ascii")
+                out_res["meta"]["preview_duration_s"] = float(len(frames) / (sw * fr))
+                # expose preview and full durations distinctly
+                out_res["meta"]["preview_duration_s"] = float(len(frames) / (sw * fr))
+                if env.get("duration_s") is not None:
+                    out_res["meta"]["full_duration_s"] = float(env.get("duration_s"))
+            return {"name": name, "result": out_res}
         except Exception as ex:
-            return {"name": name, "error": str(ex)}
+            _tb = traceback.format_exc()
+            logging.error(_tb)
+            return {"name": name, "error": str(ex), "traceback": _tb}
     if name == "audio.sfx.compose" and ALLOW_TOOL_EXECUTION:
         manifest = {"items": []}
         try:
-            env = run_sfx_compose(args if isinstance(args, dict) else {}, manifest)
-            return {"name": name, "result": env}
+            a = args if isinstance(args, dict) else {}
+            env = run_sfx_compose(a, manifest)
+            # Persist if a wav payload present
+            wav = env.get("wav_bytes") if isinstance(env, dict) else None
+            if isinstance(wav, (bytes, bytearray)) and len(wav) > 0:
+                cid = "aud-" + str(_now_ts())
+                outdir = os.path.join(UPLOAD_DIR, "artifacts", "audio", "sfx", cid)
+                _ensure_dir(outdir)
+                stem = "sfx_00_00"
+                wav_path = os.path.join(outdir, stem + ".wav")
+                with open(wav_path, "wb") as _wf:
+                    _wf.write(wav)
+                _sidecar(wav_path, {"tool": "audio.sfx.compose"})
+                _ctx_add(cid, "audio", wav_path, _uri_from_upload_path(wav_path), None, [], {})
+                tr = (a.get("trace_id") if isinstance(a.get("trace_id"), str) else None)
+                if tr:
+                    try:
+                        rel = os.path.relpath(wav_path, UPLOAD_DIR).replace("\\", "/")
+                        _append_jsonl(os.path.join(STATE_DIR, "traces", tr, "artifacts.jsonl"), {"t": int(time.time()*1000), "event": "artifact", "kind": "audio", "path": rel, "bytes": int(len(wav))})
+                    except Exception:
+                        pass
+            # Shape result with ids/meta when file persisted
+            out_res = dict(env or {})
+            if isinstance(wav, (bytes, bytearray)) and len(wav) > 0:
+                rel = os.path.relpath(wav_path, UPLOAD_DIR).replace("\\", "/")
+                out_res.setdefault("ids", {})["audio_id"] = rel
+                out_res.setdefault("meta", {})["url"] = f"/{rel}"
+                out_res["meta"]["mime"] = "audio/wav"
+                import io, wave, audioop, base64 as _b64
+                r = wave.open(io.BytesIO(wav))
+                nch = r.getnchannels(); sw = r.getsampwidth(); fr = r.getframerate()
+                frames = r.readframes(r.getnframes()); r.close()
+                if nch > 1:
+                    frames = audioop.tomono(frames, sw, 0.5, 0.5)
+                if fr != 22050:
+                    frames, _ = audioop.ratecv(frames, sw, 1, fr, 22050, None)
+                    fr = 22050
+                max_frames = 12 * fr
+                frames = frames[:max_frames * sw]
+                b2 = io.BytesIO()
+                w2 = wave.open(b2, "wb")
+                w2.setnchannels(1); w2.setsampwidth(sw); w2.setframerate(fr)
+                w2.writeframes(frames); w2.close()
+                out_res["meta"]["data_url"] = "data:audio/wav;base64," + _b64.b64encode(b2.getvalue()).decode("ascii")
+            return {"name": name, "result": out_res}
         except Exception as ex:
-            return {"name": name, "error": str(ex)}
+            _tb = traceback.format_exc()
+            logging.error(_tb)
+            return {"name": name, "error": str(ex), "traceback": _tb}
     if name == "ocr.read" and ALLOW_TOOL_EXECUTION:
         if not OCR_API_URL:
             return {"name": name, "error": "OCR_API_URL not configured"}
@@ -2093,21 +2416,87 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         provider = _MusicProvider()
         manifest = {"items": []}
         try:
-            env = run_music_compose(args if isinstance(args, dict) else {}, provider, manifest)
+            a = args if isinstance(args, dict) else {}
+            env = run_music_compose(a, provider, manifest)
+            wav = env.get("wav_bytes") if isinstance(env, dict) else None
+            if isinstance(wav, (bytes, bytearray)) and len(wav) > 0:
+                cid = "aud-" + str(_now_ts())
+                outdir = os.path.join(UPLOAD_DIR, "artifacts", "audio", "music", cid)
+                _ensure_dir(outdir)
+                stem = "music_00_00"
+                wav_path = os.path.join(outdir, stem + ".wav")
+                with open(wav_path, "wb") as _wf:
+                    _wf.write(wav)
+                _sidecar(wav_path, {"tool": "music.compose", "prompt": a.get("prompt")})
+                _ctx_add(cid, "audio", wav_path, _uri_from_upload_path(wav_path), None, [], {"prompt": a.get("prompt")})
+                tr = (a.get("trace_id") if isinstance(a.get("trace_id"), str) else None)
+                if tr:
+                    try:
+                        rel = os.path.relpath(wav_path, UPLOAD_DIR).replace("\\", "/")
+                        _append_jsonl(os.path.join(STATE_DIR, "traces", tr, "artifacts.jsonl"), {"t": int(time.time()*1000), "event": "artifact", "kind": "audio", "path": rel, "bytes": int(len(wav))})
+                    except Exception:
+                        pass
+                # RAG: embed prompt
+                pool = await get_pg_pool()
+                txt = a.get("prompt") if isinstance(a.get("prompt"), str) else None
+                if pool is not None and txt and txt.strip():
+                    emb = get_embedder()
+                    vec = emb.encode([txt])[0]
+                    async with pool.acquire() as conn:
+                        rel = os.path.relpath(wav_path, UPLOAD_DIR).replace("\\", "/")
+                        await conn.execute("INSERT INTO rag_docs (path, chunk, embedding) VALUES ($1, $2, $3)", rel, txt, list(vec))
             return {"name": name, "result": env}
         except Exception as ex:
             return {"name": name, "error": str(ex)}
     if name == "music.variation" and ALLOW_TOOL_EXECUTION:
         manifest = {"items": []}
         try:
-            env = run_music_variation(args if isinstance(args, dict) else {}, manifest)
+            a = args if isinstance(args, dict) else {}
+            env = run_music_variation(a, manifest)
+            wav = env.get("wav_bytes") if isinstance(env, dict) else None
+            if isinstance(wav, (bytes, bytearray)) and len(wav) > 0:
+                cid = "aud-" + str(_now_ts())
+                outdir = os.path.join(UPLOAD_DIR, "artifacts", "audio", "music", cid)
+                _ensure_dir(outdir)
+                stem = "music_var_00_00"
+                wav_path = os.path.join(outdir, stem + ".wav")
+                with open(wav_path, "wb") as _wf:
+                    _wf.write(wav)
+                _sidecar(wav_path, {"tool": "music.variation"})
+                _ctx_add(cid, "audio", wav_path, _uri_from_upload_path(wav_path), None, [], {})
+                tr = (a.get("trace_id") if isinstance(a.get("trace_id"), str) else None)
+                if tr:
+                    try:
+                        rel = os.path.relpath(wav_path, UPLOAD_DIR).replace("\\", "/")
+                        _append_jsonl(os.path.join(STATE_DIR, "traces", tr, "artifacts.jsonl"), {"t": int(time.time()*1000), "event": "artifact", "kind": "audio", "path": rel, "bytes": int(len(wav))})
+                    except Exception:
+                        pass
             return {"name": name, "result": env}
         except Exception as ex:
             return {"name": name, "error": str(ex)}
     if name == "music.mixdown" and ALLOW_TOOL_EXECUTION:
         manifest = {"items": []}
         try:
-            env = run_music_mixdown(args if isinstance(args, dict) else {}, manifest)
+            a = args if isinstance(args, dict) else {}
+            env = run_music_mixdown(a, manifest)
+            wav = env.get("wav_bytes") if isinstance(env, dict) else None
+            if isinstance(wav, (bytes, bytearray)) and len(wav) > 0:
+                cid = "aud-" + str(_now_ts())
+                outdir = os.path.join(UPLOAD_DIR, "artifacts", "audio", "music", cid)
+                _ensure_dir(outdir)
+                stem = "music_mix_00_00"
+                wav_path = os.path.join(outdir, stem + ".wav")
+                with open(wav_path, "wb") as _wf:
+                    _wf.write(wav)
+                _sidecar(wav_path, {"tool": "music.mixdown"})
+                _ctx_add(cid, "audio", wav_path, _uri_from_upload_path(wav_path), None, [], {})
+                tr = (a.get("trace_id") if isinstance(a.get("trace_id"), str) else None)
+                if tr:
+                    try:
+                        rel = os.path.relpath(wav_path, UPLOAD_DIR).replace("\\", "/")
+                        _append_jsonl(os.path.join(STATE_DIR, "traces", tr, "artifacts.jsonl"), {"t": int(time.time()*1000), "event": "artifact", "kind": "audio", "path": rel, "bytes": int(len(wav))})
+                    except Exception:
+                        pass
             return {"name": name, "result": env}
         except Exception as ex:
             return {"name": name, "error": str(ex)}
@@ -2358,13 +2747,47 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             return {"name": name, "error": "DEMUCS_API_URL not configured"}
         try:
             async with httpx.AsyncClient() as client:
-                payload = {
-                    "mix_wav": args.get("mix_wav") or args.get("src"),
-                    "stems": args.get("stems") or ["vocals","drums","bass","other"],
-                }
+                payload = {"mix_wav": args.get("mix_wav") or args.get("src"), "stems": args.get("stems") or ["vocals","drums","bass","other"]}
                 r = await client.post(DEMUCS_API_URL.rstrip("/") + "/v1/audio/stems", json=payload)
                 r.raise_for_status()
-                return {"name": name, "result": _resp_json(r, {})}
+                js = _resp_json(r, {})
+                # Persist stems if present
+                stems_obj = js.get("stems") if isinstance(js, dict) else None
+                if isinstance(stems_obj, dict):
+                    import base64 as _b
+                    cid = "demucs-" + str(_now_ts())
+                    outdir = os.path.join(UPLOAD_DIR, "artifacts", "audio", "demucs", cid)
+                    _ensure_dir(outdir)
+                    for stem_name, val in stems_obj.items():
+                        try:
+                            wav_bytes = b""
+                            if isinstance(val, str) and val.startswith("http"):
+                                rr = await client.get(val)
+                                if rr.status_code == 200:
+                                    wav_bytes = rr.content
+                            elif isinstance(val, str):
+                                try:
+                                    wav_bytes = _b.b64decode(val)
+                                except Exception:
+                                    wav_bytes = b""
+                            if wav_bytes:
+                                path = os.path.join(outdir, f"{stem_name}.wav")
+                                with open(path, "wb") as wf: wf.write(wav_bytes)
+                                _sidecar(path, {"tool": "audio.stems.demucs", "stem": stem_name})
+                                try:
+                                    _ctx_add(cid, "audio", path, _uri_from_upload_path(path), payload.get("mix_wav"), ["demucs"], {"stem": stem_name})
+                                except Exception:
+                                    pass
+                                tr = args.get("trace_id") if isinstance(args.get("trace_id"), str) else None
+                                if tr:
+                                    try:
+                                        rel = os.path.relpath(path, UPLOAD_DIR).replace("\\", "/")
+                                        _append_jsonl(os.path.join(STATE_DIR, "traces", tr, "artifacts.jsonl"), {"t": int(time.time()*1000), "event": "artifact", "kind": "audio", "path": rel, "bytes": int(len(wav_bytes)), "stem": stem_name})
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            continue
+                return {"name": name, "result": js}
         except Exception as ex:
             return {"name": name, "error": str(ex)}
     if name == "audio.vc.rvc" and ALLOW_TOOL_EXECUTION:
@@ -2868,6 +3291,19 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         try:
             subprocess.run(ff, check=True)
             url = dst.replace("/workspace", "") if dst.startswith("/workspace/") else dst
+            # Distilled artifact row for video
+            tr = args.get("trace_id") if isinstance(args.get("trace_id"), str) else None
+            if tr:
+                try:
+                    rel = os.path.relpath(dst, UPLOAD_DIR).replace("\\", "/")
+                    _append_jsonl(os.path.join(STATE_DIR, "traces", tr, "artifacts.jsonl"), {
+                        "t": int(time.time()*1000),
+                        "event": "artifact",
+                        "kind": "video",
+                        "path": rel,
+                    })
+                except Exception:
+                    pass
             return {"name": name, "result": {"path": url}}
         except Exception as ex:
             return {"name": name, "error": str(ex)}
@@ -5506,7 +5942,9 @@ async def refs_save(body: Dict[str, Any]):
     try:
         return _refs_save(body or {})
     except Exception as ex:
-        return JSONResponse(status_code=400, content={"error": str(ex)})
+        _tb = traceback.format_exc()
+        logging.error(_tb)
+        return JSONResponse(status_code=422, content={"error": "tool_error", "message": str(ex), "traceback": _tb})
 
 
 @app.post("/refs.refine")
@@ -5675,234 +6113,312 @@ async def tool_run(body: Dict[str, Any]):
                 set_progress_queue(None)
             yield b"data: [DONE]\n\n"
         return StreamingResponse(_gen(), media_type="text/event-stream")
+    # Standardized JSON envelope for non-stream calls
+    rid = _uuid.uuid4().hex
+    _append_jsonl(os.path.join(STATE_DIR, "tools", "tools.jsonl"), {"t": int(time.time()*1000), "event": "start", "tool": name, "args": args})
+    trace_id = args.get("trace_id") or args.get("cid")
+    if isinstance(trace_id, str) and trace_id:
+        _append_jsonl(os.path.join(STATE_DIR, "traces", trace_id, "tools.jsonl"), {
+            "t": int(time.time()*1000),
+            "event": "tool_start",
+            "tool": (name or "tool"),
+            "step_id": args.get("step_id"),
+        })
+    res = await execute_tool_call({"name": name, "arguments": args})
+    # Map to strict envelope
+    if isinstance(res, dict) and res.get("error"):
+        # Route error with traceback to errors corpus when trace_id present
+        trc = (args.get("trace_id") or args.get("cid")) if isinstance(args, dict) else None
+        if isinstance(trc, str) and trc and isinstance(res.get("traceback"), str):
+            try:
+                _append_jsonl(os.path.join(STATE_DIR, "traces", trc, "errors.jsonl"), {
+                    "t": int(time.time()*1000),
+                    "error": {"code": "tool_error", "message": str(res.get("error")), "traceback": res.get("traceback"), "tool": name}
+                })
+            except Exception:
+                logging.error(traceback.format_exc())
+        return JSONResponse(
+            status_code=422,
+            content={"schema_version": 1, "request_id": rid, "ok": False, "error": {"code": "tool_error", "message": str(res.get("error"))[:500], "traceback": (res.get("traceback") or None), "details": {"name": name}}},
+        )
+    result_obj = res.get("result") if isinstance(res, dict) else res
+    return JSONResponse(status_code=200, content={"schema_version": 1, "request_id": rid, "ok": True, "result": (result_obj or {})})
+from fastapi import Request  # type: ignore
+from fastapi import Response  # type: ignore
+
+@app.post("/logs/tools.append")
+async def tools_append(body: Dict[str, Any], request: Request):
+    row = body if isinstance(body, dict) else {}
+    row.setdefault("t", int(time.time()*1000))
     try:
-        try:
-            _append_jsonl(os.path.join(STATE_DIR, "tools", "tools.jsonl"), {"t": int(time.time()*1000), "event": "start", "tool": name, "args": args})
-        except Exception:
-            pass
-        # Reuse the exact branches from planner-executed tools
-        if name == "image.dispatch" and ALLOW_TOOL_EXECUTION:
-            mode = (args.get("mode") or "gen").strip().lower()
-            class _ImageProvider:
-                def __init__(self, base: str | None):
-                    self.base = (base or "").rstrip("/") if base else None
-                def _post_prompt(self, graph: Dict[str, Any]) -> Dict[str, Any]:
-                    import httpx as _hx  # type: ignore
-                    with _hx.Client() as client:
-                        r = client.post(self.base + "/prompt", json={"prompt": graph, "client_id": "wrapper-001"})
-                        r.raise_for_status(); return _resp_json(r, {"prompt_id": str, "uuid": str, "id": str})
-                def _poll(self, pid: str) -> Dict[str, Any]:
-                    import httpx as _hx, time as _tm  # type: ignore
-                    while True:
-                        r = _hx.get(self.base + f"/history/{pid}")
-                        if r.status_code == 200:
-                            js = _resp_json(r, {})
-                            hist = js.get("history") if isinstance(js, dict) else {}
-                            if not isinstance(hist, dict):
-                                hist = js if isinstance(js, dict) else {}
-                            h = hist.get(pid)
-                            if h and _comfy_is_completed(h):
-                                return h
-                        _tm.sleep(1.0)
-                def _download_first(self, detail: Dict[str, Any]) -> bytes:
-                    import httpx as _hx  # type: ignore
-                    outputs = (detail.get("outputs") or {})
-                    for items in outputs.values():
-                        if isinstance(items, list) and items:
-                            it = items[0]
-                            fn = it.get("filename"); tp = it.get("type") or "output"; sub = it.get("subfolder")
-                            if fn and self.base:
-                                from urllib.parse import urlencode
-                                q = {"filename": fn, "type": tp}
-                                if sub: q["subfolder"] = sub
-                                url = self.base + "/view?" + urlencode(q)
-                                r = _hx.get(url)
-                                if r.status_code == 200:
-                                    return r.content
-                    return b""
-                def _parse_wh(self, size: str) -> tuple[int, int]:
-                    try:
-                        w, h = size.lower().split("x"); return int(w), int(h)
-                    except Exception:
-                        return 1024, 1024
-                def generate(self, a: Dict[str, Any]) -> Dict[str, Any]:
-                    if not self.base:
-                        return {"image_bytes": b"", "model": "placeholder"}
-                    w, h = self._parse_wh(a.get("size") or "1024x1024")
-                    positive = a.get("prompt") or ""; negative = a.get("negative") or ""; seed = int(a.get("seed") or 0)
-                    g = {
-                        "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "sd_xl_base_1.0.safetensors"}},
-                        "3": {"class_type": "CLIPTextEncode", "inputs": {"text": positive, "clip": ["1", 1]}},
-                        "4": {"class_type": "CLIPTextEncode", "inputs": {"text": negative, "clip": ["1", 1]}},
-                        "7": {"class_type": "EmptyLatentImage", "inputs": {"width": w, "height": h, "batch_size": 1}},
-                        "8": {"class_type": "KSampler", "inputs": {"seed": seed, "steps": 25, "cfg": 6.5, "sampler_name": "dpmpp_2m", "scheduler": "karras", "denoise": 1.0, "model": ["1", 0], "positive": ["3", 0], "negative": ["4", 0], "latent_image": ["7", 0]}},
-                        "9": {"class_type": "VAEDecode", "inputs": {"samples": ["8", 0], "vae": ["1", 2]}},
-                        "10": {"class_type": "SaveImage", "inputs": {"filename_prefix": "image_gen", "images": ["9", 0]}},
-                    }
-                    js = self._post_prompt(g); pid = js.get("prompt_id") or js.get("uuid") or js.get("id")
-                    det = self._poll(pid)
-                    data = self._download_first(det)
-                    return {"image_bytes": data, "model": "comfyui:sdxl"}
-                def edit(self, a: Dict[str, Any]) -> Dict[str, Any]:
-                    if not self.base:
-                        return self.generate(a)
-                    positive = a.get("prompt") or ""; negative = a.get("negative") or ""; seed = int(a.get("seed") or 0)
-                    w, h = self._parse_wh(a.get("size") or "1024x1024")
-                    g = {
-                        "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "sd_xl_base_1.0.safetensors"}},
-                        "2": {"class_type": "LoadImage", "inputs": {"image": a.get("image_ref") or ""}},
-                        "3": {"class_type": "CLIPTextEncode", "inputs": {"text": positive, "clip": ["1", 1]}},
-                        "4": {"class_type": "CLIPTextEncode", "inputs": {"text": negative, "clip": ["1", 1]}},
-                        "5": {"class_type": "VAEEncode", "inputs": {"pixels": ["2", 0], "vae": ["1", 2]}},
-                        "8": {"class_type": "KSampler", "inputs": {"seed": seed, "steps": 20, "cfg": 6.0, "sampler_name": "dpmpp_2m", "scheduler": "karras", "denoise": 0.6, "model": ["1", 0], "positive": ["3", 0], "negative": ["4", 0], "latent_image": ["5", 0]}},
-                        "9": {"class_type": "VAEDecode", "inputs": {"samples": ["8", 0], "vae": ["1", 2]}},
-                        "10": {"class_type": "SaveImage", "inputs": {"filename_prefix": "image_edit", "images": ["9", 0]}},
-                    }
-                    js = self._post_prompt(g); pid = js.get("prompt_id") or js.get("uuid") or js.get("id"); det = self._poll(pid)
-                    data = self._download_first(det)
-                    return {"image_bytes": data, "model": "comfyui:sdxl"}
-                def upscale(self, a: Dict[str, Any]) -> Dict[str, Any]:
-                    if not self.base:
-                        return self.generate(a)
-                    scale = int(a.get("scale") or 2)
-                    g = {
-                        "2": {"class_type": "LoadImage", "inputs": {"image": a.get("image_ref") or ""}},
-                        "11": {"class_type": "UpscaleModelLoader", "inputs": {"model_name": os.getenv("COMFY_UPSCALE_MODEL", "4x-UltraSharp.pth")}},
-                        "12": {"class_type": "ImageUpscaleWithModel", "inputs": {"image": ["2", 0], "upscale_model": ["11", 0]}},
-                        "10": {"class_type": "SaveImage", "inputs": {"filename_prefix": "image_upscale", "images": ["12", 0]}},
-                    }
-                    js = self._post_prompt(g); pid = js.get("prompt_id") or js.get("uuid") or js.get("id"); det = self._poll(pid)
-                    data = self._download_first(det)
-                    return {"image_bytes": data, "model": "comfyui:realesrgan"}
-            provider = _ImageProvider(COMFYUI_API_URL)
-            manifest = {"items": []}
-            if mode == "gen":
-                env = run_image_gen(args if isinstance(args, dict) else {}, provider, manifest)
+        _append_jsonl(os.path.join(STATE_DIR, "tools", "tools.jsonl"), row)
+        # Distillation trace routing (no stack traces)
+        trace_id = row.get("trace_id") or row.get("cid")
+        if trace_id:
+            if row.get("event") == "exec_step_start":
+                _append_jsonl(os.path.join(STATE_DIR, "traces", str(trace_id), "events.jsonl"), {
+                    "t": int(row.get("t") or 0), "event": "exec_step_start", "tool": row.get("tool"), "step_id": row.get("step_id")
+                })
+            if row.get("event") == "exec_step_finish":
+                _append_jsonl(os.path.join(STATE_DIR, "traces", str(trace_id), "events.jsonl"), {
+                    "t": int(row.get("t") or 0), "event": "exec_step_finish", "tool": row.get("tool"), "step_id": row.get("step_id"), "ok": bool(row.get("ok"))
+                })
+            if row.get("event") == "exec_step_attempt":
+                _append_jsonl(os.path.join(STATE_DIR, "traces", str(trace_id), "events.jsonl"), {
+                    "t": int(row.get("t") or 0), "event": "exec_step_attempt", "tool": row.get("tool"), "step_id": row.get("step_id"), "attempt": int(row.get("attempt") or 0)
+                })
+            if row.get("event") == "exec_plan_start":
+                _append_jsonl(os.path.join(STATE_DIR, "traces", str(trace_id), "events.jsonl"), {
+                    "t": int(row.get("t") or 0), "event": "exec_plan_start", "steps": int(row.get("steps") or 0)
+                })
+            if row.get("event") == "exec_plan_finish":
+                _append_jsonl(os.path.join(STATE_DIR, "traces", str(trace_id), "events.jsonl"), {
+                    "t": int(row.get("t") or 0), "event": "exec_plan_finish", "produced_keys": (row.get("produced_keys") or [])
+                })
+            if row.get("event") == "exec_batch_start":
+                _append_jsonl(os.path.join(STATE_DIR, "traces", str(trace_id), "events.jsonl"), {
+                    "t": int(row.get("t") or 0), "event": "exec_batch_start", "items": (row.get("items") or [])
+                })
+            if row.get("event") == "exec_batch_finish":
+                _append_jsonl(os.path.join(STATE_DIR, "traces", str(trace_id), "events.jsonl"), {
+                    "t": int(row.get("t") or 0), "event": "exec_batch_finish", "items": (row.get("items") or [])
+                })
+            if bool(row.get("ok") is True) and row.get("event") == "end":
+                distilled = {
+                    "t": int(row.get("t") or 0),
+                    "event": "tool_end",
+                    "tool": row.get("tool"),
+                    "step_id": row.get("step_id"),
+                    "duration_ms": int(row.get("duration_ms") or 0),
+                }
+                if isinstance(row.get("summary"), dict):
+                    distilled["summary"] = row.get("summary")
+                _append_jsonl(os.path.join(STATE_DIR, "traces", str(trace_id), "tools.jsonl"), distilled)
+                # Compact artifact entries inferred from summary (no stack traces)
                 try:
-                    res = env or {}
-                    arts = (res.get("artifacts") or []) if isinstance(res, dict) else []
-                    if arts:
-                        a0 = arts[0]
-                        aid = a0.get("id"); cid = (res.get("meta") or {}).get("cid")
-                        if aid and cid:
-                            path = f"/uploads/artifacts/image/{cid}/{aid}"
-                            ai = _analyze_image(path, prompt=str((args or {}).get("prompt") or ""))
-                            env.setdefault("review", {}).update({"image": {"clip": float(ai.get("clip_score") or 0.0)}})
+                    s = row.get("summary") or {}
+                    arts_path = os.path.join(STATE_DIR, "traces", str(trace_id), "artifacts.jsonl")
+                    if isinstance(s.get("images_count"), int) and s.get("images_count") > 0:
+                        _append_jsonl(arts_path, {"t": int(row.get("t") or 0), "event": "artifact_summary", "kind": "image", "count": int(s.get("images_count"))})
+                    if isinstance(s.get("videos_count"), int) and s.get("videos_count") > 0:
+                        _append_jsonl(arts_path, {"t": int(row.get("t") or 0), "event": "artifact_summary", "kind": "video", "count": int(s.get("videos_count"))})
+                    if isinstance(s.get("wav_bytes"), int) and s.get("wav_bytes") > 0:
+                        _append_jsonl(arts_path, {"t": int(row.get("t") or 0), "event": "artifact_summary", "kind": "audio", "bytes": int(s.get("wav_bytes"))})
                 except Exception:
                     pass
-            elif mode == "edit":
-                env = run_image_edit(args if isinstance(args, dict) else {}, provider, manifest)
-            elif mode == "upscale":
-                env = run_image_upscale(args if isinstance(args, dict) else {}, provider, manifest)
-            else:
-                env = run_image_gen(args if isinstance(args, dict) else {}, provider, manifest)
-            # Film-2 snapshot
+            # Forward review WS events to connected client if present
             try:
-                fc = args.get("film_cid"); sid = args.get("shot_id")
-                if isinstance(fc, str) and isinstance(sid, str):
-                    _film_save_snap(fc, sid, {"tool": "image.dispatch", "mode": mode, "seed": int((args or {}).get("seed") or 0), "refs": (args or {}).get("refs") or {}, "artifacts": (env or {}).get("artifacts")})
+                app = request.app
+                ws_map = getattr(app.state, "ws_clients", {})
+                ws = ws_map.get(str(trace_id))
+                if ws and isinstance(row.get("event"), str) and (row["event"].startswith("review.") or row["event"] == "edit.plan"):
+                    payload = {"type": row["event"], "trace_id": str(trace_id), "step_id": row.get("step_id"), "notes": row.get("notes")}
+                    await ws.send_json(payload)
             except Exception:
                 pass
-            return {"ok": True, "name": name, "result": env}
-        if name == "tts.speak" and ALLOW_TOOL_EXECUTION:
-            if not XTTS_API_URL:
-                return JSONResponse(status_code=400, content={"error": "XTTS_API_URL not configured"})
-            class _TTSProvider:
-                async def _xtts(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-                    async with httpx.AsyncClient() as client:
-                        r = await client.post(XTTS_API_URL.rstrip("/") + "/tts", json=payload)
-                        r.raise_for_status(); js = _resp_json(r, {"wav_b64": str, "url": str, "duration_s": (float), "model": str})
-                        wav = b""
-                        if isinstance(js.get("wav_b64"), str):
-                            import base64 as _b
-                            wav = _b.b64decode(js.get("wav_b64"))
-                        elif isinstance(js.get("url"), str):
-                            rr = await client.get(js.get("url"));
-                            if rr.status_code == 200: wav = rr.content
-                        return {"wav_bytes": wav, "duration_s": float(js.get("duration_s") or 0.0), "model": js.get("model") or "xtts"}
-                def speak(self, args: Dict[str, Any]) -> Dict[str, Any]:
-                    import asyncio as _as
-                    return _as.get_event_loop().run_until_complete(self._xtts(args))
-            provider = _TTSProvider(); manifest = {"items": []}; env = run_tts_speak(args, provider, manifest)
-            try:
-                fc = args.get("film_cid"); lid = args.get("line_id") or args.get("shot_id")
-                if isinstance(fc, str) and isinstance(lid, str):
-                    _film_save_snap(fc, f"vo_{lid}", {"tool": "tts.speak", "seed": int((args or {}).get("seed") or 0), "refs": (args or {}).get("voice_refs") or {}, "artifacts": (env or {}).get("artifacts")})
-            except Exception:
-                pass
-            return {"ok": True, "name": name, "result": env}
-        if name == "audio.sfx.compose" and ALLOW_TOOL_EXECUTION:
-            manifest = {"items": []}; env = run_sfx_compose(args, manifest)
-            return {"ok": True, "name": name, "result": env}
-        if name == "music.compose" and ALLOW_TOOL_EXECUTION:
-            if not MUSIC_API_URL:
-                return JSONResponse(status_code=400, content={"error": "MUSIC_API_URL not configured"})
-            class _MusicProvider:
-                async def _compose(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-                    import base64 as _b
-                    async with httpx.AsyncClient() as client:
-                        body = {
-                            "prompt": payload.get("prompt"),
-                            "duration": int(payload.get("length_s") or 8),
-                            "music_lock": payload.get("music_lock") or payload.get("music_refs"),
-                            "seed": payload.get("seed"),
-                            "refs": payload.get("refs") or payload.get("music_refs"),
-                        }
-                        r = await client.post(MUSIC_API_URL.rstrip("/") + "/generate", json=body)
-                        r.raise_for_status()
-                        js = _resp_json(r, {"audio_wav_base64": str, "wav_b64": str})
-                        b64 = js.get("audio_wav_base64") or js.get("wav_b64")
-                        wav = _b.b64decode(b64) if isinstance(b64, str) else b""
-                        return {"wav_bytes": wav, "model": f"musicgen:{os.getenv('MUSIC_MODEL_ID','')}"}
-                def compose(self, args: Dict[str, Any]) -> Dict[str, Any]:
-                    import asyncio as _as
-                    return _as.get_event_loop().run_until_complete(self._compose(args))
-            provider = _MusicProvider(); manifest = {"items": []}; env = run_music_compose(args, provider, manifest)
-            try:
-                fc = args.get("film_cid"); cid = args.get("cue_id") or args.get("shot_id")
-                if isinstance(fc, str) and isinstance(cid, str):
-                    _film_save_snap(fc, f"cue_{cid}", {"tool": "music.compose", "seed": int((args or {}).get("seed") or 0), "refs": (args or {}).get("music_refs") or {}, "artifacts": (env or {}).get("artifacts")})
-            except Exception:
-                pass
-            return {"ok": True, "name": name, "result": env}
-        if name == "music.variation" and ALLOW_TOOL_EXECUTION:
-            manifest = {"items": []}; env = run_music_variation(args, manifest); return {"ok": True, "name": name, "result": env}
-        if name == "music.mixdown" and ALLOW_TOOL_EXECUTION:
-            manifest = {"items": []}; env = run_music_mixdown(args, manifest); return {"ok": True, "name": name, "result": env}
-        if name == "ocr.read" and ALLOW_TOOL_EXECUTION:
-            if not OCR_API_URL:
-                return JSONResponse(status_code=400, content={"error": "OCR_API_URL not configured"})
-            ext = (args.get("ext") or "").strip().lower(); b64 = args.get("b64")
-            if not b64 and isinstance(args.get("url"), str):
-                async with httpx.AsyncClient() as client:
-                    rr = await client.get(args.get("url").strip()); rr.raise_for_status(); import base64 as _b; b64 = _b.b64encode(rr.content).decode("ascii")
-            if not b64 and isinstance(args.get("path"), str):
-                rel = args.get("path").strip(); full = os.path.abspath(os.path.join(UPLOAD_DIR, rel)) if not os.path.isabs(rel) else rel
-                with open(full, "rb") as f: import base64 as _b; b64 = _b.b64encode(f.read()).decode("ascii");
-                if not ext and "." in rel: ext = "." + rel.split(".")[-1].lower()
-            async with httpx.AsyncClient() as client:
-                r = await client.post(OCR_API_URL.rstrip("/") + "/ocr", json={"b64": b64, "ext": ext}); r.raise_for_status(); js = _resp_json(r, {"text": str}); return {"ok": True, "name": name, "result": {"text": js.get("text") or "", "ext": ext}}
-        if name == "vlm.analyze" and ALLOW_TOOL_EXECUTION:
-            if not VLM_API_URL:
-                return JSONResponse(status_code=400, content={"error": "VLM_API_URL not configured"})
-            ext = (args.get("ext") or "").strip().lower(); b64 = args.get("b64")
-            if not b64 and isinstance(args.get("url"), str):
-                async with httpx.AsyncClient() as client:
-                    rr = await client.get(args.get("url").strip()); rr.raise_for_status(); import base64 as _b; b64 = _b.b64encode(rr.content).decode("ascii")
-            if not b64 and isinstance(args.get("path"), str):
-                rel = args.get("path").strip(); full = os.path.abspath(os.path.join(UPLOAD_DIR, rel)) if not os.path.isabs(rel) else rel
-                with open(full, "rb") as f: import base64 as _b; b64 = _b.b64encode(f.read()).decode("ascii");
-                if not ext and "." in rel: ext = "." + rel.split(".")[-1].lower()
-            async with httpx.AsyncClient() as client:
-                r = await client.post(VLM_API_URL.rstrip("/") + "/analyze", json={"b64": b64, "ext": ext}); r.raise_for_status(); js = _resp_json(r, {}); return {"ok": True, "name": name, "result": js}
-        return JSONResponse(status_code=400, content={"error": f"unsupported tool: {name}"})
-    except Exception as ex:
-        return JSONResponse(status_code=400, content={"error": str(ex)})
-    finally:
-        try:
-            _append_jsonl(os.path.join(STATE_DIR, "tools", "tools.jsonl"), {"t": int(time.time()*1000), "event": "end", "tool": name})
-        except Exception:
-            pass
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "append_failed"})
+    return {"ok": True}
+
+
+# ---------- Comfy View Proxy with explicit ACAO (binary) ----------
+@app.get("/comfy/view")
+async def comfy_view_proxy(filename: str, subfolder: str = "", type: str = "output"):
+    """
+    Minimal proxy to ensure ACAO headers are present for binary responses.
+    """
+    import httpx as _hx  # type: ignore
+    params = {"filename": filename, "type": type}
+    if subfolder:
+        params["subfolder"] = subfolder
+    async with _hx.AsyncClient(trust_env=False, timeout=None) as client:
+        r = await client.get((COMFYUI_API_URL or "http://comfyui:8188").rstrip("/") + "/view", params=params)
+        ct = r.headers.get("content-type") or "application/octet-stream"
+        return Response(
+            content=r.content,
+            media_type=ct,
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Headers": "*",
+                "Access-Control-Allow-Methods": "*",
+                "Cache-Control": "public, max-age=120",
+            },
+        )
+
+# ---------- Tool Introspection (UTC support) ----------
+_TOOL_SCHEMAS: Dict[str, Dict[str, Any]] = {
+    "image.dispatch": {
+        "name": "image.dispatch",
+        "version": "1",
+        "kind": "image",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "mode": {"type": "string", "enum": ["gen", "edit", "upscale"]},
+                "prompt": {"type": "string"},
+                "negative": {"type": "string"},
+                "seed": {"type": "integer"},
+                "size": {"type": "string"},
+                "width": {"type": "integer"},
+                "height": {"type": "integer"},
+                "assets": {"type": "object"},
+                "trace_id": {"type": "string"},
+            },
+            "required": ["prompt"],
+            "additionalProperties": True,
+        },
+        "notes": "Comfy pipeline; requires either size or width/height. Returns ids.image_id and meta.{data_url,view_url,orch_view_url}.",
+    },
+    "film2.run": {
+        "name": "film2.run",
+        "version": "1",
+        "kind": "video",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "prompt": {"type": "string"},
+                "clips": {"type": "array", "items": {"type": "string"}},
+                "images": {"type": "array", "items": {"type": "string"}},
+                "interpolate": {"type": "boolean"},
+                "scale": {"type": ["integer", "number"]},
+                "cid": {"type": "string"},
+                "trace_id": {"type": "string"},
+            },
+            "required": [],
+            "additionalProperties": True,
+        },
+        "notes": "Unified Film-2; public entrypoint; internal adapters only. Returns ids.video_id and meta.view_url.",
+    },
+    "tts.speak": {
+        "name": "tts.speak",
+        "version": "1",
+        "kind": "audio",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string"},
+                "voice_id": {"type": "string"},
+                "seed": {"type": "integer"},
+                "rate": {"type": ["integer", "number", "string"]},
+                "pitch": {"type": ["integer", "number", "string"]},
+                "trace_id": {"type": "string"},
+            },
+            "required": ["text"],
+            "additionalProperties": True,
+        },
+        "notes": "XTTS-v2 passthrough. Returns ids.audio_id and meta.{data_url,url,mime,duration_s}.",
+    },
+    "audio.sfx.compose": {
+        "name": "audio.sfx.compose",
+        "version": "1",
+        "kind": "audio",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "prompt": {"type": "string"},
+                "length_s": {"type": ["integer", "number"]},
+                "trace_id": {"type": "string"},
+            },
+            "required": ["prompt"],
+            "additionalProperties": True,
+        },
+        "notes": "SFX compose. Returns ids.audio_id and meta.{data_url,url,mime}.",
+    },
+}
+
+
+def _schema_type_ok(value: Any, spec: Any) -> bool:
+    if spec == {"type": "string"}:
+        return isinstance(value, str)
+    if spec == {"type": "integer"}:
+        return isinstance(value, int)
+    if spec == {"type": "boolean"}:
+        return isinstance(value, bool)
+    if spec == {"type": "object"}:
+        return isinstance(value, dict)
+    if spec == {"type": "array"}:
+        return isinstance(value, list)
+    if isinstance(spec, dict) and spec.get("type") in ("number",):
+        return isinstance(value, (int, float))
+    if isinstance(spec, dict) and isinstance(spec.get("type"), list):
+        # union
+        types = spec.get("type")
+        for t in types:
+            if t == "string" and isinstance(value, str): return True
+            if t == "integer" and isinstance(value, int): return True
+            if t == "number" and isinstance(value, (int, float)): return True
+            if t == "boolean" and isinstance(value, bool): return True
+            if t == "object" and isinstance(value, dict): return True
+            if t == "array" and isinstance(value, list): return True
+        return False
+    # default permissive
+    return True
+
+
+@app.get("/tool.list")
+async def tool_list():
+    rid = _uuid.uuid4().hex
+    tools = [{"name": n, "version": s.get("version"), "kind": (s.get("kind") or ("video" if n.startswith("film2") else "image" if n.startswith("image.") else "audio" if n.startswith("audio.") or n.startswith("tts.") else "utility")), "describe_url": f"/tool.describe?name={n}"} for n, s in _TOOL_SCHEMAS.items()]
+    return {"schema_version": 1, "request_id": rid, "ok": True, "result": {"tools": tools}}
+
+
+from fastapi import Response  # type: ignore
+
+@app.get("/tool.describe")
+async def tool_describe(name: str, response: Response):
+    rid = _uuid.uuid4().hex
+    meta = _TOOL_SCHEMAS.get((name or "").strip())
+    if not meta:
+        return JSONResponse(status_code=422, content={"schema_version": 1, "request_id": rid, "ok": False, "error": {"code": "unknown_tool", "message": f"{name}"}})
+    sch = meta["schema"]
+    import hashlib as _hl, json as _json
+    compact = _json.dumps(sch, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    shash = _hl.sha256(compact).hexdigest()
+    try:
+        response.headers["ETag"] = f'W/"{shash}"'
+    except Exception:
+        pass
+    return {
+        "schema_version": 1,
+        "request_id": rid,
+        "ok": True,
+        "result": {
+            "name": meta["name"],
+            "version": meta.get("version"),
+            "kind": meta.get("kind"),
+            "schema": sch,
+            "schema_hash": shash,
+            "notes": meta.get("notes"),
+            "examples": meta.get("examples", []),
+        },
+    }
+
+
+@app.post("/tool.validate")
+async def tool_validate(body: Dict[str, Any]):
+    rid = _uuid.uuid4().hex
+    if not isinstance(body, dict) or "name" not in body or "args" not in body:
+        return JSONResponse(status_code=400, content={"schema_version": 1, "request_id": rid, "ok": False, "error": {"code": "parse_error", "message": "Expected {name, args}"}})
+    name = (body or {}).get("name") or ""
+    args = (body or {}).get("args") or {}
+    meta = _TOOL_SCHEMAS.get(name.strip())
+    if not meta:
+        return JSONResponse(status_code=422, content={"schema_version": 1, "request_id": rid, "ok": False, "error": {"code": "unknown_tool", "message": f"{name}"}})
+    schema = meta["schema"]
+    errors: List[Dict[str, Any]] = []
+    for req in (schema.get("required") or []):
+        if args.get(req) is None:
+            errors.append({"code": "required_missing", "path": req, "expected": "present", "got": None})
+    props = schema.get("properties") or {}
+    for k, v in (args or {}).items():
+        ps = props.get(k)
+        if ps and not _schema_type_ok(v, ps):
+            errors.append({"code": "type_mismatch", "path": k, "expected": ps.get("type"), "got": type(v).__name__})
+        if ps and isinstance(ps.get("enum"), list) and v not in ps.get("enum"):
+            errors.append({"code": "enum_mismatch", "path": k, "allowed": ps.get("enum"), "got": v})
+    if errors:
+        return JSONResponse(status_code=422, content={"schema_version": 1, "request_id": rid, "ok": False, "error": {"code": "schema_validation", "message": "Invalid args", "details": {"errors": errors}}})
+    return {"schema_version": 1, "request_id": rid, "ok": True, "result": {"validated": True}}
 
 
 @app.post("/jobs/start")
@@ -6735,76 +7251,9 @@ async def completions_legacy(body: Dict[str, Any]):
     return JSONResponse(content=out)
 
 @app.websocket("/ws")
-async def ws_chat(websocket: WebSocket):
-    try:
-        await websocket.accept(subprotocol=websocket.headers.get("sec-websocket-protocol"))
-    except Exception:
-        await websocket.accept()
-    try:
-        await websocket.send_json({"type": "ready"})
-    except Exception:
-        pass
-    try:
-        while True:
-            raw = await websocket.receive_text()
-            body = {}
-            try:
-                body = JSONParser().parse(raw, {"messages": [{"role": str, "content": str}], "cid": (str)})
-            except Exception:
-                body = {}
-            payload = {"messages": body.get("messages") or [], "stream": False, "cid": body.get("cid"), "idempotency_key": body.get("idempotency_key")}
-            try:
-                # Periodic keepalive so committee/debate long phases do not drop WS
-                live = True
-                async def _keepalive() -> None:
-                    import asyncio as _asyncio
-                    while live:
-                        try:
-                            await websocket.send_text(json.dumps({"keepalive": True}))
-                        except Exception:
-                            break
-                        await _asyncio.sleep(10)
-                import asyncio as _asyncio
-                ka_task = _asyncio.create_task(_keepalive())
-                # Stream from chat/completions and forward chunks over WS
-                async with httpx.AsyncClient(trust_env=False, timeout=None) as client:
-                    if payload.get("stream") is not True:
-                        payload["stream"] = True
-                    async with client.stream("POST", (PUBLIC_BASE_URL.rstrip("/") if PUBLIC_BASE_URL else "http://127.0.0.1:8000") + "/v1/chat/completions", json=payload) as r:
-                        async for line in r.aiter_lines():
-                            if not line:
-                                continue
-                            if line.startswith("data: "):
-                                data_str = line[6:].strip()
-                                if data_str == "[DONE]":
-                                    await websocket.send_text(json.dumps({"done": True}))
-                                    break
-                                try:
-                                    obj = _parse_json_text(data_str, {})
-                                except Exception:
-                                    await websocket.send_text(json.dumps({"stream": True, "delta": ""}))
-                                    continue
-                                # Derive a text delta from chunk
-                                delta_txt = ""
-                                try:
-                                    delta_txt = (((obj.get("choices") or [{}])[0].get("delta") or {}).get("content") or "")
-                                    if not delta_txt:
-                                        delta_txt = (((obj.get("choices") or [{}])[0].get("message") or {}).get("content") or "")
-                                except Exception:
-                                    delta_txt = ""
-                                await websocket.send_text(json.dumps({"stream": True, "delta": delta_txt}))
-                live = False
-                try: ka_task.cancel()
-                except Exception: pass
-            except Exception as ex:
-                try:
-                    live = False
-                    ka_task.cancel()
-                except Exception:
-                    pass
-                await websocket.send_text(json.dumps({"error": str(ex)}))
-    except WebSocketDisconnect:
-        return
+async def ws_alias(websocket: WebSocket):
+    # Route legacy /ws to the unified run-all websocket handler to avoid 403s and spinner hangs
+    await _ws_run(websocket)
 
 
 @app.websocket("/tool.ws")

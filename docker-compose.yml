@@ -684,6 +684,7 @@ services:
       - EXEC_MEMORY_MB=${EXEC_MEMORY_MB:-2048}
       - ALLOW_SHELL=${ALLOW_SHELL:-false}
       - SHELL_WHITELIST=${SHELL_WHITELIST:-}
+      - ORCHESTRATOR_BASE_URL=http://orchestrator:8000
     expose:
       - "8081"
     ports:
