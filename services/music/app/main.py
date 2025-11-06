@@ -8,6 +8,8 @@ from typing import Dict, Any
 import numpy as np
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
+import logging, sys
+logging.basicConfig(level=logging.INFO, stream=sys.stdout, format="%(levelname)s:%(name)s:%(message)s")
 
 from .yue_engine import load_yue, generate_song
 

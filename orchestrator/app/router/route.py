@@ -50,6 +50,11 @@ def _last_user_text(req: Dict[str, Any]) -> str:
 
 def route_for_request(req: Dict[str, Any]) -> RouteDecision:
     t = _last_user_text(req)
+    tl = (t or "").lower()
+    # Prefer image when both image and film keywords appear but there are no explicit video terms
+    video_terms = ("video", "animate", "fps", "frames per second", "t2v", "i2v", "clip length", "seconds")
+    if looks_like_image(t) and not any(v in tl for v in video_terms):
+        return RouteDecision(kind="tool", tool="image.dispatch", args=build_image_args(t), reason="image-intent")
     if looks_like_code_task(t):
         return RouteDecision(kind="tool", tool="code.super_loop", args={"task": t, "repo_root": os.getenv("REPO_ROOT", "/workspace")}, reason="code-intent")
     if looks_like_film(t):

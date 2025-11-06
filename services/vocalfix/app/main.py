@@ -8,6 +8,8 @@ import pyloudnorm as pl
 import librosa
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
+import logging
+logging.basicConfig(level=logging.INFO, stream=sys.stdout, format="%(levelname)s:%(name)s:%(message)s")
 
 try:
     import crepe  # type: ignore

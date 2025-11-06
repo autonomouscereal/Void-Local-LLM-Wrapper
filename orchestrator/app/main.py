@@ -239,7 +239,7 @@ async def _image_dispatch_run(prompt: str, negative: Optional[str], seed: Option
                 await conn.execute("INSERT INTO rag_docs (path, chunk, embedding) VALUES ($1, $2, $3)", rel, prompt, list(vec))
 
     scores = {"image": {"clip": max([s.get("clip_score") or 0.0 for s in saved] or [0.0])}}
-    return {"cid": cid, "paths": [s.get("path") for s in saved], "scores": scores}
+    return {"cid": cid, "prompt_id": pid, "paths": [s.get("path") for s in saved], "scores": scores}
     wf = _comfy_load_wf()
     graph = _comfy_patch_wf(wf, prompt=prompt, negative=(negative or None), seed=seed, width=w, height=h, assets=(assets or {}))
     _append_ledger({
@@ -560,6 +560,20 @@ def _resp_json(resp, expected: Any) -> Any:
     return _hl.sha256(b).hexdigest()
 
 
+# ---- JSON response helpers: 400 parse error; 422 schema/semantics ----
+import uuid as _uuid
+def _ok(data: Any, rid: str) -> JSONResponse:
+    return JSONResponse({"schema_version": 1, "request_id": rid, "ok": True, "data": data}, status_code=200)
+
+def _jerr(status: int, rid: str, code: str, msg: str, details: Any | None = None) -> JSONResponse:
+    return JSONResponse({
+        "schema_version": 1,
+        "request_id": rid,
+        "ok": False,
+        "error": {"code": code, "message": msg, "details": details},
+    }, status_code=status)
+
+
 def _load_wrapper_config() -> None:
     global WRAPPER_CONFIG, WRAPPER_CONFIG_HASH
     try:
@@ -591,6 +605,7 @@ _load_wrapper_config()
 app = FastAPI(title="Void Orchestrator", version="0.1.0")
 from .middleware.ws_permissive import PermissiveWebSocketMiddleware
 app.add_middleware(PermissiveWebSocketMiddleware)
+# HTTP CORS: allow only configured UI origins when provided
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -607,6 +622,45 @@ try:
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 except Exception:
     pass
+
+# Stamp permissive headers on every HTTP response to avoid any CORS/CORP issues
+@app.middleware("http")
+async def _perm_headers(request: Request, call_next):
+    resp = await call_next(request)
+    resp.headers.setdefault("Access-Control-Allow-Origin", "*")
+    resp.headers.setdefault("Access-Control-Allow-Methods", "*")
+    resp.headers.setdefault("Access-Control-Allow-Headers", "*")
+    resp.headers.setdefault("Access-Control-Expose-Headers", "*")
+    resp.headers.setdefault("Access-Control-Allow-Credentials", "false")
+    resp.headers.setdefault("Access-Control-Allow-Private-Network", "true")
+    resp.headers.setdefault("Cross-Origin-Resource-Policy", "cross-origin")
+    resp.headers.setdefault("Timing-Allow-Origin", "*")
+    return resp
+
+@app.post("/v1/image.generate")
+async def v1_image_generate(request: Request):
+    rid = str(_uuid.uuid4())
+    raw = await request.body()
+    try:
+        body = JSONParser().parse(raw.decode("utf-8", errors="replace"), {})
+    except Exception:
+        return _jerr(400, rid, "invalid_json", "Body must be valid JSON")
+    if not isinstance(body, dict):
+        return _jerr(422, rid, "invalid_body_type", "Body must be an object")
+    prompt = body.get("prompt") or body.get("text") or ""
+    negative = body.get("negative")
+    seed = body.get("seed")
+    width = body.get("width")
+    height = body.get("height")
+    size = body.get("size")
+    assets = body.get("assets") if isinstance(body.get("assets"), dict) else {}
+    if not isinstance(prompt, str):
+        return _jerr(422, rid, "invalid_prompt", "prompt must be a string")
+    try:
+        res = await _image_dispatch_run(str(prompt), negative if isinstance(negative, str) else None, int(seed) if isinstance(seed, int) else None, int(width) if isinstance(width, int) else None, int(height) if isinstance(height, int) else None, str(size) if isinstance(size, str) else None, assets)
+        return _ok({"prompt_id": res.get("prompt_id"), "cid": res.get("cid"), "paths": res.get("paths")}, rid)
+    except Exception as ex:
+        return _jerr(422, rid, "image_generate_failed", str(ex))
 def _origin_norm(s: str) -> str:
     s = (s or "").strip()
     if s.startswith("ws://"): s = "http://" + s[5:]
@@ -6687,6 +6741,10 @@ async def ws_chat(websocket: WebSocket):
     except Exception:
         await websocket.accept()
     try:
+        await websocket.send_json({"type": "ready"})
+    except Exception:
+        pass
+    try:
         while True:
             raw = await websocket.receive_text()
             body = {}
@@ -6806,8 +6864,16 @@ async def ws_tool(websocket: WebSocket):
                 await websocket.send_text(json.dumps({"event": "result", "ok": True, "result": res}))
                 set_progress_queue(None)
                 await websocket.send_text(json.dumps({"done": True}))
+                try:
+                    await websocket.close(code=1000)
+                except Exception:
+                    pass
             except Exception as ex:
                 await websocket.send_text(json.dumps({"error": str(ex)}))
+                try:
+                    await websocket.close(code=1000)
+                except Exception:
+                    pass
                 try:
                     await websocket.close(code=1000)
                 except Exception:
