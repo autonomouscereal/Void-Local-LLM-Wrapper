@@ -153,7 +153,7 @@ async def _image_dispatch_run(prompt: str, negative: Optional[str], seed: Option
 
     # Resolve a valid sampler from this Comfy instance
     import aiohttp  # type: ignore
-    async with aiohttp.ClientSession() as _s:
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None)) as _s:
         sampler_name = await _choose_sampler_name(_s)
 
     graph_req: Dict[str, Any] = {
@@ -174,7 +174,8 @@ async def _image_dispatch_run(prompt: str, negative: Optional[str], seed: Option
     })
     out = await _comfy_submit_aio(graph)
     pid = out.get("prompt_id")
-    assert isinstance(pid, str) and pid
+    if not isinstance(pid, str) or not pid:
+        raise RuntimeError("invalid_prompt_id")
 
     files: List[Dict[str, str]] = []
     for _ in range(600):
@@ -201,7 +202,9 @@ async def _image_dispatch_run(prompt: str, negative: Optional[str], seed: Option
     base = (os.getenv("COMFYUI_API_URL", "http://comfyui:8188").rstrip("/"))
     comfy_items: List[Dict[str, Any]] = []
     for idx, f in enumerate(files):
-        fn = f.get("filename"); assert isinstance(fn, str) and fn
+        fn = f.get("filename")
+        if not (isinstance(fn, str) and fn):
+            raise RuntimeError("image_filename_missing")
         sf = f.get("subfolder") or ""
         ty = f.get("type") or "output"
         view_url = f"{base}/view?filename={fn}" + (f"&subfolder={sf}&type={ty}" if sf or ty else "")
@@ -252,8 +255,10 @@ async def _image_dispatch_run(prompt: str, negative: Optional[str], seed: Option
                     "subfolder": sf,
                     "view_url": view_url,
                 })
-            except Exception:
-                pass
+            except Exception as _e_art:
+                _append_jsonl(os.path.join(STATE_DIR, "traces", trace_id, "errors.jsonl"), {
+                    "t": int(time.time()*1000), "error": {"message": f"artifact_append_failed:{str(_e_art)}", "path": png_path}
+                })
         comfy_items.append({"filename": fn, "subfolder": sf, "type": ty, "view_url": view_url, "data_url": data_url})
         saved.append({"path": png_path, "clip_score": clip_s, "filename": fn, "subfolder": sf, "type": ty, "comfy_view": view_url})
     _man_write(outdir, manifest)
@@ -315,10 +320,12 @@ async def _image_dispatch_run(prompt: str, negative: Optional[str], seed: Option
                     imgs = v.get("images") or []
                     for img in imgs:
                         fn = img.get("filename"); sf = img.get("subfolder", ""); ty = img.get("type", "output")
-                        assert isinstance(fn, str) and fn, "image filename missing"
+                        if not (isinstance(fn, str) and fn):
+                            raise RuntimeError("image_filename_missing")
                         url = f"{base}/view?filename={fn}&subfolder={sf}&type={ty}"
                         files.append({"filename": fn, "url": url, "subfolder": sf, "type": ty})
-    assert files, "no images returned from comfy history"
+    if not files:
+        raise RuntimeError("no images returned from comfy history")
     # Persist and score (with committee loop)
     cid = "img-" + str(_now_ts())
     outdir = os.path.join(UPLOAD_DIR, "artifacts", "image", cid)
@@ -329,7 +336,9 @@ async def _image_dispatch_run(prompt: str, negative: Optional[str], seed: Option
     with _hx.Client() as client:
         def _save_batch(batch_files: List[Dict[str, str]], pass_idx: int, pr_text: str, pr_neg: Optional[str], pr_seed: Optional[int]) -> None:
             for idx, f in enumerate(batch_files):
-                u = f.get("url"); assert isinstance(u, str) and u
+                u = f.get("url")
+                if not (isinstance(u, str) and u):
+                    raise RuntimeError("image_url_missing")
                 r = client.get(u)
                 r.raise_for_status()
                 stem = f"dispatch_{pass_idx:02d}_{idx:02d}"
@@ -389,14 +398,18 @@ async def _image_dispatch_run(prompt: str, negative: Optional[str], seed: Option
                         imgs = v.get("images") or []
                         for img in imgs:
                             fn = img.get("filename"); sf = img.get("subfolder", ""); ty = img.get("type", "output")
-                            assert isinstance(fn, str) and fn, "image filename missing"
+                            if not (isinstance(fn, str) and fn):
+                                raise RuntimeError("image_filename_missing")
                             url = f"{base}/view?filename={fn}&subfolder={sf}&type={ty}"
                             files2.append({"filename": fn, "url": url, "subfolder": sf, "type": ty})
-        assert files2, "no images returned from comfy history (revise)"
+        if not files2:
+            raise RuntimeError("no images returned from comfy history (revise)")
         with _hx.Client() as client:
             def _save_batch2(batch_files: List[Dict[str, str]], pass_idx: int) -> None:
                 for idx, f in enumerate(batch_files):
-                    u = f.get("url"); assert isinstance(u, str) and u
+                    u = f.get("url")
+                    if not (isinstance(u, str) and u):
+                        raise RuntimeError("image_url_missing")
                     r = client.get(u)
                     r.raise_for_status()
                     stem = f"dispatch_{pass_idx:02d}_{idx:02d}"
@@ -815,9 +828,12 @@ async def post_image_dispatch(request: Request):
     width = obj.get("width")
     height = obj.get("height")
     size = obj.get("size")
-    assert isinstance(prompt, str) and len(prompt.strip()) > 0, "prompt must be non-empty string"
-    if negative is not None: assert isinstance(negative, str)
-    if seed is not None: assert isinstance(seed, int) and seed >= 0
+    if not (isinstance(prompt, str) and prompt.strip()):
+        return JSONResponse(status_code=422, content={"error": "invalid_prompt", "detail": "prompt must be non-empty string"})
+    if negative is not None and not isinstance(negative, str):
+        return JSONResponse(status_code=422, content={"error": "invalid_negative"})
+    if seed is not None and not (isinstance(seed, int) and seed >= 0):
+        return JSONResponse(status_code=422, content={"error": "invalid_seed"})
     assets = obj.get("assets") if isinstance(obj.get("assets"), dict) else {}
     return await _image_dispatch_run(prompt, negative, seed, width, height, size, assets)
 _characters_mem: Dict[str, Dict[str, Any]] = {}
@@ -7309,24 +7325,25 @@ async def ws_tool(websocket: WebSocket):
                         await _asyncio.sleep(0.25)
                 live = False
                 try: ka_task.cancel()
-                except Exception: pass
+                except Exception as _e_cancel:
+                    _append_jsonl(os.path.join(STATE_DIR, "ws", "errors.jsonl"), {"t": int(time.time()*1000), "route": "/tool.ws", "error": str(_e_cancel), "where": "cancel_keepalive"})
                 await websocket.send_text(json.dumps({"event": "result", "ok": True, "result": res}))
                 set_progress_queue(None)
                 await websocket.send_text(json.dumps({"done": True}))
                 try:
                     await websocket.close(code=1000)
-                except Exception:
-                    pass
+                except Exception as _e_close:
+                    _append_jsonl(os.path.join(STATE_DIR, "ws", "errors.jsonl"), {"t": int(time.time()*1000), "route": "/tool.ws", "error": str(_e_close), "where": "close_after_done"})
             except Exception as ex:
                 await websocket.send_text(json.dumps({"error": str(ex)}))
                 try:
                     await websocket.close(code=1000)
-                except Exception:
-                    pass
+                except Exception as _e_close2:
+                    _append_jsonl(os.path.join(STATE_DIR, "ws", "errors.jsonl"), {"t": int(time.time()*1000), "route": "/tool.ws", "error": str(_e_close2), "where": "close_after_error"})
                 try:
                     await websocket.close(code=1000)
-                except Exception:
-                    pass
+                except Exception as _e_close3:
+                    _append_jsonl(os.path.join(STATE_DIR, "ws", "errors.jsonl"), {"t": int(time.time()*1000), "route": "/tool.ws", "error": str(_e_close3), "where": "close_after_error_dup"})
     except WebSocketDisconnect:
         return
     try:

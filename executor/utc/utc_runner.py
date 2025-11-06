@@ -34,8 +34,16 @@ async def _emit_review_event(event: str, trace_id: Optional[str], step_id: Optio
             "notes": notes,
         }
         _post(ORCHESTRATOR_BASE_URL.rstrip("/") + "/logs/tools.append", payload)
-    except Exception:
-        pass
+    except Exception as e:
+        # Log locally to telemetry if posting fails
+        pool = await get_pg_pool()
+        if pool is not None:
+            try:
+                async with pool.acquire() as c:
+                    await c.execute("insert into tool_call_telemetry(trace_id,step_id,tool_name,version,builder_ok,repair_rounds,retargeted,status_code,error_json,final_args) values ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10::jsonb)",
+                                    trace_id, step_id, str(event), "utc", True, 0, False, 0, json.dumps({"post_logs_error": str(e)}), json.dumps({"notes": notes}))
+            except Exception:
+                pass
 
 
 RETRYABLE_STATUS = {429, 503, 524, 599}

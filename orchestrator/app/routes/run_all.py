@@ -255,9 +255,10 @@ async def ws_run(websocket: WebSocket):
         while True:
             msg = await websocket.receive_text()
             await websocket.send_json({"type": "ack", "echo": (msg[:100] if msg else "")})
-    except Exception:
+    except Exception as e:
+        tb = traceback.format_exc()
         try:
             await websocket.close(code=1000)
-        except Exception:
-            pass
+        except Exception as _e:
+            _append_jsonl(os.path.join(STATE_DIR_LOCAL, "ws", "errors.jsonl"), {"t": int(time.time()*1000), "rid": rid, "where": "ws.run.close", "error": str(_e)})
 
