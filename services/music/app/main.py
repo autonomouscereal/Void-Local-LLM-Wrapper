@@ -9,7 +9,6 @@ import numpy as np
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
-from common.torch_guard import ensure_cuda_safe
 from .yue_engine import load_yue, generate_song
 
 
@@ -21,10 +20,24 @@ _model = None
 _device = None
 
 
+# --- Device selection (per script, no helpers, no gating) ---
+import sys as _sys
+try:
+    import torch as _torch  # local to this file
+    DEVICE = "cuda:0" if _torch.cuda.is_available() else "cpu"
+    if DEVICE == "cpu":
+        print("[warn] music: CUDA not available; using CPU", file=_sys.stderr, flush=True)
+except Exception as _e:
+    DEVICE = "cpu"
+    print(f"[warn] music: torch import failed ({_e}); using CPU", file=_sys.stderr, flush=True)
+USE_FP16 = (os.environ.get("USE_FP16", "0") == "1") and DEVICE.startswith("cuda")
+# --- end device selection ---
+
+
 def get_model():
     global _model, _device
     if _model is None:
-        _device = ensure_cuda_safe()
+        _device = DEVICE
         _model = load_yue(YUE_DIR, device=_device)
     return _model, _device
 

@@ -15,16 +15,16 @@ except Exception:
     crepe = None
 
 
-def ensure_cuda_safe() -> str:
-    if not torch.cuda.is_available():
-        os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
-        return "cpu"
-    d = torch.cuda.current_device()
-    cap = torch.cuda.get_device_capability(d)
-    ver = torch.__version__
-    if cap == (6, 1) and "+cu118" not in ver:
-        sys.exit(5)
-    return f"cuda:{d}"
+# --- Device selection (per script, no helpers, no gating) ---
+try:
+    DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
+    if DEVICE == "cpu":
+        print("[warn] vocalfix: CUDA not available; using CPU", file=sys.stderr, flush=True)
+except Exception as _e:
+    DEVICE = "cpu"
+    print(f"[warn] vocalfix: torch check failed ({_e}); using CPU", file=sys.stderr, flush=True)
+USE_FP16 = (os.environ.get("USE_FP16", "0") == "1") and DEVICE.startswith("cuda")
+# --- end device selection ---
 
 
 def _read_wav_payload(wav_url: str | None, wav_bytes_b64: str | None) -> tuple[np.ndarray, int]:
@@ -91,7 +91,7 @@ async def healthz():
 @app.post("/vocal_fix")
 async def vocal_fix(body: dict):
     global _device
-    _device = _device or ensure_cuda_safe()
+    _device = _device or DEVICE
     try:
         wav_url = body.get("wav_url")
         wav_bytes = body.get("wav_bytes")

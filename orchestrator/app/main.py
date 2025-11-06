@@ -589,6 +589,8 @@ _load_wrapper_config()
 
 
 app = FastAPI(title="Void Orchestrator", version="0.1.0")
+from .middleware.ws_permissive import PermissiveWebSocketMiddleware
+app.add_middleware(PermissiveWebSocketMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -6680,14 +6682,10 @@ async def completions_legacy(body: Dict[str, Any]):
 
 @app.websocket("/ws")
 async def ws_chat(websocket: WebSocket):
-    origin = websocket.headers.get("origin") or ""
-    server_base = (os.getenv("PUBLIC_BASE_URL", "").strip()) or ""
-    same = (_origin_norm(origin) == _origin_norm(server_base)) if origin and server_base else True if not origin else False
-    allowed = same or origin.startswith("http://localhost") or origin.startswith("http://127.0.0.1") or origin.startswith("https://localhost") or origin.startswith("https://127.0.0.1")
-    if not allowed:
-        await websocket.close(code=1008)
-        return
-    await websocket.accept()
+    try:
+        await websocket.accept(subprotocol=websocket.headers.get("sec-websocket-protocol"))
+    except Exception:
+        await websocket.accept()
     try:
         while True:
             raw = await websocket.receive_text()
