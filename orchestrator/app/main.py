@@ -24,8 +24,9 @@ from __future__ import annotations
 # - We never replace the main content with status; instead we append a Status block only when empty/refusal.
 # - Long-running film pipeline: film_create → film_add_scene (ComfyUI jobs via /jobs) → film_compile (n8n or local assembler).
 # - Keep LLM models warm: we set options.keep_alive=24h on every Ollama call to avoid reloading between requests.
-# - ABSOLUTE RULE: TIMEOUTS ARE FORBIDDEN. Do not pass timeout args to HTTP/model/tool calls.
-#   All requests must wait for completion; backoff/retry is allowed, but never hard time caps.
+# - Timeouts: Default to no client-side timeouts. If a library/API requires a timeout param,
+#   set timeout=None (infinite) or the maximum safe cap. Never retry on timeouts; retries are allowed
+#   only for non-timeout transients (429/503/524/network reset/refused) with bounded jitter.
 
 import os
 import logging

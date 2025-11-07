@@ -60,8 +60,8 @@ def _soften_plan(plan: Dict[str, Any], user_text: str) -> Dict[str, Any]:
 router = APIRouter()
 
 
-def ok(data: Any, rid: str) -> JSONResponse:
-    return JSONResponse({"schema_version": 1, "request_id": rid, "ok": True, "data": data}, status_code=200)
+def ok(result: Any, rid: str) -> JSONResponse:
+    return JSONResponse({"schema_version": 1, "request_id": rid, "ok": True, "result": result}, status_code=200)
 
 
 def jerr(status: int, rid: str, code: str, msg: str, details: Any | None = None) -> JSONResponse:
