@@ -1,9 +1,11 @@
 import asyncio
 import json
 import time
+import logging
+import traceback
 from typing import Any, Dict, Optional, List
 
-from ..app.main import ORCHESTRATOR_BASE_URL
+import os
 from .schema_fetcher import fetch as fetch_schema
 from .validator import check as validate_args
 from .universal_adapter import repair as repair_args
@@ -33,7 +35,8 @@ async def _emit_review_event(event: str, trace_id: Optional[str], step_id: Optio
             "step_id": step_id,
             "notes": notes,
         }
-        _post(ORCHESTRATOR_BASE_URL.rstrip("/") + "/logs/tools.append", payload)
+        base = os.getenv("ORCHESTRATOR_BASE_URL", "http://orchestrator:8000")
+        _post(base.rstrip("/") + "/logs/tools.append", payload)
     except Exception as e:
         # Log locally to telemetry if posting fails
         pool = await get_pg_pool()
@@ -42,8 +45,9 @@ async def _emit_review_event(event: str, trace_id: Optional[str], step_id: Optio
                 async with pool.acquire() as c:
                     await c.execute("insert into tool_call_telemetry(trace_id,step_id,tool_name,version,builder_ok,repair_rounds,retargeted,status_code,error_json,final_args) values ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10::jsonb)",
                                     trace_id, step_id, str(event), "utc", True, 0, False, 0, json.dumps({"post_logs_error": str(e)}), json.dumps({"notes": notes}))
-            except Exception:
-                pass
+            except Exception as e2:
+                import logging, traceback
+                logging.error("telemetry write failed: %s", e2, exc_info=True)
 
 
 RETRYABLE_STATUS = {429, 503, 524, 599}
@@ -81,7 +85,8 @@ async def utc_run_tool(trace_id: Optional[str], step_id: Optional[str], name: st
         v = validate_args(name, attempt_args, schema)
         if v.get("ok"):
             # call tool
-            res = _post(ORCHESTRATOR_BASE_URL.rstrip("/") + "/tool.run", {"name": name, "args": attempt_args, "stream": False})
+            base = os.getenv("ORCHESTRATOR_BASE_URL", "http://orchestrator:8000")
+            res = _post(base.rstrip("/") + "/tool.run", {"name": name, "args": attempt_args, "stream": False})
             if res.get("ok"):
                 if round_idx > 0 and last_ops:
                     await persist_patch(name, version, schema_hash, schema_hash, last_ops)
@@ -122,7 +127,8 @@ async def utc_run_tool(trace_id: Optional[str], step_id: Optional[str], name: st
         if not v2.get("ok"):
             fix2 = repair_args(attempt_args, v2.get("errors") or [], schema2)
             attempt_args = fix2.get("fixed_args") or attempt_args
-        res2 = _post(ORCHESTRATOR_BASE_URL.rstrip("/") + "/tool.run", {"name": alt_name, "args": attempt_args, "stream": False})
+        base = os.getenv("ORCHESTRATOR_BASE_URL", "http://orchestrator:8000")
+        res2 = _post(base.rstrip("/") + "/tool.run", {"name": alt_name, "args": attempt_args, "stream": False})
         # record telemetry
         pool = await get_pg_pool()
         if pool is not None:

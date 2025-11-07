@@ -31,6 +31,12 @@ from __future__ import annotations
 import os
 import logging
 from types import SimpleNamespace
+from io import BytesIO
+import base64 as _b64
+import aiohttp  # type: ignore
+                    # httpx imported at top as _hx
+from PIL import Image  # type: ignore
+import imageio.v3 as iio  # type: ignore
 import asyncio
 import hashlib as _hl
 import json
@@ -153,7 +159,6 @@ async def _image_dispatch_run(prompt: str, negative: Optional[str], seed: Option
             uploaded[f"pose_{i}"] = await _comfy_upload_image(f"pose{i}", b64p)
 
     # Resolve a valid sampler from this Comfy instance
-    import aiohttp  # type: ignore
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None)) as _s:
         sampler_name = await _choose_sampler_name(_s)
 
@@ -211,9 +216,6 @@ async def _image_dispatch_run(prompt: str, negative: Optional[str], seed: Option
         view_url = f"{base}/view?filename={fn}" + (f"&subfolder={sf}&type={ty}" if sf or ty else "")
         data, ctype = await _comfy_view(fn)
         # Build capped inline preview (<=512px) for immediate UI render
-        from io import BytesIO
-        from PIL import Image  # type: ignore
-        import base64 as _b64
         _src = BytesIO(data)
         _im = Image.open(_src).convert("RGBA")
         _im.thumbnail((512, 512))
@@ -333,7 +335,7 @@ async def _image_dispatch_run(prompt: str, negative: Optional[str], seed: Option
     _ensure_dir(outdir)
     manifest = {"items": []}
     saved: List[Dict[str, Any]] = []
-    import httpx as _hx
+    # httpx imported at top as _hx
     with _hx.Client() as client:
         def _save_batch(batch_files: List[Dict[str, str]], pass_idx: int, pr_text: str, pr_neg: Optional[str], pr_seed: Optional[int]) -> None:
             for idx, f in enumerate(batch_files):
@@ -3687,7 +3689,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     frames_dir = os.path.join(outdir, "frames"); os.makedirs(frames_dir, exist_ok=True)
                     subprocess.run(["ffmpeg", "-y", "-i", dst, os.path.join(frames_dir, "%06d.png")], check=True)
                     # 2) Compute face embedding from first ref
-                    import httpx as _hx
+                    # httpx imported at top as _hx
                     face_src = face_images[0]
                     if face_src.startswith("/workspace/"):
                         face_url = face_src.replace("/workspace", "")
@@ -6244,7 +6246,7 @@ async def comfy_view_proxy(filename: str, subfolder: str = "", type: str = "outp
     """
     Minimal proxy to ensure ACAO headers are present for binary responses.
     """
-    import httpx as _hx  # type: ignore
+    # httpx imported at top as _hx
     params = {"filename": filename, "type": type}
     if subfolder:
         params["subfolder"] = subfolder

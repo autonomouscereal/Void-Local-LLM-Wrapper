@@ -1,9 +1,9 @@
+import os
 import hashlib
 import json
 from typing import Any, Dict, Optional
 import time
 
-from ..app.main import ORCHESTRATOR_BASE_URL  # reuse configured base
 from .db import get_pg_pool
 
 
@@ -25,7 +25,8 @@ def _get(url: str) -> Dict[str, Any]:
 
 async def fetch(name: str) -> Dict[str, Any]:
     """Fetch tool describe and cache to Postgres (best-effort)."""
-    url = ORCHESTRATOR_BASE_URL.rstrip("/") + f"/tool.describe?name={name}"
+    base = os.getenv("ORCHESTRATOR_BASE_URL", "http://orchestrator:8000")
+    url = base.rstrip("/") + f"/tool.describe?name={name}"
     obj = _get(url)
     res = (obj or {}).get("result") or {}
     schema = res.get("schema") or {}

@@ -3,4 +3,5 @@ uvicorn[standard]==0.30.1
 psutil==6.0.0
 pyyaml==6.0.2
 orjson==3.10.7
+asyncpg==0.29.0
 

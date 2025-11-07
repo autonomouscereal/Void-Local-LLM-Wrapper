@@ -1,6 +1,6 @@
+import os
 import json
 from typing import Any, Dict, Optional
-from ..app.main import ORCHESTRATOR_BASE_URL
 
 
 def _get(url: str) -> Dict[str, Any]:
@@ -16,7 +16,8 @@ def _get(url: str) -> Dict[str, Any]:
 
 def find_candidate(name: str) -> Optional[Dict[str, Any]]:
     """Pick nearest by name/kind. Minimal heuristic: same prefix before '.' or exact kind match."""
-    lst = _get(ORCHESTRATOR_BASE_URL.rstrip("/") + "/tool.list")
+    base = os.getenv("ORCHESTRATOR_BASE_URL", "http://orchestrator:8000")
+    lst = _get(base.rstrip("/") + "/tool.list")
     tools = ((lst or {}).get("result") or {}).get("tools") or []
     if not tools:
         return None
