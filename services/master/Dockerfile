@@ -12,6 +12,6 @@ WORKDIR /app
 COPY app /app/app
 
 EXPOSE 7865
-CMD ["python","-m","app.main"]
+CMD ["uvicorn","app.main:app","--host","0.0.0.0","--port","7865","--log-level","info","--access-log","--use-colors"]
 
 

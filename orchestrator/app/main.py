@@ -34,7 +34,8 @@ from types import SimpleNamespace
 from io import BytesIO
 import base64 as _b64
 import aiohttp  # type: ignore
-                    # httpx imported at top as _hx
+import httpx as _hx  # type: ignore
+import httpx  # type: ignore
 from PIL import Image  # type: ignore
 import imageio.v3 as iio  # type: ignore
 import asyncio
@@ -47,7 +48,7 @@ import traceback
 from .ops.policy import enforce_core_policy
 enforce_core_policy()
 
-import httpx  # type: ignore
+## httpx imported above as _hx
 import requests
 import re
 import asyncpg  # type: ignore
@@ -3906,7 +3907,6 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 if COMFYUI_API_URL and FACEID_API_URL and face_images:
                     frames_dir = os.path.join(outdir, "frames"); os.makedirs(frames_dir, exist_ok=True)
                     subprocess.run(["ffmpeg", "-y", "-i", dst, os.path.join(frames_dir, "%06d.png")], check=True)
-                    import httpx as _hx
                     face_src = face_images[0]
                     face_url = face_src.replace("/workspace", "") if face_src.startswith("/workspace/") else (face_src if face_src.startswith("/uploads/") else face_src)
                     with _hx.Client() as _c:

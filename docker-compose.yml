@@ -29,7 +29,6 @@ services:
     build:
       context: ./services/melody
       dockerfile: Dockerfile
-      network: host
     container_name: melody_service
     restart: unless-stopped
     depends_on:
@@ -46,7 +45,6 @@ services:
     build:
       context: ./services/dsinger
       dockerfile: Dockerfile
-      network: host
     container_name: dsinger_service
     restart: unless-stopped
     runtime: nvidia
@@ -66,7 +64,6 @@ services:
     build:
       context: ./services/rvc
       dockerfile: Dockerfile
-      network: host
     container_name: rvc_service
     restart: unless-stopped
     runtime: nvidia
@@ -86,7 +83,6 @@ services:
     build:
       context: ./services/vocalfix
       dockerfile: Dockerfile
-      network: host
     container_name: vocalfix_service
     restart: unless-stopped
     runtime: nvidia
@@ -106,7 +102,6 @@ services:
     build:
       context: ./services/master
       dockerfile: Dockerfile
-      network: host
     container_name: master_service
     restart: unless-stopped
     expose:
@@ -119,7 +114,6 @@ services:
     build:
       context: ./services/mfa
       dockerfile: Dockerfile
-      network: host
     container_name: mfa_service
     restart: unless-stopped
     expose:
@@ -133,7 +127,6 @@ services:
     build:
       context: ./services/prosody
       dockerfile: Dockerfile
-      network: host
     container_name: prosody_service
     restart: unless-stopped
     expose:
@@ -146,7 +139,6 @@ services:
     build:
       context: ./services/sfx
       dockerfile: Dockerfile
-      network: host
     container_name: sfx_service
     restart: unless-stopped
     runtime: nvidia
@@ -273,7 +265,6 @@ services:
     restart: unless-stopped
     
     environment:
-      
       - FILM2_MODELS=/opt/models
       - FILM2_DATA=/srv/film2
       - QWEN_BASE_URL=http://ollama_qwen:11434
@@ -294,27 +285,20 @@ services:
       - DEFAULT_NUM_CTX=${DEFAULT_NUM_CTX:-4096}
       - DEFAULT_TEMPERATURE=${DEFAULT_TEMPERATURE:-0.3}
       - ENABLE_WEBSEARCH=${ENABLE_WEBSEARCH:-true}
-      - DEFAULT_NUM_CTX=${DEFAULT_NUM_CTX:-4096}
-      - DEFAULT_TEMPERATURE=${DEFAULT_TEMPERATURE:-0.3}
-      - ENABLE_WEBSEARCH=${ENABLE_WEBSEARCH:-true}
       - SERPAPI_API_KEY
       - EXECUTOR_BASE_URL=http://executor:8081
       - PLANNER_MODEL=${PLANNER_MODEL:-qwen3}
-      - ENABLE_DEBATE=${ENABLE_DEBATE:-true}
-      - MAX_DEBATE_TURNS=${MAX_DEBATE_TURNS:-1}
       - MCP_HTTP_BRIDGE_URL
       - N8N_WEBHOOK_URL=${N8N_WEBHOOK_URL:-}
       - ASSEMBLER_API_URL=http://assembler:9095
       - ICW_API_URL=http://icw:8085
       - TEACHER_API_URL=http://teacher:8097
-      - AUTO_EXECUTE_TOOLS=${AUTO_EXECUTE_TOOLS:-true}
       - POSTGRES_HOST=pgvector
       - POSTGRES_PORT=5432
       - POSTGRES_DB=ragdb
       - POSTGRES_USER=rag
       - POSTGRES_PASSWORD=ragpass
       - EMBEDDING_MODEL_NAME=${EMBEDDING_MODEL_NAME:-BAAI/bge-large-en-v1.5}
-      - RAG_CACHE_TTL_SEC=${RAG_CACHE_TTL_SEC:-300}
       - XTTS_API_URL=http://xtts:8020
       - WHISPER_API_URL=http://whisper:9090
       - FACEID_API_URL=http://faceid:7000
@@ -337,6 +321,25 @@ services:
       - film2_models:/opt/models:ro
       - film2_data:/srv/film2
       - ./assets/comfyui/input:/comfyui/input
+
+  music:
+    build:
+      context: ./services/music
+      dockerfile: Dockerfile
+    container_name: music_service
+    restart: unless-stopped
+    environment:
+      - PYTHONUNBUFFERED=1
+    expose:
+      - "7860"
+    ports:
+      - "7860:7860"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:7860/healthz >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 40s
 
   xtts:
     build:
@@ -562,40 +565,6 @@ services:
       - ./services/n8n/workflows:/workflows:ro
     command: sh -lc "n8n import:workflow --input /workflows/film_assemble.json --separate"
 
-  music:
-    build:
-      context: ./services/music
-      dockerfile: Dockerfile
-      network: host
-      args:
-        <<: *cu118_args
-    container_name: music_service
-    restart: unless-stopped
-    runtime: nvidia
-    devices:
-      - "nvidia.com/gpu=all"
-    depends_on:
-      - nvidia_init
-      - film2_bootstrap
-    environment:
-      - NVIDIA_VISIBLE_DEVICES=${MUSIC_GPU:-all}
-      - HF_HOME=/models/hf
-      - TRANSFORMERS_CACHE=/models/hf
-      - TORCH_HOME=/models/torch
-      
-    expose:
-      - "7860"
-    ports:
-      - "7860:7860"
-    shm_size: "1g"
-    
-    volumes:
-      - hf_cache:/models/hf
-      - torch_cache:/models/torch
-      - film2_models:/opt/models:ro
-      - film2_data:/srv/film2
-    
-  
 
   demucs:
     build:

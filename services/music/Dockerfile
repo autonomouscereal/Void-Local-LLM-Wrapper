@@ -20,6 +20,7 @@ COPY app /app/app
 
 EXPOSE 7860
 
-CMD ["python","-m","app.main"]
+# Run with uvicorn so logs go to stdout/stderr and port matches compose
+CMD ["uvicorn","app.main:app","--host","0.0.0.0","--port","7860","--log-level","info","--access-log","--use-colors"]
 
 
