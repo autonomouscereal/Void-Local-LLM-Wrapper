@@ -33,8 +33,8 @@ def _post_json(url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         return JSONParser().parse(raw, expected)
 def _soften_plan(plan: Dict[str, Any], user_text: str) -> Dict[str, Any]:
     """Make inputs more forgiving by filling common defaults so execution can proceed."""
-    steps = plan.get("plan") or []
-    out = {"request_id": plan.get("request_id"), "plan": []}
+    steps = plan.get("steps") or plan.get("plan") or []
+    out = {"request_id": plan.get("request_id"), "steps": []}
     for s in steps:
         if not isinstance(s, dict):
             continue
@@ -52,7 +52,7 @@ def _soften_plan(plan: Dict[str, Any], user_text: str) -> Dict[str, Any]:
                 inputs["duration_s"] = 15
         s2 = dict(s)
         s2["inputs"] = inputs
-        out["plan"].append(s2)
+        out["steps"].append(s2)
     return out
 
 
@@ -93,8 +93,11 @@ def _strip_stacks(obj: Any) -> None:
 
 
 def _to_artifact_parts(step_result: Dict[str, Any]) -> list[Dict[str, Any]]:
-    ids = (step_result or {}).get("ids") or {}
-    meta = (step_result or {}).get("meta") or {}
+    # Accept either canonical nested shape {name, result:{ids,meta}} or legacy flat {ids,meta}
+    data = (step_result or {}).get("result") if isinstance(step_result, dict) else None
+    base = data if isinstance(data, dict) else (step_result or {})
+    ids = (base or {}).get("ids") or {}
+    meta = (base or {}).get("meta") or {}
     out: list[Dict[str, Any]] = []
     # image
     if ids.get("image_id") and (meta.get("data_url") or meta.get("orch_view_url") or meta.get("view_url")):
@@ -123,22 +126,44 @@ def _to_artifact_parts(step_result: Dict[str, Any]) -> list[Dict[str, Any]]:
 async def run_all(req: Request):
     rid = str(uuid.uuid4())
     raw = await req.body()
-    try:
-        body = JSONParser().parse(raw.decode("utf-8", errors="replace"), {})
-    except Exception:
-        return jerr(400, rid, "invalid_json", "Body must be valid JSON")
+    body = JSONParser().parse(raw.decode("utf-8", errors="replace"), {})
     if not isinstance(body, dict):
-        return jerr(422, rid, "invalid_body", "Body must be JSON object")
+        return jerr(400, rid, "invalid_json", "Body must be valid JSON")
+    # Normalize request id if provided
+    rid = str(body.get("request_id") or rid)
+    tid = uuid.uuid4().hex
     user_text = body.get("text") or ""
     if not isinstance(user_text, str):
-        return jerr(422, rid, "invalid:text", "text must be string")
-    # First plan
-    plan = await make_full_plan(user_text)
-    errs = validate_plan(plan)
-    if errs:
-        # Auto re-ask once, then proceed with softened plan even if still imperfect
+        return jerr(422, rid, "invalid_text", "text must be string")
+    # Accept either explicit plan or steps; otherwise build via committee
+    plan: Dict[str, Any] | None = None
+    req_plan = body.get("plan")
+    req_steps = body.get("steps")
+    if isinstance(req_plan, dict):
+        if isinstance(req_plan.get("steps"), list):
+            plan = req_plan
+        elif isinstance(req_plan.get("plan"), list):
+            plan = {"request_id": req_plan.get("request_id") or rid, "steps": req_plan.get("plan")}
+        else:
+            plan = {"request_id": req_plan.get("request_id") or rid, "steps": []}
+    elif isinstance(req_steps, list):
+        plan = {"request_id": rid, "steps": req_steps}
+    else:
         plan = await make_full_plan(user_text)
+        # normalize to steps key if planner returned legacy shape
+        if isinstance(plan, dict) and isinstance(plan.get("plan"), list) and not isinstance(plan.get("steps"), list):
+            plan = {"request_id": plan.get("request_id") or rid, "steps": plan.get("plan")}
         errs = validate_plan(plan)
+        if errs:
+            # Auto re-ask once, then proceed with softened plan even if still imperfect
+            plan = await make_full_plan(user_text)
+            if isinstance(plan, dict) and isinstance(plan.get("plan"), list) and not isinstance(plan.get("steps"), list):
+                plan = {"request_id": plan.get("request_id") or rid, "steps": plan.get("plan")}
+            errs = validate_plan(plan)
+        if errs:
+            plan = _soften_plan(plan, user_text)
+    # For provided plans, validate and soften if needed
+    errs = validate_plan(plan)
     if errs:
         plan = _soften_plan(plan, user_text)
     app = req.app
@@ -146,96 +171,92 @@ async def run_all(req: Request):
         app.state.jobs = {}
     if not hasattr(app.state, "ws_clients"):
         app.state.ws_clients = {}
-    app.state.jobs[rid] = {"status": "queued", "plan": plan, "result": None, "error": None}
+    app.state.jobs[rid] = {"status": "queued", "plan": plan, "result": None, "error": None, "trace_id": tid}
     # Review config (defaults: enabled true, 1 iteration)
     review_cfg = (body.get("review") or {}) if isinstance(body.get("review"), dict) else {}
     review_enabled = bool(review_cfg.get("enabled", True))
     max_iters = int(review_cfg.get("max_iterations", 1) or 1)
     async def _runner():
         ws = app.state.ws_clients.get(rid)
-        try:
-            app.state.jobs[rid]["status"] = "running"
-            if ws: await ws.send_json({"type": "status", "status": "running"})
-            # Distilled job start
-            _append_jsonl(os.path.join(STATE_DIR_LOCAL, "traces", rid, "events.jsonl"), {"t": int(time.time()*1000), "event": "job_start", "rid": rid, "steps": len(plan.get("plan") or [])})
-            # Trace: record plan submission
-            _append_jsonl(os.path.join(STATE_DIR_LOCAL, "traces", rid, "requests.jsonl"), {"t": int(time.time()*1000), "trace_id": rid, "plan": plan})
-            url = EXECUTOR_BASE_URL.rstrip("/") + "/execute_plan"
-            produced_map: Dict[str, Any] = {}
-            for iter_idx in range(max(1, max_iters)):
-                # Execute current plan
-                res = await asyncio.get_event_loop().run_in_executor(None, lambda: _post_json(url, {"plan": plan}))
-                # On schema/tool errors: re-plan once with softening and retry
-                if (not isinstance(res, dict)) or (res.get("error") and not res.get("produced")):
-                    if ws:
-                        await ws.send_json({"type": "progress", "event": "repair_attempt", "note": "retrying with corrected plan"})
-                    _append_jsonl(os.path.join(STATE_DIR_LOCAL, "traces", rid, "events.jsonl"), {"t": int(time.time()*1000), "event": "repair_attempt", "rid": rid})
-                    plan2 = _soften_plan(await make_full_plan(user_text), user_text)
-                    res2 = await asyncio.get_event_loop().run_in_executor(None, lambda: _post_json(url, {"plan": plan2}))
-                    if not isinstance(res2, dict) or (res2.get("error") and not res2.get("produced")):
-                        raise RuntimeError(f"executor_error:{(res2 or res or {})}")
-                    res = res2
-                produced_map = (res or {}).get("produced") if isinstance(res, dict) else {}
-                # Emit a chat.append preview for this iteration
+        app.state.jobs[rid]["status"] = "running"
+        if ws:
+            await ws.send_json({"type": "status", "status": "running"})
+        # Distilled job start
+        _append_jsonl(os.path.join(STATE_DIR_LOCAL, "traces", tid, "events.jsonl"), {"t": int(time.time()*1000), "event": "job_start", "rid": rid, "trace_id": tid, "steps": len(plan.get("steps") or [])})
+        # Trace: record plan submission
+        _append_jsonl(os.path.join(STATE_DIR_LOCAL, "traces", tid, "requests.jsonl"), {"t": int(time.time()*1000), "trace_id": tid, "plan": plan})
+        url = EXECUTOR_BASE_URL.rstrip("/") + "/execute_plan"
+        produced_map: Dict[str, Any] = {}
+        for iter_idx in range(max(1, max_iters)):
+            # Execute current plan
+            res = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: _post_json(url, {"request_id": rid, "trace_id": tid, "steps": (plan.get("steps") or [])}),
+            )
+            # On schema/tool errors: re-plan once with softening and retry
+            if (not isinstance(res, dict)) or (res.get("error") and not res.get("produced")):
                 if ws:
-                    parts = []
-                    # Use normalizer to build chat parts
-                    for step_name, step_result in (produced_map or {}).items():
-                        if isinstance(step_result, dict):
-                            parts.extend(_to_artifact_parts(step_result))
-                    await ws.send_json({"type": "chat.append", "message": {"role": "assistant", "parts": parts}})
-                # Record produced map for this iteration (strip data_url to keep traces clean)
-                rec = {"produced": (produced_map or {})}
-                _strip_data_urls(rec)
-                _strip_stacks(rec)
-                _append_jsonl(os.path.join(STATE_DIR_LOCAL, "traces", rid, "responses.jsonl"), {"t": int(time.time()*1000), "trace_id": rid, **rec, "iter": iter_idx})
-                # Decide whether to review and iterate
-                if not review_enabled or (iter_idx + 1) >= max(1, max_iters):
-                    break
-                try:
-                    if ws:
-                        await ws.send_json({"type": "review.start", "iter": iter_idx + 1})
-                    delta = _build_delta_plan({"produced": produced_map, "text": user_text})
-                    if ws:
-                        await ws.send_json({"type": "review.decision", "iter": iter_idx + 1, "accepted": bool(not delta), "delta": (delta or {})})
-                    if not delta:
-                        break
-                    # Apply delta to produce a new plan
-                    plan = {"request_id": plan.get("request_id") or rid, "plan": (delta.get("plan") or plan.get("plan") or [])}
-                    _append_jsonl(os.path.join(STATE_DIR_LOCAL, "traces", rid, "events.jsonl"), {"t": int(time.time()*1000), "event": "edit.plan", "rid": rid, "iter": iter_idx + 1})
-                except Exception:
-                    # On review failure, exit loop and finalize current results
-                    break
-            app.state.jobs[rid]["result"] = produced_map or {}
-            _append_jsonl(os.path.join(STATE_DIR_LOCAL, "traces", rid, "events.jsonl"), {"t": int(time.time()*1000), "event": "job_finish", "rid": rid, "produced_keys": sorted(list((produced_map or {}).keys()))})
-            app.state.jobs[rid]["status"] = "done"
+                    await ws.send_json({"type": "progress", "event": "repair_attempt", "note": "retrying with corrected plan"})
+                _append_jsonl(os.path.join(STATE_DIR_LOCAL, "traces", tid, "events.jsonl"), {"t": int(time.time()*1000), "event": "repair_attempt", "rid": rid, "trace_id": tid})
+                plan2 = _soften_plan(await make_full_plan(user_text), user_text)
+                if isinstance(plan2, dict) and isinstance(plan2.get("plan"), list) and not isinstance(plan2.get("steps"), list):
+                    plan2 = {"request_id": plan2.get("request_id") or rid, "steps": plan2.get("plan")}
+                res2 = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: _post_json(url, {"request_id": rid, "trace_id": tid, "steps": (plan2.get("steps") or [])}),
+                )
+                if not isinstance(res2, dict) or (res2.get("error") and not res2.get("produced")):
+                    return  # exit early; runner will finalize below as error not set
+                res = res2
+            produced_map = (res or {}).get("produced") if isinstance(res, dict) else {}
+            # Emit a chat.append preview for this iteration
             if ws:
-                # Final result to UI: strip any inline data to keep payload lean
-                final_res = {"result": (produced_map or {})}
-                _strip_data_urls(final_res)
-                _strip_stacks(final_res)
-                await ws.send_json({"type": "done", **final_res})
-                try: await ws.close(code=1000)
-                except Exception as _e:
-                    _append_jsonl(os.path.join(STATE_DIR_LOCAL, "ws", "errors.jsonl"), {"t": int(time.time()*1000), "rid": rid, "where": "run_all.done", "error": str(_e)})
-        except Exception as e:
-            tb = traceback.format_exc()
-            logging.error(tb)
-            # Route error with stack to errors corpus (keep primary traces clean)
-            try:
-                _append_jsonl(os.path.join(STATE_DIR_LOCAL, "traces", rid, "errors.jsonl"), {
-                    "t": int(time.time()*1000),
-                    "error": {"message": str(e), "traceback": tb}
-                })
-            except Exception:
-                logging.error(traceback.format_exc())
-            app.state.jobs[rid]["error"] = str(e)
-            app.state.jobs[rid]["status"] = "error"
+                parts = []
+                # Use normalizer to build chat parts
+                for step_name, step_result in (produced_map or {}).items():
+                    if isinstance(step_result, dict):
+                        parts.extend(_to_artifact_parts(step_result))
+                await ws.send_json({"type": "chat.append", "message": {"role": "assistant", "parts": parts}})
+            # Record produced map for this iteration (strip data_url to keep traces clean)
+            rec = {"produced": (produced_map or {})}
+            _strip_data_urls(rec)
+            _strip_stacks(rec)
+            _append_jsonl(os.path.join(STATE_DIR_LOCAL, "traces", tid, "responses.jsonl"), {"t": int(time.time()*1000), "trace_id": tid, **rec, "iter": iter_idx})
+            # Decide whether to review and iterate
+            if not review_enabled or (iter_idx + 1) >= max(1, max_iters):
+                break
             if ws:
-                await ws.send_json({"type": "error", "message": str(e)[:500], "traceback": tb})
-                try: await ws.close(code=1000)
-                except Exception as _e:
-                    _append_jsonl(os.path.join(STATE_DIR_LOCAL, "ws", "errors.jsonl"), {"t": int(time.time()*1000), "rid": rid, "where": "run_all.error", "error": str(_e)})
+                await ws.send_json({"type": "review.start", "iter": iter_idx + 1})
+            delta = _build_delta_plan({"produced": produced_map, "text": user_text})
+            if ws:
+                await ws.send_json({"type": "review.decision", "iter": iter_idx + 1, "accepted": bool(not delta), "delta": (delta or {})})
+            if not delta:
+                break
+            # Apply delta to produce a new plan
+            next_steps = (delta.get("steps") or delta.get("plan") or plan.get("steps") or [])
+            # remap needs to current identifiers (prefer explicit id else name)
+            def _id_or_name(s: Dict[str, Any]) -> str:
+                sid = s.get("id")
+                return sid if isinstance(sid, str) and sid else str(s.get("name") or "")
+            idx = { _id_or_name(s): _id_or_name(s) for s in next_steps if isinstance(s, dict) }
+            for s in next_steps:
+                if not isinstance(s, dict):
+                    continue
+                needs = s.get("needs") or []
+                if isinstance(needs, list):
+                    s["needs"] = [ idx.get(n, n) for n in needs ]
+            plan = {"request_id": plan.get("request_id") or rid, "steps": next_steps}
+            _append_jsonl(os.path.join(STATE_DIR_LOCAL, "traces", tid, "events.jsonl"), {"t": int(time.time()*1000), "event": "edit.plan", "rid": rid, "trace_id": tid, "iter": iter_idx + 1})
+        app.state.jobs[rid]["result"] = produced_map or {}
+        _append_jsonl(os.path.join(STATE_DIR_LOCAL, "traces", tid, "events.jsonl"), {"t": int(time.time()*1000), "event": "job_finish", "rid": rid, "trace_id": tid, "produced_keys": sorted(list((produced_map or {}).keys()))})
+        app.state.jobs[rid]["status"] = "done"
+        if ws:
+            # Final result to UI: strip any inline data to keep payload lean
+            final_res = {"result": (produced_map or {})}
+            _strip_data_urls(final_res)
+            _strip_stacks(final_res)
+            await ws.send_json({"type": "done", **final_res})
+            await ws.close(code=1000)
     asyncio.create_task(_runner())
     return ok({"request_id": rid, "plan": plan}, rid)
 
@@ -249,16 +270,13 @@ async def ws_run(websocket: WebSocket):
     if not hasattr(app.state, "ws_clients"):
         app.state.ws_clients = {}
     app.state.ws_clients[rid] = websocket
-    try:
-        await websocket.send_json({"type": "session", "rid": rid})
-        # Keep open until server closes from runner
-        while True:
-            msg = await websocket.receive_text()
-            await websocket.send_json({"type": "ack", "echo": (msg[:100] if msg else "")})
-    except Exception as e:
-        tb = traceback.format_exc()
-        try:
-            await websocket.close(code=1000)
-        except Exception as _e:
-            _append_jsonl(os.path.join(STATE_DIR_LOCAL, "ws", "errors.jsonl"), {"t": int(time.time()*1000), "rid": rid, "where": "ws.run.close", "error": str(_e)})
+    # Use the same trace_id associated with the job if available
+    tid = None
+    if hasattr(app.state, "jobs") and isinstance(app.state.jobs.get(rid), dict):
+        tid = app.state.jobs[rid].get("trace_id")
+    await websocket.send_json({"type": "session/ready", "trace_id": tid or rid})
+    # Keep open until server closes from runner
+    while True:
+        msg = await websocket.receive_text()
+        await websocket.send_json({"type": "ack", "echo": (msg[:100] if msg else "")})
 
