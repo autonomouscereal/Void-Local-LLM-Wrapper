@@ -93,9 +93,8 @@ def _strip_stacks(obj: Any) -> None:
 
 
 def _to_artifact_parts(step_result: Dict[str, Any]) -> list[Dict[str, Any]]:
-    # Accept either canonical nested shape {name, result:{ids,meta}} or legacy flat {ids,meta}
-    data = (step_result or {}).get("result") if isinstance(step_result, dict) else None
-    base = data if isinstance(data, dict) else (step_result or {})
+    # Canonical reader: step_result must contain {"result": {"ids":{}, "meta":{}}}
+    base = (step_result or {}).get("result") if isinstance(step_result, dict) else None
     ids = (base or {}).get("ids") or {}
     meta = (base or {}).get("meta") or {}
     out: list[Dict[str, Any]] = []
@@ -119,6 +118,31 @@ def _to_artifact_parts(step_result: Dict[str, Any]) -> list[Dict[str, Any]]:
         if isinstance(meta.get("poster_data_url"), str):
             p["preview"]["poster_data_url"] = meta.get("poster_data_url")
         out.append(p)
+    return out
+
+
+def _canonical_step_result(step_name: str, step_result: Dict[str, Any]) -> Dict[str, Any]:
+    """Coerce any legacy flat step outputs into canonical nested shape.
+    Canonical: {"name": step_name, "result": {"ids": {...}, "meta": {...}}}
+    """
+    if isinstance(step_result, dict) and isinstance(step_result.get("result"), dict):
+        res = step_result["result"]
+        ids = res.get("ids") or {}
+        meta = res.get("meta") or {}
+        return {"name": step_name, "result": {"ids": ids, "meta": meta}}
+    ids = step_result.get("ids") if isinstance(step_result, dict) else {}
+    meta = step_result.get("meta") if isinstance(step_result, dict) else {}
+    if not isinstance(ids, dict):
+        ids = {}
+    if not isinstance(meta, dict):
+        meta = {}
+    return {"name": step_name, "result": {"ids": ids, "meta": meta}}
+
+
+def _canonicalize_produced(produced_map: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for sid, val in (produced_map or {}).items():
+        out[str(sid)] = _canonical_step_result(str((val or {}).get("name") or ""), val if isinstance(val, dict) else {})
     return out
 
 
@@ -185,13 +209,13 @@ async def run_all(req: Request):
         _append_jsonl(os.path.join(STATE_DIR_LOCAL, "traces", tid, "events.jsonl"), {"t": int(time.time()*1000), "event": "job_start", "rid": rid, "trace_id": tid, "steps": len(plan.get("steps") or [])})
         # Trace: record plan submission
         _append_jsonl(os.path.join(STATE_DIR_LOCAL, "traces", tid, "requests.jsonl"), {"t": int(time.time()*1000), "trace_id": tid, "plan": plan})
-        url = EXECUTOR_BASE_URL.rstrip("/") + "/execute_plan"
+        url = EXECUTOR_BASE_URL.rstrip("/") + "/execute"
         produced_map: Dict[str, Any] = {}
         for iter_idx in range(max(1, max_iters)):
             # Execute current plan
             res = await asyncio.get_event_loop().run_in_executor(
                 None,
-                lambda: _post_json(url, {"request_id": rid, "trace_id": tid, "steps": (plan.get("steps") or [])}),
+                lambda: _post_json(url, {"schema_version": 1, "request_id": rid, "trace_id": tid, "steps": (plan.get("steps") or [])}),
             )
             # On schema/tool errors: re-plan once with softening and retry
             if (not isinstance(res, dict)) or (res.get("error") and not res.get("produced")):
@@ -203,12 +227,13 @@ async def run_all(req: Request):
                     plan2 = {"request_id": plan2.get("request_id") or rid, "steps": plan2.get("plan")}
                 res2 = await asyncio.get_event_loop().run_in_executor(
                     None,
-                    lambda: _post_json(url, {"request_id": rid, "trace_id": tid, "steps": (plan2.get("steps") or [])}),
+                    lambda: _post_json(url, {"schema_version": 1, "request_id": rid, "trace_id": tid, "steps": (plan2.get("steps") or [])}),
                 )
                 if not isinstance(res2, dict) or (res2.get("error") and not res2.get("produced")):
                     return  # exit early; runner will finalize below as error not set
                 res = res2
             produced_map = (res or {}).get("produced") if isinstance(res, dict) else {}
+            produced_map = _canonicalize_produced(produced_map)
             # Emit a chat.append preview for this iteration
             if ws:
                 parts = []
@@ -218,7 +243,7 @@ async def run_all(req: Request):
                         parts.extend(_to_artifact_parts(step_result))
                 await ws.send_json({"type": "chat.append", "message": {"role": "assistant", "parts": parts}})
             # Record produced map for this iteration (strip data_url to keep traces clean)
-            rec = {"produced": (produced_map or {})}
+                rec = {"produced": (produced_map or {})}
             _strip_data_urls(rec)
             _strip_stacks(rec)
             _append_jsonl(os.path.join(STATE_DIR_LOCAL, "traces", tid, "responses.jsonl"), {"t": int(time.time()*1000), "trace_id": tid, **rec, "iter": iter_idx})
@@ -270,11 +295,16 @@ async def ws_run(websocket: WebSocket):
     if not hasattr(app.state, "ws_clients"):
         app.state.ws_clients = {}
     app.state.ws_clients[rid] = websocket
-    # Use the same trace_id associated with the job if available
+    # Compute or fetch the unique trace id for this run; never fall back to rid
     tid = None
     if hasattr(app.state, "jobs") and isinstance(app.state.jobs.get(rid), dict):
         tid = app.state.jobs[rid].get("trace_id")
-    await websocket.send_json({"type": "session/ready", "trace_id": tid or rid})
+    if not tid:
+        tid = uuid.uuid4().hex
+        if not hasattr(app.state, "jobs"):
+            app.state.jobs = {}
+        app.state.jobs[rid] = {"trace_id": tid}
+    await websocket.send_json({"type": "session/ready", "trace_id": tid})
     # Keep open until server closes from runner
     while True:
         msg = await websocket.receive_text()
