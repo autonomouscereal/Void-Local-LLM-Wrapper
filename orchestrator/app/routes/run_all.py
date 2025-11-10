@@ -17,7 +17,8 @@ from ..json_parser import JSONParser
 from ..plan.committee import make_full_plan
 from ..plan.validator import validate_plan
 from ..review.referee import build_delta_plan as _build_delta_plan
-EXECUTOR_BASE_URL = os.getenv("EXECUTOR_BASE_URL", "http://executor:8081")
+EXECUTOR_BASE_URL = os.getenv("EXECUTOR_BASE_URL", "http://executor:8001")
+EXECUTE_URL = EXECUTOR_BASE_URL.rstrip("/") + "/execute"
 STATE_DIR_LOCAL = os.path.join(os.getenv("UPLOAD_DIR", "/workspace/uploads"), "state")
 from ..state.checkpoints import append_ndjson as _append_jsonl
 import time
@@ -211,14 +212,16 @@ async def run_all(req: Request):
         app.state.jobs[rid_]["status"] = "running"
         if ws:
             await ws.send_json({"type": "status", "status": "running"})
-        url = EXECUTOR_BASE_URL.rstrip("/") + "/execute"
+        url = EXECUTE_URL
         produced_map: Dict[str, Any] = {}
         steps_local: List[Dict[str, Any]] = list(steps0 or [])
         for iter_idx in range(max(1, max_iters_)):
             # Execute current steps
+            # Log exec_post event for visibility
+            _append_jsonl(os.path.join(STATE_DIR_LOCAL, "traces", tid_, "events.jsonl"), {"t": int(time.time()*1000), "event": "exec_post", "url": EXECUTE_URL, "rid": rid_, "trace_id": tid_})
             res = await asyncio.get_event_loop().run_in_executor(
                 None,
-                lambda: _post_json(url, {"schema_version": 1, "request_id": rid_, "trace_id": tid_, "steps": steps_local}),
+                lambda: _post_json(EXECUTE_URL, {"schema_version": 1, "request_id": rid_, "trace_id": tid_, "steps": steps_local}),
             )
             # On schema/tool errors: re-plan once with softening and retry
             if (not isinstance(res, dict)) or (res.get("error") and not res.get("produced")):
@@ -230,7 +233,7 @@ async def run_all(req: Request):
                     plan2 = {"request_id": plan2.get("request_id") or rid_, "steps": plan2.get("plan")}
                 res2 = await asyncio.get_event_loop().run_in_executor(
                     None,
-                    lambda: _post_json(url, {"schema_version": 1, "request_id": rid_, "trace_id": tid_, "steps": (plan2.get("steps") or [])}),
+                    lambda: _post_json(EXECUTE_URL, {"schema_version": 1, "request_id": rid_, "trace_id": tid_, "steps": (plan2.get("steps") or [])}),
                 )
                 if not isinstance(res2, dict) or (res2.get("error") and not res2.get("produced")):
                     return
