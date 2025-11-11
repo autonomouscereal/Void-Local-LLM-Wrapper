@@ -386,4 +386,29 @@ async def tool_run(req: Request):
 			**eff,
 		},
 	}
+	# Best-effort: persist artifacts under orchestrator /uploads and return absolute URLs for UI
+	try:
+		from app.main import UPLOAD_DIR as _UPLOAD_DIR, PUBLIC_BASE_URL as _PUBLIC_BASE_URL  # type: ignore
+		import urllib.request as _u
+		import os as _os
+		save_dir = _os.path.join(_UPLOAD_DIR, "artifacts", "image", prompt_id or client_id)
+		_os.makedirs(save_dir, exist_ok=True)
+		orch_urls: list[str] = []
+		for im in images:
+			fn = im.get("filename")
+			sf = im.get("subfolder") or ""
+			tp = im.get("type") or "output"
+			if not fn:
+				continue
+			src = f"{COMFY_BASE.rstrip('/')}/view?filename={fn}&subfolder={sf}&type={tp}"
+			raw = _u.urlopen(src).read()
+			dst = _os.path.join(save_dir, fn)
+			with open(dst, "wb") as _f:
+				_f.write(raw)
+			rel = _os.path.relpath(dst, _UPLOAD_DIR).replace("\\", "/")
+			orch_urls.append(f"{_PUBLIC_BASE_URL.rstrip('/')}/uploads/{rel}" if _PUBLIC_BASE_URL else f"/uploads/{rel}")
+		if orch_urls:
+			result["meta"]["orch_view_urls"] = orch_urls
+	except Exception:
+		pass
 	return ok_envelope(result, rid="tool.run")
