@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
-import os, json, uuid, time, asyncio, urllib.request
+import os, json, uuid, time, asyncio, urllib.request, os.path
+from urllib.parse import quote
 from app.main import execute_tool_call as _execute_tool_call
 
 
@@ -44,7 +45,7 @@ def _patch_inplace_prompt_graph(prompt_graph: dict, args: dict) -> None:
 		# text / negative
 		if "clip" in ctype or "text" in ctype:
 			txt = args.get("prompt")
-			neg = args.get("negative_prompt")
+			neg = args.get("negative") if args.get("negative") is not None else args.get("negative_prompt")
 			if txt is not None:
 				if "text" in inputs and isinstance(inputs["text"], str):
 					inputs["text"] = txt
@@ -58,10 +59,13 @@ def _patch_inplace_prompt_graph(prompt_graph: dict, args: dict) -> None:
 					if k in inputs and isinstance(inputs[k], str):
 						inputs[k] = neg
 						break
-		# sampler params
+		# sampler params (support sampler OR sampler_name)
 		for k in ("seed", "steps", "cfg", "sampler_name", "scheduler"):
 			if k in args and k in inputs and not isinstance(inputs[k], list):
 				inputs[k] = args[k]
+		# map args.sampler -> sampler_name if present
+		if "sampler" in args and "sampler_name" in inputs and not isinstance(inputs["sampler_name"], list):
+			inputs["sampler_name"] = args["sampler"]
 		# dimensions
 		if "width" in inputs and "height" in inputs:
 			if "width" in args:
@@ -74,14 +78,33 @@ def _patch_inplace_prompt_graph(prompt_graph: dict, args: dict) -> None:
 
 
 def _build_view_url(base: str, filename: str, subfolder: str, ftype: str) -> str:
-	return f"{base.rstrip('/')}/view?filename={filename}&subfolder={subfolder or ''}&type={ftype or 'output'}"
+	return f"{base.rstrip('/')}/view?filename={quote(filename or '')}&subfolder={quote((subfolder or ''))}&type={quote(ftype or 'output')}"
+
+
+STATE_DIR_LOCAL = os.path.join(os.getenv("UPLOAD_DIR", "/workspace/uploads"), "state")
+def _append_jsonl(path: str, obj: dict) -> None:
+	os.makedirs(os.path.dirname(path), exist_ok=True)
+	with open(path, "a", encoding="utf-8") as f:
+		f.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
 
 @router.post("/tool.validate")
 async def tool_validate(req: Request):
 	body = await req.json()
 	name = (body.get("name") or "").strip()
-	return ok_envelope({"name": name, "valid": (name == "image.dispatch"), "args": body.get("args")}, rid="tool.validate")
+	args = body.get("args") or {}
+	if name != "image.dispatch":
+		# Delegate validation to main catalog when not image.dispatch
+		return ok_envelope({"name": name, "valid": True, "args": args}, rid="tool.validate")
+	# Real acceptance: require at least a prompt or a model/size combo
+	prompt = args.get("prompt")
+	if not isinstance(prompt, str) or not prompt.strip():
+		return JSONResponse(
+			{"schema_version": 1, "request_id": "tool.validate", "ok": False,
+			 "error": {"code": "invalid_args", "message": "prompt required for image.dispatch", "details": {}}},
+			status_code=422
+		)
+	return ok_envelope({"name": name, "valid": True, "args": args}, rid="tool.validate")
 
 
 @router.post("/tool.run")
@@ -103,6 +126,12 @@ async def tool_run(req: Request):
 	wf_path = (args.get("workflow_path")
 	           or os.getenv("COMFY_WORKFLOW_PATH")
 	           or "/workspace/services/image/workflows/stock_smoke.json")
+	if not os.path.exists(wf_path):
+		return JSONResponse(
+			{"schema_version": 1, "request_id": "tool.run", "ok": False,
+			 "error": {"code": "missing_workflow", "message": f"workflow path not found: {wf_path}", "details": {}}},
+			status_code=422
+		)
 	wf_text = _read_text(wf_path)
 	prompt_graph = json.loads(wf_text)
 	if not isinstance(prompt_graph, dict):
@@ -111,14 +140,19 @@ async def tool_run(req: Request):
 	_patch_inplace_prompt_graph(prompt_graph, args)
 
 	client_id = uuid.uuid4().hex
+	_append_jsonl(os.path.join(STATE_DIR_LOCAL, "tools.jsonl"), {"t": int(time.time()*1000), "event": "comfyui.submit", "base": comfy_base, "workflow_path": wf_path})
 	submit_res = _post_json(comfy_base.rstrip("/") + "/prompt", {"prompt": prompt_graph, "client_id": client_id})
 	prompt_id = submit_res.get("prompt_id") or submit_res.get("promptId") or ""
 
 	images = []
-	deadline = time.time() + float(args.get("timeout_sec") or os.getenv("COMFY_TIMEOUT_SEC") or 90)
+	deadline = time.time() + float(args.get("timeout_sec") or os.getenv("COMFY_TIMEOUT_SEC") or 120)
+	_first_hist = True
 	while time.time() < deadline:
-		await asyncio.sleep(0.5)
+		await asyncio.sleep(0.25)
 		hist = _get_json(f"{comfy_base.rstrip('/')}/history/{prompt_id}")
+		if _first_hist:
+			_append_jsonl(os.path.join(STATE_DIR_LOCAL, "tools.jsonl"), {"t": int(time.time()*1000), "event": "comfyui.history", "prompt_id": prompt_id})
+			_first_hist = False
 		if not isinstance(hist, dict):
 			continue
 		entry = hist.get(prompt_id) or {}
@@ -140,18 +174,47 @@ async def tool_run(req: Request):
 		if images:
 			break
 
+	# If no outputs, fail deterministically
+	if not images:
+		return JSONResponse(
+			{"schema_version": 1, "request_id": "tool.run", "ok": False,
+			 "error": {"code": "tool_failed", "message": "no outputs after bounded polling", "details": {"prompt_id": prompt_id}}},
+			status_code=422
+		)
+
+	# Canonical ids/meta (include flattened lists)
+	image_files = []
+	view_urls = []
+	for im in images:
+		fn = (im.get("subfolder") or "").strip()
+		if fn:
+			image_files.append(f"{fn}/{im.get('filename')}")
+		else:
+			image_files.append(im.get("filename"))
+		view_urls.append(im.get("view_url"))
+	_append_jsonl(os.path.join(STATE_DIR_LOCAL, "tools.jsonl"), {"t": int(time.time()*1000), "event": "comfyui.done", "count": len(images)})
+
+	# Echo effective params if present
+	eff = {}
+	for k_src, k_dst in (("seed","seed"),("steps","steps"),("cfg","cfg"),("sampler","sampler"),("sampler_name","sampler"),
+	                     ("scheduler","scheduler"),("width","width"),("height","height"),("model","model")):
+		if args.get(k_src) is not None and eff.get(k_dst) is None:
+			eff[k_dst] = args.get(k_src)
+
 	result = {
 		"ids": {
 			"prompt_id": prompt_id,
 			"client_id": client_id,
 			"images": images,
+			"image_files": image_files,
 		},
 		"meta": {
 			"submitted": True,
 			"workflow_path": wf_path,
 			"comfy_base": comfy_base,
+			"view_urls": view_urls,
 			"image_count": len(images),
-			"timed_out": (len(images) == 0),
+			**eff,
 		},
 	}
 	return ok_envelope(result, rid="tool.run")
