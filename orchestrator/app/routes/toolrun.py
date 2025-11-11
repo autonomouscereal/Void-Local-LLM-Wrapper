@@ -245,34 +245,7 @@ async def tool_run(req: Request):
 		result = (res.get("result") if isinstance(res, dict) else res) or {}
 		return ok_envelope(result, rid="tool.run")
 
-	# Normalize args (aliases, numerics, multiples)
-	def _normalize_args(a: dict) -> dict:
-		out = dict(a or {})
-		if "sampler_name" in out and "sampler" not in out: out["sampler"] = out.pop("sampler_name")
-		if "negative_prompt" in out and "negative" not in out: out["negative"] = out.pop("negative_prompt")
-		def snap(x, mult=8, lo=64, default=512):
-			try: v = int(float(x))
-			except: v = default
-			if v < lo: v = lo
-			return (v // mult) * mult
-		if "width" in out: out["width"] = snap(out.get("width"))
-		if "height" in out: out["height"] = snap(out.get("height"))
-		try: out["steps"] = max(1, min(150, int(float(out.get("steps", 30)))))
-		except: out["steps"] = 30
-		try: out["cfg"] = float(out.get("cfg", 7.0))
-		except: out["cfg"] = 7.0
-		if not out.get("sampler"): out["sampler"] = "euler"
-		if not out.get("scheduler"): out["scheduler"] = "normal"
-		seed = out.get("seed")
-		if seed in (None, "", "random", -1, "-1"):
-			out["seed"] = None
-		else:
-			try: out["seed"] = int(seed)
-			except: out["seed"] = None
-		out["prompt"] = str(out.get("prompt","") or "")
-		out["negative"] = str(out.get("negative","") or "")
-		return out
-	args = _normalize_args(args)
+	# Use upstream global fixer (executor) for generic normalization; do not duplicate here
 
 	# Inline graph or path
 	inline = args.get("workflow_graph")
