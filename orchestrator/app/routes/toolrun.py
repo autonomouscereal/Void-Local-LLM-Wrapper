@@ -300,6 +300,7 @@ async def tool_run(req: Request):
 		prompt_graph = wf_obj
 
 	if not isinstance(prompt_graph, dict) and bool(args.get("autofix_422", False)):
+		log.info("[comfy] attempting UI→API coercion for workflow shape")
 		coerced = _coerce_ui_export_to_api_graph(wf_obj)
 		if isinstance(coerced, dict):
 			prompt_graph = coerced
@@ -309,8 +310,12 @@ async def tool_run(req: Request):
 				prompt_graph = subset
 
 	if not isinstance(prompt_graph, dict):
+		detail = {"top_level_type": type(wf_obj).__name__}
+		if isinstance(wf_obj, dict):
+			detail["top_level_keys"] = list(wf_obj.keys())[:10]
+			detail["has_nodes_key"] = ("nodes" in wf_obj)
 		return err_envelope("workflow_invalid", "Workflow must be a dict of nodes with class_type and inputs", rid="tool.run", status=422,
-		                   details={"top_level_type": type(wf_obj).__name__, "has_nodes_key": bool(isinstance(wf_obj, dict) and "nodes" in wf_obj)})
+		                   details=detail)
 
 	# Validate and bind
 	problems = _validate_api_graph(prompt_graph)
@@ -327,14 +332,17 @@ async def tool_run(req: Request):
 
 	client_id = uuid.uuid4().hex
 	_append_jsonl(os.path.join(STATE_DIR_LOCAL, "tools.jsonl"), {"t": int(time.time()*1000), "event": "comfyui.submit", "base": COMFY_BASE, "workflow_path": wf_path})
+	log.info("[comfy] POST /prompt url=%s", COMFY_BASE.rstrip("/") + "/prompt")
 	submit_res = _post_json(COMFY_BASE.rstrip("/") + "/prompt", {"prompt": prompt_graph, "client_id": client_id})
 	prompt_id = submit_res.get("prompt_id") or submit_res.get("promptId") or ""
+	log.info("[comfy] prompt_id=%s client_id=%s", prompt_id, client_id)
 
 	images = []
 	deadline = time.time() + float(args.get("timeout_sec") or os.getenv("COMFY_TIMEOUT_SEC") or 120)
 	_first_hist = True
 	while time.time() < deadline:
 		await asyncio.sleep(0.25)
+		log.info("[comfy] polling /history/%s", prompt_id)
 		hist = _get_json(f"{COMFY_BASE.rstrip('/')}/history/{prompt_id}")
 		if _first_hist:
 			_append_jsonl(os.path.join(STATE_DIR_LOCAL, "tools.jsonl"), {"t": int(time.time()*1000), "event": "comfyui.history", "prompt_id": prompt_id})
@@ -362,6 +370,7 @@ async def tool_run(req: Request):
 
 	# If no outputs, fail deterministically
 	if not images:
+		log.info("[comfy] images=0 (timeout)")
 		return JSONResponse(
 			{"schema_version": 1, "request_id": "tool.run", "ok": False,
 			 "error": {"code": "tool_failed", "message": "no outputs after bounded polling", "details": {"prompt_id": prompt_id}}},
@@ -379,6 +388,7 @@ async def tool_run(req: Request):
 			image_files.append(im.get("filename"))
 		view_urls.append(im.get("view_url"))
 	_append_jsonl(os.path.join(STATE_DIR_LOCAL, "tools.jsonl"), {"t": int(time.time()*1000), "event": "comfyui.done", "count": len(images)})
+	log.info("[comfy] images=%d", len(images))
 
 	# Echo effective params if present
 	eff = {}

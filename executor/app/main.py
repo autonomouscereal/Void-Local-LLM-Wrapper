@@ -32,6 +32,7 @@ MAX_TOOL_ATTEMPTS = int(os.getenv("EXECUTOR_MAX_ATTEMPTS", "3"))
 
 app = FastAPI(title="Void Executor", version="0.1.0")
 logging.basicConfig(level=logging.INFO, stream=sys.stdout, format="%(levelname)s:%(name)s:%(message)s")
+log = logging.getLogger("executor")
 
 
 @app.on_event("startup")
@@ -513,8 +514,22 @@ async def run_steps(trace_id: str, request_id: str, steps: list[dict]) -> Dict[s
                         logging.error(str(tb))
                 except Exception:
                     err_detail = "tool_error"
-                # Record structured failure result for this step
-                logging.error("[executor] step=%s tool=%s FAILED %s", sid, tool_name, err_detail)
+                # Record structured failure result for this step (LOUD with envelope fields)
+                try:
+                    env_fields = {}
+                    if isinstance(res, dict):
+                        for k in ("code", "message", "detail", "_http_status", "status"):
+                            if k in res:
+                                env_fields[k] = res[k]
+                        err_code = res.get("code") or (res.get("error") or {}).get("code")
+                        err_msg  = res.get("message") or (res.get("error") or {}).get("message")
+                        err_det  = res.get("detail")  or (res.get("error") or {}).get("detail")
+                        logging.error("[executor] step=%s tool=%s FAILED code=%s msg=%s detail=%s env=%s",
+                                      sid, tool_name, err_code, err_msg, err_det, json.dumps(env_fields, sort_keys=True))
+                    else:
+                        logging.error("[executor] step=%s tool=%s FAILED %s", sid, tool_name, err_detail)
+                except Exception:
+                    logging.error("[executor] step=%s tool=%s FAILED %s", sid, tool_name, err_detail)
                 produced[sid] = {"name": tool_name, "result": {"ids": {}, "meta": {"error": err_detail}}}
             else:
                 produced[sid] = {"name": tool_name, "result": _canonical_tool_result(res or {})}

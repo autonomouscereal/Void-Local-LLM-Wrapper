@@ -316,6 +316,15 @@ async def run_all(req: Request):
             final_res = {"result": (produced_map or {})}
             _strip_data_urls(final_res)
             _strip_stacks(final_res)
+            ok_flag = True
+            try:
+                ok_flag = bool(final_res.get("result"))
+            except Exception:
+                ok_flag = False
+            await ws.send_json({"type": "tool.result", "ok": ok_flag, "result": {"produced": (produced_map or {})}})
+            # Compatibility terminal events for older UIs
+            for tname in ("run.complete", "run.completed", "final", "done"):
+                await ws.send_json({"type": tname, "ok": ok_flag})
             await ws.send_json({"type": "done", **final_res})
             await ws.close(code=1000)
     asyncio.create_task(_runner(rid, tid, steps, user_text, review_enabled, max_iters))
