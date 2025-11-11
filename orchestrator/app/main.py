@@ -648,6 +648,24 @@ def _jerr(status: int, rid: str, code: str, msg: str, details: Any | None = None
         "error": {"code": code, "message": msg, "details": details},
     }, status_code=status)
 
+def _build_openai_envelope(*, ok: bool, text: str, error: Dict[str, Any] | None, usage: Dict[str, Any], model: str, seed: int, id_: str) -> Dict[str, Any]:
+    return {
+        "id": id_ or "orc-1",
+        "object": "chat.completion",
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": (text or "(no content)")},
+            }
+        ],
+        "usage": usage,
+        "ok": bool(ok),
+        "error": (error or None),
+        "seed": seed,
+    }
+
 
 def _load_wrapper_config() -> None:
     global WRAPPER_CONFIG, WRAPPER_CONFIG_HASH
@@ -678,6 +696,13 @@ _load_wrapper_config()
 
 
 app = FastAPI(title="Void Orchestrator", version="0.1.0")
+# Topmost preflight (OPTIONS * → 204 with empty body and exact headers)
+from .middleware.preflight import Preflight204Middleware
+app.add_middleware(Preflight204Middleware)
+# Stamp permissive headers on every response (no Max-Age)
+from .middleware.cors_extra import AppendCommonHeadersMiddleware
+app.add_middleware(AppendCommonHeadersMiddleware)
+# WebSocket permissive middleware (origin stripped)
 from .middleware.ws_permissive import PermissiveWebSocketMiddleware
 app.add_middleware(PermissiveWebSocketMiddleware)
 # HTTP CORS: allow only configured UI origins when provided
@@ -4545,17 +4570,19 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     t0 = time.time()
     # Validate body
     if not isinstance(body, dict) or not isinstance(body.get("messages"), list):
-        # Always return OpenAI-compatible JSON with a human-readable one-liner; never 4xx other than 422
+        # Always return OpenAI-style JSON with a human-readable one-liner; ALWAYS 200 OK
         msg = "Invalid request: 'messages' must be a list."
-        response = {
-            "id": "orc-1",
-            "object": "chat.completion",
-            "model": f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}",
-            "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": msg}}],
-            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-            "error": {"code": "bad_request", "message": "messages must be a list"},
-        }
-        return JSONResponse(status_code=422, content=response)
+        usage0 = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        env = _build_openai_envelope(
+            ok=False,
+            text=msg,
+            error={"code": "bad_request", "message": "messages must be a list"},
+            usage=usage0,
+            model=f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}",
+            seed=0,
+            id_="orc-1",
+        )
+        return JSONResponse(status_code=200, content=env)
     # No caps — never enforce caps inline (no message count/size caps here)
     try:
         body["messages"] = nfc_msgs(body.get("messages") or [])
@@ -5022,21 +5049,21 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         if still_unknown:
             msg = f"Couldn't run: unknown tool(s) {', '.join(still_unknown)}. Allowed: {', '.join(allowed_sorted)}."
             usage = estimate_usage(messages, msg)
-            response = {
-                "id": "orc-1",
-                "object": "chat.completion",
-                "model": f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}",
-                "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": msg}}],
-                "usage": usage,
-                "seed": master_seed,
-                "error": {"code": "unknown_tool", "message": "unknown tool(s)", "detail": {"unknown": still_unknown, "allowed": allowed_sorted}},
-            }
+            env = _build_openai_envelope(
+                ok=False,
+                text=msg,
+                error={"code": "unknown_tool", "message": "unknown tool(s)", "detail": {"unknown": still_unknown, "allowed": allowed_sorted}},
+                usage=usage,
+                model=f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}",
+                seed=master_seed,
+                id_="orc-1",
+            )
             try:
                 if _lock_token:
                     _release_lock(STATE_DIR, trace_id)
             except Exception:
                 pass
-            return JSONResponse(status_code=422, content=response)
+            return JSONResponse(status_code=200, content=env)
         # Adopt re-planned tool calls
         _log("replan.done", trace_id=trace_id, count=len(tool_calls2 or []))
         tool_calls = tool_calls2
@@ -5053,6 +5080,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         base_url = (PUBLIC_BASE_URL or "").rstrip("/") or (str(request.base_url) or "").rstrip("/")
         import httpx as _hx  # type: ignore
         validated: List[Dict[str, Any]] = []
+        repairs_made = False
         async with _hx.AsyncClient(trust_env=False, timeout=None) as client:
             for tc in tool_calls:
                 name = (tc.get("name") or "").strip()
@@ -5114,21 +5142,21 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                     # Cannot repair deterministically; stop with 422
                     msg = f"Validation failed for {name}; missing/invalid arguments; unable to repair automatically."
                     usage2 = estimate_usage(messages, msg)
-                    response = {
-                        "id": "orc-1",
-                        "object": "chat.completion",
-                        "model": f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}",
-                        "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": msg}}],
-                        "usage": usage2,
-                        "seed": master_seed,
-                        "error": {"code": "validation_failed", "message": "repair_failed", "detail": detail or {}},
-                    }
+                    response = _build_openai_envelope(
+                        ok=False,
+                        text=msg,
+                        error={"code": "validation_failed", "message": "repair_failed", "detail": detail or {}},
+                        usage=usage2,
+                        model=f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}",
+                        seed=master_seed,
+                        id_="orc-1",
+                    )
                     try:
                         if _lock_token:
                             _release_lock(STATE_DIR, trace_id)
                     except Exception:
                         pass
-                    return JSONResponse(status_code=422, content=response)
+                    return JSONResponse(status_code=200, content=response)
                 # Re-validate once
                 try:
                     v2 = await client.post(base_url + "/tool.validate", json={"name": name, "args": patched["arguments"]})
@@ -5140,27 +5168,29 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 except Exception:
                     pass
                 if (getattr(v2, "status_code", 0) == 200) and isinstance(v2obj, dict) and (v2obj.get("ok") is True):
-                    validated.append(patched)
+                    validated.append(patched); repairs_made = True
                 else:
                     # One attempt only — stop with 422
                     msg = f"Validation failed for {name} after repair; please specify required arguments."
                     usage2 = estimate_usage(messages, msg)
-                    response = {
-                        "id": "orc-1",
-                        "object": "chat.completion",
-                        "model": f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}",
-                        "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": msg}}],
-                        "usage": usage2,
-                        "seed": master_seed,
-                        "error": {"code": "validation_failed", "message": "still_invalid_after_repair", "detail": (v2obj.get('error') if isinstance(v2obj, dict) else {})},
-                    }
+                    response = _build_openai_envelope(
+                        ok=False,
+                        text=msg,
+                        error={"code": "validation_failed", "message": "still_invalid_after_repair", "detail": (v2obj.get('error') if isinstance(v2obj, dict) else {})},
+                        usage=usage2,
+                        model=f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}",
+                        seed=master_seed,
+                        id_="orc-1",
+                    )
                     try:
                         if _lock_token:
                             _release_lock(STATE_DIR, trace_id)
                     except Exception:
                         pass
-                    return JSONResponse(status_code=422, content=response)
+                    return JSONResponse(status_code=200, content=response)
         tool_calls = validated
+        if repairs_made:
+            _log("repair.executing", trace_id=trace_id, count=len(tool_calls))
 
     # 2) Optionally execute tools
     tool_results: List[Dict[str, Any]] = []
@@ -5172,7 +5202,8 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     # No caps — never enforce caps inline (no tool call limit enforced)
     if tool_calls:
         try:
-            # Build executor steps from planner tool_calls
+            # Build executor steps from planner (or repaired) tool_calls
+            _log("tool.run.start", trace_id=trace_id, count=len(tool_calls or []))
             steps = []
             for idx, tc in enumerate(tool_calls[:5]):
                 n = (tc.get("name") or "tool").strip()
@@ -5290,21 +5321,21 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                         if not patched_seq or (patched_seq[-1].get("name") != name):
                             msg = f"Run failed for {name}; unable to repair automatically."
                             usage2 = estimate_usage(messages, msg)
-                            response = {
-                                "id": "orc-1",
-                                "object": "chat.completion",
-                                "model": f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}",
-                                "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": msg}}],
-                                "usage": usage2,
-                                "seed": master_seed,
-                                "error": {"code": "validation_failed", "message": "repair_failed", "detail": (failing.get("error") or {})},
-                            }
+                            response = _build_openai_envelope(
+                                ok=False,
+                                text=msg,
+                                error={"code": "validation_failed", "message": "repair_failed", "detail": (failing.get("error") or {})},
+                                usage=usage2,
+                                model=f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}",
+                                seed=master_seed,
+                                id_="orc-1",
+                            )
                             try:
                                 if _lock_token:
                                     _release_lock(STATE_DIR, trace_id)
                             except Exception:
                                 pass
-                            return JSONResponse(status_code=422, content=response)
+                            return JSONResponse(status_code=200, content=response)
                         # Execute the patched sequence (at most 2 steps)
                         patched_steps = []
                         for i2, pc in enumerate(patched_seq[:2]):
@@ -5328,21 +5359,21 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                         if not ok2:
                             msg = f"Run failed for {name} after repair; please adjust arguments."
                             usage2 = estimate_usage(messages, msg)
-                            response = {
-                                "id": "orc-1",
-                                "object": "chat.completion",
-                                "model": f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}",
-                                "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": msg}}],
-                                "usage": usage2,
-                                "seed": master_seed,
-                                "error": {"code": "run_failed_after_repair"},
-                            }
+                            response = _build_openai_envelope(
+                                ok=False,
+                                text=msg,
+                                error={"code": "run_failed_after_repair"},
+                                usage=usage2,
+                                model=f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}",
+                                seed=master_seed,
+                                id_="orc-1",
+                            )
                             try:
                                 if _lock_token:
                                     _release_lock(STATE_DIR, trace_id)
                             except Exception:
                                 pass
-                            return JSONResponse(status_code=422, content=response)
+                            return JSONResponse(status_code=200, content=response)
                     else:
                         # Non-repairable: surface error immediately
                         pass
@@ -5576,19 +5607,19 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 _release_lock(STATE_DIR, trace_id)
         except Exception:
             pass
-        # Always return an OpenAI-compatible JSON envelope with a short assistant message
+        # Always return an OpenAI-compatible JSON envelope (200) with a short assistant message
         msg = "Upstream backends failed; please retry. If this persists, check model backends."
         usage = estimate_usage(messages, msg)
-        response = {
-            "id": "orc-1",
-            "object": "chat.completion",
-            "model": f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}",
-            "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": msg}}],
-            "usage": usage,
-            "seed": master_seed,
-            "error": {"code": "backend_failed", "message": "one or more backends failed", "detail": detail},
-        }
-        return JSONResponse(status_code=502, content=response)
+        response = _build_openai_envelope(
+            ok=False,
+            text=msg,
+            error={"code": "backend_failed", "message": "one or more backends failed", "detail": detail},
+            usage=usage,
+            model=f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}",
+            seed=master_seed,
+            id_="orc-1",
+        )
+        return JSONResponse(status_code=200, content=response)
 
     qwen_text = qwen_result.get("response", "")
     gptoss_text = gptoss_result.get("response", "")
