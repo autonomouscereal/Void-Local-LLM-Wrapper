@@ -17,7 +17,7 @@ from ..json_parser import JSONParser
 from ..plan.committee import make_full_plan
 from ..plan.validator import validate_plan
 from ..review.referee import build_delta_plan as _build_delta_plan
-EXECUTOR_BASE_URL = os.getenv("EXECUTOR_BASE_URL", "http://executor:8001")
+EXECUTOR_BASE_URL = os.getenv("EXECUTOR_BASE_URL", "http://executor:8081")
 EXECUTE_URL = EXECUTOR_BASE_URL.rstrip("/") + "/execute"
 STATE_DIR_LOCAL = os.path.join(os.getenv("UPLOAD_DIR", "/workspace/uploads"), "state")
 from ..state.checkpoints import append_ndjson as _append_jsonl
@@ -150,13 +150,20 @@ def _canonicalize_produced(produced_map: Dict[str, Any]) -> Dict[str, Any]:
 @router.post("/v1/run")
 async def run_all(req: Request):
     rid = str(uuid.uuid4())
+    tid = uuid.uuid4().hex
     raw = await req.body()
-    body = JSONParser().parse(raw.decode("utf-8", errors="replace"), {})
-    if not isinstance(body, dict):
-        return jerr(400, rid, "invalid_json", "Body must be valid JSON")
+    parser = JSONParser()
+    ok, body = parser.parse_strict(raw.decode("utf-8", "replace"))
+    if not ok or not isinstance(body, dict):
+        _append_jsonl(os.path.join(STATE_DIR_LOCAL, "traces", tid, "errors.jsonl"), {
+            "t": int(time.time()*1000), "event": "json_parse", "trace_id": tid, "rid": rid,
+            "raw_len": len(raw or b""),
+            "errors": (parser.errors[:5] if isinstance(parser.errors, list) else []),
+            "repairs": (parser.repairs[:5] if isinstance(parser.repairs, list) else []),
+        })
+        return jerr(400, rid, "parse_error", "Invalid JSON")
     # Normalize request id if provided
     rid = str(body.get("request_id") or rid)
-    tid = uuid.uuid4().hex
     user_text = body.get("text") or ""
     if not isinstance(user_text, str):
         return jerr(422, rid, "invalid_text", "text must be string")
@@ -295,7 +302,8 @@ async def run_all(req: Request):
 async def ws_run(websocket: WebSocket):
     await websocket.accept(subprotocol=websocket.headers.get("sec-websocket-protocol"))
     qs = websocket.query_params
-    rid = qs.get("rid") or ""
+    rid_qs = (qs.get("rid") or "").strip()
+    rid = rid_qs
     app = websocket.app
     if not hasattr(app.state, "ws_clients"):
         app.state.ws_clients = {}
@@ -310,7 +318,43 @@ async def ws_run(websocket: WebSocket):
             app.state.jobs = {}
         app.state.jobs[rid] = {"trace_id": tid}
     await websocket.send_json({"type": "session/ready", "trace_id": tid})
-    # Keep open until server closes from runner
+    # First message must be valid JSON (strict); mirror HTTP edge behavior
+    try:
+        msg0 = await websocket.receive_text()
+    except Exception:
+        await websocket.send_json({"type": "error", "error": {"code": "parse_error", "message": "Invalid JSON"}})
+        await websocket.close(code=1000)
+        return
+    parser = JSONParser()
+    ok0, body0 = parser.parse_strict(msg0 or "")
+    if not ok0 or not isinstance(body0, dict):
+        _append_jsonl(os.path.join(STATE_DIR_LOCAL, "traces", tid, "errors.jsonl"), {
+            "t": int(time.time()*1000), "event": "json_parse", "trace_id": tid, "rid": (rid_qs or None),
+            "raw_len": len(msg0 or ""),
+            "errors": (parser.errors[:5] if isinstance(parser.errors, list) else []),
+            "repairs": (parser.repairs[:5] if isinstance(parser.repairs, list) else []),
+        })
+        await websocket.send_json({"type": "error", "error": {"code": "parse_error", "message": "Invalid JSON"}})
+        await websocket.close(code=1000)
+        return
+    # Normalize to unified plan/steps as in /v1/run
+    rid_norm = str((body0.get("request_id") or rid_qs or uuid.uuid4().hex))
+    plan0: Dict[str, Any] | None = None
+    if isinstance(body0.get("plan"), dict):
+        p = body0["plan"]
+        if isinstance(p.get("steps"), list):
+            plan0 = p
+        else:
+            plan0 = {"request_id": p.get("request_id") or rid_norm, "steps": (p.get("plan") or [])}
+    elif isinstance(body0.get("steps"), list):
+        plan0 = {"request_id": rid_norm, "steps": body0["steps"]}
+    else:
+        plan0 = {"request_id": rid_norm, "steps": []}
+    if (not isinstance(plan0.get("steps"), list)) or (len(plan0.get("steps") or []) == 0):
+        await websocket.send_json({"type": "error", "error": {"code": "invalid_plan", "message": "plan.steps required"}})
+        await websocket.close(code=1000)
+        return
+    # Keep open until server closes from runner; echo subsequent messages for compatibility
     while True:
         msg = await websocket.receive_text()
         await websocket.send_json({"type": "ack", "echo": (msg[:100] if msg else "")})

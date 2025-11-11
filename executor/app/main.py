@@ -19,6 +19,7 @@ from orchestrator.app.json_parser import JSONParser  # use the same hardened JSO
 import psutil
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
+import uuid
 
 
 WORKSPACE_DIR = os.getenv("WORKSPACE_DIR", "/workspace")
@@ -197,6 +198,26 @@ def _distill_summary(result_obj: Any) -> Dict[str, Any]:
     return out
 
 
+def _canonical_tool_result(x: Dict[str, Any] | Any) -> Dict[str, Any]:
+    data: Dict[str, Any] = {}
+    if isinstance(x, dict) and "ok" in x and isinstance(x.get("result"), dict):
+        data = x.get("result") or {}
+    elif isinstance(x, dict):
+        data = x
+    ids = data.get("ids") if isinstance(data.get("ids"), dict) else {}
+    meta = data.get("meta") if isinstance(data.get("meta"), dict) else {}
+    # Lift common meta-like fields from top-level bare results to prevent accidental drops
+    lift_keys = (
+        "url", "view_url", "poster_data_url", "preview_url",
+        "mime", "duration_s", "preview_duration_s", "data_url",
+    )
+    for k in lift_keys:
+        if k in data and k not in meta:
+            v = data.get(k)
+            if isinstance(v, (str, int, float, bool)) or v is None:
+                meta[k] = v
+    return {"ids": ids, "meta": meta}
+
 @app.post("/execute_plan")
 async def execute_plan(body: Dict[str, Any]):
     # Accept either {plan: {...}} or a raw plan object
@@ -369,4 +390,191 @@ async def execute_plan(body: Dict[str, Any]):
         logging.error(traceback.format_exc())
     return {"produced": produced}
 
+
+async def run_steps(trace_id: str, request_id: str, steps: list[dict]) -> Dict[str, Any]:
+    # Normalize steps: ids, needs, inputs
+    norm_steps: Dict[str, Dict[str, Any]] = {}
+    used_ids = set()
+    auto_idx = 1
+    for s in steps:
+        if not isinstance(s, dict):
+            continue
+        sid = (s.get("id") or "").strip()
+        if not sid:
+            while True:
+                sid = f"s{auto_idx}"
+                auto_idx += 1
+                if sid not in used_ids:
+                    break
+        if sid in used_ids:
+            k = 2
+            base = sid
+            while f"{base}_{k}" in used_ids:
+                k += 1
+            sid = f"{base}_{k}"
+        used_ids.add(sid)
+        step = {
+            "id": sid,
+            "tool": (s.get("tool") or "").strip(),
+            "inputs": dict(s.get("inputs") or {}),
+            "needs": list(s.get("needs") or []),
+        }
+        norm_steps[sid] = step
+
+    dependencies: Dict[str, set[str]] = {sid: set((norm_steps[sid].get("needs") or [])) for sid in norm_steps}
+    produced: Dict[str, Any] = {}
+
+    def merge_inputs(step: Dict[str, Any]) -> Dict[str, Any]:
+        merged = dict(step.get("inputs") or {})
+        for need in (step.get("needs") or []):
+            if need in produced and isinstance(produced[need], dict):
+                merged.update(produced[need])
+        if request_id:
+            merged.setdefault("cid", request_id)
+            merged.setdefault("trace_id", request_id)
+        sid_local = (step.get("id") or "").strip()
+        if sid_local:
+            merged.setdefault("step_id", sid_local)
+        return merged
+
+    pending = set(norm_steps.keys())
+    logging.info(f"[executor] steps_start trace_id={trace_id} steps={len(pending)}")
+    try:
+        _post_json(ORCHESTRATOR_BASE_URL.rstrip("/") + "/logs/tools.append", {
+            "t": int(time.time()*1000), "event": "exec_plan_start", "trace_id": request_id, "steps": len(pending)
+        }, expected={})
+    except Exception:
+        logging.error(traceback.format_exc())
+
+    while pending:
+        satisfied = set(produced.keys())
+        runnable = [sid for sid in pending if dependencies[sid].issubset(satisfied)]
+        if not runnable:
+            raise ValueError("deadlock_or_missing")
+        batch_tools = [{"step_id": sid, "tool": norm_steps[sid].get("tool")} for sid in runnable]
+        logging.info(f"[executor] batch_start trace_id={trace_id} runnable={batch_tools}")
+        try:
+            _post_json(ORCHESTRATOR_BASE_URL.rstrip("/") + "/logs/tools.append", {
+                "t": int(time.time()*1000), "event": "exec_batch_start", "trace_id": request_id, "items": batch_tools
+            }, expected={})
+        except Exception:
+            logging.error(traceback.format_exc())
+        for sid in runnable:
+            step = norm_steps[sid]
+            tool_name = (step.get("tool") or "").strip()
+            if not tool_name:
+                raise ValueError(f"missing_tool:{sid}")
+            args = merge_inputs(step)
+            t0 = time.time()
+            try:
+                _post_json(ORCHESTRATOR_BASE_URL.rstrip("/") + "/logs/tools.append", {
+                    "t": int(time.time()*1000), "event": "exec_step_start", "tool": tool_name,
+                    "trace_id": request_id, "cid": request_id, "step_id": sid
+                }, expected={})
+            except Exception:
+                logging.error(traceback.format_exc())
+            try:
+                from executor.utc.utc_runner import utc_run_tool  # lazy import
+                res = await utc_run_tool(trace_id, sid, tool_name, args)
+            except Exception as e:
+                err_detail = str(e)
+                err_tb = traceback.format_exc()
+                logging.error(err_tb)
+                try:
+                    _post_json(ORCHESTRATOR_BASE_URL.rstrip("/") + "/logs/tools.append", {
+                        "t": int(time.time()*1000),
+                        "event": "end",
+                        "tool": tool_name,
+                        "ok": False,
+                        "duration_ms": int((time.time() - t0) * 1000.0),
+                        "trace_id": request_id,
+                        "cid": request_id,
+                        "step_id": sid,
+                        "error": err_detail,
+                        "traceback": err_tb,
+                        "summary": None,
+                    }, expected={"ok": bool, "error": str})
+                except Exception:
+                    logging.error(traceback.format_exc())
+                raise
+            ok = False
+            if isinstance(res, dict) and bool(res.get("ok")) is True and res.get("result") is not None:
+                produced[sid] = {"name": tool_name, "result": _canonical_tool_result(res)}
+                ok = True
+            elif isinstance(res, dict) and bool(res.get("ok")) is False:
+                try:
+                    err_obj = res.get("error") or {}
+                    code = (err_obj.get("code") or "tool_error")
+                    msg = (err_obj.get("message") or "")
+                    tb = (err_obj.get("traceback") or "")
+                    err_detail = f"{code}:{msg}"
+                    if tb:
+                        logging.error(str(tb))
+                except Exception:
+                    err_detail = "tool_error"
+                raise RuntimeError(err_detail)
+            else:
+                produced[sid] = {"name": tool_name, "result": _canonical_tool_result(res or {})}
+                ok = True
+            try:
+                _post_json(ORCHESTRATOR_BASE_URL.rstrip("/") + "/logs/tools.append", {
+                    "t": int(time.time()*1000),
+                    "event": "end",
+                    "tool": tool_name,
+                    "ok": bool(ok),
+                    "duration_ms": int((time.time() - t0) * 1000.0),
+                    "trace_id": request_id,
+                    "cid": request_id,
+                    "step_id": sid,
+                    "error": (None if ok else "tool_error"),
+                    "traceback": None,
+                    "summary": (_distill_summary(produced.get(sid)) if ok else None),
+                }, expected={"ok": bool, "error": str})
+            except Exception:
+                logging.error(traceback.format_exc())
+            try:
+                _post_json(ORCHESTRATOR_BASE_URL.rstrip("/") + "/logs/tools.append", {
+                    "t": int(time.time()*1000), "event": "exec_step_finish", "tool": tool_name,
+                    "trace_id": request_id, "cid": request_id, "step_id": sid,
+                    "ok": bool(ok)
+                }, expected={})
+            except Exception:
+                logging.error(traceback.format_exc())
+        for sid in runnable:
+            pending.remove(sid)
+        logging.info(f"[executor] batch_finish trace_id={trace_id} runnable={batch_tools}")
+        try:
+            _post_json(ORCHESTRATOR_BASE_URL.rstrip("/") + "/logs/tools.append", {
+                "t": int(time.time()*1000), "event": "exec_batch_finish", "trace_id": request_id, "items": batch_tools
+            }, expected={})
+        except Exception:
+            logging.error(traceback.format_exc())
+    logging.info(f"[executor] steps_finish trace_id={trace_id} produced_keys={sorted(list(produced.keys()))}")
+    try:
+        _post_json(ORCHESTRATOR_BASE_URL.rstrip("/") + "/logs/tools.append", {
+            "t": int(time.time()*1000), "event": "exec_plan_finish", "trace_id": request_id, "produced_keys": sorted(list(produced.keys()))
+        }, expected={})
+    except Exception:
+        logging.error(traceback.format_exc())
+    return produced
+
+
+@app.post("/execute")
+async def execute_http(body: Dict[str, Any]):
+    rid = str(body.get("request_id") or uuid.uuid4().hex)
+    tid = str(body.get("trace_id") or uuid.uuid4().hex)
+    steps = body.get("steps") if isinstance(body.get("steps"), list) else None
+
+    if not steps:
+        return JSONResponse(
+            {"schema_version": 1, "request_id": rid, "ok": False,
+             "error": {"code": "invalid_plan", "message": "steps required", "details": {}}},
+            status_code=422
+        )
+
+    produced = await run_steps(tid, rid, steps)
+    return JSONResponse(
+        {"schema_version": 1, "request_id": rid, "ok": True, "result": {"produced": produced}},
+        status_code=200
+    )
 
