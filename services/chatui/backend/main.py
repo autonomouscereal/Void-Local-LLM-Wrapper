@@ -34,6 +34,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from .json_parser import JSONParser
 import logging
 import websockets  # type: ignore
+from .security_headers import SecurityHeaders
 
 # Create app BEFORE any decorators use it
 app = FastAPI(title="Chat UI Backend", version="0.1.0")
@@ -41,6 +42,7 @@ app = FastAPI(title="Chat UI Backend", version="0.1.0")
 # OPTIONS short-circuiting. Built-in CORSMiddleware is intentionally not used to avoid
 # double-handling and potential interference.
 
+app.add_middleware(SecurityHeaders)
 
 ORCH_URL = os.getenv("ORCHESTRATOR_URL", "http://orchestrator:8000")
 DB_HOST = os.getenv("POSTGRES_HOST")

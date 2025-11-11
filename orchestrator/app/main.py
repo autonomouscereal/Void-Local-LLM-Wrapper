@@ -696,15 +696,14 @@ _load_wrapper_config()
 
 
 app = FastAPI(title="Void Orchestrator", version="0.1.0")
-# Topmost preflight (OPTIONS * → 204 with empty body and exact headers)
-from .middleware.preflight import Preflight204Middleware
-app.add_middleware(Preflight204Middleware)
-# Stamp permissive headers on every response (no Max-Age)
-from .middleware.cors_extra import AppendCommonHeadersMiddleware
-app.add_middleware(AppendCommonHeadersMiddleware)
-# WebSocket permissive middleware (origin stripped)
+# Middleware order matters: last added runs first.
+# We want Preflight to run FIRST, so add it LAST.
 from .middleware.ws_permissive import PermissiveWebSocketMiddleware
 app.add_middleware(PermissiveWebSocketMiddleware)
+from .middleware.cors_extra import AppendCommonHeadersMiddleware
+app.add_middleware(AppendCommonHeadersMiddleware)
+from .middleware.preflight import Preflight204Middleware
+app.add_middleware(Preflight204Middleware)
 # HTTP CORS: allow only configured UI origins when provided
 app.add_middleware(
     CORSMiddleware,
@@ -4551,14 +4550,14 @@ async def execute_tools(tool_calls: List[Dict[str, Any]]) -> List[Dict[str, Any]
             r = await client.post(EXECUTOR_BASE_URL.rstrip("/") + "/execute", json=payload)
             env = _resp_json(r, {})
         results: List[Dict[str, Any]] = []
-        if isinstance(env, dict) and env.get("ok") and isinstance(env.get("steps"), list):
-            for step in env.get("steps") or []:
+        if isinstance(env, dict) and env.get("ok") and isinstance((env.get("result") or {}).get("produced"), dict):
+            for _, step in (env.get("result") or {}).get("produced", {}).items():
                 if isinstance(step, dict):
                     res = step.get("result") if isinstance(step.get("result"), dict) else {}
                     results.append({"name": (res.get("name") or "tool") if isinstance(res, dict) else "tool", "result": res})
             return results
         # Error path: surface a single executor error record
-        err = (env or {}).get("error") or {}
+        err = (env or {}).get("error") or (env.get("result") or {}).get("error") or {}
         return [{"name": "executor", "error": (err.get("message") or "executor_failed")}]
     except Exception as ex:
         return [{"name": "executor", "error": str(ex)}]
@@ -5216,7 +5215,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 r = await client.post(EXECUTOR_BASE_URL.rstrip("/") + "/execute", json=payload)
                 env = _resp_json(r, {})
             if isinstance(env, dict) and env.get("ok"):
-                produced = env.get("produced") or {}
+                produced = (env.get("result") or {}).get("produced") or {}
                 # Detect run-time 422-class errors per-step and attempt a single AI repair for the first failing tool
                 failing: Dict[str, Any] | None = None
                 if isinstance(produced, dict):
@@ -5347,7 +5346,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                         # Validate result of final step
                         ok2 = False
                         if isinstance(env2, dict) and env2.get("ok"):
-                            prod2 = env2.get("produced") or {}
+                            prod2 = (env2.get("result") or {}).get("produced") or {}
                             if isinstance(prod2, dict):
                                 last_key = list(prod2.keys())[-1] if prod2 else None
                                 last = prod2.get(last_key) if last_key else {}
