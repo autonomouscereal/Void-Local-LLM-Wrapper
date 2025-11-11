@@ -320,7 +320,7 @@ services:
       - UPLOAD_DIR=/workspace/uploads
       - VLM_API_URL=http://vlm:8050
       - OCR_API_URL=http://ocr:8070
-    command: ["uvicorn","app.main:app","--host","0.0.0.0","--port","8000","--log-level","info","--access-log","--use-colors"]
+    command: ["uvicorn","app.main_min:app","--host","0.0.0.0","--port","8000","--log-level","info","--access-log","--use-colors"]
     ports:
       - "8000:8000"
     volumes:
