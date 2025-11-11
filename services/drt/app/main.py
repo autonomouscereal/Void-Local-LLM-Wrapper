@@ -84,6 +84,8 @@ def _robots_allowed(url: str, ua: str = "VoidBot/1.0") -> bool:
         return rp.can_fetch(ua, url)
     except Exception:
         return True
+
+
 # -------------------- Media Resolver wiring --------------------
 
 WHISPER_URL = os.getenv("WHISPER_API_URL", "http://whisper:9090") + "/transcribe"
@@ -1055,6 +1057,7 @@ async def render_fetch(url: str, opts: Dict[str, Any] | None = None) -> Dict[str
     scroll_max = int(opts.get("scroll_max", 3) or 3)
     scroll_sleep_ms = int(opts.get("scroll_sleep_ms", 350) or 350)
     screenshot = bool(opts.get("screenshot", True))
+    extra_headers = opts.get("headers") if isinstance(opts.get("headers"), dict) else {}
     t0 = time.time()
     signals = {"challenge_detected": False, "blocked": False, "scrolled": False, "redirects": 0}
     html = ""
@@ -1067,6 +1070,11 @@ async def render_fetch(url: str, opts: Dict[str, Any] | None = None) -> Dict[str
                 timezone_id="UTC",
                 viewport={"width": 1366, "height": 768},
             )
+            if extra_headers:
+                try:
+                    await ctx.set_extra_http_headers({str(k): str(v) for k, v in extra_headers.items()})
+                except Exception:
+                    pass
             page = await ctx.new_page()
             resp = await page.goto(url, wait_until="domcontentloaded", timeout=total_timeout_ms)
             try:
@@ -1148,3 +1156,140 @@ async def api_render_fetch(body: Dict[str, Any]):
     res = await render_fetch(url, opts if isinstance(opts, dict) else {})
     return res
 
+
+# -------------------- Smart Get (unified fetch) --------------------
+
+@app.post("/web/smart_get")
+async def api_smart_get(body: Dict[str, Any]):
+    url = str(_safe_get(body, "url", ""))
+    modes = _safe_get(body, "modes", {}) or {}
+    headers = _safe_get(body, "headers", {}) or {}
+    # allow simple cookie header pass-through
+    if isinstance(modes, dict) and isinstance(modes.get("cookie_header"), str):
+        headers = dict(headers)
+        headers["Cookie"] = modes.get("cookie_header")
+    if not url:
+        return {"ok": False, "error": {"code": "missing_url", "message": "url is required"}}
+    # robots gate
+    try:
+        if not _robots_allowed(url):
+            return {"ok": False, "fetch_mode": "robots", "signals": {"blocked": True, "note": "robots disallow"}, "error": {"code": "robots", "message": "robots.txt disallows fetch"}}
+    except Exception:
+        pass
+    # classify via media resolver (includes HTML fallback)
+    try:
+        mres = resolve_media(url)
+    except Exception as ex:
+        return {"ok": False, "error": {"code": "resolve_failed", "message": str(ex)}}
+    kind = mres.get("type")
+    # Media → return transcription or audio meta
+    if kind in ("video", "media"):
+        wav_path = mres.get("audio_wav")
+        text = ""
+        if bool(modes.get("audio", True)) and wav_path:
+            try:
+                text = _transcribe_with_whisper(wav_path) or ""
+            except Exception:
+                text = ""
+        return {
+            "ok": True,
+            "fetch_mode": "media",
+            "content_type": "text/plain; charset=utf-8",
+            "text": text,
+            "meta": {"media": {"wav": bool(wav_path)}, **(mres.get("meta") or {})},
+            "signals": {},
+            "artifacts": [],
+        }
+    # PDF
+    if kind == "pdf":
+        try:
+            with open(mres.get("pdf_path"), "rb") as f:
+                raw = f.read()
+            text, _ = FetcherParser.parse_pdf(raw)
+            return {
+                "ok": True,
+                "fetch_mode": "httpx",
+                "content_type": "application/pdf",
+                "text": text,
+                "meta": {},
+                "signals": {},
+                "artifacts": [],
+            }
+        except Exception as ex:
+            return {"ok": False, "error": {"code": "pdf_read_failed", "message": str(ex)}}
+    # Image
+    if kind == "image":
+        # Optional OCR if requested
+        ocr = {}
+        if bool(modes.get("ocr", False)):
+            try:
+                out = await _ocr_images([mres.get("image_path")])
+                ocr = {"ocr": out}
+            except Exception:
+                ocr = {}
+        return {
+            "ok": True,
+            "fetch_mode": "httpx",
+            "content_type": "image/octet-stream",
+            "text": json.dumps(ocr) if ocr else "",
+            "meta": {},
+            "signals": {},
+            "artifacts": [],
+        }
+    # HTML (from resolver) or fallback fetch
+    html = ""
+    status = 0
+    ctype = "text/html; charset=utf-8"
+    if kind == "html":
+        html = str(mres.get("html") or "")
+    else:
+        try:
+            async with httpx.AsyncClient() as cli:
+                r = await cli.get(url)
+                status = r.status_code
+                ctype = r.headers.get("content-type", ctype)
+                html = r.text if "html" in (ctype or "") else ""
+        except Exception:
+            html = ""
+    # Decide to render
+    def _should_render_html(html_text: str) -> bool:
+        try:
+            tlen = len(html_text or "")
+            if tlen < 2048:
+                return True
+            sl = html_text.lower()
+            sc = sl.count("<script")
+            return (sc >= 10) or (sc > 0 and (sc * 150) > tlen)
+        except Exception:
+            return False
+    if bool(modes.get("render")) or _should_render_html(html):
+        rres = await render_fetch(url, {"scroll_max": 3, "wait_networkidle_ms": 3000, "screenshot": True, "headers": headers})
+        signals = rres.get("signals") or {}
+        meta = rres.get("meta") or {}
+        return {
+            "ok": not bool(signals.get("blocked")),
+            "fetch_mode": "browser",
+            "http_status": int(rres.get("http_status") or 0),
+            "content_type": rres.get("content_type") or "text/html; charset=utf-8",
+            "text": rres.get("dom_text") or "",
+            "html": rres.get("dom_html") or "",
+            "screenshot_url": rres.get("screenshot_url"),
+            "meta": meta,
+            "signals": signals,
+            "artifacts": [],
+        }
+    # Plain HTML parse
+    text, _ = FetcherParser.parse_html(html.encode("utf-8", "replace"))
+    meta = FetcherParser.extract_metadata(html)
+    return {
+        "ok": True,
+        "fetch_mode": "httpx",
+        "http_status": int(status or 200),
+        "content_type": ctype,
+        "text": text,
+        "html": html,
+        "screenshot_url": None,
+        "meta": meta,
+        "signals": {},
+        "artifacts": [],
+    }

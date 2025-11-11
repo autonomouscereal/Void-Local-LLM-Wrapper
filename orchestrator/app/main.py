@@ -1511,6 +1511,21 @@ def get_builtin_tools_schema() -> List[Dict[str, Any]]:
         {
             "type": "function",
             "function": {
+                "name": "web.smart_get",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "url": {"type": "string"},
+                        "modes": {"type": "object"},
+                        "headers": {"type": "object"}
+                    },
+                    "required": ["url"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "metasearch.fuse",
                 "parameters": {"type": "object", "properties": {"q": {"type": "string"}, "k": {"type": "integer"}}, "required": ["q"]}
             }
@@ -3106,6 +3121,24 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             engines.setdefault(eng, _mk(eng))
         fused = _rrf_fuse(engines, k=60)[:k]
         return {"name": name, "result": {"engines": list(engines.keys()), "results": fused}}
+    if name == "web.smart_get" and ALLOW_TOOL_EXECUTION:
+        url = args.get("url") or ""
+        if not url:
+            return {"name": name, "error": "missing url"}
+        base = (DRT_API_URL or "").rstrip("/")
+        if not base:
+            return {"name": name, "error": "drt_unavailable"}
+        try:
+            async with httpx.AsyncClient() as client:
+                payload = {"url": url, "modes": (args.get("modes") or {})}
+                if isinstance(args.get("headers"), dict):
+                    payload["headers"] = args.get("headers")
+                r = await client.post(base + "/web/smart_get", json=payload)
+                r.raise_for_status()
+                js = _resp_json(r, {})
+                return {"name": name, "result": js}
+        except Exception as ex:
+            return {"name": name, "error": str(ex)}
     if name == "film.run":
         # Orchestrate Film 2.0 via film2 service endpoints
         # Normalize core args

@@ -61,7 +61,7 @@ def _http_get(url: str, max_bytes: int = 32 * 1024 * 1024, timeout: int = 30) ->
             pass
     with httpx.Client(timeout=timeout, follow_redirects=True) as cli:
         with cli.stream("GET", url, headers=headers) as r:
-            r.raise_for_status()
+            # Do not raise for status; read body even on 4xx/5xx to allow callers to parse gate pages
             out = bytearray()
             for chunk in r.iter_bytes():
                 out.extend(chunk)
