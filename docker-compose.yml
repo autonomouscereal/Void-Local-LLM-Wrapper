@@ -54,6 +54,7 @@ services:
       - nvidia_init
     environment:
       - NVIDIA_VISIBLE_DEVICES=${MUSIC_GPU:-all}
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     expose:
       - "7862"
     ports:
@@ -73,6 +74,7 @@ services:
       - nvidia_init
     environment:
       - NVIDIA_VISIBLE_DEVICES=${MUSIC_GPU:-all}
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     expose:
       - "7863"
     ports:
@@ -92,6 +94,7 @@ services:
       - nvidia_init
     environment:
       - NVIDIA_VISIBLE_DEVICES=${MUSIC_GPU:-all}
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     expose:
       - "7864"
     ports:
@@ -148,6 +151,7 @@ services:
       - nvidia_init
     environment:
       - NVIDIA_VISIBLE_DEVICES=${MUSIC_GPU:-all}
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     expose:
       - "7866"
     ports:
@@ -170,7 +174,7 @@ services:
       - /sys:/host/sys:rw
       - /dev:/host/dev:rw
       - /run/systemd/resolve:/host/run/systemd/resolve:ro
-      - ./docker/nvidia-init/init.sh:/init.sh:ro
+      - ./docker/nvidia-init/nvidia-init-safe.sh:/init.sh:ro
     entrypoint: ["/bin/bash","-lc","cp /init.sh /tmp/init.sh; chmod +x /tmp/init.sh; sed -i 's/\\r$//' /tmp/init.sh || true; bash /tmp/init.sh || true"]
 
   
@@ -204,6 +208,7 @@ services:
       - OLLAMA_HOST=0.0.0.0
       - OLLAMA_KEEP_ALIVE=24h
       - NVIDIA_VISIBLE_DEVICES=${OLLAMA_QWEN_GPU:-all}
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     volumes:
       - ollama_qwen_data:/root/.ollama
     
@@ -232,6 +237,7 @@ services:
       - OLLAMA_HOST=0.0.0.0
       - OLLAMA_KEEP_ALIVE=24h
       - NVIDIA_VISIBLE_DEVICES=${OLLAMA_GPTOSS_GPU:-all}
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     volumes:
       - ollama_gptoss_data:/root/.ollama
     
@@ -354,6 +360,7 @@ services:
     environment:
       - XTTS_MODEL_NAME=tts_models/multilingual/multi-dataset/xtts_v2
       - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       
       - HF_HOME=/models/hf
       - TRANSFORMERS_CACHE=/models/hf
@@ -388,6 +395,7 @@ services:
       - WHISPER_MODEL_NAME=large-v3
       - WHISPER_CPU_THREADS=8
       - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     expose:
       - "9090"
     ports:
@@ -408,6 +416,7 @@ services:
       - nvidia_init
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     expose:
       - "7000"
     ports:
@@ -605,6 +614,7 @@ services:
       - film2_bootstrap
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       
       - HF_HOME=/models/hf
       - TRANSFORMERS_CACHE=/models/hf
@@ -688,6 +698,7 @@ services:
     environment:
       - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-}
       - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     expose:
       - "8090"
     ports:
