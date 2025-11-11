@@ -16,7 +16,7 @@ app.include_router(run_all_routes.router)
 # Global CORS (open by default per project rules)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origin_regex=".*",  # reflect caller Origin (works with credentials)
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

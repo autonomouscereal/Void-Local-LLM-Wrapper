@@ -78,7 +78,7 @@ async def jobs(req: Request):
         for rid, info in jobs.items():
             if isinstance(info, dict):
                 items.append({"request_id": rid, "status": info.get("status"), "trace_id": info.get("trace_id")})
-    return {"ok": True, "jobs": items}
+    return ok({"jobs": items}, rid="jobs")
 
 
 def _strip_data_urls(obj: Any) -> None:
