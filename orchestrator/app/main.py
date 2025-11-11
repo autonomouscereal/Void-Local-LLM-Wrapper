@@ -4290,17 +4290,33 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
 
 
 async def execute_tools(tool_calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    results: List[Dict[str, Any]] = []
-    for call in tool_calls[:5]:
-        try:
-            _log("tool.exec.start", name=call.get("name"))
-            res = await execute_tool_call(call)
-            results.append(res)
-            _log("tool.exec.done", name=call.get("name"), status=("error" if res.get("error") else "ok"))
-        except Exception as ex:
-            results.append({"name": call.get("name", "unknown"), "error": str(ex), "traceback": traceback.format_exc()})
-            _log("tool.exec.fail", name=call.get("name"), error=str(ex))
-    return results
+    # Route all tool execution through the executor to avoid local fast paths.
+    # Coerce calls into executor steps: {"tool": str, "args": dict}
+    try:
+        steps = []
+        for call in tool_calls[:5]:
+            name = (call or {}).get("name")
+            args = (call or {}).get("arguments") or {}
+            if not isinstance(args, dict):
+                args = {}
+            steps.append({"tool": str(name or ""), "args": args})
+        rid = _uuid.uuid4().hex
+        payload = {"schema_version": 1, "request_id": rid, "trace_id": rid, "steps": steps}
+        async with httpx.AsyncClient() as client:
+            r = await client.post(EXECUTOR_BASE_URL.rstrip("/") + "/execute", json=payload, timeout=120.0)
+            env = _resp_json(r, {})
+        results: List[Dict[str, Any]] = []
+        if isinstance(env, dict) and env.get("ok") and isinstance(env.get("steps"), list):
+            for step in env.get("steps") or []:
+                if isinstance(step, dict):
+                    res = step.get("result") if isinstance(step.get("result"), dict) else {}
+                    results.append({"name": (res.get("name") or "tool") if isinstance(res, dict) else "tool", "result": res})
+            return results
+        # Error path: surface a single executor error record
+        err = (env or {}).get("error") or {}
+        return [{"name": "executor", "error": (err.get("message") or "executor_failed")}]
+    except Exception as ex:
+        return [{"name": "executor", "error": str(ex)}]
 
 
 @app.post("/v1/chat/completions")
