@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import logging, sys
 from fastapi import FastAPI
+from fastapi import APIRouter, Request
 from fastapi.middleware.cors import CORSMiddleware
+from typing import Any, Dict
 
 # Absolute imports to avoid relative/cycle resolution issues under Uvicorn
 from app.routes import run_all as run_all_routes
@@ -44,9 +46,13 @@ app.add_middleware(PermissiveWebSocketMiddleware)
 def _alive():
     return {"ok": True}
 
-# Include OpenAI-compatible chat completions endpoint from the canonical implementation
-# This avoids re-implementation and ensures planner → executor path consistency.
+# Include OpenAI-compatible chat completions endpoint from the canonical implementation,
+# mounted via a local router to guarantee the exact path and method.
 from app.main import chat_completions as _chat_completions  # type: ignore
-app.add_api_route("/v1/chat/completions", _chat_completions, methods=["POST"])
+_v1 = APIRouter(prefix="/v1")
+@_v1.post("/chat/completions")
+async def _v1_chat_completions(body: Dict[str, Any], request: Request):
+	return await _chat_completions(body, request)
+app.include_router(_v1)
 
 
