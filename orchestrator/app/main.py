@@ -4786,33 +4786,33 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     _ledger_shard = None
     _ledger_root = os.path.join(UPLOAD_DIR, "artifacts", "runs", trace_id)
     _ledger_name = "ledger"
-	# No caps — never enforce caps inline (no tool call limit enforced)
-	if tool_calls:
-		try:
-			# Build executor steps from planner tool_calls
-			steps = []
-			for idx, tc in enumerate(tool_calls[:5]):
-				n = (tc.get("name") or "tool").strip()
-				args = tc.get("arguments") or {}
-				if not isinstance(args, dict):
-					args = {"_raw": args}
-				steps.append({"step_id": f"step-{idx+1}", "tool": n, "args": args})
-			payload = {"schema_version": 1, "request_id": f"{trace_id}", "trace_id": f"{trace_id}", "steps": steps}
-			async with httpx.AsyncClient() as client:
-				r = await client.post(EXECUTOR_BASE_URL.rstrip("/") + "/execute", json=payload, timeout=120.0)
-				env = _resp_json(r, {})
-			if isinstance(env, dict) and env.get("ok"):
-				produced = env.get("produced") or {}
-				if isinstance(produced, dict):
-					for _sid, step in produced.items():
-						if isinstance(step, dict):
-							res = step.get("result") if isinstance(step.get("result"), dict) else {}
-							tool_results.append({"name": (res.get("name") or "tool") if isinstance(res, dict) else "tool", "result": res})
-			else:
-				err = (env or {}).get("error") or {}
-				tool_results.append({"name": "executor", "error": (err.get("message") or "executor_failed")})
-		except Exception as ex:
-			tool_results.append({"name": "executor", "error": str(ex)})
+    # No caps — never enforce caps inline (no tool call limit enforced)
+    if tool_calls:
+        try:
+            # Build executor steps from planner tool_calls
+            steps = []
+            for idx, tc in enumerate(tool_calls[:5]):
+                n = (tc.get("name") or "tool").strip()
+                args = tc.get("arguments") or {}
+                if not isinstance(args, dict):
+                    args = {"_raw": args}
+                steps.append({"step_id": f"step-{idx+1}", "tool": n, "args": args})
+            payload = {"schema_version": 1, "request_id": f"{trace_id}", "trace_id": f"{trace_id}", "steps": steps}
+            async with httpx.AsyncClient() as client:
+                r = await client.post(EXECUTOR_BASE_URL.rstrip("/") + "/execute", json=payload, timeout=120.0)
+                env = _resp_json(r, {})
+            if isinstance(env, dict) and env.get("ok"):
+                produced = env.get("produced") or {}
+                if isinstance(produced, dict):
+                    for _sid, step in produced.items():
+                        if isinstance(step, dict):
+                            res = step.get("result") if isinstance(step.get("result"), dict) else {}
+                            tool_results.append({"name": (res.get("name") or "tool") if isinstance(res, dict) else "tool", "result": res})
+            else:
+                err = (env or {}).get("error") or {}
+                tool_results.append({"name": "executor", "error": (err.get("message") or "executor_failed")})
+        except Exception as ex:
+            tool_results.append({"name": "executor", "error": str(ex)})
         if tool_results:
             messages = [{"role": "system", "content": "Tool results:\n" + json.dumps(tool_results, indent=2)}] + messages
             # If tools produced media artifacts, return them immediately (skip waiting on models)
