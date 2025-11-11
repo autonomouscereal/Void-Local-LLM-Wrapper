@@ -496,7 +496,8 @@ async def run_steps(trace_id: str, request_id: str, steps: list[dict]) -> Dict[s
                     }, expected={"ok": bool, "error": str})
                 except Exception:
                     logging.error(traceback.format_exc())
-                raise
+                # Return structured failure instead of propagating 500
+                res = {"schema_version": 1, "ok": False, "error": {"code": "executor_exception", "message": err_detail}}
             ok = False
             if isinstance(res, dict) and bool(res.get("ok")) is True and res.get("result") is not None:
                 produced[sid] = {"name": tool_name, "result": _canonical_tool_result(res)}

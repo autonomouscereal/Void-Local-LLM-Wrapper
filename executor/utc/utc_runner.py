@@ -6,6 +6,8 @@ import traceback
 from typing import Any, Dict, Optional, List
 
 import os
+import random
+from urllib.error import HTTPError
 from .schema_fetcher import fetch as fetch_schema
 from .validator import check as validate_args
 from .universal_adapter import repair as repair_args
@@ -18,12 +20,20 @@ def _post(url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     import urllib.request
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
-    with urllib.request.urlopen(req) as resp:
-        raw = resp.read().decode("utf-8", errors="replace")
     try:
-        return json.loads(raw)
+        with urllib.request.urlopen(req) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            return json.loads(raw)
+    except HTTPError as e:
+        body = e.read().decode("utf-8", "replace")
+        try:
+            j = json.loads(body)
+        except Exception:
+            j = {"schema_version": 1, "ok": False, "error": {"code": "http_error", "message": body[:4096]}}
+        j["_http_status"] = e.code
+        return j
     except Exception:
-        return {}
+        return {"schema_version": 1, "ok": False, "error": {"code": "network_error", "message": "request_failed"}}
 
 
 async def _emit_review_event(event: str, trace_id: Optional[str], step_id: Optional[str], notes: Any = None):
@@ -86,6 +96,7 @@ async def utc_run_tool(trace_id: Optional[str], step_id: Optional[str], name: st
         if v.get("ok"):
             # call tool
             base = os.getenv("ORCHESTRATOR_BASE_URL", "http://127.0.0.1:8000")
+            attempt_args.setdefault("autofix_422", True)
             res = _post(base.rstrip("/") + "/tool.run", {"name": name, "args": attempt_args, "stream": False})
             if res.get("ok"):
                 if round_idx > 0 and last_ops:
@@ -128,6 +139,7 @@ async def utc_run_tool(trace_id: Optional[str], step_id: Optional[str], name: st
             fix2 = repair_args(attempt_args, v2.get("errors") or [], schema2)
             attempt_args = fix2.get("fixed_args") or attempt_args
         base = os.getenv("ORCHESTRATOR_BASE_URL", "http://127.0.0.1:8000")
+        attempt_args.setdefault("autofix_422", True)
         res2 = _post(base.rstrip("/") + "/tool.run", {"name": alt_name, "args": attempt_args, "stream": False})
         # record telemetry
         pool = await get_pg_pool()
