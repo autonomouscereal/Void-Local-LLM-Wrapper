@@ -264,7 +264,6 @@ services:
     build:
       context: ./orchestrator
       dockerfile: Dockerfile
-      network: host
       args:
         <<: *cu118_args
     container_name: void_orchestrator
@@ -293,7 +292,7 @@ services:
       - DEFAULT_TEMPERATURE=${DEFAULT_TEMPERATURE:-0.3}
       - ENABLE_WEBSEARCH=${ENABLE_WEBSEARCH:-true}
       - SERPAPI_API_KEY
-      - EXECUTOR_BASE_URL=http://127.0.0.1:8081
+      - EXECUTOR_BASE_URL=http://executor:8081
       - PLANNER_MODEL=${PLANNER_MODEL:-qwen3}
       - MCP_HTTP_BRIDGE_URL
       - N8N_WEBHOOK_URL=${N8N_WEBHOOK_URL:-}
@@ -650,7 +649,6 @@ services:
     build:
       context: ./executor
       dockerfile: Dockerfile
-      network: host
     container_name: void_executor
     restart: unless-stopped
     environment:
@@ -659,7 +657,7 @@ services:
       - EXEC_MEMORY_MB=${EXEC_MEMORY_MB:-2048}
       - ALLOW_SHELL=${ALLOW_SHELL:-false}
       - SHELL_WHITELIST=${SHELL_WHITELIST:-}
-      - ORCHESTRATOR_BASE_URL=http://127.0.0.1:8000
+      - ORCHESTRATOR_BASE_URL=http://orchestrator:8000
     expose:
       - "8081"
     ports:
@@ -744,11 +742,10 @@ services:
     build:
       context: ./services/chatui
       dockerfile: Dockerfile
-      network: host
     container_name: chatui
     restart: unless-stopped
     environment:
-      - ORCHESTRATOR_URL=http://127.0.0.1:8000
+      - ORCHESTRATOR_URL=http://orchestrator:8000
       - POSTGRES_HOST=pgvector
       - POSTGRES_PORT=5432
       - POSTGRES_DB=ragdb

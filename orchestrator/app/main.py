@@ -542,7 +542,7 @@ DEFAULT_TEMPERATURE = float(os.getenv("DEFAULT_TEMPERATURE", "0.3"))
 # Gates removed: defaults are always ON; API-key checks still apply where required
 ENABLE_WEBSEARCH = True
 MCP_HTTP_BRIDGE_URL = os.getenv("MCP_HTTP_BRIDGE_URL")  # e.g., http://host.docker.internal:9999
-EXECUTOR_BASE_URL = os.getenv("EXECUTOR_BASE_URL")  # http://executor:8081
+EXECUTOR_BASE_URL = os.getenv("EXECUTOR_BASE_URL", "http://executor:8081")
 PLANNER_MODEL = os.getenv("PLANNER_MODEL", "qwen")  # qwen | gptoss
 ENABLE_DEBATE = True
 MAX_DEBATE_TURNS = 1
