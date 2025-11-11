@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.routes import run_all as run_all_routes
 from app.routes import logs as logs_routes
 from app.routes import tools as tools_routes
+from app.routes import toolrun as toolrun_routes
 from app.middleware.ws_permissive import PermissiveWebSocketMiddleware
 from app.middleware.pna import AllowPrivateNetworkMiddleware
 
@@ -17,6 +18,7 @@ app = FastAPI(title="Void Orchestrator")
 app.include_router(run_all_routes.router)
 app.include_router(logs_routes.router)
 app.include_router(tools_routes.router)
+app.include_router(toolrun_routes.router)
 
 # Append Access-Control-Allow-Private-Network on preflight (Chromium PNA) — must be outermost
 app.add_middleware(AllowPrivateNetworkMiddleware)
@@ -26,7 +28,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origin_regex=".*",  # reflect caller Origin (works with credentials)
     allow_credentials=False,
-    allow_methods=["GET", "POST", "OPTIONS", "PUT", "PATCH", "DELETE"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
     expose_headers=["*"],
     max_age=86400,
