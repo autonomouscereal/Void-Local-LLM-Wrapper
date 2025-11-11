@@ -41,9 +41,11 @@ class AppendCommonHeadersMiddleware:
 
                 # Always expose origin-related headers for browser consumption
                 setdefault(b"access-control-allow-origin", b"*")
+                setdefault(b"access-control-allow-private-network", b"true")
                 setdefault(b"access-control-expose-headers", b"*")
                 setdefault(b"cross-origin-resource-policy", b"cross-origin")
                 setdefault(b"timing-allow-origin", b"*")
+                setdefault(b"connection", b"close")
                 # Cache/key vary on Origin
                 # If Vary already present, avoid duplicating; else add
                 vary_idx = lower.get(b"vary")

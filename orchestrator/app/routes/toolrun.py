@@ -222,9 +222,16 @@ async def tool_validate(req: Request):
 	# Real acceptance: require at least a prompt or a model/size combo
 	prompt = args.get("prompt")
 	if not isinstance(prompt, str) or not prompt.strip():
+		detail = {
+			"tool": name,
+			"missing": ["prompt"],
+			"invalid": [],
+			"schema": {"required": ["prompt"], "notes": "image.dispatch minimal validator"},
+			"args": args,
+		}
 		return JSONResponse(
 			{"schema_version": 1, "request_id": "tool.validate", "ok": False,
-			 "error": {"code": "invalid_args", "message": "prompt required for image.dispatch", "details": {}}},
+			 "error": {"code": "invalid_args", "message": "prompt required for image.dispatch", "details": detail}},
 			status_code=422
 		)
 	return ok_envelope({"name": name, "valid": True, "args": args}, rid="tool.validate")

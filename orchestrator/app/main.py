@@ -456,7 +456,11 @@ async def _image_dispatch_run(prompt: str, negative: Optional[str], seed: Option
     return {"ok": True, "prompt_id": pid, "cid": cid, "files": files, "saved": saved, "scores": scores, "committee": decision}
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 try:
-    logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO), format="%(levelname)s:%(message)s")
+    logging.basicConfig(
+        level=getattr(logging, LOG_LEVEL, logging.INFO),
+        format="%(asctime)s.%(msecs)03d %(levelname)s %(process)d/%(threadName)s %(name)s %(pathname)s:%(funcName)s:%(lineno)d - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
 except Exception:
     pass
 
@@ -684,8 +688,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["*"],
-    max_age=86400,
 )
+from .middleware.preflight import Preflight204Middleware
+# Must be outermost to short-circuit OPTIONS early
+app.add_middleware(Preflight204Middleware)
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 try:
@@ -789,7 +795,7 @@ async def global_cors_middleware(request: Request, call_next):
     resp.headers["Access-Control-Allow-Private-Network"] = "true"
     resp.headers["Vary"] = "Origin"
     path = request.url.path or ""
-    if path.startswith("/uploads/") or path.endswith(".mp4") or path.endswith(".png") or path.endswith(".jpg") or path.endswith(".jpeg") or path.endswith(".webm"):
+    if path.startswith("/uploads/") or path.startswith("/view/") or path.endswith(".mp4") or path.endswith(".png") or path.endswith(".jpg") or path.endswith(".jpeg") or path.endswith(".webm"):
         resp.headers.setdefault("Cross-Origin-Resource-Policy", "cross-origin")
         resp.headers.setdefault("Timing-Allow-Origin", "*")
     return resp
@@ -1862,16 +1868,31 @@ async def planner_produce_plan(messages: List[Dict[str, Any]], tools: Optional[L
     use_qwen = str(PLANNER_MODEL or "qwen").lower().startswith("qwen")
     planner_id = QWEN_MODEL_ID if use_qwen else GPTOSS_MODEL_ID
     planner_base = QWEN_BASE_URL if use_qwen else GPTOSS_BASE_URL
-    guide = (
-        "You are the Planner. Produce a short step-by-step plan and propose up to 3 tool invocations YOU will execute.\n"
-        "Never instruct the user to run code or call tools. Do not emit shell/python snippets for the user; invoke tools yourself.\n"
-        "Decide SEMANTICALLY when to invoke tools: map the user's requested outcome to tool capabilities.\n"
-        "If any tool can directly produce the user's requested artifact (e.g., video/film creation), prefer that tool (e.g., make_movie).\n"
-        "Ask 1-3 clarifying questions ONLY if blocking details are missing (e.g., duration, style, language, target resolution).\n"
-        "If not blocked, proceed and choose reasonable defaults: duration<=10s for short clips, 1920x1080, 24fps, language=en, neutral voice.\n"
-        "Use only tool names present in the catalog below. If none apply, return tool_calls: [].\n"
-        "Return strict JSON with keys: plan (string), tool_calls (array of {name: string, arguments: object}).\n"
-        "Absolute rules: Do NOT use try/except unless explicitly asked; let errors surface. Do NOT set client timeouts unless asked. Do NOT use Pydantic. Never propose or use SQLAlchemy; use asyncpg with pooled connections and raw SQL for PostgreSQL."
+    # Planner contract: the planner must emit fully-filled tool args and strict steps JSON
+    contract = (
+        "Planner contract (MANDATORY):\n"
+        "- You (the planner) choose tools and fill ALL required arguments yourself. Do not defer arg filling to any executor/orchestrator.\n"
+        "- Use ONLY tool names from the catalog below. Unknown tools are forbidden.\n"
+        "- If you cannot determine required args, return {\"steps\": []} and a brief assistant message; do not guess invalid tools.\n"
+        "- Snap image/video width/height to multiples of 8. Prefer minimal plans (generate → QA; refine only if QA indicates).\n"
+        "- Output format MUST be strict JSON: {\"steps\":[{\"tool\":\"<name>\",\"args\":{...}}]} — no extra keys, no commentary.\n"
+        "- Do NOT rely on executor fixes. Your plans must pass validation as-is.\n"
+        "\n"
+        "Tool catalog (strict; aligned with orchestrator):\n"
+        "image.dispatch: required args -> prompt (string; default=user text), negative (string; default=\"\"), width (int; /8; default=1024), height (int; /8; default=1024), steps (int; default=32), cfg (float; default=5.5)\n"
+        "tts.speak: required args -> text (string; fill from user request), voice (string; default \"neutral\")\n"
+        "film2.run: choose for video tasks (do NOT use video.* directly); fill prompt and provide clips/images/fps/scale only if clearly requested; otherwise leave optional\n"
+        "research.run: choose only for web/research tasks when the user asks for investigation or sources; args are task-specific and may include job_id (the system may fill)\n"
+        "\n"
+        "Decision patterns:\n"
+        "- Image from text → image.dispatch with filled defaults.\n"
+        "- If user gives size like 2048x1152 → snap both to /8 (both already are multiples of 8).\n"
+        "- TTS: text from user, voice=\"neutral\" by default.\n"
+        "- Web research: use only research.run; do not generate media.\n"
+        "- Video work: use film2.run; do not invoke video.* tools.\n"
+        "- If insufficient info: return {\"steps\": []}.\n"
+        "\n"
+        "Return ONLY strict JSON with steps; no extra commentary."
     )
     all_tools = merge_tool_schemas(tools)
     tool_info = build_tools_section(all_tools)
@@ -1883,18 +1904,44 @@ async def planner_produce_plan(messages: List[Dict[str, Any]], tools: Optional[L
         _log("planner.catalog", trace_id=None, hash=_cat_hash)
     except Exception:
         pass
-    plan_messages = messages + [{"role": "user", "content": guide + ("\n" + tool_info if tool_info else "") + ("\n" + tool_catalog if tool_catalog else "")}]
+    # Install the planner contract and catalog into the planning context
+    plan_messages = messages + [
+        {"role": "system", "content": contract},
+        {"role": "system", "content": (tool_info or "")},
+        {"role": "system", "content": (tool_catalog or "")},
+    ]
     payload = build_ollama_payload(plan_messages, planner_id, DEFAULT_NUM_CTX, temperature)
     result = await call_ollama(planner_base, payload)
     text = result.get("response", "").strip()
     # Use custom parser to normalise the planner JSON
     parser = JSONParser()
-    expected = {"plan": str, "tool_calls": [ {"name": str, "arguments": dict} ]}
-    parsed = parser.parse(text, expected)
+    # Prefer strict steps format; fallback to legacy 'tool_calls'
+    parsed_steps = {}
+    try:
+        parsed_steps = parser.parse(text, {"steps": [{"tool": str, "args": dict}]})
+    except Exception:
+        parsed_steps = {}
+    steps = parsed_steps.get("steps") or []
+    if steps:
+        # Log final steps JSON verbatim and per-tool details for verification
+        try:
+            _log("planner.steps", trace_id=None, steps=steps)
+            for st in steps:
+                if isinstance(st, dict) and st.get("tool") == "image.dispatch":
+                    _log("planner.image.dispatch.args", trace_id=None, args=st.get("args") or {})
+        except Exception:
+            pass
+        tool_calls = [{"name": s.get("tool"), "arguments": (s.get("args") or {})} for s in steps if isinstance(s, dict)]
+        return "", tool_calls
+    # Legacy path
+    parsed = parser.parse(text, {"plan": str, "tool_calls": [{"name": str, "arguments": dict}]})
     plan = parsed.get("plan", "")
-    tool_calls = parsed.get("tool_calls", []) or []
-    # No heuristic synthesis or upgrades; planner decides tool_calls
-    return plan, tool_calls
+    tcs = parsed.get("tool_calls", []) or []
+    try:
+        _log("planner.steps.legacy", trace_id=None, tool_calls=tcs)
+    except Exception:
+        pass
+    return plan, tcs
 
 
 async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
@@ -1907,6 +1954,103 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
     # Hard-disable legacy Film-1 tools to enforce Film-2-only orchestration
     if name in ("film_create", "film_add_character", "film_add_scene", "film_status", "film_compile", "make_movie"):
         return {"name": name, "skipped": True, "reason": "film1_disabled"}
+    # Generic HTTP API request tool (public APIs only; no internal SSRF)
+    if name == "api.request":
+        from urllib.parse import urlsplit, urlencode
+        u = str(raw_args.get("url") or "")
+        method = str(raw_args.get("method") or "").upper()
+        headers = raw_args.get("headers") if isinstance(raw_args.get("headers"), dict) else {}
+        params = raw_args.get("params") if isinstance(raw_args.get("params"), dict) else {}
+        body = raw_args.get("body")
+        expect = (str(raw_args.get("expect") or "json")).lower()
+        follow_redirects = True if raw_args.get("follow_redirects") is None else bool(raw_args.get("follow_redirects"))
+        try:
+            max_bytes = int(raw_args.get("max_bytes") or 10485760)
+        except Exception:
+            max_bytes = 10485760
+        sp = urlsplit(u)
+        if sp.scheme not in ("http", "https"):
+            return {"name": name, "error": "scheme_not_allowed"}
+        host_low = (sp.hostname or "").lower()
+        if host_low in ("localhost",) or host_low.startswith("127.") or host_low == "::1":
+            return {"name": name, "error": "host_not_allowed"}
+        # Resolve and block RFC1918/link-local/loopback ranges
+        try:
+            import socket, ipaddress
+            addrs = set()
+            for family, _, _, _, sockaddr in socket.getaddrinfo(host_low, None):
+                ip = sockaddr[0]
+                addrs.add(ip)
+            for ip in addrs:
+                ip_obj = ipaddress.ip_address(ip)
+                if ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local:
+                    return {"name": name, "error": "host_not_allowed"}
+        except Exception:
+            # If resolution fails, proceed; validator already guards obvious hosts
+            pass
+        def _host_of(v: str) -> str:
+            try:
+                from urllib.parse import urlsplit as _us
+                return (_us(v).hostname or "").lower()
+            except Exception:
+                return ""
+        forbidden_hosts = set(filter(None, [
+            _host_of(os.getenv("EXECUTOR_BASE_URL", "")),
+            _host_of(os.getenv("COMFYUI_API_URL", "")),
+            _host_of(os.getenv("DRT_API_URL", "")),
+            _host_of(os.getenv("ORCHESTRATOR_BASE_URL", "")),
+        ]))
+        if host_low in forbidden_hosts:
+            return {"name": name, "error": "internal_host_not_allowed"}
+        # Build request
+        import httpx  # type: ignore
+        url = u
+        if params:
+            from urllib.parse import urlencode as _enc
+            qs = _enc({k: str(v) for k, v in params.items()})
+            sep = "&" if ("?" in url) else "?"
+            url = url + (("" if qs == "" else (sep + qs)))
+        # Prepare json/content
+        json_payload = None
+        content_payload = None
+        if isinstance(body, (dict, list)):
+            json_payload = body
+        elif isinstance(body, str):
+            content_payload = body.encode("utf-8")
+        elif body is None:
+            pass
+        # Perform request (no client timeouts)
+        async with httpx.AsyncClient(timeout=None, follow_redirects=follow_redirects, trust_env=False) as client:
+            resp = await client.request(method, url, headers={str(k): str(v) for k, v in (headers or {}).items()}, json=json_payload, content=content_payload)
+        # Enforce max_bytes
+        raw = resp.content or b""
+        if len(raw) > max_bytes:
+            return {"name": name, "result": {"status": int(resp.status_code), "headers": {k: v for k, v in resp.headers.items()}, "body_json": None, "body_text": None, "body_bytes_b64": None, "error": {"code": "body_too_large"}}}
+        # Extract body based on expectation
+        body_json = None
+        body_text = None
+        body_b64 = None
+        if expect == "bytes":
+            import base64 as _b64
+            body_b64 = _b64.b64encode(raw).decode("ascii")
+        elif expect == "text":
+            body_text = raw.decode(resp.encoding or "utf-8", errors="replace")
+        else:
+            # expect json: detect via simple heuristic to avoid broad try/except
+            txt = raw.decode(resp.encoding or "utf-8", errors="replace")
+            s = txt.lstrip()
+            if not (s.startswith("{") or s.startswith("[")):
+                return {"name": name, "result": {"status": int(resp.status_code), "headers": {k: v for k, v in resp.headers.items()}, "body_json": None, "body_text": txt[:2048], "body_bytes_b64": None, "error": {"code": "invalid_json"}}}
+            # attempt parse via JSONParser to avoid exceptions
+            body_json = _parse_json_text(txt, {})
+        result = {
+            "status": int(resp.status_code),
+            "headers": {k: v for k, v in resp.headers.items()},
+            "body_json": body_json,
+            "body_text": body_text,
+            "body_bytes_b64": body_b64,
+        }
+        return {"name": name, "result": result}
     # DB pool (may be None if PG not configured)
     pool = await get_pg_pool()
     # Normalize tool arguments using the custom parser and strong coercion
@@ -4779,49 +4923,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             tc = {**tc, "arguments": args}
             enriched.append(tc)
         tool_calls = enriched
-    # Planner emission guarantees for image.dispatch (fill required args at planning stage)
-    if tool_calls:
-        ensured: List[Dict[str, Any]] = []
-        def _snap8(v: int) -> int:
-            try:
-                v = int(v)
-                return max(8, (v // 8) * 8)
-            except Exception:
-                return 1024
-        for tc in tool_calls:
-            try:
-                name = (tc.get("name") or "").strip()
-                args = dict(tc.get("arguments") or {})
-                if name == "image.dispatch":
-                    # Required fields from frozen defaults
-                    if not isinstance(args.get("prompt"), str) or not args.get("prompt"):
-                        args["prompt"] = last_user_text
-                    if "negative" not in args:
-                        args["negative"] = ""
-                    # Derive width/height, snapping to /8
-                    w = args.get("width"); h = args.get("height")
-                    size = args.get("size")
-                    if isinstance(size, str) and "x" in size:
-                        try:
-                            sw, sh = [int(p.strip()) for p in size.lower().split("x", 1)]
-                            w, h = sw, sh
-                        except Exception:
-                            pass
-                    if not isinstance(w, int):
-                        w = 1024
-                    if not isinstance(h, int):
-                        h = 1024
-                    args["width"] = _snap8(w)
-                    args["height"] = _snap8(h)
-                    # Steps/cfg defaults
-                    if not isinstance(args.get("steps"), int):
-                        args["steps"] = 32
-                    if not isinstance(args.get("cfg"), (int, float)):
-                        args["cfg"] = 5.5
-                ensured.append({"name": name, "arguments": args})
-            except Exception:
-                ensured.append(tc)
-        tool_calls = ensured
+    # Planner must fully fill args per contract; no server-side arg synthesis
     # No auto-insertion of tools; the planner must propose calls explicitly
 
     # If no tool_calls were proposed but tools are available, nudge Planner by ensuring tools context is always present
@@ -4896,24 +4998,169 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         except Exception:
             continue
     if unknown:
+        # Attempt a single re-plan constrained to allowed tool names
         allowed_sorted = sorted(list(allowed_tools))
-        msg = f"Couldn't run: unknown tool(s) {', '.join(unknown)}. Allowed: {', '.join(allowed_sorted)}."
-        usage = estimate_usage(messages, msg)
-        response = {
-            "id": "orc-1",
-            "object": "chat.completion",
-            "model": f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}",
-            "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": msg}}],
-            "usage": usage,
-            "seed": master_seed,
-            "error": {"code": "unknown_tool", "message": "unknown tool(s)", "detail": {"unknown": unknown, "allowed": allowed_sorted}},
-        }
+        constraint = (
+            "Tool selection invalid. You must choose only from the allowed tool catalog:\n- "
+            + "\n- ".join(allowed_sorted)
+            + "\nReturn strict JSON: {\"steps\":[{\"tool\":\"<name>\",\"args\":{...}}]} or {\"steps\":[]}."
+        )
+        replan_messages = messages + [{"role": "system", "content": constraint}]
+        _log("replan.start", trace_id=trace_id, reason="unknown_tool", unknown=unknown, allowed=allowed_sorted)
+        plan2, tool_calls2 = await planner_produce_plan(replan_messages, body.get("tools"), body.get("temperature") or DEFAULT_TEMPERATURE)
+        # Normalize and filter
+        tool_calls2 = _normalize_tool_calls(tool_calls2)
+        # Re-check against allowed
+        still_unknown: list[str] = []
+        for tc in (tool_calls2 or []):
+            try:
+                nm = str((tc or {}).get("name") or "")
+                if nm and (nm not in allowed_tools):
+                    still_unknown.append(nm)
+            except Exception:
+                continue
+        if still_unknown:
+            msg = f"Couldn't run: unknown tool(s) {', '.join(still_unknown)}. Allowed: {', '.join(allowed_sorted)}."
+            usage = estimate_usage(messages, msg)
+            response = {
+                "id": "orc-1",
+                "object": "chat.completion",
+                "model": f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}",
+                "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": msg}}],
+                "usage": usage,
+                "seed": master_seed,
+                "error": {"code": "unknown_tool", "message": "unknown tool(s)", "detail": {"unknown": still_unknown, "allowed": allowed_sorted}},
+            }
+            try:
+                if _lock_token:
+                    _release_lock(STATE_DIR, trace_id)
+            except Exception:
+                pass
+            return JSONResponse(status_code=422, content=response)
+        # Adopt re-planned tool calls
+        _log("replan.done", trace_id=trace_id, count=len(tool_calls2 or []))
+        tool_calls = tool_calls2
+
+    # Orchestrator repair manager (single AI round): pre-validate, and on 422 call planner once to repair args
+    if tool_calls:
+        import hashlib as _hl
+        # Compute catalog hash for brief
         try:
-            if _lock_token:
-                _release_lock(STATE_DIR, trace_id)
+            _cat = build_compact_tool_catalog() or ""
+            _cat_hash = _hl.sha256((_cat).encode("utf-8")).hexdigest()[:16]
         except Exception:
-            pass
-        return JSONResponse(status_code=422, content=response)
+            _cat_hash = ""
+        base_url = (PUBLIC_BASE_URL or "").rstrip("/") or (str(request.base_url) or "").rstrip("/")
+        import httpx as _hx  # type: ignore
+        validated: List[Dict[str, Any]] = []
+        async with _hx.AsyncClient(trust_env=False, timeout=None) as client:
+            for tc in tool_calls:
+                name = (tc.get("name") or "").strip()
+                args = tc.get("arguments") or {}
+                # Validate initial args
+                try:
+                    vresp = await client.post(base_url + "/tool.validate", json={"name": name, "args": args})
+                    vobj = _resp_json(vresp, {})
+                except Exception:
+                    vobj = {}
+                if (getattr(vresp, "status_code", 0) == 200) and isinstance(vobj, dict) and (vobj.get("ok") is True):
+                    validated.append(tc)
+                    continue
+                # 422 or invalid envelope → start repair once
+                try:
+                    err = (vobj.get("error") or {})
+                    _log("validate.result", trace_id=trace_id, status=int(getattr(vresp, "status_code", 0) or 0), tool=name, detail=err)
+                except Exception:
+                    pass
+                detail = (vobj.get("error") or {}).get("details") if isinstance(vobj, dict) else {}
+                missing = (detail or {}).get("missing") or []
+                invalid = (detail or {}).get("invalid") or []
+                # Build repair brief
+                brief = {
+                    "mode": "repair",
+                    "reason": "422 validation_error",
+                    "tool": name,
+                    "missing": missing,
+                    "invalid": invalid,
+                    "current_args": args,
+                    "requirements": {
+                        "must_use_tool": name,
+                        "fill_all_required": True,
+                        "snap_sizes_to_8": True,
+                        "defaults": {"negative": "", "width": 1024, "height": 1024, "steps": 32, "cfg": 5.5},
+                        "prompt_from_user_text_if_missing": True,
+                    },
+                    "user_text": last_user_text,
+                    "tool_catalog_hash": _cat_hash,
+                }
+                repair_preamble = (
+                    "You are in repair mode. Produce exactly the SAME tool with all required arguments filled and any invalid values corrected. "
+                    "Use the user's text as prompt if needed. Snap sizes to multiples of 8. Output only strict JSON: {\"steps\":[{\"tool\":\""
+                    + name + "\",\"args\":{...}}]} with the same tool name."
+                )
+                repair_messages = [{"role": "system", "content": repair_preamble}, {"role": "user", "content": json.dumps(brief, ensure_ascii=False)}]
+                _log("repair.start", trace_id=trace_id, tool=name, brief=brief)
+                _plan2, calls2 = await planner_produce_plan(repair_messages, body.get("tools"), body.get("temperature") or DEFAULT_TEMPERATURE)
+                patched = None
+                for c2 in (calls2 or []):
+                    try:
+                        if (c2.get("name") or "").strip() == name:
+                            patched = {"name": name, "arguments": (c2.get("arguments") or {})}
+                            break
+                    except Exception:
+                        continue
+                _log("planner.repair.steps", trace_id=trace_id, tool=name, patched=patched or {})
+                if not patched:
+                    # Cannot repair deterministically; stop with 422
+                    msg = f"Validation failed for {name}; missing/invalid arguments; unable to repair automatically."
+                    usage2 = estimate_usage(messages, msg)
+                    response = {
+                        "id": "orc-1",
+                        "object": "chat.completion",
+                        "model": f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}",
+                        "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": msg}}],
+                        "usage": usage2,
+                        "seed": master_seed,
+                        "error": {"code": "validation_failed", "message": "repair_failed", "detail": detail or {}},
+                    }
+                    try:
+                        if _lock_token:
+                            _release_lock(STATE_DIR, trace_id)
+                    except Exception:
+                        pass
+                    return JSONResponse(status_code=422, content=response)
+                # Re-validate once
+                try:
+                    v2 = await client.post(base_url + "/tool.validate", json={"name": name, "args": patched["arguments"]})
+                    v2obj = _resp_json(v2, {})
+                except Exception:
+                    v2obj = {}
+                try:
+                    _log("validate.result.repair", trace_id=trace_id, status=int(getattr(v2, "status_code", 0) or 0), tool=name, detail=((v2obj or {}).get("error") or {}))
+                except Exception:
+                    pass
+                if (getattr(v2, "status_code", 0) == 200) and isinstance(v2obj, dict) and (v2obj.get("ok") is True):
+                    validated.append(patched)
+                else:
+                    # One attempt only — stop with 422
+                    msg = f"Validation failed for {name} after repair; please specify required arguments."
+                    usage2 = estimate_usage(messages, msg)
+                    response = {
+                        "id": "orc-1",
+                        "object": "chat.completion",
+                        "model": f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}",
+                        "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": msg}}],
+                        "usage": usage2,
+                        "seed": master_seed,
+                        "error": {"code": "validation_failed", "message": "still_invalid_after_repair", "detail": (v2obj.get('error') if isinstance(v2obj, dict) else {})},
+                    }
+                    try:
+                        if _lock_token:
+                            _release_lock(STATE_DIR, trace_id)
+                    except Exception:
+                        pass
+                    return JSONResponse(status_code=422, content=response)
+        tool_calls = validated
 
     # 2) Optionally execute tools
     tool_results: List[Dict[str, Any]] = []
@@ -4939,11 +5186,176 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 env = _resp_json(r, {})
             if isinstance(env, dict) and env.get("ok"):
                 produced = env.get("produced") or {}
+                # Detect run-time 422-class errors per-step and attempt a single AI repair for the first failing tool
+                failing: Dict[str, Any] | None = None
+                if isinstance(produced, dict):
+                    for idx2, (_sid, step) in enumerate(produced.items()):
+                        if not isinstance(step, dict):
+                            continue
+                        res = step.get("result") if isinstance(step.get("result"), dict) else {}
+                        # Prefer explicit error object if present; else check meta.error string
+                        err_obj = res.get("error") if isinstance(res, dict) else None
+                        meta_err = ((res.get("meta") or {}).get("error") if isinstance(res, dict) else None)
+                        if err_obj or meta_err:
+                            failing = {"index": idx2, "step_id": _sid, "result": res, "error": err_obj or {"message": meta_err}}
+                            break
+                if failing is not None:
+                    # Normalize error details for planner brief
+                    def _normalize_run_error(er: Dict[str, Any]) -> Dict[str, Any]:
+                        out = {"missing": [], "invalid": [], "schema": {}, "args": {}}
+                        if not isinstance(er, dict):
+                            return out
+                        det = er.get("details") if isinstance(er.get("details"), dict) else {}
+                        # unify schema_validation style
+                        errs = det.get("errors") if isinstance(det.get("errors"), list) else []
+                        for e in errs:
+                            try:
+                                code = (e.get("code") or "").lower()
+                                path = str(e.get("path") or "")
+                                if code in ("required_missing", "required"):
+                                    out["missing"].append(path)
+                                else:
+                                    out["invalid"].append({"field": path, "reason": code or "invalid"})
+                            except Exception:
+                                continue
+                        # pass-through if validator already provided missing/invalid
+                        if isinstance(det.get("missing"), list):
+                            out["missing"] = list(dict.fromkeys(out["missing"] + det.get("missing")))
+                        if isinstance(det.get("invalid"), list):
+                            out["invalid"] = out["invalid"] + det.get("invalid")
+                        if isinstance(det.get("schema"), dict):
+                            out["schema"] = det.get("schema")
+                        if isinstance(det.get("args"), dict):
+                            out["args"] = det.get("args")
+                        return out
+                    # Build brief using original args for that tool index when available
+                    try:
+                        failed_idx = int(failing.get("index") or 0)
+                        orig_tc = (tool_calls or [])[failed_idx] if failed_idx < len(tool_calls or []) else {}
+                    except Exception:
+                        orig_tc = {}
+                    name = (orig_tc.get("name") or "").strip()
+                    args_attempted = orig_tc.get("arguments") or {}
+                    # If name missing, attempt to read from produced
+                    if not name:
+                        name = str((failing.get("result") or {}).get("name") or "")
+                    det_norm = _normalize_run_error(failing.get("error") or {})
+                    # Repairable class: run-time shape/binding/workflow issues and validator-like issues
+                    repairable_codes = {"workflow_invalid","workflow_binding_missing","missing_workflow","asset_not_found","enum_mismatch","type_mismatch","required_missing","invalid_args","schema_validation"}
+                    code_low = str(((failing.get("error") or {}).get("code") or "")).lower()
+                    if name and (code_low in repairable_codes or det_norm["missing"] or det_norm["invalid"]):
+                        import hashlib as _hl
+                        try:
+                            _cat = build_compact_tool_catalog() or ""
+                            _cat_hash = _hl.sha256((_cat).encode("utf-8")).hexdigest()[:16]
+                        except Exception:
+                            _cat_hash = ""
+                        brief = {
+                            "mode": "repair",
+                            "reason": f"422 run_error:{code_low or 'invalid_args'}",
+                            "tool": name,
+                            "missing": det_norm["missing"],
+                            "invalid": det_norm["invalid"],
+                            "current_args": args_attempted if isinstance(args_attempted, dict) else {},
+                            "requirements": {
+                                "must_use_tool": name,
+                                "fill_all_required": True,
+                                "snap_sizes_to_8": True,
+                                "defaults": {"negative": "", "width": 1024, "height": 1024, "steps": 32, "cfg": 5.5},
+                                "prompt_from_user_text_if_missing": True,
+                            },
+                            "user_text": last_user_text,
+                            "tool_catalog_hash": _cat_hash,
+                            "run_error": (failing.get("error") or {}),
+                        }
+                        repair_preamble = (
+                            "You are in repair mode. Produce exactly the SAME tool with all required arguments filled and any invalid values corrected. "
+                            "You MAY insert a single api.request step immediately before the repaired tool to fetch needed enums/options. "
+                            "Snap sizes to multiples of 8. Output strict JSON: {\"steps\":[ ... ]} where the final step is the SAME tool."
+                        )
+                        repair_messages = [{"role": "system", "content": repair_preamble}, {"role": "user", "content": json.dumps(brief, ensure_ascii=False)}]
+                        _log("repair.start", trace_id=trace_id, tool=name, brief=brief, phase="run")
+                        plan_r, calls_r = await planner_produce_plan(repair_messages, body.get("tools"), body.get("temperature") or DEFAULT_TEMPERATURE)
+                        # Accept either [api.request?, name] or [name]
+                        patched_seq: List[Dict[str, Any]] = []
+                        for c2 in (calls_r or []):
+                            if not isinstance(c2, dict): continue
+                            nm = (c2.get("name") or "").strip()
+                            if nm == "api.request" and not patched_seq:
+                                patched_seq.append({"name": nm, "arguments": (c2.get("arguments") or {})})
+                            elif nm == name:
+                                patched_seq.append({"name": nm, "arguments": (c2.get("arguments") or {})})
+                                break
+                        _log("planner.repair.steps", trace_id=trace_id, tool=name, patched=patched_seq, phase="run")
+                        if not patched_seq or (patched_seq[-1].get("name") != name):
+                            msg = f"Run failed for {name}; unable to repair automatically."
+                            usage2 = estimate_usage(messages, msg)
+                            response = {
+                                "id": "orc-1",
+                                "object": "chat.completion",
+                                "model": f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}",
+                                "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": msg}}],
+                                "usage": usage2,
+                                "seed": master_seed,
+                                "error": {"code": "validation_failed", "message": "repair_failed", "detail": (failing.get("error") or {})},
+                            }
+                            try:
+                                if _lock_token:
+                                    _release_lock(STATE_DIR, trace_id)
+                            except Exception:
+                                pass
+                            return JSONResponse(status_code=422, content=response)
+                        # Execute the patched sequence (at most 2 steps)
+                        patched_steps = []
+                        for i2, pc in enumerate(patched_seq[:2]):
+                            patched_steps.append({"step_id": f"repair-{i2+1}", "tool": pc.get("name"), "args": (pc.get("arguments") or {})})
+                        payload2 = {"schema_version": 1, "request_id": f"{trace_id}", "trace_id": f"{trace_id}", "steps": patched_steps}
+                        async with httpx.AsyncClient(timeout=None) as client2:
+                            r2 = await client2.post(EXECUTOR_BASE_URL.rstrip("/") + "/execute", json=payload2)
+                            env2 = _resp_json(r2, {})
+                        # Validate result of final step
+                        ok2 = False
+                        if isinstance(env2, dict) and env2.get("ok"):
+                            prod2 = env2.get("produced") or {}
+                            if isinstance(prod2, dict):
+                                last_key = list(prod2.keys())[-1] if prod2 else None
+                                last = prod2.get(last_key) if last_key else {}
+                                res2 = last.get("result") if isinstance(last, dict) else {}
+                                err2 = res2.get("error") if isinstance(res2, dict) else None
+                                if not err2:
+                                    ok2 = True
+                                    tool_results.append({"name": name, "result": res2})
+                        if not ok2:
+                            msg = f"Run failed for {name} after repair; please adjust arguments."
+                            usage2 = estimate_usage(messages, msg)
+                            response = {
+                                "id": "orc-1",
+                                "object": "chat.completion",
+                                "model": f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}",
+                                "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": msg}}],
+                                "usage": usage2,
+                                "seed": master_seed,
+                                "error": {"code": "run_failed_after_repair"},
+                            }
+                            try:
+                                if _lock_token:
+                                    _release_lock(STATE_DIR, trace_id)
+                            except Exception:
+                                pass
+                            return JSONResponse(status_code=422, content=response)
+                    else:
+                        # Non-repairable: surface error immediately
+                        pass
+                # When no failing or after successful repair: collect results for success steps
                 if isinstance(produced, dict):
                     for _sid, step in produced.items():
                         if isinstance(step, dict):
                             res = step.get("result") if isinstance(step.get("result"), dict) else {}
-                            tool_results.append({"name": (res.get("name") or "tool") if isinstance(res, dict) else "tool", "result": res})
+                            if isinstance(res, dict) and res.get("error"):
+                                # include failing result as-is for visibility
+                                tool_results.append({"name": (res.get("name") or "tool") if isinstance(res, dict) else "tool", "result": res})
+                            else:
+                                tool_results.append({"name": (res.get("name") or "tool") if isinstance(res, dict) else "tool", "result": res})
             else:
                 err = (env or {}).get("error") or {}
                 tool_results.append({"name": "executor", "error": (err.get("message") or "executor_failed")})
@@ -5164,7 +5576,19 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 _release_lock(STATE_DIR, trace_id)
         except Exception:
             pass
-        return JSONResponse(status_code=502, content={"error": "backend_failed", "detail": detail})
+        # Always return an OpenAI-compatible JSON envelope with a short assistant message
+        msg = "Upstream backends failed; please retry. If this persists, check model backends."
+        usage = estimate_usage(messages, msg)
+        response = {
+            "id": "orc-1",
+            "object": "chat.completion",
+            "model": f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}",
+            "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": msg}}],
+            "usage": usage,
+            "seed": master_seed,
+            "error": {"code": "backend_failed", "message": "one or more backends failed", "detail": detail},
+        }
+        return JSONResponse(status_code=502, content=response)
 
     qwen_text = qwen_result.get("response", "")
     gptoss_text = gptoss_result.get("response", "")
@@ -6291,6 +6715,30 @@ _TOOL_SCHEMAS: Dict[str, Dict[str, Any]] = {
         },
         "notes": "Comfy pipeline; requires either size or width/height. Returns ids.image_id and meta.{data_url,view_url,orch_view_url}.",
     },
+    "api.request": {
+        "name": "api.request",
+        "version": "1",
+        "kind": "utility",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string"},
+                "method": {"type": "string", "enum": ["GET","POST","PUT","PATCH","DELETE","HEAD","OPTIONS"]},
+                "headers": {"type": "object"},
+                "params": {"type": "object"},
+                "body": {"type": ["string","object","array","null"]},
+                "expect": {"type": "string", "enum": ["json","text","bytes"]},
+                "follow_redirects": {"type": "boolean"},
+                "max_bytes": {"type": "integer"},
+            },
+            "required": ["url","method"],
+            "additionalProperties": True,
+        },
+        "notes": "Generic HTTP request for public APIs and metadata discovery for repair. Disallows internal service hosts.",
+        "examples": [
+            {"args": {"url": "https://httpbin.org/get", "method": "GET", "params": {"foo": "bar"}}}
+        ],
+    },
     "film2.run": {
         "name": "film2.run",
         "version": "1",
@@ -6438,6 +6886,49 @@ async def tool_validate(body: Dict[str, Any]):
             errors.append({"code": "type_mismatch", "path": k, "expected": ps.get("type"), "got": type(v).__name__})
         if ps and isinstance(ps.get("enum"), list) and v not in ps.get("enum"):
             errors.append({"code": "enum_mismatch", "path": k, "allowed": ps.get("enum"), "got": v})
+    # api.request extra validation and guardrails (no network IO here)
+    if name.strip() == "api.request":
+        from urllib.parse import urlsplit
+        u = str(args.get("url") or "")
+        method = str(args.get("method") or "").upper()
+        sp = urlsplit(u)
+        if sp.scheme not in ("http", "https"):
+            errors.append({"code": "scheme_not_allowed", "path": "url", "expected": "http|https", "got": sp.scheme or ""})
+        # Disallow obvious loopback hostnames
+        host_low = (sp.hostname or "").lower()
+        if host_low in ("localhost",) or host_low.startswith("127.") or host_low == "::1":
+            errors.append({"code": "host_not_allowed", "path": "url", "got": host_low})
+        # Disallow calling our own internal services by host if provided via env
+        def _host_of(env_name: str) -> str:
+            v = os.getenv(env_name, "") or ""
+            try:
+                from urllib.parse import urlsplit as _us
+                return (_us(v).hostname or "").lower()
+            except Exception:
+                return ""
+        forbidden_hosts = set(filter(None, [
+            _host_of("EXECUTOR_BASE_URL"),
+            _host_of("COMFYUI_API_URL"),
+            _host_of("DRT_API_URL"),
+            _host_of("ORCHESTRATOR_BASE_URL"),
+        ]))
+        if host_low in forbidden_hosts:
+            errors.append({"code": "internal_host_not_allowed", "path": "url", "got": host_low})
+        # follow_redirects default allowed; validate max_bytes if present
+        if args.get("max_bytes") is not None:
+            try:
+                mb = int(args.get("max_bytes"))
+                if mb <= 0:
+                    errors.append({"code": "invalid_max_bytes", "path": "max_bytes", "expected": ">0", "got": mb})
+            except Exception:
+                errors.append({"code": "type_mismatch", "path": "max_bytes", "expected": "integer", "got": type(args.get("max_bytes")).__name__})
+        # headers shape
+        if isinstance(args.get("headers"), dict):
+            for hk, hv in (args.get("headers") or {}).items():
+                if not isinstance(hk, str) or not isinstance(hv, str):
+                    errors.append({"code": "type_mismatch", "path": f"headers.{hk}", "expected": "string", "got": type(hv).__name__})
+        if method not in ("GET","POST","PUT","PATCH","DELETE","HEAD","OPTIONS"):
+            errors.append({"code": "enum_mismatch", "path": "method", "allowed": ["GET","POST","PUT","PATCH","DELETE","HEAD","OPTIONS"], "got": method})
     if errors:
         return JSONResponse(status_code=422, content={"schema_version": 1, "request_id": rid, "ok": False, "error": {"code": "schema_validation", "message": "Invalid args", "details": {"errors": errors}}})
     return {"schema_version": 1, "request_id": rid, "ok": True, "result": {"validated": True}}

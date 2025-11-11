@@ -31,7 +31,12 @@ MAX_TOOL_ATTEMPTS = int(os.getenv("EXECUTOR_MAX_ATTEMPTS", "3"))
 
 
 app = FastAPI(title="Void Executor", version="0.1.0")
-logging.basicConfig(level=logging.INFO, stream=sys.stdout, format="%(levelname)s:%(name)s:%(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    stream=sys.stdout,
+    format="%(asctime)s.%(msecs)03d %(levelname)s %(process)d/%(threadName)s %(name)s %(pathname)s:%(funcName)s:%(lineno)d - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
 log = logging.getLogger("executor")
 
 
@@ -474,31 +479,8 @@ async def run_steps(trace_id: str, request_id: str, steps: list[dict]) -> Dict[s
                 }, expected={})
             except Exception:
                 logging.error(traceback.format_exc())
-            try:
-                from executor.utc.utc_runner import utc_run_tool  # lazy import
-                res = await utc_run_tool(trace_id, sid, tool_name, args)
-            except Exception as e:
-                err_detail = str(e)
-                err_tb = traceback.format_exc()
-                logging.error(err_tb)
-                try:
-                    _post_json(ORCHESTRATOR_BASE_URL.rstrip("/") + "/logs/tools.append", {
-                        "t": int(time.time()*1000),
-                        "event": "end",
-                        "tool": tool_name,
-                        "ok": False,
-                        "duration_ms": int((time.time() - t0) * 1000.0),
-                        "trace_id": request_id,
-                        "cid": request_id,
-                        "step_id": sid,
-                        "error": err_detail,
-                        "traceback": err_tb,
-                        "summary": None,
-                    }, expected={"ok": bool, "error": str})
-                except Exception:
-                    logging.error(traceback.format_exc())
-                # Return structured failure instead of propagating 500
-                res = {"schema_version": 1, "ok": False, "error": {"code": "executor_exception", "message": err_detail}}
+            from executor.utc.utc_runner import utc_run_tool  # lazy import
+            res = await utc_run_tool(trace_id, sid, tool_name, args)
             ok = False
             if isinstance(res, dict) and bool(res.get("ok")) is True and res.get("result") is not None:
                 produced[sid] = {"name": tool_name, "result": _canonical_tool_result(res)}
@@ -514,7 +496,7 @@ async def run_steps(trace_id: str, request_id: str, steps: list[dict]) -> Dict[s
                         logging.error(str(tb))
                 except Exception:
                     err_detail = "tool_error"
-                # Record structured failure result for this step (LOUD with envelope fields)
+                # Record structured failure and preserve full error envelope in produced result
                 try:
                     env_fields = {}
                     if isinstance(res, dict):
@@ -530,7 +512,7 @@ async def run_steps(trace_id: str, request_id: str, steps: list[dict]) -> Dict[s
                         logging.error("[executor] step=%s tool=%s FAILED %s", sid, tool_name, err_detail)
                 except Exception:
                     logging.error("[executor] step=%s tool=%s FAILED %s", sid, tool_name, err_detail)
-                produced[sid] = {"name": tool_name, "result": {"ids": {}, "meta": {"error": err_detail}}}
+                produced[sid] = {"name": tool_name, "result": {"ids": {}, "meta": {}, "error": (res.get("error") if isinstance(res, dict) else {"message": err_detail}), "status": (res.get("status") if isinstance(res, dict) else 422)}}
             else:
                 produced[sid] = {"name": tool_name, "result": _canonical_tool_result(res or {})}
                 ok = True

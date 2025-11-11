@@ -130,29 +130,37 @@ function App() {
 
   // Orchestrator E2E (OpenAI-compatible): POST /v1/chat/completions (no WS required)
   const runOrchestratorFlow = async (userText, thinkingId) => {
-    try {
-      const r = await fetch(`${ORCH_BASE}/v1/chat/completions`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ messages: [{ role: 'user', content: userText }], stream: false })
-      })
-      const ct = r.headers.get('content-type') || 'application/json'
-      const updateThinking = (text) => setMsgs(prev => (prev.map(m => m.id === thinkingId ? { ...m, content: { text } } : m)))
-      if (ct.startsWith('application/json')) {
-        const obj = await r.json()
-        const msgObj = (obj && obj.choices && obj.choices[0] && obj.choices[0].message) || {}
-        const finalText = String(msgObj.content || obj.text || '').trim()
-        updateThinking(finalText || '(no content)')
-      } else {
-        const textBody = await r.text()
-        const finalText = String(textBody || '').trim()
-        updateThinking(finalText || '(no content)')
+    const updateThinking = (text) => setMsgs(prev => (prev.map(m => m.id === thinkingId ? { ...m, content: { text } } : m)))
+    return fetch(`${ORCH_BASE}/v1/chat/completions`, {
+      method: 'POST',
+      mode: 'cors',
+      credentials: 'omit',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ messages: [{ role: 'user', content: userText }], stream: false })
+    }).then(
+      async (r) => {
+        try {
+          const textBody = await r.text()
+          let finalText = String(textBody || '').trim()
+          // Try to parse as JSON to extract OpenAI message content; never throw on parse
+          try {
+            const obj = textBody ? JSON.parse(textBody) : null
+            const msgObj = obj && obj.choices && obj.choices[0] && obj.choices[0].message
+            if (msgObj && typeof msgObj.content === 'string') {
+              finalText = String(msgObj.content).trim() || finalText
+            }
+          } catch {}
+          updateThinking(finalText || '(no content)')
+        } finally {
+          setSending(false)
+        }
+      },
+      (err) => {
+        // Transport-level failure (DNS/refused/mixed-content)
+        updateThinking(`Network unreachable`)
+        setSending(false)
       }
-      setSending(false)
-    } catch (e) {
-      setMsgs(prev => (prev.map(m => m.id === thinkingId ? { ...m, content: { text: `Error: ${String(e && e.message || e)}` } } : m)))
-      setSending(false)
-    }
+    )
   }
 
   const renderChatContent = (text) => {
@@ -321,21 +329,11 @@ function App() {
     setMsgs(prev => ([...prev, { id: userId, role: 'user', content: { text: userText } }]))
     setText('')
     setSending(true)
-    try {
-      // Orchestrator-first path: POST /v1/chat/completions (OpenAI-compatible)
-      const thinkingId = nextLocalId()
-      setMsgs(prev => ([...prev, { id: thinkingId, role: 'assistant', content: { text: 'Thinking…' } }]))
-      await runOrchestratorFlow(userText, thinkingId)
-      return
-    } catch (err) {
-      // Catch network-level errors so they don’t manifest as unhandled promise rejections.
-      console.error('Network error while calling proxy', err)
-      const msg = err && err.message ? err.message : 'Network error'
-      setMsgs(prev => ([...prev, { id: Date.now(), role: 'assistant', content: { text: `Error: ${msg}` } }]))
-    } finally {
-      console.log('[ui] chat POST end')
-      setSending(false)
-    }
+    // Orchestrator-first path: POST /v1/chat/completions (OpenAI-compatible)
+    const thinkingId = nextLocalId()
+    setMsgs(prev => ([...prev, { id: thinkingId, role: 'assistant', content: { text: 'Thinking…' } }]))
+    await runOrchestratorFlow(userText, thinkingId)
+    return
   }
 
   // --- Voice Chat (Browser SpeechRecognition + SpeechSynthesis) ---

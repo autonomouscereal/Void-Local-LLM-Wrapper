@@ -131,7 +131,11 @@ def _decode_json(value: Any) -> Dict[str, Any]:
 # Mount static AFTER API routes to avoid intercepting /api/* with 404/405
 
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+	level=logging.INFO,
+	format="%(asctime)s.%(msecs)03d %(levelname)s %(process)d/%(threadName)s %(name)s %(pathname)s:%(funcName)s:%(lineno)d - %(message)s",
+	datefmt="%Y-%m-%d %H:%M:%S",
+)
 @app.exception_handler(Exception)
 async def _unhandled_exception_handler(request: Request, exc: Exception):
     # Last-resort guard: always send a JSON body with explicit length so the browser receives bytes
@@ -223,7 +227,6 @@ async def global_cors_middleware(request: Request, call_next):
             "Access-Control-Allow-Headers": "*",
             "Access-Control-Allow-Credentials": "false",
             "Access-Control-Expose-Headers": "*",
-            "Access-Control-Max-Age": "86400",
             "Access-Control-Allow-Private-Network": "true",
             "Connection": "close",
             "Vary": "Origin",
@@ -236,7 +239,6 @@ async def global_cors_middleware(request: Request, call_next):
     resp.headers["Access-Control-Allow-Headers"] = "*"
     resp.headers["Access-Control-Allow-Credentials"] = "false"
     resp.headers["Access-Control-Expose-Headers"] = "*"
-    resp.headers["Access-Control-Max-Age"] = "86400"
     resp.headers["Access-Control-Allow-Private-Network"] = "true"
     resp.headers["Vary"] = "Origin"
     # Help browsers load media without ORB/CORP issues when proxied through this backend

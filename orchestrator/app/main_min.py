@@ -14,9 +14,15 @@ from app.routes import toolrun as toolrun_routes
 from app.middleware.ws_permissive import PermissiveWebSocketMiddleware
 from app.middleware.pna import AllowPrivateNetworkMiddleware
 from app.middleware.cors_extra import AppendCommonHeadersMiddleware
+from app.middleware.preflight import Preflight204Middleware
 
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s", stream=sys.stdout)
+logging.basicConfig(
+	level=logging.INFO,
+	format="%(asctime)s.%(msecs)03d %(levelname)s %(process)d/%(threadName)s %(name)s %(pathname)s:%(funcName)s:%(lineno)d - %(message)s",
+	datefmt="%Y-%m-%d %H:%M:%S",
+	stream=sys.stdout,
+)
 
 app = FastAPI(title="Void Orchestrator")
 
@@ -26,7 +32,10 @@ app.include_router(logs_routes.router)
 app.include_router(tools_routes.router)
 app.include_router(toolrun_routes.router)
 
-# Append Access-Control-Allow-Private-Network on preflight (Chromium PNA) — must be outermost
+# Short-circuit all preflight OPTIONS with 204 + full headers — must be outermost
+app.add_middleware(Preflight204Middleware)
+
+# Append Access-Control-Allow-Private-Network on preflight (Chromium PNA)
 app.add_middleware(AllowPrivateNetworkMiddleware)
 
 # Global CORS (open by default per project rules)
