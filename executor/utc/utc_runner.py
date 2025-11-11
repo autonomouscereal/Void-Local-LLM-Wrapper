@@ -101,12 +101,17 @@ async def utc_run_tool(trace_id: Optional[str], step_id: Optional[str], name: st
 
     # WS narration start
     await _emit_review_event("review.start", trace_id, step_id, notes={"tool": name})
-    # Try up to 3 rounds before retarget
+    # Preflight validate to surface args issues early (no retries/timeouts here)
+    base = os.getenv("ORCHESTRATOR_BASE_URL", "http://127.0.0.1:8000")
+    venv = _post(base.rstrip("/") + "/tool.validate", {"name": name, "args": attempt_args})
+    if isinstance(venv, dict) and venv.get("ok") is False:
+        return {"schema_version": 1, "ok": False, "code": "args_invalid", "result": venv.get("result")}
+
+    # Try up to 3 rounds before giving up
     for round_idx in range(0, 3):
         v = validate_args(name, attempt_args, schema)
         if v.get("ok"):
             # call tool
-            base = os.getenv("ORCHESTRATOR_BASE_URL", "http://127.0.0.1:8000")
             attempt_args.setdefault("autofix_422", True)
             res = _post(base.rstrip("/") + "/tool.run", {"name": name, "args": attempt_args, "stream": False})
             if res.get("ok"):

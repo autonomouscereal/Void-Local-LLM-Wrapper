@@ -513,7 +513,8 @@ async def run_steps(trace_id: str, request_id: str, steps: list[dict]) -> Dict[s
                         logging.error(str(tb))
                 except Exception:
                     err_detail = "tool_error"
-                raise RuntimeError(err_detail)
+                # Record structured failure result for this step
+                produced[sid] = {"name": tool_name, "result": {"ids": {}, "meta": {"error": err_detail}}}
             else:
                 produced[sid] = {"name": tool_name, "result": _canonical_tool_result(res or {})}
                 ok = True
@@ -573,9 +574,15 @@ async def execute_http(body: Dict[str, Any]):
             status_code=422
         )
 
-    produced = await run_steps(tid, rid, steps)
-    return JSONResponse(
-        {"schema_version": 1, "request_id": rid, "ok": True, "result": {"produced": produced}},
-        status_code=200
-    )
+    try:
+        produced = await run_steps(tid, rid, steps)
+        return JSONResponse(
+            {"schema_version": 1, "request_id": rid, "ok": True, "result": {"produced": produced}},
+            status_code=200
+        )
+    except Exception as e:
+        return JSONResponse(
+            {"schema_version": 1, "request_id": rid, "ok": False, "error": {"code": "executor_exception", "message": str(e)}, "result": {"produced": []}},
+            status_code=200
+        )
 
