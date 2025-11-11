@@ -153,7 +153,7 @@ async def read_file(body: Dict[str, Any]):
         return {"content": f.read()}
 
 
-ORCHESTRATOR_BASE_URL = os.getenv("ORCHESTRATOR_BASE_URL", "http://orchestrator:8000")
+ORCHESTRATOR_BASE_URL = os.getenv("ORCHESTRATOR_BASE_URL", "http://127.0.0.1:8000")
 
 
 def _post_json(url: str, payload: Dict[str, Any], expected: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
