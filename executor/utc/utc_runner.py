@@ -13,7 +13,7 @@ from .validator import check as validate_args
 from .universal_adapter import repair as repair_args
 from .patch_store import preapply as preapply_patch, persist_success as persist_patch
 from .db import get_pg_pool
-from .retarget import find_candidate
+
 
 
 def _post(url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -29,8 +29,19 @@ def _post(url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         try:
             j = json.loads(body)
         except Exception:
-            j = {"schema_version": 1, "ok": False, "error": {"code": "http_error", "message": body[:4096]}}
+            j = {}
+        # Flatten FastAPI {"detail": {...}} to top-level envelope
+        if isinstance(j, dict) and "detail" in j and isinstance(j["detail"], dict):
+            j = j["detail"]
+        if not isinstance(j, dict):
+            j = {}
+        j.setdefault("schema_version", 1)
+        j.setdefault("ok", False)
+        # Provide a code if missing
+        if "code" not in j:
+            j["code"] = "http_error"
         j["_http_status"] = e.code
+        j["status"] = e.code
         return j
     except Exception:
         return {"schema_version": 1, "ok": False, "error": {"code": "network_error", "message": "request_failed"}}
@@ -112,6 +123,43 @@ async def utc_run_tool(trace_id: Optional[str], step_id: Optional[str], name: st
                     except Exception:
                         pass
                 return res
+            # If orchestrator returned a structured error (including 422), attempt a single auto-fix and retry
+            code = (res.get("code")
+                    or (res.get("error") or {}).get("code")
+                    or (res.get("result") or {}).get("code"))
+            if code in ("invalid_workflow", "workflow_invalid", "workflow_binding_missing", "args_invalid", "tool_failed") or res.get("_http_status") == 422:
+                # Simple bounded auto-fix
+                attempt_args.setdefault("autofix_422", True)
+                # Snap dims to multiples of 8 within [64,2048]
+                def _snap_dim(k):
+                    if k in attempt_args and attempt_args[k] is not None:
+                        try:
+                            v = int(float(attempt_args[k]))
+                            v = max(64, min(2048, v - (v % 8)))
+                            attempt_args[k] = v
+                        except Exception:
+                            pass
+                _snap_dim("width"); _snap_dim("height")
+                # Coerce numeric types/ranges
+                try:
+                    attempt_args["steps"] = int(float(attempt_args.get("steps", 30)))
+                except Exception:
+                    attempt_args["steps"] = 30
+                try:
+                    attempt_args["cfg"] = float(attempt_args.get("cfg", 7.0))
+                except Exception:
+                    attempt_args["cfg"] = 7.0
+                if not attempt_args.get("sampler"):
+                    attempt_args["sampler"] = "euler"
+                if not attempt_args.get("scheduler"):
+                    attempt_args["scheduler"] = "normal"
+                try:
+                    int(attempt_args.get("seed", ""))
+                except Exception:
+                    attempt_args["seed"] = random.randint(1, 2**31 - 1)
+                res_retry = _post(base.rstrip("/") + "/tool.run", {"name": name, "args": attempt_args, "stream": False})
+                if res_retry.get("ok"):
+                    return res_retry
             else:
                 err = res.get("error") or {}
                 if _is_transient(err):
@@ -127,30 +175,7 @@ async def utc_run_tool(trace_id: Optional[str], step_id: Optional[str], name: st
         await _emit_review_event("edit.plan", trace_id, step_id, notes=last_ops)
         await _emit_review_event("review.decision", trace_id, step_id, notes=f"autofix round {round_idx+1}")
 
-    # Retarget once
-    alt = find_candidate(name)
-    if alt:
-        alt_name = alt.get("name")
-        await _emit_review_event("review.decision", trace_id, step_id, notes=[f"retarget {name}→{alt_name}"])
-        sch2 = await fetch_schema(alt_name)
-        schema2 = sch2.get("schema") or {}
-        v2 = validate_args(alt_name, attempt_args, schema2)
-        if not v2.get("ok"):
-            fix2 = repair_args(attempt_args, v2.get("errors") or [], schema2)
-            attempt_args = fix2.get("fixed_args") or attempt_args
-        base = os.getenv("ORCHESTRATOR_BASE_URL", "http://127.0.0.1:8000")
-        attempt_args.setdefault("autofix_422", True)
-        res2 = _post(base.rstrip("/") + "/tool.run", {"name": alt_name, "args": attempt_args, "stream": False})
-        # record telemetry
-        pool = await get_pg_pool()
-        if pool is not None:
-            try:
-                async with pool.acquire() as c:
-                    await c.execute("insert into tool_call_telemetry(trace_id,step_id,tool_name,version,builder_ok,repair_rounds,retargeted,status_code,error_json,final_args) values ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10::jsonb)",
-                                    trace_id, step_id, alt_name, sch2.get("version") or "1", True, 1, True, (200 if res2.get('ok') else 422), json.dumps(res2.get("error") or {}), json.dumps(attempt_args))
-            except Exception:
-                pass
-        return res2
+    # No retarget per canonical route set
 
     # final failure telemetry
     pool = await get_pg_pool()

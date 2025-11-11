@@ -3,6 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Query
 from fastapi.responses import JSONResponse
 from app.main import _TOOL_SCHEMAS as _SCHEMAS
+from typing import Any, Dict
 
 
 router = APIRouter()
@@ -60,3 +61,34 @@ async def tool_describe(name: str = Query(..., alias="name")):
 	return ok_envelope({"schema": sch})
 
 
+@router.post("/tool.describe")
+async def tool_describe_post(body: Dict[str, Any]):
+	name = ((body or {}).get("name") or "").strip()
+	meta = _SCHEMAS.get(name) if isinstance(_SCHEMAS, dict) else None
+	# Preferred: expose input_schema for executor auto-fix use
+	if meta and isinstance(meta.get("schema"), dict):
+		return ok_envelope({"input_schema": meta.get("schema")}, rid="tool.describe")
+	# Fallback: construct input_schema for image.dispatch locally
+	if name == "image.dispatch":
+		input_schema = {
+			"type": "object",
+			"additionalProperties": False,
+			"properties": {
+				"prompt": {"type": "string"},
+				"negative": {"type": "string"},
+				"seed": {"type": "integer"},
+				"steps": {"type": "integer", "minimum": 1, "maximum": 150},
+				"cfg": {"type": "number", "minimum": 0.0, "maximum": 30.0},
+				"sampler": {"type": "string"},
+				"scheduler": {"type": "string"},
+				"width": {"type": "integer", "minimum": 64, "maximum": 2048, "multipleOf": 8},
+				"height": {"type": "integer", "minimum": 64, "maximum": 2048, "multipleOf": 8},
+				"model": {"type": "string"},
+				"workflow_path": {"type": "string"},
+				"workflow_graph": {"type": "object"},
+				"autofix_422": {"type": "boolean", "default": True},
+			},
+			"required": ["prompt"],
+		}
+		return ok_envelope({"input_schema": input_schema}, rid="tool.describe")
+	return JSONResponse({"schema_version": 1, "request_id": "tool.describe", "ok": False, "error": {"code": "tool_not_found", "message": f"unknown tool '{name}'"}}, status_code=404)

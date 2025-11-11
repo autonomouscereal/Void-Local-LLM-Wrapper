@@ -1,40 +1,25 @@
 import os
 import json
 from typing import Any, Dict, Optional
+import urllib.request
+import urllib.error
 
 
 def _get(url: str) -> Dict[str, Any]:
-    import urllib.request
     req = urllib.request.Request(url, headers={"Content-Type": "application/json"}, method="GET")
-    with urllib.request.urlopen(req) as resp:
-        raw = resp.read().decode("utf-8", errors="replace")
     try:
-        return json.loads(raw)
-    except Exception:
-        return {}
+        with urllib.request.urlopen(req) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+        try:
+            return json.loads(raw)
+        except Exception:
+            return {}
+    except urllib.error.HTTPError as e:
+        return {"schema_version": 1, "ok": False, "code": "not_supported", "status": e.code}
 
 
 def find_candidate(name: str) -> Optional[Dict[str, Any]]:
-    """Pick nearest by name/kind. Minimal heuristic: same prefix before '.' or exact kind match."""
-    base = os.getenv("ORCHESTRATOR_BASE_URL", "http://127.0.0.1:8000")
-    lst = _get(base.rstrip("/") + "/tool.list")
-    tools = ((lst or {}).get("result") or {}).get("tools") or []
-    if not tools:
-        return None
-    base = name.split(".")[0]
-    exact_kind = None
-    for t in tools:
-        if t.get("name") == name:
-            exact_kind = t.get("kind")
-            break
-    # prefer same base prefix, then same kind
-    for t in tools:
-        if t.get("name", "").split(".")[0] == base and t.get("name") != name:
-            return t
-    if exact_kind:
-        for t in tools:
-            if t.get("kind") == exact_kind and t.get("name") != name:
-                return t
+    # Disabled per canonical route set; orchestrator does not expose /tool.list
     return None
 
 
