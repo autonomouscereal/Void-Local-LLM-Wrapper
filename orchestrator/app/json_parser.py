@@ -14,6 +14,7 @@ class JSONParser:
       - No other try/except anywhere in this file.
       - parse_strict(text) -> (ok: bool, obj|None): strict load with one repair pass.
       - parse(text, expected) -> coerced structure to 'expected' shape.
+      - parse_superset(text, expected) -> {"coerced","raw","extras","vars","repairs","errors","last_error"}.
    
     Compatibility:
       - Keeps self.errors, self.repairs, self.last_error for callers that log them.
@@ -45,6 +46,26 @@ class JSONParser:
     # Backwards-compatible alias
     def parse_best_effort(self, text: str, expected: Any) -> Any:
         return self.parse(text, expected)
+
+    def parse_superset(self, text: str, expected: Any) -> Dict[str, Any]:
+        """Return a superset result that always includes a usable structure and preserved extras.
+        Fields: coerced, raw, extras, vars, repairs, errors, last_error
+        """
+        s = self._prep(text)
+        ok, data = self._attempt_loads(s)
+        raw = data if ok else ({} if isinstance(expected, dict) else ([] if isinstance(expected, list) else None))
+        coerced = self._ensure_structure(raw, expected)
+        extras = self._diff_extras(raw, coerced)
+        vars_map = self._extract_vars(raw)
+        return {
+            "coerced": coerced,
+            "raw": raw,
+            "extras": extras,
+            "vars": vars_map,
+            "repairs": list(self.repairs),
+            "errors": list(self.errors),
+            "last_error": (self.last_error or ""),
+        }
 
     # ---------- core loading (the ONLY try/except blocks) ----------
 
@@ -190,6 +211,97 @@ class JSONParser:
         if isinstance(item_shape, dict):
             return self._ensure_structure({}, item_shape)
         return v
+
+    # ---------- extras diff & vars extraction (no try/except) ----------
+
+    def _diff_extras(self, raw: Any, coerced: Any) -> Any:
+        """Return parts of raw not represented in coerced (structure-level, not values)."""
+        if isinstance(raw, dict) and isinstance(coerced, dict):
+            out: Dict[str, Any] = {}
+            for k, v in raw.items():
+                if k not in coerced:
+                    out[k] = v
+                else:
+                    sub = self._diff_extras(v, coerced.get(k))
+                    if self._non_empty(sub):
+                        out[k] = sub
+            return out
+        if isinstance(raw, list) and isinstance(coerced, list):
+            extras_list: List[Any] = []
+            n = max(len(raw), len(coerced))
+            for i in range(n):
+                rv = raw[i] if i < len(raw) else None
+                cv = coerced[i] if i < len(coerced) else None
+                sub = self._diff_extras(rv, cv)
+                if self._non_empty(sub):
+                    extras_list.append(sub)
+            # if there are trailing raw items beyond coerced length, include them as well
+            if len(raw) > len(coerced):
+                for j in range(len(coerced), len(raw)):
+                    extras_list.append(raw[j])
+            return extras_list
+        # For scalars or mismatched types: if equal, no extras; else prefer raw as extra
+        if raw == coerced:
+            return None
+        return raw
+
+    def _non_empty(self, v: Any) -> bool:
+        if v is None:
+            return False
+        if isinstance(v, (list, dict)):
+            return len(v) > 0
+        return True
+
+    def _extract_vars(self, raw: Any) -> Dict[str, Any]:
+        """Scan string leaves for useful k/v hints to assist tools. Best-effort; deterministic only."""
+        vars_map: Dict[str, Any] = {}
+        def _scan_str(s: str) -> None:
+            t = s.strip()
+            # simple patterns: width 512, height 768, steps 30, cfg 7.5, seed 123
+            for key in ("width", "height", "steps", "cfg", "seed"):
+                pat = r"\b" + key + r"\s*[:=]?\s*([0-9]+(?:\.[0-9]+)?)\b"
+                for m in re.finditer(pat, t, flags=re.IGNORECASE):
+                    val = m.group(1)
+                    if "." in val and key not in ("steps", "seed"):
+                        try_num = val
+                        # numeric casting: float unless obviously int
+                        if try_num.replace(".", "", 1).isdigit():
+                            if key in ("steps", "seed"):
+                                vars_map[key] = int(float(try_num))
+                            else:
+                                vars_map[key] = float(try_num)
+                    else:
+                        if val.isdigit():
+                            if key in ("steps", "seed"):
+                                vars_map[key] = int(val)
+                            else:
+                                vars_map[key] = int(val)
+            # pairs like key: value
+            for m in re.finditer(r"\b([A-Za-z0-9_\-]+)\s*[:=]\s*([A-Za-z0-9_\-\.]+)\b", t):
+                k = m.group(1).lower()
+                v = m.group(2)
+                if k not in vars_map:
+                    if v.replace(".", "", 1).isdigit():
+                        if "." in v:
+                            vars_map[k] = float(v)
+                        else:
+                            vars_map[k] = int(v)
+                    else:
+                        vars_map[k] = v
+        def _walk(x: Any) -> None:
+            if isinstance(x, str):
+                _scan_str(x)
+                return
+            if isinstance(x, list):
+                for it in x:
+                    _walk(it)
+                return
+            if isinstance(x, dict):
+                for it in x.values():
+                    _walk(it)
+                return
+        _walk(raw)
+        return vars_map
 
     # ---------- diagnostics (no try/except) ----------
 

@@ -44,4 +44,9 @@ app.add_middleware(PermissiveWebSocketMiddleware)
 def _alive():
     return {"ok": True}
 
+# Include OpenAI-compatible chat completions endpoint from the canonical implementation
+# This avoids re-implementation and ensures planner → executor path consistency.
+from app.main import chat_completions as _chat_completions  # type: ignore
+app.add_api_route("/v1/chat/completions", _chat_completions, methods=["POST"])
+
 
