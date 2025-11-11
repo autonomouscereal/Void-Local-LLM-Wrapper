@@ -14,6 +14,9 @@ app = FastAPI(title="Void Orchestrator")
 # Include routers once; no startup handlers or import-time side effects here
 app.include_router(run_all_routes.router)
 
+# Append Access-Control-Allow-Private-Network on preflight (Chromium PNA) — must be outermost
+app.add_middleware(AllowPrivateNetworkMiddleware)
+
 # Global CORS (open by default per project rules)
 app.add_middleware(
     CORSMiddleware,
@@ -21,14 +24,12 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["GET", "POST", "OPTIONS", "PUT", "PATCH", "DELETE"],
     allow_headers=["*"],
+    expose_headers=["*"],
     max_age=86400,
 )
 
 # WebSocket middleware to strip Origin header
 app.add_middleware(PermissiveWebSocketMiddleware)
-
-# Append Access-Control-Allow-Private-Network on preflight (Chromium PNA)
-app.add_middleware(AllowPrivateNetworkMiddleware)
 
 @app.get("/_alive")
 def _alive():
