@@ -101,8 +101,6 @@ from .tools_music.compose import run_music_compose
 from .tools_music.variation import run_music_variation
 from .tools_music.mixdown import run_music_mixdown
 from .context.index import add_artifact as _ctx_add
-from .routes.run_all import router as _run_all_router
-from .routes.run_all import ws_run as _ws_run
 from .artifacts.shard import open_shard as _art_open_shard, append_jsonl as _art_append_jsonl, _finalize_shard as _art_finalize
 from .artifacts.shard import newest_part as _art_newest_part, list_parts as _art_list_parts
 from .artifacts.manifest import add_manifest_row as _art_manifest_add, write_manifest_atomic as _art_manifest_write
@@ -695,7 +693,7 @@ try:
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 except Exception:
     pass
-app.include_router(_run_all_router)
+# run_all router removed (deprecated legacy /v1/run, /ws.run)
 
 # Stamp permissive headers on every HTTP response to avoid any CORS/CORP issues
 @app.middleware("http")
@@ -7221,8 +7219,16 @@ async def completions_legacy(body: Dict[str, Any]):
 
 @app.websocket("/ws")
 async def ws_alias(websocket: WebSocket):
-    # Route legacy /ws to the unified run-all websocket handler to avoid 403s and spinner hangs
-    await _ws_run(websocket)
+    # Legacy alias removed. Politely close to avoid client hangs.
+    await websocket.accept()
+    try:
+        await websocket.send_text(json.dumps({"type": "error", "error": {"code": "gone", "message": "Deprecated. Use /v1/chat/completions"}}))
+    except Exception:
+        pass
+    try:
+        await websocket.close(code=1000)
+    except Exception:
+        pass
 
 
 @app.websocket("/tool.ws")
