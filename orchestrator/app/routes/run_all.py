@@ -241,10 +241,13 @@ async def run_all(req: Request):
             # Execute current steps
             # Log exec_post event for visibility
             _append_jsonl(os.path.join(STATE_DIR_LOCAL, "traces", tid_, "events.jsonl"), {"t": int(time.time()*1000), "event": "exec_post", "url": EXECUTE_URL, "rid": rid_, "trace_id": tid_})
-            res = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: _post_json(EXECUTE_URL, {"schema_version": 1, "request_id": rid_, "trace_id": tid_, "steps": steps_local}),
-            )
+            try:
+                res = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: _post_json(EXECUTE_URL, {"schema_version": 1, "request_id": rid_, "trace_id": tid_, "steps": steps_local}),
+                )
+            except Exception as e:
+                res = {"schema_version": 1, "ok": False, "code": "executor_http_error", "message": str(e), "result": []}
             # On schema/tool errors: re-plan once with softening and retry
             if (not isinstance(res, dict)) or (res.get("error") and not res.get("produced")):
                 if ws:
@@ -262,6 +265,12 @@ async def run_all(req: Request):
                 res = res2
                 steps_local = list((plan2.get("steps") or []))
             produced_map = (res or {}).get("produced") if isinstance(res, dict) else {}
+            # Always emit terminal result to WS/UI for this iteration
+            if ws:
+                try:
+                    await ws.send_json({"type": "tool.result", "ok": bool((res or {}).get("ok", False)), "result": res})
+                except Exception:
+                    pass
             produced_map = _canonicalize_produced(produced_map)
             # Emit a chat.append preview for this iteration
             if ws:

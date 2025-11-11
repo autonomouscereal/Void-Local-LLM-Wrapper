@@ -3,13 +3,13 @@ from __future__ import annotations
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 import os, json, uuid, time, asyncio, urllib.request, os.path
+import logging, sys
 from urllib.parse import quote, urlsplit, urlparse
 import base64 as _b64
 from app.main import execute_tool_call as _execute_tool_call
 
 
 router = APIRouter()
-logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s", stream=sys.stdout)
 log = logging.getLogger("orchestrator.toolrun")
 
 

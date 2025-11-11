@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging, sys
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -11,6 +12,8 @@ from app.routes import toolrun as toolrun_routes
 from app.middleware.ws_permissive import PermissiveWebSocketMiddleware
 from app.middleware.pna import AllowPrivateNetworkMiddleware
 
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s", stream=sys.stdout)
 
 app = FastAPI(title="Void Orchestrator")
 
