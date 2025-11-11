@@ -21,7 +21,7 @@ app.add_middleware(AllowPrivateNetworkMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origin_regex=".*",  # reflect caller Origin (works with credentials)
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS", "PUT", "PATCH", "DELETE"],
     allow_headers=["*"],
     expose_headers=["*"],
