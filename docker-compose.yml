@@ -311,7 +311,7 @@ services:
       - FACEID_API_URL=http://127.0.0.1:7000
       - MUSIC_API_URL=http://127.0.0.1:7860
       - DEMUCS_API_URL=http://127.0.0.1:9101
-      - COMFYUI_API_URL=${COMFYUI_API_URL:-http://127.0.0.1:8188}
+      - COMFYUI_API_URL=http://127.0.0.1:8188
       - COMFY_WORKFLOW_PATH=/workspace/services/image/workflows/stock_smoke.json
       - COMFYUI_API_URLS=${COMFYUI_API_URLS:-}
       - COMFYUI_REPLICAS=${COMFYUI_REPLICAS:-1}
@@ -320,6 +320,7 @@ services:
       - UPLOAD_DIR=/workspace/uploads
       - VLM_API_URL=http://127.0.0.1:8050
       - OCR_API_URL=http://127.0.0.1:8070
+      - TEACHER_API_URL=http://127.0.0.1:8097
     command: ["uvicorn","app.main_min:app","--host","0.0.0.0","--port","8000","--log-level","info","--access-log","--use-colors"]
     volumes:
       - ./:/workspace

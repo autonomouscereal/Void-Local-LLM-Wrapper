@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 import os, json, uuid, time, asyncio, urllib.request, os.path
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 from app.main import execute_tool_call as _execute_tool_call
 
 
@@ -82,6 +82,16 @@ def _build_view_url(base: str, filename: str, subfolder: str, ftype: str) -> str
 
 
 STATE_DIR_LOCAL = os.path.join(os.getenv("UPLOAD_DIR", "/workspace/uploads"), "state")
+
+# Runtime guard: force loopback base in host networking even if a container hostname sneaks in
+_raw_comfy = os.getenv("COMFYUI_API_URL") or "http://127.0.0.1:8188"
+_u = urlsplit(_raw_comfy)
+_port = _u.port or 8188
+if _u.hostname not in ("127.0.0.1", "localhost"):
+	COMFY_BASE = f"{_u.scheme or 'http'}://127.0.0.1:{_port}"
+else:
+	COMFY_BASE = _raw_comfy
+
 def _append_jsonl(path: str, obj: dict) -> None:
 	os.makedirs(os.path.dirname(path), exist_ok=True)
 	with open(path, "a", encoding="utf-8") as f:
@@ -122,7 +132,6 @@ async def tool_run(req: Request):
 		result = (res.get("result") if isinstance(res, dict) else res) or {}
 		return ok_envelope(result, rid="tool.run")
 
-	comfy_base = os.getenv("COMFYUI_API_URL") or "http://127.0.0.1:8188"
 	wf_path = (args.get("workflow_path")
 	           or os.getenv("COMFY_WORKFLOW_PATH")
 	           or "/workspace/services/image/workflows/stock_smoke.json")
@@ -140,8 +149,8 @@ async def tool_run(req: Request):
 	_patch_inplace_prompt_graph(prompt_graph, args)
 
 	client_id = uuid.uuid4().hex
-	_append_jsonl(os.path.join(STATE_DIR_LOCAL, "tools.jsonl"), {"t": int(time.time()*1000), "event": "comfyui.submit", "base": comfy_base, "workflow_path": wf_path})
-	submit_res = _post_json(comfy_base.rstrip("/") + "/prompt", {"prompt": prompt_graph, "client_id": client_id})
+	_append_jsonl(os.path.join(STATE_DIR_LOCAL, "tools.jsonl"), {"t": int(time.time()*1000), "event": "comfyui.submit", "base": COMFY_BASE, "workflow_path": wf_path})
+	submit_res = _post_json(COMFY_BASE.rstrip("/") + "/prompt", {"prompt": prompt_graph, "client_id": client_id})
 	prompt_id = submit_res.get("prompt_id") or submit_res.get("promptId") or ""
 
 	images = []
@@ -149,7 +158,7 @@ async def tool_run(req: Request):
 	_first_hist = True
 	while time.time() < deadline:
 		await asyncio.sleep(0.25)
-		hist = _get_json(f"{comfy_base.rstrip('/')}/history/{prompt_id}")
+		hist = _get_json(f"{COMFY_BASE.rstrip('/')}/history/{prompt_id}")
 		if _first_hist:
 			_append_jsonl(os.path.join(STATE_DIR_LOCAL, "tools.jsonl"), {"t": int(time.time()*1000), "event": "comfyui.history", "prompt_id": prompt_id})
 			_first_hist = False
@@ -169,7 +178,7 @@ async def tool_run(req: Request):
 						"filename": fn,
 						"subfolder": sf,
 						"type": tp,
-						"view_url": _build_view_url(comfy_base, fn, sf, tp),
+						"view_url": _build_view_url(COMFY_BASE, fn, sf, tp),
 					})
 		if images:
 			break
@@ -211,7 +220,7 @@ async def tool_run(req: Request):
 		"meta": {
 			"submitted": True,
 			"workflow_path": wf_path,
-			"comfy_base": comfy_base,
+			"comfy_base": COMFY_BASE,
 			"view_urls": view_urls,
 			"image_count": len(images),
 			**eff,
