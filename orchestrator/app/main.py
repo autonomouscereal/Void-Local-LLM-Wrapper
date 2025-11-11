@@ -4787,82 +4787,111 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     _ledger_root = os.path.join(UPLOAD_DIR, "artifacts", "runs", trace_id)
     _ledger_name = "ledger"
     # No caps — never enforce caps inline (no tool call limit enforced)
-    if tool_calls:
-        for tc in tool_calls[:5]:
-            try:
-                n = tc.get("name") or "tool"
-                args = tc.get("arguments") or {}
-                try:
-                    args = _tool_stamp(n, args if isinstance(args, dict) else {})
-                except Exception:
-                    pass
-                if n == "research.run":
-                    try:
-                        if isinstance(args, dict):
-                            args.setdefault("cid", trace_id)
-                    except Exception:
-                        pass
-                seed_tool = det_seed_tool(n, trace_id, master_seed)
-                tstart = time.time()
-                tr = await execute_tool_call(tc)
-                duration_ms = int(round((time.time() - tstart) * 1000))
-                # No caps — never enforce caps inline (no output truncation)
-                tool_results.append(tr)
-                # persist to DB
-                try:
-                    await _db_insert_tool_call(run_id, n, seed_tool, args if isinstance(args, dict) else {"_raw": args}, tr if isinstance(tr, dict) else {}, duration_ms)
-                except Exception:
-                    pass
-                # append checkpoint event
-                try:
-                    _append_event(STATE_DIR, trace_id, "tool_call", {"name": n, "duration_ms": int(duration_ms), "ok": (not (isinstance(tr, dict) and tr.get("error")))})
-                except Exception:
-                    pass
-                # Append a compact ledger row for this tool call
-                try:
-                    if _ledger_shard is None:
-                        _ledger_shard = _art_open_shard(_ledger_root, _ledger_name, ARTIFACT_SHARD_BYTES)
-                    row = {"tool": n, "duration_ms": int(duration_ms)}
-                    if isinstance(args, dict):
-                        row["args_keys"] = list(args.keys())[:10]
-                    if isinstance(tr, dict):
-                        if tr.get("error"):
-                            row["error"] = str(tr.get("error"))[:200]
-                        res = tr.get("result") if isinstance(tr.get("result"), dict) else {}
-                        if res:
-                            for k in ("master_uri", "hash", "package_uri"):
-                                v = res.get(k)
-                                if isinstance(v, str) and v:
-                                    row[k] = v
-                    _ledger_shard = _art_append_jsonl(_ledger_shard, row)
-                except Exception:
-                    pass
-                # extract artifacts minimally for trace policy
-                artifacts = {}
-                if isinstance(tr, dict):
-                    res = tr.get("result") if isinstance(tr.get("result"), dict) else {}
-                    if res:
-                        if res.get("master_uri") and res.get("hash"):
-                            artifacts["master"] = {"uri": res.get("master_uri"), "hash": res.get("hash")}
-                        for key in ("edl", "nodes", "qc_report"):
-                            if isinstance(res.get(key), dict) and (res.get(key).get("uri") or res.get(key).get("hash")):
-                                artifacts[key] = {k: v for k, v in res.get(key).items() if k in ("uri", "hash")}
-                tool_exec_meta.append({"name": n, "args": args if isinstance(args, dict) else {"_raw": args}, "seed": seed_tool, "duration_ms": duration_ms, "artifacts": artifacts})
-                # Trace tool call success/failure for distillation
-                try:
-                    _trace_append("tool", {
-                        "cid": conv_cid,
-                        "trace_id": trace_id,
-                        "name": n,
-                        "args_keys": (list(args.keys()) if isinstance(args, dict) else []),
-                        "ok": (not (isinstance(tr, dict) and tr.get("error"))),
-                        "duration_ms": duration_ms,
-                    })
-                except Exception:
-                    pass
-            except Exception as ex:
-                tool_results.append({"name": tc.get("name", "tool"), "error": str(ex)})
-                tool_exec_meta.append({"name": tc.get("name", "tool"), "args": tc.get("arguments") or {}, "seed": _derive_seed("tool", tc.get("name", "tool"), trace_id), "duration_ms": 0, "artifacts": {}})
+	if tool_calls:
+		# Partition: route image.dispatch via executor, others via internal executor
+		exec_calls: List[Dict[str, Any]] = []
+		local_calls: List[Dict[str, Any]] = []
+		for tc in tool_calls[:5]:
+			nm = (tc.get("name") or "").strip()
+			if nm == "image.dispatch":
+				exec_calls.append(tc)
+			else:
+				local_calls.append(tc)
+		# Execute local calls unchanged
+		for tc in local_calls:
+			try:
+				n = tc.get("name") or "tool"
+				args = tc.get("arguments") or {}
+				try:
+					args = _tool_stamp(n, args if isinstance(args, dict) else {})
+				except Exception:
+					pass
+				if n == "research.run":
+					try:
+						if isinstance(args, dict):
+							args.setdefault("cid", trace_id)
+					except Exception:
+						pass
+				seed_tool = det_seed_tool(n, trace_id, master_seed)
+				tstart = time.time()
+				tr = await execute_tool_call(tc)
+				duration_ms = int(round((time.time() - tstart) * 1000))
+				tool_results.append(tr)
+				try:
+					await _db_insert_tool_call(run_id, n, seed_tool, args if isinstance(args, dict) else {"_raw": args}, tr if isinstance(tr, dict) else {}, duration_ms)
+				except Exception:
+					pass
+				try:
+					_append_event(STATE_DIR, trace_id, "tool_call", {"name": n, "duration_ms": int(duration_ms), "ok": (not (isinstance(tr, dict) and tr.get("error")))})
+				except Exception:
+					pass
+				try:
+					if _ledger_shard is None:
+						_ledger_shard = _art_open_shard(_ledger_root, _ledger_name, ARTIFACT_SHARD_BYTES)
+					row = {"tool": n, "duration_ms": int(duration_ms)}
+					if isinstance(args, dict):
+						row["args_keys"] = list(args.keys())[:10]
+					if isinstance(tr, dict):
+						if tr.get("error"):
+							row["error"] = str(tr.get("error"))[:200]
+						res = tr.get("result") if isinstance(tr.get("result"), dict) else {}
+						if res:
+							for k in ("master_uri", "hash", "package_uri"):
+								v = res.get(k)
+								if isinstance(v, str) and v:
+									row[k] = v
+					_ledger_shard = _art_append_jsonl(_ledger_shard, row)
+				except Exception:
+					pass
+				artifacts = {}
+				if isinstance(tr, dict):
+					res = tr.get("result") if isinstance(tr.get("result"), dict) else {}
+					if res:
+						if res.get("master_uri") and res.get("hash"):
+							artifacts["master"] = {"uri": res.get("master_uri"), "hash": res.get("hash")}
+						for key in ("edl", "nodes", "qc_report"):
+							if isinstance(res.get(key), dict) and (res.get(key).get("uri") or res.get(key).get("hash")):
+								artifacts[key] = {k: v for k, v in res.get(key).items() if k in ("uri", "hash")}
+				tool_exec_meta.append({"name": n, "args": args if isinstance(args, dict) else {"_raw": args}, "seed": seed_tool, "duration_ms": duration_ms, "artifacts": artifacts})
+				try:
+					_trace_append("tool", {
+						"cid": conv_cid,
+						"trace_id": trace_id,
+						"name": n,
+						"args_keys": (list(args.keys()) if isinstance(args, dict) else []),
+						"ok": (not (isinstance(tr, dict) and tr.get("error"))),
+						"duration_ms": duration_ms,
+					})
+				except Exception:
+					pass
+			except Exception as ex:
+				tool_results.append({"name": tc.get("name", "tool"), "error": str(ex)})
+				tool_exec_meta.append({"name": tc.get("name", "tool"), "args": tc.get("arguments") or {}, "seed": _derive_seed("tool", tc.get("name", "tool"), trace_id), "duration_ms": 0, "artifacts": {}})
+		# Execute image.dispatch via executor (/execute)
+		if exec_calls:
+			try:
+				steps = []
+				for idx, tc in enumerate(exec_calls):
+					args = tc.get("arguments") or {}
+					if not isinstance(args, dict):
+						args = {"_raw": args}
+					steps.append({"step_id": f"img-{idx+1}", "tool": "image.dispatch", "args": args})
+				payload = {"schema_version": 1, "request_id": f"{trace_id}", "trace_id": f"{trace_id}", "steps": steps}
+				async with httpx.AsyncClient() as client:
+					r = await client.post(EXECUTOR_BASE_URL.rstrip("/") + "/execute", json=payload, timeout=60.0)
+					env = _resp_json(r, {})
+				if isinstance(env, dict) and env.get("ok"):
+					produced = env.get("produced") or {}
+					if isinstance(produced, dict):
+						for _sid, step in produced.items():
+							if isinstance(step, dict):
+								res = step.get("result") if isinstance(step.get("result"), dict) else {}
+								tool_results.append({"name": "image.dispatch", "result": res})
+				else:
+					err = (env or {}).get("error") or {}
+					tool_results.append({"name": "image.dispatch", "error": (err.get("message") or "executor_failed")})
+			except Exception as ex:
+				tool_results.append({"name": "image.dispatch", "error": str(ex)})
         if tool_results:
             messages = [{"role": "system", "content": "Tool results:\n" + json.dumps(tool_results, indent=2)}] + messages
             # If tools produced media artifacts, return them immediately (skip waiting on models)

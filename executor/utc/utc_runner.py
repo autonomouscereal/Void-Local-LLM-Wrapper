@@ -105,9 +105,11 @@ async def utc_run_tool(trace_id: Optional[str], step_id: Optional[str], name: st
     base = os.getenv("ORCHESTRATOR_BASE_URL", "http://127.0.0.1:8000")
     venv = _post(base.rstrip("/") + "/tool.validate", {"name": name, "args": attempt_args})
     if isinstance(venv, dict) and venv.get("ok") is False:
-        return {"schema_version": 1, "ok": False, "code": "args_invalid", "result": venv.get("result")}
+        # Pass through orchestrator envelope unchanged
+        return venv
 
     # Try up to 3 rounds before giving up
+    last_res: Optional[Dict[str, Any]] = None
     for round_idx in range(0, 3):
         v = validate_args(name, attempt_args, schema)
         if v.get("ok"):
@@ -129,6 +131,7 @@ async def utc_run_tool(trace_id: Optional[str], step_id: Optional[str], name: st
                         pass
                 return res
             # If orchestrator returned a structured error (including 422), attempt a single auto-fix and retry
+            last_res = res
             code = (res.get("code")
                     or (res.get("error") or {}).get("code")
                     or (res.get("result") or {}).get("code"))
@@ -165,6 +168,7 @@ async def utc_run_tool(trace_id: Optional[str], step_id: Optional[str], name: st
                 res_retry = _post(base.rstrip("/") + "/tool.run", {"name": name, "args": attempt_args, "stream": False})
                 if res_retry.get("ok"):
                     return res_retry
+                last_res = res_retry
             else:
                 err = res.get("error") or {}
                 if _is_transient(err):
@@ -188,9 +192,12 @@ async def utc_run_tool(trace_id: Optional[str], step_id: Optional[str], name: st
         try:
             async with pool.acquire() as c:
                 await c.execute("insert into tool_call_telemetry(trace_id,step_id,tool_name,version,builder_ok,repair_rounds,retargeted,status_code,error_json,final_args) values ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10::jsonb)",
-                                trace_id, step_id, name, version, True, 2, False, 422, json.dumps({"code": "tool_error", "message": "Unable to satisfy tool schema after bounded repairs."}), json.dumps(attempt_args))
+                                trace_id, step_id, name, version, True, 2, False, 422, json.dumps((last_res or {}).get("error")), json.dumps(attempt_args))
         except Exception:
             pass
-    return {"ok": False, "error": {"code": "tool_error", "message": "Unable to satisfy tool schema after bounded repairs.", "details": {"name": name}}}
+    # Pass through the last orchestrator envelope if available
+    if isinstance(last_res, dict):
+        return last_res
+    return {"ok": False, "error": {"code": "tool_failed", "message": "tool.run failed"}}
 
 
