@@ -5,6 +5,8 @@ from fastapi.middleware.cors import CORSMiddleware
 
 # Absolute imports to avoid relative/cycle resolution issues under Uvicorn
 from app.routes import run_all as run_all_routes
+from app.routes import logs as logs_routes
+from app.routes import tools as tools_routes
 from app.middleware.ws_permissive import PermissiveWebSocketMiddleware
 from app.middleware.pna import AllowPrivateNetworkMiddleware
 
@@ -13,6 +15,8 @@ app = FastAPI(title="Void Orchestrator")
 
 # Include routers once; no startup handlers or import-time side effects here
 app.include_router(run_all_routes.router)
+app.include_router(logs_routes.router)
+app.include_router(tools_routes.router)
 
 # Append Access-Control-Allow-Private-Network on preflight (Chromium PNA) — must be outermost
 app.add_middleware(AllowPrivateNetworkMiddleware)

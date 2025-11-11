@@ -17,7 +17,8 @@ from ..json_parser import JSONParser
 from ..plan.committee import make_full_plan
 from ..plan.validator import validate_plan
 from ..review.referee import build_delta_plan as _build_delta_plan
-EXECUTOR_BASE_URL_ENV = os.getenv("EXECUTOR_BASE_URL", "").strip()
+EXECUTOR_BASE_URL = os.getenv("EXECUTOR_BASE_URL", "http://127.0.0.1:8081")
+EXECUTE_URL = EXECUTOR_BASE_URL.rstrip("/") + "/execute"
 
 STATE_DIR_LOCAL = os.path.join(os.getenv("UPLOAD_DIR", "/workspace/uploads"), "state")
 from ..state.checkpoints import append_ndjson as _append_jsonl
@@ -34,21 +35,7 @@ def _post_json(url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         return JSONParser().parse(raw, expected)
 
 
-def _build_execute_url(req: Request) -> str:
-    """
-    Derive the executor /execute URL without relying on Docker DNS.
-    Priority:
-      1) Header override: X-Executor-Base-Url
-      2) ENV EXECUTOR_BASE_URL
-      3) Same-host fallback: http://127.0.0.1:8081
-    """
-    hdr = (req.headers.get("x-executor-base-url") or req.headers.get("X-Executor-Base-Url") or "").strip()
-    if hdr:
-        return hdr.rstrip("/") + "/execute"
-    if EXECUTOR_BASE_URL_ENV:
-        return EXECUTOR_BASE_URL_ENV.rstrip("/") + "/execute"
-    # Fallback: loopback with standard executor port
-    return "http://127.0.0.1:8081/execute"
+
 def _soften_plan(plan: Dict[str, Any], user_text: str) -> Dict[str, Any]:
     """Make inputs more forgiving by filling common defaults so execution can proceed."""
     steps = plan.get("steps") or plan.get("plan") or []
@@ -243,7 +230,6 @@ async def run_all(req: Request):
     review_cfg = (body.get("review") or {}) if isinstance(body.get("review"), dict) else {}
     review_enabled = bool(review_cfg.get("enabled", True))
     max_iters = int(review_cfg.get("max_iterations", 1) or 1)
-    execute_url = _build_execute_url(req)
     async def _runner(rid_: str, tid_: str, steps0: List[Dict[str, Any]], user_text_: str, review_enabled_: bool, max_iters_: int):
         ws = app.state.ws_clients.get(rid_)
         app.state.jobs[rid_]["status"] = "running"
@@ -254,10 +240,10 @@ async def run_all(req: Request):
         for iter_idx in range(max(1, max_iters_)):
             # Execute current steps
             # Log exec_post event for visibility
-            _append_jsonl(os.path.join(STATE_DIR_LOCAL, "traces", tid_, "events.jsonl"), {"t": int(time.time()*1000), "event": "exec_post", "url": execute_url, "rid": rid_, "trace_id": tid_})
+            _append_jsonl(os.path.join(STATE_DIR_LOCAL, "traces", tid_, "events.jsonl"), {"t": int(time.time()*1000), "event": "exec_post", "url": EXECUTE_URL, "rid": rid_, "trace_id": tid_})
             res = await asyncio.get_event_loop().run_in_executor(
                 None,
-                lambda: _post_json(execute_url, {"schema_version": 1, "request_id": rid_, "trace_id": tid_, "steps": steps_local}),
+                lambda: _post_json(EXECUTE_URL, {"schema_version": 1, "request_id": rid_, "trace_id": tid_, "steps": steps_local}),
             )
             # On schema/tool errors: re-plan once with softening and retry
             if (not isinstance(res, dict)) or (res.get("error") and not res.get("produced")):
@@ -269,7 +255,7 @@ async def run_all(req: Request):
                     plan2 = {"request_id": plan2.get("request_id") or rid_, "steps": plan2.get("plan")}
                 res2 = await asyncio.get_event_loop().run_in_executor(
                     None,
-                    lambda: _post_json(execute_url, {"schema_version": 1, "request_id": rid_, "trace_id": tid_, "steps": (plan2.get("steps") or [])}),
+                    lambda: _post_json(EXECUTE_URL, {"schema_version": 1, "request_id": rid_, "trace_id": tid_, "steps": (plan2.get("steps") or [])}),
                 )
                 if not isinstance(res2, dict) or (res2.get("error") and not res2.get("produced")):
                     return
@@ -387,4 +373,5 @@ async def ws_run(websocket: WebSocket):
     while True:
         msg = await websocket.receive_text()
         await websocket.send_json({"type": "ack", "echo": (msg[:100] if msg else "")})
+
 

@@ -268,14 +268,15 @@ services:
         <<: *cu118_args
     container_name: void_orchestrator
     restart: unless-stopped
+    network_mode: host
     
     environment:
       - PYTHONUNBUFFERED=1
       - FILM2_MODELS=/opt/models
       - FILM2_DATA=/srv/film2
-      - QWEN_BASE_URL=http://ollama_qwen:11434
+      - QWEN_BASE_URL=http://127.0.0.1:11434
       - QWEN_MODEL_ID=${QWEN_MODEL_ID:-qwen3:30b-a3b-instruct-2507-q4_K_M}
-      - GPTOSS_BASE_URL=http://ollama_gptoss:11434
+      - GPTOSS_BASE_URL=http://127.0.0.1:11435
       - GPTOSS_MODEL_ID=${GPTOSS_MODEL_ID}
       # Enable ICW + Committee + Tools by default
       - ICW_MODE=${ICW_MODE:-committee}
@@ -292,36 +293,34 @@ services:
       - DEFAULT_TEMPERATURE=${DEFAULT_TEMPERATURE:-0.3}
       - ENABLE_WEBSEARCH=${ENABLE_WEBSEARCH:-true}
       - SERPAPI_API_KEY
-      - EXECUTOR_BASE_URL=http://executor:8081
+      - EXECUTOR_BASE_URL=http://127.0.0.1:8081
       - PLANNER_MODEL=${PLANNER_MODEL:-qwen3}
       - MCP_HTTP_BRIDGE_URL
       - N8N_WEBHOOK_URL=${N8N_WEBHOOK_URL:-}
-      - ASSEMBLER_API_URL=http://assembler:9095
-      - ICW_API_URL=http://icw:8085
+      - ASSEMBLER_API_URL=http://127.0.0.1:9095
+      - ICW_API_URL=http://127.0.0.1:8085
       - TEACHER_API_URL=http://teacher:8097
-      - POSTGRES_HOST=pgvector
+      - POSTGRES_HOST=127.0.0.1
       - POSTGRES_PORT=5432
       - POSTGRES_DB=ragdb
       - POSTGRES_USER=rag
       - POSTGRES_PASSWORD=ragpass
       - EMBEDDING_MODEL_NAME=${EMBEDDING_MODEL_NAME:-BAAI/bge-large-en-v1.5}
-      - XTTS_API_URL=http://xtts:8020
-      - WHISPER_API_URL=http://whisper:9090
-      - FACEID_API_URL=http://faceid:7000
-      - MUSIC_API_URL=http://music:7860
-      - DEMUCS_API_URL=http://demucs:9101
-      - COMFYUI_API_URL=${COMFYUI_API_URL:-http://comfyui:8188}
+      - XTTS_API_URL=http://127.0.0.1:8020
+      - WHISPER_API_URL=http://127.0.0.1:9090
+      - FACEID_API_URL=http://127.0.0.1:7000
+      - MUSIC_API_URL=http://127.0.0.1:7860
+      - DEMUCS_API_URL=http://127.0.0.1:9101
+      - COMFYUI_API_URL=${COMFYUI_API_URL:-http://127.0.0.1:8188}
       - COMFY_WORKFLOW_PATH=/workspace/services/image/workflows/stock_smoke.json
       - COMFYUI_API_URLS=${COMFYUI_API_URLS:-}
       - COMFYUI_REPLICAS=${COMFYUI_REPLICAS:-1}
       - SCENE_SUBMIT_CONCURRENCY=${SCENE_SUBMIT_CONCURRENCY:-4}
       - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-}
       - UPLOAD_DIR=/workspace/uploads
-      - VLM_API_URL=http://vlm:8050
-      - OCR_API_URL=http://ocr:8070
+      - VLM_API_URL=http://127.0.0.1:8050
+      - OCR_API_URL=http://127.0.0.1:8070
     command: ["uvicorn","app.main_min:app","--host","0.0.0.0","--port","8000","--log-level","info","--access-log","--use-colors"]
-    ports:
-      - "8000:8000"
     volumes:
       - ./:/workspace
       - film2_models:/opt/models:ro
@@ -651,17 +650,14 @@ services:
       dockerfile: Dockerfile
     container_name: void_executor
     restart: unless-stopped
+    network_mode: host
     environment:
       - WORKSPACE_DIR=/workspace
       - EXEC_TIMEOUT_SEC=${EXEC_TIMEOUT_SEC:-30}
       - EXEC_MEMORY_MB=${EXEC_MEMORY_MB:-2048}
       - ALLOW_SHELL=${ALLOW_SHELL:-false}
       - SHELL_WHITELIST=${SHELL_WHITELIST:-}
-      - ORCHESTRATOR_BASE_URL=http://orchestrator:8000
-    expose:
-      - "8081"
-    ports:
-      - "8081:8081"
+      - ORCHESTRATOR_BASE_URL=http://127.0.0.1:8000
     volumes:
       - ./:/workspace
 

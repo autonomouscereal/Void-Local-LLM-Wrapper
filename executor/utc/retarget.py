@@ -16,7 +16,7 @@ def _get(url: str) -> Dict[str, Any]:
 
 def find_candidate(name: str) -> Optional[Dict[str, Any]]:
     """Pick nearest by name/kind. Minimal heuristic: same prefix before '.' or exact kind match."""
-    base = os.getenv("ORCHESTRATOR_BASE_URL", "http://orchestrator:8000")
+    base = os.getenv("ORCHESTRATOR_BASE_URL", "http://127.0.0.1:8000")
     lst = _get(base.rstrip("/") + "/tool.list")
     tools = ((lst or {}).get("result") or {}).get("tools") or []
     if not tools:

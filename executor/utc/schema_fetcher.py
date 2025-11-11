@@ -25,7 +25,7 @@ def _get(url: str) -> Dict[str, Any]:
 
 async def fetch(name: str) -> Dict[str, Any]:
     """Fetch tool describe and cache to Postgres (best-effort)."""
-    base = os.getenv("ORCHESTRATOR_BASE_URL", "http://orchestrator:8000")
+    base = os.getenv("ORCHESTRATOR_BASE_URL", "http://127.0.0.1:8000")
     url = base.rstrip("/") + f"/tool.describe?name={name}"
     obj = _get(url)
     res = (obj or {}).get("result") or {}

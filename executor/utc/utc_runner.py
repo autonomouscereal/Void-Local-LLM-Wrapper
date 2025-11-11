@@ -35,7 +35,7 @@ async def _emit_review_event(event: str, trace_id: Optional[str], step_id: Optio
             "step_id": step_id,
             "notes": notes,
         }
-        base = os.getenv("ORCHESTRATOR_BASE_URL", "http://orchestrator:8000")
+        base = os.getenv("ORCHESTRATOR_BASE_URL", "http://127.0.0.1:8000")
         _post(base.rstrip("/") + "/logs/tools.append", payload)
     except Exception as e:
         # Log locally to telemetry if posting fails
@@ -85,7 +85,7 @@ async def utc_run_tool(trace_id: Optional[str], step_id: Optional[str], name: st
         v = validate_args(name, attempt_args, schema)
         if v.get("ok"):
             # call tool
-            base = os.getenv("ORCHESTRATOR_BASE_URL", "http://orchestrator:8000")
+            base = os.getenv("ORCHESTRATOR_BASE_URL", "http://127.0.0.1:8000")
             res = _post(base.rstrip("/") + "/tool.run", {"name": name, "args": attempt_args, "stream": False})
             if res.get("ok"):
                 if round_idx > 0 and last_ops:
@@ -127,7 +127,7 @@ async def utc_run_tool(trace_id: Optional[str], step_id: Optional[str], name: st
         if not v2.get("ok"):
             fix2 = repair_args(attempt_args, v2.get("errors") or [], schema2)
             attempt_args = fix2.get("fixed_args") or attempt_args
-        base = os.getenv("ORCHESTRATOR_BASE_URL", "http://orchestrator:8000")
+        base = os.getenv("ORCHESTRATOR_BASE_URL", "http://127.0.0.1:8000")
         res2 = _post(base.rstrip("/") + "/tool.run", {"name": alt_name, "args": attempt_args, "stream": False})
         # record telemetry
         pool = await get_pg_pool()
