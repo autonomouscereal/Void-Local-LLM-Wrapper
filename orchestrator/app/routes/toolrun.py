@@ -9,6 +9,8 @@ from app.main import execute_tool_call as _execute_tool_call
 
 
 router = APIRouter()
+logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s", stream=sys.stdout)
+log = logging.getLogger("orchestrator.toolrun")
 
 
 def ok_envelope(result, rid: str) -> JSONResponse:
@@ -143,6 +145,14 @@ def _apply_overrides(graph: dict, bind: dict, args: dict) -> None:
         graph[bind["ckpt"]]["inputs"]["ckpt_name"] = str(args["model"]).strip()
 
 
+def _extract_node_subset(raw: dict) -> dict:
+	out: dict = {}
+	if isinstance(raw, dict):
+		for k, v in raw.items():
+			if isinstance(v, dict) and "class_type" in v and "inputs" in v:
+				out[str(k)] = v
+	return out
+
 def patch_workflow_in_place(g: dict, args: dict) -> None:
 	# 1) Prompt / Negative (support common CLIP encoders)
 	prompt = args.get("prompt")
@@ -235,22 +245,74 @@ async def tool_run(req: Request):
 		result = (res.get("result") if isinstance(res, dict) else res) or {}
 		return ok_envelope(result, rid="tool.run")
 
-	wf_path = (args.get("workflow_path")
-	           or os.getenv("COMFY_WORKFLOW_PATH")
-	           or "/workspace/services/image/workflows/stock_smoke.json")
-	if not os.path.exists(wf_path):
-		return JSONResponse(
-			{"schema_version": 1, "request_id": "tool.run", "ok": False,
-			 "error": {"code": "missing_workflow", "message": f"workflow path not found: {wf_path}", "details": {}}},
-			status_code=422
-		)
-	wf_text = _read_text(wf_path)
-	wf_obj = json.loads(wf_text)
-	# Normalize to API prompt graph and validate before binding/overrides
-	try:
-		prompt_graph = _ensure_api_prompt_graph(wf_obj)
-	except ValueError as ve:
-		return err_envelope("workflow_invalid", str(ve), rid="tool.run", status=422)
+	# Normalize args (aliases, numerics, multiples)
+	def _normalize_args(a: dict) -> dict:
+		out = dict(a or {})
+		if "sampler_name" in out and "sampler" not in out: out["sampler"] = out.pop("sampler_name")
+		if "negative_prompt" in out and "negative" not in out: out["negative"] = out.pop("negative_prompt")
+		def snap(x, mult=8, lo=64, default=512):
+			try: v = int(float(x))
+			except: v = default
+			if v < lo: v = lo
+			return (v // mult) * mult
+		if "width" in out: out["width"] = snap(out.get("width"))
+		if "height" in out: out["height"] = snap(out.get("height"))
+		try: out["steps"] = max(1, min(150, int(float(out.get("steps", 30)))))
+		except: out["steps"] = 30
+		try: out["cfg"] = float(out.get("cfg", 7.0))
+		except: out["cfg"] = 7.0
+		if not out.get("sampler"): out["sampler"] = "euler"
+		if not out.get("scheduler"): out["scheduler"] = "normal"
+		seed = out.get("seed")
+		if seed in (None, "", "random", -1, "-1"):
+			out["seed"] = None
+		else:
+			try: out["seed"] = int(seed)
+			except: out["seed"] = None
+		out["prompt"] = str(out.get("prompt","") or "")
+		out["negative"] = str(out.get("negative","") or "")
+		return out
+	args = _normalize_args(args)
+
+	# Inline graph or path
+	inline = args.get("workflow_graph")
+	if inline is not None:
+		wf_obj = inline
+		wf_path = "(inline)"
+	else:
+		wf_path = (args.get("workflow_path")
+		           or os.getenv("COMFY_WORKFLOW_PATH")
+		           or "/workspace/services/image/workflows/stock_smoke.json")
+		if not os.path.exists(wf_path):
+			return JSONResponse(
+				{"schema_version": 1, "request_id": "tool.run", "ok": False,
+				 "error": {"code": "missing_workflow", "message": f"workflow path not found: {wf_path}", "details": {}}},
+				status_code=422
+			)
+		wf_text = _read_text(wf_path)
+		wf_obj = json.loads(wf_text)
+
+	# Try to ensure API prompt mapping, with optional coercion/subset
+	prompt_graph = None
+	if isinstance(wf_obj, dict) and "prompt" in wf_obj and isinstance(wf_obj["prompt"], dict):
+		prompt_graph = wf_obj["prompt"]
+	elif isinstance(wf_obj, dict) and "nodes" not in wf_obj:
+		prompt_graph = wf_obj
+
+	if not isinstance(prompt_graph, dict) and bool(args.get("autofix_422", False)):
+		coerced = _coerce_ui_export_to_api_graph(wf_obj)
+		if isinstance(coerced, dict):
+			prompt_graph = coerced
+		if not isinstance(prompt_graph, dict) and isinstance(coerced, dict):
+			subset = _extract_node_subset(coerced)
+			if subset:
+				prompt_graph = subset
+
+	if not isinstance(prompt_graph, dict):
+		return err_envelope("workflow_invalid", "Workflow must be a dict of nodes with class_type and inputs", rid="tool.run", status=422,
+		                   details={"top_level_type": type(wf_obj).__name__, "has_nodes_key": bool(isinstance(wf_obj, dict) and "nodes" in wf_obj)})
+
+	# Validate and bind
 	problems = _validate_api_graph(prompt_graph)
 	if problems:
 		avail = [{"id": str(nid), "class": (node.get("class_type") if isinstance(node, dict) else None)} for nid, node in prompt_graph.items() if isinstance(node, dict)]

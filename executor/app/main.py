@@ -514,6 +514,7 @@ async def run_steps(trace_id: str, request_id: str, steps: list[dict]) -> Dict[s
                 except Exception:
                     err_detail = "tool_error"
                 # Record structured failure result for this step
+                logging.error("[executor] step=%s tool=%s FAILED %s", sid, tool_name, err_detail)
                 produced[sid] = {"name": tool_name, "result": {"ids": {}, "meta": {"error": err_detail}}}
             else:
                 produced[sid] = {"name": tool_name, "result": _canonical_tool_result(res or {})}
