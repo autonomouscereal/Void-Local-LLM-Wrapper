@@ -69,6 +69,18 @@ def jerr(status: int, rid: str, code: str, msg: str, details: Any | None = None)
     return JSONResponse({"schema_version": 1, "request_id": rid, "ok": False, "error": {"code": code, "message": msg, "details": details}}, status_code=status)
 
 
+@router.get("/jobs")
+async def jobs(req: Request):
+    app = req.app
+    jobs = getattr(app.state, "jobs", {})
+    items: List[Dict[str, Any]] = []
+    if isinstance(jobs, dict):
+        for rid, info in jobs.items():
+            if isinstance(info, dict):
+                items.append({"request_id": rid, "status": info.get("status"), "trace_id": info.get("trace_id")})
+    return {"ok": True, "jobs": items}
+
+
 def _strip_data_urls(obj: Any) -> None:
     if isinstance(obj, dict):
         if "data_url" in obj:
