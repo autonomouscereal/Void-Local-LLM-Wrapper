@@ -9,6 +9,9 @@ import math
 import os
 import re
 import time
+import asyncio
+import urllib.parse
+import urllib.robotparser
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -17,6 +20,13 @@ from bs4 import BeautifulSoup
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from .media_resolver import resolve_media
+
+try:
+    # Optional; only used when render_fetch is invoked
+    from playwright.async_api import async_playwright  # type: ignore
+    _HAS_PLAYWRIGHT = True
+except Exception:
+    _HAS_PLAYWRIGHT = False
 
 
 DRT_VERSION = "1.0.0"
@@ -40,6 +50,40 @@ def _sha256_bytes(data: bytes) -> str:
 
 def _sha256_str(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
+# Robots.txt (optional)
+_ROBOTS_CACHE: Dict[str, Tuple[float, urllib.robotparser.RobotFileParser]] = {}
+def _robots_allowed(url: str, ua: str = "VoidBot/1.0") -> bool:
+    try:
+        respect = (os.getenv("DRT_RESPECT_ROBOTS", "true").lower() == "true")
+        if not respect:
+            return True
+        parsed = urllib.parse.urlparse(url)
+        base = f"{parsed.scheme}://{parsed.netloc}"
+        ttl = int(os.getenv("DRT_ROBOTS_TTL_S", "900") or "900")
+        now = time.time()
+        rp: Optional[urllib.robotparser.RobotFileParser] = None
+        ts = 0.0
+        if base in _ROBOTS_CACHE:
+            ts, rp = _ROBOTS_CACHE.get(base, (0.0, None))  # type: ignore
+        if (rp is None) or (now - ts > ttl):
+            robots_url = urllib.parse.urljoin(base, "/robots.txt")
+            rpp = urllib.robotparser.RobotFileParser()
+            try:
+                rpp.set_url(robots_url)
+                rpp.read()
+            except Exception:
+                rpp = None  # type: ignore
+            if rpp is None:
+                _ROBOTS_CACHE[base] = (now, urllib.robotparser.RobotFileParser())
+                # No robots means allow by default
+                return True
+            _ROBOTS_CACHE[base] = (now, rpp)
+            rp = rpp
+        if rp is None:
+            return True
+        return rp.can_fetch(ua, url)
+    except Exception:
+        return True
 # -------------------- Media Resolver wiring --------------------
 
 WHISPER_URL = os.getenv("WHISPER_API_URL", "http://whisper:9090") + "/transcribe"
@@ -282,6 +326,59 @@ class FetcherParser:
             return text, []
         except Exception:
             return "", []
+
+    @staticmethod
+    def extract_metadata(raw_or_html: Any) -> Dict[str, Any]:
+        try:
+            html = raw_or_html if isinstance(raw_or_html, str) else raw_or_html.decode("utf-8", "replace")
+        except Exception:
+            html = ""
+        out: Dict[str, Any] = {"title": "", "author": "", "date": "", "og": {}, "jsonld": []}
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+            # title
+            t = soup.title.get_text(strip=True) if soup.title else ""
+            out["title"] = t or ""
+            # author
+            meta_author = soup.select_one('meta[name="author"]')
+            if meta_author and meta_author.get("content"):
+                out["author"] = meta_author.get("content", "")
+            # date (common props)
+            for sel in [
+                'meta[property="article:published_time"]',
+                'meta[name="date"]',
+                'meta[itemprop="datePublished"]',
+                'meta[property="og:updated_time"]',
+            ]:
+                m = soup.select_one(sel)
+                if m and m.get("content"):
+                    out["date"] = m.get("content", "")
+                    break
+            # OpenGraph
+            og: Dict[str, str] = {}
+            for m in soup.select('meta[property^="og:"]'):
+                p = m.get("property") or ""
+                c = m.get("content") or ""
+                if p and c:
+                    og[p] = c
+            out["og"] = og
+            # JSON-LD
+            jsonld_list: List[Dict[str, Any]] = []
+            for sc in soup.select('script[type="application/ld+json"]'):
+                try:
+                    js = json.loads(sc.get_text() or "{}")
+                    if isinstance(js, dict):
+                        jsonld_list.append(js)
+                    elif isinstance(js, list):
+                        for it in js:
+                            if isinstance(it, dict):
+                                jsonld_list.append(it)
+                except Exception:
+                    continue
+            out["jsonld"] = jsonld_list
+        except Exception:
+            return out
+        return out
 
 
 # -------------------- Deduplicate/Normalize --------------------
@@ -557,6 +654,16 @@ def _save_csv(name: str, rows: List[Dict[str, Any]]) -> str:
     return _save_text(name, buf.getvalue())
 
 
+# Binary artifact save (e.g., screenshots)
+def _save_bytes(name: str, data: bytes) -> str:
+    path = os.path.join(UPLOAD_ROOT, name)
+    with open(path, "wb") as f:
+        f.write(data)
+    if PUBLIC_BASE_URL:
+        return f"{PUBLIC_BASE_URL.rstrip('/')}/uploads/{name}"
+    return f"/uploads/{name}"
+
+
 # -------------------- Endpoints --------------------
 
 
@@ -591,18 +698,45 @@ async def research_collect(body: Dict[str, Any]):
     bytes_total = 0
     blocked_count = 0
     within_horizon = 0
+    seen_urls: set[str] = set()
+    # simple per-domain rate limiter (gap in ms)
+    rate_min_gap_ms = int(os.getenv("DRT_RATE_MIN_GAP_MS", "200") or "200")
+    _last_fetch: Dict[str, float] = {}
+    def _allow_fetch(domain: str) -> float:
+        now = time.time()
+        last = _last_fetch.get(domain, 0.0)
+        gap = (rate_min_gap_ms / 1000.0)
+        wait = max(0.0, (last + gap) - now)
+        _last_fetch[domain] = max(now, last) + gap
+        return wait
     for item in discovered:
         url = DeduperNormalizer.canonical_url(item["url"])
         dom = item.get("domain") or _domain_from_url(url)
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
         if block and dom in set([d.lower() for d in block]):
             blocked_count += 1
             continue
+        # robots.txt respect (optional)
+        try:
+            if not _robots_allowed(url):
+                blocked_count += 1
+                continue
+        except Exception:
+            pass
         # Unified media-aware fetch: try media resolver first, fall back to HTTP fetch
         text = ""
         tables: List[Dict[str, str]] = []
         raw: bytes = b""
         ctype: str = "application/octet-stream"
+        fetch_mode = "httpx"
+        render_signals: Dict[str, Any] = {}
         try:
+            # simple per-domain rate control
+            w = _allow_fetch(dom)
+            if w > 0:
+                await asyncio.sleep(w)
             mres = resolve_media(url)
             kind = mres.get("type")
             if kind in ("video", "media"):
@@ -611,6 +745,7 @@ async def research_collect(body: Dict[str, Any]):
                 text, tables = (t or ""), []
                 raw = (text or "").encode("utf-8")
                 ctype = "text/plain; charset=utf-8"
+                fetch_mode = "media"
             elif kind == "pdf":
                 try:
                     with open(mres.get("pdf_path"), "rb") as f:
@@ -619,6 +754,7 @@ async def research_collect(body: Dict[str, Any]):
                     text, tables = FetcherParser.parse_pdf(raw)
                 except Exception:
                     raw, ctype = await FetcherParser.fetch(url)
+                fetch_mode = "httpx"
             elif kind == "image":
                 try:
                     with open(mres.get("image_path"), "rb") as f:
@@ -630,19 +766,35 @@ async def research_collect(body: Dict[str, Any]):
                         text = json.dumps(o) if o else ""
                 except Exception:
                     raw, ctype = await FetcherParser.fetch(url)
+                fetch_mode = "httpx"
             elif kind == "html":
                 html = str(mres.get("html") or "")
                 raw = html.encode("utf-8")
                 ctype = "text/html; charset=utf-8"
                 text, tables = FetcherParser.parse_html(raw)
+                fetch_mode = "httpx"
             else:
                 # unknown kind: fallback
                 raw, ctype = await FetcherParser.fetch(url)
+                fetch_mode = "httpx"
         except Exception:
             try:
                 raw, ctype = await FetcherParser.fetch(url)
+                fetch_mode = "httpx"
             except Exception:
                 continue
+        # Heuristics: escalate to browser render when HTML appears script-heavy or too small
+        def _should_render_html(html_text: str) -> bool:
+            try:
+                tlen = len(html_text or "")
+                if tlen < 2048:
+                    return True
+                sl = html_text.lower()
+                sc = sl.count("<script")
+                # crude script-to-length heuristic
+                return (sc >= 10) or (sc > 0 and (sc * 150) > tlen)
+            except Exception:
+                return False
         size = len(raw)
         bytes_total += size
         if (bytes_total / (1024 * 1024)) > max_fetch_mb:
@@ -652,9 +804,33 @@ async def research_collect(body: Dict[str, Any]):
             if "pdf" in ctype.lower() and modes.get("pdf", True):
                 text, tables = FetcherParser.parse_pdf(raw)
             elif modes.get("web", True):
-                text, tables = FetcherParser.parse_html(raw)
-        # naive title extraction
-        title = (text.strip().split("\n")[0] if text else url)[:200]
+                # Prefer browser render for dynamic pages
+                html_guess = ""
+                try:
+                    html_guess = raw.decode("utf-8", "replace")
+                except Exception:
+                    html_guess = ""
+                did_render = False
+                if _should_render_html(html_guess) and _HAS_PLAYWRIGHT:
+                    try:
+                        rres = await render_fetch(url, {"scroll_max": 4, "wait_networkidle_ms": 3000})
+                        if isinstance(rres, dict) and (rres.get("dom_text") or rres.get("dom_html")):
+                            text = (rres.get("dom_text") or "")
+                            tables = []
+                            did_render = True
+                            fetch_mode = "browser"
+                            render_signals = rres.get("signals") or {}
+                    except Exception:
+                        did_render = False
+                if not did_render:
+                    text, tables = FetcherParser.parse_html(raw)
+        # extraction: metadata
+        try:
+            meta = FetcherParser.extract_metadata((rres.get("dom_html") if (locals().get("did_render") and 'rres' in locals()) else raw) if fetch_mode == "browser" else raw)
+        except Exception:
+            meta = {}
+        # naive title extraction (fallback to metadata title)
+        title = (text.strip().split("\n")[0] if text else (meta.get("title") or url))[:200]
         # scoring features
         owner = _owner_from_domain(dom)
         owner_counts = {owner: 1}
@@ -673,7 +849,9 @@ async def research_collect(body: Dict[str, Any]):
             "owner": owner,
             "sha256": sha_hex,
             "bytes": size,
-            "extracted": {"text": text, "tables": tables},
+            "extracted": {"text": text, "tables": tables, "meta": meta},
+            "fetch_mode": fetch_mode,
+            "signals": render_signals,
             "engine_hits": [],
             "authority": _round6(authority),
             "recency": _round6(recency),
@@ -684,6 +862,11 @@ async def research_collect(body: Dict[str, Any]):
         # horizon check via published_at if available in future; count as within if unknown
         within_horizon += 1
         fetched_rows.append(row)
+        # observability: compact JSON log per fetch
+        try:
+            print(json.dumps({"event": "fetch", "url": url, "mode": fetch_mode, "bytes": size, "challenge": bool(render_signals.get("challenge_detected"))}))
+        except Exception:
+            pass
 
     # Deduplicate
     deduped, removed_exact = DeduperNormalizer.collapse_dups(fetched_rows)
@@ -860,4 +1043,108 @@ async def media_resolve(body: Dict[str, Any]):
         res["ocr"] = out
     return res
 
+
+# -------------------- Browser Render (Playwright) --------------------
+
+async def render_fetch(url: str, opts: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    if not _HAS_PLAYWRIGHT:
+        return {"type": "rendered", "error": "playwright_not_installed"}
+    opts = opts or {}
+    wait_networkidle_ms = int(opts.get("wait_networkidle_ms", 4000) or 4000)
+    total_timeout_ms = int(opts.get("total_timeout_ms", 15000) or 15000)
+    scroll_max = int(opts.get("scroll_max", 3) or 3)
+    scroll_sleep_ms = int(opts.get("scroll_sleep_ms", 350) or 350)
+    screenshot = bool(opts.get("screenshot", True))
+    t0 = time.time()
+    signals = {"challenge_detected": False, "blocked": False, "scrolled": False, "redirects": 0}
+    html = ""
+    try:
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(headless=True, args=["--disable-dev-shm-usage"])
+            ctx = await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36",
+                locale="en-US",
+                timezone_id="UTC",
+                viewport={"width": 1366, "height": 768},
+            )
+            page = await ctx.new_page()
+            resp = await page.goto(url, wait_until="domcontentloaded", timeout=total_timeout_ms)
+            try:
+                # Minimal consent auto-close (best-effort; non-fatal)
+                btn = await page.query_selector("button:has-text('Accept'), button:has-text('I agree')")
+                if btn:
+                    await btn.click(timeout=1000)
+            except Exception:
+                pass
+            if scroll_max > 0:
+                signals["scrolled"] = True
+                for _ in range(max(0, scroll_max)):
+                    try:
+                        await page.evaluate("window.scrollBy(0, Math.max(400, window.innerHeight*0.8));")
+                        await page.wait_for_timeout(scroll_sleep_ms)
+                    except Exception:
+                        break
+            try:
+                await page.wait_for_load_state("networkidle", timeout=wait_networkidle_ms)
+            except Exception:
+                pass
+            html = await page.content()
+            title = (await page.title()) or ""
+            body_text = ""
+            try:
+                body_text = await page.evaluate("document.body ? document.body.innerText : ''")
+            except Exception:
+                body_text = ""
+            # Challenge detection
+            low = (title + " " + body_text).lower()
+            if ("checking your browser" in low) or ("cloudflare" in low) or ("captcha" in low):
+                signals["challenge_detected"] = True
+                signals["blocked"] = True
+            # Optional screenshot
+            screenshot_url = None
+            if screenshot:
+                try:
+                    png = await page.screenshot(full_page=True)
+                    name = f"render_{int(time.time())}_{_sha256_str(url)[:8]}.png"
+                    screenshot_url = _save_bytes(name, png)
+                except Exception:
+                    screenshot_url = None
+            await ctx.close()
+            await browser.close()
+            # Extract text via existing HTML parser to stay consistent
+            text, _ = FetcherParser.parse_html(html.encode("utf-8", "replace"))
+            meta = FetcherParser.extract_metadata(html)
+            dt_ms = int((time.time() - t0) * 1000)
+            return {
+                "type": "rendered",
+                "url_final": (resp.url if resp else url),
+                "http_status": (resp.status if resp else 0),
+                "content_type": "text/html; charset=utf-8",
+                "dom_html": html,
+                "dom_text": text,
+                "meta": meta,
+                "screenshot_url": screenshot_url,
+                "fetch_mode": "browser",
+                "signals": signals,
+                "timing_ms": dt_ms,
+            }
+    except Exception as ex:
+        dt_ms = int((time.time() - t0) * 1000)
+        return {
+            "type": "rendered",
+            "error": str(ex),
+            "fetch_mode": "browser",
+            "signals": {**signals, "blocked": True},
+            "timing_ms": dt_ms,
+        }
+
+
+@app.post("/render/fetch")
+async def api_render_fetch(body: Dict[str, Any]):
+    url = str(_safe_get(body, "url", ""))
+    opts = _safe_get(body, "options", {}) or {}
+    if not url:
+        return JSONResponse(status_code=400, content={"error": "missing url"})
+    res = await render_fetch(url, opts if isinstance(opts, dict) else {})
+    return res
 

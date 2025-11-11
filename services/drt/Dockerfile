@@ -6,11 +6,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends libxml2 libxslt1.1 ffmpeg ca-certificates \
+    && apt-get install -y --no-install-recommends libxml2 libxslt1.1 ffmpeg ca-certificates curl gnupg \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt \
+    && python -m playwright install --with-deps chromium
 
 COPY app /app/app
 

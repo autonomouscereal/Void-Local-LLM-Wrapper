@@ -4599,11 +4599,52 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         except Exception:
             items = []
         if items:
+            # Optional prefetch of top results via DRT to improve snippets
+            improved: Dict[str, str] = {}
+            try:
+                base = (DRT_API_URL or "").rstrip("/")
+                if base:
+                    import asyncio as _aio
+                    import httpx as _hx
+                    async def _prefetch(url: str) -> str:
+                        try:
+                            async with _hx.AsyncClient(timeout=6.0) as cli:
+                                # Prefer rendered fetch for HTML
+                                r = await cli.post(base + "/render/fetch", json={"url": url, "options": {"scroll_max": 2, "screenshot": False}})
+                                if r.status_code == 200:
+                                    js = _resp_json(r, {})
+                                    txt = (js.get("dom_text") or "") if isinstance(js, dict) else ""
+                                    if not txt:
+                                        # Fallback to media resolver (may return transcribed text)
+                                        r2 = await cli.post(base + "/media/resolve", json={"url": url})
+                                        if r2.status_code == 200:
+                                            j2 = _resp_json(r2, {})
+                                            txt = (j2.get("text") or j2.get("ocr") or "") if isinstance(j2, dict) else ""
+                                    return (txt or "").strip()
+                        except Exception:
+                            return ""
+                        return ""
+                    top = [it for it in items[:3] if isinstance(it, dict) and (it.get("link") or it.get("url"))]
+                    tasks = [_prefetch(it.get("link") or it.get("url")) for it in top]
+                    out = await _aio.gather(*tasks, return_exceptions=True)
+                    for idx, it in enumerate(top):
+                        try:
+                            txt = out[idx] if isinstance(out[idx], str) else ""
+                            if txt:
+                                # collapse whitespace, take a concise snippet
+                                snip = " ".join(txt.split())[:360]
+                                improved[(it.get("link") or it.get("url"))] = snip
+                        except Exception:
+                            continue
+            except Exception:
+                pass
             lines = []
             for it in items[:8]:
+                u = it.get('link') or it.get('url')
+                snip = improved.get(u) or it.get('snippet','')
                 lines.append(f"- {it.get('title','')}")
-                lines.append(it.get('snippet',''))
-                lines.append(it.get('link',''))
+                lines.append(snip)
+                lines.append(u)
             snippets = "\n".join([ln for ln in lines if ln is not None])
             messages = [
                 {"role": "system", "content": "Web search results follow. Use them only if relevant."},

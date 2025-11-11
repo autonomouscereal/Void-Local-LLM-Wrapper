@@ -298,6 +298,7 @@ services:
       - MCP_HTTP_BRIDGE_URL
       - N8N_WEBHOOK_URL=${N8N_WEBHOOK_URL:-}
       - ASSEMBLER_API_URL=http://127.0.0.1:9095
+      - DRT_API_URL=http://127.0.0.1:8086
       - ICW_API_URL=http://127.0.0.1:8085
       - TEACHER_API_URL=http://teacher:8097
       - POSTGRES_HOST=127.0.0.1
@@ -669,8 +670,12 @@ services:
       network: host
     container_name: deep_research_tool
     restart: unless-stopped
+    shm_size: "1gb"
     environment:
       - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-}
+      - DRT_RESPECT_ROBOTS=${DRT_RESPECT_ROBOTS:-true}
+      - DRT_ROBOTS_TTL_S=${DRT_ROBOTS_TTL_S:-900}
+      - DRT_RATE_MIN_GAP_MS=${DRT_RATE_MIN_GAP_MS:-200}
     expose:
       - "8086"
     ports:
