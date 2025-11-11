@@ -14,6 +14,13 @@ def ok_envelope(result, rid: str) -> JSONResponse:
 	return JSONResponse({"schema_version": 1, "request_id": rid, "ok": True, "result": result}, status_code=200)
 
 
+def err_envelope(code: str, message: str, rid: str, status: int = 422, details: dict | None = None) -> JSONResponse:
+	return JSONResponse(
+		{"schema_version": 1, "request_id": rid, "ok": False, "error": {"code": code, "message": message, "details": (details or {})}},
+		status_code=status,
+	)
+
+
 def _post_json(url: str, obj: dict) -> dict:
 	data = json.dumps(obj).encode("utf-8")
 	req = urllib.request.Request(url, data=data, headers={"content-type": "application/json"}, method="POST")
@@ -32,49 +39,60 @@ def _read_text(path: str) -> str:
 		return f.read()
 
 
-def _patch_inplace_prompt_graph(prompt_graph: dict, args: dict) -> None:
-	if not isinstance(prompt_graph, dict):
-		return
-	for _, node in prompt_graph.items():
+def _nodes_by_type(g: dict, *class_types: str) -> list[str]:
+	want = set(class_types or ())
+	out: list[str] = []
+	for nid, node in g.items():
 		if not isinstance(node, dict):
 			continue
-		inputs = node.get("inputs")
-		ctype = (node.get("class_type") or "").lower()
-		if not isinstance(inputs, dict):
-			continue
-		# text / negative
-		if "clip" in ctype or "text" in ctype:
-			txt = args.get("prompt")
-			neg = args.get("negative") if args.get("negative") is not None else args.get("negative_prompt")
-			if txt is not None:
-				if "text" in inputs and isinstance(inputs["text"], str):
-					inputs["text"] = txt
-				else:
-					for k in list(inputs.keys()):
-						if "text" in k and isinstance(inputs[k], str):
-							inputs[k] = txt
-							break
-			if neg is not None:
-				for k in ("negative", "neg", "text_g", "negative_text"):
-					if k in inputs and isinstance(inputs[k], str):
-						inputs[k] = neg
-						break
-		# sampler params (support sampler OR sampler_name)
-		for k in ("seed", "steps", "cfg", "sampler_name", "scheduler"):
-			if k in args and k in inputs and not isinstance(inputs[k], list):
-				inputs[k] = args[k]
-		# map args.sampler -> sampler_name if present
-		if "sampler" in args and "sampler_name" in inputs and not isinstance(inputs["sampler_name"], list):
-			inputs["sampler_name"] = args["sampler"]
-		# dimensions
-		if "width" in inputs and "height" in inputs:
-			if "width" in args:
-				inputs["width"] = args["width"]
-			if "height" in args:
-				inputs["height"] = args["height"]
-		# model (direct value)
-		if "model" in args and "model" in inputs and not isinstance(inputs["model"], list):
-			inputs["model"] = args["model"]
+		ctype = node.get("class_type")
+		if isinstance(ctype, str) and ctype in want and isinstance(node.get("inputs"), dict):
+			out.append(str(nid))
+	return out
+
+
+def _set_inputs(g: dict, nid: str, **kwargs) -> None:
+	inputs = g[str(nid)].setdefault("inputs", {})
+	for k, v in kwargs.items():
+		if v is not None:
+			inputs[k] = v
+
+
+def patch_workflow_in_place(g: dict, args: dict) -> None:
+	# 1) Prompt / Negative (support common CLIP encoders)
+	prompt = args.get("prompt")
+	negative = args.get("negative") if args.get("negative") is not None else args.get("negative_prompt")
+	clip_nodes = _nodes_by_type(g, "CLIPTextEncode", "CLIPTextEncodeSDXL", "CLIPTextEncodeAdvanced")
+	if clip_nodes:
+		if prompt is not None:
+			_set_inputs(g, clip_nodes[0], text=str(prompt))
+		if negative is not None and len(clip_nodes) > 1:
+			_set_inputs(g, clip_nodes[1], text=str(negative))
+	# 2) Sampler settings
+	sampler_name = args.get("sampler") or args.get("sampler_name")
+	ksamplers = _nodes_by_type(g, "KSampler", "KSamplerAdvanced")
+	for nid in ksamplers:
+		_set_inputs(
+			g, nid,
+			seed=args.get("seed"),
+			steps=args.get("steps"),
+			cfg=args.get("cfg"),
+			sampler_name=(str(sampler_name) if sampler_name is not None else None),
+			scheduler=args.get("scheduler"),
+		)
+	# 3) Latent size
+	latent_nodes = _nodes_by_type(g, "EmptyLatentImage")
+	if latent_nodes:
+		_set_inputs(
+			g, latent_nodes[0],
+			width=args.get("width"),
+			height=args.get("height"),
+		)
+	# 4) Model checkpoint
+	ckpt_nodes = _nodes_by_type(g, "CheckpointLoaderSimple", "CheckpointLoaderSimpleSDXL")
+	model = args.get("model") or args.get("ckpt_name")
+	if ckpt_nodes and model:
+		_set_inputs(g, ckpt_nodes[0], ckpt_name=str(model))
 
 
 def _build_view_url(base: str, filename: str, subfolder: str, ftype: str) -> str:
@@ -144,9 +162,13 @@ async def tool_run(req: Request):
 	wf_text = _read_text(wf_path)
 	prompt_graph = json.loads(wf_text)
 	if not isinstance(prompt_graph, dict):
-		raise ValueError("COMFY_WORKFLOW_PATH must be a valid ComfyUI prompt graph (dict)")
+		return err_envelope("invalid_workflow", "Workflow must be a dict of nodes (node_id -> {class_type, inputs,...})", rid="tool.run", status=422)
+	# Validate graph shape: every top-level value must be a node with class_type/inputs
+	bad = [nid for nid, n in prompt_graph.items() if not (isinstance(n, dict) and isinstance(n.get("inputs"), dict) and isinstance(n.get("class_type"), str))]
+	if bad:
+		return err_envelope("invalid_workflow", f"Workflow contains non-node entries or missing class_type: {bad[:3]}", rid="tool.run", status=422)
 
-	_patch_inplace_prompt_graph(prompt_graph, args)
+	patch_workflow_in_place(prompt_graph, args)
 
 	client_id = uuid.uuid4().hex
 	_append_jsonl(os.path.join(STATE_DIR_LOCAL, "tools.jsonl"), {"t": int(time.time()*1000), "event": "comfyui.submit", "base": COMFY_BASE, "workflow_path": wf_path})
