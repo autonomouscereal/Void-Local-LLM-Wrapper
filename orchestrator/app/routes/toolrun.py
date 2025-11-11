@@ -3,7 +3,8 @@ from __future__ import annotations
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 import os, json, uuid, time, asyncio, urllib.request, os.path
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, urlsplit, urlparse
+import base64 as _b64
 from app.main import execute_tool_call as _execute_tool_call
 
 
@@ -56,6 +57,90 @@ def _set_inputs(g: dict, nid: str, **kwargs) -> None:
 	for k, v in kwargs.items():
 		if v is not None:
 			inputs[k] = v
+
+
+def _ensure_api_prompt_graph(wf: dict) -> dict:
+    # Accept {"prompt": {...}} or direct mapping
+    if isinstance(wf, dict) and "prompt" in wf and isinstance(wf["prompt"], dict):
+        return wf["prompt"]
+    if isinstance(wf, dict) and "nodes" in wf:
+        raise ValueError("workflow_ui_format_not_supported")
+    if isinstance(wf, dict):
+        return wf
+    raise ValueError("workflow_shape_invalid")
+
+
+def _get_ref_node_id(ref) -> str | None:
+    # Comfy API references are typically ["12", 0]
+    if isinstance(ref, list) and len(ref) >= 1:
+        return str(ref[0])
+    return None
+
+
+def _first_node_id_by_class(graph: dict, class_name_prefix: str) -> str | None:
+    for nid, node in graph.items():
+        ct = (node.get("class_type") or "").strip() if isinstance(node, dict) else ""
+        if isinstance(ct, str) and ct.startswith(class_name_prefix):
+            return str(nid)
+    return None
+
+
+def _resolve_bindings(graph: dict) -> dict:
+    ks_id = (_first_node_id_by_class(graph, "KSampler")
+             or _first_node_id_by_class(graph, "KSamplerAdvanced"))
+    if not ks_id:
+        raise ValueError("missing_ksampler")
+    ks_in = graph[ks_id].get("inputs", {})
+    pos_id = _get_ref_node_id(ks_in.get("positive"))
+    neg_id = _get_ref_node_id(ks_in.get("negative"))
+    if not pos_id or not neg_id:
+        raise ValueError("ksampler_missing_positive_or_negative_refs")
+    latent_id = (_first_node_id_by_class(graph, "EmptyLatentImage")
+                 or _first_node_id_by_class(graph, "LatentImage"))
+    ckpt_id = (_first_node_id_by_class(graph, "CheckpointLoaderSimple")
+               or _first_node_id_by_class(graph, "CheckpointLoaderSimpleSDXL"))
+    return {"ks": ks_id, "pos": pos_id, "neg": neg_id, "latent": latent_id, "ckpt": ckpt_id}
+
+
+def _validate_api_graph(graph: dict) -> list[str]:
+    problems: list[str] = []
+    if not isinstance(graph, dict) or not graph:
+        problems.append("graph_not_mapping_or_empty")
+        return problems
+    for nid, node in graph.items():
+        if not isinstance(node, dict):
+            problems.append(f"node_{nid}_not_object")
+            continue
+        if "class_type" not in node:
+            problems.append(f"node_{nid}_missing_class_type")
+        if "inputs" not in node or not isinstance(node.get("inputs"), dict):
+            problems.append(f"node_{nid}_missing_inputs")
+    return problems
+
+
+def _apply_overrides(graph: dict, bind: dict, args: dict) -> None:
+    # Positive / Negative
+    if bind.get("pos") and ("prompt" in args):
+        graph[bind["pos"]]["inputs"]["text"] = str(args.get("prompt") or "")
+    if bind.get("neg") and (("negative" in args) or ("negative_prompt" in args)):
+        graph[bind["neg"]]["inputs"]["text"] = str(args.get("negative") or args.get("negative_prompt") or "")
+    # Sampler
+    if bind.get("ks"):
+        ks_in = graph[bind["ks"]]["inputs"]
+        if "seed" in args: ks_in["seed"] = int(args["seed"])
+        if "steps" in args: ks_in["steps"] = int(args["steps"])
+        if "cfg" in args: ks_in["cfg"] = float(args["cfg"])
+        if "sampler" in args: ks_in["sampler_name"] = str(args["sampler"]).strip()
+        if "sampler_name" in args: ks_in["sampler_name"] = str(args["sampler_name"]).strip()
+        if "scheduler" in args: ks_in["scheduler"] = str(args["scheduler"]).strip()
+    # Latent size
+    if bind.get("latent"):
+        li = graph[bind["latent"]]["inputs"]
+        if "width" in args: li["width"] = int(args["width"])
+        if "height" in args: li["height"] = int(args["height"])
+    # Model checkpoint
+    if bind.get("ckpt") and ("model" in args) and args.get("model"):
+        graph[bind["ckpt"]]["inputs"]["ckpt_name"] = str(args["model"]).strip()
 
 
 def patch_workflow_in_place(g: dict, args: dict) -> None:
@@ -160,15 +245,23 @@ async def tool_run(req: Request):
 			status_code=422
 		)
 	wf_text = _read_text(wf_path)
-	prompt_graph = json.loads(wf_text)
-	if not isinstance(prompt_graph, dict):
-		return err_envelope("invalid_workflow", "Workflow must be a dict of nodes (node_id -> {class_type, inputs,...})", rid="tool.run", status=422)
-	# Validate graph shape: every top-level value must be a node with class_type/inputs
-	bad = [nid for nid, n in prompt_graph.items() if not (isinstance(n, dict) and isinstance(n.get("inputs"), dict) and isinstance(n.get("class_type"), str))]
-	if bad:
-		return err_envelope("invalid_workflow", f"Workflow contains non-node entries or missing class_type: {bad[:3]}", rid="tool.run", status=422)
-
-	patch_workflow_in_place(prompt_graph, args)
+	wf_obj = json.loads(wf_text)
+	# Normalize to API prompt graph and validate before binding/overrides
+	try:
+		prompt_graph = _ensure_api_prompt_graph(wf_obj)
+	except ValueError as ve:
+		return err_envelope("workflow_invalid", str(ve), rid="tool.run", status=422)
+	problems = _validate_api_graph(prompt_graph)
+	if problems:
+		avail = [{"id": str(nid), "class": (node.get("class_type") if isinstance(node, dict) else None)} for nid, node in prompt_graph.items() if isinstance(node, dict)]
+		return err_envelope("workflow_invalid", ";".join(problems[:4]), rid="tool.run", status=422, details={"available": avail})
+	# Resolve actual nodes and apply overrides only to those
+	try:
+		bind = _resolve_bindings(prompt_graph)
+	except ValueError as ve:
+		avail = [{"id": str(nid), "class": (node.get("class_type") if isinstance(node, dict) else None)} for nid, node in prompt_graph.items() if isinstance(node, dict)]
+		return err_envelope("workflow_binding_missing", str(ve), rid="tool.run", status=422, details={"available": avail})
+	_apply_overrides(prompt_graph, bind, args)
 
 	client_id = uuid.uuid4().hex
 	_append_jsonl(os.path.join(STATE_DIR_LOCAL, "tools.jsonl"), {"t": int(time.time()*1000), "event": "comfyui.submit", "base": COMFY_BASE, "workflow_path": wf_path})
