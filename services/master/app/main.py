@@ -43,7 +43,7 @@ async def master(body: dict):
             y, sr = sf.read(io.BytesIO(data), always_2d=False)
         elif wav_url:
             import requests
-            y, sr = sf.read(io.BytesIO(requests.get(wav_url, timeout=30).content), always_2d=False)
+            y, sr = sf.read(io.BytesIO(requests.get(wav_url).content), always_2d=False)
         else:
             return JSONResponse(status_code=400, content={"error": "missing wav_url or wav_bytes"})
         if y.ndim > 1:

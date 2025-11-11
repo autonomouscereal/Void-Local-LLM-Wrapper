@@ -311,10 +311,11 @@ async def tool_run(req: Request):
 	log.info("[comfy] prompt_id=%s client_id=%s", prompt_id, client_id)
 
 	images = []
-	deadline = time.time() + float(args.get("timeout_sec") or os.getenv("COMFY_TIMEOUT_SEC") or 120)
 	_first_hist = True
-	while time.time() < deadline:
-		await asyncio.sleep(0.25)
+	_poll_delay = 0.25
+	_POLL_MAX = 2.0
+	while True:
+		await asyncio.sleep(_poll_delay)
 		log.info("[comfy] polling /history/%s", prompt_id)
 		hist = _get_json(f"{COMFY_BASE.rstrip('/')}/history/{prompt_id}")
 		if _first_hist:
@@ -323,8 +324,29 @@ async def tool_run(req: Request):
 		if not isinstance(hist, dict):
 			continue
 		entry = hist.get(prompt_id) or {}
+		# Detect terminal error/success states when available
+		try:
+			status_obj = entry.get("status") or {}
+			state = str(status_obj.get("status") or "").lower()
+			if state in ("error", "failed", "canceled", "cancelled"):
+				return err_envelope("comfy_error", "workflow reported error state", rid="tool.run", status=422, details={"prompt_id": prompt_id, "status": status_obj})
+		except Exception:
+			pass
 		outs = entry.get("outputs") or {}
 		if not outs:
+			# progressive backoff to avoid busy spin
+			try:
+				_poll_delay = _POLL_MAX if _poll_delay >= _POLL_MAX else min(_POLL_MAX, _poll_delay * 2.0)
+			except Exception:
+				_poll_delay = _POLL_MAX
+			# If history reports a completed/executed state but no outputs, fail deterministically
+			try:
+				status_obj = entry.get("status") or {}
+				state = str(status_obj.get("status") or "").lower()
+				if state in ("completed", "success", "executed"):
+					return err_envelope("no_outputs", "workflow completed without outputs", rid="tool.run", status=422, details={"prompt_id": prompt_id, "status": status_obj})
+			except Exception:
+				pass
 			continue
 		for _, out in outs.items():
 			for im in (out.get("images") or []):
@@ -341,14 +363,7 @@ async def tool_run(req: Request):
 		if images:
 			break
 
-	# If no outputs, fail deterministically
-	if not images:
-		log.info("[comfy] images=0 (timeout)")
-		return JSONResponse(
-			{"schema_version": 1, "request_id": "tool.run", "ok": False,
-			 "error": {"code": "tool_failed", "message": "no outputs after bounded polling", "details": {"prompt_id": prompt_id}}},
-			status_code=422
-		)
+	# Should not reach here without images due to terminal checks above
 
 	# Canonical ids/meta (include flattened lists)
 	image_files = []

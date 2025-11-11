@@ -94,7 +94,7 @@ OCR_URL = os.getenv("OCR_API_URL", "http://ocr:8070") + "/ocr"
 def _transcribe_with_whisper(wav_path: str) -> str:
     try:
         with open(wav_path, "rb") as f:
-            r = httpx.post(WHISPER_URL, files={"file": ("a.wav", f, "audio/wav")}, timeout=120)
+            r = httpx.post(WHISPER_URL, files={"file": ("a.wav", f, "audio/wav")})
         r.raise_for_status()
         return (r.json() or {}).get("text", "")
     except Exception:
@@ -103,7 +103,7 @@ def _transcribe_with_whisper(wav_path: str) -> str:
 async def _ocr_images(paths: list[str]) -> list[dict]:
     out = []
     try:
-        async with httpx.AsyncClient(timeout=60) as cli:
+        async with httpx.AsyncClient(timeout=None) as cli:
             for p in paths or []:
                 with open(p, "rb") as f:
                     r = await cli.post(OCR_URL, files={"file": ("f.png", f, "image/png")})
@@ -1076,12 +1076,12 @@ async def render_fetch(url: str, opts: Dict[str, Any] | None = None) -> Dict[str
                 except Exception:
                     pass
             page = await ctx.new_page()
-            resp = await page.goto(url, wait_until="domcontentloaded", timeout=total_timeout_ms)
+            resp = await page.goto(url, wait_until="domcontentloaded", timeout=0)
             try:
                 # Minimal consent auto-close (best-effort; non-fatal)
                 btn = await page.query_selector("button:has-text('Accept'), button:has-text('I agree')")
                 if btn:
-                    await btn.click(timeout=1000)
+                    await btn.click(timeout=0)
             except Exception:
                 pass
             if scroll_max > 0:
@@ -1093,7 +1093,7 @@ async def render_fetch(url: str, opts: Dict[str, Any] | None = None) -> Dict[str
                     except Exception:
                         break
             try:
-                await page.wait_for_load_state("networkidle", timeout=wait_networkidle_ms)
+                await page.wait_for_load_state("networkidle", timeout=0)
             except Exception:
                 pass
             html = await page.content()

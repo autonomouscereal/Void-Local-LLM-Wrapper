@@ -39,7 +39,7 @@ def _read_wav_payload(wav_url: str | None, wav_bytes_b64: str | None) -> tuple[n
         return y.astype(np.float32), int(sr)
     if wav_url:
         import requests
-        y, sr = sf.read(io.BytesIO(requests.get(wav_url, timeout=30).content), always_2d=False)
+        y, sr = sf.read(io.BytesIO(requests.get(wav_url).content), always_2d=False)
         if y.ndim > 1:
             y = y.mean(axis=1)
         return y.astype(np.float32), int(sr)

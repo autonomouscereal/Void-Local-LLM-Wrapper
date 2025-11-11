@@ -123,7 +123,7 @@ class SizeBeat:
     def stop(self) -> None:
         self._stop = True
         try:
-            self.t.join(timeout=2)
+            self.t.join()
         except Exception:
             pass
 

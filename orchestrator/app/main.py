@@ -546,7 +546,7 @@ ENABLE_DEBATE = True
 MAX_DEBATE_TURNS = 1
 AUTO_EXECUTE_TOOLS = True
 # Always allow tool execution
-ALLOW_TOOL_EXECUTION = True
+ALLOW_TOOL_EXECUTION = False
 TIMEOUTS_FORBIDDEN = True
 STREAM_CHUNK_SIZE_CHARS = int(os.getenv("STREAM_CHUNK_SIZE_CHARS", "0"))
 STREAM_CHUNK_INTERVAL_MS = int(os.getenv("STREAM_CHUNK_INTERVAL_MS", "50"))
@@ -1373,6 +1373,37 @@ def build_tools_section(tools: Optional[List[Dict[str, Any]]]) -> str:
         return ""
 
 
+def build_compact_tool_catalog() -> str:
+    try:
+        catalog = {
+            "tools": [
+                {"name": "image.dispatch", "required": ["prompt", "width", "height", "steps", "cfg"], "notes": "width/height divisible by 8"},
+                {"name": "image.qa", "required": ["url"]},
+                {"name": "image.edit", "required": ["url", "operation"]},
+                {"name": "video.dispatch", "required": ["prompt", "seconds", "fps", "width", "height"]},
+                {"name": "video.qa", "required": ["url"]},
+                {"name": "tts.speak", "required": ["text", "voice"]},
+                {"name": "tts.eval", "required": ["url"]},
+                {"name": "media.inspect", "required": ["url"]},
+                {"name": "drt.fetch", "required": ["url_or_query"]},
+                {"name": "drt.resolve_media", "required": ["url"]},
+            ],
+            "constraints": {
+                "routing": "All tools run via executor→orchestrator /tool.run (no fast paths).",
+                "args": "Planner must emit all required args; snap sizes to /8.",
+                "sequence_examples": [
+                    {"intent": "generate image", "steps": ["image.dispatch", "image.qa"]},
+                    {"intent": "generate video", "steps": ["video.dispatch", "video.qa"]},
+                    {"intent": "tts", "steps": ["tts.speak", "tts.eval"]},
+                    {"intent": "web research", "steps": ["drt.fetch", "(optional) drt.resolve_media", "media.inspect"]},
+                ],
+            },
+        }
+        return "Tool catalog (strict, data-only):\n" + json.dumps(catalog, indent=2)
+    except Exception:
+        return ""
+
+
 def get_builtin_tools_schema() -> List[Dict[str, Any]]:
     return [
         {
@@ -1816,7 +1847,15 @@ async def planner_produce_plan(messages: List[Dict[str, Any]], tools: Optional[L
     )
     all_tools = merge_tool_schemas(tools)
     tool_info = build_tools_section(all_tools)
-    plan_messages = messages + [{"role": "user", "content": guide + ("\n" + tool_info if tool_info else "")}]
+    tool_catalog = build_compact_tool_catalog()
+    # Log catalog hash for observability
+    try:
+        import hashlib as _hl
+        _cat_hash = _hl.sha256((tool_catalog or "").encode("utf-8")).hexdigest()[:16]
+        _log("planner.catalog", trace_id=None, hash=_cat_hash)
+    except Exception:
+        pass
+    plan_messages = messages + [{"role": "user", "content": guide + ("\n" + tool_info if tool_info else "") + ("\n" + tool_catalog if tool_catalog else "")}]
     payload = build_ollama_payload(plan_messages, planner_id, DEFAULT_NUM_CTX, temperature)
     result = await call_ollama(planner_base, payload)
     text = result.get("response", "").strip()
@@ -1826,31 +1865,7 @@ async def planner_produce_plan(messages: List[Dict[str, Any]], tools: Optional[L
     parsed = parser.parse(text, expected)
     plan = parsed.get("plan", "")
     tool_calls = parsed.get("tool_calls", []) or []
-    # If planner proposes nothing but user intent implies video/film, synthesize make_movie call
-    if not tool_calls:
-        # find latest user message
-        last_user = ""
-        for m in reversed(messages):
-            if (isinstance(m, dict) and m.get("role") == "user" and isinstance(m.get("content"), str) and m.get("content").strip()):
-                last_user = m.get("content").strip()
-                break
-        if _detect_video_intent(last_user):
-            prefs = _derive_movie_prefs_from_text(last_user)
-            # Prefer unified Film‑2 tool
-            tool_calls = [{"name": "film.run", "arguments": {"title": "Untitled", "duration_s": int(prefs.get("duration_seconds", 10)), "res": prefs.get("resolution", "1920x1080"), "refresh": int(prefs.get("fps", 24)), "base_fps": 30}}]
-    else:
-        # If planner proposed film_create for a film request (but not make_movie), upgrade to make_movie
-        last_user = ""
-        for m in reversed(messages):
-            if (isinstance(m, dict) and m.get("role") == "user" and isinstance(m.get("content"), str) and m.get("content").strip()):
-                last_user = m.get("content").strip()
-                break
-        if _detect_video_intent(last_user):
-            has_run = any((tc.get("name") == "film.run") for tc in tool_calls if isinstance(tc, dict))
-            if not has_run:
-                # Replace any legacy film_* tools with a single film.run
-                prefs = _derive_movie_prefs_from_text(last_user)
-                tool_calls = [{"name": "film.run", "arguments": {"title": "Untitled", "duration_s": int(prefs.get("duration_seconds", 10)), "res": prefs.get("resolution", "1920x1080"), "refresh": int(prefs.get("fps", 24)), "base_fps": 30}}]
+    # No heuristic synthesis or upgrades; planner decides tool_calls
     return plan, tool_calls
 
 
@@ -4335,8 +4350,8 @@ async def execute_tools(tool_calls: List[Dict[str, Any]]) -> List[Dict[str, Any]
             steps.append({"tool": str(name or ""), "args": args})
         rid = _uuid.uuid4().hex
         payload = {"schema_version": 1, "request_id": rid, "trace_id": rid, "steps": steps}
-        async with httpx.AsyncClient() as client:
-            r = await client.post(EXECUTOR_BASE_URL.rstrip("/") + "/execute", json=payload, timeout=120.0)
+        async with httpx.AsyncClient(timeout=None) as client:
+            r = await client.post(EXECUTOR_BASE_URL.rstrip("/") + "/execute", json=payload)
             env = _resp_json(r, {})
         results: List[Dict[str, Any]] = []
         if isinstance(env, dict) and env.get("ok") and isinstance(env.get("steps"), list):
@@ -4411,6 +4426,19 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     except Exception:
         pass
     _log("chat.start", trace_id=trace_id, mode=mode, stream=bool(body.get("stream")), cid=conv_cid)
+    # Helper: build absolute URLs for any same-origin artifact paths
+    def _abs_url(u: str) -> str:
+        try:
+            if isinstance(u, str) and u.startswith("/"):
+                base = (PUBLIC_BASE_URL or "").rstrip("/")
+                if not base:
+                    # request.base_url includes trailing slash
+                    base = (str(request.base_url) or "").rstrip("/")
+                if base:
+                    return base + u
+        except Exception:
+            return u
+        return u
     # Acquire per-trace lock and record start event
     _lock_token = None
     try:
@@ -4602,6 +4630,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                         _walk(res)
                 return list(dict.fromkeys(urls))
             urls = _asset_urls_from_tools(trs)
+            urls = [_abs_url(u) for u in (urls or [])]
             if urls:
                 omni_sections.append("### Assets\n" + "\n".join([f"- {u}" for u in urls]))
         omni_md = ("\n\n" + "\n\n".join(omni_sections)) if omni_sections else ""
@@ -4635,74 +4664,6 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             response = locals().get("response", {"id": "orc-1"})
             resp_id = (response.get("id") if isinstance(response, dict) else "orc-1") or "orc-1"
     # No early returns: continue to planner/tools; responses emitted only after work completes
-
-    # Optional self-ask-with-search augmentation
-    # Multi-engine metasearch augmentation (no external keys)
-    queries = await propose_search_queries(messages)
-    if queries:
-        # Fuse top query to keep budget small
-        q0 = queries[0]
-        fused = await execute_tool_call({"name": "metasearch.fuse", "arguments": {"q": q0, "k": 8}})
-        try:
-            items = (fused.get("result") or {}).get("results") or []
-        except Exception:
-            items = []
-        if items:
-            # Optional prefetch of top results via DRT to improve snippets
-            improved: Dict[str, str] = {}
-            try:
-                base = (DRT_API_URL or "").rstrip("/")
-                if base:
-                    import asyncio as _aio
-                    import httpx as _hx
-                    async def _prefetch(url: str) -> str:
-                        try:
-                            async with _hx.AsyncClient(timeout=6.0) as cli:
-                                # Prefer rendered fetch for HTML
-                                r = await cli.post(base + "/render/fetch", json={"url": url, "options": {"scroll_max": 2, "screenshot": False}})
-                                if r.status_code == 200:
-                                    js = _resp_json(r, {})
-                                    txt = (js.get("dom_text") or "") if isinstance(js, dict) else ""
-                                    if not txt:
-                                        # Fallback to media resolver (may return transcribed text)
-                                        r2 = await cli.post(base + "/media/resolve", json={"url": url})
-                                        if r2.status_code == 200:
-                                            j2 = _resp_json(r2, {})
-                                            txt = (j2.get("text") or j2.get("ocr") or "") if isinstance(j2, dict) else ""
-                                    return (txt or "").strip()
-                        except Exception:
-                            return ""
-                        return ""
-                    top = [it for it in items[:3] if isinstance(it, dict) and (it.get("link") or it.get("url"))]
-                    tasks = [_prefetch(it.get("link") or it.get("url")) for it in top]
-                    out = await _aio.gather(*tasks, return_exceptions=True)
-                    for idx, it in enumerate(top):
-                        try:
-                            txt = out[idx] if isinstance(out[idx], str) else ""
-                            if txt:
-                                # collapse whitespace, take a concise snippet
-                                snip = " ".join(txt.split())[:360]
-                                improved[(it.get("link") or it.get("url"))] = snip
-                        except Exception:
-                            continue
-            except Exception:
-                pass
-            lines = []
-            for it in items[:8]:
-                u = it.get('link') or it.get('url')
-                snip = improved.get(u) or it.get('snippet','')
-                lines.append(f"- {it.get('title','')}")
-                lines.append(snip)
-                lines.append(u)
-            snippets = "\n".join([ln for ln in lines if ln is not None])
-            messages = [
-                {"role": "system", "content": "Web search results follow. Use them only if relevant."},
-                {"role": "system", "content": snippets},
-            ] + messages
-            try:
-                _trace_append("rag", {"cid": conv_cid, "trace_id": trace_id, "query": q0, "results": items})
-            except Exception:
-                pass
 
     # 1) Planner proposes plan + tool calls
     _log("planner.call", trace_id=trace_id)
@@ -4747,41 +4708,14 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     except Exception:
         pass
     # Deterministic router: if intent is recognized, override planner with a direct tool call
-    try:
-        decision = route_for_request({"messages": normalized_msgs})
-    except Exception:
-        decision = None
-    if decision and getattr(decision, "kind", None) == "tool" and getattr(decision, "tool", None):
-        tool_calls = [{"name": decision.tool, "arguments": (decision.args or {})}]
-        try:
-            _trace_append("decision", {"cid": conv_cid, "trace_id": trace_id, "router": {"tool": decision.tool, "args": decision.args}})
-        except Exception:
-            pass
+    # No router overrides — the planner is solely responsible for tool choice
     # Execute planner/router tool calls immediately when present
     tool_results: List[Dict[str, Any]] = []
     if tool_calls:
         _log("tools.exec.start", trace_id=trace_id, count=len(tool_calls))
         tool_results = await execute_tools(tool_calls)
         _log("tools.exec.done", trace_id=trace_id, count=len(tool_results))
-    # Heuristic upgrade: complex image prompts → image.super_gen for higher fidelity multi-object scenes
-    try:
-        upgraded = []
-        for tc in tool_calls or []:
-            try:
-                nm = (tc.get("name") or "").strip()
-                args0 = tc.get("arguments") or {}
-                if nm == "image.gen" and isinstance(args0, dict):
-                    pr = str(args0.get("prompt") or "")
-                    # consider 3+ comma-separated or ' and ' segments as multi-entity
-                    parts = [p.strip() for p in pr.replace(" and ", ", ").split(",") if p.strip()]
-                    if len(parts) >= 3:
-                        tc = {"name": "image.super_gen", "arguments": {**args0}}
-                upgraded.append(tc)
-            except Exception:
-                upgraded.append(tc)
-        tool_calls = upgraded
-    except Exception:
-        pass
+    # No heuristic upgrades; planner decides exact tools
     # Surface attachments in tool arguments so downstream jobs can use user media
     if tool_calls and attachments:
         enriched: List[Dict[str, Any]] = []
@@ -4807,21 +4741,50 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             tc = {**tc, "arguments": args}
             enriched.append(tc)
         tool_calls = enriched
-    # tool_choice=required compatibility: force at least one tool_call if tools are provided
-    if (body.get("tool_choice") == "required") and (not tool_calls):
-        # Choose a sensible default tool with minimal required params
-        builtins = get_builtin_tools_schema()
-        chosen = None
-        fewest_required = 1e9
-        for t in builtins:
-            fn = (t.get("function") or {})
-            name = fn.get("name")
-            req = ((fn.get("parameters") or {}).get("required") or [])
-            if name and len(req) < fewest_required:
-                chosen = name
-                fewest_required = len(req)
-        if chosen:
-            tool_calls = [{"name": chosen, "arguments": {}}]
+    # Planner emission guarantees for image.dispatch (fill required args at planning stage)
+    if tool_calls:
+        ensured: List[Dict[str, Any]] = []
+        def _snap8(v: int) -> int:
+            try:
+                v = int(v)
+                return max(8, (v // 8) * 8)
+            except Exception:
+                return 1024
+        for tc in tool_calls:
+            try:
+                name = (tc.get("name") or "").strip()
+                args = dict(tc.get("arguments") or {})
+                if name == "image.dispatch":
+                    # Required fields from frozen defaults
+                    if not isinstance(args.get("prompt"), str) or not args.get("prompt"):
+                        args["prompt"] = last_user_text
+                    if "negative" not in args:
+                        args["negative"] = ""
+                    # Derive width/height, snapping to /8
+                    w = args.get("width"); h = args.get("height")
+                    size = args.get("size")
+                    if isinstance(size, str) and "x" in size:
+                        try:
+                            sw, sh = [int(p.strip()) for p in size.lower().split("x", 1)]
+                            w, h = sw, sh
+                        except Exception:
+                            pass
+                    if not isinstance(w, int):
+                        w = 1024
+                    if not isinstance(h, int):
+                        h = 1024
+                    args["width"] = _snap8(w)
+                    args["height"] = _snap8(h)
+                    # Steps/cfg defaults
+                    if not isinstance(args.get("steps"), int):
+                        args["steps"] = 32
+                    if not isinstance(args.get("cfg"), (int, float)):
+                        args["cfg"] = 5.5
+                ensured.append({"name": name, "arguments": args})
+            except Exception:
+                ensured.append(tc)
+        tool_calls = ensured
+    # No auto-insertion of tools; the planner must propose calls explicitly
 
     # If no tool_calls were proposed but tools are available, nudge Planner by ensuring tools context is always present
     # (No keyword heuristics; semantic mapping is handled by the Planner instructions above.)
@@ -4886,8 +4849,8 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                     args = {"_raw": args}
                 steps.append({"step_id": f"step-{idx+1}", "tool": n, "args": args})
             payload = {"schema_version": 1, "request_id": f"{trace_id}", "trace_id": f"{trace_id}", "steps": steps}
-            async with httpx.AsyncClient() as client:
-                r = await client.post(EXECUTOR_BASE_URL.rstrip("/") + "/execute", json=payload, timeout=120.0)
+            async with httpx.AsyncClient(timeout=None) as client:
+                r = await client.post(EXECUTOR_BASE_URL.rstrip("/") + "/execute", json=payload)
                 env = _resp_json(r, {})
             if isinstance(env, dict) and env.get("ok"):
                 produced = env.get("produced") or {}
@@ -4957,6 +4920,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                         continue
                 return list(dict.fromkeys(urls))
             asset_urls = _asset_urls_from_tools(tool_results)
+            asset_urls = [_abs_url(u) for u in (asset_urls or [])]
             if asset_urls:
                 final_text = "\n".join(["Assets:"] + [f"- {u}" for u in asset_urls])
                 usage = estimate_usage(messages, final_text)
@@ -5123,94 +5087,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     orig_qwen_text = qwen_text
     orig_gptoss_text = gptoss_text
 
-    # Safety correction: if executors refuse despite available tools, trigger semantic tool path
-    # Detect generic refusal; if tools can fulfill and no tools were executed yet, synthesize a best-match tool call
-    refusal_markers = ("can't", "cannot", "unable", "i can't", "i can't", "i cannot")
-    refused = any(tok in (qwen_text.lower() + "\n" + gptoss_text.lower()) for tok in refusal_markers)
-    if refused and not tool_results:
-        # Fast-path: if user text clearly asks for an image, force image.dispatch with minimal args
-        try:
-            from .router.predicates import looks_like_image as _looks_like_image  # lazy import
-            last_user = ""
-            for m in reversed(messages):
-                if m.role == "user" and isinstance(m.content, str) and m.content.strip():
-                    last_user = m.content.strip(); break
-            if last_user and _looks_like_image(last_user):
-                forced_calls = [{"name": "image.dispatch", "arguments": {"mode": "gen", "prompt": last_user, "size": "1024x1024"}}]
-                tr = await execute_tools(forced_calls)
-                tool_results = tr
-        except Exception:
-            pass
-        # Safe semantic forcing: only for tools we can call without hidden context (no film_id requirements)
-        # 1) Identify latest user text
-        last_user = ""
-        for m in reversed(messages):
-            if m.role == "user" and isinstance(m.content, str) and m.content.strip():
-                last_user = m.content.strip()
-                break
-        # 2) Merge tools and score semantic overlap
-        merged_tools = merge_tool_schemas(body.get("tools"))
-        allowed_tools: List[Tuple[str, Dict[str, Any]]] = []
-        for t in merged_tools:
-            fn = (t.get("function") or {})
-            name = fn.get("name") or t.get("name")
-            params = (fn.get("parameters") or {})
-            required = (params.get("required") or [])
-            # Skip tools that require film_id or other unavailable hard requirements
-            if any(req in ("film_id",) for req in required):
-                continue
-            if name:
-                allowed_tools.append((name, fn))
-        # 3) Pick best match
-        best_name = None
-        best_score = -1
-        ux_tokens = set([w for w in (last_user or "").lower().replace("\n", " ").split(" ") if w])
-        for name, fn in allowed_tools:
-            desc = (fn.get("description") or "").lower()
-            corpus_tokens = set([w for w in (name.replace("_"," ") + " " + desc).split(" ") if w])
-            score = len(ux_tokens & corpus_tokens)
-            if score > best_score:
-                best_name = name
-                best_score = score
-        MIN_SEMANTIC_SCORE = 3
-        forced_calls: List[Dict[str, Any]] = []
-        if best_name and best_score >= MIN_SEMANTIC_SCORE:
-            # 4) Build minimal arguments by tool
-            def _minimal_args(tool_name: str, text: str) -> Dict[str, Any]:
-                if tool_name == "make_movie":
-                    prefs = _derive_movie_prefs_from_text(text)
-                    return {**prefs, "synopsis": text}
-                if tool_name == "film_create":
-                    prefs = _derive_movie_prefs_from_text(text)
-                    return {"title": "Untitled", "synopsis": text, "metadata": prefs}
-                if tool_name == "rag_search":
-                    return {"query": text, "k": 8}
-                if tool_name == "tts_speak":
-                    return {"text": text}
-                if tool_name in ("image_generate", "video_generate", "controlnet"):
-                    return {"prompt": text}
-                return {}
-            forced_calls = [{"name": best_name, "arguments": _minimal_args(best_name, last_user)}]
-        # 5) Execute if any, then include results for synthesis context
-        if forced_calls:
-            try:
-                tool_results = await execute_tools(forced_calls)
-                evidence_blocks = [{"role": "system", "content": "Tool results:\n" + json.dumps(tool_results, indent=2)}]
-                exec_messages2 = evidence_blocks + messages
-                qwen_payload2 = build_ollama_payload(messages=exec_messages2, model=QWEN_MODEL_ID, num_ctx=DEFAULT_NUM_CTX, temperature=body.get("temperature") or DEFAULT_TEMPERATURE)
-                gptoss_payload2 = build_ollama_payload(messages=exec_messages2, model=GPTOSS_MODEL_ID, num_ctx=DEFAULT_NUM_CTX, temperature=body.get("temperature") or DEFAULT_TEMPERATURE)
-                qwen_res2 = await call_ollama(QWEN_BASE_URL, qwen_payload2)
-                gptoss_res2 = await call_ollama(GPTOSS_BASE_URL, gptoss_payload2)
-                # Do not discard the original answers; append improved content if any
-                new_q = qwen_res2.get("response", "")
-                new_g = gptoss_res2.get("response", "")
-                if isinstance(new_q, str) and new_q.strip():
-                    qwen_text = (orig_qwen_text or qwen_text or "") + ("\n\n" + new_q)
-                if isinstance(new_g, str) and new_g.strip():
-                    gptoss_text = (orig_gptoss_text or gptoss_text or "") + ("\n\n" + new_g)
-                exec_messages_current = exec_messages2
-            except Exception as ex:
-                tool_results = tool_results or [{"name": best_name or "unknown", "error": str(ex)}]
+    # No synthetic tool forcing; the planner alone selects tools
 
     # If response still looks like a refusal, synthesize a constructive message using tool_results
     final_refusal = any(tok in (qwen_text.lower() + "\n" + gptoss_text.lower()) for tok in refusal_markers)
@@ -5350,6 +5227,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         return list(dict.fromkeys(urls))
 
     asset_urls = _asset_urls_from_tools(tool_results)
+    asset_urls = [_abs_url(u) for u in (asset_urls or [])]
     # Fallback: if no URLs surfaced from tool results (e.g. async image jobs that finished out-of-band),
     # look up recent artifacts from multimodal memory for this conversation and attach their public URLs.
     if (not asset_urls) and conv_cid:

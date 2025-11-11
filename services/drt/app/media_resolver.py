@@ -52,7 +52,7 @@ def _yt_dlp_info(url: str) -> Dict[str, Any]:
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=0.5, max=8))
-def _http_get(url: str, max_bytes: int = 32 * 1024 * 1024, timeout: int = 30) -> bytes:
+def _http_get(url: str, max_bytes: int = 32 * 1024 * 1024, timeout: int | None = None) -> bytes:
     headers = {"User-Agent": DEFAULT_USER_AGENT}
     if HEADERS_JSON:
         try:

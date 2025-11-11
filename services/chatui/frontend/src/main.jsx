@@ -311,41 +311,6 @@ function App() {
 
   async function send() {
     if (!text.trim()) return
-    // Quick per-modality path for non-power users
-    if (makeMode !== 'auto') {
-      try {
-        if (makeMode === 'image') {
-          const resp = await callTool('image.dispatch', { mode: 'gen', prompt: text.trim(), size: '1024x1024' })
-          const cid = resp?.result?.meta?.cid
-          const id = resp?.result?.tool_calls?.[0]?.result_ref
-          const url = (cid && id) ? (ORCH_BASE + `/uploads/artifacts/image/${cid}/${id}`) : ''
-          setMsgs(prev => ([...prev, { id: nextLocalId(), role: 'assistant', content: { text: url || JSON.stringify(resp) } }]))
-          setText('')
-          return
-        }
-        if (makeMode === 'tts') {
-          const resp = await callTool('tts.speak', { text: text.trim() })
-          const cid = resp?.result?.meta?.cid
-          const id = resp?.result?.tool_calls?.[0]?.result_ref
-          const url = (cid && id) ? (ORCH_BASE + `/uploads/artifacts/audio/tts/${cid}/${id}`) : ''
-          setMsgs(prev => ([...prev, { id: nextLocalId(), role: 'assistant', content: { text: url || JSON.stringify(resp) } }]))
-          setText('')
-          return
-        }
-        if (makeMode === 'music') {
-          const resp = await callTool('music.compose', { prompt: text.trim(), length_s: 30 })
-          const cid = resp?.result?.meta?.cid
-          const id = resp?.result?.tool_calls?.[0]?.result_ref
-          const url = (cid && id) ? (ORCH_BASE + `/uploads/artifacts/music/${cid}/${id}`) : ''
-          setMsgs(prev => ([...prev, { id: nextLocalId(), role: 'assistant', content: { text: url || JSON.stringify(resp) } }]))
-          setText('')
-          return
-        }
-      } catch (e) {
-        setMsgs(prev => ([...prev, { id: nextLocalId(), role: 'assistant', content: { text: `Error: ${e?.message || e}` } }]))
-        return
-      }
-    }
     let conversationId = cid
     if (!conversationId) {
       conversationId = await newConversation()
@@ -361,97 +326,6 @@ function App() {
       const thinkingId = nextLocalId()
       setMsgs(prev => ([...prev, { id: thinkingId, role: 'assistant', content: { text: 'Thinking…' } }]))
       await runOrchestratorFlow(userText, thinkingId)
-      return
-      // Legacy path (kept as fallback): send chat message and await server push
-      const t0 = performance.now()
-      console.log('[ui] ws connect')
-      try { await fetch(`/api/conversations/${encodeURIComponent(conversationId)}/message`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ role: 'user', content: userText }) }) } catch {}
-      await wsSendWithRetry({ conversation_id: conversationId, content: userText }, async (ev) => {
-        const t1 = performance.now()
-        const raw = ev.data || ''
-        console.log('[ui] ws message', { bytes: raw.length, dt_ms: (t1 - t0).toFixed(1) })
-        let data
-        try { data = raw ? JSON.parse(raw) : {} } catch { data = { error: raw } }
-        if (data && data.stream === true) {
-          const d = (typeof data.delta === 'string') ? data.delta : ''
-          streamBufRef.current = (streamBufRef.current || '') + d
-          setMsgs(prev => (prev.map(m => m.id === thinkingId ? { ...m, content: { text: (streamBufRef.current || 'Thinking…') } } : m)))
-          return
-        }
-        if (data && data.done === true) {
-          const finalText = String(streamBufRef.current || '').trim()
-          setMsgs(prev => (prev.map(m => m.id === thinkingId ? { ...m, content: { text: finalText || '(no content)' } } : m)))
-          try { await fetch(`/api/conversations/${encodeURIComponent(conversationId)}/message`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ role: 'assistant', content: finalText }) }) } catch {}
-          streamBufRef.current = ''
-          setSending(false)
-          return
-        }
-        if (data && data.error) {
-          // Replace thinking bubble with error
-          setMsgs(prev => (prev.map(m => m.id === thinkingId ? { ...m, content: { text: `Error: ${data.error}` } } : m)))
-          setSending(false)
-          return
-        }
-        // Prefer normalized message payload if provided; fallback to OpenAI-style choices
-        let finalContent = ''
-        if (data && data.message && data.message.role === 'assistant') {
-          const mc = data.message.content
-          if (typeof mc === 'string') finalContent = mc
-          else if (mc && typeof mc.text === 'string') finalContent = mc.text
-        }
-        if (!finalContent) {
-          const msgObj = (data && data.data && data.data.choices && data.data.choices[0] && data.data.choices[0].message) || {}
-          finalContent = msgObj.content || data.text || data.error || raw
-        }
-        // Replace thinking bubble with final assistant content (never leave it empty)
-        const finalText = String(finalContent || streamBufRef.current || '').trim()
-        setMsgs(prev => (prev.map(m => m.id === thinkingId ? { ...m, content: { text: finalText } } : m)))
-        try { await fetch(`/api/conversations/${encodeURIComponent(conversationId)}/message`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ role: 'assistant', content: finalText }) }) } catch {}
-        streamBufRef.current = ''
-        // If voice mode is on, speak the assistant reply via Web Speech
-        if (voiceOn && finalText) {
-          try {
-            const u = new SpeechSynthesisUtterance(finalText)
-            u.rate = 1.0; u.pitch = 1.0
-            window.speechSynthesis.cancel()
-            window.speechSynthesis.speak(u)
-          } catch {}
-        }
-        // Scan for job IDs and start live progress streams
-        const jobIds = parseJobIdsFromText(finalText)
-        jobIds.forEach(startJobStream)
-        setSending(false)
-      }, {
-        maxAttempts: 5,
-        onExhausted: async () => {
-          // POST fallback to ensure we always complete a request
-          try {
-            const rr = await fetch(ORCH_BASE + '/v1/chat/completions', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ messages: [{ role: 'user', content: userText }], stream: false })
-            })
-            const ct = rr.headers.get('content-type') || 'application/json'
-            if (ct.startsWith('application/json')) {
-              const obj = await rr.json()
-              const msgObj = (obj && obj.choices && obj.choices[0] && obj.choices[0].message) || {}
-              const finalText = String(msgObj.content || obj.text || '').trim()
-              setMsgs(prev => (prev.map(m => m.id === thinkingId ? { ...m, content: { text: finalText || '(no content)' } } : m)))
-              try { await fetch(`/api/conversations/${encodeURIComponent(conversationId)}/message`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ role: 'assistant', content: finalText }) }) } catch {}
-            } else {
-              const textBody = await rr.text()
-              const finalText = String(textBody || '').trim()
-              setMsgs(prev => (prev.map(m => m.id === thinkingId ? { ...m, content: { text: finalText || '(no content)' } } : m)))
-              try { await fetch(`/api/conversations/${encodeURIComponent(conversationId)}/message`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ role: 'assistant', content: finalText }) }) } catch {}
-            }
-          } catch (e) {
-            const emsg = e?.message || 'Network error'
-            setMsgs(prev => (prev.map(m => m.id === thinkingId ? { ...m, content: { text: `Error: ${emsg}` } } : m)))
-          } finally {
-            setSending(false)
-          }
-        }
-      })
       return
     } catch (err) {
       // Catch network-level errors so they don’t manifest as unhandled promise rejections.

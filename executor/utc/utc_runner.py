@@ -101,20 +101,23 @@ async def utc_run_tool(trace_id: Optional[str], step_id: Optional[str], name: st
 
     # WS narration start
     await _emit_review_event("review.start", trace_id, step_id, notes={"tool": name})
-    # Preflight validate to surface args issues early (no retries/timeouts here)
-    base = os.getenv("ORCHESTRATOR_BASE_URL", "http://127.0.0.1:8000")
-    venv = _post(base.rstrip("/") + "/tool.validate", {"name": name, "args": attempt_args})
-    if isinstance(venv, dict) and venv.get("ok") is False:
-        # Pass through orchestrator envelope unchanged
-        return venv
 
-    # Single global fixer pass (schema-driven), then one tool.run
+    # Single global fixer pass (schema-driven), then validate and run
     v = validate_args(name, attempt_args, schema)
     # Use the universal adapter once to normalize based on schema/errors
     decision = repair_args(attempt_args, v.get("errors") or [], schema)
     attempt_args = decision.get("fixed_args") or attempt_args
     last_ops = decision.get("ops") or []
     await _emit_review_event("edit.plan", trace_id, step_id, notes=last_ops)
+    await _emit_review_event("fixer.summary", trace_id, step_id, notes={"fixer_applied": bool(last_ops), "ops_count": len(last_ops)})
+
+    # Validate once after fixer so required args are present
+    base = os.getenv("ORCHESTRATOR_BASE_URL", "http://127.0.0.1:8000")
+    venv = _post(base.rstrip("/") + "/tool.validate", {"name": name, "args": attempt_args})
+    if isinstance(venv, dict) and venv.get("ok") is False:
+        # Pass through orchestrator envelope unchanged
+        return venv
+
     attempt_args.setdefault("autofix_422", True)
     res = _post(base.rstrip("/") + "/tool.run", {"name": name, "args": attempt_args, "stream": False})
     if res.get("ok"):
