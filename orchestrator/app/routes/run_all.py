@@ -163,17 +163,9 @@ def _canonicalize_produced(produced_map: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-@router.post("/v1/run")
-async def run_all(req: Request):
-    # Deprecated: steer clients to OpenAI-compatible endpoint
-    return JSONResponse(status_code=410, content={"schema_version": 1, "ok": False, "error": {"code": "gone", "message": "Deprecated. Use /v1/chat/completions"}})
 
 
-@router.websocket("/ws.run")
-async def ws_run(websocket: WebSocket):
-    # Deprecated: close with 1000 and advise client
-    await websocket.accept(subprotocol=websocket.headers.get("sec-websocket-protocol"))
-    await websocket.send_json({"type": "error", "error": {"code": "gone", "message": "Deprecated. Use /v1/chat/completions"}})
-    await websocket.close(code=1000)
+
+
 
 

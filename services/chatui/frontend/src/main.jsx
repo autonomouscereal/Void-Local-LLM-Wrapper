@@ -128,64 +128,27 @@ function App() {
     return { images, videos, audios }
   }
 
-  // Orchestrator E2E run (no proxy): POST /v1/run then WS /ws.run?rid=...
+  // Orchestrator E2E (OpenAI-compatible): POST /v1/chat/completions (no WS required)
   const runOrchestratorFlow = async (userText, thinkingId) => {
     try {
-      const r = await fetch(`${ORCH_BASE}/v1/run`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text: userText }) })
-      const js = await r.json()
-      const rid = (js && (js.data && js.data.request_id)) || js.request_id || js.rid
-      if (!rid) throw new Error('missing request_id')
-      const wsUrl = (ORCH_BASE.startsWith('https:') ? ORCH_BASE.replace(/^https:/, 'wss:') : ORCH_BASE.replace(/^http:/, 'ws:')) + `/ws.run?rid=${encodeURIComponent(rid)}`
-      const ws = new WebSocket(wsUrl)
+      const r = await fetch(`${ORCH_BASE}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: userText }], stream: false })
+      })
+      const ct = r.headers.get('content-type') || 'application/json'
       const updateThinking = (text) => setMsgs(prev => (prev.map(m => m.id === thinkingId ? { ...m, content: { text } } : m)))
-      ws.onmessage = (ev) => {
-        let obj = null
-        try { obj = ev?.data ? JSON.parse(ev.data) : null } catch { obj = null }
-        if (!obj) return
-        if (obj.type === 'status' && obj.status === 'running') {
-          updateThinking('Running…')
-          return
-        }
-        if (obj.type === 'progress') {
-          // optional: show step progress
-          return
-        }
-        if (obj.type === 'done') {
-          const produced = obj.result || {}
-          const urls = []
-          const collect = (v) => {
-            if (!v) return
-            if (typeof v === 'string') { if (/\/view\?filename=/.test(v)) urls.push(v); return }
-            if (Array.isArray(v)) { v.forEach(collect); return }
-            if (typeof v === 'object') {
-              if (v.view_url) urls.push(v.view_url)
-              Object.values(v).forEach(collect)
-            }
-          }
-          try { Object.values(produced).forEach(collect) } catch {}
-          let md = 'Done.'
-          if (urls.length) {
-            const unique = Array.from(new Set(urls))
-            md += '\n\n' + unique.map(u => `![image](${u})`).join('\n')
-          }
-          updateThinking(md)
-          setSending(false)
-          try { ws.close() } catch {}
-          return
-        }
-        if (obj.type === 'error') {
-          const tb = (obj && typeof obj.traceback === 'string') ? (`\n\n\`\`\`\n${obj.traceback}\n\`\`\``) : ''
-          updateThinking(`Error: ${String(obj.message || 'unknown')}${tb}`)
-          setSending(false)
-          try { ws.close() } catch {}
-          return
-        }
+      if (ct.startsWith('application/json')) {
+        const obj = await r.json()
+        const msgObj = (obj && obj.choices && obj.choices[0] && obj.choices[0].message) || {}
+        const finalText = String(msgObj.content || obj.text || '').trim()
+        updateThinking(finalText || '(no content)')
+      } else {
+        const textBody = await r.text()
+        const finalText = String(textBody || '').trim()
+        updateThinking(finalText || '(no content)')
       }
-      ws.onerror = () => {
-        updateThinking('Error: websocket')
-        setSending(false)
-        try { ws.close() } catch {}
-      }
+      setSending(false)
     } catch (e) {
       setMsgs(prev => (prev.map(m => m.id === thinkingId ? { ...m, content: { text: `Error: ${String(e && e.message || e)}` } } : m)))
       setSending(false)
@@ -394,7 +357,7 @@ function App() {
     setText('')
     setSending(true)
     try {
-      // Orchestrator-first path: POST /v1/run then WS /ws.run?rid=...
+      // Orchestrator-first path: POST /v1/chat/completions (OpenAI-compatible)
       const thinkingId = nextLocalId()
       setMsgs(prev => ([...prev, { id: thinkingId, role: 'assistant', content: { text: 'Thinking…' } }]))
       await runOrchestratorFlow(userText, thinkingId)
