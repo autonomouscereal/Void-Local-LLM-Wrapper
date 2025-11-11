@@ -18,8 +18,15 @@ app.add_middleware(
     CORSMiddleware,
     allow_origin_regex=".*",  # reflect caller Origin (works with credentials)
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "OPTIONS", "PUT", "PATCH", "DELETE"],
+    allow_headers=[
+        "content-type",
+        "authorization",
+        "accept",
+        "x-requested-with",
+        "origin",
+    ],
+    max_age=86400,
 )
 
 # WebSocket middleware to strip Origin header
