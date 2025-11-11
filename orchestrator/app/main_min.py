@@ -13,6 +13,7 @@ from app.routes import tools as tools_routes
 from app.routes import toolrun as toolrun_routes
 from app.middleware.ws_permissive import PermissiveWebSocketMiddleware
 from app.middleware.pna import AllowPrivateNetworkMiddleware
+from app.middleware.cors_extra import AppendCommonHeadersMiddleware
 
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s", stream=sys.stdout)
@@ -36,8 +37,10 @@ app.add_middleware(
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
     expose_headers=["*"],
-    max_age=86400,
 )
+
+# Append common headers on all responses (including static and non-API)
+app.add_middleware(AppendCommonHeadersMiddleware)
 
 # WebSocket middleware to strip Origin header
 app.add_middleware(PermissiveWebSocketMiddleware)

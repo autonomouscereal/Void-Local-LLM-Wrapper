@@ -323,7 +323,6 @@ async def chat_preflight(cid: int):
         "Access-Control-Allow-Methods": "POST, OPTIONS",
         "Access-Control-Allow-Headers": "*",
         "Access-Control-Allow-Private-Network": "true",
-        "Access-Control-Max-Age": "86400",
     })
 
 
@@ -334,7 +333,6 @@ async def any_preflight(path: str):
         "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
         "Access-Control-Allow-Headers": "*",
         "Access-Control-Allow-Private-Network": "true",
-        "Access-Control-Max-Age": "86400",
     })
 
 
@@ -423,7 +421,6 @@ async def chat_alt_preflight():
         "Access-Control-Allow-Methods": "POST, OPTIONS",
         "Access-Control-Allow-Headers": "*",
         "Access-Control-Allow-Private-Network": "true",
-        "Access-Control-Max-Age": "86400",
     })
 
 
@@ -435,6 +432,25 @@ async def orch_diag():
 @app.get("/favicon.ico")
 async def favicon():
     return Response(status_code=204)
+
+
+@app.get("/config.js")
+async def config_js(request: Request):
+    # Prefer explicit public base if provided; otherwise derive from request host with port 8000
+    base = os.getenv("PUBLIC_ORCH_BASE", "").strip()
+    if not base:
+        host = (request.headers.get("host") or "").split(":")[0]
+        scheme = "https" if str(request.url.scheme).lower() == "https" else "http"
+        base = f"{scheme}://{host}:8000"
+    base = base.rstrip("/")
+    body = f"window.__ORCH_BASE__ = {json.dumps(base)};\n"
+    headers = {
+        "Cache-Control": "no-store",
+        "Content-Type": "application/javascript; charset=utf-8",
+        "Content-Length": str(len(body.encode("utf-8"))),
+        "Connection": "close",
+    }
+    return Response(content=body, media_type="application/javascript", headers=headers)
 
 
 @app.get("/api/conversations/{cid}/chat")

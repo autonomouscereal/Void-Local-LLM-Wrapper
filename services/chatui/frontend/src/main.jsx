@@ -430,7 +430,7 @@ function App() {
       // Map to path if needed
       args.image_ref = url
     }
-    const toolName = (mode === 'gen') ? 'image.gen' : 'image.dispatch'
+    const toolName = 'image.dispatch'
     const resp = await callTool(toolName, args)
     if (resp && resp.result) {
       const meta = resp.result.meta || {}

@@ -92,7 +92,7 @@ from .admin.prompts import _id_of as _prompt_id_of, save_prompt as _save_prompt,
 from .state.checkpoints import append_ndjson as _append_jsonl, read_tail as _read_tail
 from .film2.snapshots import save_shot_snapshot as _film_save_snap, load_shot_snapshot as _film_load_snap
 from .film2.qa_embed import face_similarity as _qa_face, voice_similarity as _qa_voice, music_similarity as _qa_music
-from .tools_image.gen import run_image_gen
+# run_image_gen removed with legacy image.gen; planner must use image.dispatch
 from .tools_image.edit import run_image_edit
 from .tools_image.upscale import run_image_upscale
 from .tools_tts.speak import run_tts_speak
@@ -700,7 +700,7 @@ except Exception:
 async def _perm_headers(request: Request, call_next):
     resp = await call_next(request)
     resp.headers.setdefault("Access-Control-Allow-Origin", "*")
-    resp.headers.setdefault("Access-Control-Allow-Methods", "*")
+    resp.headers.setdefault("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
     resp.headers.setdefault("Access-Control-Allow-Headers", "*")
     resp.headers.setdefault("Access-Control-Expose-Headers", "*")
     resp.headers.setdefault("Access-Control-Allow-Credentials", "false")
@@ -1375,27 +1375,61 @@ def build_tools_section(tools: Optional[List[Dict[str, Any]]]) -> str:
 
 def build_compact_tool_catalog() -> str:
     try:
+        # Build the catalog directly from the registered tool schemas so names are guaranteed valid
+        try:
+            from .routes.tools import _REGISTRY as _TOOL_REG  # type: ignore
+        except Exception:
+            _TOOL_REG = {}
+        try:
+            builtins = get_builtin_tools_schema()
+        except Exception:
+            builtins = []
+        # Merge tool names + required args from both registries
+        merged: dict[str, dict] = {}
+        # From route registry
+        if isinstance(_TOOL_REG, dict):
+            for nm, spec in _TOOL_REG.items():
+                reqs: list[str] = []
+                try:
+                    for k, v in (spec.get("inputs") or {}).items():
+                        if isinstance(v, dict) and v.get("required") is True:
+                            reqs.append(k)
+                except Exception:
+                    pass
+                merged[nm] = {"name": nm, "required": reqs}
+        # From built-in OpenAI-style schema
+        for t in (builtins or []):
+            try:
+                fn = (t.get("function") or {})
+                nm = fn.get("name")
+                if not nm:
+                    continue
+                params = (fn.get("parameters") or {})
+                reqs = list((params.get("required") or []))
+                if nm in merged:
+                    prev = merged[nm].get("required") or []
+                    merged[nm]["required"] = sorted(list(dict.fromkeys(list(prev) + list(reqs))))
+                else:
+                    merged[nm] = {"name": nm, "required": reqs}
+            except Exception:
+                continue
+        tools_list: list[dict] = list(merged.values())
+        tools_list.sort(key=lambda d: d.get("name", ""))
         catalog = {
-            "tools": [
-                {"name": "image.dispatch", "required": ["prompt", "width", "height", "steps", "cfg"], "notes": "width/height divisible by 8"},
-                {"name": "image.qa", "required": ["url"]},
-                {"name": "image.edit", "required": ["url", "operation"]},
-                {"name": "video.dispatch", "required": ["prompt", "seconds", "fps", "width", "height"]},
-                {"name": "video.qa", "required": ["url"]},
-                {"name": "tts.speak", "required": ["text", "voice"]},
-                {"name": "tts.eval", "required": ["url"]},
-                {"name": "media.inspect", "required": ["url"]},
-                {"name": "drt.fetch", "required": ["url_or_query"]},
-                {"name": "drt.resolve_media", "required": ["url"]},
-            ],
+            "tools": tools_list,
             "constraints": {
                 "routing": "All tools run via executor→orchestrator /tool.run (no fast paths).",
                 "args": "Planner must emit all required args; snap sizes to /8.",
                 "sequence_examples": [
                     {"intent": "generate image", "steps": ["image.dispatch", "image.qa"]},
-                    {"intent": "generate video", "steps": ["video.dispatch", "video.qa"]},
+                    {"intent": "generate video", "steps": ["film.run"]},
                     {"intent": "tts", "steps": ["tts.speak", "tts.eval"]},
-                    {"intent": "web research", "steps": ["drt.fetch", "(optional) drt.resolve_media", "media.inspect"]},
+                    {"intent": "music", "steps": ["music.compose"]},
+                    {"intent": "sfx", "steps": ["audio.sfx.compose"]},
+                    {"intent": "deep research", "steps": ["research.run"]}
+                ],
+                "rules": [
+                    "Use only tool names present in the catalog. If none apply, return steps: []."
                 ],
             },
         }
@@ -1566,13 +1600,6 @@ def get_builtin_tools_schema() -> List[Dict[str, Any]]:
             "function": {
                 "name": "image.dispatch",
                 "parameters": {"type": "object", "properties": {"mode": {"type": "string"}, "prompt": {"type": "string"}, "scale": {"type": "integer"}}, "required": []}
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "image.gen",
-                "parameters": {"type": "object", "properties": {"prompt": {"type": "string"}, "negative": {"type": "string"}, "size": {"type": "string"}, "seed": {"type": "integer"}, "refs": {"type": "object"}, "cid": {"type": "string"}}, "required": ["prompt"]}
             }
         },
         {
@@ -1842,6 +1869,7 @@ async def planner_produce_plan(messages: List[Dict[str, Any]], tools: Optional[L
         "If any tool can directly produce the user's requested artifact (e.g., video/film creation), prefer that tool (e.g., make_movie).\n"
         "Ask 1-3 clarifying questions ONLY if blocking details are missing (e.g., duration, style, language, target resolution).\n"
         "If not blocked, proceed and choose reasonable defaults: duration<=10s for short clips, 1920x1080, 24fps, language=en, neutral voice.\n"
+        "Use only tool names present in the catalog below. If none apply, return tool_calls: [].\n"
         "Return strict JSON with keys: plan (string), tool_calls (array of {name: string, arguments: object}).\n"
         "Absolute rules: Do NOT use try/except unless explicitly asked; let errors surface. Do NOT set client timeouts unless asked. Do NOT use Pydantic. Never propose or use SQLAlchemy; use asyncpg with pooled connections and raw SQL for PostgreSQL."
     )
@@ -2884,7 +2912,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 return {"name": name, "result": _resp_json(r, {})}
         except Exception as ex:
             return {"name": name, "error": str(ex)}
-    if name in ("image.gen", "image.edit", "image.upscale") and ALLOW_TOOL_EXECUTION:
+    if name in ("image.edit", "image.upscale") and ALLOW_TOOL_EXECUTION:
         return {"name": name, "error": "disabled: use image.dispatch with full graph (no fallbacks)"}
     if name == "image.super_gen" and ALLOW_TOOL_EXECUTION:
         # Multi-object iterative generation: base canvas + per-object refinement + global polish
@@ -2967,7 +2995,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 web_sources = []
         # 4) Base canvas
         base_args = {"prompt": base_style, "size": f"{w}x{h}", "seed": args.get("seed"), "refs": args.get("refs"), "cid": args.get("cid")}
-        base = await execute_tool_call({"name": "image.gen", "arguments": base_args})
+        base = await execute_tool_call({"name": "legacy.image.gen", "arguments": base_args})
         try:
             cid = ((base.get("result") or {}).get("meta") or {}).get("cid")
             rid = ((base.get("result") or {}).get("tool_calls") or [{}])[0].get("result_ref")
@@ -2986,7 +3014,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 sub_args = {"prompt": refined_prompt, "size": f"{box[2]-box[0]}x{box[3]-box[1]}", "seed": args.get("seed"), "refs": args.get("refs"), "cid": args.get("cid")}
                 best_tile = None
                 for attempt in range(0, 3):
-                    sub = await execute_tool_call({"name": "image.gen", "arguments": sub_args})
+                    sub = await execute_tool_call({"name": "legacy.image.gen", "arguments": sub_args})
                     scid = ((sub.get("result") or {}).get("meta") or {}).get("cid")
                     srid = ((sub.get("result") or {}).get("tool_calls") or [{}])[0].get("result_ref")
                     sub_path = _os.path.join(UPLOAD_DIR, "artifacts", "image", scid, srid) if (scid and srid) else None
@@ -4373,7 +4401,17 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     t0 = time.time()
     # Validate body
     if not isinstance(body, dict) or not isinstance(body.get("messages"), list):
-        return JSONResponse(status_code=400, content={"error": "bad_request", "detail": "messages must be a list"})
+        # Always return OpenAI-compatible JSON with a human-readable one-liner; never 4xx other than 422
+        msg = "Invalid request: 'messages' must be a list."
+        response = {
+            "id": "orc-1",
+            "object": "chat.completion",
+            "model": f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}",
+            "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": msg}}],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            "error": {"code": "bad_request", "message": "messages must be a list"},
+        }
+        return JSONResponse(status_code=422, content=response)
     # No caps — never enforce caps inline (no message count/size caps here)
     try:
         body["messages"] = nfc_msgs(body.get("messages") or [])
@@ -4829,6 +4867,53 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         except Exception:
             pass
         return JSONResponse(content=response)
+
+    # Pre-validate tool names against the registered catalog to avoid executor 404s
+    try:
+        from .routes.tools import _REGISTRY as _TOOL_REG  # type: ignore
+    except Exception:
+        _TOOL_REG = {}
+    # Include tools from built-in schema as well so planner can use all implemented tools
+    try:
+        builtins = get_builtin_tools_schema()
+    except Exception:
+        builtins = []
+    allowed_tools = set([str(k) for k in (_TOOL_REG or {}).keys()])
+    for t in (builtins or []):
+        try:
+            fn = (t.get("function") or {})
+            nm = fn.get("name")
+            if nm:
+                allowed_tools.add(str(nm))
+        except Exception:
+            continue
+    unknown: list[str] = []
+    for tc in (tool_calls or []):
+        try:
+            nm = str((tc or {}).get("name") or "")
+            if nm and (nm not in allowed_tools):
+                unknown.append(nm)
+        except Exception:
+            continue
+    if unknown:
+        allowed_sorted = sorted(list(allowed_tools))
+        msg = f"Couldn't run: unknown tool(s) {', '.join(unknown)}. Allowed: {', '.join(allowed_sorted)}."
+        usage = estimate_usage(messages, msg)
+        response = {
+            "id": "orc-1",
+            "object": "chat.completion",
+            "model": f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}",
+            "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": msg}}],
+            "usage": usage,
+            "seed": master_seed,
+            "error": {"code": "unknown_tool", "message": "unknown tool(s)", "detail": {"unknown": unknown, "allowed": allowed_sorted}},
+        }
+        try:
+            if _lock_token:
+                _release_lock(STATE_DIR, trace_id)
+        except Exception:
+            pass
+        return JSONResponse(status_code=422, content=response)
 
     # 2) Optionally execute tools
     tool_results: List[Dict[str, Any]] = []
@@ -6175,7 +6260,9 @@ async def comfy_view_proxy(filename: str, subfolder: str = "", type: str = "outp
             headers={
                 "Access-Control-Allow-Origin": "*",
                 "Access-Control-Allow-Headers": "*",
-                "Access-Control-Allow-Methods": "*",
+                "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+                "Cross-Origin-Resource-Policy": "cross-origin",
+                "Timing-Allow-Origin": "*",
                 "Cache-Control": "public, max-age=120",
             },
         )
