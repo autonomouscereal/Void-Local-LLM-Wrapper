@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # Absolute imports to avoid relative/cycle resolution issues under Uvicorn
 from app.routes import run_all as run_all_routes
 from app.middleware.ws_permissive import PermissiveWebSocketMiddleware
+from app.middleware.pna import AllowPrivateNetworkMiddleware
 
 
 app = FastAPI(title="Void Orchestrator")
@@ -19,18 +20,15 @@ app.add_middleware(
     allow_origin_regex=".*",  # reflect caller Origin (works with credentials)
     allow_credentials=True,
     allow_methods=["GET", "POST", "OPTIONS", "PUT", "PATCH", "DELETE"],
-    allow_headers=[
-        "content-type",
-        "authorization",
-        "accept",
-        "x-requested-with",
-        "origin",
-    ],
+    allow_headers=["*"],
     max_age=86400,
 )
 
 # WebSocket middleware to strip Origin header
 app.add_middleware(PermissiveWebSocketMiddleware)
+
+# Append Access-Control-Allow-Private-Network on preflight (Chromium PNA)
+app.add_middleware(AllowPrivateNetworkMiddleware)
 
 @app.get("/_alive")
 def _alive():
