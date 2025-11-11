@@ -271,6 +271,7 @@ services:
     restart: unless-stopped
     
     environment:
+      - PYTHONUNBUFFERED=1
       - FILM2_MODELS=/opt/models
       - FILM2_DATA=/srv/film2
       - QWEN_BASE_URL=http://ollama_qwen:11434
@@ -319,7 +320,7 @@ services:
       - UPLOAD_DIR=/workspace/uploads
       - VLM_API_URL=http://vlm:8050
       - OCR_API_URL=http://ocr:8070
-    command: ["/bin/bash","-lc","uvicorn app.main:app --host 0.0.0.0 --port 8000"]
+    command: ["uvicorn","app.main:app","--host","0.0.0.0","--port","8000","--log-level","info","--access-log","--use-colors"]
     ports:
       - "8000:8000"
     volumes:
