@@ -753,16 +753,16 @@ services:
       dockerfile: Dockerfile
     container_name: chatui
     restart: unless-stopped
+    network_mode: host
     environment:
-      - ORCHESTRATOR_URL=http://orchestrator:8000
+      - ORCHESTRATOR_URL=http://127.0.0.1:8000
+      - PUBLIC_ORCH_BASE=http://192.168.50.222:8000
       - POSTGRES_HOST=pgvector
       - POSTGRES_PORT=5432
       - POSTGRES_DB=ragdb
       - POSTGRES_USER=rag
       - POSTGRES_PASSWORD=ragpass
-    
-    ports:
-      - "3000:3000"
+    # host networking exposes 3000 directly; no ports mapping needed
 
 volumes:
   ollama_qwen_data: {}
