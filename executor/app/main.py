@@ -191,16 +191,17 @@ def _distill_summary(result_obj: Any) -> Dict[str, Any]:
     for key in ("files", "outputs"):
         val = result_obj.get(key)
         if isinstance(val, list):
-            try:
-                exts = [str(x).lower() for x in val]
-                vids = [x for x in exts if any(x.endswith(e) for e in (".mp4", ".mov", ".mkv", ".webm"))]
-                auds = [x for x in exts if any(x.endswith(e) for e in (".wav", ".mp3", ".flac", ".aac"))]
-                if vids:
-                    out["videos_count"] = max(int(out.get("videos_count") or 0), len(vids))
-                if auds:
-                    out["audio_files_count"] = max(int(out.get("audio_files_count") or 0), len(auds))
-            except Exception:
-                pass
+            safe_vals = [x for x in val if isinstance(x, (str, bytes, bytearray))]
+            exts = [
+                (x.decode("utf-8", "ignore") if isinstance(x, (bytes, bytearray)) else str(x)).lower()
+                for x in safe_vals
+            ]
+            vids = [x for x in exts if any(x.endswith(e) for e in (".mp4", ".mov", ".mkv", ".webm"))]
+            auds = [x for x in exts if any(x.endswith(e) for e in (".wav", ".mp3", ".flac", ".aac"))]
+            if vids:
+                out["videos_count"] = max(int(out.get("videos_count") or 0), len(vids))
+            if auds:
+                out["audio_files_count"] = max(int(out.get("audio_files_count") or 0), len(auds))
     return out
 
 
@@ -285,12 +286,6 @@ async def execute_plan(body: Dict[str, Any]):
     pending = set(norm_steps.keys())
     trace_id = plan_obj.get("request_id") if isinstance(plan_obj.get("request_id"), str) else None
     logging.info(f"[executor] plan_start trace_id={trace_id} steps={len(pending)}")
-    try:
-        _post_json(ORCHESTRATOR_BASE_URL.rstrip("/") + "/logs/tools.append", {
-            "t": int(time.time()*1000), "event": "exec_plan_start", "trace_id": trace_id, "steps": len(pending)
-        }, expected={})
-    except Exception:
-        logging.error(traceback.format_exc())
     while pending:
         satisfied = set(produced.keys())
         runnable = [sid for sid in pending if deps[sid].issubset(satisfied)]
@@ -298,12 +293,6 @@ async def execute_plan(body: Dict[str, Any]):
             return JSONResponse(status_code=422, content={"error": "deadlock_or_missing", "pending": sorted(list(pending))})
         batch_tools = [{"step_id": sid, "tool": norm_steps[sid].get("tool")} for sid in runnable]
         logging.info(f"[executor] batch_start trace_id={trace_id} runnable={batch_tools}")
-        try:
-            _post_json(ORCHESTRATOR_BASE_URL.rstrip("/") + "/logs/tools.append", {
-                "t": int(time.time()*1000), "event": "exec_batch_start", "trace_id": trace_id, "items": batch_tools
-            }, expected={})
-        except Exception:
-            logging.error(traceback.format_exc())
         for sid in runnable:
             step = norm_steps[sid]
             tool_name = (step.get("tool") or "").strip()
@@ -313,13 +302,6 @@ async def execute_plan(body: Dict[str, Any]):
             # UTC-enabled tool run (builder→validate→autofix→retarget)
             t0 = time.time()
             # Distilled executor step start
-            try:
-                _post_json(ORCHESTRATOR_BASE_URL.rstrip("/") + "/logs/tools.append", {
-                    "t": int(time.time()*1000), "event": "exec_step_start", "tool": tool_name,
-                    "trace_id": plan_obj.get("request_id"), "cid": plan_obj.get("request_id"), "step_id": sid
-                }, expected={})
-            except Exception:
-                logging.error(traceback.format_exc())
             ok = False
             err_detail = None
             err_tb = None
@@ -337,63 +319,27 @@ async def execute_plan(body: Dict[str, Any]):
                     produced[sid] = res.get("result")
                     ok = True
                 elif isinstance(res, dict) and bool(res.get("ok")) is False:
-                    try:
-                        err_obj = res.get("error") or {}
-                        code = (err_obj.get("code") or "tool_error")
-                        msg = (err_obj.get("message") or "")
-                        tb = (err_obj.get("traceback") or "")
-                        err_detail = f"{code}:{msg}"
-                        if tb:
-                            logging.error(str(tb))
-                    except Exception:
-                        err_detail = "tool_error"
+                    err_obj = res.get("error") if isinstance(res, dict) and isinstance(res.get("error"), dict) else {}
+                    code_val = err_obj.get("code") if isinstance(err_obj, dict) else None
+                    msg_val = err_obj.get("message") if isinstance(err_obj, dict) else None
+                    tb_val = err_obj.get("traceback") if isinstance(err_obj, dict) else None
+                    code = code_val if isinstance(code_val, str) and code_val else "tool_error"
+                    msg = msg_val if isinstance(msg_val, str) else ""
+                    tb = tb_val if isinstance(tb_val, (str, bytes)) else ""
+                    err_detail = f"{code}:{msg}"
+                    if tb:
+                        logging.error(tb if isinstance(tb, str) else str(tb))
                 else:
                     produced[sid] = (res or {})
                     ok = True
-            # Append end event to orchestrator tool logs for robust per-step trace
-            try:
-                _post_json(ORCHESTRATOR_BASE_URL.rstrip("/") + "/logs/tools.append", {
-                    "t": int(time.time()*1000),
-                    "event": "end",
-                    "tool": tool_name,
-                    "ok": bool(ok),
-                    "duration_ms": int((time.time() - t0) * 1000.0),
-                    "trace_id": plan_obj.get("request_id"),
-                    "cid": plan_obj.get("request_id"),
-                    "step_id": sid,
-                    "error": (None if ok else (err_detail or "tool_error")),
-                    "traceback": (None if ok else err_tb),
-                    "summary": (_distill_summary(produced.get(sid)) if ok else None),
-                }, expected={"ok": bool, "error": str})
-            except Exception:
-                logging.error(traceback.format_exc())
-            # Distilled executor step finish (separate event)
-            try:
-                _post_json(ORCHESTRATOR_BASE_URL.rstrip("/") + "/logs/tools.append", {
-                    "t": int(time.time()*1000), "event": "exec_step_finish", "tool": tool_name,
-                    "trace_id": plan_obj.get("request_id"), "cid": plan_obj.get("request_id"), "step_id": sid,
-                    "ok": bool(ok)
-                }, expected={})
-            except Exception:
-                logging.error(traceback.format_exc())
+            # Append end event to orchestrator tool logs is skipped to avoid network exceptions
+            # Distilled executor step finish skipped to avoid network exceptions
             if err_detail is not None and not ok:
                 return JSONResponse(status_code=422, content={"error": "tool_error", "step": sid, "detail": err_detail, "traceback": err_tb, "attempts": int(max(1, MAX_TOOL_ATTEMPTS))})
         for sid in runnable:
             pending.remove(sid)
         logging.info(f"[executor] batch_finish trace_id={trace_id} runnable={batch_tools}")
-        try:
-            _post_json(ORCHESTRATOR_BASE_URL.rstrip("/") + "/logs/tools.append", {
-                "t": int(time.time()*1000), "event": "exec_batch_finish", "trace_id": trace_id, "items": batch_tools
-            }, expected={})
-        except Exception:
-            logging.error(traceback.format_exc())
     logging.info(f"[executor] plan_finish trace_id={trace_id} produced_keys={sorted(list(produced.keys()))}")
-    try:
-        _post_json(ORCHESTRATOR_BASE_URL.rstrip("/") + "/logs/tools.append", {
-            "t": int(time.time()*1000), "event": "exec_plan_finish", "trace_id": trace_id, "produced_keys": sorted(list(produced.keys()))
-        }, expected={})
-    except Exception:
-        logging.error(traceback.format_exc())
     return {"produced": produced}
 
 
@@ -486,16 +432,16 @@ async def run_steps(trace_id: str, request_id: str, steps: list[dict]) -> Dict[s
                 produced[sid] = {"name": tool_name, "result": _canonical_tool_result(res)}
                 ok = True
             elif isinstance(res, dict) and bool(res.get("ok")) is False:
-                try:
-                    err_obj = res.get("error") or {}
-                    code = (err_obj.get("code") or "tool_error")
-                    msg = (err_obj.get("message") or "")
-                    tb = (err_obj.get("traceback") or "")
-                    err_detail = f"{code}:{msg}"
-                    if tb:
-                        logging.error(str(tb))
-                except Exception:
-                    err_detail = "tool_error"
+                err_obj = res.get("error") if isinstance(res, dict) and isinstance(res.get("error"), dict) else {}
+                code_val = err_obj.get("code") if isinstance(err_obj, dict) else None
+                msg_val = err_obj.get("message") if isinstance(err_obj, dict) else None
+                tb_val = err_obj.get("traceback") if isinstance(err_obj, dict) else None
+                code = code_val if isinstance(code_val, str) and code_val else "tool_error"
+                msg = msg_val if isinstance(msg_val, str) else ""
+                tb = tb_val if isinstance(tb_val, (str, bytes)) else ""
+                err_detail = f"{code}:{msg}"
+                if tb:
+                    logging.error(tb if isinstance(tb, str) else str(tb))
                 # Record structured failure and preserve full error envelope in produced result
                 try:
                     env_fields = {}

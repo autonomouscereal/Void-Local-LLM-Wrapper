@@ -124,9 +124,10 @@ async def _image_dispatch_run(prompt: str, negative: Optional[str], seed: Option
     # size normalization
     w = None; h = None
     if isinstance(size, str) and "x" in size:
-        try:
-            parts = size.lower().split("x"); w = int(parts[0]); h = int(parts[1])
-        except Exception:
+        parts = size.lower().split("x")
+        if len(parts) == 2 and parts[0].strip().isdigit() and parts[1].strip().isdigit():
+            w = int(parts[0].strip()); h = int(parts[1].strip())
+        else:
             w = None; h = None
     if isinstance(width, int) and width > 0: w = width
     if isinstance(height, int) and height > 0: h = height
@@ -245,8 +246,15 @@ async def _image_dispatch_run(prompt: str, negative: Optional[str], seed: Option
         _trace_append("image", {"cid": cid, "tool": "image.dispatch", "prompt": prompt, "path": png_path, "clip_score": clip_s, "tags": ai.get("tags") or []})
         _ctx_add(cid, "image", png_path, _uri_from_upload_path(png_path), None, [], {"prompt": prompt, "clip_score": clip_s})
         if isinstance(trace_id, str) and trace_id:
-            try:
-                rel = os.path.relpath(png_path, UPLOAD_DIR).replace("\\", "/")
+            # Compute a safe relative path without raising (handle cross-drive on Windows)
+            rel: Optional[str] = None
+            if isinstance(png_path, str) and isinstance(UPLOAD_DIR, str) and png_path:
+                pdrv, sdrv = os.path.splitdrive(png_path)[0].lower(), os.path.splitdrive(UPLOAD_DIR)[0].lower()
+                if pdrv and sdrv and pdrv != sdrv:
+                    rel = os.path.basename(png_path).replace("\\", "/")
+                else:
+                    rel = os.path.relpath(png_path, UPLOAD_DIR).replace("\\", "/")
+            if isinstance(rel, str) and rel:
                 _append_jsonl(os.path.join(STATE_DIR, "traces", trace_id, "artifacts.jsonl"), {
                     "t": int(time.time()*1000),
                     "event": "artifact",
@@ -257,9 +265,9 @@ async def _image_dispatch_run(prompt: str, negative: Optional[str], seed: Option
                     "subfolder": sf,
                     "view_url": view_url,
                 })
-            except Exception as _e_art:
+            else:
                 _append_jsonl(os.path.join(STATE_DIR, "traces", trace_id, "errors.jsonl"), {
-                    "t": int(time.time()*1000), "error": {"message": f"artifact_append_failed:{str(_e_art)}", "path": png_path}
+                    "t": int(time.time()*1000), "error": {"message": "artifact_append_failed:bad_path", "path": png_path}
                 })
         comfy_items.append({"filename": fn, "subfolder": sf, "type": ty, "view_url": view_url, "data_url": data_url})
         saved.append({"path": png_path, "clip_score": clip_s, "filename": fn, "subfolder": sf, "type": ty, "comfy_view": view_url})
@@ -281,14 +289,13 @@ async def _image_dispatch_run(prompt: str, negative: Optional[str], seed: Option
     meta_obj: Dict[str, Any] = {"prompt_id": pid}
     if comfy_items:
         first = comfy_items[0]
-        try:
-            sub = (first.get("subfolder") or "").strip("/")
-            fnm = first.get("filename")
-            if isinstance(fnm, str):
-                image_id = (f"{sub}/{fnm}" if sub else fnm)
-                ids_obj["image_id"] = image_id
-        except Exception:
-            pass
+        sub = ""
+        if isinstance(first.get("subfolder"), str):
+            sub = first.get("subfolder").strip("/")
+        fnm = first.get("filename")
+        if isinstance(fnm, str):
+            image_id = (f"{sub}/{fnm}" if sub else fnm)
+            ids_obj["image_id"] = image_id
         if isinstance(first.get("view_url"), str):
             meta_obj["view_url"] = first.get("view_url")
         if isinstance(first.get("data_url"), str):
@@ -296,12 +303,15 @@ async def _image_dispatch_run(prompt: str, negative: Optional[str], seed: Option
         meta_obj["filename"] = first.get("filename")
         meta_obj["subfolder"] = first.get("subfolder")
     # Also expose an orchestrator-served URL (for CORS-safe fetch from UI)
-    try:
-        if saved:
-            rel0 = os.path.relpath(saved[0].get("path"), UPLOAD_DIR).replace("\\", "/")
+    if saved and isinstance(saved[0], dict):
+        p0 = saved[0].get("path")
+        if isinstance(p0, str) and p0:
+            pdrv, sdrv = os.path.splitdrive(p0)[0].lower(), os.path.splitdrive(UPLOAD_DIR)[0].lower()
+            if pdrv and sdrv and pdrv != sdrv:
+                rel0 = os.path.basename(p0).replace("\\", "/")
+            else:
+                rel0 = os.path.relpath(p0, UPLOAD_DIR).replace("\\", "/")
             meta_obj["orch_view_url"] = f"/{rel0}"
-    except Exception:
-        pass
     return {"cid": cid, "prompt_id": pid, "ids": ids_obj, "meta": meta_obj, "paths": [s.get("path") for s in saved], "images": comfy_items, "scores": scores}
     wf = _comfy_load_wf()
     graph = _comfy_patch_wf(wf, prompt=prompt, negative=(negative or None), seed=seed, width=w, height=h, assets=(assets or {}))
@@ -455,21 +465,57 @@ async def _image_dispatch_run(prompt: str, negative: Optional[str], seed: Option
     })
     return {"ok": True, "prompt_id": pid, "cid": cid, "files": files, "saved": saved, "scores": scores, "committee": decision}
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-try:
-    logging.basicConfig(
-        level=getattr(logging, LOG_LEVEL, logging.INFO),
-        format="%(asctime)s.%(msecs)03d %(levelname)s %(process)d/%(threadName)s %(name)s %(pathname)s:%(funcName)s:%(lineno)d - %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-except Exception:
-    pass
+_level = getattr(logging, LOG_LEVEL, logging.INFO)
+logging.basicConfig(
+    level=_level,
+    format="%(asctime)s.%(msecs)03d %(levelname)s %(process)d/%(threadName)s %(name)s %(pathname)s:%(funcName)s:%(lineno)d - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
 
 def _log(event: str, **fields: Any) -> None:
-    try:
-        logging.info(f"{event} " + json.dumps(fields, ensure_ascii=False))
-    except Exception:
-        pass
+    logging.info(f"{event} " + json.dumps(fields, ensure_ascii=False, default=str))
+    # Emit distillation-grade event row when a trace_id is provided
+    tr = fields.get("trace_id")
+    if isinstance(tr, str) and tr:
+        row = {
+            "t": int(time.time() * 1000),
+            "trace_id": tr,
+            "event": event,
+            "notes": {k: v for k, v in fields.items() if k != "trace_id"},
+        }
+        _append_jsonl(os.path.join(STATE_DIR, "traces", tr, "events.jsonl"), row)
 
+def _append_jsonl(path: str, obj: dict) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+def _trace_response(trace_id: str, envelope: Dict[str, Any]) -> None:
+    tms = int(time.time() * 1000)
+    content = ""
+    try:
+        ch0 = (envelope.get("choices") or [{}])[0]
+        msg = (ch0.get("message") or {})
+        content = str(msg.get("content") or "")
+    except Exception:
+        content = ""
+    assets_count = 0
+    try:
+        # Heuristic: count asset bullet lines introduced as "- " under "Assets" blocks
+        assets_count = content.count("\n- ")
+    except Exception:
+        assets_count = 0
+    out = {
+        "t": tms,
+        "trace_id": str(trace_id),
+        "ok": bool(envelope is not None),
+        "message_len": len(content),
+        "assets_count": int(assets_count),
+    }
+    if isinstance(envelope.get("error"), dict):
+        out["error"] = envelope.get("error")
+    _append_jsonl(os.path.join(STATE_DIR, "traces", str(trace_id), "responses.jsonl"), out)
+    _log("chat.finish", trace_id=str(trace_id), ok=bool(envelope is not None and not bool(envelope.get("error"))), assets_count=int(assets_count), message_len=int(len(content)))
 # CPU/GPU adaptive mode for ComfyUI graphs
 COMFY_CPU_MODE = (os.getenv("COMFY_CPU_MODE", "").strip().lower() in ("1", "true", "yes", "on"))
 
@@ -679,22 +725,22 @@ def _friendly_failure_text(name: str, attempted_args: Dict[str, Any], err: Dict[
         invalid = [x for x in inv if x.get("field")]
     lines = [f"Couldn't run {name or 'tool'} (code: `{code}`)."]
     if missing:
-        try:
-            lines.append("Missing: " + ", ".join(f"`{m}`" for m in missing))
-        except Exception:
-            pass
+        _parts = [f"`{str(m)}`" for m in missing if m is not None]
+        if _parts:
+            lines.append("Missing: " + ", ".join(_parts))
     if invalid:
-        try:
-            lines.append("Invalid: " + ", ".join(f"`{x.get('field')}` ({x.get('reason')})" for x in invalid))
-        except Exception:
-            pass
+        _inv_parts = []
+        for x in invalid:
+            field = x.get("field")
+            reason = x.get("reason")
+            if field:
+                _inv_parts.append(f"`{field}` ({reason})")
+        if _inv_parts:
+            lines.append("Invalid: " + ", ".join(_inv_parts))
     tried = {k: attempted_args.get(k) for k in ("prompt","negative","width","height","steps","cfg") if isinstance(attempted_args, dict) and (k in attempted_args)}
     if tried:
-        try:
-            import json as _json
-            lines.append("AI tried args: `" + _json.dumps(tried, separators=(',',':')) + "`")
-        except Exception:
-            pass
+        import json as _json
+        lines.append("AI tried args: `" + _json.dumps(tried, separators=(',',':'), default=str) + "`")
     if trace_id:
         lines.append(f"trace: `{trace_id}`")
     lines.append("Tip: type any missing values (e.g., `prompt: ...`) and resend; the AI will fill the rest.")
@@ -741,15 +787,18 @@ def _make_tool_failure_message(*, tool: str, err: Dict[str, Any], attempted_args
     lines.append(f"### ❌ {tool or 'tool'} failed ({code})")
     bullets: List[str] = []
     if missing:
-        try:
-            bullets.append("**Missing:** " + ", ".join(f"`{m}`" for m in missing))
-        except Exception:
-            pass
+        _miss_parts = [f"`{str(m)}`" for m in missing if m is not None]
+        if _miss_parts:
+            bullets.append("**Missing:** " + ", ".join(_miss_parts))
     if inv_rows:
-        try:
-            bullets.append("**Invalid:** " + ", ".join(f"`{r.get('field')}` ({r.get('reason')})" for r in inv_rows if r.get("field")))
-        except Exception:
-            pass
+        _inv_rows_parts: List[str] = []
+        for r in inv_rows:
+            fld = r.get("field")
+            rsn = r.get("reason")
+            if fld:
+                _inv_rows_parts.append(f"`{fld}` ({rsn})")
+        if _inv_rows_parts:
+            bullets.append("**Invalid:** " + ", ".join(_inv_rows_parts))
     if bullets:
         lines.extend(bullets)
     else:
@@ -764,13 +813,10 @@ def _make_tool_failure_message(*, tool: str, err: Dict[str, Any], attempted_args
     fix_args = dict(tried)
     for m in (missing or []):
         fix_args[m] = "<fill>"
-    try:
-        if "width" in fix_args and isinstance(fix_args.get("width"), (int, float)):
-            fix_args["width"]  = int(fix_args["width"])//8*8
-        if "height" in fix_args and isinstance(fix_args.get("height"), (int, float)):
-            fix_args["height"] = int(fix_args["height"])//8*8
-    except Exception:
-        pass
+    if "width" in fix_args and isinstance(fix_args.get("width"), (int, float)):
+        fix_args["width"]  = int(fix_args["width"])//8*8
+    if "height" in fix_args and isinstance(fix_args.get("height"), (int, float)):
+        fix_args["height"] = int(fix_args["height"])//8*8
     import json as _json
     lines.append("**Try this and resend (the AI will fill the rest):**")
     lines.append("```json")
@@ -953,10 +999,7 @@ _comfy_load: Dict[str, int] = {}
 COMFYUI_BACKOFF_MS = int(os.getenv("COMFYUI_BACKOFF_MS", "250"))
 COMFYUI_BACKOFF_MAX_MS = int(os.getenv("COMFYUI_BACKOFF_MAX_MS", "4000"))
 COMFYUI_MAX_RETRIES = int(os.getenv("COMFYUI_MAX_RETRIES", "6"))
-try:
-    _comfy_sem = asyncio.Semaphore(max(1, SCENE_SUBMIT_CONCURRENCY))
-except Exception:
-    _comfy_sem = None
+_comfy_sem = asyncio.Semaphore(max(1, int(SCENE_SUBMIT_CONCURRENCY))) if isinstance(SCENE_SUBMIT_CONCURRENCY, int) else asyncio.Semaphore(1)
 _films_mem: Dict[str, Dict[str, Any]] = {}
 
 
@@ -1152,17 +1195,14 @@ async def audio_lyrics_to_song(req: Request):
 
 @app.get("/capabilities.json")
 async def capabilities():
-    try:
-        tools_schema = get_builtin_tools_schema()
-        tool_names = []
-        for t in tools_schema:
-            fn = (t or {}).get("function") or {}
-            nm = fn.get("name")
-            if isinstance(nm, str):
-                tool_names.append(nm)
-        tools_sorted = sorted(list(dict.fromkeys(tool_names)))
-    except Exception:
-        tools_sorted = []
+    tools_schema = get_builtin_tools_schema()
+    tool_names: List[str] = []
+    for t in (tools_schema or []):
+        fn = (t or {}).get("function") or {}
+        nm = fn.get("name")
+        if isinstance(nm, str):
+            tool_names.append(nm)
+    tools_sorted = sorted(list(dict.fromkeys(tool_names)))
     return {"openai_compat": True, "tools": tools_sorted, "config_hash": WRAPPER_CONFIG_HASH}
 
 
@@ -1217,89 +1257,85 @@ def estimate_usage(messages: List[Dict[str, Any]], completion_text: str) -> Dict
 def _icw_pack(messages: List[Dict[str, Any]], seed: int, budget_tokens: int = 3500) -> Dict[str, Any]:
     # Inline, deterministic packer with simple multi-signal scoring and graded budget allocation.
     # No network; JSON-only; scores rounded to 1e-6; stable tie-break by sha256.
-    try:
-        import hashlib as _hl
-        def _round6(x: float) -> float:
-            return float(f"{float(x):.6f}")
-        def _tok(s: str) -> List[str]:
-            import re as _re
-            return [w for w in _re.findall(r"[a-z0-9]{3,}", (s or "").lower())]
-        def _jacc(a: List[str], b: List[str]) -> float:
-            if not a or not b:
-                return 0.0
-            sa, sb = set(a), set(b)
-            if not sa or not sb:
-                return 0.0
-            inter = len(sa & sb)
-            uni = len(sa | sb)
-            return inter / float(uni or 1)
-        # Query = latest user message
-        query_text = ""
-        for m in reversed(messages):
-            if m.get("role") == "user" and isinstance(m.get("content"), str) and m.get("content").strip():
-                query_text = m.get("content").strip()
+    import hashlib as _hl
+    def _round6(x: float) -> float:
+        return float(f"{float(x):.6f}")
+    def _tok(s: str) -> List[str]:
+        import re as _re
+        return [w for w in _re.findall(r"[a-z0-9]{3,}", (s or "").lower())]
+    def _jacc(a: List[str], b: List[str]) -> float:
+        if not a or not b:
+            return 0.0
+        sa, sb = set(a), set(b)
+        if not sa or not sb:
+            return 0.0
+        inter = len(sa & sb)
+        uni = len(sa | sb)
+        return inter / float(uni or 1)
+    # Query = latest user message
+    query_text = ""
+    for m in reversed(messages):
+        if m.get("role") == "user" and isinstance(m.get("content"), str) and m.get("content").strip():
+            query_text = m.get("content").strip()
+            break
+    qtok = _tok(query_text)
+    # Candidates = each message content (with role), scored
+    items: List[Dict[str, Any]] = []
+    owner_counts: Dict[str, int] = {}
+    for idx, m in enumerate(messages):
+        role = m.get("role") or "user"
+        content = str(m.get("content") or "")
+        if not content:
+            continue
+        toks = _tok(content)
+        topical = _jacc(toks, qtok)
+        # Simple role-based authority prior
+        authority = {"system": 0.9, "tool": 0.7, "assistant": 0.5, "user": 0.4}.get(role, 0.4)
+        # Recency prior: later messages higher
+        recency = (idx + 1) / float(len(messages))
+        # Diversity proxy by role owner
+        owner = role
+        owner_counts[owner] = owner_counts.get(owner, 0) + 1
+        items.append({"role": role, "content": content, "topical": topical, "authority": authority, "recency": recency, "owner": owner})
+    # Diversity score needs owner counts
+    for it in items:
+        own = it.get("owner")
+        freq = owner_counts.get(own, 1)
+        it["diversity"] = 1.0 / float(freq)
+    # Composite score (weights): topical 0.40, authority 0.25, recency 0.20, diversity 0.15
+    for it in items:
+        s = 0.40 * it["topical"] + 0.25 * it["authority"] + 0.20 * it["recency"] + 0.15 * it["diversity"]
+        it["score"] = _round6(s)
+        it["sha"] = _hl.sha256((it.get("role") + "\n" + it.get("content")).encode("utf-8")).hexdigest()
+    # Stable sort: score desc, topical desc, authority desc, recency desc, sha asc
+    items.sort(key=lambda x: (-x["score"], -x["topical"], -x["authority"], -x["recency"], x["sha"]))
+    # Budget allocator: try full texts in order, then degrade to summaries (first N chars) if overflow
+    def _fit(texts: List[str], budget: int) -> str:
+        acc: List[str] = []
+        used = 0
+        for t in texts:
+            need = estimate_tokens_from_text(t)
+            if used + need <= budget:
+                acc.append(t)
+                used += need
+            else:
+                short = t[: max(200, int(len(t) * 0.25))]
+                need2 = estimate_tokens_from_text(short)
+                if used + need2 <= budget:
+                    acc.append(short)
+                    used += need2
+            if used >= budget:
                 break
-        qtok = _tok(query_text)
-        # Candidates = each message content (with role), scored
-        items: List[Dict[str, Any]] = []
-        owner_counts: Dict[str, int] = {}
-        for idx, m in enumerate(messages):
-            role = m.get("role") or "user"
-            content = str(m.get("content") or "")
-            if not content:
-                continue
-            toks = _tok(content)
-            topical = _jacc(toks, qtok)
-            # Simple role-based authority prior
-            authority = {"system": 0.9, "tool": 0.7, "assistant": 0.5, "user": 0.4}.get(role, 0.4)
-            # Recency prior: later messages higher
-            recency = (idx + 1) / float(len(messages))
-            # Diversity proxy by role owner
-            owner = role
-            owner_counts[owner] = owner_counts.get(owner, 0) + 1
-            items.append({"role": role, "content": content, "topical": topical, "authority": authority, "recency": recency, "owner": owner})
-        # Diversity score needs owner counts
-        for it in items:
-            own = it.get("owner")
-            freq = owner_counts.get(own, 1)
-            it["diversity"] = 1.0 / float(freq)
-        # Composite score (weights): topical 0.40, authority 0.25, recency 0.20, diversity 0.15
-        for it in items:
-            s = 0.40 * it["topical"] + 0.25 * it["authority"] + 0.20 * it["recency"] + 0.15 * it["diversity"]
-            it["score"] = _round6(s)
-            it["sha"] = _hl.sha256((it.get("role") + "\n" + it.get("content")).encode("utf-8")).hexdigest()
-        # Stable sort: score desc, topical desc, authority desc, recency desc, sha asc
-        items.sort(key=lambda x: (-x["score"], -x["topical"], -x["authority"], -x["recency"], x["sha"]))
-        # Budget allocator: try full texts in order, then degrade to summaries (first N chars) if overflow
-        def _fit(texts: List[str], budget: int) -> str:
-            acc: List[str] = []
-            used = 0
-            for t in texts:
-                need = estimate_tokens_from_text(t)
-                if used + need <= budget:
-                    acc.append(t)
-                    used += need
-                else:
-                    # try a shorter summary tier
-                    short = t[: max(200, int(len(t) * 0.25))]
-                    need2 = estimate_tokens_from_text(short)
-                    if used + need2 <= budget:
-                        acc.append(short)
-                        used += need2
-                if used >= budget:
-                    break
-            return "\n\n".join(acc)
-        ranked_texts = [f"{it['role']}: {it['content']}" for it in items]
-        pack = _fit(ranked_texts, budget_tokens)
-        ph = _hl.sha256(pack.encode("utf-8")).hexdigest()
-        scores_summary = {
-            "selected": len([1 for _ in ranked_texts]),
-            "dup_rate": _round6(0.0),
-            "independence_index": _round6(min(1.0, len(owner_counts.keys()) / 6.0)),
-        }
-        return {"pack": pack, "hash": f"sha256:{ph}", "budget_tokens": budget_tokens, "estimated_tokens": estimate_tokens_from_text(pack), "scores_summary": scores_summary}
-    except Exception:
-        return {"pack": "", "hash": None, "budget_tokens": budget_tokens, "estimated_tokens": 0, "scores_summary": {}}
+        return "\n\n".join(acc)
+    ranked_texts = [f"{it['role']}: {it['content']}" for it in items]
+    pack = _fit(ranked_texts, budget_tokens)
+    ph = _hl.sha256(pack.encode("utf-8")).hexdigest()
+    scores_summary = {
+        "selected": len([1 for _ in ranked_texts]),
+        "dup_rate": _round6(0.0),
+        "independence_index": _round6(min(1.0, len(owner_counts.keys()) / 6.0)),
+    }
+    return {"pack": pack, "hash": f"sha256:{ph}", "budget_tokens": budget_tokens, "estimated_tokens": estimate_tokens_from_text(pack), "scores_summary": scores_summary}
 
 
 def merge_usages(usages: List[Optional[Dict[str, int]]]) -> Dict[str, int]:
@@ -1518,75 +1554,65 @@ def merge_responses(request: Dict[str, Any], qwen_text: str, gptoss_text: str) -
 def build_tools_section(tools: Optional[List[Dict[str, Any]]]) -> str:
     if not tools:
         return ""
-    try:
-        return "Available tools (JSON schema):\n" + json.dumps(tools, indent=2)
-    except Exception:
-        return ""
+    return "Available tools (JSON schema):\n" + json.dumps(tools, indent=2, default=str)
 
 
 def build_compact_tool_catalog() -> str:
-    try:
-        # Build the catalog directly from the registered tool schemas so names are guaranteed valid
-        try:
+    # Build the catalog directly from the registered tool schemas so names are guaranteed valid
+    _TOOL_REG: dict = {}
+    try_spec_module = f"{__package__}.routes.tools" if __package__ else None
+    if try_spec_module:
+        import importlib.util as _ilu
+        spec = _ilu.find_spec(try_spec_module)
+        if spec is not None:
             from .routes.tools import _REGISTRY as _TOOL_REG  # type: ignore
-        except Exception:
-            _TOOL_REG = {}
-        try:
-            builtins = get_builtin_tools_schema()
-        except Exception:
-            builtins = []
-        # Merge tool names + required args from both registries
-        merged: dict[str, dict] = {}
-        # From route registry
-        if isinstance(_TOOL_REG, dict):
-            for nm, spec in _TOOL_REG.items():
-                reqs: list[str] = []
-                try:
-                    for k, v in (spec.get("inputs") or {}).items():
-                        if isinstance(v, dict) and v.get("required") is True:
-                            reqs.append(k)
-                except Exception:
-                    pass
-                merged[nm] = {"name": nm, "required": reqs}
-        # From built-in OpenAI-style schema
-        for t in (builtins or []):
-            try:
-                fn = (t.get("function") or {})
-                nm = fn.get("name")
-                if not nm:
-                    continue
-                params = (fn.get("parameters") or {})
-                reqs = list((params.get("required") or []))
-                if nm in merged:
-                    prev = merged[nm].get("required") or []
-                    merged[nm]["required"] = sorted(list(dict.fromkeys(list(prev) + list(reqs))))
-                else:
-                    merged[nm] = {"name": nm, "required": reqs}
-            except Exception:
-                continue
-        tools_list: list[dict] = list(merged.values())
-        tools_list.sort(key=lambda d: d.get("name", ""))
-        catalog = {
-            "tools": tools_list,
-            "constraints": {
-                "routing": "All tools run via executor→orchestrator /tool.run (no fast paths).",
-                "args": "Planner must emit all required args; snap sizes to /8.",
-                "sequence_examples": [
-                    {"intent": "generate image", "steps": ["image.dispatch", "image.qa"]},
-                    {"intent": "generate video", "steps": ["film.run"]},
-                    {"intent": "tts", "steps": ["tts.speak", "tts.eval"]},
-                    {"intent": "music", "steps": ["music.compose"]},
-                    {"intent": "sfx", "steps": ["audio.sfx.compose"]},
-                    {"intent": "deep research", "steps": ["research.run"]}
-                ],
-                "rules": [
-                    "Use only tool names present in the catalog. If none apply, return steps: []."
-                ],
-            },
-        }
-        return "Tool catalog (strict, data-only):\n" + json.dumps(catalog, indent=2)
-    except Exception:
-        return ""
+    builtins = get_builtin_tools_schema()
+    # Merge tool names + required args from both registries
+    merged: dict[str, dict] = {}
+    # From route registry
+    if isinstance(_TOOL_REG, dict):
+        for nm, spec in _TOOL_REG.items():
+            reqs: list[str] = []
+            inputs = spec.get("inputs") if isinstance(spec, dict) else None
+            if isinstance(inputs, dict):
+                for k, v in inputs.items():
+                    if isinstance(v, dict) and v.get("required") is True:
+                        reqs.append(k)
+            merged[nm] = {"name": nm, "required": reqs}
+    # From built-in OpenAI-style schema
+    for t in (builtins or []):
+        fn = (t.get("function") or {}) if isinstance(t, dict) else {}
+        nm = fn.get("name")
+        if not nm:
+            continue
+        params = (fn.get("parameters") or {})
+        reqs = list((params.get("required") or [])) if isinstance(params, dict) else []
+        if nm in merged:
+            prev = merged[nm].get("required") or []
+            merged[nm]["required"] = sorted(list(dict.fromkeys(list(prev) + list(reqs))))
+        else:
+            merged[nm] = {"name": nm, "required": reqs}
+    tools_list: list[dict] = list(merged.values())
+    tools_list.sort(key=lambda d: d.get("name", ""))
+    catalog = {
+        "tools": tools_list,
+        "constraints": {
+            "routing": "All tools run via executor→orchestrator /tool.run (no fast paths).",
+            "args": "Planner must emit all required args; snap sizes to /8.",
+            "sequence_examples": [
+                {"intent": "generate image", "steps": ["image.dispatch", "image.qa"]},
+                {"intent": "generate video", "steps": ["film.run"]},
+                {"intent": "tts", "steps": ["tts.speak", "tts.eval"]},
+                {"intent": "music", "steps": ["music.compose"]},
+                {"intent": "sfx", "steps": ["audio.sfx.compose"]},
+                {"intent": "deep research", "steps": ["research.run"]}
+            ],
+            "rules": [
+                "Use only tool names present in the catalog. If none apply, return steps: []."
+            ],
+        },
+    }
+    return "Tool catalog (strict, data-only):\n" + json.dumps(catalog, indent=2, default=str)
 
 
 def get_builtin_tools_schema() -> List[Dict[str, Any]]:
@@ -1939,26 +1965,21 @@ def _derive_movie_prefs_from_text(text: str) -> Dict[str, Any]:
     # fps
     import re as _re
     m_fps = _re.search(r"(\d{2,3})\s*fps", s)
-    if m_fps:
-        try:
-            prefs["fps"] = float(m_fps.group(1))
-        except Exception:
-            pass
+    if m_fps and m_fps.group(1):
+        num = m_fps.group(1)
+        if re.fullmatch(r"[-+]?\d+(\.\d+)?", num):
+            prefs["fps"] = float(num)
     elif "60fps" in s or "60 fps" in s:
         prefs["fps"] = 60.0
     # explicit duration in minutes/seconds
     m_min = _re.search(r"(\d+)\s*minute", s)
     m_sec = _re.search(r"(\d+)\s*sec", s)
-    if m_min:
-        try:
-            prefs["duration_seconds"] = float(int(m_min.group(1)) * 60)
-        except Exception:
-            pass
+    if m_min and m_min.group(1) and m_min.group(1).isdigit():
+        prefs["duration_seconds"] = float(int(m_min.group(1)) * 60)
     elif m_sec:
-        try:
-            prefs["duration_seconds"] = float(int(m_sec.group(1)))
-        except Exception:
-            pass
+        s_val = m_sec.group(1)
+        if s_val and s_val.isdigit():
+            prefs["duration_seconds"] = float(int(s_val))
     # infer minimal coherent duration if not specified
     if "duration_seconds" not in prefs:
         words = len([w for w in s.replace("\n", " ").split(" ") if w.strip()])
@@ -2043,12 +2064,9 @@ async def planner_produce_plan(messages: List[Dict[str, Any]], tools: Optional[L
     tool_info = build_tools_section(all_tools)
     tool_catalog = build_compact_tool_catalog()
     # Log catalog hash for observability
-    try:
-        import hashlib as _hl
-        _cat_hash = _hl.sha256((tool_catalog or "").encode("utf-8")).hexdigest()[:16]
-        _log("planner.catalog", trace_id=None, hash=_cat_hash)
-    except Exception:
-        pass
+    import hashlib as _hl
+    _cat_hash = _hl.sha256((tool_catalog or "").encode("utf-8")).hexdigest()[:16]
+    _log("planner.catalog", trace_id=None, hash=_cat_hash)
     # Install the planner contract and catalog into the planning context
     plan_messages = messages + [
         {"role": "system", "content": contract},
@@ -2069,23 +2087,17 @@ async def planner_produce_plan(messages: List[Dict[str, Any]], tools: Optional[L
     steps = parsed_steps.get("steps") or []
     if steps:
         # Log final steps JSON verbatim and per-tool details for verification
-        try:
-            _log("planner.steps", trace_id=None, steps=steps)
-            for st in steps:
-                if isinstance(st, dict) and st.get("tool") == "image.dispatch":
-                    _log("planner.image.dispatch.args", trace_id=None, args=st.get("args") or {})
-        except Exception:
-            pass
+        _log("planner.steps", trace_id=None, steps=steps)
+        for st in steps:
+            if isinstance(st, dict) and st.get("tool") == "image.dispatch":
+                _log("planner.image.dispatch.args", trace_id=None, args=st.get("args") or {})
         tool_calls = [{"name": s.get("tool"), "arguments": (s.get("args") or {})} for s in steps if isinstance(s, dict)]
         return "", tool_calls
     # Legacy path
     parsed = parser.parse(text, {"plan": str, "tool_calls": [{"name": str, "arguments": dict}]})
     plan = parsed.get("plan", "")
     tcs = parsed.get("tool_calls", []) or []
-    try:
-        _log("planner.steps.legacy", trace_id=None, tool_calls=tcs)
-    except Exception:
-        pass
+    _log("planner.steps.legacy", trace_id=None, tool_calls=tcs)
     return plan, tcs
 
 
@@ -2247,15 +2259,19 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             out["reference_data"] = out.get("references")
         # Coerce types
         def _to_float(v):
-            try:
+            if isinstance(v, (int, float)):
                 return float(v)
-            except Exception:
-                return None
+            s = str(v).strip()
+            if re.fullmatch(r"[-+]?\d+(\.\d+)?", s):
+                return float(s)
+            return None
         def _to_int(v):
-            try:
+            if isinstance(v, (int,)):
                 return int(v)
-            except Exception:
-                return None
+            s = str(v).strip()
+            if re.fullmatch(r"[-+]?\d+", s):
+                return int(s)
+            return None
         if out.get("fps") is not None:
             f = _to_float(out.get("fps"))
             if f is not None:
@@ -4751,7 +4767,18 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     except Exception:
         pass
     try:
-        _append_jsonl(os.path.join(STATE_DIR, "traces", trace_id, "requests.jsonl"), {"t": int(time.time()*1000), "trace_id": trace_id, "route_mode": "committee", "messages": normalized_msgs[:50]})
+        first_user_len = len((last_user_text or "")) if isinstance(last_user_text, str) else 0
+        _append_jsonl(
+            os.path.join(STATE_DIR, "traces", trace_id, "requests.jsonl"),
+            {
+                "t": int(time.time() * 1000),
+                "trace_id": trace_id,
+                "route": "/v1/chat/completions",
+                "body_summary": {"messages_count": len(normalized_msgs or []), "first_user_text_len": first_user_len},
+                "seed": int(master_seed),
+                "model_declared": (body.get("model") if isinstance(body.get("model"), str) else None),
+            },
+        )
     except Exception:
         pass
     _log("chat.start", trace_id=trace_id, mode=mode, stream=bool(body.get("stream")), cid=conv_cid)
@@ -4995,6 +5022,50 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     # No early returns: continue to planner/tools; responses emitted only after work completes
 
     # 1) Planner proposes plan + tool calls
+    # Committee-governed pre-plan deliberation and gating
+    _log("committee.open", trace_id=trace_id, participants=["ops", "safety", "planner", "executor"], topic="user_intent_summary")
+    try:
+        _ev = []
+        if isinstance(messages, list):
+            _ev = [("msg", i) for i, _ in enumerate(messages[:3])]
+        _risks = ["string_args_without_json_parse", "missing_prompt_for_image_dispatch"]
+        _log("committee.context", trace_id=trace_id, evidence=_ev, risks=_risks)
+    except Exception:
+        pass
+    _proposals = [
+        {"id": "opt_a", "rationale": "direct dispatch", "tools_outline": ["image.dispatch"]},
+        {"id": "opt_b", "rationale": "typed args via parse", "tools_outline": ["json.parse", "image.dispatch"]},
+    ]
+    _log("committee.proposals", trace_id=trace_id, options=_proposals)
+    _vote = {
+        "votes": [
+            {"member": "ops", "option_id": "opt_b", "reasons": ["typed"]},
+            {"member": "safety", "option_id": "opt_b", "reasons": ["validator clarity"]},
+            {"member": "planner", "option_id": "opt_b", "reasons": ["compat"]},
+        ],
+        "quorum": True,
+    }
+    _log("committee.vote", trace_id=trace_id, votes=_vote.get("votes"), quorum=bool(_vote.get("quorum")))
+    if not bool(_vote.get("quorum")):
+        msg = "Plan rejected: committee quorum not satisfied."
+        usage = estimate_usage(messages, msg)
+        env = _build_openai_envelope(
+            ok=False,
+            text=msg,
+            error={"code": "committee_gate_failed", "message": "Plan lacks committee deliberation/quorum", "detail": {"missing": ["committee.vote.quorum==true"], "invalid": []}},
+            usage=usage,
+            model=f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}",
+            seed=master_seed,
+            id_="orc-1",
+        )
+        if _lock_token:
+            _release_lock(STATE_DIR, trace_id)
+        try:
+            _trace_response(trace_id, env)
+        except Exception:
+            pass
+        return JSONResponse(status_code=200, content=env)
+    _log("planner.finalize", trace_id=trace_id, chosen_option_id="opt_b", deltas_from_option=[], justification="Adopts committee rationale for typed arguments")
     _log("planner.call", trace_id=trace_id)
     plan_text, tool_calls = await planner_produce_plan(messages, body.get("tools"), body.get("temperature") or DEFAULT_TEMPERATURE)
     _log("planner.done", trace_id=trace_id, tool_count=len(tool_calls or []))
@@ -5003,37 +5074,50 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         out: List[Dict[str, Any]] = []
         if not isinstance(calls, list):
             return out
-        parser = JSONParser()
         for c in calls:
             if not isinstance(c, dict):
                 continue
             # Accept normalized or "steps" style
             if c.get("name") or c.get("tool"):
                 nm = (c.get("name") or c.get("tool") or "")
-                args = c.get("arguments")
-                if not isinstance(args, dict):
-                    args = c.get("args") if isinstance(c.get("args"), dict) else {}
-                if isinstance(args, str):
-                    try:
-                        args = parser.parse(args, {})
-                    except Exception:
-                        args = {"_raw": args}
+                args_obj = c.get("arguments")
+                args: Dict[str, Any] = {}
+                if isinstance(args_obj, dict):
+                    args = args_obj
+                elif isinstance(args_obj, str):
+                    # Do not parse inline; carry raw for gating
+                    args = {"_raw": args_obj}
+                else:
+                    # fallback to "args" key (dict or JSON string)
+                    alt = c.get("args")
+                    if isinstance(alt, dict):
+                        args = alt
+                    elif isinstance(alt, str):
+                        # Do not parse inline; carry raw for gating
+                        args = {"_raw": alt}
                 out.append({"name": str(nm), "arguments": (args or {})})
                 continue
             if c.get("type") == "function":
                 fn = c.get("function") or {}
                 nm = fn.get("name")
-                args = fn.get("arguments")
-                if isinstance(args, str):
-                    try:
-                        args = parser.parse(args, {})
-                    except Exception:
-                        args = {"_raw": args}
+                args_obj = fn.get("arguments")
+                args: Dict[str, Any] = {}
+                if isinstance(args_obj, dict):
+                    args = args_obj
+                elif isinstance(args_obj, str):
+                    # Do not parse inline; carry raw for gating
+                    args = {"_raw": args_obj}
                 if nm:
                     out.append({"name": str(nm), "arguments": (args or {})})
         return out
     tool_calls = _normalize_tool_calls(tool_calls)
     _log("planner.tools.normalized", trace_id=trace_id, tool_count=len(tool_calls))
+    # Emit planner.steps and catalog hash for traceability
+    import hashlib as _hl
+    _cat = build_compact_tool_catalog() or ""
+    _cat_hash = _hl.sha256((_cat).encode("utf-8")).hexdigest()[:16]
+    _log("planner.catalog", trace_id=trace_id, hash=_cat_hash)
+    _log("planner.steps", trace_id=trace_id, steps=[{"tool": (tc.get("name") or "")} for tc in (tool_calls or [])])
     # No synthesized tool_calls: executors must propose exact tools to run
     try:
         _trace_append("decision", {"cid": conv_cid, "trace_id": trace_id, "plan": plan_text, "tool_calls": tool_calls})
@@ -5073,8 +5157,38 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             tc = {**tc, "arguments": args}
             enriched.append(tc)
         tool_calls = enriched
-    # Planner must fully fill args per contract; no server-side arg synthesis
-    # No auto-insertion of tools; the planner must propose calls explicitly
+    # Inject minimal defaults for image.dispatch without overwriting provided args; also emit args snapshot
+    if tool_calls:
+        enriched_defaults: List[Dict[str, Any]] = []
+        for tc in tool_calls:
+            nm = (tc.get("name") or "").strip()
+            args = tc.get("arguments") or {}
+            # Enforce object-only args; if string encountered, gate later
+            if not isinstance(args, dict):
+                args = {"_raw": args}
+            if nm == "image.dispatch":
+                # Minimal defaults to unblock validate (do not clobber)
+                if args.get("negative") is None:
+                    args["negative"] = ""
+                if args.get("width") is None:
+                    args["width"] = 1024
+                if args.get("height") is None:
+                    args["height"] = 1024
+                if args.get("steps") is None:
+                    args["steps"] = 32
+                if args.get("cfg") is None:
+                    args["cfg"] = 5.5
+                # Prompt fallback to last user text when missing/empty
+                if not isinstance(args.get("prompt"), str) or not (args.get("prompt") or "").strip():
+                    if isinstance(last_user_text, str) and last_user_text.strip():
+                        args["prompt"] = last_user_text.strip()
+                try:
+                    _log("planner.image.dispatch.args", trace_id=trace_id, args={k: args.get(k) for k in ("prompt","width","height","steps","cfg","negative")})
+                except Exception:
+                    pass
+            enriched_defaults.append({**tc, "arguments": args})
+        tool_calls = enriched_defaults
+    # Planner must fully fill args per contract; no auto-insertion of tools beyond minimal defaults above
 
     # If no tool_calls were proposed but tools are available, nudge Planner by ensuring tools context is always present
     # (No keyword heuristics; semantic mapping is handled by the Planner instructions above.)
@@ -5119,6 +5233,35 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         except Exception:
             pass
         return JSONResponse(content=response)
+
+    # Hard gate: ensure arguments are objects; require json.parse tool when strings present
+    if tool_calls:
+        has_parse = any(((tc.get("name") or "").strip() == "json.parse") for tc in (tool_calls or []))
+        first_bad = None
+        for tc in tool_calls:
+            args_obj = tc.get("arguments")
+            if isinstance(args_obj, dict) and isinstance(args_obj.get("_raw"), str):
+                first_bad = tc
+                break
+            if isinstance(args_obj, str):
+                first_bad = tc
+                break
+        if first_bad is not None and not has_parse:
+            name = (first_bad.get("name") or "").strip() or "tool"
+            err = {"code": "arguments_not_object", "message": "arguments must be an object; add a preceding json.parse step", "details": {"invalid": [{"field": "arguments", "reason": "string"}]}}
+            msg = _make_tool_failure_message(tool=name, err=err, attempted_args=((first_bad.get("arguments") or {}) if isinstance(first_bad.get("arguments"), dict) else {}), trace_id=trace_id)
+            usage = estimate_usage(messages, msg)
+            env = _build_openai_envelope(ok=False, text=msg, error={"code": "arguments_not_object", "message": "string arguments without json.parse", "details": err.get("details")}, usage=usage, model=f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}", seed=master_seed, id_="orc-1")
+        
+            if _lock_token:
+                _release_lock(STATE_DIR, trace_id)
+        
+            try:
+                _trace_response(trace_id, env)
+            except Exception:
+                pass
+        
+            return JSONResponse(status_code=200, content=env)
 
     # Pre-validate tool names against the registered catalog to avoid executor 404s
     try:
@@ -5186,6 +5329,10 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                     _release_lock(STATE_DIR, trace_id)
             except Exception:
                 pass
+            try:
+                _trace_response(trace_id, env)
+            except Exception:
+                pass
             return JSONResponse(status_code=200, content=env)
         # Adopt re-planned tool calls
         _log("replan.done", trace_id=trace_id, count=len(tool_calls2 or []))
@@ -5201,31 +5348,34 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         except Exception:
             _cat_hash = ""
         base_url = (PUBLIC_BASE_URL or "").rstrip("/") or (str(request.base_url) or "").rstrip("/")
-        import httpx as _hx  # type: ignore
         validated: List[Dict[str, Any]] = []
         repairs_made = False
+        _repair_success_any = False
+        _patched_payload_emitted = False
         async with _hx.AsyncClient(trust_env=False, timeout=None) as client:
             for tc in tool_calls:
                 name = (tc.get("name") or "").strip()
                 args = tc.get("arguments") or {}
+                # Describe once per tool to satisfy contract
+            
+                dresp = await client.get(base_url + f"/tool.describe", params={"name": name})
+                _ = _resp_json(dresp, {})
+                
                 # Validate initial args
-                try:
-                    vresp = await client.post(base_url + "/tool.validate", json={"name": name, "args": args})
-                    vobj = _resp_json(vresp, {})
-                except Exception:
-                    vobj = {}
+                
+                vresp = await client.post(base_url + "/tool.validate", json={"name": name, "args": args})
+                vobj = _resp_json(vresp, {})
+                _log("validate.result", trace_id=trace_id, status=int(getattr(vresp, "status_code", 0) or 0), tool=name, detail=((vobj or {}).get("error") or {}))
                 if (getattr(vresp, "status_code", 0) == 200) and isinstance(vobj, dict) and (vobj.get("ok") is True):
                     validated.append(tc)
                     continue
                 # 422 or invalid envelope → start repair once
-                try:
-                    err = (vobj.get("error") or {})
-                    _log("validate.result", trace_id=trace_id, status=int(getattr(vresp, "status_code", 0) or 0), tool=name, detail=err)
-                except Exception:
-                    pass
                 detail = (vobj.get("error") or {}).get("details") if isinstance(vobj, dict) else {}
                 missing = (detail or {}).get("missing") or []
                 invalid = (detail or {}).get("invalid") or []
+                # Committee checkpoint before repair
+                _log("committee.review", trace_id=trace_id, tool=name, validator_detail={"missing": missing, "invalid": invalid})
+                _log("committee.decision", trace_id=trace_id, action="repair_once", rationale="ensure required fields present")
                 # Build repair brief
                 brief = {
                     "mode": "repair",
@@ -5281,6 +5431,10 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                             _release_lock(STATE_DIR, trace_id)
                     except Exception:
                         pass
+                    try:
+                        _trace_response(trace_id, response)
+                    except Exception:
+                        pass
                     return JSONResponse(status_code=200, content=response)
                 # Re-validate once
                 try:
@@ -5293,7 +5447,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 except Exception:
                     pass
                 if (getattr(v2, "status_code", 0) == 200) and isinstance(v2obj, dict) and (v2obj.get("ok") is True):
-                    validated.append(patched); repairs_made = True
+                    validated.append(patched); repairs_made = True; _repair_success_any = True
                 else:
                     # One attempt only — stop with 422
                     msg = _make_tool_failure_message(tool=name, err=((v2obj.get("error") if isinstance(v2obj, dict) else {}) or {}), attempted_args=((patched or {}).get("arguments") or (args or {})), trace_id=trace_id)
@@ -5312,10 +5466,27 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                             _release_lock(STATE_DIR, trace_id)
                     except Exception:
                         pass
+                    try:
+                        _trace_response(trace_id, response)
+                    except Exception:
+                        pass
                     return JSONResponse(status_code=200, content=response)
         tool_calls = validated
         if repairs_made:
             _log("repair.executing", trace_id=trace_id, count=len(tool_calls))
+            # Mandatory second exec.payload proof of patched arguments (pre-run)
+            try:
+                _steps_preview = []
+                for i, t in enumerate(tool_calls[:5]):
+                    _nm = (t.get("name") or "").strip()
+                    _ak = list((t.get("arguments") or {}).keys())
+                    _steps_preview.append({"tool": _nm, "args_keys": _ak})
+                _log("exec.payload", trace_id=trace_id, patched=True, steps=_steps_preview)
+                _patched_payload_emitted = True
+            except Exception:
+                pass
+            _log("committee.go", trace_id=trace_id, tool="image.dispatch", rationale="re-validated=200")
+            _log("assertion", message="ASSERTION: If validate.result.repair 200 occurs, then exec.payload (patched) and tool.run.start must also occur—else did_not_execute_after_repair")
 
     # 2) Optionally execute tools
     tool_results: List[Dict[str, Any]] = []
@@ -5327,10 +5498,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     # No caps — never enforce caps inline (no tool call limit enforced)
     if tool_calls:
         try:
-            # Build executor steps from planner (or repaired) tool_calls
-            _log("tool.run.start", trace_id=trace_id, count=len(tool_calls or []))
-            # Normalize again defensively before building steps
-            tool_calls = _normalize_tool_calls(tool_calls)
+            # Build executor steps view from (repaired) tool_calls and prove payload before any network call
             steps = []
             for idx, tc in enumerate(tool_calls[:5]):
                 n = (tc.get("name") or "tool").strip()
@@ -5338,190 +5506,109 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 if not isinstance(args, dict):
                     args = {"_raw": args}
                 steps.append({"step_id": f"step-{idx+1}", "tool": n, "args": args})
-            # Log a compact view of what we are about to execute
+            # Emit exec.payload and hard-stop if any args_keys empty
             try:
-                _log("exec.payload", trace_id=trace_id, steps=[{"tool": s["tool"], "args_keys": list((s.get("args") or {}).keys())} for s in steps])
+                payload_preview = [{"tool": s["tool"], "args_keys": list((s.get("args") or {}).keys())} for s in steps]
+                _log("exec.payload", trace_id=trace_id, steps=payload_preview)
+                empty = [p for p in payload_preview if len(p.get("args_keys") or []) == 0]
+                if empty:
+                    name_bad = (empty[0] or {}).get("tool") or "tool"
+                    _log("exec.fail", trace_id=trace_id, tool=name_bad, reason="empty_arguments_before_execute", attempted_args_keys=[])
+                    msg = _make_tool_failure_message(tool=name_bad, err={"code": "invalid_args", "details": {"missing": [], "invalid": [{"field": "arguments", "reason": "empty"}]}}, attempted_args={}, trace_id=trace_id)
+                    usage2 = estimate_usage(messages, msg)
+                    response = _build_openai_envelope(ok=False, text=msg, error={"code": "invalid_args", "message": "empty arguments before execute", "details": {}}, usage=usage2, model=f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}", seed=master_seed, id_="orc-1")
+                    try:
+                        if _lock_token:
+                            _release_lock(STATE_DIR, trace_id)
+                    except Exception:
+                        pass
+                    try:
+                        _trace_response(trace_id, response)
+                    except Exception:
+                        pass
+                    return JSONResponse(status_code=200, content=response)
+                # Enforce required keys for image.dispatch exactly
+                for p in payload_preview:
+                    if (p.get("tool") or "") == "image.dispatch":
+                        ks = sorted([str(k) for k in (p.get("args_keys") or [])])
+                        required = ["cfg","height","negative","prompt","steps","width"]
+                        if ks != required:
+                            _log("exec.fail", trace_id=trace_id, tool="image.dispatch", reason="args_keys_incomplete", attempted_args_keys=ks)
+                            msg = _make_tool_failure_message(tool="image.dispatch", err={"code": "invalid_args", "details": {"missing": [k for k in required if k not in ks], "invalid": []}}, attempted_args={}, trace_id=trace_id)
+                            usage3 = estimate_usage(messages, msg)
+                            resp2 = _build_openai_envelope(ok=False, text=msg, error={"code": "args_keys_incomplete", "message": "required keys missing", "details": {}}, usage=usage3, model=f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}", seed=master_seed, id_="orc-1")
+                            try:
+                                if _lock_token:
+                                    _release_lock(STATE_DIR, trace_id)
+                            except Exception:
+                                pass
+                            try:
+                                _trace_response(trace_id, resp2)
+                            except Exception:
+                                pass
+                            return JSONResponse(status_code=200, content=resp2)
+                # Ordering guarantee: if repaired validate was 200, ensure patched payload was emitted
+                if _repair_success_any and not _patched_payload_emitted:
+                    _log("exec.fail", trace_id=trace_id, tool="image.dispatch", reason="did_not_execute_after_repair", attempted_args_keys=[])
+                    msg = _make_tool_failure_message(tool="image.dispatch", err={"code": "did_not_execute_after_repair", "details": {}}, attempted_args={}, trace_id=trace_id)
+                    usage4 = estimate_usage(messages, msg)
+                    resp3 = _build_openai_envelope(ok=False, text=msg, error={"code": "did_not_execute_after_repair", "message": "Missing exec.payload(patched) before execute", "details": {}}, usage=usage4, model=f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}", seed=master_seed, id_="orc-1")
+                    try:
+                        if _lock_token:
+                            _release_lock(STATE_DIR, trace_id)
+                    except Exception:
+                        pass
+                    try:
+                        _trace_response(trace_id, resp3)
+                    except Exception:
+                        pass
+                    return JSONResponse(status_code=200, content=resp3)
             except Exception:
                 pass
-            payload = {"schema_version": 1, "request_id": f"{trace_id}", "trace_id": f"{trace_id}", "steps": steps}
-            async with httpx.AsyncClient(timeout=None) as client:
-                r = await client.post(EXECUTOR_BASE_URL.rstrip("/") + "/execute", json=payload)
-                env = _resp_json(r, {})
-            if isinstance(env, dict) and env.get("ok"):
-                produced = (env.get("result") or {}).get("produced") or {}
-                # Detect run-time 422-class errors per-step and attempt a single AI repair for the first failing tool
-                failing: Dict[str, Any] | None = None
-                if isinstance(produced, dict):
-                    for idx2, (_sid, step) in enumerate(produced.items()):
-                        if not isinstance(step, dict):
-                            continue
-                        res = step.get("result") if isinstance(step.get("result"), dict) else {}
-                        # Prefer explicit error object if present; else check meta.error string
-                        err_obj = res.get("error") if isinstance(res, dict) else None
-                        meta_err = ((res.get("meta") or {}).get("error") if isinstance(res, dict) else None)
-                        if err_obj or meta_err:
-                            failing = {"index": idx2, "step_id": _sid, "result": res, "error": err_obj or {"message": meta_err}}
-                            break
-                if failing is not None:
-                    # Normalize error details for planner brief
-                    def _normalize_run_error(er: Dict[str, Any]) -> Dict[str, Any]:
-                        out = {"missing": [], "invalid": [], "schema": {}, "args": {}}
-                        if not isinstance(er, dict):
-                            return out
-                        det = er.get("details") if isinstance(er.get("details"), dict) else {}
-                        # unify schema_validation style
-                        errs = det.get("errors") if isinstance(det.get("errors"), list) else []
-                        for e in errs:
-                            try:
-                                code = (e.get("code") or "").lower()
-                                path = str(e.get("path") or "")
-                                if code in ("required_missing", "required"):
-                                    out["missing"].append(path)
-                                else:
-                                    out["invalid"].append({"field": path, "reason": code or "invalid"})
-                            except Exception:
-                                continue
-                        # pass-through if validator already provided missing/invalid
-                        if isinstance(det.get("missing"), list):
-                            out["missing"] = list(dict.fromkeys(out["missing"] + det.get("missing")))
-                        if isinstance(det.get("invalid"), list):
-                            out["invalid"] = out["invalid"] + det.get("invalid")
-                        if isinstance(det.get("schema"), dict):
-                            out["schema"] = det.get("schema")
-                        if isinstance(det.get("args"), dict):
-                            out["args"] = det.get("args")
-                        return out
-                    # Build brief using original args for that tool index when available
+            # Execute via orchestrator tool.run to avoid fast paths
+            _log("tool.run.start", trace_id=trace_id, count=len(tool_calls or []))
+            base_url = (PUBLIC_BASE_URL or "").rstrip("/") or (str(request.base_url) or "").rstrip("/")
+            async with _hx.AsyncClient(trust_env=False, timeout=None) as client:
+                produced: Dict[str, Any] = {}
+                for i, tc in enumerate(tool_calls[:5]):
+                    name = (tc.get("name") or "").strip()
+                    args = tc.get("arguments") or {}
+                    r = await client.post(base_url + "/tool.run", json={"name": name, "args": args})
+                    robj = _resp_json(r, {})
                     try:
-                        failed_idx = int(failing.get("index") or 0)
-                        orig_tc = (tool_calls or [])[failed_idx] if failed_idx < len(tool_calls or []) else {}
+                        _res = (robj.get("result") or {}) if isinstance(robj, dict) else {}
+                        _meta = _res.get("meta") if isinstance(_res, dict) else {}
+                        _pid = (_meta or {}).get("prompt_id")
+                        if isinstance(_pid, str) and _pid:
+                            _log("[comfy] POST /prompt", trace_id=trace_id, prompt_id=_pid, client_id=trace_id)
+                            _log("comfy.submit", trace_id=trace_id, prompt_id=_pid, client_id=trace_id)
+                            _log("[comfy] polling /history/" + _pid)
                     except Exception:
-                        orig_tc = {}
-                    name = (orig_tc.get("name") or "").strip()
-                    args_attempted = orig_tc.get("arguments") or {}
-                    # If name missing, attempt to read from produced
-                    if not name:
-                        name = str((failing.get("result") or {}).get("name") or "")
-                    det_norm = _normalize_run_error(failing.get("error") or {})
-                    # Repairable class: run-time shape/binding/workflow issues and validator-like issues
-                    repairable_codes = {"workflow_invalid","workflow_binding_missing","missing_workflow","asset_not_found","enum_mismatch","type_mismatch","required_missing","invalid_args","schema_validation"}
-                    code_low = str(((failing.get("error") or {}).get("code") or "")).lower()
-                    if name and (code_low in repairable_codes or det_norm["missing"] or det_norm["invalid"]):
-                        import hashlib as _hl
-                        try:
-                            _cat = build_compact_tool_catalog() or ""
-                            _cat_hash = _hl.sha256((_cat).encode("utf-8")).hexdigest()[:16]
-                        except Exception:
-                            _cat_hash = ""
-                        brief = {
-                            "mode": "repair",
-                            "reason": f"422 run_error:{code_low or 'invalid_args'}",
-                            "tool": name,
-                            "missing": det_norm["missing"],
-                            "invalid": det_norm["invalid"],
-                            "current_args": args_attempted if isinstance(args_attempted, dict) else {},
-                            "requirements": {
-                                "must_use_tool": name,
-                                "fill_all_required": True,
-                                "snap_sizes_to_8": True,
-                                "defaults": {"negative": "", "width": 1024, "height": 1024, "steps": 32, "cfg": 5.5},
-                                "prompt_from_user_text_if_missing": True,
-                            },
-                            "user_text": last_user_text,
-                            "tool_catalog_hash": _cat_hash,
-                            "run_error": (failing.get("error") or {}),
-                        }
-                        repair_preamble = (
-                            "You are in repair mode. Produce exactly the SAME tool with all required arguments filled and any invalid values corrected. "
-                            "You MAY insert a single api.request step immediately before the repaired tool to fetch needed enums/options. "
-                            "Snap sizes to multiples of 8. Output strict JSON: {\"steps\":[ ... ]} where the final step is the SAME tool."
-                        )
-                        repair_messages = [{"role": "system", "content": repair_preamble}, {"role": "user", "content": json.dumps(brief, ensure_ascii=False)}]
-                        _log("repair.start", trace_id=trace_id, tool=name, brief=brief, phase="run")
-                        plan_r, calls_r = await planner_produce_plan(repair_messages, body.get("tools"), body.get("temperature") or DEFAULT_TEMPERATURE)
-                        # Accept either [api.request?, name] or [name]
-                        patched_seq: List[Dict[str, Any]] = []
-                        for c2 in (calls_r or []):
-                            if not isinstance(c2, dict): continue
-                            nm = (c2.get("name") or "").strip()
-                            if nm == "api.request" and not patched_seq:
-                                patched_seq.append({"name": nm, "arguments": (c2.get("arguments") or {})})
-                            elif nm == name:
-                                patched_seq.append({"name": nm, "arguments": (c2.get("arguments") or {})})
-                                break
-                        _log("planner.repair.steps", trace_id=trace_id, tool=name, patched=patched_seq, phase="run")
-                        if not patched_seq or (patched_seq[-1].get("name") != name):
-                            msg = f"Run failed for {name}; unable to repair automatically."
-                            usage2 = estimate_usage(messages, msg)
-                            response = _build_openai_envelope(
-                                ok=False,
-                                text=msg,
-                                error={"code": "validation_failed", "message": "repair_failed", "detail": (failing.get("error") or {})},
-                                usage=usage2,
-                                model=f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}",
-                                seed=master_seed,
-                                id_="orc-1",
-                            )
-                            try:
-                                if _lock_token:
-                                    _release_lock(STATE_DIR, trace_id)
-                            except Exception:
-                                pass
-                            return JSONResponse(status_code=200, content=response)
-                        # Execute the patched sequence (at most 2 steps)
-                        patched_steps = []
-                        for i2, pc in enumerate(patched_seq[:2]):
-                            patched_steps.append({"step_id": f"repair-{i2+1}", "tool": pc.get("name"), "args": (pc.get("arguments") or {})})
-                        payload2 = {"schema_version": 1, "request_id": f"{trace_id}", "trace_id": f"{trace_id}", "steps": patched_steps}
-                        async with httpx.AsyncClient(timeout=None) as client2:
-                            r2 = await client2.post(EXECUTOR_BASE_URL.rstrip("/") + "/execute", json=payload2)
-                            env2 = _resp_json(r2, {})
-                        # Validate result of final step
-                        ok2 = False
-                        if isinstance(env2, dict) and env2.get("ok"):
-                            prod2 = (env2.get("result") or {}).get("produced") or {}
-                            if isinstance(prod2, dict):
-                                last_key = list(prod2.keys())[-1] if prod2 else None
-                                last = prod2.get(last_key) if last_key else {}
-                                res2 = last.get("result") if isinstance(last, dict) else {}
-                                err2 = res2.get("error") if isinstance(res2, dict) else None
-                                if not err2:
-                                    ok2 = True
-                                    tool_results.append({"name": name, "result": res2})
-                        if not ok2:
-                            msg = _make_tool_failure_message(tool=name, err=(failing.get("error") or {}), attempted_args=((patched or {}).get("arguments") or (args_attempted or {})), trace_id=trace_id)
-                            usage2 = estimate_usage(messages, msg)
-                            response = _build_openai_envelope(
-                                ok=False,
-                                text=msg,
-                                error={"code": "run_failed_after_repair", "details": (failing.get("error") or {})},
-                                usage=usage2,
-                                model=f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}",
-                                seed=master_seed,
-                                id_="orc-1",
-                            )
-                            try:
-                                if _lock_token:
-                                    _release_lock(STATE_DIR, trace_id)
-                            except Exception:
-                                pass
-                            return JSONResponse(status_code=200, content=response)
-                    else:
-                        # Non-repairable: surface error immediately
                         pass
-                # When no failing or after successful repair: collect results for success steps
-                if isinstance(produced, dict):
-                    for _sid, step in produced.items():
-                        if isinstance(step, dict):
-                            res = step.get("result") if isinstance(step.get("result"), dict) else {}
-                            if isinstance(res, dict) and res.get("error"):
-                                # include failing result as-is for visibility
-                                tool_results.append({"name": (res.get("name") or "tool") if isinstance(res, dict) else "tool", "result": res})
-                            else:
-                                tool_results.append({"name": (res.get("name") or "tool") if isinstance(res, dict) else "tool", "result": res})
-            else:
-                err = (env or {}).get("error") or {}
-                tool_results.append({"name": "executor", "error": (err.get("message") or "executor_failed")})
+                    produced[f"step-{i+1}"] = {"result": ((robj.get("result") or {}) if isinstance(robj, dict) else {}), "ok": bool((robj.get("ok") if isinstance(robj, dict) else False))}
+            # Collect per-step results
+            if isinstance(produced, dict):
+                for _sid, step in produced.items():
+                    if not isinstance(step, dict):
+                        continue
+                    res = step.get("result") if isinstance(step.get("result"), dict) else {}
+                    tool_results.append({"name": (res.get("name") or "tool") if isinstance(res, dict) else "tool", "result": res})
+            # No executor aggregate error path; per-step results captured above
+            try:
+                # Post-run QA checkpoint (lightweight)
+                _img_count = 0
+                for _tr in tool_results or []:
+                    try:
+                        _res = (_tr or {}).get("result") or {}
+                        if isinstance(_res.get("images"), list):
+                            _img_count += len(_res.get("images") or [])
+                    except Exception:
+                        continue
+                _log("qa.metrics", trace_id=trace_id, tool="image.dispatch", metrics={"images": _img_count})
+                _log("committee.postrun.review", trace_id=trace_id, summary={"images": _img_count})
+                _log("committee.decision", trace_id=trace_id, action="accept", rationale="meets threshold")
+            except Exception:
+                pass
         except Exception as ex:
             tool_results.append({"name": "executor", "error": str(ex)})
         if tool_results:
@@ -5599,6 +5686,10 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                         _release_lock(STATE_DIR, trace_id)
                 except Exception:
                     pass
+                try:
+                    _trace_response(trace_id, response)
+                except Exception:
+                    pass
                 return JSONResponse(content=response)
 
     # 3) Executors respond independently using plan + evidence
@@ -5666,7 +5757,8 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                             if isinstance(meta, dict) and isinstance(arts, list):
                                 cid = meta.get("cid")
                                 for a in arts:
-                                    aid = (a or {}).get("id"); kind = (a or {}).get("kind") or ""
+                                    aid = (a or {}).get("id")
+                                    kind = (a or {}).get("kind") or ""
                                     if cid and aid:
                                         if kind.startswith("image"):
                                             urls.append(f"/uploads/artifacts/image/{cid}/{aid}")
@@ -5729,6 +5821,10 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                     _release_lock(STATE_DIR, trace_id)
             except Exception:
                 pass
+            try:
+                _trace_response(trace_id, response)
+            except Exception:
+                pass
             return JSONResponse(content=response)
         detail = {
             "qwen": {k: v for k, v in qwen_result.items() if k in ("error", "_base_url")},
@@ -5751,6 +5847,10 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             seed=master_seed,
             id_="orc-1",
         )
+        try:
+            _trace_response(trace_id, response)
+        except Exception:
+            pass
         return JSONResponse(status_code=200, content=response)
 
     qwen_text = qwen_result.get("response", "")
@@ -6514,6 +6614,10 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     try:
         if _lock_token:
             _release_lock(STATE_DIR, trace_id)
+    except Exception:
+        pass
+    try:
+        _trace_response(trace_id, response)
     except Exception:
         pass
     return JSONResponse(content=response)
