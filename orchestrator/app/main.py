@@ -906,7 +906,7 @@ from .pipeline.args_prep import ensure_object_args as args_ensure_object_args, f
 from .pipeline.assets import collect_urls as assets_collect_urls, count_images as assets_count_images  # type: ignore
 from .pipeline.executor_gateway import execute as gateway_execute  # type: ignore
 from .pipeline.catalog import build_allowed_tool_names as catalog_allowed, validate_tool_names as catalog_validate  # type: ignore
-from .pipeline.finalize import finalize_tool_phase as finalize_tool_phase  # type: ignore
+from .pipeline.finalize import finalize_tool_phase as finalize_tool_phase, compose_openai_response as compose_openai_response  # type: ignore
 from .pipeline.request_shaping import shape_request as shape_request  # type: ignore
 
 # ---- Single-exit helpers (state + finalization) ----
@@ -6396,23 +6396,18 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     except Exception:
         final_env = {}
 
-    response = _build_openai_envelope(
-        ok=True,
-        text=display_content,
-        error=None,
-        usage=usage_with_wall,
-        model=f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}",
-        seed=master_seed,
-        id_="orc-1",
+    # Compose final OpenAI-compatible response envelope (prebuilt respected)
+    response = compose_openai_response(
+        display_content,
+        usage_with_wall,
+        f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}",
+        master_seed,
+        "orc-1",
+        envelope_builder=_build_openai_envelope,
+        prebuilt=(response_prebuilt if 'response_prebuilt' in locals() else None),
+        artifacts=(artifacts if isinstance(artifacts, dict) else None),
+        final_env=None,  # will be attached below after bump/assert/stamp
     )
-    # Prefer any prebuilt response (from earlier success/failure branches) to enforce single-exit
-    try:
-        if 'response_prebuilt' in locals() and response_prebuilt is not None:
-            response = response_prebuilt
-    except Exception:
-        logging.debug("response_prebuilt override failed:\n%s", traceback.format_exc())
-    if artifacts:
-        response["artifacts"] = artifacts
     if isinstance(final_env, dict) and final_env:
         try:
             final_env = _env_bump(final_env); _env_assert(final_env)
