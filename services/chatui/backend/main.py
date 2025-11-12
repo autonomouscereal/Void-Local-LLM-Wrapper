@@ -313,19 +313,7 @@ def _build_openai_messages(base: List[Dict[str, Any]], attachments: List[Dict[st
     return [sys] + base
 
 
-@app.post("/api/conversations/{cid}/chat")
-async def chat(cid: int, request: Request, background_tasks: BackgroundTasks):
-    return JSONResponse(status_code=410, content={"error": "proxy disabled; call orchestrator directly"})
 
-
-@app.options("/api/conversations/{cid}/chat")
-async def chat_preflight(cid: int):
-    return Response(status_code=204, headers={
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "POST, OPTIONS",
-        "Access-Control-Allow-Headers": "*",
-        "Access-Control-Allow-Private-Network": "true",
-    })
 
 
 @app.options("/api/{path:path}")
@@ -353,14 +341,10 @@ async def echo(body: Dict[str, Any]):
     return Response(content=b, media_type="application/json", headers=headers)
 
 
-@app.post("/api/passthrough")
-async def passthrough(body: Dict[str, Any]):
-    return JSONResponse(status_code=410, content={"error": "proxy disabled; call orchestrator directly"})
 
 
-@app.get("/api/tool.stream")
-async def tool_stream(name: str, request: Request):
-    return JSONResponse(status_code=410, content={"error": "proxy disabled; call orchestrator directly"})
+
+
 
 @app.options("/api/chat")
 async def chat_alt_preflight():
@@ -372,9 +356,7 @@ async def chat_alt_preflight():
     })
 
 
-@app.get("/api/orchestrator/diagnostics")
-async def orch_diag():
-    return JSONResponse(status_code=410, content={"error": "proxy disabled; call orchestrator directly"})
+
 
 
 @app.get("/favicon.ico")
@@ -446,9 +428,7 @@ async def healthz():
     return {"status": "ok"}
 
 
-@app.get("/uploads/{path:path}")
-async def uploads_proxy(path: str, request: Request):
-    return JSONResponse(status_code=410, content={"error": "proxy disabled; use orchestrator /uploads directly"})
+
 
 
 @app.websocket("/api/ws")
