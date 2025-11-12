@@ -5443,7 +5443,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         tool_calls = args_ensure_object_args(tool_calls, _parse_json_text)
 
     # Pre-validate tool names against the registered catalog to avoid executor 404s
-    allowed_tools = catalog_allowed()
+    allowed_tools = catalog_allowed(get_builtin_tools_schema)
     _, unknown = catalog_validate(tool_calls or [], allowed_tools)
     if unknown:
         # Attempt a single re-plan constrained to allowed tool names
@@ -6544,7 +6544,7 @@ async def refs_resolve(body: Dict[str, Any]):
             if not rec:
                 trace_append("memory_ref", {"cid": cid, "text": text, "kind": kind, "found": False})
                 return {"ok": False, "matches": []}
-        trace_append("memory_ref", {"cid": cid, "text": text, "kind": kind, "found": True, "path": rec.get("path"), "source": ("cid" if cid else "global")})
+            trace_append("memory_ref", {"cid": cid, "text": text, "kind": kind, "found": True, "path": rec.get("path"), "source": ("cid" if cid else "global")})
         return {"ok": True, "matches": [rec]}
     except Exception as ex:
         return JSONResponse(status_code=400, content={"error": str(ex)})

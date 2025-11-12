@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Set, Tuple
-
-from app.tools_schema import get_builtin_tools_schema  # type: ignore
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 
-def build_allowed_tool_names() -> Set[str]:
+def build_allowed_tool_names(builtins_provider: Optional[Callable[[], List[Dict[str, Any]]]] = None) -> Set[str]:
 	"""
 	Collect allowed tool names from the route registry and built-in OpenAI-style schema.
 	"""
@@ -16,10 +14,12 @@ def build_allowed_tool_names() -> Set[str]:
 		_TOOL_REG = {}
 	allowed: Set[str] = set([str(k) for k in (_TOOL_REG or {}).keys()])
 	# Builtins (OpenAI-style)
-	try:
-		builtins = get_builtin_tools_schema()
-	except Exception:
-		builtins = []
+	builtins: List[Dict[str, Any]] = []
+	if callable(builtins_provider):
+		try:
+			builtins = builtins_provider() or []
+		except Exception:
+			builtins = []
 	for t in (builtins or []):
 		try:
 			fn = (t.get("function") or {})
