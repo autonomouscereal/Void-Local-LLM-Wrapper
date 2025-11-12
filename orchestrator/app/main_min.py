@@ -32,6 +32,8 @@ app.include_router(logs_routes.router)
 app.include_router(tools_routes.router)
 app.include_router(toolrun_routes.router)
 
+# IMPORTANT (policy): Do not change the container workpath/module path.
+# All imports assume the 'app.*' module namespace rooted at /app.
 # Short-circuit all preflight OPTIONS with 204 + full headers — must be outermost
 app.add_middleware(Preflight204Middleware)
 

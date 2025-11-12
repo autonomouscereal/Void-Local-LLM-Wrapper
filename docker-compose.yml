@@ -270,6 +270,11 @@ services:
     restart: unless-stopped
     network_mode: host
     
+    # IMPORTANT (policy): Workpath/imports are FIXED.
+    # - Do NOT set PYTHONPATH here.
+    # - Do NOT use uvicorn --app-dir or change the module path.
+    # - The app must be imported as 'app.*' from /app inside the image.
+    # - Changing workpath/module path is FORBIDDEN.
     environment:
       - PYTHONUNBUFFERED=1
       - FILM2_MODELS=/opt/models
@@ -322,6 +327,8 @@ services:
       - VLM_API_URL=http://127.0.0.1:8050
       - OCR_API_URL=http://127.0.0.1:8070
       - TEACHER_API_URL=http://127.0.0.1:8097
+    # DO NOT change this command to include --app-dir or a different module path.
+    # Workpath changes are forbidden; keep 'app.main_min:app'.
     command: ["uvicorn","app.main_min:app","--host","0.0.0.0","--port","8000","--log-level","info","--access-log","--use-colors"]
     volumes:
       - ./:/workspace
