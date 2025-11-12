@@ -120,7 +120,6 @@ from .artifacts.manifest import add_manifest_row as _man_add, write_manifest_ato
 from .datasets.trace import append_sample as _trace_append
 from .review.referee import build_delta_plan as _committee
 from .context.index import add_artifact as _ctx_add
-from .routes.tools import _REGISTRY as _TOOL_REG  # type: ignore
 
 from .pipeline.subject_resolver import resolve_subject_canon as _resolve_subject_canon  # type: ignore
 from .pipeline.roe_store import load_roe_digest as _roe_load, save_roe_digest as _roe_save  # type: ignore
@@ -4830,7 +4829,15 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     # Emit planner.steps and catalog hash for traceability (derived from allowed tool names)
     import hashlib as _hl
     def _compute_tools_hash() -> str:
-        names = set([str(k) for k in ((_TOOL_REG or {}).keys())])
+        names = set()
+        # include client-declared tool names if provided
+        client_tools = body.get("tools") if isinstance(body.get("tools"), list) else []
+        for t in (client_tools or []):
+            if isinstance(t, dict):
+                nm = (t.get("function") or {}).get("name") or t.get("name")
+                if isinstance(nm, str) and nm.strip():
+                    names.add(nm.strip())
+        # include built-in tool names
         builtins = get_builtin_tools_schema()
         for t in (builtins or []):
             fn = (t.get("function") or {})
@@ -4884,7 +4891,14 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     # If planner returned no tools or unnamed tools, run a strict re-plan to force valid names from the catalog
     # Build allowed tool names (registry + builtins) early, since we reference them in name-fix logic
     builtins = get_builtin_tools_schema()
-    allowed_tools = set([str(k) for k in (_TOOL_REG or {}).keys()])
+    # Allow only built-ins + client-declared tools
+    allowed_tools = set()
+    client_tools = body.get("tools") if isinstance(body.get("tools"), list) else []
+    for t in (client_tools or []):
+        if isinstance(t, dict):
+            nm = (t.get("function") or {}).get("name") or t.get("name")
+            if isinstance(nm, str) and nm.strip():
+                allowed_tools.add(nm.strip())
     for t in (builtins or []):
         fn = (t.get("function") or {})
         nm = fn.get("name")
@@ -4975,7 +4989,13 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         import hashlib as _hl
         # Compute catalog hash for brief (names-only, unified with CO)
         def _compute_tools_hash() -> str:
-            names = set([str(k) for k in ((_TOOL_REG or {}).keys())])
+            names = set()
+            client_tools = body.get("tools") if isinstance(body.get("tools"), list) else []
+            for t in (client_tools or []):
+                if isinstance(t, dict):
+                    nm = (t.get("function") or {}).get("name") or t.get("name")
+                    if isinstance(nm, str) and nm.strip():
+                        names.add(nm.strip())
             builtins = get_builtin_tools_schema()
             for t in (builtins or []):
                 fn = (t.get("function") or {})
