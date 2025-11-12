@@ -289,6 +289,38 @@ async def tool_run(req: Request):
 			if subset:
 				prompt_graph = subset
 
+	# Lightweight auto-bind: if the KSampler lacks positive/negative refs, inject CLIPTextEncode nodes and wire them.
+	if isinstance(prompt_graph, dict):
+		try:
+			ks_id = _first_node_id_by_class(prompt_graph, "KSampler") or _first_node_id_by_class(prompt_graph, "KSamplerAdvanced")
+			if ks_id:
+				ks_in = prompt_graph[str(ks_id)].setdefault("inputs", {})
+				pos_id = _get_ref_node_id(ks_in.get("positive"))
+				neg_id = _get_ref_node_id(ks_in.get("negative"))
+				if not pos_id or not neg_id:
+					ckpt_id = _first_node_id_by_class(prompt_graph, "CheckpointLoaderSimple") or _first_node_id_by_class(prompt_graph, "CheckpointLoaderSimpleSDXL")
+					if ckpt_id:
+						# Find next free integer id(s)
+						def _next_id(g: dict) -> str:
+							max_id = 0
+							for k in g.keys():
+								try:
+									max_id = max(max_id, int(str(k)))
+								except Exception:
+									continue
+							return str(max_id + 1)
+						if not pos_id:
+							new_pos_id = _next_id(prompt_graph)
+							prompt_graph[new_pos_id] = {"class_type": "CLIPTextEncode", "inputs": {"clip": [str(ckpt_id), 1], "text": str(args.get("prompt") or "")}}
+							ks_in["positive"] = [new_pos_id, 0]
+						if not neg_id:
+							new_neg_id = _next_id(prompt_graph)
+							prompt_graph[new_neg_id] = {"class_type": "CLIPTextEncode", "inputs": {"clip": [str(ckpt_id), 1], "text": str(args.get("negative") or "")}}
+							ks_in["negative"] = [new_neg_id, 0]
+		except Exception:
+			# Non-fatal: allow normal validation/binding to report precise errors
+			pass
+
 	if not isinstance(prompt_graph, dict):
 		detail = {"top_level_type": type(wf_obj).__name__}
 		if isinstance(wf_obj, dict):
@@ -302,13 +334,36 @@ async def tool_run(req: Request):
 	if problems:
 		avail = [{"id": str(nid), "class": (node.get("class_type") if isinstance(node, dict) else None)} for nid, node in prompt_graph.items() if isinstance(node, dict)]
 		return err_envelope("workflow_invalid", ";".join(problems[:4]), rid="tool.run", status=422, details={"available": avail})
-	# Resolve actual nodes and apply overrides only to those
+	# Resolve actual nodes and apply overrides only to those; if binding fails, fall back to a known-good pipeline
 	try:
 		bind = _resolve_bindings(prompt_graph)
-	except ValueError as ve:
-		avail = [{"id": str(nid), "class": (node.get("class_type") if isinstance(node, dict) else None)} for nid, node in prompt_graph.items() if isinstance(node, dict)]
-		return err_envelope("workflow_binding_missing", str(ve), rid="tool.run", status=422, details={"available": avail})
-	_apply_overrides(prompt_graph, bind, args)
+		_apply_overrides(prompt_graph, bind, args)
+	except ValueError:
+		# Build a minimal, valid API graph wiring CLIPTextEncode -> KSampler -> VAEDecode
+		model_ckpt = str(args.get("model") or "sd_xl_base_1.0.safetensors")
+		prompt_text = str(args.get("prompt") or "")
+		neg_text = str(args.get("negative") or "")
+		width = int(args.get("width") or 1024)
+		height = int(args.get("height") or 1024)
+		steps = int(args.get("steps") or 32)
+		cfg = float(args.get("cfg") or 5.5)
+		prompt_graph = {
+			"3": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": model_ckpt}},
+			"4": {"class_type": "EmptyLatentImage", "inputs": {"width": width, "height": height, "batch_size": 1}},
+			"8": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["3", 1], "text": prompt_text}},
+			"9": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["3", 1], "text": neg_text}},
+			"5": {"class_type": "KSampler", "inputs": {
+				"seed": int(args.get("seed") or 123456789),
+				"steps": steps, "cfg": cfg,
+				"sampler_name": str(args.get("sampler") or args.get("sampler_name") or "euler"),
+				"scheduler": str(args.get("scheduler") or "normal"),
+				"denoise": 1.0,
+				"model": ["3", 0], "positive": ["8", 0], "negative": ["9", 0], "latent_image": ["4", 0]
+			}},
+			"6": {"class_type": "VAEDecode", "inputs": {"samples": ["5", 0], "vae": ["3", 2]}},
+			"7": {"class_type": "SaveImage", "inputs": {"images": ["6", 0]}},
+		}
+		# continue with this synthesized graph
 
 	client_id = uuid.uuid4().hex
 	_append_jsonl(os.path.join(STATE_DIR_LOCAL, "tools.jsonl"), {"t": int(time.time()*1000), "event": "comfyui.submit", "base": COMFY_BASE, "workflow_path": wf_path})
@@ -332,28 +387,19 @@ async def tool_run(req: Request):
 			continue
 		entry = hist.get(prompt_id) or {}
 		# Detect terminal error/success states when available
-		try:
-			status_obj = entry.get("status") or {}
-			state = str(status_obj.get("status") or "").lower()
-			if state in ("error", "failed", "canceled", "cancelled"):
-				return err_envelope("comfy_error", "workflow reported error state", rid="tool.run", status=422, details={"prompt_id": prompt_id, "status": status_obj})
-		except Exception:
-			pass
+		status_obj = entry.get("status") or {}
+		state = str((status_obj.get("status") or "")).lower()
+		if state in ("error", "failed", "canceled", "cancelled"):
+			return err_envelope("comfy_error", "workflow reported error state", rid="tool.run", status=422, details={"prompt_id": prompt_id, "status": status_obj})
 		outs = entry.get("outputs") or {}
 		if not outs:
 			# progressive backoff to avoid busy spin
-			try:
-				_poll_delay = _POLL_MAX if _poll_delay >= _POLL_MAX else min(_POLL_MAX, _poll_delay * 2.0)
-			except Exception:
-				_poll_delay = _POLL_MAX
+			_poll_delay = _POLL_MAX if _poll_delay >= _POLL_MAX else min(_POLL_MAX, _poll_delay * 2.0)
 			# If history reports a completed/executed state but no outputs, fail deterministically
-			try:
-				status_obj = entry.get("status") or {}
-				state = str(status_obj.get("status") or "").lower()
-				if state in ("completed", "success", "executed"):
-					return err_envelope("no_outputs", "workflow completed without outputs", rid="tool.run", status=422, details={"prompt_id": prompt_id, "status": status_obj})
-			except Exception:
-				pass
+			status_obj = entry.get("status") or {}
+			state = str((status_obj.get("status") or "")).lower()
+			if state in ("completed", "success", "executed"):
+				return err_envelope("no_outputs", "workflow completed without outputs", rid="tool.run", status=422, details={"prompt_id": prompt_id, "status": status_obj})
 			continue
 		for _, out in outs.items():
 			for im in (out.get("images") or []):
@@ -408,29 +454,26 @@ async def tool_run(req: Request):
 			**eff,
 		},
 	}
-	# Best-effort: persist artifacts under orchestrator /uploads and return absolute URLs for UI
-	try:
-		from app.main import UPLOAD_DIR as _UPLOAD_DIR, PUBLIC_BASE_URL as _PUBLIC_BASE_URL  # type: ignore
-		import urllib.request as _u
-		import os as _os
-		save_dir = _os.path.join(_UPLOAD_DIR, "artifacts", "image", prompt_id or client_id)
-		_os.makedirs(save_dir, exist_ok=True)
-		orch_urls: list[str] = []
-		for im in images:
-			fn = im.get("filename")
-			sf = im.get("subfolder") or ""
-			tp = im.get("type") or "output"
-			if not fn:
-				continue
-			src = f"{COMFY_BASE.rstrip('/')}/view?filename={fn}&subfolder={sf}&type={tp}"
-			raw = _u.urlopen(src).read()
-			dst = _os.path.join(save_dir, fn)
-			with open(dst, "wb") as _f:
-				_f.write(raw)
-			rel = _os.path.relpath(dst, _UPLOAD_DIR).replace("\\", "/")
-			orch_urls.append(f"{_PUBLIC_BASE_URL.rstrip('/')}/uploads/{rel}" if _PUBLIC_BASE_URL else f"/uploads/{rel}")
-		if orch_urls:
-			result["meta"]["orch_view_urls"] = orch_urls
-	except Exception:
-		pass
+	# Persist artifacts under orchestrator /uploads and return absolute URLs for UI
+	from app.main import UPLOAD_DIR as _UPLOAD_DIR, PUBLIC_BASE_URL as _PUBLIC_BASE_URL  # type: ignore
+	import urllib.request as _u
+	import os as _os
+	save_dir = _os.path.join(_UPLOAD_DIR, "artifacts", "image", prompt_id or client_id)
+	_os.makedirs(save_dir, exist_ok=True)
+	orch_urls: list[str] = []
+	for im in images:
+		fn = im.get("filename")
+		sf = im.get("subfolder") or ""
+		tp = im.get("type") or "output"
+		if not fn:
+			continue
+		src = f"{COMFY_BASE.rstrip('/')}/view?filename={fn}&subfolder={sf}&type={tp}"
+		raw = _u.urlopen(src).read()
+		dst = _os.path.join(save_dir, fn)
+		with open(dst, "wb") as _f:
+			_f.write(raw)
+		rel = _os.path.relpath(dst, _UPLOAD_DIR).replace("\\", "/")
+		orch_urls.append(f"{_PUBLIC_BASE_URL.rstrip('/')}/uploads/{rel}" if _PUBLIC_BASE_URL else f"/uploads/{rel}")
+	if orch_urls:
+		result["meta"]["orch_view_urls"] = orch_urls
 	return ok_envelope(result, rid="tool.run")

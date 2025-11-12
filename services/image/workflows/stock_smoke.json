@@ -1,10 +1,13 @@
 {
   "prompt": {
     "3": { "class_type": "CheckpointLoaderSimple", "inputs": { "ckpt_name": "sd_xl_base_1.0.safetensors" } },
-    "4": { "class_type": "EmptyLatentImage", "inputs": { "width": 512, "height": 512, "batch_size": 1 } },
+    "4": { "class_type": "EmptyLatentImage", "inputs": { "width": 1024, "height": 1024, "batch_size": 1 } },
+    "8": { "class_type": "CLIPTextEncode", "inputs": { "clip": ["3", 1], "text": " " } },
+    "9": { "class_type": "CLIPTextEncode", "inputs": { "clip": ["3", 1], "text": "" } },
     "5": { "class_type": "KSampler", "inputs": {
-      "seed": 123456789, "steps": 10, "cfg": 5.0, "sampler_name": "euler",
-      "scheduler": "normal", "denoise": 1.0, "model": ["3", 0], "latent_image": ["4", 0]
+      "seed": 123456789, "steps": 32, "cfg": 5.5, "sampler_name": "euler",
+      "scheduler": "normal", "denoise": 1.0,
+      "model": ["3", 0], "positive": ["8", 0], "negative": ["9", 0], "latent_image": ["4", 0]
     } },
     "6": { "class_type": "VAEDecode", "inputs": { "samples": ["5", 0], "vae": ["3", 2] } },
     "7": { "class_type": "SaveImage", "inputs": { "images": ["6", 0] } }
