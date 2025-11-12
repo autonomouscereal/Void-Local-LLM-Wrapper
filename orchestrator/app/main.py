@@ -666,6 +666,127 @@ def _build_openai_envelope(*, ok: bool, text: str, error: Dict[str, Any] | None,
         "seed": seed,
     }
 
+def _friendly_failure_text(name: str, attempted_args: Dict[str, Any], err: Dict[str, Any], trace_id: str) -> str:
+    code = (err.get("code") or "validation_error")
+    details = err.get("details") or {}
+    missing = details.get("missing") or []
+    invalid = details.get("invalid") or []
+    # fallback: derive from schema_validation errors array
+    if (not missing) and isinstance(details.get("errors"), list):
+        miss = [e.get("path") for e in details["errors"] if (e.get("code") in ("required_missing", "required"))]
+        missing = [m for m in miss if m]
+        inv = [{"field": e.get("path"), "reason": e.get("code")} for e in details["errors"] if (e.get("code") not in ("required_missing","required"))]
+        invalid = [x for x in inv if x.get("field")]
+    lines = [f"Couldn't run {name or 'tool'} (code: `{code}`)."]
+    if missing:
+        try:
+            lines.append("Missing: " + ", ".join(f"`{m}`" for m in missing))
+        except Exception:
+            pass
+    if invalid:
+        try:
+            lines.append("Invalid: " + ", ".join(f"`{x.get('field')}` ({x.get('reason')})" for x in invalid))
+        except Exception:
+            pass
+    tried = {k: attempted_args.get(k) for k in ("prompt","negative","width","height","steps","cfg") if isinstance(attempted_args, dict) and (k in attempted_args)}
+    if tried:
+        try:
+            import json as _json
+            lines.append("AI tried args: `" + _json.dumps(tried, separators=(',',':')) + "`")
+        except Exception:
+            pass
+    if trace_id:
+        lines.append(f"trace: `{trace_id}`")
+    lines.append("Tip: type any missing values (e.g., `prompt: ...`) and resend; the AI will fill the rest.")
+    return "\n".join(lines)
+
+_DISPLAY_KEYS = ("prompt","negative","width","height","steps","cfg","seconds","fps","model","workflow_path")
+def _summarize_invalid(errors: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    out: List[Dict[str, str]] = []
+    for e in (errors or []):
+        code = str(e.get("code") or "")
+        path = str(e.get("path") or e.get("field") or "")
+        exp  = e.get("expected") or e.get("allowed")
+        got  = e.get("got")
+        reason = code
+        if code == "enum_mismatch":
+            reason = f"must be one of {exp}"
+        elif code == "type_mismatch":
+            reason = f"type {exp}, got {type(got).__name__}"
+        elif code == "schema_validation":
+            reason = "schema mismatch"
+        elif code == "workflow_invalid":
+            reason = "invalid workflow graph (topology/keys)"
+        elif code == "workflow_binding_missing":
+            reason = "missing required node binding"
+        out.append({"field": path, "reason": reason})
+    return out
+
+def _make_tool_failure_message(*, tool: str, err: Dict[str, Any], attempted_args: Dict[str, Any], trace_id: str) -> str:
+    code    = str((err.get("code") or "tool_error"))
+    details = err.get("details") or {}
+    missing = list(details.get("missing") or [])
+    invalid = list(details.get("invalid") or [])
+    if not (missing or invalid) and isinstance(details.get("errors"), list):
+        m, inv = [], []
+        for e in details["errors"]:
+            if e.get("code") in ("required_missing","required"):
+                m.append(e.get("path"))
+            else:
+                inv.append({"field": e.get("path"), "reason": e.get("code")})
+        missing, invalid = m, inv
+    inv_rows = _summarize_invalid(details.get("errors") or []) or invalid
+    tried    = {k: attempted_args.get(k) for k in _DISPLAY_KEYS if isinstance(attempted_args, dict) and (k in attempted_args)}
+    lines: List[str] = []
+    lines.append(f"### ❌ {tool or 'tool'} failed ({code})")
+    bullets: List[str] = []
+    if missing:
+        try:
+            bullets.append("**Missing:** " + ", ".join(f"`{m}`" for m in missing))
+        except Exception:
+            pass
+    if inv_rows:
+        try:
+            bullets.append("**Invalid:** " + ", ".join(f"`{r.get('field')}` ({r.get('reason')})" for r in inv_rows if r.get("field")))
+        except Exception:
+            pass
+    if bullets:
+        lines.extend(bullets)
+    else:
+        lines.append("**Reason:** See diagnostic details below.")
+    if tried:
+        import json as _json
+        lines.append("**AI attempted args:**")
+        lines.append("```json")
+        lines.append(_json.dumps(tried, separators=(',',':'), ensure_ascii=False))
+        lines.append("```")
+    # Fix template
+    fix_args = dict(tried)
+    for m in (missing or []):
+        fix_args[m] = "<fill>"
+    try:
+        if "width" in fix_args and isinstance(fix_args.get("width"), (int, float)):
+            fix_args["width"]  = int(fix_args["width"])//8*8
+        if "height" in fix_args and isinstance(fix_args.get("height"), (int, float)):
+            fix_args["height"] = int(fix_args["height"])//8*8
+    except Exception:
+        pass
+    import json as _json
+    lines.append("**Try this and resend (the AI will fill the rest):**")
+    lines.append("```json")
+    lines.append(_json.dumps({"tool": tool, "args": fix_args}, ensure_ascii=False))
+    lines.append("```")
+    auto: List[str] = []
+    if code in ("schema_validation","invalid_args","required_missing","type_mismatch","enum_mismatch"):
+        auto.append("re-validate once after you include the missing/invalid fields")
+    if code in ("workflow_invalid","workflow_binding_missing","missing_workflow"):
+        auto.append("coerce/inspect the workflow and bind required nodes once")
+    if auto:
+        lines.append("**System next:** " + "; ".join(auto) + ".")
+    if trace_id:
+        lines.append(f"_trace: `{trace_id}`_")
+    return "\n".join(lines)
+
 
 def _load_wrapper_config() -> None:
     global WRAPPER_CONFIG, WRAPPER_CONFIG_HASH
@@ -4886,15 +5007,18 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         for c in calls:
             if not isinstance(c, dict):
                 continue
-            if c.get("name"):
-                # already normalized
+            # Accept normalized or "steps" style
+            if c.get("name") or c.get("tool"):
+                nm = (c.get("name") or c.get("tool") or "")
                 args = c.get("arguments")
+                if not isinstance(args, dict):
+                    args = c.get("args") if isinstance(c.get("args"), dict) else {}
                 if isinstance(args, str):
                     try:
                         args = parser.parse(args, {})
                     except Exception:
                         args = {"_raw": args}
-                out.append({"name": str(c.get("name")), "arguments": (args or {})})
+                out.append({"name": str(nm), "arguments": (args or {})})
                 continue
             if c.get("type") == "function":
                 fn = c.get("function") or {}
@@ -5128,8 +5252,10 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 repair_messages = [{"role": "system", "content": repair_preamble}, {"role": "user", "content": json.dumps(brief, ensure_ascii=False)}]
                 _log("repair.start", trace_id=trace_id, tool=name, brief=brief)
                 _plan2, calls2 = await planner_produce_plan(repair_messages, body.get("tools"), body.get("temperature") or DEFAULT_TEMPERATURE)
+                # Normalize repair outputs to {name, arguments}
+                calls2_norm = _normalize_tool_calls(calls2)
                 patched = None
-                for c2 in (calls2 or []):
+                for c2 in (calls2_norm or []):
                     try:
                         if (c2.get("name") or "").strip() == name:
                             patched = {"name": name, "arguments": (c2.get("arguments") or {})}
@@ -5139,7 +5265,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 _log("planner.repair.steps", trace_id=trace_id, tool=name, patched=patched or {})
                 if not patched:
                     # Cannot repair deterministically; stop with 422
-                    msg = f"Validation failed for {name}; missing/invalid arguments; unable to repair automatically."
+                    msg = _make_tool_failure_message(tool=name, err=(detail or {}), attempted_args=((patched or {}).get("arguments") or (args or {})), trace_id=trace_id)
                     usage2 = estimate_usage(messages, msg)
                     response = _build_openai_envelope(
                         ok=False,
@@ -5170,7 +5296,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                     validated.append(patched); repairs_made = True
                 else:
                     # One attempt only — stop with 422
-                    msg = f"Validation failed for {name} after repair; please specify required arguments."
+                    msg = _make_tool_failure_message(tool=name, err=((v2obj.get("error") if isinstance(v2obj, dict) else {}) or {}), attempted_args=((patched or {}).get("arguments") or (args or {})), trace_id=trace_id)
                     usage2 = estimate_usage(messages, msg)
                     response = _build_openai_envelope(
                         ok=False,
@@ -5203,6 +5329,8 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         try:
             # Build executor steps from planner (or repaired) tool_calls
             _log("tool.run.start", trace_id=trace_id, count=len(tool_calls or []))
+            # Normalize again defensively before building steps
+            tool_calls = _normalize_tool_calls(tool_calls)
             steps = []
             for idx, tc in enumerate(tool_calls[:5]):
                 n = (tc.get("name") or "tool").strip()
@@ -5210,6 +5338,11 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 if not isinstance(args, dict):
                     args = {"_raw": args}
                 steps.append({"step_id": f"step-{idx+1}", "tool": n, "args": args})
+            # Log a compact view of what we are about to execute
+            try:
+                _log("exec.payload", trace_id=trace_id, steps=[{"tool": s["tool"], "args_keys": list((s.get("args") or {}).keys())} for s in steps])
+            except Exception:
+                pass
             payload = {"schema_version": 1, "request_id": f"{trace_id}", "trace_id": f"{trace_id}", "steps": steps}
             async with httpx.AsyncClient(timeout=None) as client:
                 r = await client.post(EXECUTOR_BASE_URL.rstrip("/") + "/execute", json=payload)
@@ -5356,12 +5489,12 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                                     ok2 = True
                                     tool_results.append({"name": name, "result": res2})
                         if not ok2:
-                            msg = f"Run failed for {name} after repair; please adjust arguments."
+                            msg = _make_tool_failure_message(tool=name, err=(failing.get("error") or {}), attempted_args=((patched or {}).get("arguments") or (args_attempted or {})), trace_id=trace_id)
                             usage2 = estimate_usage(messages, msg)
                             response = _build_openai_envelope(
                                 ok=False,
                                 text=msg,
-                                error={"code": "run_failed_after_repair"},
+                                error={"code": "run_failed_after_repair", "details": (failing.get("error") or {})},
                                 usage=usage2,
                                 model=f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}",
                                 seed=master_seed,
