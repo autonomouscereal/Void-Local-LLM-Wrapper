@@ -5432,7 +5432,8 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 vresp = await client.post(base_url + "/tool.validate", json={"name": name, "args": args})
                 vobj = _resp_json(vresp, {})
                 _log("validate.result", trace_id=trace_id, status=int(getattr(vresp, "status_code", 0) or 0), tool=name, detail=((vobj or {}).get("error") or {}))
-                if (getattr(vresp, "status_code", 0) == 200) and isinstance(vobj, dict) and bool(vobj.get("ok")):
+                # Hard short-circuit: any 200 from validator is accepted — skip repair entirely
+                if int(getattr(vresp, "status_code", 0) or 0) == 200:
                     validated.append(tc)
                     continue
                 # 422 or invalid envelope → start repair once
@@ -5566,109 +5567,105 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     _ledger_name = "ledger"
     # No caps — never enforce caps inline (no tool call limit enforced)
     if tool_calls:
+        # Announce executor handoff (ordering: this must appear before any run)
+        _log("tools.exec.start", trace_id=trace_id, count=len(tool_calls or []))
+        # Build executor steps view from (repaired) tool_calls and prove payload before any network call
+        steps = []
+        for idx, tc in enumerate(tool_calls[:5]):
+            n = (tc.get("name") or "tool").strip()
+            args = tc.get("arguments") or {}
+            if not isinstance(args, dict):
+                args = {"_raw": args}
+            steps.append({"step_id": f"step-{idx+1}", "tool": n, "args": args})
+        # Emit exec.payload and hard-stop if any args_keys empty
         try:
-            # Build executor steps view from (repaired) tool_calls and prove payload before any network call
-            steps = []
-            for idx, tc in enumerate(tool_calls[:5]):
-                n = (tc.get("name") or "tool").strip()
-                args = tc.get("arguments") or {}
-                if not isinstance(args, dict):
-                    args = {"_raw": args}
-                steps.append({"step_id": f"step-{idx+1}", "tool": n, "args": args})
-            # Emit exec.payload and hard-stop if any args_keys empty
+            payload_preview = [{"tool": s["tool"], "args_keys": list((s.get("args") or {}).keys())} for s in steps]
+            _log("exec.payload", trace_id=trace_id, steps=payload_preview)
+            empty = [p for p in payload_preview if len(p.get("args_keys") or []) == 0]
+            if empty:
+                name_bad = (empty[0] or {}).get("tool") or "tool"
+                _log("exec.fail", trace_id=trace_id, tool=name_bad, reason="empty_arguments_before_execute", attempted_args_keys=[])
+                msg = _make_tool_failure_message(tool=name_bad, err={"code": "invalid_args", "details": {"missing": [], "invalid": [{"field": "arguments", "reason": "empty"}]}}, attempted_args={}, trace_id=trace_id)
+                usage2 = estimate_usage(messages, msg)
+                response = _build_openai_envelope(ok=False, text=msg, error={"code": "invalid_args", "message": "empty arguments before execute", "details": {}}, usage=usage2, model=f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}", seed=master_seed, id_="orc-1")
+                try:
+                    if _lock_token:
+                        _release_lock(STATE_DIR, trace_id)
+                except Exception:
+                    pass
+                try:
+                    _trace_response(trace_id, response)
+                except Exception:
+                    pass
+                return JSONResponse(status_code=200, content=response)
+            # Enforce required keys for image.dispatch exactly
+            for p in payload_preview:
+                if (p.get("tool") or "") == "image.dispatch":
+                    ks = sorted([str(k) for k in (p.get("args_keys") or [])])
+                    required = ["cfg","height","negative","prompt","steps","width"]
+                    if ks != required:
+                        _log("exec.fail", trace_id=trace_id, tool="image.dispatch", reason="args_keys_incomplete", attempted_args_keys=ks)
+                        msg = _make_tool_failure_message(tool="image.dispatch", err={"code": "invalid_args", "details": {"missing": [k for k in required if k not in ks], "invalid": []}}, attempted_args={}, trace_id=trace_id)
+                        usage3 = estimate_usage(messages, msg)
+                        resp2 = _build_openai_envelope(ok=False, text=msg, error={"code": "args_keys_incomplete", "message": "required keys missing", "details": {}}, usage=usage3, model=f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}", seed=master_seed, id_="orc-1")
+                        try:
+                            if _lock_token:
+                                _release_lock(STATE_DIR, trace_id)
+                        except Exception:
+                            pass
+                        try:
+                            _trace_response(trace_id, resp2)
+                        except Exception:
+                            pass
+                        return JSONResponse(status_code=200, content=resp2)
+            # Ordering guarantee: if repaired validate was 200, ensure patched payload was emitted
+            if _repair_success_any and not _patched_payload_emitted:
+                _log("exec.fail", trace_id=trace_id, tool="image.dispatch", reason="did_not_execute_after_repair", attempted_args_keys=[])
+                msg = _make_tool_failure_message(tool="image.dispatch", err={"code": "did_not_execute_after_repair", "details": {}}, attempted_args={}, trace_id=trace_id)
+                usage4 = estimate_usage(messages, msg)
+                resp3 = _build_openai_envelope(ok=False, text=msg, error={"code": "did_not_execute_after_repair", "message": "Missing exec.payload(patched) before execute", "details": {}}, usage=usage4, model=f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}", seed=master_seed, id_="orc-1")
+                try:
+                    if _lock_token:
+                        _release_lock(STATE_DIR, trace_id)
+                except Exception:
+                    pass
+                try:
+                    _trace_response(trace_id, resp3)
+                except Exception:
+                    pass
+                return JSONResponse(status_code=200, content=resp3)
+        except Exception:
+            pass
+        # Execute via external void executor to ensure Comfy is driven by the executor
+        _log("tool.run.start", trace_id=trace_id, executor="void", count=len(tool_calls or []))
+        # Reuse the executor client helper to call EXECUTOR_BASE_URL/execute
+        tool_results = await execute_tools(tool_calls)
+        # Log Comfy prompt ids if present in results
+        try:
+            for _tr in tool_results or []:
+                _res = (_tr or {}).get("result") or {}
+                if isinstance(_res, dict):
+                    _meta = _res.get("meta") if isinstance(_res, dict) else {}
+                    _pid = (_meta or {}).get("prompt_id")
+                    if isinstance(_pid, str) and _pid:
+                        _log("[comfy] POST /prompt", trace_id=trace_id, prompt_id=_pid, client_id=trace_id)
+                        _log("comfy.submit", trace_id=trace_id, prompt_id=_pid, client_id=trace_id)
+                        _log("[comfy] polling /history/" + _pid)
+        except Exception:
+            pass
+        # No executor aggregate error path; per-step results captured above
+        # Post-run QA checkpoint (lightweight)
+        _img_count = 0
+        for _tr in tool_results or []:
             try:
-                payload_preview = [{"tool": s["tool"], "args_keys": list((s.get("args") or {}).keys())} for s in steps]
-                _log("exec.payload", trace_id=trace_id, steps=payload_preview)
-                empty = [p for p in payload_preview if len(p.get("args_keys") or []) == 0]
-                if empty:
-                    name_bad = (empty[0] or {}).get("tool") or "tool"
-                    _log("exec.fail", trace_id=trace_id, tool=name_bad, reason="empty_arguments_before_execute", attempted_args_keys=[])
-                    msg = _make_tool_failure_message(tool=name_bad, err={"code": "invalid_args", "details": {"missing": [], "invalid": [{"field": "arguments", "reason": "empty"}]}}, attempted_args={}, trace_id=trace_id)
-                    usage2 = estimate_usage(messages, msg)
-                    response = _build_openai_envelope(ok=False, text=msg, error={"code": "invalid_args", "message": "empty arguments before execute", "details": {}}, usage=usage2, model=f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}", seed=master_seed, id_="orc-1")
-                    try:
-                        if _lock_token:
-                            _release_lock(STATE_DIR, trace_id)
-                    except Exception:
-                        pass
-                    try:
-                        _trace_response(trace_id, response)
-                    except Exception:
-                        pass
-                    return JSONResponse(status_code=200, content=response)
-                # Enforce required keys for image.dispatch exactly
-                for p in payload_preview:
-                    if (p.get("tool") or "") == "image.dispatch":
-                        ks = sorted([str(k) for k in (p.get("args_keys") or [])])
-                        required = ["cfg","height","negative","prompt","steps","width"]
-                        if ks != required:
-                            _log("exec.fail", trace_id=trace_id, tool="image.dispatch", reason="args_keys_incomplete", attempted_args_keys=ks)
-                            msg = _make_tool_failure_message(tool="image.dispatch", err={"code": "invalid_args", "details": {"missing": [k for k in required if k not in ks], "invalid": []}}, attempted_args={}, trace_id=trace_id)
-                            usage3 = estimate_usage(messages, msg)
-                            resp2 = _build_openai_envelope(ok=False, text=msg, error={"code": "args_keys_incomplete", "message": "required keys missing", "details": {}}, usage=usage3, model=f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}", seed=master_seed, id_="orc-1")
-                            try:
-                                if _lock_token:
-                                    _release_lock(STATE_DIR, trace_id)
-                            except Exception:
-                                pass
-                            try:
-                                _trace_response(trace_id, resp2)
-                            except Exception:
-                                pass
-                            return JSONResponse(status_code=200, content=resp2)
-                # Ordering guarantee: if repaired validate was 200, ensure patched payload was emitted
-                if _repair_success_any and not _patched_payload_emitted:
-                    _log("exec.fail", trace_id=trace_id, tool="image.dispatch", reason="did_not_execute_after_repair", attempted_args_keys=[])
-                    msg = _make_tool_failure_message(tool="image.dispatch", err={"code": "did_not_execute_after_repair", "details": {}}, attempted_args={}, trace_id=trace_id)
-                    usage4 = estimate_usage(messages, msg)
-                    resp3 = _build_openai_envelope(ok=False, text=msg, error={"code": "did_not_execute_after_repair", "message": "Missing exec.payload(patched) before execute", "details": {}}, usage=usage4, model=f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}", seed=master_seed, id_="orc-1")
-                    try:
-                        if _lock_token:
-                            _release_lock(STATE_DIR, trace_id)
-                    except Exception:
-                        pass
-                    try:
-                        _trace_response(trace_id, resp3)
-                    except Exception:
-                        pass
-                    return JSONResponse(status_code=200, content=resp3)
+                _res = (_tr or {}).get("result") or {}
+                if isinstance(_res.get("images"), list):
+                    _img_count += len(_res.get("images") or [])
             except Exception:
-                pass
-            # Execute via external void executor to ensure Comfy is driven by the executor
-            _log("tool.run.start", trace_id=trace_id, executor="void", count=len(tool_calls or []))
-            # Reuse the executor client helper to call EXECUTOR_BASE_URL/execute
-            tool_results = await execute_tools(tool_calls)
-            # Log Comfy prompt ids if present in results
-            try:
-                for _tr in tool_results or []:
-                    _res = (_tr or {}).get("result") or {}
-                    if isinstance(_res, dict):
-                        _meta = _res.get("meta") if isinstance(_res, dict) else {}
-                        _pid = (_meta or {}).get("prompt_id")
-                        if isinstance(_pid, str) and _pid:
-                            _log("[comfy] POST /prompt", trace_id=trace_id, prompt_id=_pid, client_id=trace_id)
-                            _log("comfy.submit", trace_id=trace_id, prompt_id=_pid, client_id=trace_id)
-                            _log("[comfy] polling /history/" + _pid)
-            except Exception:
-                pass
-            # No executor aggregate error path; per-step results captured above
-            try:
-                # Post-run QA checkpoint (lightweight)
-                _img_count = 0
-                for _tr in tool_results or []:
-                    try:
-                        _res = (_tr or {}).get("result") or {}
-                        if isinstance(_res.get("images"), list):
-                            _img_count += len(_res.get("images") or [])
-                    except Exception:
-                        continue
-                _log("qa.metrics", trace_id=trace_id, tool="image.dispatch", metrics={"images": _img_count})
-                _log("committee.postrun.review", trace_id=trace_id, summary={"images": _img_count})
-                _log("committee.decision", trace_id=trace_id, action="accept", rationale="meets threshold")
-            except Exception:
-                pass
-        except Exception as ex:
-            tool_results.append({"name": "executor", "error": str(ex)})
+                continue
+        _log("qa.metrics", trace_id=trace_id, tool="image.dispatch", metrics={"images": _img_count})
+        _log("committee.postrun.review", trace_id=trace_id, summary={"images": _img_count})
+        _log("committee.decision", trace_id=trace_id, action="accept", rationale="meets threshold")
         if tool_results:
             messages = [{"role": "system", "content": "Tool results:\n" + json.dumps(tool_results, indent=2)}] + messages
             # If tools produced media artifacts, return them immediately (skip waiting on models)

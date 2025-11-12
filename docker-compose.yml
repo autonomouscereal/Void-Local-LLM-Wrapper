@@ -272,6 +272,7 @@ services:
     
     environment:
       - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/workspace
       - FILM2_MODELS=/opt/models
       - FILM2_DATA=/srv/film2
       - QWEN_BASE_URL=http://127.0.0.1:11434
@@ -322,7 +323,7 @@ services:
       - VLM_API_URL=http://127.0.0.1:8050
       - OCR_API_URL=http://127.0.0.1:8070
       - TEACHER_API_URL=http://127.0.0.1:8097
-    command: ["uvicorn","app.main_min:app","--host","0.0.0.0","--port","8000","--log-level","info","--access-log","--use-colors"]
+    command: ["uvicorn","orchestrator.app.main_min:app","--app-dir","/workspace","--host","0.0.0.0","--port","8000","--log-level","info","--access-log","--use-colors"]
     volumes:
       - ./:/workspace
       - film2_models:/opt/models:ro
