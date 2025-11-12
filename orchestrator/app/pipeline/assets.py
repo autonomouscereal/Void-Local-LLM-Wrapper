@@ -31,13 +31,7 @@ def collect_urls(tool_results: List[Dict[str, Any]], absolutize_url: Callable[[s
 			for u in (meta.get("orch_view_urls") or []):
 				if isinstance(u, str) and u.strip():
 					urls.append(u)
-		# ids.image_files fallback
-		ids_obj = res.get("ids") if isinstance(res.get("ids"), dict) else {}
-		if isinstance(ids_obj, dict) and isinstance(ids_obj.get("image_files"), list):
-			for fp in (ids_obj.get("image_files") or []):
-				if isinstance(fp, str) and fp.strip():
-					rel_fp = fp.replace("\\", "/")
-					urls.append(f"/uploads/{rel_fp}")
+		# Drop ids.image_files fallback to avoid dead /uploads/<file> links; rely on explicit artifacts or view URLs
 		# generic path scraping
 		exts = (".mp4", ".webm", ".mov", ".mkv", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".wav", ".mp3", ".m4a", ".ogg", ".flac", ".opus", ".srt")
 		def _walk(v):
