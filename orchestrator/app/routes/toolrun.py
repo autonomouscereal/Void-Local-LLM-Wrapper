@@ -572,7 +572,8 @@ async def tool_run(req: Request):
 				continue
 			src = f"{COMFY_BASE.rstrip('/')}/view?filename={fn}&subfolder={sf}&type={tp}"
 			resp = await client.get(src)
-			resp.raise_for_status()
+			if int(getattr(resp, "status_code", 0) or 0) != 200:
+				return err_envelope("fetch_failed", f"download failed for {src}", rid="tool.run", status=200, details={"status": int(getattr(resp, "status_code", 0) or 0)})
 			dst = _os.path.join(save_dir, fn)
 			with open(dst, "wb") as _f:
 				_f.write(resp.content)

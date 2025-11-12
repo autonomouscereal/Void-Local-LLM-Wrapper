@@ -506,8 +506,9 @@ async def execute_http(body: Dict[str, Any]):
     if not steps:
         return JSONResponse(
             {"schema_version": 1, "request_id": rid, "ok": False,
-             "error": {"code": "invalid_plan", "message": "steps required", "details": {}}},
-            status_code=422
+             "error": {"code": "invalid_plan", "message": "steps required", "details": {}},
+             "result": {"produced": []}},
+            status_code=200
         )
 
     try:

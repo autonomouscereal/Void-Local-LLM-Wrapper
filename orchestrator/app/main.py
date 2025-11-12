@@ -4881,9 +4881,11 @@ async def execute_tools(tool_calls: List[Dict[str, Any]], trace_id: str | None =
 async def chat_completions(body: Dict[str, Any], request: Request):
     # normalize and extract attachments (images/audio/video/files) for tools
     t0 = time.time()
+    # Single-exit accumulator for prebuilt final responses (avoid early returns)
+    response_prebuilt = None
     # Validate body
     if not isinstance(body, dict) or not isinstance(body.get("messages"), list):
-        # Always return OpenAI-style JSON with a human-readable one-liner; ALWAYS 200 OK
+        # Build OpenAI-style JSON with a human-readable one-liner; do not return early
         msg = "Invalid request: 'messages' must be a list."
         usage0 = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         env = _build_openai_envelope(
@@ -4895,7 +4897,8 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             seed=0,
             id_="orc-1",
         )
-        return JSONResponse(status_code=200, content=env)
+        response_prebuilt = env
+        # Fall through to unified finalization at the end
     # No caps — never enforce caps inline (no message count/size caps here)
     body["messages"] = nfc_msgs(body.get("messages") or [])
     normalized_msgs, attachments = extract_attachments_from_messages(body.get("messages"))
@@ -5387,7 +5390,8 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         # Do not stream; always return a single complete response after the entire flow finishes
         if _lock_token:
             _release_lock(STATE_DIR, trace_id)
-        return _json_response(response)
+        response_prebuilt = response
+        # Do not return early; finalize at unified tail
         # include usage estimate even in tool_calls path (no completion tokens yet)
         # (dead code; we returned above)
 
@@ -5501,13 +5505,11 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 dresp = await client.get(base_url + f"/tool.describe", params={"name": name})
                 _ = _resp_json(dresp, {})
                 
-                # Validate initial args
-                
+                # Validate initial args (decide by body.ok only)
                 vresp = await client.post(base_url + "/tool.validate", json={"name": name, "args": args})
                 vobj = _resp_json(vresp, {})
                 _log("validate.result", trace_id=trace_id, status=int(getattr(vresp, "status_code", 0) or 0), tool=name, detail=((vobj or {}).get("error") or {}))
-                # Hard short-circuit: any 200 from validator is accepted — skip repair entirely
-                if int(getattr(vresp, "status_code", 0) or 0) == 200:
+                if isinstance(vobj, dict) and (vobj.get("ok") is True):
                     validated.append(tc)
                     continue
                 # 422 or invalid envelope → start repair once
@@ -5560,16 +5562,16 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                     # Drop execution for this tool
                     tool_calls = []
                     continue
-                # Re-validate once
+                # Re-validate once (decide by body.ok only)
                 v2 = await client.post(base_url + "/tool.validate", json={"name": name, "args": patched["arguments"]})
                 v2obj = _resp_json(v2, {})
                 _log("validate.result.repair", trace_id=trace_id, status=int(getattr(v2, "status_code", 0) or 0), tool=name, detail=((v2obj or {}).get("error") or {}))
-                if (getattr(v2, "status_code", 0) == 200) and isinstance(v2obj, dict) and (v2obj.get("ok") is True):
+                if isinstance(v2obj, dict) and (v2obj.get("ok") is True):
                     validated.append(patched); repairs_made = True; _repair_success_any = True
                 else:
                     # One attempt only — record failure and continue to final answer composition
                     pre_err = (v2obj.get("error") if isinstance(v2obj, dict) else {}) or {}
-                    pre_tool_failures.append({"name": name, "result": {"error": pre_err, "status": int(getattr(v2, "status_code", 422) or 422)}})
+                    pre_tool_failures.append({"name": name, "result": {"error": pre_err, "status": 200}})
                     tool_calls = []
                     continue
         tool_calls = validated
@@ -5669,9 +5671,10 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 _img_count += len(_ids.get("images") or [])
         _log("qa.metrics", trace_id=trace_id, tool="image.dispatch", metrics={"images": _img_count})
         _log("committee.postrun.review", trace_id=trace_id, summary={"images": _img_count})
-        _log("committee.decision", trace_id=trace_id, action="accept", rationale="meets threshold")
+        final_action = "go" if int(_img_count) > 0 else "revise"
+        _log("committee.decision", trace_id=trace_id, action=final_action, rationale=("assets_present" if _img_count > 0 else "no_assets"))
         checkpoints_append_event(STATE_DIR, trace_id, "committee.review.final", {"summary": {"images": _img_count}})
-        checkpoints_append_event(STATE_DIR, trace_id, "committee.decision.final", {"action": "go"})
+        checkpoints_append_event(STATE_DIR, trace_id, "committee.decision.final", {"action": final_action})
         if tool_results:
             messages = [{"role": "system", "content": "Tool results:\n" + json.dumps(tool_results, indent=2)}] + messages
             # If tools produced media artifacts, return them immediately (skip waiting on models)
@@ -5766,12 +5769,10 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                     if isinstance(err_obj, dict):
                         status = err_obj.get("status") or err_obj.get("_http_status") or err_obj.get("http_status")
                     message = (err_obj.get("message") if isinstance(err_obj, dict) else None) or ""
-                    tool_errors.append({"tool": str(name_t), "code": (code or ""), "status": status, "message": message})
-            # If we have assets, prefer success copy even if some tool error records exist
-            if asset_urls:
-                tool_errors = []
+                    tool_errors.append({"tool": str(name_t), "code": (code or ""), "status": status, "message": message, "error": err_obj})
+            warnings = tool_errors[:] if tool_errors else []
             summary_lines: List[str] = []
-            if tool_errors:
+            if (not asset_urls) and tool_errors:
                 # Compose an explicit failure report
                 summary_lines.append("The image tool failed to run.")
                 for e in tool_errors:
@@ -5806,10 +5807,17 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 if asset_urls:
                     summary_lines.append("Assets:")
                     summary_lines.extend([f"- {u}" for u in asset_urls])
+                if warnings:
+                    summary_lines.append("")
+                    summary_lines.append("Warnings:")
+                    for e in warnings[:5]:
+                        code = (e.get("error") or {}).get("code") if isinstance(e.get("error"), dict) else (e.get("code") or "tool_error")
+                        message = (e.get("error") or {}).get("message") if isinstance(e.get("error"), dict) else (e.get("message") or "")
+                        summary_lines.append(f"- {code}: {message}")
             final_text = "\n".join(summary_lines) if summary_lines else "Generation completed."
             usage = estimate_usage(messages, final_text)
             response = _build_openai_envelope(
-                ok=True,
+                ok=bool(asset_urls) and not bool(tool_errors),
                 text=final_text,
                 error=None,
                 usage=usage,
@@ -5817,10 +5825,16 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 seed=master_seed,
                 id_="orc-1",
             )
+            if warnings:
+                try:
+                    response["_meta"] = {"errors": warnings}
+                except Exception:
+                    pass
             if _lock_token:
                 _release_lock(STATE_DIR, trace_id)
             _trace_response(trace_id, response)
-            return _json_response(response)
+            response_prebuilt = response
+            # Do not return; finalize at the unified tail
 
     # 3) Executors respond independently using plan + evidence
     evidence_blocks: List[Dict[str, Any]] = [
@@ -5934,7 +5948,8 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             if _lock_token:
                 _release_lock(STATE_DIR, trace_id)
             _trace_response(trace_id, response)
-            return _json_response(response)
+            response_prebuilt = response
+            # Do not return early; finalize at unified tail
         detail = {
             "qwen": {k: v for k, v in qwen_result.items() if k in ("error", "_base_url")},
             "gptoss": {k: v for k, v in gptoss_result.items() if k in ("error", "_base_url")},
@@ -5954,7 +5969,8 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             id_="orc-1",
         )
         _trace_response(trace_id, response)
-        return JSONResponse(status_code=200, content=response)
+        response_prebuilt = response
+        # Do not return; finalize at the unified tail
 
     qwen_text = qwen_result.get("response", "")
     gptoss_text = gptoss_result.get("response", "")
@@ -6617,6 +6633,12 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         seed=master_seed,
         id_="orc-1",
     )
+    # Prefer any prebuilt response (from earlier success/failure branches) to enforce single-exit
+    try:
+        if 'response_prebuilt' in locals() and response_prebuilt is not None:
+            response = response_prebuilt
+    except Exception:
+        pass
     if artifacts:
         response["artifacts"] = artifacts
     if isinstance(final_env, dict) and final_env:
