@@ -41,7 +41,7 @@ import imageio.v3 as iio  # type: ignore
 import asyncio
 import hashlib as _hl
 import json
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, TypedDict
 import time
 import traceback
 
@@ -350,7 +350,6 @@ async def _image_dispatch_run(prompt: str, negative: Optional[str], seed: Option
                 if not (isinstance(u, str) and u):
                     raise RuntimeError("image_url_missing")
                 r = client.get(u)
-                r.raise_for_status()
                 stem = f"dispatch_{pass_idx:02d}_{idx:02d}"
                 png_path, meta_path = _make_outpaths(outdir, stem)
                 with open(png_path, "wb") as _f:
@@ -421,7 +420,6 @@ async def _image_dispatch_run(prompt: str, negative: Optional[str], seed: Option
                     if not (isinstance(u, str) and u):
                         raise RuntimeError("image_url_missing")
                     r = client.get(u)
-                    r.raise_for_status()
                     stem = f"dispatch_{pass_idx:02d}_{idx:02d}"
                     png_path, meta_path = _make_outpaths(outdir, stem)
                     with open(png_path, "wb") as _f:
@@ -901,6 +899,89 @@ def _json_response(obj: Dict[str, Any], status_code: int = 200) -> Response:
         "Content-Length": str(len(body.encode("utf-8"))),
     }
     return Response(content=body, status_code=status_code, media_type="application/json", headers=headers)
+
+# ---- Pipeline imports (extracted helpers) ----
+from .pipeline.trace_locks import acquire_lock as trace_acquire_lock, release_lock as trace_release_lock  # type: ignore
+from .pipeline.args_prep import ensure_object_args as args_ensure_object_args, fill_min_defaults as args_fill_min_defaults  # type: ignore
+from .pipeline.assets import collect_urls as assets_collect_urls, count_images as assets_count_images  # type: ignore
+from .pipeline.executor_gateway import execute as gateway_execute  # type: ignore
+from .pipeline.catalog import build_allowed_tool_names as catalog_allowed, validate_tool_names as catalog_validate  # type: ignore
+from .pipeline.finalize import finalize_tool_phase as finalize_tool_phase  # type: ignore
+from .pipeline.request_shaping import shape_request as shape_request  # type: ignore
+
+# ---- Single-exit helpers (state + finalization) ----
+class RunState(TypedDict, total=False):
+    tool_results: List[Dict[str, Any]]
+    errors: List[Dict[str, Any]]
+    warnings: List[Dict[str, Any]]
+    img_count: int
+
+def accumulate_error(state: RunState, code: str, message: str, details: Optional[Dict[str, Any]] = None) -> None:
+    if "errors" not in state:
+        state["errors"] = []
+    state["errors"].append({"code": code, "message": message, "details": details or {}})
+
+def _collect_urls_from_results(results: List[Dict[str, Any]], abs_url_fn) -> List[str]:
+    urls: List[str] = []
+    for tr in results or []:
+        res = (tr or {}).get("result") or {}
+        if not isinstance(res, dict):
+            continue
+        meta = res.get("meta"); arts = res.get("artifacts")
+        if isinstance(arts, list):
+            for a in arts:
+                u = (a or {}).get("url")
+                if isinstance(u, str) and u.strip():
+                    urls.append(u)
+        if isinstance(meta, dict) and isinstance(meta.get("orch_view_urls"), list):
+            for u in (meta.get("orch_view_urls") or []):
+                if isinstance(u, str) and u.strip():
+                    urls.append(u)
+        ids_obj = res.get("ids") if isinstance(res.get("ids"), dict) else {}
+        if isinstance(ids_obj, dict) and isinstance(ids_obj.get("image_files"), list):
+            for fp in (ids_obj.get("image_files") or []):
+                if isinstance(fp, str) and fp.strip():
+                    urls.append(f"/uploads/{fp.replace('\\', '/')}")
+    # dedupe and absolutize
+    urls = list(dict.fromkeys(urls))
+    return [abs_url_fn(u) for u in urls]
+
+def finalize_response(trace_id: str, messages: List[Dict[str, Any]], state: RunState, abs_url_fn, seed: int) -> Dict[str, Any]:
+    urls = _collect_urls_from_results(state.get("tool_results") or [], abs_url_fn)
+    state["img_count"] = len(urls)
+    lines: List[str] = []
+    if state["img_count"] > 0:
+        lines.append("Here are your generated image(s):")
+        lines.extend([f"- {u}" for u in urls])
+        warns = state.get("warnings") or []
+        if warns:
+            lines.append("")
+            lines.append("Warnings:")
+            for w in warns[:5]:
+                lines.append(f"- {w.get('code','warn')}: {w.get('message','')}")
+        ok_flag = True
+        err_payload = None
+    else:
+        lines.append("The job completed with errors and no assets were produced.")
+        errs = state.get("errors") or []
+        for e in errs[:5]:
+            lines.append(f"- {e.get('code','error')}: {e.get('message','')}")
+        ok_flag = False
+        err_payload = None
+    final_text = "\n".join(lines) if lines else "Done."
+    usage = estimate_usage(messages, final_text)
+    resp = _build_openai_envelope(
+        ok=ok_flag,
+        text=final_text,
+        error=err_payload,
+        usage=usage,
+        model=f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}",
+        seed=seed,
+        id_="orc-1",
+    )
+    resp["_meta"] = {"errors": state.get("errors") or [], "warnings": state.get("warnings") or [], "assets": urls}
+    checkpoints_append_event(STATE_DIR, str(trace_id), "response.preview", {"ok": ok_flag, "assets": len(urls)})
+    return resp
 
 @app.get("/minimal")
 async def minimal_same_origin():
@@ -1575,7 +1656,6 @@ async def call_ollama(base_url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
             ppayload = dict(payload)
             # Some Ollama versions reject the keep_alive option in the request body; rely on server env instead
             resp = await client.post(f"{base_url}/api/generate", json=ppayload)
-            resp.raise_for_status()
             # Expected minimal Ollama generate response
             data = _resp_json(resp, {"response": str, "prompt_eval_count": int, "eval_count": int})
             if isinstance(data, dict) and ("prompt_eval_count" in data or "eval_count" in data):
@@ -2838,7 +2918,6 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             try:
                 async with httpx.AsyncClient() as client:
                     rr = await client.get(args.get("url").strip())
-                    rr.raise_for_status()
                     import base64 as _b
                     b64 = _b.b64encode(rr.content).decode("ascii")
                     if not ext:
@@ -2867,7 +2946,6 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         try:
             async with httpx.AsyncClient() as client:
                 r = await client.post(OCR_API_URL.rstrip("/") + "/ocr", json={"b64": b64, "ext": ext})
-                r.raise_for_status()
                 js = _resp_json(r, {"text": str})
                 return {"name": name, "result": {"text": js.get("text") or "", "ext": ext}}
         except Exception as ex:
@@ -2883,7 +2961,6 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             try:
                 async with httpx.AsyncClient() as client:
                     rr = await client.get(args.get("url").strip())
-                    rr.raise_for_status()
                     import base64 as _b
                     b64 = _b.b64encode(rr.content).decode("ascii")
                     if not ext:
@@ -2912,7 +2989,6 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         try:
             async with httpx.AsyncClient() as client:
                 r = await client.post(VLM_API_URL.rstrip("/") + "/analyze", json={"b64": b64, "ext": ext})
-                r.raise_for_status()
                 js = _resp_json(r, {})
                 return {"name": name, "result": js}
         except Exception as ex:
@@ -2928,7 +3004,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     async with httpx.AsyncClient() as client:
                         emit_progress({"stage": "request", "target": "music"})
                         r = await client.post(MUSIC_API_URL.rstrip("/") + "/generate", json={"prompt": payload.get("prompt"), "duration": int(payload.get("length_s") or 8)})
-                        r.raise_for_status(); js = _resp_json(r, {"audio_wav_base64": str, "wav_b64": str}); b64 = js.get("audio_wav_base64") or js.get("wav_b64"); wav = _b.b64decode(b64) if isinstance(b64, str) else b""; return {"wav_bytes": wav, "model": f"musicgen:{os.getenv('MUSIC_MODEL_ID','')}"}
+                        js = _resp_json(r, {"audio_wav_base64": str, "wav_b64": str}); b64 = js.get("audio_wav_base64") or js.get("wav_b64"); wav = _b.b64decode(b64) if isinstance(b64, str) else b""; return {"wav_bytes": wav, "model": f"musicgen:{os.getenv('MUSIC_MODEL_ID','')}"}
                 def compose(self, args: Dict[str, Any]) -> Dict[str, Any]:
                     import asyncio as _as
                     return _as.get_event_loop().run_until_complete(self._compose(args))
@@ -2970,7 +3046,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                         "refs": payload.get("refs") or payload.get("music_refs"),
                     }
                     r = await client.post(MUSIC_API_URL.rstrip("/") + "/generate", json=body)
-                    r.raise_for_status(); js = _resp_json(r, {"audio_wav_base64": str, "wav_b64": str})
+                    js = _resp_json(r, {"audio_wav_base64": str, "wav_b64": str})
                     b64 = js.get("audio_wav_base64") or js.get("wav_b64")
                     wav = _b.b64decode(b64) if isinstance(b64, str) else b""
                     return {"wav_bytes": wav, "model": f"musicgen:{os.getenv('MUSIC_MODEL_ID','')}"}
@@ -4612,7 +4688,6 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             }
             async with httpx.AsyncClient() as client:
                 r = await client.post(HUNYUAN_VIDEO_API_URL.rstrip("/") + "/v1/video/hv/t2v", json=payload)
-            r.raise_for_status()
             return {"name": name, "result": _resp_json(r, {})}
         except Exception as ex:
             return {"name": name, "error": str(ex)}
@@ -4635,7 +4710,6 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             }
             async with httpx.AsyncClient() as client:
                 r = await client.post(HUNYUAN_VIDEO_API_URL.rstrip("/") + "/v1/video/hv/i2v", json=payload)
-            r.raise_for_status()
             return {"name": name, "result": _resp_json(r, {})}
         except Exception as ex:
             return {"name": name, "error": str(ex)}
@@ -4653,7 +4727,6 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             }
             async with httpx.AsyncClient() as client:
                 r = await client.post(SVD_API_URL.rstrip("/") + "/v1/video/svd/i2v", json=payload)
-            r.raise_for_status()
             return {"name": name, "result": _resp_json(r, {})}
         except Exception as ex:
             return {"name": name, "error": str(ex)}
@@ -4883,9 +4956,26 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     t0 = time.time()
     # Single-exit accumulator for prebuilt final responses (avoid early returns)
     response_prebuilt = None
-    # Validate body
-    if not isinstance(body, dict) or not isinstance(body.get("messages"), list):
-        # Build OpenAI-style JSON with a human-readable one-liner; do not return early
+    # Request shaping (pure; no network)
+    shaped = shape_request(
+        body or {},
+        request,
+        extract_attachments_fn=extract_attachments_from_messages,
+        meta_prompt_fn=meta_prompt,
+        derive_seed_fn=_derive_seed,
+        detect_video_intent_fn=_detect_video_intent,
+    )
+    messages = shaped.get("messages") or []
+    normalized_msgs = shaped.get("normalized_msgs") or []
+    attachments = shaped.get("attachments") or []
+    last_user_text = shaped.get("last_user_text") or ""
+    conv_cid = shaped.get("conv_cid")
+    mode = shaped.get("mode") or "general"
+    master_seed = int(shaped.get("master_seed") or 0)
+    trace_id = shaped.get("trace_id") or "tt_unknown"
+    # Body invalid → build a non-fatal envelope; do not return early
+    problems = shaped.get("problems") or []
+    if any((p.get("code") == "bad_request") for p in problems if isinstance(p, dict)):
         msg = "Invalid request: 'messages' must be a list."
         usage0 = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         env = _build_openai_envelope(
@@ -4898,47 +4988,6 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             id_="orc-1",
         )
         response_prebuilt = env
-        # Fall through to unified finalization at the end
-    # No caps — never enforce caps inline (no message count/size caps here)
-    body["messages"] = nfc_msgs(body.get("messages") or [])
-    normalized_msgs, attachments = extract_attachments_from_messages(body.get("messages"))
-    # prepend a system hint with attachment summary (non-invasive)
-    if attachments:
-        attn = json.dumps(attachments, indent=2)
-        normalized_msgs = [{"role": "system", "content": f"Attachments available for tools:\n{attn}"}] + normalized_msgs
-    messages = meta_prompt(normalized_msgs)
-    # Strong tool-use steering via prompting (no predicate mapping; planner decides).
-    # Instruct models to prefer tools when they can produce artifacts, especially for images.
-    tool_steer = (
-        "Policy: Prefer calling available tools over text-only answers whenever a tool can produce the desired output.\n"
-        "- If the user asks to generate an image, you MUST plan a call to the tool 'image.dispatch' with filled arguments "
-        "(prompt, negative=\"\", width=1024, height=1024, steps=32, cfg=5.5) unless the user provided explicit values.\n"
-        "- Do not apologize or claim inability; propose and use the tool.\n"
-        "- Keep the plan minimal and only include the tool calls required."
-    )
-    messages = [{"role": "system", "content": tool_steer}] + messages
-
-    # Determine mode and trace/run identifiers early
-    conv_cid = None
-    if isinstance(body.get("cid"), (int, str)):
-        conv_cid = str(body.get("cid"))
-    elif isinstance(body.get("conversation_id"), (int, str)):
-        conv_cid = str(body.get("conversation_id"))
-    last_user_text = ""
-    for m in reversed(normalized_msgs):
-        if (m.get("role") == "user") and isinstance(m.get("content"), str) and m.get("content").strip():
-            last_user_text = m.get("content").strip(); break
-    mode = "film" if _detect_video_intent(last_user_text) else "general"
-    # generate a deterministic trace id from messages
-    msgs_for_seed = json.dumps([{"role": m.get("role"), "content": m.get("content")} for m in normalized_msgs], ensure_ascii=False, separators=(",", ":"))
-    provided_seed = int(body.get("seed")) if isinstance(body.get("seed"), (int, float)) else None
-    master_seed = provided_seed if provided_seed is not None else _derive_seed("chat", msgs_for_seed)
-    import hashlib as _hl
-    trace_id = (f"cid_{conv_cid}" if conv_cid else None) or ("tt_" + _hl.sha256(msgs_for_seed.encode("utf-8")).hexdigest()[:16])
-    # Allow client-provided idempotency key to override trace_id for deduplication
-    ikey = body.get("idempotency_key")
-    if isinstance(ikey, str) and len(ikey) >= 8:
-        trace_id = ikey.strip()
     first_user_len = len((last_user_text or "")) if isinstance(last_user_text, str) else 0
     # Purge legacy trace files for this trace to enforce unified format
     _cleanup_legacy_trace_files(trace_id)
@@ -4960,7 +5009,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 return base + u
         return u
     # Acquire per-trace lock and record start event
-    _lock_token = _acquire_lock(STATE_DIR, trace_id, timeout_s=10)
+    _lock_token = trace_acquire_lock(STATE_DIR, trace_id, timeout_s=10)
     checkpoints_append_event(STATE_DIR, trace_id, "start", {"seed": int(master_seed), "mode": mode})
 
     # ICW pack (always-on) — inline; record pack_hash for traces
@@ -5315,34 +5364,27 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         tool_calls = enriched
     # Inject minimal defaults for image.dispatch without overwriting provided args; also emit args snapshot
     if tool_calls:
-        enriched_defaults: List[Dict[str, Any]] = []
-        for tc in tool_calls:
-            nm = (tc.get("name") or "").strip()
-            args = tc.get("arguments") or {}
-            # Enforce object-only args; if string encountered, gate later
-            if not isinstance(args, dict):
-                args = {"_raw": args}
-            if nm == "image.dispatch":
-                # Minimal defaults to unblock validate (do not clobber)
-                if args.get("negative") is None:
-                    args["negative"] = ""
-                if args.get("width") is None:
-                    args["width"] = 1024
-                if args.get("height") is None:
-                    args["height"] = 1024
-                if args.get("steps") is None:
-                    args["steps"] = 32
-                if args.get("cfg") is None:
-                    args["cfg"] = 5.5
-                # Prompt fallback to last user text when missing/empty
-                if not isinstance(args.get("prompt"), str) or not (args.get("prompt") or "").strip():
-                    if isinstance(last_user_text, str) and last_user_text.strip():
-                        args["prompt"] = last_user_text.strip()
-                _log("planner.image.dispatch.args", trace_id=trace_id, args={k: args.get(k) for k in ("prompt","width","height","steps","cfg","negative")})
-            enriched_defaults.append({**tc, "arguments": args})
-        tool_calls = enriched_defaults
+        tool_calls = args_fill_min_defaults(tool_calls, last_user_text, log_fn=_log, trace_id=trace_id)
     # Planner must fully fill args per contract; no auto-insertion of tools beyond minimal defaults above
     # If planner returned no tools or unnamed tools, run a strict re-plan to force valid names from the catalog
+    # Build allowed tool names (registry + builtins) early, since we reference them in name-fix logic
+    try:
+        from .routes.tools import _REGISTRY as _TOOL_REG  # type: ignore
+    except Exception:
+        _TOOL_REG = {}
+    try:
+        builtins = get_builtin_tools_schema()
+    except Exception:
+        builtins = []
+    allowed_tools = set([str(k) for k in (_TOOL_REG or {}).keys()])
+    for t in (builtins or []):
+        try:
+            fn = (t.get("function") or {})
+            nm = fn.get("name")
+            if nm:
+                allowed_tools.add(str(nm))
+        except Exception:
+            continue
     need_name_fix = (len(tool_calls or []) == 0) or any(not str((tc or {}).get("name") or "").strip() for tc in (tool_calls or []))
     if need_name_fix:
         allowed_sorted = sorted(list(allowed_tools))
@@ -5389,7 +5431,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         }
         # Do not stream; always return a single complete response after the entire flow finishes
         if _lock_token:
-            _release_lock(STATE_DIR, trace_id)
+            trace_release_lock(STATE_DIR, trace_id)
         response_prebuilt = response
         # Do not return early; finalize at unified tail
         # include usage estimate even in tool_calls path (no completion tokens yet)
@@ -5397,45 +5439,11 @@ async def chat_completions(body: Dict[str, Any], request: Request):
 
     # Ensure arguments are objects; auto-parse JSON strings instead of returning early
     if tool_calls:
-        fixed_calls: List[Dict[str, Any]] = []
-        for tc in tool_calls:
-            args_obj = tc.get("arguments")
-            if isinstance(args_obj, dict) and isinstance(args_obj.get("_raw"), str):
-                parsed = _parse_json_text(args_obj.get("_raw"), {})
-                tc = {**tc, "arguments": (parsed if isinstance(parsed, dict) else {})}
-            elif isinstance(args_obj, str):
-                parsed = _parse_json_text(args_obj, {})
-                tc = {**tc, "arguments": (parsed if isinstance(parsed, dict) else {})}
-            fixed_calls.append(tc)
-        tool_calls = fixed_calls
+        tool_calls = args_ensure_object_args(tool_calls, _parse_json_text)
 
     # Pre-validate tool names against the registered catalog to avoid executor 404s
-    try:
-        from .routes.tools import _REGISTRY as _TOOL_REG  # type: ignore
-    except Exception:
-        _TOOL_REG = {}
-    # Include tools from built-in schema as well so planner can use all implemented tools
-    try:
-        builtins = get_builtin_tools_schema()
-    except Exception:
-        builtins = []
-    allowed_tools = set([str(k) for k in (_TOOL_REG or {}).keys()])
-    for t in (builtins or []):
-        try:
-            fn = (t.get("function") or {})
-            nm = fn.get("name")
-            if nm:
-                allowed_tools.add(str(nm))
-        except Exception:
-            continue
-    unknown: list[str] = []
-    for tc in (tool_calls or []):
-        try:
-            nm = str((tc or {}).get("name") or "")
-            if nm and (nm not in allowed_tools):
-                unknown.append(nm)
-        except Exception:
-            continue
+    allowed_tools = catalog_allowed()
+    _, unknown = catalog_validate(tool_calls or [], allowed_tools)
     if unknown:
         # Attempt a single re-plan constrained to allowed tool names
         allowed_sorted = sorted(list(allowed_tools))
@@ -5450,14 +5458,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         # Normalize and filter
         tool_calls2 = _normalize_tool_calls(tool_calls2)
         # Re-check against allowed
-        still_unknown: list[str] = []
-        for tc in (tool_calls2 or []):
-            try:
-                nm = str((tc or {}).get("name") or "")
-                if nm and (nm not in allowed_tools):
-                    still_unknown.append(nm)
-            except Exception:
-                continue
+        _, still_unknown = catalog_validate(tool_calls2 or [], allowed_tools)
         if still_unknown:
             _log("tools.unknown.filtered", trace_id=trace_id, unknown=still_unknown, allowed=allowed_sorted)
             # Drop unknown tools and continue
@@ -5496,104 +5497,26 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                     # Do not return early; drop all tool calls to avoid execution
                     tool_calls = []
         # DO NOT pre-execute before validation — enforce validate-first ordering
-        async with _hx.AsyncClient(trust_env=False, timeout=None) as client:
-            for tc in tool_calls:
-                name = (tc.get("name") or "").strip()
-                args = tc.get("arguments") or {}
-                # Describe once per tool to satisfy contract
-            
-                dresp = await client.get(base_url + f"/tool.describe", params={"name": name})
-                _ = _resp_json(dresp, {})
-                
-                # Validate initial args (decide by body.ok only)
-                vresp = await client.post(base_url + "/tool.validate", json={"name": name, "args": args})
-                vobj = _resp_json(vresp, {})
-                _log("validate.result", trace_id=trace_id, status=int(getattr(vresp, "status_code", 0) or 0), tool=name, detail=((vobj or {}).get("error") or {}))
-                if isinstance(vobj, dict) and (vobj.get("ok") is True):
-                    validated.append(tc)
-                    continue
-                # 422 or invalid envelope → start repair once
-                detail = (vobj.get("error") or {}).get("details") if isinstance(vobj, dict) else {}
-                missing = (detail or {}).get("missing") or []
-                invalid = (detail or {}).get("invalid") or []
-                # Committee checkpoint before repair
-                _log("committee.review", trace_id=trace_id, tool=name, validator_detail={"missing": missing, "invalid": invalid})
-                _log("committee.decision", trace_id=trace_id, action="repair_once", rationale="ensure required fields present")
-                # Build repair brief
-                brief = {
-                    "mode": "repair",
-                    "reason": "422 validation_error",
-                    "tool": name,
-                    "missing": missing,
-                    "invalid": invalid,
-                    "current_args": args,
-                    "requirements": {
-                        "must_use_tool": name,
-                        "fill_all_required": True,
-                        "snap_sizes_to_8": True,
-                        "defaults": {"negative": "", "width": 1024, "height": 1024, "steps": 32, "cfg": 5.5},
-                        "prompt_from_user_text_if_missing": True,
-                    },
-                    "user_text": last_user_text,
-                    "tool_catalog_hash": _cat_hash,
-                }
-                repair_preamble = (
-                    "You are in repair mode. Produce exactly the SAME tool with all required arguments filled and any invalid values corrected. "
-                    "Use the user's text as prompt if needed. Snap sizes to multiples of 8. Output only strict JSON: {\"steps\":[{\"tool\":\""
-                    + name + "\",\"args\":{...}}]} with the same tool name."
-                )
-                repair_messages = [{"role": "system", "content": repair_preamble}, {"role": "user", "content": json.dumps(brief, ensure_ascii=False)}]
-                _log("repair.start", trace_id=trace_id, tool=name, brief=brief)
-                _plan2, calls2 = await planner_produce_plan(repair_messages, body.get("tools"), body.get("temperature") or DEFAULT_TEMPERATURE, trace_id=trace_id)
-                # Normalize repair outputs to {name, arguments}
-                calls2_norm = _normalize_tool_calls(calls2)
-                patched = None
-                for c2 in (calls2_norm or []):
-                    try:
-                        if (c2.get("name") or "").strip() == name:
-                            patched = {"name": name, "arguments": (c2.get("arguments") or {})}
-                            break
-                    except Exception:
-                        continue
-                _log("planner.repair.steps", trace_id=trace_id, tool=name, patched=patched or {})
-                if not patched:
-                    # Cannot repair deterministically; record failure and continue to final answer composition
-                    pre_tool_failures.append({"name": name, "result": {"error": (detail or {}), "status": 422}})
-                    # Drop execution for this tool
-                    tool_calls = []
-                    continue
-                # Re-validate once (decide by body.ok only)
-                v2 = await client.post(base_url + "/tool.validate", json={"name": name, "args": patched["arguments"]})
-                v2obj = _resp_json(v2, {})
-                _log("validate.result.repair", trace_id=trace_id, status=int(getattr(v2, "status_code", 0) or 0), tool=name, detail=((v2obj or {}).get("error") or {}))
-                if isinstance(v2obj, dict) and (v2obj.get("ok") is True):
-                    validated.append(patched); repairs_made = True; _repair_success_any = True
-                else:
-                    # One attempt only — record failure and continue to final answer composition
-                    pre_err = (v2obj.get("error") if isinstance(v2obj, dict) else {}) or {}
-                    pre_tool_failures.append({"name": name, "result": {"error": pre_err, "status": 200}})
-                    tool_calls = []
-                    continue
+        from .pipeline.validator import validate_and_repair as validator_validate_and_repair  # type: ignore
+        vr = await validator_validate_and_repair(
+            tool_calls,
+            base_url=base_url,
+            temperature=(body.get("temperature") or DEFAULT_TEMPERATURE),
+            last_user_text=last_user_text,
+            tool_catalog_hash=_cat_hash,
+            trace_id=trace_id,
+            state_dir=STATE_DIR,
+            planner_fn=lambda msgs, tools, temp, tid: planner_produce_plan(msgs, body.get("tools"), temp, tid),
+            normalize_fn=_normalize_tool_calls,
+            log_fn=_log,
+            checkpoints_append_event=checkpoints_append_event,
+        )
+        validated = vr.get("validated") or []
+        pre_tool_failures = vr.get("pre_tool_failures") or []
+        repairs_made = bool(vr.get("repairs_made"))
+        _repair_success_any = bool(vr.get("_repair_success_any"))
+        _patched_payload_emitted = bool(vr.get("_patched_payload_emitted"))
         tool_calls = validated
-        if repairs_made:
-            _log("repair.executing", trace_id=trace_id, count=len(tool_calls))
-            # Mandatory second exec.payload proof of patched arguments (pre-run)
-            _steps_preview = []
-            for i, t in enumerate(tool_calls[:5]):
-                _nm = (t.get("name") or "").strip()
-                _ak = list((t.get("arguments") or {}).keys())
-                _steps_preview.append({"tool": _nm, "args_keys": _ak})
-            _log("exec.payload", trace_id=trace_id, patched=True, steps=_steps_preview)
-            _patched_payload_emitted = True
-            _log("committee.go", trace_id=trace_id, tool="image.dispatch", rationale="re-validated=200")
-            checkpoints_append_event(STATE_DIR, trace_id, "committee.review.mid", {"phase": "post-repair", "tool": name})
-            checkpoints_append_event(STATE_DIR, trace_id, "committee.decision.mid", {"action": "go"})
-            _log("assertion", message="ASSERTION: If validate.result.repair 200 occurs, then exec.payload (patched) and tool.run.start must also occur—else did_not_execute_after_repair")
-        else:
-            # Mid-run oversight on initial success path
-            _log("committee.go", trace_id=trace_id, tool="image.dispatch", rationale="validate=200")
-            checkpoints_append_event(STATE_DIR, trace_id, "committee.review.mid", {"phase": "post-validate", "tool": name})
-            checkpoints_append_event(STATE_DIR, trace_id, "committee.decision.mid", {"action": "go"})
 
     # 2) Optionally execute tools
     tool_results: List[Dict[str, Any]] = []
@@ -5640,8 +5563,8 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             tool_calls = []
         # Execute via external void executor to ensure Comfy is driven by the executor
         _log("tool.run.start", trace_id=trace_id, executor="void", count=len(tool_calls or []))
-        # Reuse the executor client helper to call EXECUTOR_BASE_URL/execute
-        tool_results = await execute_tools(tool_calls, trace_id)
+        # Execute via executor gateway
+        tool_results = await gateway_execute(tool_calls, trace_id, EXECUTOR_BASE_URL or "http://127.0.0.1:8081")
         # Log Comfy prompt ids if present in results
         for _tr in tool_results or []:
             _res = (_tr or {}).get("result") or {}
@@ -5657,18 +5580,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             tool_results.extend(locals().get("pre_tool_failures") or [])
         # No executor aggregate error path; per-step results captured above
         # Post-run QA checkpoint (lightweight)
-        _img_count = 0
-        for _tr in tool_results or []:
-            _res = (_tr or {}).get("result") or {}
-            if not isinstance(_res, dict):
-                continue
-            # Count flat images array if present
-            if isinstance(_res.get("images"), list):
-                _img_count += len(_res.get("images") or [])
-            # Count ids.images from Comfy bridge
-            _ids = _res.get("ids") if isinstance(_res, dict) else {}
-            if isinstance(_ids, dict) and isinstance(_ids.get("images"), list):
-                _img_count += len(_ids.get("images") or [])
+        _img_count = assets_count_images(tool_results)
         _log("qa.metrics", trace_id=trace_id, tool="image.dispatch", metrics={"images": _img_count})
         _log("committee.postrun.review", trace_id=trace_id, summary={"images": _img_count})
         final_action = "go" if int(_img_count) > 0 else "revise"
@@ -5678,68 +5590,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         if tool_results:
             messages = [{"role": "system", "content": "Tool results:\n" + json.dumps(tool_results, indent=2)}] + messages
             # If tools produced media artifacts, return them immediately (skip waiting on models)
-            def _asset_urls_from_tools(results: List[Dict[str, Any]]) -> List[str]:
-                urls: List[str] = []
-                for tr in results or []:
-                    res = (tr or {}).get("result") or {}
-                    if isinstance(res, dict):
-                        meta = res.get("meta")
-                        arts = res.get("artifacts")
-                        if isinstance(meta, dict) and isinstance(arts, list):
-                            cid = meta.get("cid")
-                            for a in arts:
-                                aid = (a or {}).get("id"); kind = (a or {}).get("kind") or ""
-                                if cid and aid:
-                                    if kind.startswith("image"):
-                                        urls.append(f"/uploads/artifacts/image/{cid}/{aid}")
-                                    elif kind.startswith("audio"):
-                                        urls.append(f"/uploads/artifacts/audio/tts/{cid}/{aid}")
-                                        urls.append(f"/uploads/artifacts/music/{cid}/{aid}")
-                        # Include direct view URLs persisted by the Comfy bridge
-                        if isinstance(meta, dict) and isinstance(meta.get("orch_view_urls"), list):
-                            for u in (meta.get("orch_view_urls") or []):
-                                if isinstance(u, str) and u.strip():
-                                    urls.append(u)
-                        # Fallback: construct URLs from ids.image_files if present
-                        ids_obj = res.get("ids") if isinstance(res.get("ids"), dict) else {}
-                        if isinstance(ids_obj, dict) and isinstance(ids_obj.get("image_files"), list):
-                            for fp in (ids_obj.get("image_files") or []):
-                                if not isinstance(fp, str) or not fp.strip():
-                                    continue
-                                rel = fp.replace("\\", "/")
-                                # Ensure leading /uploads/ for UI fetch; make absolute if PUBLIC_BASE_URL available
-                                if PUBLIC_BASE_URL and PUBLIC_BASE_URL.strip():
-                                    urls.append(_abs_url(f"/uploads/{rel}"))
-                                else:
-                                    urls.append(f"/uploads/{rel}")
-                        exts = (".mp4", ".webm", ".mov", ".mkv", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".wav", ".mp3", ".m4a", ".ogg", ".flac", ".opus", ".srt")
-                        def _walk(v):
-                            if isinstance(v, str):
-                                s = v.strip().lower()
-                                if not s:
-                                    return
-                                if s.startswith("http://") or s.startswith("https://"):
-                                    urls.append(v); return
-                                if "/workspace/uploads/" in v:
-                                    tail = v.split("/workspace", 1)[1]
-                                    urls.append(tail)
-                                    return
-                                if v.startswith("/uploads/"):
-                                    urls.append(v); return
-                                if any(s.endswith(ext) for ext in exts) and ("/uploads/" in s or "/workspace/uploads/" in s):
-                                    if "/workspace/uploads/" in v:
-                                        tail = v.split("/workspace", 1)[1]
-                                        urls.append(tail)
-                                    else:
-                                        urls.append(v)
-                            elif isinstance(v, list):
-                                for it in v: _walk(it)
-                            elif isinstance(v, dict):
-                                for it in v.values(): _walk(it)
-                        _walk(res)
-                return list(dict.fromkeys(urls))
-            asset_urls = _asset_urls_from_tools(tool_results)
-            asset_urls = [_abs_url(u) for u in (asset_urls or [])]
+            asset_urls = assets_collect_urls(tool_results, _abs_url)
             # Always return a final OpenAI envelope after tools complete (even without assets)
             # Build a richer assistant message using tool meta (prompt/params) when available
             prompt_text = ""
@@ -5814,24 +5665,18 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                         code = (e.get("error") or {}).get("code") if isinstance(e.get("error"), dict) else (e.get("code") or "tool_error")
                         message = (e.get("error") or {}).get("message") if isinstance(e.get("error"), dict) else (e.get("message") or "")
                         summary_lines.append(f"- {code}: {message}")
-            final_text = "\n".join(summary_lines) if summary_lines else "Generation completed."
-            usage = estimate_usage(messages, final_text)
-            response = _build_openai_envelope(
-                ok=bool(asset_urls) and not bool(tool_errors),
-                text=final_text,
-                error=None,
-                usage=usage,
-                model=f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}",
-                seed=master_seed,
-                id_="orc-1",
+            response = finalize_tool_phase(
+                messages=messages,
+                tool_results=tool_results,
+                master_seed=master_seed,
+                trace_id=trace_id,
+                model_name=f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}",
+                absolutize_url=_abs_url,
+                estimate_usage_fn=estimate_usage,
+                envelope_builder=_build_openai_envelope,
             )
-            if warnings:
-                try:
-                    response["_meta"] = {"errors": warnings}
-                except Exception:
-                    pass
             if _lock_token:
-                _release_lock(STATE_DIR, trace_id)
+                trace_release_lock(STATE_DIR, trace_id)
             _trace_response(trace_id, response)
             response_prebuilt = response
             # Do not return; finalize at the unified tail
@@ -5955,7 +5800,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             "gptoss": {k: v for k, v in gptoss_result.items() if k in ("error", "_base_url")},
         }
         if _lock_token:
-            _release_lock(STATE_DIR, trace_id)
+            trace_release_lock(STATE_DIR, trace_id)
         # Always return an OpenAI-compatible JSON envelope (200) with a short assistant message
         msg = "Upstream backends failed; please retry. If this persists, check model backends."
         usage = estimate_usage(messages, msg)
@@ -6057,80 +5902,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     synth_result = await call_ollama(planner_base, synth_payload)
     final_text = synth_result.get("response", "") or qwen_text or gptoss_text
     # Append discovered asset URLs from tool results so users see concrete outputs inline
-    def _asset_urls_from_tools(results: List[Dict[str, Any]]) -> List[str]:
-        urls: List[str] = []
-        for tr in results or []:
-            try:
-                name = (tr or {}).get("name") or ""
-                res = (tr or {}).get("result") or {}
-                # Envelope-based tools (image/tts/music) carry meta.cid and artifacts with ids
-                meta = res.get("meta") if isinstance(res, dict) else None
-                arts = res.get("artifacts") if isinstance(res, dict) else None
-                if isinstance(meta, dict) and isinstance(arts, list):
-                    cid = meta.get("cid")
-                    for a in arts:
-                        try:
-                            aid = (a or {}).get("id")
-                            kind = (a or {}).get("kind") or ""
-                            if cid and aid:
-                                if kind.startswith("image") or name.startswith("image"):
-                                    urls.append(f"/uploads/artifacts/image/{cid}/{aid}")
-                                elif kind.startswith("audio") and name.startswith("tts"):
-                                    urls.append(f"/uploads/artifacts/audio/tts/{cid}/{aid}")
-                                elif kind.startswith("audio") and name.startswith("music"):
-                                    urls.append(f"/uploads/artifacts/music/{cid}/{aid}")
-                        except Exception:
-                            continue
-                # Traverse result to collect media/artifact paths (same-origin only)
-                if isinstance(res, dict):
-                    # Film-2 and other tools: traverse result to collect media/artifact paths
-                    exts = (".mp4", ".webm", ".mov", ".mkv", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".wav", ".mp3", ".m4a", ".ogg", ".flac", ".opus", ".srt")
-                    def _walk(v):
-                        if isinstance(v, str):
-                            s = v.strip()
-                            if not s:
-                                return
-                            # public urls
-                            if s.startswith("http://") or s.startswith("https://"):
-                                urls.append(s)
-                                return
-                            # convert filesystem paths under /workspace/uploads to public /uploads
-                            if "/workspace/uploads/" in s:
-                                try:
-                                    tail = s.split("/workspace", 1)[1]
-                                    urls.append(tail)
-                                except Exception:
-                                    pass
-                                return
-                            # already-public /uploads paths
-                            if s.startswith("/uploads/"):
-                                urls.append(s)
-                                return
-                            # file-like with known extensions — if it contains /uploads, surface it
-                            lower = s.lower()
-                            if any(lower.endswith(ext) for ext in exts):
-                                if "/uploads/" in lower:
-                                    urls.append(s)
-                                elif "/workspace/uploads/" in lower:
-                                    try:
-                                        tail = s.split("/workspace", 1)[1]
-                                        urls.append(tail)
-                                    except Exception:
-                                        pass
-                        elif isinstance(v, list):
-                            for it in v:
-                                _walk(it)
-                        elif isinstance(v, dict):
-                            for it in v.values():
-                                _walk(it)
-                    _walk(res)
-            except Exception:
-                continue
-        # de-dup
-        return list(dict.fromkeys(urls))
-
-    asset_urls = _asset_urls_from_tools(tool_results)
-    asset_urls = [_abs_url(u) for u in (asset_urls or [])]
+    asset_urls = assets_collect_urls(tool_results, _abs_url)
     # Fallback: if no URLs surfaced from tool results (e.g. async image jobs that finished out-of-band),
     # look up recent artifacts from multimodal memory for this conversation and attach their public URLs.
     if (not asset_urls) and conv_cid:
@@ -6638,7 +6410,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         if 'response_prebuilt' in locals() and response_prebuilt is not None:
             response = response_prebuilt
     except Exception:
-        pass
+        logging.debug("response_prebuilt override failed:\n%s", traceback.format_exc())
     if artifacts:
         response["artifacts"] = artifacts
     if isinstance(final_env, dict) and final_env:
@@ -6646,7 +6418,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             final_env = _env_bump(final_env); _env_assert(final_env)
             final_env = _env_stamp(final_env, tool=None, model=f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}")
         except Exception:
-            pass
+            logging.debug("final_env bump/assert/stamp failed:\n%s", traceback.format_exc())
         # Optional ablation: extract grounded facts and export
         try:
             do_ablate = True
@@ -6665,9 +6437,9 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                             uri = _uri_from_upload_path(facts_path)
                             response["artifacts"]["ablation_facts"] = {"uri": uri}
                     except Exception:
-                        pass
+                        logging.debug("ablation facts export failed:\n%s", traceback.format_exc())
         except Exception:
-            pass
+            logging.debug("ablation phase failed:\n%s", traceback.format_exc())
         response["envelope"] = final_env
     # Finalize artifacts shard and write a tiny manifest reference
     if _ledger_shard is not None:
@@ -6708,21 +6480,9 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     await _db_update_run_response(run_id, response, usage)
     checkpoints_append_event(STATE_DIR, trace_id, "halt", {"kind": "committee", "chars": len(display_content)})
     if _lock_token:
-        _release_lock(STATE_DIR, trace_id)
+        trace_release_lock(STATE_DIR, trace_id)
     _trace_response(trace_id, response)
     return _json_response(response)
-
-
-@app.post("/run")
-async def run_endpoint(body: Dict[str, Any], request: Request):
-    # Minimal adapter to reuse the same pipeline
-    # Allow either OpenAI-compatible or plain JSON
-    if isinstance(body.get("messages"), list):
-        return await chat_completions(body, request)
-    # Coerce a single prompt string into messages
-    prompt = str(body.get("prompt") or "")
-    cr = {"model": body.get("model"), "messages": [{"role": "user", "content": prompt}], "stream": bool(body.get("stream", False)), "tools": body.get("tools")}
-    return await chat_completions(cr, request)
 
 
 @app.get("/healthz")
@@ -6786,15 +6546,9 @@ async def refs_resolve(body: Dict[str, Any]):
             # Fallback to global artifact memory across conversations
             rec = _glob_resolve(text, kind)
             if not rec:
-                try:
-                    trace_append("memory_ref", {"cid": cid, "text": text, "kind": kind, "found": False})
-                except Exception:
-                    pass
+                trace_append("memory_ref", {"cid": cid, "text": text, "kind": kind, "found": False})
                 return {"ok": False, "matches": []}
-        try:
-            trace_append("memory_ref", {"cid": cid, "text": text, "kind": kind, "found": True, "path": rec.get("path"), "source": ("cid" if cid else "global")})
-        except Exception:
-            pass
+        trace_append("memory_ref", {"cid": cid, "text": text, "kind": kind, "found": True, "path": rec.get("path"), "source": ("cid" if cid else "global")})
         return {"ok": True, "matches": [rec]}
     except Exception as ex:
         return JSONResponse(status_code=400, content={"error": str(ex)})
@@ -6831,7 +6585,7 @@ def _build_locks_from_context(cid: str) -> Dict[str, Any]:
         if len(char) > 1:
             locks["characters"].append(char)
     except Exception:
-        pass
+        logging.debug("locks build from context failed:\n%s", traceback.format_exc())
     return locks
 
 
@@ -6930,7 +6684,7 @@ async def tools_append(body: Dict[str, Any], request: Request):
                     if isinstance(s.get("wav_bytes"), int) and s.get("wav_bytes") > 0:
                         checkpoints_append_event(STATE_DIR, str(trace_id), "artifact_summary", {"kind": "audio", "bytes": int(s.get("wav_bytes"))})
                 except Exception:
-                    pass
+                    logging.debug("artifact summary distillation failed:\n%s", traceback.format_exc())
             # Forward review WS events to connected client if present
             try:
                 app = request.app
@@ -6940,7 +6694,7 @@ async def tools_append(body: Dict[str, Any], request: Request):
                     payload = {"type": row["event"], "trace_id": str(trace_id), "step_id": row.get("step_id"), "notes": row.get("notes")}
                     await ws.send_json(payload)
             except Exception:
-                pass
+                logging.debug("websocket forward failed:\n%s", traceback.format_exc())
     except Exception:
         return JSONResponse(status_code=400, content={"error": "append_failed"})
     return {"ok": True}
