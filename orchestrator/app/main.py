@@ -5657,8 +5657,13 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         for _tr in tool_results or []:
             try:
                 _res = (_tr or {}).get("result") or {}
+                # Count flat images array if present
                 if isinstance(_res.get("images"), list):
                     _img_count += len(_res.get("images") or [])
+                # Count ids.images from Comfy bridge
+                _ids = _res.get("ids") if isinstance(_res, dict) else {}
+                if isinstance(_ids, dict) and isinstance(_ids.get("images"), list):
+                    _img_count += len(_ids.get("images") or [])
             except Exception:
                 continue
         _log("qa.metrics", trace_id=trace_id, tool="image.dispatch", metrics={"images": _img_count})
@@ -5685,6 +5690,11 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                                         elif kind.startswith("audio"):
                                             urls.append(f"/uploads/artifacts/audio/tts/{cid}/{aid}")
                                             urls.append(f"/uploads/artifacts/music/{cid}/{aid}")
+                            # Include direct view URLs persisted by the Comfy bridge
+                            if isinstance(meta, dict) and isinstance(meta.get("orch_view_urls"), list):
+                                for u in (meta.get("orch_view_urls") or []):
+                                    if isinstance(u, str) and u.strip():
+                                        urls.append(u)
                             exts = (".mp4", ".webm", ".mov", ".mkv", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".wav", ".mp3", ".m4a", ".ogg", ".flac", ".opus", ".srt")
                             def _walk(v):
                                 if isinstance(v, str):
