@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from typing import Any, Dict, List, Tuple, Callable
-import json as _json
+import json
 from app.json_parser import JSONParser  # type: ignore
 
 import httpx as _hx  # type: ignore
@@ -68,7 +68,7 @@ async def validate_and_repair(
 			args = tc.get("arguments") or {}
 			# Describe once per tool to satisfy contract
 			# Validate (no try/except; rely on body.ok semantics and schema parser)
-			vpayload = _json.dumps({"name": name, "args": args})
+			vpayload = json.dumps({"name": name, "args": args})
 			vresp = await client.post(base + "/tool.validate", content=vpayload, headers={"content-type": "application/json"})
 			parser = JSONParser()
 			vobj = parser.parse(vresp.text or "", {"ok": bool, "error": {"code": str, "message": str, "details": dict}})
@@ -125,7 +125,7 @@ async def validate_and_repair(
 				pre_tool_failures.append({"name": name, "result": {"error": (detail or {}), "status": 422}})
 				continue
 			# Re-validate once (no try/except; schema parser handles bad bodies)
-			v2payload = _json.dumps({"name": name, "args": patched["arguments"]})
+			v2payload = json.dumps({"name": name, "args": patched["arguments"]})
 			v2 = await client.post(base + "/tool.validate", content=v2payload, headers={"content-type": "application/json"})
 			parser2 = JSONParser()
 			v2obj = parser2.parse(v2.text or "", {"ok": bool, "error": {"code": str, "message": str, "details": dict}})
