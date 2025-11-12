@@ -341,6 +341,11 @@ async def any_preflight(path: str):
 # Alternate chat endpoint to avoid any extension/content filters on "/chat" path
 @app.post("/api/chat")
 async def chat_alt(body: Dict[str, Any], background_tasks: BackgroundTasks):
+    """
+    Streaming proxy with periodic keepalives so the browser/proxies don't abort
+    while waiting for orchestrator to finish tool execution.
+    """
+    import asyncio
     logging.info("/api/chat: start cid=%s", (body or {}).get("conversation_id"))
     cid = int((body or {}).get("conversation_id") or 0)
     user_content = (body or {}).get("content") or ""
@@ -351,35 +356,39 @@ async def chat_alt(body: Dict[str, Any], background_tasks: BackgroundTasks):
         atts = await conn.fetch("SELECT name, url, mime FROM attachments WHERE conversation_id=$1", cid)
     oa_msgs = _build_openai_messages([{"role": "user", "content": user_content}], [dict(a) for a in atts])
     payload = {"messages": oa_msgs, "stream": False, "cid": cid}
-    async with httpx.AsyncClient(trust_env=False, timeout=None) as client:
-        url = ORCH_URL.rstrip("/") + "/v1/chat/completions"
-        logging.info("proxy -> orchestrator POST %s", url)
-        rr = await client.post(url, json=payload)
-    # best-effort assistant extraction (does not affect response)
-    if (rr.headers.get("content-type") or "").startswith("application/json"):
-        try:
-            expected_response = {"choices": [{"message": {"content": str}}]}
-            obj = JSONParser().parse(rr.text, expected_response)
-            assistant = ((obj.get("choices") or [{}])[0].get("message") or {}).get("content")
-            if assistant:
-                async with _pool().acquire() as c2:
-                    await c2.execute("INSERT INTO messages (conversation_id, role, content) VALUES ($1, 'assistant', $2::jsonb)", cid, json.dumps({"text": assistant}))
-        except Exception:
-            pass
-    body = rr.content
-    ct = rr.headers.get("content-type") or "application/json; charset=utf-8"
+
+    async def _gen():
+        async with httpx.AsyncClient(trust_env=False, timeout=None) as client:
+            url = ORCH_URL.rstrip("/") + "/v1/chat/completions"
+            logging.info("proxy(stream) -> orchestrator POST %s", url)
+            task = asyncio.create_task(client.post(url, json=payload))
+            # initial flush byte
+            yield b" "
+            while not task.done():
+                await asyncio.sleep(2.0)
+                yield b" "
+            rr = await task
+            # best-effort assistant extraction (does not affect response)
+            if (rr.headers.get("content-type") or "").startswith("application/json"):
+                try:
+                    expected_response = {"choices": [{"message": {"content": str}}]}
+                    obj = JSONParser().parse(rr.text, expected_response)
+                    assistant = ((obj.get("choices") or [{}])[0].get("message") or {}).get("content")
+                    if assistant:
+                        async with _pool().acquire() as c2:
+                            await c2.execute("INSERT INTO messages (conversation_id, role, content) VALUES ($1, 'assistant', $2::jsonb)", cid, json.dumps({"text": assistant}))
+                except Exception:
+                    pass
+            yield rr.content
+
     headers = {
         "Cache-Control": "no-store",
-        "Access-Control-Allow-Origin": request.headers.get("origin") or "*",
-        "Access-Control-Allow-Credentials": "true",
         "Access-Control-Allow-Private-Network": "true",
-        "Access-Control-Expose-Headers": "Content-Type, Content-Length",
-        "Connection": "close",
-        "Content-Length": str(len(body)),
-        "Content-Type": ct,
+        "Access-Control-Expose-Headers": "Content-Type",
+        # Content-Length omitted for streaming
     }
-    logging.info("/api/chat: done cid=%s", cid)
-    return Response(content=body, media_type=ct, status_code=rr.status_code, headers=headers)
+    logging.info("/api/chat(stream): open cid=%s", cid)
+    return StreamingResponse(_gen(), media_type="application/json", headers=headers)
 
 
 # Neutral path versions (avoid filters on "chat")
