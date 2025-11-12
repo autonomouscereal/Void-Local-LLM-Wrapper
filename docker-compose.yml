@@ -345,7 +345,6 @@ services:
     build:
       context: ./services/xtts
       dockerfile: Dockerfile
-      network_mode: host
       args:
         <<: *cu118_args
     container_name: xtts_service
@@ -380,7 +379,6 @@ services:
     build:
       context: ./services/whisper
       dockerfile: Dockerfile
-      network_mode: host
     container_name: whisper_service
     restart: unless-stopped
     runtime: nvidia
@@ -401,7 +399,6 @@ services:
     build:
       context: ./services/faceid
       dockerfile: Dockerfile
-      network_mode: host
     container_name: faceid_service
     restart: unless-stopped
     runtime: nvidia
@@ -420,7 +417,6 @@ services:
     build:
       context: ./services/comfyui
       dockerfile: Dockerfile
-      network_mode: host
       args:
         <<: *cu118_args
     container_name: comfyui
@@ -452,7 +448,6 @@ services:
     build:
       context: ./services/comfyui
       dockerfile: Dockerfile
-      network_mode: host
       args:
         <<: *cu118_args
     container_name: comfyui-1
@@ -478,7 +473,6 @@ services:
     build:
       context: ./services/comfyui
       dockerfile: Dockerfile
-      network_mode: host
       args:
         <<: *cu118_args
     container_name: comfyui-2
@@ -504,7 +498,6 @@ services:
     build:
       context: ./services/comfyui_init
       dockerfile: Dockerfile
-      network_mode: host
     container_name: comfyui_init
     environment:
       - HUGGINGFACE_TOKEN=${HUGGINGFACE_TOKEN:-}
@@ -561,7 +554,6 @@ services:
     build:
       context: ./services/demucs
       dockerfile: Dockerfile
-      network_mode: host
       args:
         <<: *cu118_args
     container_name: demucs_service
@@ -586,7 +578,6 @@ services:
     build:
       context: ./services/vlm
       dockerfile: Dockerfile
-      network_mode: host
       args:
         <<: *cu118_args
     container_name: vlm_service
@@ -619,7 +610,6 @@ services:
     build:
       context: ./services/ocr
       dockerfile: Dockerfile
-      network_mode: host
     container_name: ocr_service
     restart: unless-stopped
     expose:
@@ -647,7 +637,6 @@ services:
     build:
       context: ./services/drt
       dockerfile: Dockerfile
-      network_mode: host
     container_name: deep_research_tool
     restart: unless-stopped
     shm_size: "1gb"
@@ -665,7 +654,6 @@ services:
     build:
       context: ./services/film2
       dockerfile: Dockerfile
-      network_mode: host
     container_name: film2_service
     restart: unless-stopped
     runtime: nvidia
@@ -687,7 +675,6 @@ services:
     build:
       context: ./services/ablation
       dockerfile: Dockerfile
-      network_mode: host
     container_name: ablation_layer
     restart: unless-stopped
     environment:
@@ -702,7 +689,6 @@ services:
     build:
       context: ./services/teacher
       dockerfile: Dockerfile
-      network_mode: host
     container_name: teacher_service
     restart: unless-stopped
     environment:
