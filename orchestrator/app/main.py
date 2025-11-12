@@ -5925,6 +5925,18 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     # No synthetic tool forcing; the planner alone selects tools
 
     # If response still looks like a refusal, synthesize a constructive message using tool_results
+    refusal_markers = [
+        "cannot",
+        "can't",
+        "unable",
+        "i won't",
+        "i will not",
+        "refuse",
+        "not able",
+        "i cannot",
+        "i can't",
+        "sorry, i",
+    ]
     final_refusal = any(tok in (qwen_text.lower() + "\n" + gptoss_text.lower()) for tok in refusal_markers)
     if final_refusal:
         # Try to extract a film_id or any success info from tool results
