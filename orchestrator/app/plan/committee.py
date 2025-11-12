@@ -8,6 +8,7 @@ from typing import Dict, Any
 import httpx  # type: ignore
 
 from ..json_parser import JSONParser
+from ..pipeline.compression_orchestrator import co_pack, frames_to_string
 
 
 PLAN_SCHEMA: Dict[str, Any] = {
@@ -53,11 +54,35 @@ async def _call_llm_json(prompt: str) -> Dict[str, Any]:
 
 
 async def _plan_with_role(system: str, user_text: str, request_id: str) -> Dict[str, Any]:
+    # Build CO frames for planner/committee via internal pack (prompt-only, no enforcement)
+    co_env = {
+        "schema_version": 1,
+        "trace_id": request_id,
+        "call_kind": "planner",
+        "model_caps": {"num_ctx": 8192},
+        "user_turn": {"role": "user", "content": user_text},
+        "history": [],
+        "attachments": [],
+        "tool_memory": [],
+        "rag_hints": [],
+        "roe_incoming_instructions": [],
+        "subject_canon": {},
+        "percent_budget": {"icw_pct": [65, 70], "tools_pct": [18, 20], "roe_pct": [5, 10], "misc_pct": [3, 5], "buffer_pct": 5},
+        "sweep_plan": ["0-90", "30-120", "60-150+wrap"],
+    }
+    co_out = co_pack(co_env)
+    frames_text = frames_to_string(co_out.get("frames") or [])
     prompt = (
-        f"Return JSON exactly matching this schema: {json.dumps(PLAN_SCHEMA, ensure_ascii=False)}\n"
-        f"User request: {user_text}\n"
-        f"Your role: {system}\n"
-        "Include ALL relevant steps for your modality; do not omit sub-steps."
+        frames_text
+        + "\n\n"
+        + f"Return JSON exactly matching this schema: {json.dumps(PLAN_SCHEMA, ensure_ascii=False)}\n"
+        + f"User request: {user_text}\n"
+        + f"Your role: {system}\n"
+        + "Include ALL relevant steps for your modality; do not omit sub-steps.\n"
+        + "### [PLANNER / SYSTEM]\n"
+        + "Plan minimal steps, prefer tools over text; for image.dispatch integrate subject canon when applicable and key args; merge to single plan and note uncertainties.\n"
+        + "### [FINALITY / SYSTEM]\n"
+        + "Do not output assistant content until committee consensus; one final answer only."
     )
     out = await _call_llm_json(prompt)
     out["request_id"] = request_id

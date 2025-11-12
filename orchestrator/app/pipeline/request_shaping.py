@@ -48,15 +48,7 @@ def shape_request(
 		normalized_msgs = [{"role": "system", "content": f"Attachments available for tools:\n{attn}"}] + normalized_msgs
 	# Meta prompt
 	messages = meta_prompt_fn(normalized_msgs)
-	# Tool-use steering (strong preference for tools when applicable)
-	tool_steer = (
-		"Policy: Prefer calling available tools over text-only answers whenever a tool can produce the desired output.\n"
-		"- If the user asks to generate an image, you MUST plan a call to the tool 'image.dispatch' with filled arguments "
-		"(prompt, negative=\"\", width=1024, height=1024, steps=32, cfg=5.5) unless the user provided explicit values.\n"
-		"- Do not apologize or claim inability; propose and use the tool.\n"
-		"- Keep the plan minimal and only include the tool calls required."
-	)
-	messages = [{"role": "system", "content": tool_steer}] + messages
+	# Keep CO as the first frame; any tool steering now lives in meta/system frames
 	# Conversation id
 	conv_cid = None
 	if isinstance(body.get("cid"), (int, str)):

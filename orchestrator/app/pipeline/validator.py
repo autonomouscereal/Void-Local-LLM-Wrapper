@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Tuple, Callable
 import json
 from app.json_parser import JSONParser  # type: ignore
+from .tool_evidence_store import append_tool_evidence as _tel_append  # type: ignore
 
 import httpx as _hx  # type: ignore
 
@@ -84,6 +85,18 @@ async def validate_and_repair(
 			detail = (vobj.get("error") or {}).get("details") if isinstance(vobj, dict) else {}
 			missing = (detail or {}).get("missing") or []
 			invalid = (detail or {}).get("invalid") or []
+			# Persist TEL evidence for this failed validation (no try/except; let errors surface)
+			_tel_append(state_dir, trace_id, {
+				"name": name,
+				"ok": False,
+				"label": "failure",
+				"raw": {
+					"ts": None,
+					"ok": False,
+					"args": (args or {}),
+					"error": {"code": "validation_error", "message": (vobj.get("error") or {}).get("message"), "details": (vobj.get("error") or {}).get("details")},
+				}
+			})
 			log_fn("committee.review", trace_id=trace_id, tool=name, validator_detail={"missing": missing, "invalid": invalid})
 			log_fn("committee.decision", trace_id=trace_id, action="repair_once", rationale="ensure required fields present")
 			brief = {

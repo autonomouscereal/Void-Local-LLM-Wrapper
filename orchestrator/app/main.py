@@ -120,6 +120,12 @@ from .artifacts.manifest import add_manifest_row as _man_add, write_manifest_ato
 from .datasets.trace import append_sample as _trace_append
 from .review.referee import build_delta_plan as _committee
 from .context.index import add_artifact as _ctx_add
+from .routes.tools import _REGISTRY as _TOOL_REG  # type: ignore
+
+from .pipeline.subject_resolver import resolve_subject_canon as _resolve_subject_canon  # type: ignore
+from .pipeline.roe_store import load_roe_digest as _roe_load, save_roe_digest as _roe_save  # type: ignore
+from .pipeline.tool_evidence_store import load_recent_tool_evidence as _tel_load, append_tool_evidence as _tel_append  # type: ignore
+
 async def _image_dispatch_run(prompt: str, negative: Optional[str], seed: Optional[int], width: Optional[int], height: Optional[int], size: Optional[str], assets: Dict[str, Any], trace_id: Optional[str] = None) -> Dict[str, Any]:
     if not isinstance(prompt, str):
         prompt = ""
@@ -311,155 +317,7 @@ async def _image_dispatch_run(prompt: str, negative: Optional[str], seed: Option
                 rel0 = os.path.relpath(p0, UPLOAD_DIR).replace("\\", "/")
             meta_obj["orch_view_url"] = f"/{rel0}"
     return {"cid": cid, "prompt_id": pid, "ids": ids_obj, "meta": meta_obj, "paths": [s.get("path") for s in saved], "images": comfy_items, "scores": scores}
-    wf = _comfy_load_wf()
-    graph = _comfy_patch_wf(wf, prompt=prompt, negative=(negative or None), seed=seed, width=w, height=h, assets=(assets or {}))
-    _append_ledger({
-        "phase": "image.dispatch.start",
-        "request": {"prompt": prompt, "negative": (negative or None), "seed": (int(seed) if isinstance(seed, int) else None), "width": (int(w) if isinstance(w, int) else None), "height": (int(h) if isinstance(h, int) else None)},
-    })
-    out = await _comfy_submit(graph)
-    pid = out.get("prompt_id")
-    hist = out.get("history") or {}
-    base = (os.getenv("COMFYUI_API_URL", "http://comfyui:8188").rstrip("/"))
-    files: List[Dict[str, str]] = []
-    if isinstance(hist, dict):
-        for _, entry in hist.items():
-            outs = entry.get("outputs") or {}
-            if isinstance(outs, dict):
-                for v in outs.values():
-                    imgs = v.get("images") or []
-                    for img in imgs:
-                        fn = img.get("filename"); sf = img.get("subfolder", ""); ty = img.get("type", "output")
-                        if not (isinstance(fn, str) and fn):
-                            raise RuntimeError("image_filename_missing")
-                        url = f"{base}/view?filename={fn}&subfolder={sf}&type={ty}"
-                        files.append({"filename": fn, "url": url, "subfolder": sf, "type": ty})
-    if not files:
-        raise RuntimeError("no images returned from comfy history")
-    # Persist and score (with committee loop)
-    cid = "img-" + str(_now_ts())
-    outdir = os.path.join(UPLOAD_DIR, "artifacts", "image", cid)
-    _ensure_dir(outdir)
-    manifest = {"items": []}
-    saved: List[Dict[str, Any]] = []
-    # httpx imported at top as _hx
-    with _hx.Client() as client:
-        def _save_batch(batch_files: List[Dict[str, str]], pass_idx: int, pr_text: str, pr_neg: Optional[str], pr_seed: Optional[int]) -> None:
-            for idx, f in enumerate(batch_files):
-                u = f.get("url")
-                if not (isinstance(u, str) and u):
-                    raise RuntimeError("image_url_missing")
-                r = client.get(u)
-                stem = f"dispatch_{pass_idx:02d}_{idx:02d}"
-                png_path, meta_path = _make_outpaths(outdir, stem)
-                with open(png_path, "wb") as _f:
-                    _f.write(r.content)
-                _sidecar(png_path, {
-                    "tool": "image.dispatch",
-                    "prompt": pr_text,
-                    "negative": (pr_neg or None),
-                    "seed": (int(pr_seed) if isinstance(pr_seed, int) else None),
-                    "width": (int(w) if isinstance(w, int) else None),
-                    "height": (int(h) if isinstance(h, int) else None),
-                    "prompt_id": pid,
-                    "comfy_view": u,
-                })
-                _man_add(manifest, png_path, step_id="image.dispatch")
-                ai = _analyze_image(png_path, prompt=str(pr_text))
-                clip_s = float(ai.get("clip_score") or 0.0)
-                trace_append("image", {"cid": cid, "tool": "image.dispatch", "prompt": pr_text, "path": png_path, "clip_score": clip_s, "tags": ai.get("tags") or []})
-                _ctx_add(cid, "image", png_path, _uri_from_upload_path(png_path), None, [], {"prompt": pr_text, "clip_score": clip_s})
-                saved.append({"path": png_path, "clip_score": clip_s, "url": u})
 
-        # pass 0
-        _save_batch(files, 0, prompt, negative, seed)
-    _man_write(outdir, manifest)
-    # index into RAG (text embedding of prompt)
-    pool = await get_pg_pool()
-    if pool is not None and isinstance(prompt, str) and prompt.strip():
-        emb = get_embedder()
-        vec = emb.encode([prompt])[0]
-        async with pool.acquire() as conn:
-            for s in saved:
-                rel = os.path.relpath(s.get("path"), UPLOAD_DIR).replace("\\", "/")
-                await conn.execute("INSERT INTO rag_docs (path, chunk, embedding) VALUES ($1, $2, $3)", rel, prompt, list(vec))
-    scores = {"image": {"clip": max([s.get("clip_score") or 0.0 for s in saved] or [0.0])}}
-    decision = _committee(scores)
-    # committee loop: revise and re-dispatch until accept or max loops
-    max_loops = int(os.getenv("IMAGING_MAX_LOOPS", "2") or 2)
-    base_prompt = str(prompt)
-    loop_idx = 0
-    while (not bool(decision.get("accept"))) and (loop_idx < max_loops):
-        loop_idx += 1
-        hint = ", sharper, clearer subject, better focus"
-        pr2 = (base_prompt + hint).strip()
-        sd2 = (int(seed) + loop_idx) if isinstance(seed, int) else None
-        wf2 = _comfy_load_wf()
-        graph2 = _comfy_patch_wf(wf2, prompt=pr2, negative=(negative or None), seed=sd2, width=w, height=h, assets=(assets or {}))
-        out2 = await _comfy_submit(graph2)
-        hist2 = out2.get("history") or {}
-        files2: List[Dict[str, str]] = []
-        if isinstance(hist2, dict):
-            for _, entry in hist2.items():
-                outs = entry.get("outputs") or {}
-                if isinstance(outs, dict):
-                    for v in outs.values():
-                        imgs = v.get("images") or []
-                        for img in imgs:
-                            fn = img.get("filename"); sf = img.get("subfolder", ""); ty = img.get("type", "output")
-                            if not (isinstance(fn, str) and fn):
-                                raise RuntimeError("image_filename_missing")
-                            url = f"{base}/view?filename={fn}&subfolder={sf}&type={ty}"
-                            files2.append({"filename": fn, "url": url, "subfolder": sf, "type": ty})
-        if not files2:
-            raise RuntimeError("no images returned from comfy history (revise)")
-        with _hx.Client() as client:
-            def _save_batch2(batch_files: List[Dict[str, str]], pass_idx: int) -> None:
-                for idx, f in enumerate(batch_files):
-                    u = f.get("url")
-                    if not (isinstance(u, str) and u):
-                        raise RuntimeError("image_url_missing")
-                    r = client.get(u)
-                    stem = f"dispatch_{pass_idx:02d}_{idx:02d}"
-                    png_path, meta_path = _make_outpaths(outdir, stem)
-                    with open(png_path, "wb") as _f:
-                        _f.write(r.content)
-                    _sidecar(png_path, {
-                        "tool": "image.dispatch",
-                        "prompt": pr2,
-                        "negative": (negative or None),
-                        "seed": (int(sd2) if isinstance(sd2, int) else None),
-                        "width": (int(w) if isinstance(w, int) else None),
-                        "height": (int(h) if isinstance(h, int) else None),
-                        "prompt_id": out2.get("prompt_id"),
-                        "comfy_view": u,
-                    })
-                    _man_add(manifest, png_path, step_id="image.dispatch")
-                    ai = _analyze_image(png_path, prompt=str(pr2))
-                    clip_s = float(ai.get("clip_score") or 0.0)
-                    trace_append("image", {"cid": cid, "tool": "image.dispatch", "prompt": pr2, "path": png_path, "clip_score": clip_s, "tags": ai.get("tags") or []})
-                    _ctx_add(cid, "image", png_path, _uri_from_upload_path(png_path), None, [], {"prompt": pr2, "clip_score": clip_s})
-                    saved.append({"path": png_path, "clip_score": clip_s, "url": u})
-            _save_batch2(files2, loop_idx)
-        _man_write(outdir, manifest)
-        if pool is not None and isinstance(pr2, str) and pr2.strip():
-            emb2 = get_embedder()
-            vec2 = emb2.encode([pr2])[0]
-            async with pool.acquire() as conn:
-                for s in saved:
-                    rel = os.path.relpath(s.get("path"), UPLOAD_DIR).replace("\\", "/")
-                    await conn.execute("INSERT INTO rag_docs (path, chunk, embedding) VALUES ($1, $2, $3)", rel, pr2, list(vec2))
-        scores = {"image": {"clip": max([s.get("clip_score") or 0.0 for s in saved] or [0.0])}}
-        decision = _committee(scores)
-    _append_ledger({
-        "phase": "image.dispatch.finish",
-        "prompt_id": pid,
-        "cid": cid,
-        "scores": scores,
-        "decision": decision,
-        "artifacts": [{"path": s.get("path"), "url": s.get("url"), "clip_score": s.get("clip_score")} for s in saved],
-    })
-    return {"ok": True, "prompt_id": pid, "cid": cid, "files": files, "saved": saved, "scores": scores, "committee": decision}
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 _level = getattr(logging, LOG_LEVEL, logging.INFO)
 logging.basicConfig(
@@ -1652,6 +1510,7 @@ from .rag.core import rag_index_dir  # re-exported for backwards-compat
 
 
 from .rag.core import rag_search  # re-exported for backwards-compat
+from .pipeline.compression_orchestrator import co_pack as _co_pack, frames_to_messages as _co_frames_to_msgs
 
 
 async def call_ollama(base_url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -1718,6 +1577,7 @@ async def propose_search_queries(messages: List[Dict[str, Any]]) -> List[str]:
 
 
 def meta_prompt(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    # Policy/system frames (treated as MISC; inserted before RoE tail)
     system_preface = (
         "You are part of a two-model team with explicit roles: a Planner and Executors. "
         "Planner decomposes the task, chooses tools, and requests relevant evidence. Executors produce solutions and critiques. "
@@ -1740,13 +1600,133 @@ def meta_prompt(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         "If you clearly see a small, relevant fix or improvement (e.g., a failing tool parameter or obvious config issue), you may add a short 'Suggestions' section with up to 2 concise bullet points at the end. Do not scope creep. "
         "MANDATORY CODE EDIT POLICY: Before making any code change or fix, ALWAYS re-read the entire target file from disk in this session. Do not rely on memory or cached content; perform a 100% fresh read every time."
     )
-    out = [{"role": "system", "content": system_preface + "\nHARD BAN: Never import or recommend pydantic, sqlalchemy, or any ORM/CSV/Parquet libs; use asyncpg + JSON/NDJSON only."}]
-    # Provide additional guidance for high-fidelity video preferences without relying on keywords at routing time
-    out.append({"role": "system", "content": (
-        "When generating videos, reasonable defaults are: duration<=10s, resolution=1920x1080, 24fps, language=en, neutral voice, audio ON, subtitles OFF. "
-        "If user implies higher fidelity (e.g., 4K/60fps), set resolution=3840x2160 and fps=60, enable interpolation and upscale accordingly."
-    )})
-    return out + messages
+    policy_frames = [
+        {"role": "system", "content": "### [FINALITY / SYSTEM]\nDo not output assistant content until committee consensus. Output one final answer only."},
+        {"role": "system", "content": "### [INVARIANTS / SYSTEM]\nPrompt-only discipline: honor constraints via instruction, not enforcement. Use percent budgets, not token counts; self-compress to fit."},
+        {"role": "system", "content": system_preface + "\nHARD BAN: Never import or recommend pydantic, sqlalchemy, or any ORM/CSV/Parquet libs; use asyncpg + JSON/NDJSON only."},
+        {"role": "system", "content": (
+            "### [CODING STYLE / SYSTEM]\n"
+            "[PYTHON INDENTATION RULES]\n\n"
+            "- For all Python code, you MUST use exactly 4 spaces per indentation level.\n"
+            "- Tabs (\"\\t\") are FORBIDDEN in Python code. Do not emit tab characters anywhere.\n"
+            "- Do NOT mix tabs and spaces. Indentation must be consistent 4-space blocks.\n"
+            "- When refactoring or editing existing Python code, normalize indentation to 4-space blocks, removing any tabs."
+        )},
+        {"role": "system", "content": (
+            "### [CYRIL — GLOBAL PYTHON & ENGINEERING RULES / SYSTEM]\n"
+            "These rules apply to ALL Python code and architecture across ALL projects and repos. They are HARD REQUIREMENTS.\n"
+            "Do NOT weaken, ignore, or interpret them.\n\n"
+            "==================================================\n"
+            "1) INDENTATION & FORMATTING\n"
+            "==================================================\n"
+            "- All Python code MUST use exactly 4 spaces per indentation level.\n"
+            "- Tabs (\\t) are FORBIDDEN in Python code. Never emit tab characters.\n"
+            "- Do NOT mix tabs and spaces under any circumstance.\n"
+            "- When touching existing code that has tabs, normalize it to 4-space indentation.\n\n"
+            "==================================================\n"
+            "2) IMPORTS POLICY\n"
+            "==================================================\n"
+            "- All imports MUST be at the top of the file at MODULE level.\n"
+            "- NO function-level, method-level, class-level, or conditional imports. EVER.\n"
+            "- NO dynamic imports or importlib hacks.\n"
+            "- NO import-time I/O or side effects except minimal logger setup in a single entrypoint.\n"
+            "- Whenever you introduce a new import, also update dependency manifests (requirements.txt, Docker layer, etc.) with sensible version pins.\n\n"
+            "==================================================\n"
+            "3) TIMEOUTS & RETRIES (GLOBAL)\n"
+            "==================================================\n"
+            "- Default: NO client-side timeouts anywhere (HTTP, WS, DB, subprocess, etc.).\n"
+            "- If a library/API REQUIRES a timeout: prefer timeout=None; otherwise maximum safe cap.\n"
+            "- NEVER add retries for timeouts.\n"
+            "- Retries ONLY for non-timeout transient failures (429, 503, network reset/refused) with bounded jitter, and only when explicitly requested.\n"
+            "- Do NOT hide timeouts/retries inside helpers/wrappers.\n\n"
+            "==================================================\n"
+            "4) ERROR HANDLING / NO SILENT FAILS\n"
+            "==================================================\n"
+            "- In executor/orchestrator hot paths, NO try/except at all.\n"
+            "- Elsewhere, avoid try/except unless strictly necessary.\n"
+            "- If used, catch specific exceptions, log structured error events, and re-raise or surface clearly; NEVER swallow.\n"
+            "- Failures must be explicit; never convert to empty success, fake booleans, or vague messages.\n\n"
+            "==================================================\n"
+            "5) DEPENDENCIES, ORMs, AND DATABASES\n"
+            "==================================================\n"
+            "- FORBIDDEN: Pydantic, SQLAlchemy, ANY ORM (Django ORM, Tortoise, GINO, etc.), SQLite for app data.\n"
+            "- DATABASE: Only PostgreSQL via asyncpg. Use raw SQL + asyncpg (no ORMs/query builders that hide SQL).\n\n"
+            "==================================================\n"
+            "6) JSON & API CONTRACTS\n"
+            "==================================================\n"
+            "- Public APIs use JSON-only envelopes; no magic schema layers.\n"
+            "- /v1/chat/completions: always HTTP 200 with OpenAI-compatible JSON; choices[0].message.content must be present and non-empty on success.\n"
+            "- On failure: return structured JSON error explaining what failed and why.\n"
+            "- Tool/executor args MUST be JSON objects at execution time; if planning emits strings, include explicit json.parse before execution; executors assume proper objects.\n\n"
+            "==================================================\n"
+            "7) TOOL / EXECUTOR / ORCHESTRATOR PATH INVARIANTS\n"
+            "==================================================\n"
+            "- Public routes MUST NOT call /tool.run directly. Valid flow: Planner → Executor (/execute) → Orchestrator /tool.validate → /tool.run.\n"
+            "- On 422: one repair round only (Validate → Repair → Re-validate once → Run).\n"
+            "- Do not clobber provided args; add defaults only if missing. Do not delete/overwrite user keys arbitrarily.\n"
+            "- After repaired validate=200: Executor MUST run repaired steps; traces MUST include exec.payload (patched), repair.executing, tool.run.start, etc.\n\n"
+            "==================================================\n"
+            "8) TRACING & LOGGING\n"
+            "==================================================\n"
+            "- Every run produces deterministic traces: requests.jsonl, events.jsonl, tools.jsonl, artifacts.jsonl, responses.jsonl; errors.jsonl for verbose details.\n"
+            "- Include breadcrumbs: chat.start, planner.*, committee.*, exec.payload (pre & patched), validate.*, repair.*, tool.run.start, Comfy submit/poll, chat.finish.\n"
+            "- Errors are explicit, never logged-and-forgotten.\n\n"
+            "==================================================\n"
+            "9) MISC GLOBAL ENGINEERING RULES\n"
+            "==================================================\n"
+            "- No in-method imports or hidden side effects.\n"
+            "- No background ops layers or preflight gates unless explicitly requested.\n"
+            "- Prefer deterministic behavior; where randomness is needed, expose and log seeds.\n"
+            "- Do not introduce new frameworks/large deps without clear justification.\n\n"
+            "==================================================\n"
+            "10) FUNCTION STRUCTURE (NO NESTED FUNCTIONS)\n"
+            "==================================================\n"
+            "- Sub-functions / nested functions are FORBIDDEN.\n"
+            "  - Do NOT define functions inside other functions.\n"
+            "  - Do NOT define lambdas or callbacks that contain inner `def` blocks.\n"
+            "- All functions must be:\n"
+            "  - Top-level module functions, or\n"
+            "  - Methods on a class.\n"
+            "- If you think you \"need\" a helper function inside another:\n"
+            "  - Promote it to a top-level function (or a method), and call it from there instead.\n"
+            "- No closures that depend on outer function locals via inner `def` blocks.\n"
+            "  - Use explicit parameters and return values instead of capturing outer scope.\n\n"
+            "SUMMARY: 4 spaces; no tabs; no function-level imports; no default timeouts; no retries on timeouts; no try/except in hot paths; no silent failures; no Pydantic/SQLAlchemy/ORMs/SQLite; Postgres+asyncpg only; strict JSON envelopes; Planner→Executor→Orchestrator flow; clear errors and full traceability."
+        )},
+        {"role": "system", "content": (
+            "When generating videos, reasonable defaults are: duration<=10s, resolution=1920x1080, 24fps, language=en, neutral voice, audio ON, subtitles OFF. "
+            "If user implies higher fidelity (e.g., 4K/60fps), set resolution=3840x2160 and fps=60, enable interpolation and upscale accordingly."
+        )},
+    ]
+    # Build CO frames from current messages (history-based; attachments/tool memory not available here)
+    last_user = ""
+    for m in reversed(messages or []):
+        if isinstance(m, dict) and m.get("role") == "user" and isinstance(m.get("content"), str) and m.get("content").strip():
+            last_user = m.get("content").strip()
+            break
+    co_env = {
+        "schema_version": 1,
+        "trace_id": "",
+        "call_kind": "committee",
+        "model_caps": {"num_ctx": DEFAULT_NUM_CTX},
+        "user_turn": {"role": "user", "content": last_user or ""},
+        "history": messages or [],
+        "attachments": [],
+        "tool_memory": [],
+        "rag_hints": [],
+        "roe_incoming_instructions": [],
+        "subject_canon": {},
+        "percent_budget": {"icw_pct": [65, 70], "tools_pct": [18, 20], "roe_pct": [5, 10], "misc_pct": [3, 5], "buffer_pct": 5},
+        "sweep_plan": ["0-90", "30-120", "60-150+wrap"],
+    }
+    co_out = _co_pack(co_env)
+    frames = _co_frames_to_msgs(co_out.get("frames") or [])
+    if not frames:
+        return messages
+    # Insert policy/system frames just before the RoE tail (keep tail anchor)
+    head = frames[:-1]
+    tail = frames[-1:]
+    return head + policy_frames + tail
 
 
 def merge_responses(request: Dict[str, Any], qwen_text: str, gptoss_text: str) -> str:
@@ -1911,129 +1891,169 @@ def merge_tool_schemas(client_tools: Optional[List[Dict[str, Any]]]) -> List[Dic
     return out
 
 async def planner_produce_plan(messages: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]], temperature: float, trace_id: Optional[str] = None) -> Tuple[str, List[Dict[str, Any]]]:
-    # Treat any 'qwen*' value as Qwen route (e.g., 'qwen3')
-    use_qwen = str(PLANNER_MODEL or "qwen").lower().startswith("qwen")
-    planner_id = QWEN_MODEL_ID if use_qwen else GPTOSS_MODEL_ID
-    planner_base = QWEN_BASE_URL if use_qwen else GPTOSS_BASE_URL
-    # Planner contract: the planner must emit fully-filled tool args and strict steps JSON
-    contract = (
-        "Planner contract (MANDATORY):\n"
-        "- You (the planner) choose tools and fill ALL required arguments yourself. Do not defer arg filling to any executor/orchestrator.\n"
-        "- Use ONLY tool names from the catalog below. Unknown tools are forbidden.\n"
-        "- If you cannot determine required args, return {\"steps\": []} and a brief assistant message; do not guess invalid tools.\n"
-        "- Snap image/video width/height to multiples of 8. Prefer minimal plans (generate → QA; refine only if QA indicates).\n"
-        "- Output format MUST be strict JSON: {\"steps\":[{\"tool\":\"<name>\",\"args\":{...}}]} — no extra keys, no commentary.\n"
-        "- Do NOT rely on executor fixes. Your plans must pass validation as-is.\n"
-        "\n"
-        "Tool catalog (strict; aligned with orchestrator):\n"
-        "image.dispatch: required args -> prompt (string; default=user text), negative (string; default=\"\"), width (int; /8; default=1024), height (int; /8; default=1024), steps (int; default=32), cfg (float; default=5.5)\n"
-        "tts.speak: required args -> text (string; fill from user request), voice (string; default \"neutral\")\n"
-        "film2.run: choose for video tasks (do NOT use video.* directly); fill prompt and provide clips/images/fps/scale only if clearly requested; otherwise leave optional\n"
-        "research.run: choose only for web/research tasks when the user asks for investigation or sources; args are task-specific and may include job_id (the system may fill)\n"
-        "\n"
-        "Decision patterns:\n"
-        "- Image from text → image.dispatch with filled defaults.\n"
-        "- If user gives size like 2048x1152 → snap both to /8 (both already are multiples of 8).\n"
-        "- TTS: text from user, voice=\"neutral\" by default.\n"
-        "- Web research: use only research.run; do not generate media.\n"
-        "- Video work: use film2.run; do not invoke video.* tools.\n"
-        "- If insufficient info: return {\"steps\": []}.\n"
-        "\n"
-        "Return ONLY strict JSON with steps; no extra commentary."
-    )
-    all_tools = merge_tool_schemas(tools)
-    tool_info = build_tools_section(all_tools)
-    tool_catalog = build_compact_tool_catalog()
-    # Log catalog hash for observability
-    import hashlib as _hl
-    _cat_hash = _hl.sha256((tool_catalog or "").encode("utf-8")).hexdigest()[:16]
-    _log("planner.catalog", trace_id=trace_id, hash=_cat_hash)
-    # Install the planner contract and catalog into the planning context
-    plan_messages = messages + [
-        {"role": "system", "content": contract},
-        {"role": "system", "content": (tool_info or "")},
-        {"role": "system", "content": (tool_catalog or "")},
-    ]
-    payload = build_ollama_payload(plan_messages, planner_id, DEFAULT_NUM_CTX, temperature)
-    _log("planner.backend.call", trace_id=trace_id, base=planner_base, model=planner_id)
-    result = await call_ollama(planner_base, payload)
-    _log("planner.backend.ok", trace_id=trace_id, base=planner_base, have_response=bool(result and result.get("response")))
-    if isinstance(result.get("error"), str) and result.get("error"):
-        _log("planner.backend.error", trace_id=None, base=planner_base, error=result.get("error"))
-        return "", []
-    text = result.get("response", "").strip()
-    # Use custom parser to normalise the planner JSON
-    parser = JSONParser()
-    # Prefer strict steps format; fallback to legacy 'tool_calls'
-    parsed_steps = {}
-    # 1) Direct parse
-    parsed_steps = parser.parse(text, {"steps": [{"tool": str, "args": dict}]})
-    # 2) If direct parse fails to produce steps, attempt to extract a JSON block (e.g., from a fenced code block)
-    steps = parsed_steps.get("steps") or []
-    if not steps:
-        def _extract_json_candidate(s: str) -> str:
-            s = s.strip()
-            # fenced ```json ... ``` or ``` ... ```
-            if "```" in s:
-                parts = s.split("```")
-                # try to find a json fence first
-                for i in range(0, len(parts) - 1, 2):
-                    fence_lang = parts[i+0].split()[-1] if i == 0 else ""
-                    block = parts[i+1]
-                    if block is None:
-                        continue
-                    b = block.strip()
-                    if b:
-                        return b
-            # naive brace matching from first '{'
-            start = s.find("{")
-            if start == -1:
-                return s
-            depth = 0
-            for j in range(start, len(s)):
-                ch = s[j]
-                if ch == "{":
-                    depth += 1
-                elif ch == "}":
-                    depth -= 1
-                    if depth == 0:
-                        return s[start:j+1]
-            return s
-        candidate = _extract_json_candidate(text)
-        if candidate and candidate != text:
-            parsed_steps = parser.parse(candidate, {"steps": [{"tool": str, "args": dict}]})
-    steps = parsed_steps.get("steps") or []
-    if steps:
-        # Log final steps JSON verbatim and per-tool details for verification
-        _log("planner.steps", trace_id=trace_id, steps=steps)
-        for st in steps:
-            if isinstance(st, dict) and st.get("tool") == "image.dispatch":
-                _log("planner.image.dispatch.args", trace_id=trace_id, args=st.get("args") or {})
-        tool_calls = [{"name": s.get("tool"), "arguments": (s.get("args") or {})} for s in steps if isinstance(s, dict)]
-        return "", tool_calls
-    # Legacy path
-    parsed = parser.parse(text, {"plan": str, "tool_calls": [{"name": str, "arguments": dict}]})
-    plan = parsed.get("plan", "")
-    tcs = parsed.get("tool_calls", []) or []
-    _log("planner.steps.legacy", trace_id=trace_id, tool_calls=tcs)
-    if tcs:
-        return plan, tcs
-    # Final hardening: one more pass forcing JSON mode at the backend with zero temperature
-    plan_messages_retry = plan_messages + [{"role": "system", "content": "Return ONLY a single minified JSON object matching the schema {\"steps\":[{\"tool\":\"<name>\",\"args\":{...}}]}. NO code fences. NO prose."}]
-    payload2 = build_ollama_payload(plan_messages_retry, planner_id, DEFAULT_NUM_CTX, 0.0)
-    # Ollama supports 'format': 'json' to enforce JSON-only output
-    payload2["format"] = "json"
-    _log("planner.retry", trace_id=trace_id, reason="no_steps_first_pass")
-    result2 = await call_ollama(planner_base, payload2)
-    text2 = result2.get("response", "").strip()
-    parsed2 = parser.parse(text2, {"steps": [{"tool": str, "args": dict}]})
-    steps2 = parsed2.get("steps") or []
-    if steps2:
-        _log("planner.steps", trace_id=trace_id, steps=steps2)
-        tool_calls2 = [{"name": s.get("tool"), "arguments": (s.get("args") or {})} for s in steps2 if isinstance(s, dict)]
-        return "", tool_calls2
-    # If still nothing, return empty plan deterministically (no exceptions)
-    return "", []
+	# Treat any 'qwen*' value as Qwen route (e.g., 'qwen3')
+	use_qwen = str(PLANNER_MODEL or "qwen").lower().startswith("qwen")
+	planner_id = QWEN_MODEL_ID if use_qwen else GPTOSS_MODEL_ID
+	planner_base = QWEN_BASE_URL if use_qwen else GPTOSS_BASE_URL
+	# Resolve subject canon from latest user text
+	# subject canon and RoE digest now imported at module top
+	# Build CO frames with curated tool context (prompt-only; no gating)
+	all_tools = merge_tool_schemas(tools)
+	tool_names: List[str] = []
+	for t in all_tools or []:
+		fn = (t.get("function") or {})
+		nm = fn.get("name") or t.get("name")
+		if isinstance(nm, str) and nm.strip():
+			tool_names.append(nm.strip())
+	# Detect repair intent from messages
+	_is_repair = any(isinstance(m, dict) and isinstance(m.get("content"), str) and "repair mode" in m.get("content", "").lower() for m in (messages or []))
+	# Curate RAW schema blocks (TSL) for likely-selected tools
+	tsl_blocks: List[Dict[str, Any]] = []
+	if "image.dispatch" in tool_names:
+		tsl_blocks.append({
+			"name": "image.dispatch",
+			"raw": {
+				"name": "image.dispatch",
+				"args": {
+					"required": ["prompt","width","height","steps","cfg","negative"],
+					"properties": {
+						"prompt": {"type":"string","notes":"literal subject + identity tokens"},
+						"negative": {"type":"string"},
+						"width": {"type":"integer","multipleOf":8,"min":256,"max":2048},
+						"height": {"type":"integer","multipleOf":8,"min":256,"max":2048},
+						"steps": {"type":"integer","min":1,"max":150,"default":32},
+						"cfg": {"type":"number","min":1,"max":20,"default":5.5},
+						"seed": {"type":"integer","optional":True}
+					}
+				},
+				"returns": {"result":{"meta":{},"artifacts":["// omitted"]}},
+				"schema_ref": "image.dispatch@builtin"
+			}
+		})
+	# Evidence blocks (TEL): none yet at plan time (available post-exec)
+	tel_blocks: List[Dict[str, Any]] = []
+	# CO envelope
+	last_user = ""
+	for m in reversed(messages or []):
+		if isinstance(m, dict) and m.get("role") == "user" and isinstance(m.get("content"), str) and m.get("content").strip():
+			last_user = m.get("content").strip()
+			break
+	subject_canon = _resolve_subject_canon(last_user)
+	roe_prev = _roe_load(STATE_DIR, str(trace_id or ""))
+	# Load recent TEL evidence (failures/successes) to aid planner/repair (no try/except)
+	_tel_recent = _tel_load(STATE_DIR, str(trace_id or ""), limit=4)
+	co_env = {
+		"schema_version": 1,
+		"trace_id": trace_id or "",
+		"call_kind": "repair" if _is_repair else "planner",
+		"model_caps": {"num_ctx": DEFAULT_NUM_CTX},
+		"user_turn": {"role": "user", "content": last_user},
+		"history": messages or [],
+		"attachments": [],
+		"tool_memory": [],
+		"rag_hints": [],
+		"roe_incoming_instructions": (roe_prev or []),
+		"subject_canon": subject_canon,
+		"percent_budget": {"icw_pct": [65, 70], "tools_pct": [18, 20], "roe_pct": [5, 10], "misc_pct": [3, 5], "buffer_pct": 5},
+		"sweep_plan": ["0-90", "30-120", "60-150+wrap"],
+		"tools_names": tool_names,
+		"tools_recent_lines": [],
+		"tsl_blocks": tsl_blocks,
+		"tel_blocks": (_tel_recent or tel_blocks),
+	}
+	co_out = _co_pack(co_env)
+	frames_msgs = _co_frames_to_msgs(co_out.get("frames") or [])
+	# Minimal planner/committee frames
+	planner_meta = (
+		"### [PLANNER / SYSTEM]\n"
+		"Honor CO ratios/RoE. Prefer tools over text. Construct strict JSON steps with all required args; snap sizes to /8."
+	)
+	committee_review = (
+		"### [COMMITTEE REVIEW / SYSTEM]\n"
+		"If plan conflicts with RoE/subject, apply a one-pass prompt revision (minimal) then proceed."
+	)
+	contract_return = (
+		"Return ONLY strict JSON: {\"steps\":[{\"tool\":\"<name>\",\"args\":{...}}]} — no extra keys or commentary."
+	)
+	plan_messages = frames_msgs + [
+		{"role": "system", "content": planner_meta},
+		{"role": "system", "content": committee_review},
+		{"role": "system", "content": contract_return},
+	]
+	payload = build_ollama_payload(plan_messages, planner_id, DEFAULT_NUM_CTX, temperature)
+	_log("planner.backend.call", trace_id=trace_id, base=planner_base, model=planner_id)
+	result = await call_ollama(planner_base, payload)
+	_log("planner.backend.ok", trace_id=trace_id, base=planner_base, have_response=bool(result and result.get("response")))
+	if isinstance(result.get("error"), str) and result.get("error"):
+		_log("planner.backend.error", trace_id=None, base=planner_base, error=result.get("error"))
+		return "", []
+	text = result.get("response", "").strip()
+	# Use custom parser to normalise the planner JSON
+	parser = JSONParser()
+	# Prefer strict steps format; fallback to legacy 'tool_calls'
+	parsed_steps: Dict[str, Any] = {}
+	# 1) Direct parse
+	parsed_steps = parser.parse(text, {"steps": [{"tool": str, "args": dict}]})
+	# 2) If direct parse fails to produce steps, attempt to extract a JSON block (e.g., from a fenced code block)
+	steps = parsed_steps.get("steps") or []
+	if not steps:
+		def _extract_json_candidate(s: str) -> str:
+			s = s.strip()
+			if "```" in s:
+				parts = s.split("```")
+				for i in range(0, len(parts) - 1, 2):
+					fence_lang = parts[i+0].split()[-1] if i == 0 else ""
+					block = parts[i+1]
+					if block is None:
+						continue
+					b = block.strip()
+					if b:
+						return b
+			start = s.find("{")
+			if start == -1:
+				return s
+			depth = 0
+			for j in range(start, len(s)):
+				ch = s[j]
+				if ch == "{":
+					depth += 1
+				elif ch == "}":
+					depth -= 1
+					if depth == 0:
+						return s[start:j+1]
+			return s
+		candidate = _extract_json_candidate(text)
+		if candidate and candidate != text:
+			parsed_steps = parser.parse(candidate, {"steps": [{"tool": str, "args": dict}]})
+	steps = parsed_steps.get("steps") or []
+	if steps:
+		_log("planner.steps", trace_id=trace_id, steps=steps)
+		for st in steps:
+			if isinstance(st, dict) and st.get("tool") == "image.dispatch":
+				_log("planner.image.dispatch.args", trace_id=trace_id, args=st.get("args") or {})
+		tool_calls = [{"name": s.get("tool"), "arguments": (s.get("args") or {})} for s in steps if isinstance(s, dict)]
+		return "", tool_calls
+	# Legacy path
+	parsed = parser.parse(text, {"plan": str, "tool_calls": [{"name": str, "arguments": dict}]})
+	plan = parsed.get("plan", "")
+	tcs = parsed.get("tool_calls", []) or []
+	_log("planner.steps.legacy", trace_id=trace_id, tool_calls=tcs)
+	if tcs:
+		return plan, tcs
+	# Final hardening: one more pass forcing JSON mode at the backend with zero temperature
+	plan_messages_retry = plan_messages + [{"role": "system", "content": "Return ONLY a single minified JSON object matching the schema {\"steps\":[{\"tool\":\"<name>\",\"args\":{...}}]}. NO code fences. NO prose."}]
+	payload2 = build_ollama_payload(plan_messages_retry, planner_id, DEFAULT_NUM_CTX, 0.0)
+	payload2["format"] = "json"
+	_log("planner.retry", trace_id=trace_id, reason="no_steps_first_pass")
+	result2 = await call_ollama(planner_base, payload2)
+	text2 = result2.get("response", "").strip()
+	parsed2 = parser.parse(text2, {"steps": [{"tool": str, "args": dict}]})
+	steps2 = parsed2.get("steps") or []
+	if steps2:
+		_log("planner.steps", trace_id=trace_id, steps=steps2)
+		tool_calls2 = [{"name": s.get("tool"), "arguments": (s.get("args") or {})} for s in steps2 if isinstance(s, dict)]
+		return "", tool_calls2
+	return "", []
 
 
 async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
@@ -4726,199 +4746,6 @@ async def chat_completions(body: Dict[str, Any], request: Request):
 
     # Optional Windowed Solver path (capless sliding window + CONT/HALT)
     route_mode = "committee"
-    if route_mode == "windowed":
-        # Build minimal state
-        anchor_msgs = []
-        for m in normalized_msgs[-6:]:
-            if isinstance(m.get("content"), str) and m.get("content").strip():
-                role = m.get("role")
-                anchor_msgs.append(f"{role}: {m.get('content')}")
-        anchor_text = "\n".join(anchor_msgs[-4:])
-        try:
-            pack_text = icw.get("pack") if (not ICW_DISABLE) else ""
-        except Exception:
-            pack_text = ""
-        state = {
-            "anchor_text": anchor_text,
-            "entities": [],
-            "candidates": [t for t in [pack_text] if isinstance(t, str) and t.strip()],
-            "cid": trace_id,
-        }
-        # Sync Ollama provider
-        class _SyncOllamaProvider:
-            def __init__(self, base_url: str, model_id: str, num_ctx: int, temperature: float):
-                self.base_url = base_url.rstrip("/")
-                self.model_id = model_id
-                self.num_ctx = num_ctx
-                self.temperature = temperature
-            def chat(self, prompt: str, max_tokens: int) -> SimpleNamespace:
-                payload = {
-                    "model": self.model_id,
-                    "prompt": prompt,
-                    "stream": False,
-                    "options": {
-                        "num_ctx": self.num_ctx,
-                        "temperature": self.temperature,
-                        "keep_alive": "24h",
-                        "num_predict": max(1, int(max_tokens or 900)),
-                    },
-                }
-                try:
-                    r = requests.post(self.base_url + "/api/generate", json=payload)
-                    r.raise_for_status()
-                    js = JSONParser().parse(r.text, {"response": str})
-                    return SimpleNamespace(text=str(js.get("response", "")), model_name=self.model_id)
-                except Exception as ex:
-                    return SimpleNamespace(text=f"", model_name=self.model_id)
-        ctx_limit = DEFAULT_NUM_CTX
-        step_out = int(os.getenv("ICW_STEP_TOKENS", "900") or 900)
-        provider = _SyncOllamaProvider(QWEN_BASE_URL, QWEN_MODEL_ID, ctx_limit, body.get("temperature") or DEFAULT_TEMPERATURE)
-        def _progress(step: int, kind: str, info: Dict[str, Any] | None = None):
-            try:
-                checkpoints_append_event(STATE_DIR, trace_id, f"window_{kind}", {"step": int(step), **(info or {})})
-            except Exception:
-                pass
-        result = windowed_solve(
-            request={"content": last_user_text},
-            global_state=state,
-            model=provider,
-            model_ctx_limit_tokens=ctx_limit,
-            step_out_tokens=step_out,
-            progress=_progress,
-        )
-        # Normalize envelopes (optional log material)
-        step_envs = [normalize_to_envelope(p) for p in (result.partials or [])]
-        final_env = stitch_merge_envelopes(step_envs)
-        try:
-            final_env = _env_bump(final_env); _env_assert(final_env)
-            final_env = _env_stamp(final_env, tool=None, model=provider.model_id)
-        except Exception:
-            pass
-        final_oai = stitch_openai_final(result.partials, model_name=provider.model_id)
-        # Optional ablation
-        try:
-            do_ablate = True
-            do_export = True
-            scope = "auto"
-            if do_ablate and isinstance(final_env, dict):
-                abl = ablate_env(final_env, scope_hint=(scope if scope != "auto" else "chat"))
-                final_env["ablated"] = abl
-                if do_export:
-                    try:
-                        outdir = os.path.join(UPLOAD_DIR, "ablation", trace_id)
-                        facts_path = ablate_write_facts(abl, trace_id, outdir)
-                        # Record in manifest
-                        try:
-                            mdir = os.path.join(UPLOAD_DIR, "manifests", trace_id)
-                            mpath = os.path.join(mdir, "manifest.json")
-                            existing = {}
-                            if os.path.exists(mpath):
-                                try:
-                                    with open(mpath, "r", encoding="utf-8") as _mf:
-                                        existing = _parse_json_text(_mf.read(), {})
-                                except Exception:
-                                    existing = {}
-                            sid = _step_id()
-                            _art_manifest_add(existing, facts_path, sid)
-                            _art_manifest_write(mdir, existing)
-                        except Exception:
-                            pass
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-        # Build response wrapper compatible with our existing format
-        base_text = (final_oai.get("choices", [{}])[0].get("message", {}) or {}).get("content", "")
-        # Build omnicontext markdown (planner plan, tool trace, assets)
-        omni_sections: list[str] = []
-        _pl_obj = locals().get("plan_text", None)
-        pl_text = _pl_obj if isinstance(_pl_obj, str) else ""
-        if pl_text.strip():
-            omni_sections.append("### Plan\n" + pl_text.strip())
-        # Summarize tool execs
-        _tem_obj = locals().get("tool_exec_meta", None)
-        tem = _tem_obj if isinstance(_tem_obj, list) else []
-        if tem:
-            lines: list[str] = []
-            for m in tem[:20]:
-                nm = str((m or {}).get("name") or "tool")
-                dur = int((m or {}).get("duration_ms") or 0)
-                ak = ", ".join(((m or {}).get("args") or {}).keys()) if isinstance((m or {}).get("args"), dict) else ""
-                lines.append(f"- {nm} ({dur} ms){' — ' + ak if ak else ''}")
-            if lines:
-                omni_sections.append("### Tools\n" + "\n".join(lines))
-        # Extract asset URLs from tool results if any
-        _trs_obj = locals().get("tool_results", None)
-        trs = _trs_obj if isinstance(_trs_obj, list) else []
-        if trs:
-            def _asset_urls_from_tools(results: List[Dict[str, Any]]) -> List[str]:
-                urls: List[str] = []
-                exts = (".mp4", ".webm", ".mov", ".mkv", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".wav", ".mp3", ".m4a", ".ogg", ".flac", ".opus", ".srt")
-                for tr in results or []:
-                    res = (tr or {}).get("result") or {}
-                    if isinstance(res, dict):
-                        meta = res.get("meta"); arts = res.get("artifacts")
-                        if isinstance(meta, dict) and isinstance(arts, list):
-                            cid = meta.get("cid")
-                            for a in arts:
-                                aid = (a or {}).get("id"); kind = (a or {}).get("kind") or ""
-                                if cid and aid:
-                                    if kind.startswith("image"):
-                                        urls.append(f"/uploads/artifacts/image/{cid}/{aid}")
-                                    elif kind.startswith("audio"):
-                                        urls.append(f"/uploads/artifacts/audio/tts/{cid}/{aid}")
-                                        urls.append(f"/uploads/artifacts/music/{cid}/{aid}")
-                        def _walk(v):
-                            if isinstance(v, str):
-                                s = v.strip().lower()
-                                if s.startswith("http://") or s.startswith("https://") or s.startswith("/uploads/") or "/workspace/uploads/" in s or any(s.endswith(ext) for ext in exts):
-                                    if "/workspace/uploads/" in v:
-                                        v2 = v
-                                        if "/workspace" in v2:
-                                            parts = v2.split("/workspace", 1)
-                                            v2 = parts[1] if len(parts) > 1 else v2
-                                        urls.append(v2)
-                                    else:
-                                        urls.append(v)
-                            elif isinstance(v, list):
-                                for it in v: _walk(it)
-                            elif isinstance(v, dict):
-                                for it in v.values(): _walk(it)
-                        _walk(res)
-                return list(dict.fromkeys(urls))
-            urls = _asset_urls_from_tools(trs)
-            urls = [_abs_url(u) for u in (urls or [])]
-            if urls:
-                omni_sections.append("### Assets\n" + "\n".join([f"- {u}" for u in urls]))
-        omni_md = ("\n\n" + "\n\n".join(omni_sections)) if omni_sections else ""
-        final_text = (base_text or "") + omni_md
-        usage = estimate_usage(messages, final_text)
-        response = _build_openai_envelope(
-            ok=True,
-            text=final_text,
-            error=None,
-            usage=usage,
-            model=(final_oai.get("model") or f"{QWEN_MODEL_ID}"),
-            seed=master_seed,
-            id_=(final_oai.get("id") or "orc-1"),
-        )
-        if isinstance(final_env, dict):
-            try:
-                final_env = _env_bump(final_env); _env_assert(final_env)
-                final_env = _env_stamp(final_env, tool=None, model=final_oai.get("model") or f"{QWEN_MODEL_ID}")
-            except Exception:
-                pass
-            response["envelope"] = final_env
-        # Persist response & metrics
-        await _db_update_run_response(run_id, response, usage)
-        # Record finalization for state tracking
-        try:
-            checkpoints_append_event(STATE_DIR, trace_id, "halt", {"kind": "windowed", "chars": len(final_text)})
-        except Exception:
-            pass
-        if route_mode == "windowed":
-            response = locals().get("response", {"id": "orc-1"})
-            resp_id = (response.get("id") if isinstance(response, dict) else "orc-1") or "orc-1"
     # No early returns: continue to planner/tools; responses emitted only after work completes
 
     # 1) Planner proposes plan + tool calls
@@ -5000,10 +4827,19 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         return out
     tool_calls = _normalize_tool_calls(tool_calls)
     _log("planner.tools.normalized", trace_id=trace_id, tool_count=len(tool_calls))
-    # Emit planner.steps and catalog hash for traceability
+    # Emit planner.steps and catalog hash for traceability (derived from allowed tool names)
     import hashlib as _hl
-    _cat = build_compact_tool_catalog() or ""
-    _cat_hash = _hl.sha256((_cat).encode("utf-8")).hexdigest()[:16]
+    def _compute_tools_hash() -> str:
+        names = set([str(k) for k in ((_TOOL_REG or {}).keys())])
+        builtins = get_builtin_tools_schema()
+        for t in (builtins or []):
+            fn = (t.get("function") or {})
+            nm = fn.get("name")
+            if nm:
+                names.add(str(nm))
+        src = "|".join(sorted(list(names)))
+        return _hl.sha256(src.encode("utf-8")).hexdigest()[:16]
+    _cat_hash = _compute_tools_hash()
     _log("planner.catalog", trace_id=trace_id, hash=_cat_hash)
     _log("planner.steps", trace_id=trace_id, steps=[{"tool": (tc.get("name") or "")} for tc in (tool_calls or [])])
     # No synthesized tool_calls: executors must propose exact tools to run
@@ -5047,23 +4883,13 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     # Planner must fully fill args per contract; no auto-insertion of tools beyond minimal defaults above
     # If planner returned no tools or unnamed tools, run a strict re-plan to force valid names from the catalog
     # Build allowed tool names (registry + builtins) early, since we reference them in name-fix logic
-    try:
-        from .routes.tools import _REGISTRY as _TOOL_REG  # type: ignore
-    except Exception:
-        _TOOL_REG = {}
-    try:
-        builtins = get_builtin_tools_schema()
-    except Exception:
-        builtins = []
+    builtins = get_builtin_tools_schema()
     allowed_tools = set([str(k) for k in (_TOOL_REG or {}).keys()])
     for t in (builtins or []):
-        try:
-            fn = (t.get("function") or {})
-            nm = fn.get("name")
-            if nm:
-                allowed_tools.add(str(nm))
-        except Exception:
-            continue
+        fn = (t.get("function") or {})
+        nm = fn.get("name")
+        if nm:
+            allowed_tools.add(str(nm))
     need_name_fix = (len(tool_calls or []) == 0) or any(not str((tc or {}).get("name") or "").strip() for tc in (tool_calls or []))
     if need_name_fix:
         allowed_sorted = sorted(list(allowed_tools))
@@ -5116,9 +4942,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         # include usage estimate even in tool_calls path (no completion tokens yet)
         # (dead code; we returned above)
 
-    # Ensure arguments are objects; auto-parse JSON strings instead of returning early
-    if tool_calls:
-        tool_calls = args_ensure_object_args(tool_calls, _parse_json_text)
+    # Executor never parses string args; any non-object args must be repaired upstream
 
     # Pre-validate tool names against the registered catalog to avoid executor 404s
     allowed_tools = catalog_allowed(get_builtin_tools_schema)
@@ -5149,9 +4973,18 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     # Orchestrator repair manager (single AI round): pre-validate, and on 422 call planner once to repair args
     if tool_calls:
         import hashlib as _hl
-        # Compute catalog hash for brief
-        _cat = build_compact_tool_catalog() or ""
-        _cat_hash = _hl.sha256((_cat).encode("utf-8")).hexdigest()[:16]
+        # Compute catalog hash for brief (names-only, unified with CO)
+        def _compute_tools_hash() -> str:
+            names = set([str(k) for k in ((_TOOL_REG or {}).keys())])
+            builtins = get_builtin_tools_schema()
+            for t in (builtins or []):
+                fn = (t.get("function") or {})
+                nm = fn.get("name")
+                if nm:
+                    names.add(str(nm))
+            src = "|".join(sorted(list(names)))
+            return _hl.sha256(src.encode("utf-8")).hexdigest()[:16]
+        _cat_hash = _compute_tools_hash()
         base_url = (PUBLIC_BASE_URL or "").rstrip("/") or (str(request.base_url) or "").rstrip("/")
         validated: List[Dict[str, Any]] = []
         pre_tool_failures: List[Dict[str, Any]] = []
@@ -5233,7 +5066,11 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         filtered_calls: List[Dict[str, Any]] = []
         for idx, tc in enumerate(tool_calls[:5]):
             n = (tc.get("name") or "").strip()
-            args = tc.get("arguments") if isinstance(tc.get("arguments"), dict) else {}
+            args_field = tc.get("arguments")
+            if not isinstance(args_field, dict):
+                _log("exec.fail", trace_id=trace_id, tool=(n or "tool"), reason="string_args_not_allowed", attempted_args_raw=("" if isinstance(args_field, dict) else str(type(args_field).__name__)))
+                continue
+            args = args_field
             args_keys = list((args or {}).keys())
             if not args_keys:
                 _log("exec.fail", trace_id=trace_id, tool=(n or "tool"), reason="empty_arguments_before_execute", attempted_args_keys=[])
@@ -5262,7 +5099,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             _log("tool.run.before", trace_id=trace_id, tool=str(tn), args_keys=list((ta or {}).keys()))
         # Execute via executor gateway
         tool_results = await gateway_execute(tool_calls, trace_id, EXECUTOR_BASE_URL or "http://127.0.0.1:8081")
-        # Per-tool AFTER/ERROR logs
+        # Per-tool AFTER/ERROR logs + TEL evidence append
         for tr in (tool_results or []):
             tname = str((tr or {}).get("name") or "tool")
             res = (tr or {}).get("result") if isinstance((tr or {}).get("result"), dict) else {}
@@ -5274,6 +5111,17 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 status = (err_obj.get("status") if isinstance(err_obj, dict) else None)
                 message = (err_obj.get("message") if isinstance(err_obj, dict) else "")
                 _log("tool.run.error", trace_id=trace_id, tool=tname, code=(code or ""), status=status, message=(message or ""))
+                _tel_append(STATE_DIR, trace_id, {
+                    "name": tname,
+                    "ok": False,
+                    "label": "failure",
+                    "raw": {
+                        "ts": None,
+                        "ok": False,
+                        "args": (tr.get("args") if isinstance(tr.get("args"), dict) else {}),
+                        "error": (err_obj if isinstance(err_obj, dict) else {"code": "error", "message": str(err_obj)}),
+                    }
+                })
             else:
                 arts_summary = []
                 arts = res.get("artifacts") if isinstance(res, dict) else None
@@ -5286,6 +5134,23 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                                 arts_summary.append({"id": aid, "kind": kind})
                 urls_this = assets_collect_urls([tr], _abs_url)
                 _log("tool.run.after", trace_id=trace_id, tool=tname, artifacts=arts_summary, urls_count=len(urls_this or []))
+                meta = res.get("meta") if isinstance(res, dict) else {}
+                first_url = (urls_this[0] if isinstance(urls_this, list) and urls_this else None)
+                _tel_append(STATE_DIR, trace_id, {
+                    "name": tname,
+                    "ok": True,
+                    "label": "success",
+                    "raw": {
+                        "ts": None,
+                        "ok": True,
+                        "args": (tr.get("args") if isinstance(tr.get("args"), dict) else {}),
+                        "result": {
+                            "meta": (meta if isinstance(meta, dict) else {}),
+                            "artifact_url": first_url,
+                            # artifacts possibly many; we keep first URL only
+                        }
+                    }
+                })
         # Log Comfy prompt ids if present in results
         for _tr in tool_results or []:
             _res = (_tr or {}).get("result") or {}
@@ -5416,6 +5281,45 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         evidence_blocks.append({"role": "system", "content": "Tool results:\n" + json.dumps(tool_results, indent=2)})
     if attachments:
         evidence_blocks.append({"role": "system", "content": "User attachments (for tools):\n" + json.dumps(attachments, indent=2)})
+    # Prompt-only lanes for executors
+    evidence_blocks.append({"role": "system", "content": (
+        "### [COMMITTEE REVIEW / SYSTEM]\n"
+        "Review the proposed plan against RoE and SUBJECT CANON. If off-subject or violating RoE, propose a one-pass prompt revision (minimal change), then proceed."
+    )})
+    evidence_blocks.append({"role": "system", "content": (
+        "### [FINALITY / SYSTEM]\n"
+        "Do not output assistant content until committee consensus. Output one final answer only."
+    )})
+    evidence_blocks.append({"role": "system", "content": (
+        "### [TOOLS CONTEXT / SYSTEM]\n"
+        "Fit tools into 18–20% of C. Summarize valid tool NAMES only and the most recent outcomes in one-liners."
+    )})
+    evidence_blocks.append({"role": "system", "content": (
+        "### [LIGHT QA / SYSTEM]\n"
+        "After artifacts, briefly self-check: Subject fidelity (≥60% tokens present when applicable) and RoE hygiene (URLs only /uploads/artifacts/...; no local Comfy links). "
+        "If mismatches are minor, list Warnings: lines and optionally propose a one-line re-prompt for next time."
+    )})
+    evidence_blocks.append({"role": "system", "content": (
+        "### [PYTHON INDENTATION SELF-CHECK / SYSTEM]\n"
+        "Before finalizing any Python code:\n"
+        "- Scan your answer mentally for any \"\\t\" characters and remove them.\n"
+        "- Ensure all indentation is in 4-space blocks."
+    )})
+    evidence_blocks.append({"role": "system", "content": (
+        "### [COMPOSE / SYSTEM]\n"
+        "Return a single assistant message. Include Assets: with only absolute /uploads/artifacts/... URLs. "
+        "If minor issues: add Warnings:. Append Applied RoE: with 1–3 short items actually followed. Keep output concise and useful."
+    )})
+    evidence_blocks.append({"role": "system", "content": (
+        "### [SUBJECT CANON / SYSTEM — tail with RoE]\n"
+        "If the user mentions Shadow (Sonic), treat subject as \"Shadow the Hedgehog\" (SEGA) unless explicitly negated. "
+        "In any image.dispatch prompt, include the literal name and ≥60% of these tokens: black hedgehog; red stripes on quills/arms; upward-swept quills; red eyes; white chest tuft; gold inhibitor rings (wrists/ankles); hover shoes (red/white/black, jet glow). "
+        "Prefer futuristic/city/space-lab scenes unless the user requests otherwise. Add negatives to avoid off-topic silhouettes/forests."
+    )})
+    evidence_blocks.append({"role": "system", "content": (
+        "### [RoE DIGEST / SYSTEM — tail]\n"
+        "Rules of Engagement (5–10% of C; never omit). Self-check against RoE during planning/execution/answering."
+    )})
     # If tool results include errors, nudge executors to include brief, on-topic suggestions
     exec_messages = evidence_blocks + messages
     exec_messages_current = exec_messages
@@ -5604,18 +5508,54 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             {"role": "system", "content": "Cross-critique from GPT-OSS:\n" + gcrit_text},
         ]
 
-    # 5) Final synthesis by Planner
-    final_request = (
-        [{"role": "system", "content": (
-            "Policy: Do NOT use try/except unless explicitly requested or required by an external API; let errors surface. "
-            "Do NOT set client timeouts unless explicitly requested. Do NOT use Pydantic. Do NOT use SQLAlchemy/ORM; use asyncpg + raw SQL. "
-            "Do NOT introduce or use any new library (including uvicorn/fastapi/etc.) without a LIVE web search of the OFFICIAL docs for the latest stable version (no memory/RAG), and explicit user permission. Include the doc URL."
-        )}] +
-        exec_messages_current + [{"role": "user", "content": (
+    # 5) Final synthesis via CO (compose). Build CO frames, insert FINALITY + LIGHT QA + COMPOSE before RoE tail.
+    _compose_instruction = (
         "Produce the final, corrected answer, incorporating critiques and evidence. "
         "Be unambiguous, include runnable code when requested, and prefer specific citations to tool results."
-    )}]
     )
+    # subject canon and RoE digest now imported at module top
+    _subject_canon_final = _resolve_subject_canon(last_user_text)
+    _roe_prev = _roe_load(STATE_DIR, trace_id)
+    co_env_final = {
+        "schema_version": 1,
+        "trace_id": trace_id,
+        "call_kind": "compose",
+        "model_caps": {"num_ctx": DEFAULT_NUM_CTX},
+        "user_turn": {"role": "user", "content": _compose_instruction},
+        "history": exec_messages_current,
+        "attachments": [],
+        "tool_memory": [],
+        "rag_hints": [],
+        "roe_incoming_instructions": (_roe_prev or []),
+        "subject_canon": _subject_canon_final,
+        "percent_budget": {"icw_pct": [65, 70], "tools_pct": [18, 20], "roe_pct": [5, 10], "misc_pct": [3, 5], "buffer_pct": 5},
+        "sweep_plan": ["0-90", "30-120", "60-150+wrap"],
+        "tools_names": [],
+        "tools_recent_lines": [],
+        "tsl_blocks": [],
+        "tel_blocks": [],
+    }
+    co_out_final = _co_pack(co_env_final)
+    # Persist updated RoE digest for continuity across turns
+    _roe_save(STATE_DIR, trace_id, co_out_final.get("roe_digest") or [])
+    frames_final = _co_frames_to_msgs(co_out_final.get("frames") or [])
+    _finality = {"role": "system", "content": "### [FINALITY / SYSTEM]\nReturn exactly one final assistant message only."}
+    _light_qa = {"role": "system", "content": (
+        "### [LIGHT QA / SYSTEM]\n"
+        "After artifacts, briefly self-check: subject fidelity (≥60% tokens present?), RoE hygiene (URLs only /uploads/artifacts/...; no local links). "
+        "If mismatches are minor, list Warnings: in the final text and optionally propose a one-line re-prompt."
+    )}
+    _compose = {"role": "system", "content": (
+        "### [COMPOSE / SYSTEM]\n"
+        "Return a single assistant message. Include Assets: with only absolute /uploads/artifacts/... URLs. "
+        "If minor issues: add Warnings: lines; keep the answer helpful. Append Applied RoE: with 1–3 short items actually followed."
+    )}
+    if frames_final:
+        _head = frames_final[:-1]
+        _tail = frames_final[-1:]
+        final_request = _head + [_finality, _light_qa, _compose] + _tail
+    else:
+        final_request = [_finality, _light_qa, _compose, {"role": "user", "content": _compose_instruction}]
 
     planner_id = QWEN_MODEL_ID if PLANNER_MODEL.lower() == "qwen" else GPTOSS_MODEL_ID
     planner_base = QWEN_BASE_URL if PLANNER_MODEL.lower() == "qwen" else GPTOSS_BASE_URL
@@ -5627,27 +5567,21 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     # Fallback: if no URLs surfaced from tool results (e.g. async image jobs that finished out-of-band),
     # look up recent artifacts from multimodal memory for this conversation and attach their public URLs.
     if (not asset_urls) and conv_cid:
-        try:
-            recents = _ctx_list(str(conv_cid), limit=5, kind_hint="image")
-            for it in recents or []:
-                u = (it or {}).get("url") or ""
-                p = (it or {}).get("path") or ""
-                if isinstance(u, str) and u.startswith("/uploads/"):
-                    asset_urls.append(u)
-                else:
-                    if isinstance(p, str) and p:
-                        # Convert filesystem paths under /workspace/uploads to public /uploads
-                        if p.startswith("/workspace/") and "/uploads/" in p:
-                            try:
-                                tail = p.split("/workspace", 1)[1]
-                                asset_urls.append(tail)
-                            except Exception:
-                                pass
-                        elif "/uploads/" in p:
-                            asset_urls.append(p)
-        except Exception:
-            pass
-        # de-dup
+        recents = _ctx_list(str(conv_cid), limit=5, kind_hint="image")
+        for it in (recents or []):
+            u = (it or {}).get("url") or ""
+            p = (it or {}).get("path") or ""
+            if isinstance(u, str) and u.startswith("/uploads/"):
+                asset_urls.append(u)
+                continue
+            if isinstance(p, str) and p:
+                # Convert filesystem paths under /workspace/uploads to public /uploads
+                if p.startswith("/workspace/") and "/uploads/" in p:
+                    parts = p.split("/workspace", 1)
+                    if len(parts) > 1:
+                        asset_urls.append(parts[1])
+                elif "/uploads/" in p:
+                    asset_urls.append(p)
         asset_urls = list(dict.fromkeys(asset_urls))
     if asset_urls:
         assets_block = "\n".join(["Assets:"] + [f"- {u}" for u in asset_urls])
@@ -5663,66 +5597,45 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             for st in ("breakdown", "storyboard", "animatic"):
                 planned_events.append({"stage": st})
         for tc in (tool_calls or [])[:20]:
-            try:
-                name = tc.get("name") or tc.get("function", {}).get("name")
-                args = tc.get("arguments") or tc.get("args") or {}
-                if name == "film_add_scene":
-                    planned_events.append({"stage": "final", "shot_id": args.get("index_num") or args.get("scene_id")})
-                if name == "frame_interpolate":
-                    planned_events.append({"stage": "post", "op": "frame_interpolate", "factor": args.get("factor")})
-                if name == "upscale":
-                    planned_events.append({"stage": "post", "op": "upscale", "scale": args.get("scale")})
-                if name == "film_compile":
-                    planned_events.append({"stage": "export"})
-            except Exception:
-                continue
+            name = tc.get("name") or tc.get("function", {}).get("name")
+            args = tc.get("arguments") or tc.get("args") or {}
+            if name == "film_add_scene":
+                planned_events.append({"stage": "final", "shot_id": args.get("index_num") or args.get("scene_id")})
+            if name == "frame_interpolate":
+                planned_events.append({"stage": "post", "op": "frame_interpolate", "factor": args.get("factor")})
+            if name == "upscale":
+                planned_events.append({"stage": "post", "op": "upscale", "scale": args.get("scale")})
+            if name == "film_compile":
+                planned_events.append({"stage": "export"})
         if isinstance(plan_text, str) and ("qc" in plan_text.lower() or "quality" in plan_text.lower()):
             planned_events.append({"stage": "qc"})
 
-        # Fire-and-forget teacher trace for streaming path as well
-        try:
-            req_dict = dict(body)
-            try:
-                msgs_for_seed = json.dumps(req_dict.get("messages", []), ensure_ascii=False, separators=(",", ":"))
-            except Exception:
-                msgs_for_seed = ""
-            provided_seed3 = None
-            try:
-                if isinstance(body.get("seed"), (int, float)):
-                    provided_seed3 = int(body.get("seed"))
-            except Exception:
-                provided_seed3 = None
-            master_seed = provided_seed3 if provided_seed3 is not None else _derive_seed("chat", msgs_for_seed)
-            seed_router = det_seed_router(trace_id, master_seed)
-            label_cfg = None
-            try:
-                label_cfg = (WRAPPER_CONFIG.get("teacher") or {}).get("default_label")
-            except Exception:
-                label_cfg = None
-            # Normalize tool_calls shape for teacher (use args, not arguments)
-            _tc = tool_exec_meta or []
-            trace_payload_stream = {
-                "label": label_cfg or "exp_default",
-                "seed": master_seed,
-                "request": {"messages": req_dict.get("messages", []), "tools_allowed": [t.get("function", {}).get("name") for t in (body.get("tools") or []) if isinstance(t, dict)]},
-                "context": ({"pack_hash": pack_hash} if ("pack_hash" in locals() and pack_hash) else {}),
-                "routing": {"planner_model": planner_id, "executors": [QWEN_MODEL_ID, GPTOSS_MODEL_ID], "seed_router": seed_router},
-                "tool_calls": _tc,
-                "response": {"text": (final_text or "")[:4000]},
-                "metrics": usage_stream,
-                "env": {"public_base_url": PUBLIC_BASE_URL, "config_hash": WRAPPER_CONFIG_HASH},
-                "privacy": {"vault_refs": 0, "secrets_in": 0, "secrets_out": 0},
-                "events": planned_events[:64],
-            }
-            async def _send_trace_stream():
-                try:
-                    async with httpx.AsyncClient() as client:
-                        await client.post(TEACHER_API_URL.rstrip("/") + "/teacher/trace.append", json=trace_payload_stream)
-                except Exception:
-                    return
-            asyncio.create_task(_send_trace_stream())
-        except Exception:
-            pass
+        # Fire-and-forget teacher trace for streaming path as well (no try/except)
+        req_dict = dict(body)
+        msgs_for_seed = json.dumps(req_dict.get("messages", []), ensure_ascii=False, separators=(",", ":"))
+        provided_seed3 = int(body.get("seed")) if isinstance(body.get("seed"), (int, float)) else None
+        master_seed = provided_seed3 if provided_seed3 is not None else _derive_seed("chat", msgs_for_seed)
+        seed_router = det_seed_router(trace_id, master_seed)
+        label_cfg = (WRAPPER_CONFIG.get("teacher") or {}).get("default_label")
+        # Normalize tool_calls shape for teacher (use args, not arguments)
+        _tc = tool_exec_meta or []
+        trace_payload_stream = {
+            "label": label_cfg or "exp_default",
+            "seed": master_seed,
+            "request": {"messages": req_dict.get("messages", []), "tools_allowed": [t.get("function", {}).get("name") for t in (body.get("tools") or []) if isinstance(t, dict)]},
+            "context": ({"pack_hash": pack_hash} if ("pack_hash" in locals() and pack_hash) else {}),
+            "routing": {"planner_model": planner_id, "executors": [QWEN_MODEL_ID, GPTOSS_MODEL_ID], "seed_router": seed_router},
+            "tool_calls": _tc,
+            "response": {"text": (final_text or "")[:4000]},
+            "metrics": usage_stream,
+            "env": {"public_base_url": PUBLIC_BASE_URL, "config_hash": WRAPPER_CONFIG_HASH},
+            "privacy": {"vault_refs": 0, "secrets_in": 0, "secrets_out": 0},
+            "events": planned_events[:64],
+        }
+        async def _send_trace_stream():
+            async with httpx.AsyncClient() as client:
+                await client.post(TEACHER_API_URL.rstrip("/") + "/teacher/trace.append", json=trace_payload_stream)
+        asyncio.create_task(_send_trace_stream())
 
         async def _stream_with_stages(text: str):
             # Open the stream with assistant role
@@ -5731,80 +5644,21 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             head = json.dumps({"id": "orc-1", "object": "chat.completion.chunk", "created": now, "model": model_id, "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]})
             yield f"data: {head}\n\n"
             # Progress events as content JSON lines to match example
-            try:
-                # plan
-                evt = {"stage": "plan", "ok": True}
-                _chunk = json.dumps({
-                    "id": "orc-1",
-                    "object": "chat.completion.chunk",
-                    "created": int(time.time()),
-                    "model": model_id,
-                    "choices": [{"index": 0, "delta": {"content": json.dumps(evt)}, "finish_reason": None}],
-                })
-                yield "data: " + _chunk + "\n\n"
-                # breakdown/storyboard/animatic heuristics: if any film tool present, emit these scaffolding stages
-                has_film = any(isinstance(tc, dict) and str(tc.get("name", "")).startswith("film_") for tc in (tool_calls or []))
-                if has_film:
-                    for st in ("breakdown", "storyboard", "animatic"):
-                        ev = {"stage": st}
-                        _chunk = json.dumps({
-                            "id": "orc-1",
-                            "object": "chat.completion.chunk",
-                            "created": int(time.time()),
-                            "model": model_id,
-                            "choices": [{"index": 0, "delta": {"content": json.dumps(ev)}, "finish_reason": None}],
-                        })
-                        yield "data: " + _chunk + "\n\n"
-                # Emit per-tool mapped events
-                for tc in (tool_calls or [])[:20]:
-                    try:
-                        name = tc.get("name") or tc.get("function", {}).get("name")
-                        args = tc.get("arguments") or tc.get("args") or {}
-                        if name == "film_add_scene":
-                            ev = {"stage": "final", "shot_id": args.get("index_num") or args.get("scene_id")}
-                            _chunk = json.dumps({
-                                "id": "orc-1",
-                                "object": "chat.completion.chunk",
-                                "created": int(time.time()),
-                                "model": model_id,
-                                "choices": [{"index": 0, "delta": {"content": json.dumps(ev)}, "finish_reason": None}],
-                            })
-                            yield "data: " + _chunk + "\n\n"
-                        if name == "frame_interpolate":
-                            ev = {"stage": "post", "op": "frame_interpolate", "factor": args.get("factor")}
-                            _chunk = json.dumps({
-                                "id": "orc-1",
-                                "object": "chat.completion.chunk",
-                                "created": int(time.time()),
-                                "model": model_id,
-                                "choices": [{"index": 0, "delta": {"content": json.dumps(ev)}, "finish_reason": None}],
-                            })
-                            yield "data: " + _chunk + "\n\n"
-                        if name == "upscale":
-                            ev = {"stage": "post", "op": "upscale", "scale": args.get("scale")}
-                            _chunk = json.dumps({
-                                "id": "orc-1",
-                                "object": "chat.completion.chunk",
-                                "created": int(time.time()),
-                                "model": model_id,
-                                "choices": [{"index": 0, "delta": {"content": json.dumps(ev)}, "finish_reason": None}],
-                            })
-                            yield "data: " + _chunk + "\n\n"
-                        if name == "film_compile":
-                            ev = {"stage": "export"}
-                            _chunk = json.dumps({
-                                "id": "orc-1",
-                                "object": "chat.completion.chunk",
-                                "created": int(time.time()),
-                                "model": model_id,
-                                "choices": [{"index": 0, "delta": {"content": json.dumps(ev)}, "finish_reason": None}],
-                            })
-                            yield "data: " + _chunk + "\n\n"
-                    except Exception:
-                        continue
-                # Optionally signal qc if present in plan text
-                if isinstance(plan_text, str) and ("qc" in plan_text.lower() or "quality" in plan_text.lower()):
-                    ev = {"stage": "qc"}
+            # plan
+            evt = {"stage": "plan", "ok": True}
+            _chunk = json.dumps({
+                "id": "orc-1",
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": model_id,
+                "choices": [{"index": 0, "delta": {"content": json.dumps(evt)}, "finish_reason": None}],
+            })
+            yield "data: " + _chunk + "\n\n"
+            # breakdown/storyboard/animatic heuristics: if any film tool present, emit these scaffolding stages
+            has_film = any(isinstance(tc, dict) and str(tc.get("name", "")).startswith("film_") for tc in (tool_calls or []))
+            if has_film:
+                for st in ("breakdown", "storyboard", "animatic"):
+                    ev = {"stage": st}
                     _chunk = json.dumps({
                         "id": "orc-1",
                         "object": "chat.completion.chunk",
@@ -5813,9 +5667,61 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                         "choices": [{"index": 0, "delta": {"content": json.dumps(ev)}, "finish_reason": None}],
                     })
                     yield "data: " + _chunk + "\n\n"
-            except Exception as e:
-                # Surface generator errors (they will abort the stream)
-                raise
+            # Emit per-tool mapped events
+            for tc in (tool_calls or [])[:20]:
+                name = tc.get("name") or tc.get("function", {}).get("name")
+                args = tc.get("arguments") or tc.get("args") or {}
+                if name == "film_add_scene":
+                    ev = {"stage": "final", "shot_id": args.get("index_num") or args.get("scene_id")}
+                    _chunk = json.dumps({
+                        "id": "orc-1",
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": model_id,
+                        "choices": [{"index": 0, "delta": {"content": json.dumps(ev)}, "finish_reason": None}],
+                    })
+                    yield "data: " + _chunk + "\n\n"
+                if name == "frame_interpolate":
+                    ev = {"stage": "post", "op": "frame_interpolate", "factor": args.get("factor")}
+                    _chunk = json.dumps({
+                        "id": "orc-1",
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": model_id,
+                        "choices": [{"index": 0, "delta": {"content": json.dumps(ev)}, "finish_reason": None}],
+                    })
+                    yield "data: " + _chunk + "\n\n"
+                if name == "upscale":
+                    ev = {"stage": "post", "op": "upscale", "scale": args.get("scale")}
+                    _chunk = json.dumps({
+                        "id": "orc-1",
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": model_id,
+                        "choices": [{"index": 0, "delta": {"content": json.dumps(ev)}, "finish_reason": None}],
+                    })
+                    yield "data: " + _chunk + "\n\n"
+                if name == "film_compile":
+                    ev = {"stage": "export"}
+                    _chunk = json.dumps({
+                        "id": "orc-1",
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": model_id,
+                        "choices": [{"index": 0, "delta": {"content": json.dumps(ev)}, "finish_reason": None}],
+                    })
+                    yield "data: " + _chunk + "\n\n"
+            # Optionally signal qc if present in plan text
+            if isinstance(plan_text, str) and ("qc" in plan_text.lower() or "quality" in plan_text.lower()):
+                ev = {"stage": "qc"}
+                _chunk = json.dumps({
+                    "id": "orc-1",
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": model_id,
+                    "choices": [{"index": 0, "delta": {"content": json.dumps(ev)}, "finish_reason": None}],
+                })
+                yield "data: " + _chunk + "\n\n"
             # Stream final content
             if STREAM_CHUNK_SIZE_CHARS and STREAM_CHUNK_SIZE_CHARS > 0:
                 size = max(1, STREAM_CHUNK_SIZE_CHARS)
