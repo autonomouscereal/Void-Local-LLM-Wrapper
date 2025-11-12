@@ -4732,10 +4732,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         )
         return JSONResponse(status_code=200, content=env)
     # No caps — never enforce caps inline (no message count/size caps here)
-    try:
-        body["messages"] = nfc_msgs(body.get("messages") or [])
-    except Exception:
-        pass
+    body["messages"] = nfc_msgs(body.get("messages") or [])
     normalized_msgs, attachments = extract_attachments_from_messages(body.get("messages"))
     # prepend a system hint with attachment summary (non-invasive)
     if attachments:
@@ -4755,123 +4752,81 @@ async def chat_completions(body: Dict[str, Any], request: Request):
 
     # Determine mode and trace/run identifiers early
     conv_cid = None
-    try:
-        if isinstance(body.get("cid"), (int, str)):
-            conv_cid = str(body.get("cid"))
-        elif isinstance(body.get("conversation_id"), (int, str)):
-            conv_cid = str(body.get("conversation_id"))
-    except Exception:
-        conv_cid = None
+    if isinstance(body.get("cid"), (int, str)):
+        conv_cid = str(body.get("cid"))
+    elif isinstance(body.get("conversation_id"), (int, str)):
+        conv_cid = str(body.get("conversation_id"))
     last_user_text = ""
     for m in reversed(normalized_msgs):
         if (m.get("role") == "user") and isinstance(m.get("content"), str) and m.get("content").strip():
             last_user_text = m.get("content").strip(); break
     mode = "film" if _detect_video_intent(last_user_text) else "general"
     # generate a deterministic trace id from messages
-    try:
-        msgs_for_seed = json.dumps([{"role": m.get("role"), "content": m.get("content")} for m in normalized_msgs], ensure_ascii=False, separators=(",", ":"))
-    except Exception:
-        msgs_for_seed = ""
-    provided_seed = None
-    try:
-        if isinstance(body.get("seed"), (int, float)):
-            provided_seed = int(body.get("seed"))
-    except Exception:
-        provided_seed = None
+    msgs_for_seed = json.dumps([{"role": m.get("role"), "content": m.get("content")} for m in normalized_msgs], ensure_ascii=False, separators=(",", ":"))
+    provided_seed = int(body.get("seed")) if isinstance(body.get("seed"), (int, float)) else None
     master_seed = provided_seed if provided_seed is not None else _derive_seed("chat", msgs_for_seed)
     import hashlib as _hl
     trace_id = (f"cid_{conv_cid}" if conv_cid else None) or ("tt_" + _hl.sha256(msgs_for_seed.encode("utf-8")).hexdigest()[:16])
     # Allow client-provided idempotency key to override trace_id for deduplication
-    try:
-        ikey = body.get("idempotency_key")
-        if isinstance(ikey, str) and len(ikey) >= 8:
-            trace_id = ikey.strip()
-    except Exception:
-        pass
-    try:
-        first_user_len = len((last_user_text or "")) if isinstance(last_user_text, str) else 0
-        _append_jsonl(
-            os.path.join(STATE_DIR, "traces", trace_id, "requests.jsonl"),
-            {
-                "t": int(time.time() * 1000),
-                "trace_id": trace_id,
-                "route": "/v1/chat/completions",
-                "body_summary": {"messages_count": len(normalized_msgs or []), "first_user_text_len": first_user_len},
-                "seed": int(master_seed),
-                "model_declared": (body.get("model") if isinstance(body.get("model"), str) else None),
-            },
-        )
-    except Exception:
-        pass
+    ikey = body.get("idempotency_key")
+    if isinstance(ikey, str) and len(ikey) >= 8:
+        trace_id = ikey.strip()
+    first_user_len = len((last_user_text or "")) if isinstance(last_user_text, str) else 0
+    _append_jsonl(
+        os.path.join(STATE_DIR, "traces", trace_id, "requests.jsonl"),
+        {
+            "t": int(time.time() * 1000),
+            "trace_id": trace_id,
+            "route": "/v1/chat/completions",
+            "body_summary": {"messages_count": len(normalized_msgs or []), "first_user_text_len": first_user_len},
+            "seed": int(master_seed),
+            "model_declared": (body.get("model") if isinstance(body.get("model"), str) else None),
+        },
+    )
     _log("chat.start", trace_id=trace_id, mode=mode, stream=bool(body.get("stream")), cid=conv_cid)
     # Helper: build absolute URLs for any same-origin artifact paths
     def _abs_url(u: str) -> str:
-        try:
-            if isinstance(u, str) and u.startswith("/"):
-                base = (PUBLIC_BASE_URL or "").rstrip("/")
-                if not base:
-                    # request.base_url includes trailing slash
-                    base = (str(request.base_url) or "").rstrip("/")
-                if base:
-                    return base + u
-        except Exception:
-            return u
+        if isinstance(u, str) and u.startswith("/"):
+            base = (PUBLIC_BASE_URL or "").rstrip("/")
+            if not base:
+                base = (str(request.base_url) or "").rstrip("/")
+            if base:
+                return base + u
         return u
     # Acquire per-trace lock and record start event
-    _lock_token = None
-    try:
-        _lock_token = _acquire_lock(STATE_DIR, trace_id, timeout_s=10)
-    except Exception:
-        _lock_token = None
-    try:
-        _append_event(STATE_DIR, trace_id, "start", {"seed": int(master_seed), "mode": mode})
-    except Exception:
-        pass
+    _lock_token = _acquire_lock(STATE_DIR, trace_id, timeout_s=10)
+    _append_event(STATE_DIR, trace_id, "start", {"seed": int(master_seed), "mode": mode})
 
     # ICW pack (always-on) — inline; record pack_hash for traces
     pack_hash = None
-    try:
-        seed_icw = _derive_seed("icw", msgs_for_seed)
-        icw = _icw_pack(normalized_msgs, seed_icw, budget_tokens=3500)
-        pack_text = icw.get("pack") or ""
-        if isinstance(pack_text, str) and pack_text.strip():
-            messages = [{"role": "system", "content": f"ICW PACK (hash tracked):\n{pack_text[:12000]}"}] + messages
-        pack_hash = icw.get("hash")
-        run_id = await _db_insert_run(trace_id=trace_id, mode=mode, seed=master_seed, pack_hash=pack_hash, request_json=body)
-        await _db_insert_icw_log(run_id=run_id, pack_hash=pack_hash or None, budget_tokens=int(icw.get("budget_tokens") or 0), scores_json=icw.get("scores_summary") or {})
-    except Exception:
-        pack_hash = None
-        run_id = await _db_insert_run(trace_id=trace_id, mode=mode, seed=master_seed, pack_hash=None, request_json=body)
+    seed_icw = _derive_seed("icw", msgs_for_seed)
+    icw = _icw_pack(normalized_msgs, seed_icw, budget_tokens=3500)
+    pack_text = icw.get("pack") or ""
+    if isinstance(pack_text, str) and pack_text.strip():
+        messages = [{"role": "system", "content": f"ICW PACK (hash tracked):\n{pack_text[:12000]}"}] + messages
+    pack_hash = icw.get("hash")
+    run_id = await _db_insert_run(trace_id=trace_id, mode=mode, seed=master_seed, pack_hash=pack_hash, request_json=body)
+    await _db_insert_icw_log(run_id=run_id, pack_hash=pack_hash or None, budget_tokens=int(icw.get("budget_tokens") or 0), scores_json=icw.get("scores_summary") or {})
 
     # Multi-ICW augmentation: inject lightweight, high-signal snapshots for planning/committee
-    try:
-        # 1) Attachment snapshot (if any) to guide tool selection without overloading models
-        if attachments:
-            try:
-                attn_compact = json.dumps(attachments, ensure_ascii=False)[:12000]
-            except Exception:
-                attn_compact = str(attachments)[:12000]
-            messages = [{"role": "system", "content": f"ICW ATTACHMENTS (compact):\n{attn_compact}"}] + messages
-        # 2) Conversation history snapshot (compact rolling window)
-        try:
-            # Build a deterministic rolling window: last 50 user/assistant turns flattened
-            hist_lines: list[str] = []
-            kept = 0
-            for m in reversed(normalized_msgs):
-                role = (m.get("role") or "").strip()
-                content = (m.get("content") or "").strip()
-                if role in ("user", "assistant") and content:
-                    hist_lines.append(f"{role}: {content}")
-                    kept += 1
-                if kept >= 50:
-                    break
-            hist_text = "\n".join(reversed(hist_lines))[:16000]
-            if hist_text:
-                messages = [{"role": "system", "content": f"ICW HISTORY (rolling window):\n{hist_text}"}] + messages
-        except Exception:
-            pass
-    except Exception:
-        pass
+    # 1) Attachment snapshot (if any) to guide tool selection without overloading models
+    if attachments:
+        attn_compact = json.dumps(attachments, ensure_ascii=False)[:12000]
+        messages = [{"role": "system", "content": f"ICW ATTACHMENTS (compact):\n{attn_compact}"}] + messages
+    # 2) Conversation history snapshot (compact rolling window)
+    hist_lines: list[str] = []
+    kept = 0
+    for m in reversed(normalized_msgs):
+        role = (m.get("role") or "").strip()
+        content = (m.get("content") or "").strip()
+        if role in ("user", "assistant") and content:
+            hist_lines.append(f"{role}: {content}")
+            kept += 1
+        if kept >= 50:
+            break
+    hist_text = "\n".join(reversed(hist_lines))[:16000]
+    if hist_text:
+        messages = [{"role": "system", "content": f"ICW HISTORY (rolling window):\n{hist_text}"}] + messages
 
     # If client supplies tool results (role=tool) we include them verbatim for the planner/executors
 
