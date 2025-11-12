@@ -2096,10 +2096,42 @@ async def planner_produce_plan(messages: List[Dict[str, Any]], tools: Optional[L
     parser = JSONParser()
     # Prefer strict steps format; fallback to legacy 'tool_calls'
     parsed_steps = {}
-    try:
-        parsed_steps = parser.parse(text, {"steps": [{"tool": str, "args": dict}]})
-    except Exception:
-        parsed_steps = {}
+    # 1) Direct parse
+    parsed_steps = parser.parse(text, {"steps": [{"tool": str, "args": dict}]})
+    # 2) If direct parse fails to produce steps, attempt to extract a JSON block (e.g., from a fenced code block)
+    steps = parsed_steps.get("steps") or []
+    if not steps:
+        def _extract_json_candidate(s: str) -> str:
+            s = s.strip()
+            # fenced ```json ... ``` or ``` ... ```
+            if "```" in s:
+                parts = s.split("```")
+                # try to find a json fence first
+                for i in range(0, len(parts) - 1, 2):
+                    fence_lang = parts[i+0].split()[-1] if i == 0 else ""
+                    block = parts[i+1]
+                    if block is None:
+                        continue
+                    b = block.strip()
+                    if b:
+                        return b
+            # naive brace matching from first '{'
+            start = s.find("{")
+            if start == -1:
+                return s
+            depth = 0
+            for j in range(start, len(s)):
+                ch = s[j]
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return s[start:j+1]
+            return s
+        candidate = _extract_json_candidate(text)
+        if candidate and candidate != text:
+            parsed_steps = parser.parse(candidate, {"steps": [{"tool": str, "args": dict}]})
     steps = parsed_steps.get("steps") or []
     if steps:
         # Log final steps JSON verbatim and per-tool details for verification
@@ -2114,7 +2146,24 @@ async def planner_produce_plan(messages: List[Dict[str, Any]], tools: Optional[L
     plan = parsed.get("plan", "")
     tcs = parsed.get("tool_calls", []) or []
     _log("planner.steps.legacy", trace_id=None, tool_calls=tcs)
-    return plan, tcs
+    if tcs:
+        return plan, tcs
+    # Final hardening: one more pass forcing JSON mode at the backend with zero temperature
+    plan_messages_retry = plan_messages + [{"role": "system", "content": "Return ONLY a single minified JSON object matching the schema {\"steps\":[{\"tool\":\"<name>\",\"args\":{...}}]}. NO code fences. NO prose."}]
+    payload2 = build_ollama_payload(plan_messages_retry, planner_id, DEFAULT_NUM_CTX, 0.0)
+    # Ollama supports 'format': 'json' to enforce JSON-only output
+    payload2["format"] = "json"
+    _log("planner.retry", trace_id=None, reason="no_steps_first_pass")
+    result2 = await call_ollama(planner_base, payload2)
+    text2 = result2.get("response", "").strip()
+    parsed2 = parser.parse(text2, {"steps": [{"tool": str, "args": dict}]})
+    steps2 = parsed2.get("steps") or []
+    if steps2:
+        _log("planner.steps", trace_id=None, steps=steps2)
+        tool_calls2 = [{"name": s.get("tool"), "arguments": (s.get("args") or {})} for s in steps2 if isinstance(s, dict)]
+        return "", tool_calls2
+    # If still nothing, return empty plan deterministically (no exceptions)
+    return "", []
 
 
 async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
