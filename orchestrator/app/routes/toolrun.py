@@ -27,25 +27,35 @@ def err_envelope(code: str, message: str, rid: str, status: int = 200, details: 
 	)
 
 
+def _ok_env(ok: bool, **kwargs) -> dict:
+	out = {"ok": bool(ok)}
+	out.update(kwargs or {})
+	return out
+
 async def _post_json(url: str, obj: dict) -> dict:
 	async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
-		resp = await client.post(url, json=obj)
-		resp.raise_for_status()
-		ct = resp.headers.get("content-type","")
-		if "application/json" in ct:
-			return resp.json()
-		# Fallback for ComfyUI text/json without header
-		return json.loads(resp.text)
+		try:
+			resp = await client.post(url, json=obj)
+			ct = resp.headers.get("content-type","")
+			data = resp.json() if ("application/json" in ct) else json.loads(resp.text or "{}")
+			if 200 <= resp.status_code < 300:
+				return _ok_env(True, **(data if isinstance(data, dict) else {"data": data}))
+			return _ok_env(False, code="http_error", status=resp.status_code, detail=data)
+		except Exception as ex:
+			return _ok_env(False, code="network_error", message=str(ex))
 
 
 async def _get_json(url: str) -> dict:
 	async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
-		resp = await client.get(url, headers={"accept": "application/json"})
-		resp.raise_for_status()
-		ct = resp.headers.get("content-type","")
-		if "application/json" in ct:
-			return resp.json()
-		return json.loads(resp.text)
+		try:
+			resp = await client.get(url, headers={"accept": "application/json"})
+			ct = resp.headers.get("content-type","")
+			data = resp.json() if ("application/json" in ct) else json.loads(resp.text or "{}")
+			if 200 <= resp.status_code < 300:
+				return _ok_env(True, **(data if isinstance(data, dict) else {"data": data}))
+			return _ok_env(False, code="http_error", status=resp.status_code, detail=data)
+		except Exception as ex:
+			return _ok_env(False, code="network_error", message=str(ex))
 
 
 def _read_text(path: str) -> str:
@@ -224,9 +234,16 @@ def _build_view_url(base: str, filename: str, subfolder: str, ftype: str) -> str
 STATE_DIR_LOCAL = os.path.join(os.getenv("UPLOAD_DIR", "/workspace/uploads"), "state")
 
 # Runtime guard: force loopback base in host networking even if a container hostname sneaks in
+def _force_loopback(url: str) -> str:
+	try:
+		u = urlsplit(url)
+		host = "127.0.0.1"
+		port = u.port or (8188 if (u.scheme or "http") == "http" else 8188)
+		return f"{u.scheme or 'http'}://{host}:{port}"
+	except Exception:
+		return "http://127.0.0.1:8188"
 _raw_comfy = os.getenv("COMFYUI_API_URL") or "http://127.0.0.1:8188"
-# Use the configured URL as-is (no host rewriting). Host networking aligns all services.
-COMFY_BASE = _raw_comfy
+COMFY_BASE = _force_loopback(_raw_comfy)
 
 def _append_jsonl(path: str, obj: dict) -> None:
 	os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -427,20 +444,22 @@ async def tool_run(req: Request):
 		# continue with this synthesized graph
 	# Ensure SaveImage nodes have a filename_prefix (required by newer ComfyUI)
 	_client_id = uuid.uuid4().hex
+	cid = (args.get("cid") or "").strip() if isinstance(args.get("cid"), str) else ""
+	trace = (args.get("trace_id") or "").strip() if isinstance(args.get("trace_id"), str) else ""
+	step_id = (args.get("step_id") or "").strip() if isinstance(args.get("step_id"), str) else ""
 	for nid, node in (prompt_graph or {}).items():
 		if isinstance(node, dict) and (node.get("class_type") or "") == "SaveImage":
 			ins = node.setdefault("inputs", {})
 			if not isinstance(ins.get("filename_prefix"), str) or not (ins.get("filename_prefix") or "").strip():
-				ins["filename_prefix"] = f"void_{_client_id}"
+				prefix = f"{cid}_{trace}_{step_id}" if (cid or trace or step_id) else f"void_{_client_id}"
+				ins["filename_prefix"] = prefix
 
 	client_id = _client_id
 	_emit_trace(STATE_DIR_LOCAL, "global", "comfyui.submit", {"t": int(time.time()*1000), "base": COMFY_BASE, "workflow_path": wf_path})
 	log.info("[comfy] POST /prompt url=%s", COMFY_BASE.rstrip("/") + "/prompt")
-	try:
-		submit_res = await _post_json(COMFY_BASE.rstrip("/") + "/prompt", {"prompt": prompt_graph, "client_id": client_id})
-	except httpx.HTTPError as ex:
-		# Return a structured error so the assistant can report the failure
-		return err_envelope("http_error", f"comfy submit failed: {str(ex)}", rid="tool.run", status=500, details={"_http_status": getattr(getattr(ex, 'response', None), 'status_code', None)})
+	submit_res = await _post_json(COMFY_BASE.rstrip("/") + "/prompt", {"prompt": prompt_graph, "client_id": client_id})
+	if not bool(submit_res.get("ok")):
+		return err_envelope("http_error", "comfy submit failed", rid="tool.run", status=200, details=submit_res)
 	prompt_id = submit_res.get("prompt_id") or submit_res.get("promptId") or ""
 	log.info("[comfy] prompt_id=%s client_id=%s", prompt_id, client_id)
 
@@ -451,10 +470,9 @@ async def tool_run(req: Request):
 	while True:
 		await asyncio.sleep(_poll_delay)
 		log.info("[comfy] polling /history/%s", prompt_id)
-		try:
-			hist = await _get_json(f"{COMFY_BASE.rstrip('/')}/history/{prompt_id}")
-		except httpx.HTTPError as ex:
-			return err_envelope("http_error", f"comfy history failed: {str(ex)}", rid="tool.run", status=500, details={"prompt_id": prompt_id, "_http_status": getattr(getattr(ex, 'response', None), 'status_code', None)})
+		hist = await _get_json(f"{COMFY_BASE.rstrip('/')}/history/{prompt_id}")
+		if not bool(hist.get("ok")):
+			return err_envelope("http_error", "comfy history failed", rid="tool.run", status=200, details={"prompt_id": prompt_id, **hist})
 		if _first_hist:
 			_emit_trace(STATE_DIR_LOCAL, "global", "comfyui.history", {"t": int(time.time()*1000), "prompt_id": prompt_id})
 			_first_hist = False

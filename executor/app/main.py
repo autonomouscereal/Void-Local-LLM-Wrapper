@@ -19,6 +19,7 @@ from orchestrator.app.json_parser import JSONParser  # use the same hardened JSO
 import psutil
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
+from executor.utc.utc_runner import utc_run_tool  # moved to top per import policy
 import uuid
 
 
@@ -170,6 +171,13 @@ def _post_json(url: str, payload: Dict[str, Any], expected: Optional[Dict[str, A
         parser = JSONParser()
         schema = expected if expected is not None else {}
         return parser.parse(raw, schema)
+
+def _post_json_safe(url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        return _post_json(url, payload, expected={})
+    except Exception as ex:
+        # Return explicit ok=false so callers can proceed without exceptions
+        return {"ok": False, "error": {"code": "post_failed", "message": str(ex)}}
 
 
 def _distill_summary(result_obj: Any) -> Dict[str, Any]:
@@ -397,12 +405,9 @@ async def run_steps(trace_id: str, request_id: str, steps: list[dict]) -> Dict[s
 
     pending = set(norm_steps.keys())
     logging.info(f"[executor] steps_start trace_id={trace_id} steps={len(pending)}")
-    try:
-        _post_json(ORCHESTRATOR_BASE_URL.rstrip("/") + "/logs/tools.append", {
-            "t": int(time.time()*1000), "event": "exec_plan_start", "trace_id": request_id, "steps": len(pending)
-        }, expected={})
-    except Exception:
-        logging.error(traceback.format_exc())
+    _post_json_safe(ORCHESTRATOR_BASE_URL.rstrip("/") + "/logs/tools.append", {
+        "t": int(time.time()*1000), "event": "exec_plan_start", "trace_id": request_id, "steps": len(pending)
+    })
 
     while pending:
         satisfied = set(produced.keys())
@@ -411,12 +416,9 @@ async def run_steps(trace_id: str, request_id: str, steps: list[dict]) -> Dict[s
             raise ValueError("deadlock_or_missing")
         batch_tools = [{"step_id": sid, "tool": norm_steps[sid].get("tool")} for sid in runnable]
         logging.info(f"[executor] batch_start trace_id={trace_id} runnable={batch_tools}")
-        try:
-            _post_json(ORCHESTRATOR_BASE_URL.rstrip("/") + "/logs/tools.append", {
-                "t": int(time.time()*1000), "event": "exec_batch_start", "trace_id": request_id, "items": batch_tools
-            }, expected={})
-        except Exception:
-            logging.error(traceback.format_exc())
+        _post_json_safe(ORCHESTRATOR_BASE_URL.rstrip("/") + "/logs/tools.append", {
+            "t": int(time.time()*1000), "event": "exec_batch_start", "trace_id": request_id, "items": batch_tools
+        })
         for sid in runnable:
             step = norm_steps[sid]
             tool_name = (step.get("tool") or "").strip()
@@ -424,14 +426,10 @@ async def run_steps(trace_id: str, request_id: str, steps: list[dict]) -> Dict[s
                 raise ValueError(f"missing_tool:{sid}")
             args = merge_inputs(step)
             t0 = time.time()
-            try:
-                _post_json(ORCHESTRATOR_BASE_URL.rstrip("/") + "/logs/tools.append", {
-                    "t": int(time.time()*1000), "event": "exec_step_start", "tool": tool_name,
-                    "trace_id": request_id, "cid": request_id, "step_id": sid
-                }, expected={})
-            except Exception:
-                logging.error(traceback.format_exc())
-            from executor.utc.utc_runner import utc_run_tool  # lazy import
+            _post_json_safe(ORCHESTRATOR_BASE_URL.rstrip("/") + "/logs/tools.append", {
+                "t": int(time.time()*1000), "event": "exec_step_start", "tool": tool_name,
+                "trace_id": request_id, "cid": request_id, "step_id": sid
+            })
             res = await utc_run_tool(trace_id, sid, tool_name, args)
             ok = False
             if isinstance(res, dict) and bool(res.get("ok")) is True and res.get("result") is not None:
@@ -468,46 +466,34 @@ async def run_steps(trace_id: str, request_id: str, steps: list[dict]) -> Dict[s
             else:
                 produced[sid] = {"name": tool_name, "result": _canonical_tool_result(res or {})}
                 ok = True
-            try:
-                _post_json(ORCHESTRATOR_BASE_URL.rstrip("/") + "/logs/tools.append", {
-                    "t": int(time.time()*1000),
-                    "event": "end",
-                    "tool": tool_name,
-                    "ok": bool(ok),
-                    "duration_ms": int((time.time() - t0) * 1000.0),
-                    "trace_id": request_id,
-                    "cid": request_id,
-                    "step_id": sid,
-                    "error": (None if ok else "tool_error"),
-                    "traceback": None,
-                    "summary": (_distill_summary(produced.get(sid)) if ok else None),
-                }, expected={"ok": bool, "error": str})
-            except Exception:
-                logging.error(traceback.format_exc())
-            try:
-                _post_json(ORCHESTRATOR_BASE_URL.rstrip("/") + "/logs/tools.append", {
-                    "t": int(time.time()*1000), "event": "exec_step_finish", "tool": tool_name,
-                    "trace_id": request_id, "cid": request_id, "step_id": sid,
-                    "ok": bool(ok)
-                }, expected={})
-            except Exception:
-                logging.error(traceback.format_exc())
+            _post_json_safe(ORCHESTRATOR_BASE_URL.rstrip("/") + "/logs/tools.append", {
+                "t": int(time.time()*1000),
+                "event": "end",
+                "tool": tool_name,
+                "ok": bool(ok),
+                "duration_ms": int((time.time() - t0) * 1000.0),
+                "trace_id": request_id,
+                "cid": request_id,
+                "step_id": sid,
+                "error": (None if ok else "tool_error"),
+                "traceback": None,
+                "summary": (_distill_summary(produced.get(sid)) if ok else None),
+            })
+            _post_json_safe(ORCHESTRATOR_BASE_URL.rstrip("/") + "/logs/tools.append", {
+                "t": int(time.time()*1000), "event": "exec_step_finish", "tool": tool_name,
+                "trace_id": request_id, "cid": request_id, "step_id": sid,
+                "ok": bool(ok)
+            })
         for sid in runnable:
             pending.remove(sid)
         logging.info(f"[executor] batch_finish trace_id={trace_id} runnable={batch_tools}")
-        try:
-            _post_json(ORCHESTRATOR_BASE_URL.rstrip("/") + "/logs/tools.append", {
-                "t": int(time.time()*1000), "event": "exec_batch_finish", "trace_id": request_id, "items": batch_tools
-            }, expected={})
-        except Exception:
-            logging.error(traceback.format_exc())
+        _post_json_safe(ORCHESTRATOR_BASE_URL.rstrip("/") + "/logs/tools.append", {
+            "t": int(time.time()*1000), "event": "exec_batch_finish", "trace_id": request_id, "items": batch_tools
+        })
     logging.info(f"[executor] steps_finish trace_id={trace_id} produced_keys={sorted(list(produced.keys()))}")
-    try:
-        _post_json(ORCHESTRATOR_BASE_URL.rstrip("/") + "/logs/tools.append", {
-            "t": int(time.time()*1000), "event": "exec_plan_finish", "trace_id": request_id, "produced_keys": sorted(list(produced.keys()))
-        }, expected={})
-    except Exception:
-        logging.error(traceback.format_exc())
+    _post_json_safe(ORCHESTRATOR_BASE_URL.rstrip("/") + "/logs/tools.append", {
+        "t": int(time.time()*1000), "event": "exec_plan_finish", "trace_id": request_id, "produced_keys": sorted(list(produced.keys()))
+    })
     return produced
 
 

@@ -1012,6 +1012,9 @@ async def _reflect_cors_headers(request: Request, call_next):
         response.headers.setdefault("Access-Control-Allow-Headers", request.headers.get("access-control-request-headers") or "*")
         response.headers.setdefault("Access-Control-Expose-Headers", "*")
         response.headers.setdefault("Access-Control-Allow-Private-Network", "true")
+    # Ensure uploads can be fetched by the UI without CORP issues
+    if request.url.path.startswith("/uploads/"):
+        response.headers["Access-Control-Allow-Origin"] = origin or "*"
     return response
 
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
@@ -4854,34 +4857,31 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
     return {"name": name or "unknown", "skipped": True, "reason": "unsupported tool in orchestrator"}
 
 
-async def execute_tools(tool_calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+async def execute_tools(tool_calls: List[Dict[str, Any]], trace_id: str | None = None) -> List[Dict[str, Any]]:
     # Route all tool execution through the executor to avoid local fast paths.
     # Coerce calls into executor steps: {"tool": str, "args": dict}
-    try:
-        steps = []
-        for call in tool_calls[:5]:
-            name = (call or {}).get("name")
-            args = (call or {}).get("arguments") or {}
-            if not isinstance(args, dict):
-                args = {}
-            steps.append({"tool": str(name or ""), "args": args})
-        rid = _uuid.uuid4().hex
-        payload = {"schema_version": 1, "request_id": rid, "trace_id": rid, "steps": steps}
-        async with httpx.AsyncClient(timeout=None) as client:
-            r = await client.post(EXECUTOR_BASE_URL.rstrip("/") + "/execute", json=payload)
-            env = _resp_json(r, {})
-        results: List[Dict[str, Any]] = []
-        if isinstance(env, dict) and env.get("ok") and isinstance((env.get("result") or {}).get("produced"), dict):
-            for _, step in (env.get("result") or {}).get("produced", {}).items():
-                if isinstance(step, dict):
-                    res = step.get("result") if isinstance(step.get("result"), dict) else {}
-                    results.append({"name": (res.get("name") or "tool") if isinstance(res, dict) else "tool", "result": res})
-            return results
-        # Error path: surface a single executor error record
-        err = (env or {}).get("error") or (env.get("result") or {}).get("error") or {}
-        return [{"name": "executor", "error": (err.get("message") or "executor_failed")}]
-    except Exception as ex:
-        return [{"name": "executor", "error": str(ex)}]
+    steps: List[Dict[str, Any]] = []
+    for call in tool_calls[:5]:
+        name = (call or {}).get("name")
+        args = (call or {}).get("arguments") or {}
+        if not isinstance(args, dict):
+            args = {}
+        steps.append({"tool": str(name or ""), "args": args})
+    rid = str(trace_id or _uuid.uuid4().hex)
+    payload = {"schema_version": 1, "request_id": rid, "trace_id": rid, "steps": steps}
+    async with _hx.AsyncClient(timeout=None) as client:
+        r = await client.post(EXECUTOR_BASE_URL.rstrip("/") + "/execute", json=payload)
+        env = _resp_json(r, {})
+    results: List[Dict[str, Any]] = []
+    if isinstance(env, dict) and env.get("ok") and isinstance((env.get("result") or {}).get("produced"), dict):
+        for _, step in (env.get("result") or {}).get("produced", {}).items():
+            if isinstance(step, dict):
+                res = step.get("result") if isinstance(step.get("result"), dict) else {}
+                results.append({"name": (res.get("name") or "tool") if isinstance(res, dict) else "tool", "result": res})
+        return results
+    # Error path: surface a single executor error record
+    err = (env or {}).get("error") or (env.get("result") or {}).get("error") or {}
+    return [{"name": "executor", "error": (err.get("message") or "executor_failed")}]
 
 
 @app.post("/v1/chat/completions")
@@ -5169,16 +5169,15 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         omni_md = ("\n\n" + "\n\n".join(omni_sections)) if omni_sections else ""
         final_text = (base_text or "") + omni_md
         usage = estimate_usage(messages, final_text)
-        response = {
-            "id": final_oai.get("id", "orc-1"),
-            "object": "chat.completion",
-            "model": final_oai.get("model") or f"{QWEN_MODEL_ID}",
-            "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": final_text}}],
-            "usage": usage,
-            "created": int(time.time()),
-            "system_fingerprint": _hl.sha256((str(QWEN_MODEL_ID) + "+" + str(GPTOSS_MODEL_ID)).encode("utf-8")).hexdigest()[:16],
-            "seed": master_seed,
-        }
+        response = _build_openai_envelope(
+            ok=True,
+            text=final_text,
+            error=None,
+            usage=usage,
+            model=(final_oai.get("model") or f"{QWEN_MODEL_ID}"),
+            seed=master_seed,
+            id_=(final_oai.get("id") or "orc-1"),
+        )
         if isinstance(final_env, dict):
             try:
                 final_env = _env_bump(final_env); _env_assert(final_env)
@@ -5206,6 +5205,8 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         _ev = [("msg", i) for i, _ in enumerate(messages[:3])]
     _risks = ["string_args_without_json_parse", "missing_prompt_for_image_dispatch"]
     _log("committee.context", trace_id=trace_id, evidence=_ev, risks=_risks)
+    # Pre-review checkpoint
+    checkpoints_append_event(STATE_DIR, trace_id, "committee.review.pre", {"evidence": _ev, "risks": _risks})
     _proposals = [
         {"id": "opt_qwen", "author": "qwen", "rationale": "Direct dispatch with executor defaults; minimal plan", "tools_outline": ["image.dispatch"]},
         {"id": "opt_gptoss", "author": "gptoss", "rationale": "Typed arguments with explicit parsing step to enforce object-only args", "tools_outline": ["json.parse", "image.dispatch"]},
@@ -5219,6 +5220,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         "quorum": True,
     }
     _log("committee.vote", trace_id=trace_id, votes=_vote.get("votes"), quorum=bool(_vote.get("quorum")))
+    checkpoints_append_event(STATE_DIR, trace_id, "committee.decision.pre", {"votes": _vote.get("votes"), "quorum": bool(_vote.get("quorum"))})
     if not bool(_vote.get("quorum")):
         _log("committee.quorum.fail", trace_id=trace_id)
     # Determine winner (simple majority among two votes)
@@ -5588,10 +5590,14 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             _log("exec.payload", trace_id=trace_id, patched=True, steps=_steps_preview)
             _patched_payload_emitted = True
             _log("committee.go", trace_id=trace_id, tool="image.dispatch", rationale="re-validated=200")
+            checkpoints_append_event(STATE_DIR, trace_id, "committee.review.mid", {"phase": "post-repair", "tool": name})
+            checkpoints_append_event(STATE_DIR, trace_id, "committee.decision.mid", {"action": "go"})
             _log("assertion", message="ASSERTION: If validate.result.repair 200 occurs, then exec.payload (patched) and tool.run.start must also occur—else did_not_execute_after_repair")
         else:
             # Mid-run oversight on initial success path
             _log("committee.go", trace_id=trace_id, tool="image.dispatch", rationale="validate=200")
+            checkpoints_append_event(STATE_DIR, trace_id, "committee.review.mid", {"phase": "post-validate", "tool": name})
+            checkpoints_append_event(STATE_DIR, trace_id, "committee.decision.mid", {"action": "go"})
 
     # 2) Optionally execute tools
     tool_results: List[Dict[str, Any]] = []
@@ -5639,7 +5645,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         # Execute via external void executor to ensure Comfy is driven by the executor
         _log("tool.run.start", trace_id=trace_id, executor="void", count=len(tool_calls or []))
         # Reuse the executor client helper to call EXECUTOR_BASE_URL/execute
-        tool_results = await execute_tools(tool_calls)
+        tool_results = await execute_tools(tool_calls, trace_id)
         # Log Comfy prompt ids if present in results
         for _tr in tool_results or []:
             _res = (_tr or {}).get("result") or {}
@@ -5667,6 +5673,8 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         _log("qa.metrics", trace_id=trace_id, tool="image.dispatch", metrics={"images": _img_count})
         _log("committee.postrun.review", trace_id=trace_id, summary={"images": _img_count})
         _log("committee.decision", trace_id=trace_id, action="accept", rationale="meets threshold")
+        checkpoints_append_event(STATE_DIR, trace_id, "committee.review.final", {"summary": {"images": _img_count}})
+        checkpoints_append_event(STATE_DIR, trace_id, "committee.decision.final", {"action": "go"})
         if tool_results:
             messages = [{"role": "system", "content": "Tool results:\n" + json.dumps(tool_results, indent=2)}] + messages
             # If tools produced media artifacts, return them immediately (skip waiting on models)
@@ -5788,16 +5796,15 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                     summary_lines.extend([f"- {u}" for u in asset_urls])
             final_text = "\n".join(summary_lines) if summary_lines else "Generation completed."
             usage = estimate_usage(messages, final_text)
-            response = {
-                "id": "orc-1",
-                "object": "chat.completion",
-                "model": f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}",
-                "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": final_text}}],
-                "usage": usage,
-                "created": int(time.time()),
-                "system_fingerprint": _hl.sha256((str(QWEN_MODEL_ID) + "+" + str(GPTOSS_MODEL_ID)).encode("utf-8")).hexdigest()[:16],
-                "seed": master_seed,
-            }
+            response = _build_openai_envelope(
+                ok=True,
+                text=final_text,
+                error=None,
+                usage=usage,
+                model=f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}",
+                seed=master_seed,
+                id_="orc-1",
+            )
             if _lock_token:
                 _release_lock(STATE_DIR, trace_id)
             _trace_response(trace_id, response)
@@ -6598,20 +6605,15 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     except Exception:
         final_env = {}
 
-    response = {
-        "id": "orc-1",
-        "object": "chat.completion",
-        "model": f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}",
-        "choices": [
-            {
-                "index": 0,
-                "finish_reason": "stop",
-                "message": {"role": "assistant", "content": display_content}
-            }
-        ],
-        "usage": usage_with_wall,
-        "seed": master_seed,
-    }
+    response = _build_openai_envelope(
+        ok=True,
+        text=display_content,
+        error=None,
+        usage=usage_with_wall,
+        model=f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}",
+        seed=master_seed,
+        id_="orc-1",
+    )
     if artifacts:
         response["artifacts"] = artifacts
     if isinstance(final_env, dict) and final_env:
