@@ -1486,9 +1486,8 @@ from .rag.core import rag_index_dir  # re-exported for backwards-compat
 from .rag.core import rag_search  # re-exported for backwards-compat
 
 
-@retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=0.5, max=2))
 async def call_ollama(base_url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
         try:
             # Keep models warm across requests
             ppayload = dict(payload)
@@ -2115,7 +2114,9 @@ async def planner_produce_plan(messages: List[Dict[str, Any]], tools: Optional[L
         {"role": "system", "content": (tool_catalog or "")},
     ]
     payload = build_ollama_payload(plan_messages, planner_id, DEFAULT_NUM_CTX, temperature)
+    _log("planner.backend.call", trace_id=trace_id, base=planner_base, model=planner_id)
     result = await call_ollama(planner_base, payload)
+    _log("planner.backend.ok", trace_id=trace_id, base=planner_base, have_response=bool(result and result.get("response")))
     if isinstance(result.get("error"), str) and result.get("error"):
         _log("planner.backend.error", trace_id=None, base=planner_base, error=result.get("error"))
         return "", []

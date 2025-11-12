@@ -131,16 +131,18 @@ function App() {
   // Orchestrator E2E (OpenAI-compatible): POST /v1/chat/completions (no WS required)
   const runOrchestratorFlow = async (userText, thinkingId, conversationId) => {
     const updateThinking = (text) => setMsgs(prev => (prev.map(m => m.id === thinkingId ? { ...m, content: { text } } : m)))
-    return fetch(`${ORCH_BASE}/v1/chat/completions`, {
-      method: 'POST',
-      mode: 'cors',
-      credentials: 'omit',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ messages: [{ role: 'user', content: userText }], stream: false })
-    }).then(
-      async (r) => {
+    return new Promise((resolve) => {
+      const xhr = new XMLHttpRequest()
+      xhr.open('POST', `${ORCH_BASE}/v1/chat/completions`, true)
+      // No client-side timeout: allow long generations to complete
+      xhr.timeout = 0
+      // Do NOT send credentials/cookies across origins
+      xhr.withCredentials = false
+      xhr.setRequestHeader('Content-Type', 'application/json')
+      xhr.onreadystatechange = async () => {
+        if (xhr.readyState !== 4) return
         try {
-          const textBody = await r.text()
+          const textBody = xhr.responseText || ''
           let finalText = String(textBody || '').trim()
           // Try to parse as JSON to extract OpenAI message content; never throw on parse
           try {
@@ -151,7 +153,7 @@ function App() {
             }
           } catch {}
           updateThinking(finalText || '(no content)')
-          // Persist assistant message
+          // Persist assistant message (best-effort)
           try {
             if (conversationId) {
               await fetch(`/api/conversations/${conversationId}/message`, {
@@ -163,14 +165,17 @@ function App() {
           } catch {}
         } finally {
           setSending(false)
+          resolve()
         }
-      },
-      (err) => {
-        // Transport-level failure (DNS/refused/mixed-content)
-        updateThinking(`Network unreachable`)
-        setSending(false)
       }
-    )
+      xhr.onerror = () => {
+        updateThinking('Network unreachable')
+        setSending(false)
+        resolve()
+      }
+      const body = JSON.stringify({ messages: [{ role: 'user', content: userText }], stream: false })
+      try { xhr.send(body) } catch { xhr.abort(); updateThinking('Network unreachable'); setSending(false); resolve() }
+    })
   }
 
   const renderChatContent = (text) => {
