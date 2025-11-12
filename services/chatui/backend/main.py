@@ -428,6 +428,114 @@ async def healthz():
     return {"status": "ok"}
 
 
+@app.get("/minimal")
+async def minimal_ui(request: Request):
+    """
+    Minimal, no-framework UI that POSTS directly to the orchestrator /v1/chat/completions.
+    No proxies, no polling, no extras. Use this to isolate browser/network issues.
+    """
+    base = os.getenv("PUBLIC_ORCH_BASE", "").strip()
+    if not base:
+        host = (request.headers.get("host") or "").split(":")[0]
+        scheme = "https" if str(request.url.scheme).lower() == "https" else "http"
+        base = f"{scheme}://{host}:8000"
+    base = base.rstrip("/")
+    html = f"""<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Minimal Completions Client</title>
+    <style>
+      body {{ background:#0b0b0f; color:#e6e6e6; font-family: ui-sans-serif, system-ui, Arial; margin:0; padding:20px; }}
+      .row {{ display:flex; gap:8px; margin-bottom:8px; align-items:center; }}
+      input, textarea, button {{ background:#0f172a; color:#fff; border:1px solid #333; border-radius:6px; padding:8px; }}
+      textarea {{ width:100%; }}
+      #out {{ white-space:pre-wrap; background:#111827; border:1px solid #222; border-radius:8px; padding:12px; min-height:160px; }}
+      label.small {{ font-size:12px; color:#9ca3af; }}
+    </style>
+  </head>
+  <body>
+    <h2>Minimal /v1/chat/completions Client</h2>
+    <div class="row">
+      <label class="small">ORCH_BASE</label>
+      <input id="base" value="{base}" style="flex:1" />
+      <button id="ping">Ping</button>
+    </div>
+    <div class="row">
+      <textarea id="prompt" rows="4" placeholder="Describe the image you want...">please draw me a picture of shadow the hedgehog</textarea>
+    </div>
+    <div class="row">
+      <button id="send">Send</button>
+      <label class="small" id="status"></label>
+    </div>
+    <div id="out"></div>
+    <script>
+      const statusEl = document.getElementById('status');
+      const outEl = document.getElementById('out');
+      const baseEl = document.getElementById('base');
+      const promptEl = document.getElementById('prompt');
+
+      function setStatus(s) {{ statusEl.textContent = s; }}
+      function setOut(t) {{ outEl.textContent = t; }}
+
+      document.getElementById('ping').onclick = async () => {{
+        const u = baseEl.value.replace(/\\/$/, '') + '/healthz';
+        setStatus('Pinging ' + u + ' ...');
+        try {{
+          const r = await fetch(u, {{ mode: 'cors', credentials: 'omit' }});
+          const txt = await r.text();
+          setOut('PING ' + r.status + '\\n' + txt);
+          setStatus('OK');
+        }} catch (e) {{
+          setOut('PING failed: ' + (e && e.message || e));
+          setStatus('ERROR');
+        }}
+      }};
+
+      document.getElementById('send').onclick = async () => {{
+        const ORCH_BASE = baseEl.value.replace(/\\/$/, '');
+        const url = ORCH_BASE + '/v1/chat/completions';
+        const body = JSON.stringify({{ messages: [{{ role: 'user', content: promptEl.value }}], stream: false }});
+        setStatus('Sending...');
+        setOut('');
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', url, true);
+        xhr.timeout = 0; // no client-side timeout
+        xhr.withCredentials = false;
+        xhr.setRequestHeader('Content-Type', 'application/json');
+        xhr.setRequestHeader('Accept', '*/*');
+        xhr.onreadystatechange = () => {{
+          if (xhr.readyState !== 4) return;
+          setStatus('Done (' + xhr.status + ')');
+          const txt = xhr.responseText || '';
+          try {{
+            const obj = txt ? JSON.parse(txt) : null;
+            setOut(JSON.stringify(obj, null, 2));
+          }} catch {{
+            setOut(txt);
+          }}
+        }};
+        xhr.onabort = () => {{ setStatus('Aborted'); setOut('Request aborted by browser'); }};
+        xhr.ontimeout = () => {{ setStatus('Timed out'); setOut('Client-side timeout'); }};
+        xhr.onerror = () => {{ setStatus('Network error'); setOut('Network error'); }};
+        try {{ xhr.send(body); }} catch (e) {{
+          setStatus('Send failed');
+          setOut('Send failed: ' + (e && e.message || e));
+        }}
+      }};
+    </script>
+  </body>
+</html>
+"""
+    headers = {
+        "Cache-Control": "no-store",
+        "Content-Type": "text/html; charset=utf-8",
+        "Content-Length": str(len(html.encode("utf-8"))),
+        "Connection": "close",
+    }
+    return Response(content=html, media_type="text/html", headers=headers)
+
 
 
 
