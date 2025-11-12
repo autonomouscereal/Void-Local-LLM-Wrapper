@@ -536,7 +536,8 @@ def _cleanup_legacy_trace_files(trace_key: str) -> None:
                 except Exception:
                     continue
     except Exception:
-        pass
+        # Surface artifact export errors
+        raise
 def _comfy_is_completed(detail: Dict[str, Any]) -> bool:
     st = detail.get("status") or {}
     if st.get("completed") is True:
@@ -5370,20 +5371,14 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 chunk = json.dumps({"id": resp_id2, "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": tool_calls_openai}, "finish_reason": None}]})
                 yield f"data: {chunk}\n\n"
                 yield "data: [DONE]\n\n"
-            try:
-                if _lock_token:
-                    _release_lock(STATE_DIR, trace_id)
-            except Exception:
-                pass
+            if _lock_token:
+                _release_lock(STATE_DIR, trace_id)
             return StreamingResponse(_stream_once(), media_type="text/event-stream")
         # include usage estimate even in tool_calls path (no completion tokens yet)
         response["usage"] = estimate_usage(messages, "")
         response["seed"] = master_seed
-        try:
-            if _lock_token:
-                _release_lock(STATE_DIR, trace_id)
-        except Exception:
-            pass
+        if _lock_token:
+            _release_lock(STATE_DIR, trace_id)
         return _json_response(response)
 
     # Ensure arguments are objects; auto-parse JSON strings instead of returning early
@@ -5561,26 +5556,14 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                         seed=master_seed,
                         id_="orc-1",
                     )
-                    try:
-                        if _lock_token:
-                            _release_lock(STATE_DIR, trace_id)
-                    except Exception:
-                        pass
-                    try:
-                        _trace_response(trace_id, response)
-                    except Exception:
-                        pass
+                    if _lock_token:
+                        _release_lock(STATE_DIR, trace_id)
+                    _trace_response(trace_id, response)
                     return JSONResponse(status_code=200, content=response)
                 # Re-validate once
-                try:
-                    v2 = await client.post(base_url + "/tool.validate", json={"name": name, "args": patched["arguments"]})
-                    v2obj = _resp_json(v2, {})
-                except Exception:
-                    v2obj = {}
-                try:
-                    _log("validate.result.repair", trace_id=trace_id, status=int(getattr(v2, "status_code", 0) or 0), tool=name, detail=((v2obj or {}).get("error") or {}))
-                except Exception:
-                    pass
+                v2 = await client.post(base_url + "/tool.validate", json={"name": name, "args": patched["arguments"]})
+                v2obj = _resp_json(v2, {})
+                _log("validate.result.repair", trace_id=trace_id, status=int(getattr(v2, "status_code", 0) or 0), tool=name, detail=((v2obj or {}).get("error") or {}))
                 if (getattr(v2, "status_code", 0) == 200) and isinstance(v2obj, dict) and (v2obj.get("ok") is True):
                     validated.append(patched); repairs_made = True; _repair_success_any = True
                 else:
@@ -5596,15 +5579,9 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                         seed=master_seed,
                         id_="orc-1",
                     )
-                    try:
-                        if _lock_token:
-                            _release_lock(STATE_DIR, trace_id)
-                    except Exception:
-                        pass
-                    try:
-                        _trace_response(trace_id, response)
-                    except Exception:
-                        pass
+                    if _lock_token:
+                        _release_lock(STATE_DIR, trace_id)
+                    _trace_response(trace_id, response)
                     return JSONResponse(status_code=200, content=response)
         tool_calls = validated
         if repairs_made:
@@ -6324,8 +6301,9 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                         "choices": [{"index": 0, "delta": {"content": json.dumps(ev)}, "finish_reason": None}],
                     })
                     yield "data: " + _chunk + "\n\n"
-            except Exception:
-                pass
+            except Exception as e:
+                # Surface generator errors (they will abort the stream)
+                raise
             # Stream final content
             if STREAM_CHUNK_SIZE_CHARS and STREAM_CHUNK_SIZE_CHARS > 0:
                 size = max(1, STREAM_CHUNK_SIZE_CHARS)
@@ -6341,15 +6319,9 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             done = json.dumps({"id": "orc-1", "object": "chat.completion.chunk", "created": int(time.time()), "model": model_id, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})
             yield f"data: {done}\n\n"
             yield "data: [DONE]\n\n"
-        try:
-            checkpoints_append_event(STATE_DIR, trace_id, "halt", {"kind": "committee", "chars": len(final_text)})
-        except Exception:
-            pass
-        try:
-            if _lock_token:
-                _release_lock(STATE_DIR, trace_id)
-        except Exception:
-            pass
+        checkpoints_append_event(STATE_DIR, trace_id, "halt", {"kind": "committee", "chars": len(final_text)})
+        if _lock_token:
+            _release_lock(STATE_DIR, trace_id)
         return StreamingResponse(_stream_with_stages(final_text), media_type="text/event-stream")
 
     # Merge exact usages if available, else approximate
@@ -6680,81 +6652,48 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             pass
         response["envelope"] = final_env
     # Finalize artifacts shard and write a tiny manifest reference
-    try:
-        if _ledger_shard is not None:
-            _art_finalize_shard_local = _art_finalize  # alias to avoid shadowing name
-            _art_finalize_shard_local(_ledger_shard)
-            _mani = {"items": []}
-            idx_path = os.path.join(_ledger_root, f"{_ledger_name}.index.json")
-            _art_manifest_add(_mani, idx_path, step_id="final")
-            _art_manifest_write(_ledger_root, _mani)
-    except Exception:
-        pass
+    if _ledger_shard is not None:
+        _art_finalize_shard_local = _art_finalize  # alias to avoid shadowing name
+        _art_finalize_shard_local(_ledger_shard)
+        _mani = {"items": []}
+        idx_path = os.path.join(_ledger_root, f"{_ledger_name}.index.json")
+        _art_manifest_add(_mani, idx_path, step_id="final")
+        _art_manifest_write(_ledger_root, _mani)
 
     # Fire-and-forget: Teacher trace tap (if reachable)
-    try:
-        # Build trace payload
-        if isinstance(body, dict):
-            req_dict = dict(body)
-        else:
-            try:
-                req_dict = body.dict()
-            except Exception:
-                req_dict = {}
-        try:
-            msgs_for_seed = json.dumps(req_dict.get("messages", []), ensure_ascii=False, separators=(",", ":"))
-        except Exception:
-            msgs_for_seed = ""
-        provided_seed2 = None
-        try:
-            if isinstance(req_dict.get("seed"), (int, float)):
-                provided_seed2 = int(req_dict.get("seed"))
-        except Exception:
-            provided_seed2 = None
-        master_seed = provided_seed2 if provided_seed2 is not None else _derive_seed("chat", msgs_for_seed)
-        label_cfg = None
-        try:
-            label_cfg = (WRAPPER_CONFIG.get("teacher") or {}).get("default_label")
-        except Exception:
-            label_cfg = None
-        # Normalize tool_calls shape for teacher (use args, not arguments)
-        _tc2 = tool_exec_meta or []
-        trace_payload = {
-            "label": label_cfg or "exp_default",
-            "seed": master_seed,
-            "request": {"messages": req_dict.get("messages", []), "tools_allowed": [t.get("function", {}).get("name") for t in (body.get("tools") or []) if isinstance(t, dict)]},
-            "context": ({"pack_hash": pack_hash} if pack_hash else {}),
-            "routing": {"planner_model": planner_id, "executors": [QWEN_MODEL_ID, GPTOSS_MODEL_ID], "seed_router": det_seed_router(trace_id, master_seed)},
-            "tool_calls": _tc2,
-            "response": {"text": (display_content or "")[:4000]},
-            "metrics": usage,
-            "env": {"public_base_url": PUBLIC_BASE_URL, "config_hash": WRAPPER_CONFIG_HASH},
-            "privacy": {"vault_refs": 0, "secrets_in": 0, "secrets_out": 0},
-        }
-        async def _send_trace():
-            try:
-                async with httpx.AsyncClient() as client:
-                    await client.post(TEACHER_API_URL.rstrip("/") + "/teacher/trace.append", json=trace_payload)
-            except Exception:
-                return
-        asyncio.create_task(_send_trace())
-    except Exception:
-        pass
+    # Build trace payload (errors here will surface)
+    if isinstance(body, dict):
+        req_dict = dict(body)
+    else:
+        req_dict = body.dict()
+    msgs_for_seed = json.dumps(req_dict.get("messages", []), ensure_ascii=False, separators=(",", ":"))
+    provided_seed2 = int(req_dict.get("seed")) if isinstance(req_dict.get("seed"), (int, float)) else None
+    master_seed = provided_seed2 if provided_seed2 is not None else _derive_seed("chat", msgs_for_seed)
+    label_cfg = (WRAPPER_CONFIG.get("teacher") or {}).get("default_label")
+    # Normalize tool_calls shape for teacher (use args, not arguments)
+    _tc2 = tool_exec_meta or []
+    trace_payload = {
+        "label": label_cfg or "exp_default",
+        "seed": master_seed,
+        "request": {"messages": req_dict.get("messages", []), "tools_allowed": [t.get("function", {}).get("name") for t in (body.get("tools") or []) if isinstance(t, dict)]},
+        "context": ({"pack_hash": pack_hash} if pack_hash else {}),
+        "routing": {"planner_model": planner_id, "executors": [QWEN_MODEL_ID, GPTOSS_MODEL_ID], "seed_router": det_seed_router(trace_id, master_seed)},
+        "tool_calls": _tc2,
+        "response": {"text": (display_content or "")[:4000]},
+        "metrics": usage,
+        "env": {"public_base_url": PUBLIC_BASE_URL, "config_hash": WRAPPER_CONFIG_HASH},
+        "privacy": {"vault_refs": 0, "secrets_in": 0, "secrets_out": 0},
+    }
+    async def _send_trace():
+        async with httpx.AsyncClient() as client:
+            await client.post(TEACHER_API_URL.rstrip("/") + "/teacher/trace.append", json=trace_payload)
+    asyncio.create_task(_send_trace())
     # Persist response & metrics
     await _db_update_run_response(run_id, response, usage)
-    try:
-        checkpoints_append_event(STATE_DIR, trace_id, "halt", {"kind": "committee", "chars": len(display_content)})
-    except Exception:
-        pass
-    try:
-        if _lock_token:
-            _release_lock(STATE_DIR, trace_id)
-    except Exception:
-        pass
-    try:
-        _trace_response(trace_id, response)
-    except Exception:
-        pass
+    checkpoints_append_event(STATE_DIR, trace_id, "halt", {"kind": "committee", "chars": len(display_content)})
+    if _lock_token:
+        _release_lock(STATE_DIR, trace_id)
+    _trace_response(trace_id, response)
     return _json_response(response)
 
 
