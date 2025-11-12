@@ -941,7 +941,8 @@ def _collect_urls_from_results(results: List[Dict[str, Any]], abs_url_fn) -> Lis
         if isinstance(ids_obj, dict) and isinstance(ids_obj.get("image_files"), list):
             for fp in (ids_obj.get("image_files") or []):
                 if isinstance(fp, str) and fp.strip():
-                    urls.append(f"/uploads/{fp.replace('\\', '/')}")
+                    rel_fp = fp.replace("\\", "/")
+                    urls.append(f"/uploads/{rel_fp}")
     # dedupe and absolutize
     urls = list(dict.fromkeys(urls))
     return [abs_url_fn(u) for u in urls]

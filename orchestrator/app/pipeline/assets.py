@@ -36,7 +36,8 @@ def collect_urls(tool_results: List[Dict[str, Any]], absolutize_url: Callable[[s
 		if isinstance(ids_obj, dict) and isinstance(ids_obj.get("image_files"), list):
 			for fp in (ids_obj.get("image_files") or []):
 				if isinstance(fp, str) and fp.strip():
-					urls.append(f"/uploads/{fp.replace('\\', '/')}")
+					rel_fp = fp.replace("\\", "/")
+					urls.append(f"/uploads/{rel_fp}")
 		# generic path scraping
 		exts = (".mp4", ".webm", ".mov", ".mkv", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".wav", ".mp3", ".m4a", ".ogg", ".flac", ".opus", ".srt")
 		def _walk(v):
