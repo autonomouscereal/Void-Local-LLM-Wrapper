@@ -66,6 +66,8 @@ from .jsonio.helpers import parse_json_text as _parse_json_text, resp_json as _r
 from .search.meta import rrf_fuse as _rrf_fuse
 from .tools.progress import emit_progress, set_progress_queue, get_progress_queue
 from .tools.mcp_bridge import call_mcp_tool as _call_mcp_tool
+from .state.checkpoints import append_event as checkpoints_append_event
+from .trace_utils import emit_trace, append_jsonl_compat
 from .omni.context import build_omni_context
 from .jsonio.stitch import merge_envelopes as stitch_merge_envelopes, stitch_openai as stitch_openai_final
 from .router.route import route_for_request
@@ -243,7 +245,7 @@ async def _image_dispatch_run(prompt: str, negative: Optional[str], seed: Option
         _man_add(manifest, png_path, step_id="image.dispatch")
         ai = _analyze_image(png_path, prompt=str(prompt))
         clip_s = float(ai.get("clip_score") or 0.0)
-        _trace_append("image", {"cid": cid, "tool": "image.dispatch", "prompt": prompt, "path": png_path, "clip_score": clip_s, "tags": ai.get("tags") or []})
+        trace_append("image", {"cid": cid, "tool": "image.dispatch", "prompt": prompt, "path": png_path, "clip_score": clip_s, "tags": ai.get("tags") or []})
         _ctx_add(cid, "image", png_path, _uri_from_upload_path(png_path), None, [], {"prompt": prompt, "clip_score": clip_s})
         if isinstance(trace_id, str) and trace_id:
             # Compute a safe relative path without raising (handle cross-drive on Windows)
@@ -255,9 +257,7 @@ async def _image_dispatch_run(prompt: str, negative: Optional[str], seed: Option
                 else:
                     rel = os.path.relpath(png_path, UPLOAD_DIR).replace("\\", "/")
             if isinstance(rel, str) and rel:
-                _append_jsonl(os.path.join(STATE_DIR, "traces", trace_id, "artifacts.jsonl"), {
-                    "t": int(time.time()*1000),
-                    "event": "artifact",
+                checkpoints_append_event(STATE_DIR, trace_id, "artifact", {
                     "kind": "image",
                     "path": rel,
                     "prompt_id": pid,
@@ -266,9 +266,7 @@ async def _image_dispatch_run(prompt: str, negative: Optional[str], seed: Option
                     "view_url": view_url,
                 })
             else:
-                _append_jsonl(os.path.join(STATE_DIR, "traces", trace_id, "errors.jsonl"), {
-                    "t": int(time.time()*1000), "error": {"message": "artifact_append_failed:bad_path", "path": png_path}
-                })
+                checkpoints_append_event(STATE_DIR, trace_id, "error", {"message": "artifact_append_failed:bad_path", "path": png_path})
         comfy_items.append({"filename": fn, "subfolder": sf, "type": ty, "view_url": view_url, "data_url": data_url})
         saved.append({"path": png_path, "clip_score": clip_s, "filename": fn, "subfolder": sf, "type": ty, "comfy_view": view_url})
     _man_write(outdir, manifest)
@@ -370,7 +368,7 @@ async def _image_dispatch_run(prompt: str, negative: Optional[str], seed: Option
                 _man_add(manifest, png_path, step_id="image.dispatch")
                 ai = _analyze_image(png_path, prompt=str(pr_text))
                 clip_s = float(ai.get("clip_score") or 0.0)
-                _trace_append("image", {"cid": cid, "tool": "image.dispatch", "prompt": pr_text, "path": png_path, "clip_score": clip_s, "tags": ai.get("tags") or []})
+                trace_append("image", {"cid": cid, "tool": "image.dispatch", "prompt": pr_text, "path": png_path, "clip_score": clip_s, "tags": ai.get("tags") or []})
                 _ctx_add(cid, "image", png_path, _uri_from_upload_path(png_path), None, [], {"prompt": pr_text, "clip_score": clip_s})
                 saved.append({"path": png_path, "clip_score": clip_s, "url": u})
 
@@ -441,7 +439,7 @@ async def _image_dispatch_run(prompt: str, negative: Optional[str], seed: Option
                     _man_add(manifest, png_path, step_id="image.dispatch")
                     ai = _analyze_image(png_path, prompt=str(pr2))
                     clip_s = float(ai.get("clip_score") or 0.0)
-                    _trace_append("image", {"cid": cid, "tool": "image.dispatch", "prompt": pr2, "path": png_path, "clip_score": clip_s, "tags": ai.get("tags") or []})
+                    trace_append("image", {"cid": cid, "tool": "image.dispatch", "prompt": pr2, "path": png_path, "clip_score": clip_s, "tags": ai.get("tags") or []})
                     _ctx_add(cid, "image", png_path, _uri_from_upload_path(png_path), None, [], {"prompt": pr2, "clip_score": clip_s})
                     saved.append({"path": png_path, "clip_score": clip_s, "url": u})
             _save_batch2(files2, loop_idx)
@@ -483,21 +481,17 @@ def _log(event: str, **fields: Any) -> None:
             "event": event,
             "notes": {k: v for k, v in fields.items() if k != "trace_id"},
         }
-        _append_jsonl(os.path.join(STATE_DIR, "traces", tr, "events.jsonl"), row)
+        checkpoints_append_event(STATE_DIR, tr, str(row.get("event") or "event"), row)
 
 def _append_jsonl(path: str, obj: dict) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+    append_jsonl_compat(STATE_DIR, path, obj)
 
-def _trace_append(kind: str, obj: Dict[str, Any]) -> None:
+def trace_append(kind: str, obj: Dict[str, Any]) -> None:
     """
-    Append a generic trace event row. Uses trace_id, tid, or cid if present; falls back to 'global'.
+    Unified trace appender: Chooses key from trace_id | tid | cid | 'global'.
     """
-    tms = int(time.time() * 1000)
-    tr = str((obj.get("trace_id") or obj.get("tid") or obj.get("cid") or "global"))
-    row = {"t": tms, "kind": str(kind), "payload": obj}
-    _append_jsonl(os.path.join(STATE_DIR, "traces", tr, "events.jsonl"), row)
+    key = str((obj.get("trace_id") or obj.get("tid") or obj.get("cid") or "global"))
+    emit_trace(STATE_DIR, key, kind, obj)
 
 def _trace_response(trace_id: str, envelope: Dict[str, Any]) -> None:
     tms = int(time.time() * 1000)
@@ -523,11 +517,26 @@ def _trace_response(trace_id: str, envelope: Dict[str, Any]) -> None:
     }
     if isinstance(envelope.get("error"), dict):
         out["error"] = envelope.get("error")
-    _append_jsonl(os.path.join(STATE_DIR, "traces", str(trace_id), "responses.jsonl"), out)
+    checkpoints_append_event(STATE_DIR, str(trace_id), "response", out)
     _log("chat.finish", trace_id=str(trace_id), ok=bool(envelope is not None and not bool(envelope.get("error"))), assets_count=int(assets_count), message_len=int(len(content)))
 # CPU/GPU adaptive mode for ComfyUI graphs
 COMFY_CPU_MODE = (os.getenv("COMFY_CPU_MODE", "").strip().lower() in ("1", "true", "yes", "on"))
 
+def _cleanup_legacy_trace_files(trace_key: str) -> None:
+    """
+    Remove legacy per-trace files now unified under trace.jsonl.
+    """
+    try:
+        base = os.path.join(STATE_DIR, "traces", str(trace_key))
+        for fname in ("events.jsonl", "responses.jsonl", "artifacts.jsonl", "tools.jsonl", "errors.jsonl", "chat.jsonl", "requests.jsonl"):
+            fpath = os.path.join(base, fname)
+            if os.path.exists(fpath):
+                try:
+                    os.remove(fpath)
+                except Exception:
+                    continue
+    except Exception:
+        pass
 def _comfy_is_completed(detail: Dict[str, Any]) -> bool:
     st = detail.get("status") or {}
     if st.get("completed") is True:
@@ -2365,7 +2374,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         def _ev(e: Dict[str, Any]) -> None:
             if trace_id:
                 row = {"t": int(time.time()*1000), **e}
-                _append_jsonl(os.path.join(STATE_DIR, "traces", trace_id, "events.jsonl"), row)
+                checkpoints_append_event(STATE_DIR, trace_id, str(e.get("event") or "event"), row)
         _ev({"event": "film2.shot_start", "prompt": prompt})
         try:
             # Helper to append distilled artifact rows when a path is produced
@@ -2373,7 +2382,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 if not (trace_id and isinstance(path, str) and path):
                     return
                 rel = os.path.relpath(path, UPLOAD_DIR).replace("\\", "/")
-                _append_jsonl(os.path.join(STATE_DIR, "traces", trace_id, "artifacts.jsonl"), {"t": int(time.time()*1000), "event": "artifact", "kind": "video", "path": rel})
+                checkpoints_append_event(STATE_DIR, trace_id, "artifact", {"kind": "video", "path": rel})
             # Enhance/cleanup path with provided clips
             if clips:
                 for i, src in enumerate(clips):
@@ -2469,9 +2478,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 rel = final_path
                 if os.path.isabs(final_path):
                     rel = os.path.relpath(final_path, UPLOAD_DIR).replace("\\", "/")
-                _append_jsonl(os.path.join(STATE_DIR, "traces", trace_id, "artifacts.jsonl"), {
-                    "t": int(time.time()*1000), "event": "artifact", "kind": "video", "path": rel
-                })
+                checkpoints_append_event(STATE_DIR, trace_id, "artifact", {"kind": "video", "path": rel})
                 result.setdefault("ids", {})["video_id"] = rel
                 view_rel = rel if rel.startswith("uploads/") else f"uploads/{rel.lstrip('/')}"
                 result.setdefault("meta", {})["view_url"] = f"/{view_rel}"
@@ -2560,14 +2567,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 if tr:
                     try:
                         rel = os.path.relpath(wav_path, UPLOAD_DIR).replace("\\", "/")
-                        _append_jsonl(os.path.join(STATE_DIR, "traces", tr, "artifacts.jsonl"), {
-                            "t": int(time.time()*1000),
-                            "event": "artifact",
-                            "kind": "audio",
-                            "path": rel,
-                            "bytes": int(len(wav)),
-                            "duration_s": float(env.get("duration_s") or 0.0),
-                        })
+                        checkpoints_append_event(STATE_DIR, tr, "artifact", {"kind": "audio", "path": rel, "bytes": int(len(wav)), "duration_s": float(env.get("duration_s") or 0.0)})
                     except Exception:
                         pass
                 # Optional: embed transcript text into RAG
@@ -2634,7 +2634,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 if tr:
                     try:
                         rel = os.path.relpath(wav_path, UPLOAD_DIR).replace("\\", "/")
-                        _append_jsonl(os.path.join(STATE_DIR, "traces", tr, "artifacts.jsonl"), {"t": int(time.time()*1000), "event": "artifact", "kind": "audio", "path": rel, "bytes": int(len(wav))})
+                        checkpoints_append_event(STATE_DIR, tr, "artifact", {"kind": "audio", "path": rel, "bytes": int(len(wav))})
                     except Exception:
                         pass
             # Shape result with ids/meta when file persisted
@@ -2835,7 +2835,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 if tr:
                     try:
                         rel = os.path.relpath(wav_path, UPLOAD_DIR).replace("\\", "/")
-                        _append_jsonl(os.path.join(STATE_DIR, "traces", tr, "artifacts.jsonl"), {"t": int(time.time()*1000), "event": "artifact", "kind": "audio", "path": rel, "bytes": int(len(wav))})
+                        checkpoints_append_event(STATE_DIR, tr, "artifact", {"kind": "audio", "path": rel, "bytes": int(len(wav))})
                     except Exception:
                         pass
                 # RAG: embed prompt
@@ -2870,7 +2870,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 if tr:
                     try:
                         rel = os.path.relpath(wav_path, UPLOAD_DIR).replace("\\", "/")
-                        _append_jsonl(os.path.join(STATE_DIR, "traces", tr, "artifacts.jsonl"), {"t": int(time.time()*1000), "event": "artifact", "kind": "audio", "path": rel, "bytes": int(len(wav))})
+                        checkpoints_append_event(STATE_DIR, tr, "artifact", {"kind": "audio", "path": rel, "bytes": int(len(wav))})
                     except Exception:
                         pass
             return {"name": name, "result": env}
@@ -2896,7 +2896,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 if tr:
                     try:
                         rel = os.path.relpath(wav_path, UPLOAD_DIR).replace("\\", "/")
-                        _append_jsonl(os.path.join(STATE_DIR, "traces", tr, "artifacts.jsonl"), {"t": int(time.time()*1000), "event": "artifact", "kind": "audio", "path": rel, "bytes": int(len(wav))})
+                        checkpoints_append_event(STATE_DIR, tr, "artifact", {"kind": "audio", "path": rel, "bytes": int(len(wav))})
                     except Exception:
                         pass
             return {"name": name, "result": env}
@@ -3184,7 +3184,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                                 if tr:
                                     try:
                                         rel = os.path.relpath(path, UPLOAD_DIR).replace("\\", "/")
-                                        _append_jsonl(os.path.join(STATE_DIR, "traces", tr, "artifacts.jsonl"), {"t": int(time.time()*1000), "event": "artifact", "kind": "audio", "path": rel, "bytes": int(len(wav_bytes)), "stem": stem_name})
+                                        checkpoints_append_event(STATE_DIR, tr, "artifact", {"kind": "audio", "path": rel, "bytes": int(len(wav_bytes)), "stem": stem_name})
                                     except Exception:
                                         pass
                         except Exception:
@@ -3390,7 +3390,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         except Exception:
             pass
         try:
-            _trace_append("image", {"cid": args.get("cid"), "tool": "image.super_gen", "prompt": prompt, "size": f"{w}x{h}", "objects": objs, "boxes": boxes, "path": final_path, "signage_text": exact_text, "web_sources": web_sources})
+            trace_append("image", {"cid": args.get("cid"), "tool": "image.super_gen", "prompt": prompt, "size": f"{w}x{h}", "objects": objs, "boxes": boxes, "path": final_path, "signage_text": exact_text, "web_sources": web_sources})
         except Exception:
             pass
         return {"name": name, "result": {"path": url}}
@@ -3716,12 +3716,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             if tr:
                 try:
                     rel = os.path.relpath(dst, UPLOAD_DIR).replace("\\", "/")
-                    _append_jsonl(os.path.join(STATE_DIR, "traces", tr, "artifacts.jsonl"), {
-                        "t": int(time.time()*1000),
-                        "event": "artifact",
-                        "kind": "video",
-                        "path": rel,
-                    })
+                    checkpoints_append_event(STATE_DIR, tr, "artifact", {"kind": "video", "path": rel})
                 except Exception:
                     pass
             return {"name": name, "result": {"path": url}}
@@ -3799,7 +3794,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             except Exception:
                 pass
             try:
-                _trace_append("image", {"cid": args.get("cid"), "tool": "image.cleanup", "src": src, "path": dst})
+                trace_append("image", {"cid": args.get("cid"), "tool": "image.cleanup", "src": src, "path": dst})
             except Exception:
                 pass
             return {"name": name, "result": {"path": url}}
@@ -3828,7 +3823,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             except Exception:
                 pass
             try:
-                _trace_append("video", {"cid": args.get("cid"), "tool": "video.cleanup", "src": src, "vf": vf, "path": dst})
+                trace_append("video", {"cid": args.get("cid"), "tool": "video.cleanup", "src": src, "vf": vf, "path": dst})
             except Exception:
                 pass
             return {"name": name, "result": {"path": url}}
@@ -3892,7 +3887,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             except Exception:
                 pass
             try:
-                _trace_append("image", {"cid": args.get("cid"), "tool": "image.artifact_fix", "src": src, "type": atype, "path": dst})
+                trace_append("image", {"cid": args.get("cid"), "tool": "image.artifact_fix", "src": src, "type": atype, "path": dst})
             except Exception:
                 pass
             return {"name": name, "result": {"path": url}}
@@ -3922,7 +3917,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             except Exception:
                 pass
             try:
-                _trace_append("video", {"cid": args.get("cid"), "tool": "video.artifact_fix", "src": src, "type": atype, "path": dst})
+                trace_append("video", {"cid": args.get("cid"), "tool": "video.artifact_fix", "src": src, "type": atype, "path": dst})
             except Exception:
                 pass
             return {"name": name, "result": {"path": url}}
@@ -3999,7 +3994,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             except Exception:
                 pass
             try:
-                _trace_append("image", {"cid": args.get("cid"), "tool": "image.hands.fix", "src": src, "path": dst})
+                trace_append("image", {"cid": args.get("cid"), "tool": "image.hands.fix", "src": src, "path": dst})
             except Exception:
                 pass
             return {"name": name, "result": {"path": url}}
@@ -4026,7 +4021,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             except Exception:
                 pass
             try:
-                _trace_append("video", {"cid": args.get("cid"), "tool": "video.hands.fix", "src": src, "path": dst})
+                trace_append("video", {"cid": args.get("cid"), "tool": "video.hands.fix", "src": src, "path": dst})
             except Exception:
                 pass
             return {"name": name, "result": {"path": url}}
@@ -4170,7 +4165,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             except Exception:
                 pass
             try:
-                _trace_append("video", {"cid": args.get("cid"), "tool": "video.interpolate", "src": src, "target_fps": target_fps, "path": dst})
+                trace_append("video", {"cid": args.get("cid"), "tool": "video.interpolate", "src": src, "target_fps": target_fps, "path": dst})
             except Exception:
                 pass
             return {"name": name, "result": {"path": url}}
@@ -4241,7 +4236,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             except Exception:
                 pass
             try:
-                _trace_append("video", {"cid": args.get("cid"), "tool": "video.flow.derive", "src": src, "frame_a": frame_a, "frame_b": frame_b, "path": npz_path})
+                trace_append("video", {"cid": args.get("cid"), "tool": "video.flow.derive", "src": src, "frame_a": frame_a, "frame_b": frame_b, "path": npz_path})
             except Exception:
                 pass
             return {"name": name, "result": {"path": url}}
@@ -4374,7 +4369,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             except Exception:
                 pass
             try:
-                _trace_append("video", {"cid": args.get("cid"), "tool": "video.upscale", "src": src, "scale": scale, "width": w, "height": h, "path": dst})
+                trace_append("video", {"cid": args.get("cid"), "tool": "video.upscale", "src": src, "scale": scale, "width": w, "height": h, "path": dst})
             except Exception:
                 pass
             return {"name": name, "result": {"path": url}}
@@ -4431,7 +4426,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             except Exception:
                 pass
             try:
-                _trace_append("video", {"cid": args.get("cid"), "tool": "video.text.overlay", "src": src, "path": dst, "texts": texts})
+                trace_append("video", {"cid": args.get("cid"), "tool": "video.text.overlay", "src": src, "path": dst, "texts": texts})
             except Exception:
                 pass
             return {"name": name, "result": {"path": url}}
@@ -4781,17 +4776,15 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     if isinstance(ikey, str) and len(ikey) >= 8:
         trace_id = ikey.strip()
     first_user_len = len((last_user_text or "")) if isinstance(last_user_text, str) else 0
-    _append_jsonl(
-        os.path.join(STATE_DIR, "traces", trace_id, "requests.jsonl"),
-        {
-            "t": int(time.time() * 1000),
-            "trace_id": trace_id,
-            "route": "/v1/chat/completions",
-            "body_summary": {"messages_count": len(normalized_msgs or []), "first_user_text_len": first_user_len},
-            "seed": int(master_seed),
-            "model_declared": (body.get("model") if isinstance(body.get("model"), str) else None),
-        },
-    )
+    # Purge legacy trace files for this trace to enforce unified format
+    _cleanup_legacy_trace_files(trace_id)
+    checkpoints_append_event(STATE_DIR, trace_id, "request", {
+        "trace_id": trace_id,
+        "route": "/v1/chat/completions",
+        "body_summary": {"messages_count": len(normalized_msgs or []), "first_user_text_len": first_user_len},
+        "seed": int(master_seed),
+        "model_declared": (body.get("model") if isinstance(body.get("model"), str) else None),
+    })
     _log("chat.start", trace_id=trace_id, mode=mode, stream=bool(body.get("stream")), cid=conv_cid)
     # Helper: build absolute URLs for any same-origin artifact paths
     def _abs_url(u: str) -> str:
@@ -4804,7 +4797,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         return u
     # Acquire per-trace lock and record start event
     _lock_token = _acquire_lock(STATE_DIR, trace_id, timeout_s=10)
-    _append_event(STATE_DIR, trace_id, "start", {"seed": int(master_seed), "mode": mode})
+    checkpoints_append_event(STATE_DIR, trace_id, "start", {"seed": int(master_seed), "mode": mode})
 
     # ICW pack (always-on) — inline; record pack_hash for traces
     pack_hash = None
@@ -4890,7 +4883,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         provider = _SyncOllamaProvider(QWEN_BASE_URL, QWEN_MODEL_ID, ctx_limit, body.get("temperature") or DEFAULT_TEMPERATURE)
         def _progress(step: int, kind: str, info: Dict[str, Any] | None = None):
             try:
-                _append_event(STATE_DIR, trace_id, f"window_{kind}", {"step": int(step), **(info or {})})
+                checkpoints_append_event(STATE_DIR, trace_id, f"window_{kind}", {"step": int(step), **(info or {})})
             except Exception:
                 pass
         result = windowed_solve(
@@ -5029,7 +5022,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         await _db_update_run_response(run_id, response, usage)
         # Record finalization for state tracking
         try:
-            _append_event(STATE_DIR, trace_id, "halt", {"kind": "windowed", "chars": len(final_text)})
+            checkpoints_append_event(STATE_DIR, trace_id, "halt", {"kind": "windowed", "chars": len(final_text)})
         except Exception:
             pass
         if route_mode == "windowed":
@@ -5120,7 +5113,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     _log("planner.catalog", trace_id=trace_id, hash=_cat_hash)
     _log("planner.steps", trace_id=trace_id, steps=[{"tool": (tc.get("name") or "")} for tc in (tool_calls or [])])
     # No synthesized tool_calls: executors must propose exact tools to run
-    _trace_append("decision", {"cid": conv_cid, "trace_id": trace_id, "plan": plan_text, "tool_calls": tool_calls})
+    trace_append("decision", {"cid": conv_cid, "trace_id": trace_id, "plan": plan_text, "tool_calls": tool_calls})
     # Deterministic router: if intent is recognized, override planner with a direct tool call
     # No router overrides — the planner is solely responsible for tool choice
     # Execute planner/router tool calls immediately when present
@@ -6119,7 +6112,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             yield f"data: {done}\n\n"
             yield "data: [DONE]\n\n"
         try:
-            _append_event(STATE_DIR, trace_id, "halt", {"kind": "committee", "chars": len(final_text)})
+            checkpoints_append_event(STATE_DIR, trace_id, "halt", {"kind": "committee", "chars": len(final_text)})
         except Exception:
             pass
         try:
@@ -6320,7 +6313,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     looks_refusal = any(tok in text_lower for tok in refusal_markers)
     display_content = f"{cleaned}{footer}"
     try:
-        _append_jsonl(os.path.join(STATE_DIR, "traces", trace_id, "responses.jsonl"), {"t": int(time.time()*1000), "trace_id": trace_id, "seed": int(master_seed), "pack_hash": pack_hash, "route_mode": route_mode, "tool_results_count": len(tool_results or []), "content_preview": (display_content or "")[:800]})
+        checkpoints_append_event(STATE_DIR, trace_id, "response", {"trace_id": trace_id, "seed": int(master_seed), "pack_hash": pack_hash, "route_mode": route_mode, "tool_results_count": len(tool_results or []), "content_preview": (display_content or "")[:800]})
     except Exception:
         pass
     # Provide an appendix with raw model answers to avoid any perception of truncation
@@ -6520,7 +6513,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     # Persist response & metrics
     await _db_update_run_response(run_id, response, usage)
     try:
-        _append_event(STATE_DIR, trace_id, "halt", {"kind": "committee", "chars": len(display_content)})
+        checkpoints_append_event(STATE_DIR, trace_id, "halt", {"kind": "committee", "chars": len(display_content)})
     except Exception:
         pass
     try:
@@ -6609,12 +6602,12 @@ async def refs_resolve(body: Dict[str, Any]):
             rec = _glob_resolve(text, kind)
             if not rec:
                 try:
-                    _trace_append("memory_ref", {"cid": cid, "text": text, "kind": kind, "found": False})
+                    trace_append("memory_ref", {"cid": cid, "text": text, "kind": kind, "found": False})
                 except Exception:
                     pass
                 return {"ok": False, "matches": []}
         try:
-            _trace_append("memory_ref", {"cid": cid, "text": text, "kind": kind, "found": True, "path": rec.get("path"), "source": ("cid" if cid else "global")})
+            trace_append("memory_ref", {"cid": cid, "text": text, "kind": kind, "found": True, "path": rec.get("path"), "source": ("cid" if cid else "global")})
         except Exception:
             pass
         return {"ok": True, "matches": [rec]}
@@ -6741,12 +6734,7 @@ async def tool_run(body: Dict[str, Any]):
     _append_jsonl(os.path.join(STATE_DIR, "tools", "tools.jsonl"), {"t": int(time.time()*1000), "event": "start", "tool": name, "args": args})
     trace_id = args.get("trace_id") or args.get("cid")
     if isinstance(trace_id, str) and trace_id:
-        _append_jsonl(os.path.join(STATE_DIR, "traces", trace_id, "tools.jsonl"), {
-            "t": int(time.time()*1000),
-            "event": "tool_start",
-            "tool": (name or "tool"),
-            "step_id": args.get("step_id"),
-        })
+        checkpoints_append_event(STATE_DIR, trace_id, "tool_start", {"tool": (name or "tool"), "step_id": args.get("step_id")})
     res = await execute_tool_call({"name": name, "arguments": args})
     # Map to strict envelope
     if isinstance(res, dict) and res.get("error"):
@@ -6754,10 +6742,7 @@ async def tool_run(body: Dict[str, Any]):
         trc = (args.get("trace_id") or args.get("cid")) if isinstance(args, dict) else None
         if isinstance(trc, str) and trc and isinstance(res.get("traceback"), str):
             try:
-                _append_jsonl(os.path.join(STATE_DIR, "traces", trc, "errors.jsonl"), {
-                    "t": int(time.time()*1000),
-                    "error": {"code": "tool_error", "message": str(res.get("error")), "traceback": res.get("traceback"), "tool": name}
-                })
+                checkpoints_append_event(STATE_DIR, trc, "error", {"code": "tool_error", "message": str(res.get("error")), "traceback": res.get("traceback"), "tool": name})
             except Exception:
                 logging.error(traceback.format_exc())
         return JSONResponse(
@@ -6779,33 +6764,19 @@ async def tools_append(body: Dict[str, Any], request: Request):
         trace_id = row.get("trace_id") or row.get("cid")
         if trace_id:
             if row.get("event") == "exec_step_start":
-                _append_jsonl(os.path.join(STATE_DIR, "traces", str(trace_id), "events.jsonl"), {
-                    "t": int(row.get("t") or 0), "event": "exec_step_start", "tool": row.get("tool"), "step_id": row.get("step_id")
-                })
+                checkpoints_append_event(STATE_DIR, str(trace_id), "exec_step_start", {"tool": row.get("tool"), "step_id": row.get("step_id")})
             if row.get("event") == "exec_step_finish":
-                _append_jsonl(os.path.join(STATE_DIR, "traces", str(trace_id), "events.jsonl"), {
-                    "t": int(row.get("t") or 0), "event": "exec_step_finish", "tool": row.get("tool"), "step_id": row.get("step_id"), "ok": bool(row.get("ok"))
-                })
+                checkpoints_append_event(STATE_DIR, str(trace_id), "exec_step_finish", {"tool": row.get("tool"), "step_id": row.get("step_id"), "ok": bool(row.get("ok"))})
             if row.get("event") == "exec_step_attempt":
-                _append_jsonl(os.path.join(STATE_DIR, "traces", str(trace_id), "events.jsonl"), {
-                    "t": int(row.get("t") or 0), "event": "exec_step_attempt", "tool": row.get("tool"), "step_id": row.get("step_id"), "attempt": int(row.get("attempt") or 0)
-                })
+                checkpoints_append_event(STATE_DIR, str(trace_id), "exec_step_attempt", {"tool": row.get("tool"), "step_id": row.get("step_id"), "attempt": int(row.get("attempt") or 0)})
             if row.get("event") == "exec_plan_start":
-                _append_jsonl(os.path.join(STATE_DIR, "traces", str(trace_id), "events.jsonl"), {
-                    "t": int(row.get("t") or 0), "event": "exec_plan_start", "steps": int(row.get("steps") or 0)
-                })
+                checkpoints_append_event(STATE_DIR, str(trace_id), "exec_plan_start", {"steps": int(row.get("steps") or 0)})
             if row.get("event") == "exec_plan_finish":
-                _append_jsonl(os.path.join(STATE_DIR, "traces", str(trace_id), "events.jsonl"), {
-                    "t": int(row.get("t") or 0), "event": "exec_plan_finish", "produced_keys": (row.get("produced_keys") or [])
-                })
+                checkpoints_append_event(STATE_DIR, str(trace_id), "exec_plan_finish", {"produced_keys": (row.get("produced_keys") or [])})
             if row.get("event") == "exec_batch_start":
-                _append_jsonl(os.path.join(STATE_DIR, "traces", str(trace_id), "events.jsonl"), {
-                    "t": int(row.get("t") or 0), "event": "exec_batch_start", "items": (row.get("items") or [])
-                })
+                checkpoints_append_event(STATE_DIR, str(trace_id), "exec_batch_start", {"items": (row.get("items") or [])})
             if row.get("event") == "exec_batch_finish":
-                _append_jsonl(os.path.join(STATE_DIR, "traces", str(trace_id), "events.jsonl"), {
-                    "t": int(row.get("t") or 0), "event": "exec_batch_finish", "items": (row.get("items") or [])
-                })
+                checkpoints_append_event(STATE_DIR, str(trace_id), "exec_batch_finish", {"items": (row.get("items") or [])})
             if bool(row.get("ok") is True) and row.get("event") == "end":
                 distilled = {
                     "t": int(row.get("t") or 0),
@@ -6816,17 +6787,16 @@ async def tools_append(body: Dict[str, Any], request: Request):
                 }
                 if isinstance(row.get("summary"), dict):
                     distilled["summary"] = row.get("summary")
-                _append_jsonl(os.path.join(STATE_DIR, "traces", str(trace_id), "tools.jsonl"), distilled)
+                checkpoints_append_event(STATE_DIR, str(trace_id), "tool_summary", distilled)
                 # Compact artifact entries inferred from summary (no stack traces)
                 try:
                     s = row.get("summary") or {}
-                    arts_path = os.path.join(STATE_DIR, "traces", str(trace_id), "artifacts.jsonl")
                     if isinstance(s.get("images_count"), int) and s.get("images_count") > 0:
-                        _append_jsonl(arts_path, {"t": int(row.get("t") or 0), "event": "artifact_summary", "kind": "image", "count": int(s.get("images_count"))})
+                        checkpoints_append_event(STATE_DIR, str(trace_id), "artifact_summary", {"kind": "image", "count": int(s.get("images_count"))})
                     if isinstance(s.get("videos_count"), int) and s.get("videos_count") > 0:
-                        _append_jsonl(arts_path, {"t": int(row.get("t") or 0), "event": "artifact_summary", "kind": "video", "count": int(s.get("videos_count"))})
+                        checkpoints_append_event(STATE_DIR, str(trace_id), "artifact_summary", {"kind": "video", "count": int(s.get("videos_count"))})
                     if isinstance(s.get("wav_bytes"), int) and s.get("wav_bytes") > 0:
-                        _append_jsonl(arts_path, {"t": int(row.get("t") or 0), "event": "artifact_summary", "kind": "audio", "bytes": int(s.get("wav_bytes"))})
+                        checkpoints_append_event(STATE_DIR, str(trace_id), "artifact_summary", {"kind": "audio", "bytes": int(s.get("wav_bytes"))})
                 except Exception:
                     pass
             # Forward review WS events to connected client if present

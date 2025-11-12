@@ -7,6 +7,8 @@ import logging, sys
 from urllib.parse import quote, urlsplit, urlparse
 import base64 as _b64
 from app.main import execute_tool_call as _execute_tool_call
+from app.state.checkpoints import append_event as checkpoints_append_event
+from app.trace_utils import emit_trace as _emit_trace
 
 
 router = APIRouter()
@@ -411,7 +413,7 @@ async def tool_run(req: Request):
 				ins["filename_prefix"] = f"void_{_client_id}"
 
 	client_id = _client_id
-	_append_jsonl(os.path.join(STATE_DIR_LOCAL, "tools.jsonl"), {"t": int(time.time()*1000), "event": "comfyui.submit", "base": COMFY_BASE, "workflow_path": wf_path})
+	_emit_trace(STATE_DIR_LOCAL, "global", "comfyui.submit", {"t": int(time.time()*1000), "base": COMFY_BASE, "workflow_path": wf_path})
 	log.info("[comfy] POST /prompt url=%s", COMFY_BASE.rstrip("/") + "/prompt")
 	submit_res = _post_json(COMFY_BASE.rstrip("/") + "/prompt", {"prompt": prompt_graph, "client_id": client_id})
 	prompt_id = submit_res.get("prompt_id") or submit_res.get("promptId") or ""
@@ -426,7 +428,7 @@ async def tool_run(req: Request):
 		log.info("[comfy] polling /history/%s", prompt_id)
 		hist = _get_json(f"{COMFY_BASE.rstrip('/')}/history/{prompt_id}")
 		if _first_hist:
-			_append_jsonl(os.path.join(STATE_DIR_LOCAL, "tools.jsonl"), {"t": int(time.time()*1000), "event": "comfyui.history", "prompt_id": prompt_id})
+			_emit_trace(STATE_DIR_LOCAL, "global", "comfyui.history", {"t": int(time.time()*1000), "prompt_id": prompt_id})
 			_first_hist = False
 		if not isinstance(hist, dict):
 			continue
@@ -473,7 +475,7 @@ async def tool_run(req: Request):
 		else:
 			image_files.append(im.get("filename"))
 		view_urls.append(im.get("view_url"))
-	_append_jsonl(os.path.join(STATE_DIR_LOCAL, "tools.jsonl"), {"t": int(time.time()*1000), "event": "comfyui.done", "count": len(images)})
+	_emit_trace(STATE_DIR_LOCAL, "global", "comfyui.done", {"t": int(time.time()*1000), "count": len(images)})
 	log.info("[comfy] images=%d", len(images))
 
 	# Echo effective params if present
@@ -524,15 +526,11 @@ async def tool_run(req: Request):
 		# Trace for distillation: emit chat.append with media parts for this trace
 		trc = args.get("trace_id") or args.get("cid")
 		if isinstance(trc, str) and trc.strip():
-			try:
-				parts = [{"image": u} for u in orch_urls if isinstance(u, str) and u.strip()]
-				_append_jsonl(os.path.join(STATE_DIR_LOCAL, "traces", trc, "chat.jsonl"), {
-					"t": int(time.time()*1000),
-					"event": "chat.append",
-					"message": {"role": "assistant", "parts": parts},
-					"tool": "image.dispatch",
-					"prompt_id": prompt_id,
-				})
-			except Exception:
-				pass
+			parts = [{"image": u} for u in orch_urls if isinstance(u, str) and u.strip()]
+			_emit_trace(STATE_DIR_LOCAL, trc, "chat.append", {
+				"t": int(time.time()*1000),
+				"message": {"role": "assistant", "parts": parts},
+				"tool": "image.dispatch",
+				"prompt_id": prompt_id,
+			})
 	return ok_envelope(result, rid="tool.run")
