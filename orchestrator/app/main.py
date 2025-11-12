@@ -4847,8 +4847,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
 
 
 async def execute_tools(tool_calls: List[Dict[str, Any]], trace_id: str | None = None) -> List[Dict[str, Any]]:
-    # Route all tool execution through the executor to avoid local fast paths.
-    # Coerce calls into executor steps: {"tool": str, "args": dict}
+    # Route all tool execution through the executor only.
     steps: List[Dict[str, Any]] = []
     for call in tool_calls[:5]:
         name = (call or {}).get("name")
@@ -4859,8 +4858,11 @@ async def execute_tools(tool_calls: List[Dict[str, Any]], trace_id: str | None =
     rid = str(trace_id or _uuid.uuid4().hex)
     payload = {"schema_version": 1, "request_id": rid, "trace_id": rid, "steps": steps}
     async with _hx.AsyncClient(timeout=None) as client:
-        r = await client.post(EXECUTOR_BASE_URL.rstrip("/") + "/execute", json=payload)
-        env = _resp_json(r, {})
+        try:
+            r = await client.post(EXECUTOR_BASE_URL.rstrip("/") + "/execute", json=payload)
+            env = _resp_json(r, {})
+        except Exception as ex:
+            env = {"ok": False, "error": {"code": "executor_connect_error", "message": str(ex)}, "result": {"produced": {}}}
     results: List[Dict[str, Any]] = []
     if isinstance(env, dict) and env.get("ok") and isinstance((env.get("result") or {}).get("produced"), dict):
         for _, step in (env.get("result") or {}).get("produced", {}).items():

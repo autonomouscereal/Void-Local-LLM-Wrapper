@@ -1,6 +1,6 @@
+import os
 import json
 from typing import Any, Dict, List
-from ..app.main import ORCHESTRATOR_BASE_URL
 
 
 def _post(url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -51,7 +51,8 @@ def _local_validate(schema: Dict[str, Any], args: Dict[str, Any]) -> List[Dict[s
 
 def check(name: str, args: Dict[str, Any], schema: Dict[str, Any]) -> Dict[str, Any]:
     """Prefer server-side /tool.validate; fallback to minimal validator."""
-    url = ORCHESTRATOR_BASE_URL.rstrip("/") + "/tool.validate"
+    base = os.getenv("ORCHESTRATOR_BASE_URL", "http://127.0.0.1:8000")
+    url = base.rstrip("/") + "/tool.validate"
     try:
         obj = _post(url, {"name": name, "args": args})
         if obj and obj.get("ok") is True:
