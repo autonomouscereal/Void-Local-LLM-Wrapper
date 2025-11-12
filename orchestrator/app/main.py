@@ -901,6 +901,16 @@ app.add_middleware(
 from .middleware.preflight import Preflight204Middleware
 # Must be outermost to short-circuit OPTIONS early
 
+def _json_response(obj: Dict[str, Any], status_code: int = 200) -> Response:
+    body = json.dumps(obj, ensure_ascii=False)
+    headers = {
+        "Cache-Control": "no-store",
+        "Connection": "close",
+        "Content-Type": "application/json; charset=utf-8",
+        "Content-Length": str(len(body.encode("utf-8"))),
+    }
+    return Response(content=body, status_code=status_code, media_type="application/json", headers=headers)
+
 # Reflective CORS headers on all responses to satisfy browsers with credentials
 @app.middleware("http")
 async def _reflect_cors_headers(request: Request, call_next):
@@ -5301,7 +5311,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 _release_lock(STATE_DIR, trace_id)
         except Exception:
             pass
-        return JSONResponse(content=response)
+        return _json_response(response)
 
     # Ensure arguments are objects; auto-parse JSON strings instead of returning early
     if tool_calls:
@@ -5683,7 +5693,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             if _lock_token:
                 _release_lock(STATE_DIR, trace_id)
             _trace_response(trace_id, response)
-            return JSONResponse(content=response)
+            return _json_response(response)
 
     # 3) Executors respond independently using plan + evidence
     evidence_blocks: List[Dict[str, Any]] = [
@@ -5806,7 +5816,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             if _lock_token:
                 _release_lock(STATE_DIR, trace_id)
             _trace_response(trace_id, response)
-            return JSONResponse(content=response)
+            return _json_response(response)
         detail = {
             "qwen": {k: v for k, v in qwen_result.items() if k in ("error", "_base_url")},
             "gptoss": {k: v for k, v in gptoss_result.items() if k in ("error", "_base_url")},
@@ -6607,7 +6617,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         _trace_response(trace_id, response)
     except Exception:
         pass
-    return JSONResponse(content=response)
+    return _json_response(response)
 
 
 @app.post("/run")
