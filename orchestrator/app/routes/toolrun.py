@@ -200,12 +200,8 @@ STATE_DIR_LOCAL = os.path.join(os.getenv("UPLOAD_DIR", "/workspace/uploads"), "s
 
 # Runtime guard: force loopback base in host networking even if a container hostname sneaks in
 _raw_comfy = os.getenv("COMFYUI_API_URL") or "http://127.0.0.1:8188"
-_u = urlsplit(_raw_comfy)
-_port = _u.port or 8188
-if _u.hostname not in ("127.0.0.1", "localhost"):
-	COMFY_BASE = f"{_u.scheme or 'http'}://127.0.0.1:{_port}"
-else:
-	COMFY_BASE = _raw_comfy
+# Use the configured URL as-is (no host rewriting). Host networking aligns all services.
+COMFY_BASE = _raw_comfy
 
 def _append_jsonl(path: str, obj: dict) -> None:
 	os.makedirs(os.path.dirname(path), exist_ok=True)

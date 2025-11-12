@@ -5757,19 +5757,61 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                     pt = meta_used.get("prompt")
                     if isinstance(pt, str) and pt.strip():
                         prompt_text = pt.strip()
+            # Detect tool errors and surface them clearly to the user
+            tool_errors: List[Dict[str, Any]] = []
+            for tr in (tool_results or []):
+                if not isinstance(tr, dict):
+                    continue
+                name_t = (tr.get("name") or tr.get("tool") or "tool")
+                err_obj: Any = None
+                if isinstance(tr.get("error"), (str, dict)):
+                    err_obj = tr.get("error")
+                res_t = tr.get("result") if isinstance(tr.get("result"), dict) else {}
+                if isinstance(res_t.get("error"), (str, dict)):
+                    err_obj = res_t.get("error")
+                if err_obj is not None:
+                    code = (err_obj.get("code") if isinstance(err_obj, dict) else str(err_obj))
+                    status = None
+                    if isinstance(err_obj, dict):
+                        status = err_obj.get("status") or err_obj.get("_http_status") or err_obj.get("http_status")
+                    message = (err_obj.get("message") if isinstance(err_obj, dict) else None) or ""
+                    tool_errors.append({"tool": str(name_t), "code": (code or ""), "status": status, "message": message})
             summary_lines: List[str] = []
-            if prompt_text:
-                summary_lines.append(f"Here is your image:\n“{prompt_text}”")
+            if tool_errors:
+                # Compose an explicit failure report
+                summary_lines.append("The image tool failed to run.")
+                for e in tool_errors:
+                    line = f"- {e.get('tool')}: {e.get('code') or 'error'}"
+                    if e.get("status") is not None:
+                        line += f" (status {e.get('status')})"
+                    if e.get("message"):
+                        line += f" — {e.get('message')}"
+                    summary_lines.append(line)
+                if prompt_text:
+                    summary_lines.append(f"Prompt attempted:\n“{prompt_text}”")
+                # Provide effective params when known
+                if isinstance(meta_used, dict) and meta_used:
+                    param_bits = []
+                    for k in ("width","height","steps","cfg","sampler","scheduler","model","seed"):
+                        v = meta_used.get(k)
+                        if v is not None and v != "":
+                            param_bits.append(f"{k}={v}")
+                    if param_bits:
+                        summary_lines.append("Parameters: " + ", ".join(param_bits))
+                summary_lines.append("No assets were produced.")
             else:
-                summary_lines.append("Here are your generated image(s):")
-            # include effective params when present
-            for k in ("width","height","steps","cfg","sampler","scheduler","model","seed"):
-                v = meta_used.get(k)
-                if v is not None and v != "":
-                    summary_lines.append(f"{k}: {v}")
-            if asset_urls:
-                summary_lines.append("Assets:")
-                summary_lines.extend([f"- {u}" for u in asset_urls])
+                if prompt_text:
+                    summary_lines.append(f"Here is your image:\n“{prompt_text}”")
+                else:
+                    summary_lines.append("Here are your generated image(s):")
+                # include effective params when present
+                for k in ("width","height","steps","cfg","sampler","scheduler","model","seed"):
+                    v = meta_used.get(k)
+                    if v is not None and v != "":
+                        summary_lines.append(f"{k}: {v}")
+                if asset_urls:
+                    summary_lines.append("Assets:")
+                    summary_lines.extend([f"- {u}" for u in asset_urls])
             final_text = "\n".join(summary_lines) if summary_lines else "Generation completed."
             usage = estimate_usage(messages, final_text)
             response = {
