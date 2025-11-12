@@ -139,6 +139,17 @@ function App() {
       // Do NOT send credentials/cookies across origins
       xhr.withCredentials = false
       xhr.setRequestHeader('Content-Type', 'application/json')
+      xhr.setRequestHeader('Accept', '*/*')
+      xhr.onabort = () => {
+        updateThinking('Request aborted by the browser (reload/navigation)')
+        setSending(false)
+        resolve()
+      }
+      xhr.ontimeout = () => {
+        updateThinking('Request timed out on the client')
+        setSending(false)
+        resolve()
+      }
       xhr.onreadystatechange = async () => {
         if (xhr.readyState !== 4) return
         try {
@@ -592,6 +603,8 @@ function App() {
       return Array.from(new Set(urls))
     }
     const tick = async () => {
+      // Pause polling while a send is in-flight to avoid any chance of browser churn
+      if (sending) return
       try {
         const r = await fetch(ORCH_BASE + '/jobs')
         const j = await r.json()

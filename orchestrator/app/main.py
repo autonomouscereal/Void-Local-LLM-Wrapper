@@ -913,6 +913,8 @@ async def _reflect_cors_headers(request: Request, call_next):
             "Access-Control-Allow-Credentials": "true",
             "Access-Control-Allow-Methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS",
             "Access-Control-Allow-Headers": acrh,
+            "Access-Control-Expose-Headers": "*",
+            "Access-Control-Allow-Private-Network": "true",
             "Access-Control-Max-Age": "600",
         }
         return Response(status_code=204, headers=headers)
@@ -924,6 +926,8 @@ async def _reflect_cors_headers(request: Request, call_next):
         response.headers["Access-Control-Allow-Credentials"] = "true"
         response.headers.setdefault("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS")
         response.headers.setdefault("Access-Control-Allow-Headers", request.headers.get("access-control-request-headers") or "*")
+        response.headers.setdefault("Access-Control-Expose-Headers", "*")
+        response.headers.setdefault("Access-Control-Allow-Private-Network", "true")
     return response
 app.add_middleware(Preflight204Middleware)
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
