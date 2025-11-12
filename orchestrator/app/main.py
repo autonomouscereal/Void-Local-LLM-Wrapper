@@ -882,6 +882,9 @@ _load_wrapper_config()
 
 
 app = FastAPI(title="Void Orchestrator", version="0.1.0")
+# Mount canonical tool routes (validate/run) so /tool.run is served by the orchestrator
+from app.routes import toolrun as _toolrun_routes  # type: ignore
+app.include_router(_toolrun_routes.router)
 # Middleware order matters: last added runs first.
 # We want Preflight to run FIRST, so add it LAST.
 from .middleware.ws_permissive import PermissiveWebSocketMiddleware
