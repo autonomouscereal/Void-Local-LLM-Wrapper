@@ -498,6 +498,8 @@ async def tool_run(req: Request):
 			"comfy_base": COMFY_BASE,
 			"view_urls": view_urls,
 			"image_count": len(images),
+			"prompt": str(args.get("prompt") or ""),
+			"negative": str(args.get("negative") or args.get("negative_prompt") or ""),
 			**eff,
 		},
 	}

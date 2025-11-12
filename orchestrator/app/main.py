@@ -911,6 +911,75 @@ def _json_response(obj: Dict[str, Any], status_code: int = 200) -> Response:
     }
     return Response(content=body, status_code=status_code, media_type="application/json", headers=headers)
 
+@app.get("/minimal")
+async def minimal_same_origin():
+    """
+    Same-origin minimal UI to eliminate CORS entirely. Posts to /v1/chat/completions on this host.
+    """
+    html = """<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Minimal Same-Origin Client</title>
+    <style>
+      body { background:#0b0b0f; color:#e6e6e6; font-family: ui-sans-serif, system-ui, Arial; margin:0; padding:20px; }
+      .row { display:flex; gap:8px; margin-bottom:8px; align-items:center; }
+      input, textarea, button { background:#0f172a; color:#fff; border:1px solid #333; border-radius:6px; padding:8px; }
+      textarea { width:100%; }
+      #out { white-space:pre-wrap; background:#111827; border:1px solid #222; border-radius:8px; padding:12px; min-height:160px; }
+      label.small { font-size:12px; color:#9ca3af; }
+    </style>
+  </head>
+  <body>
+    <h2>Same-Origin /v1/chat/completions</h2>
+    <div class="row">
+      <textarea id="prompt" rows="4" placeholder="Describe the image…">please draw me a picture of shadow the hedgehog</textarea>
+    </div>
+    <div class="row">
+      <button id="send">Send</button>
+      <label class="small" id="status"></label>
+    </div>
+    <div id="out"></div>
+    <script>
+      const statusEl = document.getElementById('status');
+      const outEl = document.getElementById('out');
+      const promptEl = document.getElementById('prompt');
+      function setStatus(s){ statusEl.textContent = s; }
+      function setOut(t){ outEl.textContent = t; }
+      document.getElementById('send').onclick = async () => {
+        const url = '/v1/chat/completions';
+        const body = JSON.stringify({ messages: [{ role: 'user', content: promptEl.value }], stream: false });
+        setStatus('Sending…'); setOut('');
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', url, true);
+        xhr.timeout = 0; xhr.withCredentials = false;
+        xhr.setRequestHeader('Content-Type', 'application/json');
+        xhr.setRequestHeader('Accept', '*/*');
+        xhr.onreadystatechange = () => {
+          if (xhr.readyState !== 4) return;
+          setStatus('Done ('+xhr.status+')');
+          const txt = xhr.responseText || '';
+          try { setOut(JSON.stringify(JSON.parse(txt), null, 2)); } catch { setOut(txt); }
+        };
+        xhr.onabort = () => { setStatus('Aborted'); setOut('Request aborted by browser'); };
+        xhr.ontimeout = () => { setStatus('Timed out'); setOut('Client-side timeout'); };
+        xhr.onerror = () => { setStatus('Network error'); setOut('Network error'); };
+        try { xhr.send(body); } catch(e){ setStatus('Send failed'); setOut(String(e && e.message || e)); }
+      };
+    </script>
+  </body>
+</html>"""
+    return Response(
+        content=html,
+        media_type="text/html",
+        headers={
+            "Cache-Control": "no-store",
+            "Connection": "close",
+            "Content-Length": str(len(html.encode("utf-8"))),
+        },
+    )
+
 # Reflective CORS headers on all responses to satisfy browsers with credentials
 @app.middleware("http")
 async def _reflect_cors_headers(request: Request, call_next):
@@ -5678,7 +5747,30 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             asset_urls = _asset_urls_from_tools(tool_results)
             asset_urls = [_abs_url(u) for u in (asset_urls or [])]
             # Always return a final OpenAI envelope after tools complete (even without assets)
-            final_text = ("\n".join(["Assets:"] + [f"- {u}" for u in asset_urls])) if asset_urls else "Generation completed."
+            # Build a richer assistant message using tool meta (prompt/params) when available
+            prompt_text = ""
+            meta_used: Dict[str, Any] = {}
+            if isinstance(tool_results, list) and tool_results:
+                first = (tool_results[0] or {}).get("result") or {}
+                if isinstance(first.get("meta"), dict):
+                    meta_used = first.get("meta") or {}
+                    pt = meta_used.get("prompt")
+                    if isinstance(pt, str) and pt.strip():
+                        prompt_text = pt.strip()
+            summary_lines: List[str] = []
+            if prompt_text:
+                summary_lines.append(f"Here is your image:\n“{prompt_text}”")
+            else:
+                summary_lines.append("Here are your generated image(s):")
+            # include effective params when present
+            for k in ("width","height","steps","cfg","sampler","scheduler","model","seed"):
+                v = meta_used.get(k)
+                if v is not None and v != "":
+                    summary_lines.append(f"{k}: {v}")
+            if asset_urls:
+                summary_lines.append("Assets:")
+                summary_lines.extend([f"- {u}" for u in asset_urls])
+            final_text = "\n".join(summary_lines) if summary_lines else "Generation completed."
             usage = estimate_usage(messages, final_text)
             response = {
                 "id": "orc-1",
