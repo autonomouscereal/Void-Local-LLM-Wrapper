@@ -197,7 +197,7 @@ services:
       - nvidia_init
     # host networking: no ports mapping needed
     environment:
-      - OLLAMA_HOST=0.0.0.0
+      - OLLAMA_HOST=0.0.0.0:11435
       - OLLAMA_KEEP_ALIVE=24h
       - NVIDIA_VISIBLE_DEVICES=${OLLAMA_QWEN_GPU:-all}
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
@@ -208,11 +208,12 @@ services:
   init_qwen:
     image: curlimages/curl:8.7.1
     container_name: init_qwen
+    network_mode: host
     depends_on:
       - ollama_qwen
     environment:
       - QWEN_MODEL_ID=${QWEN_MODEL_ID:-qwen3:30b-a3b-instruct-2507-q4_K_M}
-    command: ["sh","-lc","until curl -sf http://ollama_qwen:11434/api/tags >/dev/null; do sleep 2; done; echo Pulling $QWEN_MODEL_ID; curl -sf -X POST http://ollama_qwen:11434/api/pull -H 'Content-Type: application/json' -d '{\"name\":\"${QWEN_MODEL_ID}\"}'; echo Pulled $QWEN_MODEL_ID"]
+    command: ["sh","-lc","until curl -sf http://127.0.0.1:11435/api/tags >/dev/null; do sleep 2; done; echo Pulling $QWEN_MODEL_ID; curl -sf -X POST http://127.0.0.1:11435/api/pull -H 'Content-Type: application/json' -d '{\"name\":\"${QWEN_MODEL_ID}\"}'; echo Pulled $QWEN_MODEL_ID"]
 
   ollama_gptoss:
     network_mode: host
@@ -226,7 +227,7 @@ services:
       - nvidia_init
     # host networking: no ports mapping needed
     environment:
-      - OLLAMA_HOST=0.0.0.0
+      - OLLAMA_HOST=0.0.0.0:11434
       - OLLAMA_KEEP_ALIVE=24h
       - NVIDIA_VISIBLE_DEVICES=${OLLAMA_GPTOSS_GPU:-all}
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
@@ -237,20 +238,22 @@ services:
   init_gptoss:
     image: curlimages/curl:8.7.1
     container_name: init_gptoss
+    network_mode: host
     depends_on:
       - ollama_gptoss
     environment:
       - GPTOSS_MODEL_ID=${GPTOSS_MODEL_ID}
-    command: ["sh","-lc","until curl -s http://ollama_gptoss:11434/api/tags >/dev/null; do sleep 2; done; curl -s -X POST http://ollama_gptoss:11434/api/pull -H 'Content-Type: application/json' -d '{\"name\":\"${GPTOSS_MODEL_ID}\"}'"]
+    command: ["sh","-lc","until curl -s http://127.0.0.1:11434/api/tags >/dev/null; do sleep 2; done; curl -s -X POST http://127.0.0.1:11434/api/pull -H 'Content-Type: application/json' -d '{\"name\":\"${GPTOSS_MODEL_ID}\"}'"]
 
   init_qwen_vl:
     image: curlimages/curl:8.7.1
     container_name: init_qwen_vl
+    network_mode: host
     depends_on:
       - ollama_qwen
     environment:
       - QWEN_VL_MODEL_ID=${QWEN_VL_MODEL_ID:-qwen3-vl:8b}
-    command: ["sh","-lc","until curl -sf http://ollama_qwen:11434/api/tags >/dev/null; do sleep 2; done; echo Pulling $QWEN_VL_MODEL_ID; curl -sf -X POST http://ollama_qwen:11434/api/pull -H 'Content-Type: application/json' -d '{\"name\":\"${QWEN_VL_MODEL_ID}\"}'; echo Pulled $QWEN_VL_MODEL_ID"]
+    command: ["sh","-lc","until curl -sf http://127.0.0.1:11435/api/tags >/dev/null; do sleep 2; done; echo Pulling $QWEN_VL_MODEL_ID; curl -sf -X POST http://127.0.0.1:11435/api/pull -H 'Content-Type: application/json' -d '{\"name\":\"${QWEN_VL_MODEL_ID}\"}'; echo Pulled $QWEN_VL_MODEL_ID"]
 
   orchestrator:
     build:
@@ -271,9 +274,9 @@ services:
       - PYTHONUNBUFFERED=1
       - FILM2_MODELS=/opt/models
       - FILM2_DATA=/srv/film2
-      - QWEN_BASE_URL=http://127.0.0.1:11434
+      - QWEN_BASE_URL=http://127.0.0.1:11435
       - QWEN_MODEL_ID=${QWEN_MODEL_ID:-qwen3:30b-a3b-instruct-2507-q4_K_M}
-      - GPTOSS_BASE_URL=http://127.0.0.1:11435
+      - GPTOSS_BASE_URL=http://127.0.0.1:11434
       - GPTOSS_MODEL_ID=${GPTOSS_MODEL_ID}
       # Enable ICW + Committee + Tools by default
       - ICW_MODE=${ICW_MODE:-committee}
@@ -309,8 +312,6 @@ services:
       - FACEID_API_URL=http://127.0.0.1:7000
       - MUSIC_API_URL=http://127.0.0.1:7860
       - DEMUCS_API_URL=http://127.0.0.1:9101
-      - COMFYUI_API_URL=http://127.0.0.1:8188
-      # With host networking, prefer explicit host IP to avoid loopback ambiguity
       - COMFYUI_API_URL=http://192.168.50.222:8188
       - COMFY_WORKFLOW_PATH=/workspace/services/image/workflows/stock_smoke.json
       - COMFYUI_API_URLS=${COMFYUI_API_URLS:-}
@@ -321,9 +322,8 @@ services:
       - VLM_API_URL=http://127.0.0.1:8050
       - OCR_API_URL=http://127.0.0.1:8070
       - TEACHER_API_URL=http://127.0.0.1:8097
-    # DO NOT change this command to include --app-dir or a different module path.
-    # Workpath changes are forbidden; keep 'app.main_min:app'.
-    command: ["uvicorn","app.main_min:app","--host","0.0.0.0","--port","8000","--log-level","info","--access-log","--use-colors"]
+    # Use the full orchestrator with minimal UI route and unified tracing
+    command: ["uvicorn","app.main:app","--host","0.0.0.0","--port","8000","--log-level","info","--access-log","--use-colors"]
     volumes:
       - ./:/workspace
       - film2_models:/opt/models:ro
