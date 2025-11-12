@@ -5177,6 +5177,8 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                     tool_calls = []
         # DO NOT pre-execute before validation — enforce validate-first ordering
         from .pipeline.validator import validate_and_repair as validator_validate_and_repair  # type: ignore
+        # Log start of validate+repair with tool names
+        _log("validate.repair.start", trace_id=trace_id, tools=[(t.get("name") or "") for t in (tool_calls or [])])
         vr = await validator_validate_and_repair(
             tool_calls,
             base_url=base_url,
@@ -5195,6 +5197,14 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         repairs_made = bool(vr.get("repairs_made"))
         _repair_success_any = bool(vr.get("_repair_success_any"))
         _patched_payload_emitted = bool(vr.get("_patched_payload_emitted"))
+        # Log completion of validate+repair with outcome summary
+        _failure_codes = []
+        for f in (pre_tool_failures or []):
+            err = ((f.get("result") or {}).get("error") or {})
+            code = err.get("code") if isinstance(err, dict) else None
+            if isinstance(code, str) and code:
+                _failure_codes.append(code)
+        _log("validate.repair.done", trace_id=trace_id, validated_count=len(validated or []), failures_count=len(pre_tool_failures or []), repairs_made=repairs_made, failure_codes=list(dict.fromkeys(_failure_codes))[:8])
         tool_calls = validated
 
     # 2) Optionally execute tools
@@ -5242,8 +5252,37 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             tool_calls = []
         # Execute via external void executor to ensure Comfy is driven by the executor
         _log("tool.run.start", trace_id=trace_id, executor="void", count=len(tool_calls or []))
+        # Per-tool BEFORE logs
+        for tc in (tool_calls or []):
+            tn = (tc.get("name") or "tool")
+            ta = tc.get("arguments") if isinstance(tc.get("arguments"), dict) else {}
+            _log("tool.run.before", trace_id=trace_id, tool=str(tn), args_keys=list((ta or {}).keys()))
         # Execute via executor gateway
         tool_results = await gateway_execute(tool_calls, trace_id, EXECUTOR_BASE_URL or "http://127.0.0.1:8081")
+        # Per-tool AFTER/ERROR logs
+        for tr in (tool_results or []):
+            tname = str((tr or {}).get("name") or "tool")
+            res = (tr or {}).get("result") if isinstance((tr or {}).get("result"), dict) else {}
+            err_obj = (tr or {}).get("error")
+            if not err_obj and isinstance(res, dict):
+                err_obj = res.get("error")
+            if isinstance(err_obj, (str, dict)):
+                code = (err_obj.get("code") if isinstance(err_obj, dict) else str(err_obj))
+                status = (err_obj.get("status") if isinstance(err_obj, dict) else None)
+                message = (err_obj.get("message") if isinstance(err_obj, dict) else "")
+                _log("tool.run.error", trace_id=trace_id, tool=tname, code=(code or ""), status=status, message=(message or ""))
+            else:
+                arts_summary = []
+                arts = res.get("artifacts") if isinstance(res, dict) else None
+                if isinstance(arts, list):
+                    for a in arts:
+                        if isinstance(a, dict):
+                            aid = a.get("id")
+                            kind = a.get("kind")
+                            if isinstance(aid, str) and isinstance(kind, str):
+                                arts_summary.append({"id": aid, "kind": kind})
+                urls_this = assets_collect_urls([tr], _abs_url)
+                _log("tool.run.after", trace_id=trace_id, tool=tname, artifacts=arts_summary, urls_count=len(urls_this or []))
         # Log Comfy prompt ids if present in results
         for _tr in tool_results or []:
             _res = (_tr or {}).get("result") or {}
