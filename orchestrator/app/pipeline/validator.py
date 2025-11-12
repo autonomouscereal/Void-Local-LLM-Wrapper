@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from typing import Any, Dict, List, Tuple, Callable
+import json as _json
+from app.json_parser import JSONParser  # type: ignore
 
 import httpx as _hx  # type: ignore
 
@@ -65,17 +67,11 @@ async def validate_and_repair(
 			name = (tc.get("name") or "").strip()
 			args = tc.get("arguments") or {}
 			# Describe once per tool to satisfy contract
-			try:
-				dresp = await client.get(base + f"/tool.describe", params={"name": name})
-				_ = dresp.text  # ignored; existence satisfies contract
-			except Exception:
-				pass
-			# Validate
-			vresp = await client.post(base + "/tool.validate", json={"name": name, "args": args})
-			try:
-				vobj = vresp.json()
-			except Exception:
-				vobj = {"ok": False, "error": {"code": "invalid_json", "message": vresp.text}}
+			# Validate (no try/except; rely on body.ok semantics and schema parser)
+			vpayload = _json.dumps({"name": name, "args": args})
+			vresp = await client.post(base + "/tool.validate", content=vpayload, headers={"content-type": "application/json"})
+			parser = JSONParser()
+			vobj = parser.parse(vresp.text or "", {"ok": bool, "error": {"code": str, "message": str, "details": dict}})
 			log_fn("validate.result", trace_id=trace_id, status=int(getattr(vresp, "status_code", 0) or 0), tool=name, detail=((vobj or {}).get("error") or {}))
 			if isinstance(vobj, dict) and (vobj.get("ok") is True):
 				validated.append(tc)
@@ -115,22 +111,24 @@ async def validate_and_repair(
 			calls2_norm = normalize_fn(calls2)
 			patched = None
 			for c2 in (calls2_norm or []):
-				try:
-					if (c2.get("name") or "").strip() == name:
-						patched = {"name": name, "arguments": (c2.get("arguments") or {})}
-						break
-				except Exception:
+				if not isinstance(c2, dict):
 					continue
+				c2_name = (c2.get("name") or "")
+				if not isinstance(c2_name, str):
+					continue
+				if c2_name.strip() == name:
+					args2 = c2.get("arguments") if isinstance(c2.get("arguments"), dict) else {}
+					patched = {"name": name, "arguments": args2}
+					break
 			log_fn("planner.repair.steps", trace_id=trace_id, tool=name, patched=patched or {})
 			if not patched:
 				pre_tool_failures.append({"name": name, "result": {"error": (detail or {}), "status": 422}})
 				continue
-			# Re-validate once
-			v2 = await client.post(base + "/tool.validate", json={"name": name, "args": patched["arguments"]})
-			try:
-				v2obj = v2.json()
-			except Exception:
-				v2obj = {"ok": False, "error": {"code": "invalid_json", "message": v2.text}}
+			# Re-validate once (no try/except; schema parser handles bad bodies)
+			v2payload = _json.dumps({"name": name, "args": patched["arguments"]})
+			v2 = await client.post(base + "/tool.validate", content=v2payload, headers={"content-type": "application/json"})
+			parser2 = JSONParser()
+			v2obj = parser2.parse(v2.text or "", {"ok": bool, "error": {"code": str, "message": str, "details": dict}})
 			log_fn("validate.result.repair", trace_id=trace_id, status=int(getattr(v2, "status_code", 0) or 0), tool=name, detail=((v2obj or {}).get("error") or {}))
 			if isinstance(v2obj, dict) and (v2obj.get("ok") is True):
 				validated.append(patched)
