@@ -5031,14 +5031,11 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     # 1) Planner proposes plan + tool calls
     # Committee-governed pre-plan deliberation and gating
     _log("committee.open", trace_id=trace_id, participants=["qwen", "gptoss", "planner", "executor"], topic="user_intent_summary")
-    try:
-        _ev = []
-        if isinstance(messages, list):
-            _ev = [("msg", i) for i, _ in enumerate(messages[:3])]
-        _risks = ["string_args_without_json_parse", "missing_prompt_for_image_dispatch"]
-        _log("committee.context", trace_id=trace_id, evidence=_ev, risks=_risks)
-    except Exception:
-        pass
+    _ev = []
+    if isinstance(messages, list):
+        _ev = [("msg", i) for i, _ in enumerate(messages[:3])]
+    _risks = ["string_args_without_json_parse", "missing_prompt_for_image_dispatch"]
+    _log("committee.context", trace_id=trace_id, evidence=_ev, risks=_risks)
     _proposals = [
         {"id": "opt_qwen", "author": "qwen", "rationale": "Direct dispatch with executor defaults; minimal plan", "tools_outline": ["image.dispatch"]},
         {"id": "opt_gptoss", "author": "gptoss", "rationale": "Typed arguments with explicit parsing step to enforce object-only args", "tools_outline": ["json.parse", "image.dispatch"]},
@@ -5066,10 +5063,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         )
         if _lock_token:
             _release_lock(STATE_DIR, trace_id)
-        try:
-            _trace_response(trace_id, env)
-        except Exception:
-            pass
+        _trace_response(trace_id, env)
         return JSONResponse(status_code=200, content=env)
     # Determine winner (simple majority among two votes)
     _winner = "opt_gptoss"
@@ -5089,10 +5083,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         )
         if _lock_token:
             _release_lock(STATE_DIR, trace_id)
-        try:
-            _trace_response(trace_id, env)
-        except Exception:
-            pass
+        _trace_response(trace_id, env)
         return JSONResponse(status_code=200, content=env)
     _log("planner.finalize", trace_id=trace_id, chosen_option_id=_winner, deltas_from_option=[], justification="Adopts committee-winning rationale for typed arguments")
     _log("planner.call", trace_id=trace_id)
@@ -5148,10 +5139,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     _log("planner.catalog", trace_id=trace_id, hash=_cat_hash)
     _log("planner.steps", trace_id=trace_id, steps=[{"tool": (tc.get("name") or "")} for tc in (tool_calls or [])])
     # No synthesized tool_calls: executors must propose exact tools to run
-    try:
-        _trace_append("decision", {"cid": conv_cid, "trace_id": trace_id, "plan": plan_text, "tool_calls": tool_calls})
-    except Exception:
-        pass
+    _trace_append("decision", {"cid": conv_cid, "trace_id": trace_id, "plan": plan_text, "tool_calls": tool_calls})
     # Deterministic router: if intent is recognized, override planner with a direct tool call
     # No router overrides — the planner is solely responsible for tool choice
     # Execute planner/router tool calls immediately when present
@@ -5210,10 +5198,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 if not isinstance(args.get("prompt"), str) or not (args.get("prompt") or "").strip():
                     if isinstance(last_user_text, str) and last_user_text.strip():
                         args["prompt"] = last_user_text.strip()
-                try:
-                    _log("planner.image.dispatch.args", trace_id=trace_id, args={k: args.get(k) for k in ("prompt","width","height","steps","cfg","negative")})
-                except Exception:
-                    pass
+                _log("planner.image.dispatch.args", trace_id=trace_id, args={k: args.get(k) for k in ("prompt","width","height","steps","cfg","negative")})
             enriched_defaults.append({**tc, "arguments": args})
         tool_calls = enriched_defaults
     # Planner must fully fill args per contract; no auto-insertion of tools beyond minimal defaults above
@@ -5352,15 +5337,9 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 seed=master_seed,
                 id_="orc-1",
             )
-            try:
-                if _lock_token:
-                    _release_lock(STATE_DIR, trace_id)
-            except Exception:
-                pass
-            try:
-                _trace_response(trace_id, env)
-            except Exception:
-                pass
+            if _lock_token:
+                _release_lock(STATE_DIR, trace_id)
+            _trace_response(trace_id, env)
             return JSONResponse(status_code=200, content=env)
         # Adopt re-planned tool calls
         _log("replan.done", trace_id=trace_id, count=len(tool_calls2 or []))
@@ -5370,47 +5349,35 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     if tool_calls:
         import hashlib as _hl
         # Compute catalog hash for brief
-        try:
-            _cat = build_compact_tool_catalog() or ""
-            _cat_hash = _hl.sha256((_cat).encode("utf-8")).hexdigest()[:16]
-        except Exception:
-            _cat_hash = ""
+        _cat = build_compact_tool_catalog() or ""
+        _cat_hash = _hl.sha256((_cat).encode("utf-8")).hexdigest()[:16]
         base_url = (PUBLIC_BASE_URL or "").rstrip("/") or (str(request.base_url) or "").rstrip("/")
         validated: List[Dict[str, Any]] = []
         repairs_made = False
         _repair_success_any = False
         _patched_payload_emitted = False
         # Pre-validate payload proof (before any network I/O)
-        try:
-            _steps_preview0 = []
-            for t in (tool_calls or [])[:5]:
-                _nm0 = (t.get("name") or "").strip()
-                _ak0 = list((t.get("arguments") or {}).keys())
-                _steps_preview0.append({"tool": _nm0, "args_keys": _ak0})
-            _log("exec.payload", trace_id=trace_id, steps=_steps_preview0)
-            # Early gate: ensure image.dispatch has at least the six required keys before validation
-            for p in _steps_preview0:
-                if (p.get("tool") or "") == "image.dispatch":
-                    _ks0 = sorted([str(k) for k in (p.get("args_keys") or [])])
-                    _required0 = ["cfg","height","negative","prompt","steps","width"]
-                    _missing0 = [k for k in _required0 if k not in _ks0]
-                    if _missing0:
-                        _log("exec.fail", trace_id=trace_id, tool="image.dispatch", reason="arguments_lost_before_execute", attempted_args_keys=_ks0)
-                        _msg0 = _make_tool_failure_message(tool="image.dispatch", err={"code": "arguments_lost_before_execute", "details": {"missing": _missing0, "invalid": []}}, attempted_args={}, trace_id=trace_id)
-                        _usage0 = estimate_usage(messages, _msg0)
-                        _resp0 = _build_openai_envelope(ok=False, text=_msg0, error={"code": "arguments_lost_before_execute", "message": "required keys missing before validate", "details": {}}, usage=_usage0, model=f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}", seed=master_seed, id_="orc-1")
-                        try:
-                            if _lock_token:
-                                _release_lock(STATE_DIR, trace_id)
-                        except Exception:
-                            pass
-                        try:
-                            _trace_response(trace_id, _resp0)
-                        except Exception:
-                            pass
-                        return JSONResponse(status_code=200, content=_resp0)
-        except Exception:
-            pass
+        _steps_preview0 = []
+        for t in (tool_calls or [])[:5]:
+            _nm0 = (t.get("name") or "").strip()
+            _ak0 = list((t.get("arguments") or {}).keys())
+            _steps_preview0.append({"tool": _nm0, "args_keys": _ak0})
+        _log("exec.payload", trace_id=trace_id, steps=_steps_preview0)
+        # Early gate: ensure image.dispatch has at least the six required keys before validation
+        for p in _steps_preview0:
+            if (p.get("tool") or "") == "image.dispatch":
+                _ks0 = sorted([str(k) for k in (p.get("args_keys") or [])])
+                _required0 = ["cfg","height","negative","prompt","steps","width"]
+                _missing0 = [k for k in _required0 if k not in _ks0]
+                if _missing0:
+                    _log("exec.fail", trace_id=trace_id, tool="image.dispatch", reason="arguments_lost_before_execute", attempted_args_keys=_ks0)
+                    _msg0 = _make_tool_failure_message(tool="image.dispatch", err={"code": "arguments_lost_before_execute", "details": {"missing": _missing0, "invalid": []}}, attempted_args={}, trace_id=trace_id)
+                    _usage0 = estimate_usage(messages, _msg0)
+                    _resp0 = _build_openai_envelope(ok=False, text=_msg0, error={"code": "arguments_lost_before_execute", "message": "required keys missing before validate", "details": {}}, usage=_usage0, model=f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}", seed=master_seed, id_="orc-1")
+                    if _lock_token:
+                        _release_lock(STATE_DIR, trace_id)
+                    _trace_response(trace_id, _resp0)
+                    return JSONResponse(status_code=200, content=_resp0)
         # DO NOT pre-execute before validation — enforce validate-first ordering
         async with _hx.AsyncClient(trust_env=False, timeout=None) as client:
             for tc in tool_calls:
@@ -5536,16 +5503,13 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         if repairs_made:
             _log("repair.executing", trace_id=trace_id, count=len(tool_calls))
             # Mandatory second exec.payload proof of patched arguments (pre-run)
-            try:
-                _steps_preview = []
-                for i, t in enumerate(tool_calls[:5]):
-                    _nm = (t.get("name") or "").strip()
-                    _ak = list((t.get("arguments") or {}).keys())
-                    _steps_preview.append({"tool": _nm, "args_keys": _ak})
-                _log("exec.payload", trace_id=trace_id, patched=True, steps=_steps_preview)
-                _patched_payload_emitted = True
-            except Exception:
-                pass
+            _steps_preview = []
+            for i, t in enumerate(tool_calls[:5]):
+                _nm = (t.get("name") or "").strip()
+                _ak = list((t.get("arguments") or {}).keys())
+                _steps_preview.append({"tool": _nm, "args_keys": _ak})
+            _log("exec.payload", trace_id=trace_id, patched=True, steps=_steps_preview)
+            _patched_payload_emitted = True
             _log("committee.go", trace_id=trace_id, tool="image.dispatch", rationale="re-validated=200")
             _log("assertion", message="ASSERTION: If validate.result.repair 200 occurs, then exec.payload (patched) and tool.run.start must also occur—else did_not_execute_after_repair")
         else:
@@ -5572,26 +5536,19 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 args = {"_raw": args}
             steps.append({"step_id": f"step-{idx+1}", "tool": n, "args": args})
         # Emit exec.payload and hard-stop if any args_keys empty
-        try:
-            payload_preview = [{"tool": s["tool"], "args_keys": list((s.get("args") or {}).keys())} for s in steps]
-            _log("exec.payload", trace_id=trace_id, steps=payload_preview)
-            empty = [p for p in payload_preview if len(p.get("args_keys") or []) == 0]
-            if empty:
-                name_bad = (empty[0] or {}).get("tool") or "tool"
-                _log("exec.fail", trace_id=trace_id, tool=name_bad, reason="empty_arguments_before_execute", attempted_args_keys=[])
-                msg = _make_tool_failure_message(tool=name_bad, err={"code": "invalid_args", "details": {"missing": [], "invalid": [{"field": "arguments", "reason": "empty"}]}}, attempted_args={}, trace_id=trace_id)
-                usage2 = estimate_usage(messages, msg)
-                response = _build_openai_envelope(ok=False, text=msg, error={"code": "invalid_args", "message": "empty arguments before execute", "details": {}}, usage=usage2, model=f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}", seed=master_seed, id_="orc-1")
-                try:
-                    if _lock_token:
-                        _release_lock(STATE_DIR, trace_id)
-                except Exception:
-                    pass
-                try:
-                    _trace_response(trace_id, response)
-                except Exception:
-                    pass
-                return JSONResponse(status_code=200, content=response)
+        payload_preview = [{"tool": s["tool"], "args_keys": list((s.get("args") or {}).keys())} for s in steps]
+        _log("exec.payload", trace_id=trace_id, steps=payload_preview)
+        empty = [p for p in payload_preview if len(p.get("args_keys") or []) == 0]
+        if empty:
+            name_bad = (empty[0] or {}).get("tool") or "tool"
+            _log("exec.fail", trace_id=trace_id, tool=name_bad, reason="empty_arguments_before_execute", attempted_args_keys=[])
+            msg = _make_tool_failure_message(tool=name_bad, err={"code": "invalid_args", "details": {"missing": [], "invalid": [{"field": "arguments", "reason": "empty"}]}}, attempted_args={}, trace_id=trace_id)
+            usage2 = estimate_usage(messages, msg)
+            response = _build_openai_envelope(ok=False, text=msg, error={"code": "invalid_args", "message": "empty arguments before execute", "details": {}}, usage=usage2, model=f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}", seed=master_seed, id_="orc-1")
+            if _lock_token:
+                _release_lock(STATE_DIR, trace_id)
+            _trace_response(trace_id, response)
+            return JSONResponse(status_code=200, content=response)
                 # Enforce required keys for image.dispatch (allow extras like seed)
             for p in payload_preview:
                 if (p.get("tool") or "") == "image.dispatch":
@@ -5603,15 +5560,9 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                         msg = _make_tool_failure_message(tool="image.dispatch", err={"code": "invalid_args", "details": {"missing": missing, "invalid": []}}, attempted_args={}, trace_id=trace_id)
                         usage3 = estimate_usage(messages, msg)
                         resp2 = _build_openai_envelope(ok=False, text=msg, error={"code": "args_keys_incomplete", "message": "required keys missing", "details": {}}, usage=usage3, model=f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}", seed=master_seed, id_="orc-1")
-                        try:
-                            if _lock_token:
-                                _release_lock(STATE_DIR, trace_id)
-                        except Exception:
-                            pass
-                        try:
-                            _trace_response(trace_id, resp2)
-                        except Exception:
-                            pass
+                        if _lock_token:
+                            _release_lock(STATE_DIR, trace_id)
+                        _trace_response(trace_id, resp2)
                         return JSONResponse(status_code=200, content=resp2)
             # Ordering guarantee: if repaired validate was 200, ensure patched payload was emitted
             if _repair_success_any and not _patched_payload_emitted:
@@ -5619,50 +5570,38 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 msg = _make_tool_failure_message(tool="image.dispatch", err={"code": "did_not_execute_after_repair", "details": {}}, attempted_args={}, trace_id=trace_id)
                 usage4 = estimate_usage(messages, msg)
                 resp3 = _build_openai_envelope(ok=False, text=msg, error={"code": "did_not_execute_after_repair", "message": "Missing exec.payload(patched) before execute", "details": {}}, usage=usage4, model=f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}", seed=master_seed, id_="orc-1")
-                try:
-                    if _lock_token:
-                        _release_lock(STATE_DIR, trace_id)
-                except Exception:
-                    pass
-                try:
-                    _trace_response(trace_id, resp3)
-                except Exception:
-                    pass
+                if _lock_token:
+                    _release_lock(STATE_DIR, trace_id)
+                _trace_response(trace_id, resp3)
                 return JSONResponse(status_code=200, content=resp3)
-        except Exception:
-            pass
         # Execute via external void executor to ensure Comfy is driven by the executor
         _log("tool.run.start", trace_id=trace_id, executor="void", count=len(tool_calls or []))
         # Reuse the executor client helper to call EXECUTOR_BASE_URL/execute
         tool_results = await execute_tools(tool_calls)
         # Log Comfy prompt ids if present in results
-        try:
-            for _tr in tool_results or []:
-                _res = (_tr or {}).get("result") or {}
-                if isinstance(_res, dict):
-                    _meta = _res.get("meta") if isinstance(_res, dict) else {}
-                    _pid = (_meta or {}).get("prompt_id")
-                    if isinstance(_pid, str) and _pid:
-                        _log("[comfy] POST /prompt", trace_id=trace_id, prompt_id=_pid, client_id=trace_id)
-                        _log("comfy.submit", trace_id=trace_id, prompt_id=_pid, client_id=trace_id)
-                        _log("[comfy] polling /history/" + _pid)
-        except Exception:
-            pass
+        for _tr in tool_results or []:
+            _res = (_tr or {}).get("result") or {}
+            if isinstance(_res, dict):
+                _meta = _res.get("meta") if isinstance(_res, dict) else {}
+                _pid = (_meta or {}).get("prompt_id")
+                if isinstance(_pid, str) and _pid:
+                    _log("[comfy] POST /prompt", trace_id=trace_id, prompt_id=_pid, client_id=trace_id)
+                    _log("comfy.submit", trace_id=trace_id, prompt_id=_pid, client_id=trace_id)
+                    _log("[comfy] polling /history/" + _pid)
         # No executor aggregate error path; per-step results captured above
         # Post-run QA checkpoint (lightweight)
         _img_count = 0
         for _tr in tool_results or []:
-            try:
-                _res = (_tr or {}).get("result") or {}
-                # Count flat images array if present
-                if isinstance(_res.get("images"), list):
-                    _img_count += len(_res.get("images") or [])
-                # Count ids.images from Comfy bridge
-                _ids = _res.get("ids") if isinstance(_res, dict) else {}
-                if isinstance(_ids, dict) and isinstance(_ids.get("images"), list):
-                    _img_count += len(_ids.get("images") or [])
-            except Exception:
+            _res = (_tr or {}).get("result") or {}
+            if not isinstance(_res, dict):
                 continue
+            # Count flat images array if present
+            if isinstance(_res.get("images"), list):
+                _img_count += len(_res.get("images") or [])
+            # Count ids.images from Comfy bridge
+            _ids = _res.get("ids") if isinstance(_res, dict) else {}
+            if isinstance(_ids, dict) and isinstance(_ids.get("images"), list):
+                _img_count += len(_ids.get("images") or [])
         _log("qa.metrics", trace_id=trace_id, tool="image.dispatch", metrics={"images": _img_count})
         _log("committee.postrun.review", trace_id=trace_id, summary={"images": _img_count})
         _log("committee.decision", trace_id=trace_id, action="accept", rationale="meets threshold")
@@ -5672,85 +5611,70 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             def _asset_urls_from_tools(results: List[Dict[str, Any]]) -> List[str]:
                 urls: List[str] = []
                 for tr in results or []:
-                    try:
-                        res = (tr or {}).get("result") or {}
-                        if isinstance(res, dict):
-                            meta = res.get("meta")
-                            arts = res.get("artifacts")
-                            if isinstance(meta, dict) and isinstance(arts, list):
-                                cid = meta.get("cid")
-                                for a in arts:
-                                    aid = (a or {}).get("id"); kind = (a or {}).get("kind") or ""
-                                    if cid and aid:
-                                        if kind.startswith("image"):
-                                            urls.append(f"/uploads/artifacts/image/{cid}/{aid}")
-                                        elif kind.startswith("audio"):
-                                            urls.append(f"/uploads/artifacts/audio/tts/{cid}/{aid}")
-                                            urls.append(f"/uploads/artifacts/music/{cid}/{aid}")
-                            # Include direct view URLs persisted by the Comfy bridge
-                            if isinstance(meta, dict) and isinstance(meta.get("orch_view_urls"), list):
-                                for u in (meta.get("orch_view_urls") or []):
-                                    if isinstance(u, str) and u.strip():
-                                        urls.append(u)
-                            exts = (".mp4", ".webm", ".mov", ".mkv", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".wav", ".mp3", ".m4a", ".ogg", ".flac", ".opus", ".srt")
-                            def _walk(v):
-                                if isinstance(v, str):
-                                    s = v.strip().lower()
-                                    if not s:
-                                        return
-                                    if s.startswith("http://") or s.startswith("https://"):
-                                        urls.append(v); return
+                    res = (tr or {}).get("result") or {}
+                    if isinstance(res, dict):
+                        meta = res.get("meta")
+                        arts = res.get("artifacts")
+                        if isinstance(meta, dict) and isinstance(arts, list):
+                            cid = meta.get("cid")
+                            for a in arts:
+                                aid = (a or {}).get("id"); kind = (a or {}).get("kind") or ""
+                                if cid and aid:
+                                    if kind.startswith("image"):
+                                        urls.append(f"/uploads/artifacts/image/{cid}/{aid}")
+                                    elif kind.startswith("audio"):
+                                        urls.append(f"/uploads/artifacts/audio/tts/{cid}/{aid}")
+                                        urls.append(f"/uploads/artifacts/music/{cid}/{aid}")
+                        # Include direct view URLs persisted by the Comfy bridge
+                        if isinstance(meta, dict) and isinstance(meta.get("orch_view_urls"), list):
+                            for u in (meta.get("orch_view_urls") or []):
+                                if isinstance(u, str) and u.strip():
+                                    urls.append(u)
+                        exts = (".mp4", ".webm", ".mov", ".mkv", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".wav", ".mp3", ".m4a", ".ogg", ".flac", ".opus", ".srt")
+                        def _walk(v):
+                            if isinstance(v, str):
+                                s = v.strip().lower()
+                                if not s:
+                                    return
+                                if s.startswith("http://") or s.startswith("https://"):
+                                    urls.append(v); return
+                                if "/workspace/uploads/" in v:
+                                    tail = v.split("/workspace", 1)[1]
+                                    urls.append(tail)
+                                    return
+                                if v.startswith("/uploads/"):
+                                    urls.append(v); return
+                                if any(s.endswith(ext) for ext in exts) and ("/uploads/" in s or "/workspace/uploads/" in s):
                                     if "/workspace/uploads/" in v:
-                                        try:
-                                            tail = v.split("/workspace", 1)[1]
-                                            urls.append(tail)
-                                        except Exception:
-                                            pass
-                                        return
-                                    if v.startswith("/uploads/"):
-                                        urls.append(v); return
-                                    if any(s.endswith(ext) for ext in exts) and ("/uploads/" in s or "/workspace/uploads/" in s):
-                                        if "/workspace/uploads/" in v:
-                                            try:
-                                                tail = v.split("/workspace", 1)[1]
-                                                urls.append(tail)
-                                            except Exception:
-                                                pass
-                                        else:
-                                            urls.append(v)
-                                elif isinstance(v, list):
-                                    for it in v: _walk(it)
-                                elif isinstance(v, dict):
-                                    for it in v.values(): _walk(it)
-                            _walk(res)
-                    except Exception:
-                        continue
+                                        tail = v.split("/workspace", 1)[1]
+                                        urls.append(tail)
+                                    else:
+                                        urls.append(v)
+                            elif isinstance(v, list):
+                                for it in v: _walk(it)
+                            elif isinstance(v, dict):
+                                for it in v.values(): _walk(it)
+                        _walk(res)
                 return list(dict.fromkeys(urls))
             asset_urls = _asset_urls_from_tools(tool_results)
             asset_urls = [_abs_url(u) for u in (asset_urls or [])]
-            if asset_urls:
-                final_text = "\n".join(["Assets:"] + [f"- {u}" for u in asset_urls])
-                usage = estimate_usage(messages, final_text)
-                response = {
-                    "id": "orc-1",
-                    "object": "chat.completion",
-                    "model": f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}",
-                    "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": final_text}}],
-                    "usage": usage,
-                    "created": int(time.time()),
-                    "system_fingerprint": _hl.sha256((str(QWEN_MODEL_ID) + "+" + str(GPTOSS_MODEL_ID)).encode("utf-8")).hexdigest()[:16],
-                    "seed": master_seed,
-                }
-                try:
-                    if _lock_token:
-                        _release_lock(STATE_DIR, trace_id)
-                except Exception:
-                    pass
-                try:
-                    _trace_response(trace_id, response)
-                except Exception:
-                    pass
-                return JSONResponse(content=response)
+            # Always return a final OpenAI envelope after tools complete (even without assets)
+            final_text = ("\n".join(["Assets:"] + [f"- {u}" for u in asset_urls])) if asset_urls else "Generation completed."
+            usage = estimate_usage(messages, final_text)
+            response = {
+                "id": "orc-1",
+                "object": "chat.completion",
+                "model": f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}",
+                "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": final_text}}],
+                "usage": usage,
+                "created": int(time.time()),
+                "system_fingerprint": _hl.sha256((str(QWEN_MODEL_ID) + "+" + str(GPTOSS_MODEL_ID)).encode("utf-8")).hexdigest()[:16],
+                "seed": master_seed,
+            }
+            if _lock_token:
+                _release_lock(STATE_DIR, trace_id)
+            _trace_response(trace_id, response)
+            return JSONResponse(content=response)
 
     # 3) Executors respond independently using plan + evidence
     evidence_blocks: List[Dict[str, Any]] = [
@@ -5775,21 +5699,15 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         )}]
 
     # Idempotency fast-path: if an identical run has already completed, return cached response
-    try:
-        pool = await get_pg_pool()
-        if pool is not None:
-            async with pool.acquire() as conn:
-                cached = await conn.fetchrow("SELECT response_json FROM run WHERE trace_id=$1 AND response_json IS NOT NULL", trace_id)
-            if cached and cached[0]:
-                resp = cached[0]
-                try:
-                    if _lock_token:
-                        _release_lock(STATE_DIR, trace_id)
-                except Exception:
-                    pass
-                return JSONResponse(content=resp)
-    except Exception:
-        pass
+    pool = await get_pg_pool()
+    if pool is not None:
+        async with pool.acquire() as conn:
+            cached = await conn.fetchrow("SELECT response_json FROM run WHERE trace_id=$1 AND response_json IS NOT NULL", trace_id)
+        if cached and cached[0]:
+            resp = cached[0]
+            if _lock_token:
+                _release_lock(STATE_DIR, trace_id)
+            return JSONResponse(content=resp)
 
     qwen_payload = build_ollama_payload(
         messages=exec_messages, model=QWEN_MODEL_ID, num_ctx=DEFAULT_NUM_CTX, temperature=body.get("temperature") or DEFAULT_TEMPERATURE
@@ -5876,25 +5794,16 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 "usage": usage,
                 "seed": master_seed,
             }
-            try:
-                if _lock_token:
-                    _release_lock(STATE_DIR, trace_id)
-            except Exception:
-                pass
-            try:
-                _trace_response(trace_id, response)
-            except Exception:
-                pass
+            if _lock_token:
+                _release_lock(STATE_DIR, trace_id)
+            _trace_response(trace_id, response)
             return JSONResponse(content=response)
         detail = {
             "qwen": {k: v for k, v in qwen_result.items() if k in ("error", "_base_url")},
             "gptoss": {k: v for k, v in gptoss_result.items() if k in ("error", "_base_url")},
         }
-        try:
-            if _lock_token:
-                _release_lock(STATE_DIR, trace_id)
-        except Exception:
-            pass
+        if _lock_token:
+            _release_lock(STATE_DIR, trace_id)
         # Always return an OpenAI-compatible JSON envelope (200) with a short assistant message
         msg = "Upstream backends failed; please retry. If this persists, check model backends."
         usage = estimate_usage(messages, msg)
@@ -5907,10 +5816,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             seed=master_seed,
             id_="orc-1",
         )
-        try:
-            _trace_response(trace_id, response)
-        except Exception:
-            pass
+        _trace_response(trace_id, response)
         return JSONResponse(status_code=200, content=response)
 
     qwen_text = qwen_result.get("response", "")
