@@ -1716,7 +1716,9 @@ def build_compact_tool_catalog() -> str:
             merged[nm] = {"name": nm, "required": reqs}
     tools_list: list[dict] = list(merged.values())
     tools_list.sort(key=lambda d: d.get("name", ""))
+    names_list = [t.get("name") for t in tools_list if isinstance(t, dict) and isinstance(t.get("name"), str)]
     catalog = {
+        "names": names_list,
         "tools": tools_list,
         "constraints": {
             "routing": "All tools run via executor→orchestrator /tool.run (no fast paths).",
@@ -1734,7 +1736,7 @@ def build_compact_tool_catalog() -> str:
             ],
         },
     }
-    return "Tool catalog (strict, data-only):\n" + json.dumps(catalog, indent=2, default=str)
+    return "Tool catalog (strict, data-only):\n" + json.dumps(catalog, indent=2, default=str) + "\nValid tool names: " + ", ".join(names_list)
 
 
 def get_builtin_tools_schema() -> List[Dict[str, Any]]:
@@ -5337,6 +5339,28 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             enriched_defaults.append({**tc, "arguments": args})
         tool_calls = enriched_defaults
     # Planner must fully fill args per contract; no auto-insertion of tools beyond minimal defaults above
+    # If planner returned no tools or unnamed tools, run a strict re-plan to force valid names from the catalog
+    need_name_fix = (len(tool_calls or []) == 0) or any(not str((tc or {}).get("name") or "").strip() for tc in (tool_calls or []))
+    if need_name_fix:
+        allowed_sorted = sorted(list(allowed_tools))
+        constraint = (
+            "Your previous output omitted tool names. You MUST choose only from the allowed tool catalog:\n- "
+            + "\n- ".join(allowed_sorted)
+            + "\nReturn strict JSON ONLY: {\"steps\":[{\"tool\":\"<name>\",\"args\":{...}}]} or {\"steps\":[]}. "
+            "If the user requested an image, select image.dispatch and provide args."
+        )
+        replan_messages = messages + [{"role": "system", "content": constraint}]
+        _log("replan.start", trace_id=trace_id, reason="empty_or_unnamed_tools", allowed=allowed_sorted)
+        plan2, calls2 = await planner_produce_plan(replan_messages, body.get("tools"), body.get("temperature") or DEFAULT_TEMPERATURE, trace_id=trace_id)
+        calls2_norm = _normalize_tool_calls(calls2)
+        # Filter out any unknown tools
+        filtered = []
+        for tc in (calls2_norm or []):
+            nm = str((tc or {}).get("name") or "").strip()
+            if nm and (nm in allowed_tools):
+                filtered.append(tc)
+        _log("replan.done", trace_id=trace_id, count=len(filtered or []))
+        tool_calls = filtered
 
     # If no tool_calls were proposed but tools are available, nudge Planner by ensuring tools context is always present
     # (No keyword heuristics; semantic mapping is handled by the Planner instructions above.)
@@ -5446,6 +5470,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         _cat_hash = _hl.sha256((_cat).encode("utf-8")).hexdigest()[:16]
         base_url = (PUBLIC_BASE_URL or "").rstrip("/") or (str(request.base_url) or "").rstrip("/")
         validated: List[Dict[str, Any]] = []
+        pre_tool_failures: List[Dict[str, Any]] = []
         repairs_made = False
         _repair_success_any = False
         _patched_payload_emitted = False
@@ -5530,22 +5555,11 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                         continue
                 _log("planner.repair.steps", trace_id=trace_id, tool=name, patched=patched or {})
                 if not patched:
-                    # Cannot repair deterministically; stop with 422
-                    msg = _make_tool_failure_message(tool=name, err=(detail or {}), attempted_args=((patched or {}).get("arguments") or (args or {})), trace_id=trace_id)
-                    usage2 = estimate_usage(messages, msg)
-                    response = _build_openai_envelope(
-                        ok=False,
-                        text=msg,
-                        error={"code": "validation_failed", "message": "repair_failed", "detail": detail or {}},
-                        usage=usage2,
-                        model=f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}",
-                        seed=master_seed,
-                        id_="orc-1",
-                    )
-                    if _lock_token:
-                        _release_lock(STATE_DIR, trace_id)
-                    _trace_response(trace_id, response)
-                    return JSONResponse(status_code=200, content=response)
+                    # Cannot repair deterministically; record failure and continue to final answer composition
+                    pre_tool_failures.append({"name": name, "result": {"error": (detail or {}), "status": 422}})
+                    # Drop execution for this tool
+                    tool_calls = []
+                    continue
                 # Re-validate once
                 v2 = await client.post(base_url + "/tool.validate", json={"name": name, "args": patched["arguments"]})
                 v2obj = _resp_json(v2, {})
@@ -5553,22 +5567,11 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 if (getattr(v2, "status_code", 0) == 200) and isinstance(v2obj, dict) and (v2obj.get("ok") is True):
                     validated.append(patched); repairs_made = True; _repair_success_any = True
                 else:
-                    # One attempt only — stop with 422
-                    msg = _make_tool_failure_message(tool=name, err=((v2obj.get("error") if isinstance(v2obj, dict) else {}) or {}), attempted_args=((patched or {}).get("arguments") or (args or {})), trace_id=trace_id)
-                    usage2 = estimate_usage(messages, msg)
-                    response = _build_openai_envelope(
-                        ok=False,
-                        text=msg,
-                        error={"code": "validation_failed", "message": "still_invalid_after_repair", "detail": (v2obj.get('error') if isinstance(v2obj, dict) else {})},
-                        usage=usage2,
-                        model=f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}",
-                        seed=master_seed,
-                        id_="orc-1",
-                    )
-                    if _lock_token:
-                        _release_lock(STATE_DIR, trace_id)
-                    _trace_response(trace_id, response)
-                    return JSONResponse(status_code=200, content=response)
+                    # One attempt only — record failure and continue to final answer composition
+                    pre_err = (v2obj.get("error") if isinstance(v2obj, dict) else {}) or {}
+                    pre_tool_failures.append({"name": name, "result": {"error": pre_err, "status": int(getattr(v2, "status_code", 422) or 422)}})
+                    tool_calls = []
+                    continue
         tool_calls = validated
         if repairs_made:
             _log("repair.executing", trace_id=trace_id, count=len(tool_calls))
@@ -5647,6 +5650,9 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                     _log("[comfy] POST /prompt", trace_id=trace_id, prompt_id=_pid, client_id=trace_id)
                     _log("comfy.submit", trace_id=trace_id, prompt_id=_pid, client_id=trace_id)
                     _log("[comfy] polling /history/" + _pid)
+        # Merge any pre-validation failures so the final composer can report them
+        if isinstance(locals().get("pre_tool_failures"), list) and locals().get("pre_tool_failures"):
+            tool_results.extend(locals().get("pre_tool_failures") or [])
         # No executor aggregate error path; per-step results captured above
         # Post-run QA checkpoint (lightweight)
         _img_count = 0
