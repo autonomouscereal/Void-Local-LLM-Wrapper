@@ -165,8 +165,16 @@ class JSONParser:
         # list expectation
         if isinstance(expected, list):
             item_shape = expected[0] if expected else {}
+            # Normalize into a list:
+            # - if a single dict arrives where a list of dicts is expected, wrap it
+            # - if a single scalar arrives where a list of scalars is expected, wrap it
             if not isinstance(data, list):
-                data = []
+                if isinstance(data, dict) and isinstance(item_shape, dict):
+                    data = [data]
+                elif data is None:
+                    data = []
+                else:
+                    data = [data]
             out_list: List[Any] = []
             for v in data:
                 if isinstance(item_shape, dict):
@@ -183,10 +191,18 @@ class JSONParser:
             for k, shape in expected.items():
                 v = src.get(k) if isinstance(src, dict) else None
                 if isinstance(shape, dict):
-                    out[k] = self._ensure_structure(v if isinstance(v, dict) else {}, shape)
+                    # Accept singleton-list for dict fields: use first element
+                    if isinstance(v, list) and v:
+                        v0 = v[0] if isinstance(v[0], dict) else {}
+                        out[k] = self._ensure_structure(v0, shape)
+                    else:
+                        out[k] = self._ensure_structure(v if isinstance(v, dict) else {}, shape)
                 elif isinstance(shape, list):
+                    # Accept dict for list-of-dict fields by wrapping
                     if isinstance(v, list):
                         out[k] = self._ensure_structure(v, shape)
+                    elif isinstance(v, dict) and shape:
+                        out[k] = self._ensure_structure([v], shape)
                     else:
                         out[k] = []
                 else:
