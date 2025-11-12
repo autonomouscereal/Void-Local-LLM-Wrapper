@@ -224,8 +224,8 @@ async def global_cors_middleware(request: Request, call_next):
         return Response(status_code=204, headers={
             "Access-Control-Allow-Origin": (request.headers.get("origin") or "*"),
             "Access-Control-Allow-Methods": "*",
-            "Access-Control-Allow-Headers": "*",
-            "Access-Control-Allow-Credentials": "false",
+            "Access-Control-Allow-Headers": (request.headers.get("access-control-request-headers") or "*"),
+            "Access-Control-Allow-Credentials": "true",
             "Access-Control-Expose-Headers": "*",
             "Access-Control-Allow-Private-Network": "true",
             "Connection": "close",
@@ -237,7 +237,7 @@ async def global_cors_middleware(request: Request, call_next):
     resp.headers["Access-Control-Allow-Origin"] = request.headers.get("origin") or "*"
     resp.headers["Access-Control-Allow-Methods"] = "*"
     resp.headers["Access-Control-Allow-Headers"] = "*"
-    resp.headers["Access-Control-Allow-Credentials"] = "false"
+    resp.headers["Access-Control-Allow-Credentials"] = "true"
     resp.headers["Access-Control-Expose-Headers"] = "*"
     resp.headers["Access-Control-Allow-Private-Network"] = "true"
     resp.headers["Vary"] = "Origin"
@@ -370,7 +370,8 @@ async def chat_alt(body: Dict[str, Any], background_tasks: BackgroundTasks):
     ct = rr.headers.get("content-type") or "application/json; charset=utf-8"
     headers = {
         "Cache-Control": "no-store",
-        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Origin": request.headers.get("origin") or "*",
+        "Access-Control-Allow-Credentials": "true",
         "Access-Control-Allow-Private-Network": "true",
         "Access-Control-Expose-Headers": "Content-Type, Content-Length",
         "Connection": "close",
