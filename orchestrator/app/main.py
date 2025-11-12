@@ -961,14 +961,12 @@ def _allowed_cross(origin: str, request: Request) -> bool:
 @app.middleware("http")
 async def global_cors_middleware(request: Request, call_next):
     origin = request.headers.get("origin") or ""
-    same = _same_origin(origin, request) if origin else False
-    allowed = same or (origin and _allowed_cross(origin, request))
     if request.method == "OPTIONS":
         hdrs = {
-            "Access-Control-Allow-Origin": (origin if allowed else "*"),
+            "Access-Control-Allow-Origin": (origin or "*"),
             "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
             "Access-Control-Allow-Headers": request.headers.get("access-control-request-headers") or "*",
-            "Access-Control-Allow-Credentials": ("true" if allowed else "false"),
+            "Access-Control-Allow-Credentials": "true",
             "Access-Control-Expose-Headers": "*",
             "Access-Control-Max-Age": "86400",
             "Access-Control-Allow-Private-Network": "true",
@@ -977,10 +975,10 @@ async def global_cors_middleware(request: Request, call_next):
         }
         return StreamingResponse(content=iter(()), status_code=204, headers=hdrs)
     resp = await call_next(request)
-    resp.headers["Access-Control-Allow-Origin"] = origin if allowed else "*"
+    resp.headers["Access-Control-Allow-Origin"] = origin or "*"
     resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
     resp.headers["Access-Control-Allow-Headers"] = "*"
-    resp.headers["Access-Control-Allow-Credentials"] = ("true" if allowed else "false")
+    resp.headers["Access-Control-Allow-Credentials"] = "true"
     resp.headers["Access-Control-Expose-Headers"] = "*"
     resp.headers["Access-Control-Max-Age"] = "86400"
     resp.headers["Access-Control-Allow-Private-Network"] = "true"
