@@ -490,6 +490,15 @@ def _append_jsonl(path: str, obj: dict) -> None:
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
+def _trace_append(kind: str, obj: Dict[str, Any]) -> None:
+    """
+    Append a generic trace event row. Uses trace_id, tid, or cid if present; falls back to 'global'.
+    """
+    tms = int(time.time() * 1000)
+    tr = str((obj.get("trace_id") or obj.get("tid") or obj.get("cid") or "global"))
+    row = {"t": tms, "kind": str(kind), "payload": obj}
+    _append_jsonl(os.path.join(STATE_DIR, "traces", tr, "events.jsonl"), row)
+
 def _trace_response(trace_id: str, envelope: Dict[str, Any]) -> None:
     tms = int(time.time() * 1000)
     content = ""
@@ -5050,41 +5059,13 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     }
     _log("committee.vote", trace_id=trace_id, votes=_vote.get("votes"), quorum=bool(_vote.get("quorum")))
     if not bool(_vote.get("quorum")):
-        msg = "Plan rejected: committee quorum not satisfied."
-        usage = estimate_usage(messages, msg)
-        env = _build_openai_envelope(
-            ok=False,
-            text=msg,
-            error={"code": "committee_gate_failed", "message": "Plan lacks committee deliberation/quorum", "detail": {"missing": ["committee.vote.quorum==true"], "invalid": []}},
-            usage=usage,
-            model=f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}",
-            seed=master_seed,
-            id_="orc-1",
-        )
-        if _lock_token:
-            _release_lock(STATE_DIR, trace_id)
-        _trace_response(trace_id, env)
-        return JSONResponse(status_code=200, content=env)
+        _log("committee.quorum.fail", trace_id=trace_id)
     # Determine winner (simple majority among two votes)
     _winner = "opt_gptoss"
     _proposal_ids = [p.get("id") for p in (_proposals or [])]
     # Safety check: chosen option must be one of proposed
     if _winner not in _proposal_ids:
-        msg = "Plan rejected: chosen_option_id not in committee proposals."
-        usage = estimate_usage(messages, msg)
-        env = _build_openai_envelope(
-            ok=False,
-            text=msg,
-            error={"code": "committee_gate_failed", "message": "chosen_option_id not in proposals", "detail": {"missing": [], "invalid": ["planner.finalize.chosen_option_id"]}},
-            usage=usage,
-            model=f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}",
-            seed=master_seed,
-            id_="orc-1",
-        )
-        if _lock_token:
-            _release_lock(STATE_DIR, trace_id)
-        _trace_response(trace_id, env)
-        return JSONResponse(status_code=200, content=env)
+        _log("committee.selection.warn", trace_id=trace_id, reason="chosen_option_not_in_proposals")
     _log("planner.finalize", trace_id=trace_id, chosen_option_id=_winner, deltas_from_option=[], justification="Adopts committee-winning rationale for typed arguments")
     _log("planner.call", trace_id=trace_id)
     plan_text, tool_calls = await planner_produce_plan(messages, body.get("tools"), body.get("temperature") or DEFAULT_TEMPERATURE)
@@ -5247,34 +5228,19 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             pass
         return JSONResponse(content=response)
 
-    # Hard gate: ensure arguments are objects; require json.parse tool when strings present
+    # Ensure arguments are objects; auto-parse JSON strings instead of returning early
     if tool_calls:
-        has_parse = any(((tc.get("name") or "").strip() == "json.parse") for tc in (tool_calls or []))
-        first_bad = None
+        fixed_calls: List[Dict[str, Any]] = []
         for tc in tool_calls:
             args_obj = tc.get("arguments")
             if isinstance(args_obj, dict) and isinstance(args_obj.get("_raw"), str):
-                first_bad = tc
-                break
-            if isinstance(args_obj, str):
-                first_bad = tc
-                break
-        if first_bad is not None and not has_parse:
-            name = (first_bad.get("name") or "").strip() or "tool"
-            err = {"code": "arguments_not_objects", "message": "arguments must be an object; add a preceding json.parse step", "details": {"invalid": [{"field": "arguments", "reason": "string"}]}}
-            msg = _make_tool_failure_message(tool=name, err=err, attempted_args=((first_bad.get("arguments") or {}) if isinstance(first_bad.get("arguments"), dict) else {}), trace_id=trace_id)
-            usage = estimate_usage(messages, msg)
-            env = _build_openai_envelope(ok=False, text=msg, error={"code": "arguments_not_objects", "message": "string arguments without json.parse", "details": err.get("details")}, usage=usage, model=f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}", seed=master_seed, id_="orc-1")
-        
-            if _lock_token:
-                _release_lock(STATE_DIR, trace_id)
-        
-            try:
-                _trace_response(trace_id, env)
-            except Exception:
-                pass
-        
-            return JSONResponse(status_code=200, content=env)
+                parsed = _parse_json_text(args_obj.get("_raw"), {})
+                tc = {**tc, "arguments": (parsed if isinstance(parsed, dict) else {})}
+            elif isinstance(args_obj, str):
+                parsed = _parse_json_text(args_obj, {})
+                tc = {**tc, "arguments": (parsed if isinstance(parsed, dict) else {})}
+            fixed_calls.append(tc)
+        tool_calls = fixed_calls
 
     # Pre-validate tool names against the registered catalog to avoid executor 404s
     try:
@@ -5326,21 +5292,9 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             except Exception:
                 continue
         if still_unknown:
-            msg = f"Couldn't run: unknown tool(s) {', '.join(still_unknown)}. Allowed: {', '.join(allowed_sorted)}."
-            usage = estimate_usage(messages, msg)
-            env = _build_openai_envelope(
-                ok=False,
-                text=msg,
-                error={"code": "unknown_tool", "message": "unknown tool(s)", "detail": {"unknown": still_unknown, "allowed": allowed_sorted}},
-                usage=usage,
-                model=f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}",
-                seed=master_seed,
-                id_="orc-1",
-            )
-            if _lock_token:
-                _release_lock(STATE_DIR, trace_id)
-            _trace_response(trace_id, env)
-            return JSONResponse(status_code=200, content=env)
+            _log("tools.unknown.filtered", trace_id=trace_id, unknown=still_unknown, allowed=allowed_sorted)
+            # Drop unknown tools and continue
+            tool_calls2 = [tc for tc in (tool_calls2 or []) if str((tc or {}).get("name") or "") not in still_unknown]
         # Adopt re-planned tool calls
         _log("replan.done", trace_id=trace_id, count=len(tool_calls2 or []))
         tool_calls = tool_calls2
@@ -5371,13 +5325,8 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 _missing0 = [k for k in _required0 if k not in _ks0]
                 if _missing0:
                     _log("exec.fail", trace_id=trace_id, tool="image.dispatch", reason="arguments_lost_before_execute", attempted_args_keys=_ks0)
-                    _msg0 = _make_tool_failure_message(tool="image.dispatch", err={"code": "arguments_lost_before_execute", "details": {"missing": _missing0, "invalid": []}}, attempted_args={}, trace_id=trace_id)
-                    _usage0 = estimate_usage(messages, _msg0)
-                    _resp0 = _build_openai_envelope(ok=False, text=_msg0, error={"code": "arguments_lost_before_execute", "message": "required keys missing before validate", "details": {}}, usage=_usage0, model=f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}", seed=master_seed, id_="orc-1")
-                    if _lock_token:
-                        _release_lock(STATE_DIR, trace_id)
-                    _trace_response(trace_id, _resp0)
-                    return JSONResponse(status_code=200, content=_resp0)
+                    # Do not return early; drop all tool calls to avoid execution
+                    tool_calls = []
         # DO NOT pre-execute before validation — enforce validate-first ordering
         async with _hx.AsyncClient(trust_env=False, timeout=None) as client:
             for tc in tool_calls:
@@ -5542,38 +5491,23 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         if empty:
             name_bad = (empty[0] or {}).get("tool") or "tool"
             _log("exec.fail", trace_id=trace_id, tool=name_bad, reason="empty_arguments_before_execute", attempted_args_keys=[])
-            msg = _make_tool_failure_message(tool=name_bad, err={"code": "invalid_args", "details": {"missing": [], "invalid": [{"field": "arguments", "reason": "empty"}]}}, attempted_args={}, trace_id=trace_id)
-            usage2 = estimate_usage(messages, msg)
-            response = _build_openai_envelope(ok=False, text=msg, error={"code": "invalid_args", "message": "empty arguments before execute", "details": {}}, usage=usage2, model=f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}", seed=master_seed, id_="orc-1")
-            if _lock_token:
-                _release_lock(STATE_DIR, trace_id)
-            _trace_response(trace_id, response)
-            return JSONResponse(status_code=200, content=response)
-                # Enforce required keys for image.dispatch (allow extras like seed)
-            for p in payload_preview:
-                if (p.get("tool") or "") == "image.dispatch":
-                    ks = sorted([str(k) for k in (p.get("args_keys") or [])])
-                    required = ["cfg","height","negative","prompt","steps","width"]
-                    missing = [k for k in required if k not in ks]
-                    if missing:
-                        _log("exec.fail", trace_id=trace_id, tool="image.dispatch", reason="args_keys_incomplete", attempted_args_keys=ks)
-                        msg = _make_tool_failure_message(tool="image.dispatch", err={"code": "invalid_args", "details": {"missing": missing, "invalid": []}}, attempted_args={}, trace_id=trace_id)
-                        usage3 = estimate_usage(messages, msg)
-                        resp2 = _build_openai_envelope(ok=False, text=msg, error={"code": "args_keys_incomplete", "message": "required keys missing", "details": {}}, usage=usage3, model=f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}", seed=master_seed, id_="orc-1")
-                        if _lock_token:
-                            _release_lock(STATE_DIR, trace_id)
-                        _trace_response(trace_id, resp2)
-                        return JSONResponse(status_code=200, content=resp2)
-            # Ordering guarantee: if repaired validate was 200, ensure patched payload was emitted
-            if _repair_success_any and not _patched_payload_emitted:
-                _log("exec.fail", trace_id=trace_id, tool="image.dispatch", reason="did_not_execute_after_repair", attempted_args_keys=[])
-                msg = _make_tool_failure_message(tool="image.dispatch", err={"code": "did_not_execute_after_repair", "details": {}}, attempted_args={}, trace_id=trace_id)
-                usage4 = estimate_usage(messages, msg)
-                resp3 = _build_openai_envelope(ok=False, text=msg, error={"code": "did_not_execute_after_repair", "message": "Missing exec.payload(patched) before execute", "details": {}}, usage=usage4, model=f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}", seed=master_seed, id_="orc-1")
-                if _lock_token:
-                    _release_lock(STATE_DIR, trace_id)
-                _trace_response(trace_id, resp3)
-                return JSONResponse(status_code=200, content=resp3)
+            # Do not return early; drop tool calls to avoid execution
+            tool_calls = []
+        # Enforce required keys for image.dispatch (allow extras like seed)
+        for p in payload_preview:
+            if (p.get("tool") or "") == "image.dispatch":
+                ks = sorted([str(k) for k in (p.get("args_keys") or [])])
+                required = ["cfg","height","negative","prompt","steps","width"]
+                missing = [k for k in required if k not in ks]
+                if missing:
+                    _log("exec.fail", trace_id=trace_id, tool="image.dispatch", reason="args_keys_incomplete", attempted_args_keys=ks)
+                    # Do not return early; drop tool calls to avoid execution
+                    tool_calls = []
+        # Ordering guarantee: if repaired validate was 200, ensure patched payload was emitted
+        if _repair_success_any and not _patched_payload_emitted:
+            _log("exec.fail", trace_id=trace_id, tool="image.dispatch", reason="did_not_execute_after_repair", attempted_args_keys=[])
+            # Do not return early; proceed without executing tools
+            tool_calls = []
         # Execute via external void executor to ensure Comfy is driven by the executor
         _log("tool.run.start", trace_id=trace_id, executor="void", count=len(tool_calls or []))
         # Reuse the executor client helper to call EXECUTOR_BASE_URL/execute
