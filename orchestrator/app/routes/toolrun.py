@@ -164,6 +164,22 @@ def _extract_node_subset(raw: dict) -> dict:
 				out[str(k)] = v
 	return out
 
+def _coerce_ui_export_to_api_graph(wf: dict) -> dict:
+	"""
+	Best-effort coercion: if a UI export with 'nodes' array is provided, convert it into
+	a simple API graph mapping of {id: {class_type, inputs}}. Otherwise, return any
+	subset that already looks API-like.
+	"""
+	if isinstance(wf, dict) and isinstance(wf.get("nodes"), list):
+		graph: dict = {}
+		next_id = 1
+		for node in wf["nodes"]:
+			if isinstance(node, dict) and "class_type" in node and "inputs" in node:
+				graph[str(next_id)] = {"class_type": node["class_type"], "inputs": node["inputs"]}
+				next_id += 1
+		return graph
+	return _extract_node_subset(wf) if isinstance(wf, dict) else {}
+
 def patch_workflow_in_place(g: dict, args: dict) -> None:
 	# 1) Prompt / Negative (support common CLIP encoders)
 	prompt = args.get("prompt")
