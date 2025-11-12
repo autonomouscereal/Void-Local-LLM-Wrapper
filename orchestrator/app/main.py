@@ -891,18 +891,7 @@ from .middleware.ws_permissive import PermissiveWebSocketMiddleware
 app.add_middleware(PermissiveWebSocketMiddleware)
 from .middleware.cors_extra import AppendCommonHeadersMiddleware
 app.add_middleware(AppendCommonHeadersMiddleware)
-# Preflight middleware disabled; we handle OPTIONS explicitly in our own middleware
-# HTTP CORS: allow only configured UI origins when provided
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["*"],
-)
 from .middleware.preflight import Preflight204Middleware
-# Must be outermost to short-circuit OPTIONS early
 
 def _json_response(obj: Dict[str, Any], status_code: int = 200) -> Response:
     body = json.dumps(obj, ensure_ascii=False)
@@ -1100,7 +1089,7 @@ async def global_cors_middleware(request: Request, call_next):
             "Access-Control-Allow-Origin": (origin or "*"),
             "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
             "Access-Control-Allow-Headers": request.headers.get("access-control-request-headers") or "*",
-            "Access-Control-Allow-Credentials": "true",
+            "Access-Control-Allow-Credentials": "false",
             "Access-Control-Expose-Headers": "*",
             "Access-Control-Max-Age": "86400",
             "Access-Control-Allow-Private-Network": "true",
@@ -1114,7 +1103,7 @@ async def global_cors_middleware(request: Request, call_next):
     resp.headers["Access-Control-Allow-Origin"] = origin or "*"
     resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
     resp.headers["Access-Control-Allow-Headers"] = "*"
-    resp.headers["Access-Control-Allow-Credentials"] = "true"
+    resp.headers["Access-Control-Allow-Credentials"] = "false"
     resp.headers["Access-Control-Expose-Headers"] = "*"
     resp.headers["Access-Control-Max-Age"] = "86400"
     resp.headers["Access-Control-Allow-Private-Network"] = "true"
@@ -5832,16 +5821,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             "If the tool results above contain errors that block the user's goal, include a short 'Suggestions' section (max 2 bullets) with specific, on-topic fixes (e.g., missing parameter defaults, retry guidance). Keep it brief and avoid scope creep."
         )}]
 
-    # Idempotency fast-path: if an identical run has already completed, return cached response
-    pool = await get_pg_pool()
-    if pool is not None:
-        async with pool.acquire() as conn:
-            cached = await conn.fetchrow("SELECT response_json FROM run WHERE trace_id=$1 AND response_json IS NOT NULL", trace_id)
-        if cached and cached[0]:
-            resp = cached[0]
-            if _lock_token:
-                _release_lock(STATE_DIR, trace_id)
-            return JSONResponse(content=resp)
+    # Idempotency fast-path disabled to prevent early returns; defer any cached reuse to finalization if desired
 
     qwen_payload = build_ollama_payload(
         messages=exec_messages, model=QWEN_MODEL_ID, num_ctx=DEFAULT_NUM_CTX, temperature=body.get("temperature") or DEFAULT_TEMPERATURE
