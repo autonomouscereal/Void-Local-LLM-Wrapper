@@ -352,8 +352,11 @@ async def chat_alt(body: Dict[str, Any], background_tasks: BackgroundTasks):
     if not cid:
         return JSONResponse(status_code=400, content={"error": "missing conversation_id"})
     async with _pool().acquire() as conn:
+        # Persist only the latest user turn; let orchestrator ICW/RAG handle long-term memory
         await conn.execute("INSERT INTO messages (conversation_id, role, content) VALUES ($1, 'user', $2::jsonb)", cid, json.dumps({"text": user_content}))
+        # Fetch attachments to include for multimodal context; do NOT send full chat history
         atts = await conn.fetch("SELECT name, url, mime FROM attachments WHERE conversation_id=$1", cid)
+    # Send only the current user message; orchestrator injects ICW/HISTORY/RAG
     oa_msgs = _build_openai_messages([{"role": "user", "content": user_content}], [dict(a) for a in atts])
     payload = {"messages": oa_msgs, "stream": False, "cid": cid}
 
@@ -368,18 +371,34 @@ async def chat_alt(body: Dict[str, Any], background_tasks: BackgroundTasks):
                 await asyncio.sleep(2.0)
                 yield b" "
             rr = await task
-            # best-effort assistant extraction (does not affect response)
+            out = {"content": "", "assets": []}
             if (rr.headers.get("content-type") or "").startswith("application/json"):
                 try:
                     expected_response = {"choices": [{"message": {"content": str}}]}
                     obj = JSONParser().parse(rr.text, expected_response)
-                    assistant = ((obj.get("choices") or [{}])[0].get("message") or {}).get("content")
+                    assistant = ((obj.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+                    # Extract simple Assets list from assistant content if present
+                    assets: list[str] = []
+                    try:
+                        if isinstance(assistant, str) and "Assets:" in assistant:
+                            after = assistant.split("Assets:", 1)[1]
+                            for line in after.splitlines():
+                                line = line.strip()
+                                if line.startswith("- "):
+                                    u = line[2:].strip()
+                                    if u:
+                                        assets.append(u)
+                    except Exception:
+                        assets = []
+                    out = {"content": assistant, "assets": assets}
                     if assistant:
                         async with _pool().acquire() as c2:
                             await c2.execute("INSERT INTO messages (conversation_id, role, content) VALUES ($1, 'assistant', $2::jsonb)", cid, json.dumps({"text": assistant}))
                 except Exception:
-                    pass
-            yield rr.content
+                    out = {"content": rr.text, "assets": []}
+            else:
+                out = {"content": rr.text, "assets": []}
+            yield json.dumps(out, ensure_ascii=False).encode("utf-8")
 
     headers = {
         "Cache-Control": "no-store",

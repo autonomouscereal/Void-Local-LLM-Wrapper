@@ -4742,6 +4742,16 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         attn = json.dumps(attachments, indent=2)
         normalized_msgs = [{"role": "system", "content": f"Attachments available for tools:\n{attn}"}] + normalized_msgs
     messages = meta_prompt(normalized_msgs)
+    # Strong tool-use steering via prompting (no predicate mapping; planner decides).
+    # Instruct models to prefer tools when they can produce artifacts, especially for images.
+    tool_steer = (
+        "Policy: Prefer calling available tools over text-only answers whenever a tool can produce the desired output.\n"
+        "- If the user asks to generate an image, you MUST plan a call to the tool 'image.dispatch' with filled arguments "
+        "(prompt, negative=\"\", width=1024, height=1024, steps=32, cfg=5.5) unless the user provided explicit values.\n"
+        "- Do not apologize or claim inability; propose and use the tool.\n"
+        "- Keep the plan minimal and only include the tool calls required."
+    )
+    messages = [{"role": "system", "content": tool_steer}] + messages
 
     # Determine mode and trace/run identifiers early
     conv_cid = None
@@ -4832,6 +4842,36 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     except Exception:
         pack_hash = None
         run_id = await _db_insert_run(trace_id=trace_id, mode=mode, seed=master_seed, pack_hash=None, request_json=body)
+
+    # Multi-ICW augmentation: inject lightweight, high-signal snapshots for planning/committee
+    try:
+        # 1) Attachment snapshot (if any) to guide tool selection without overloading models
+        if attachments:
+            try:
+                attn_compact = json.dumps(attachments, ensure_ascii=False)[:12000]
+            except Exception:
+                attn_compact = str(attachments)[:12000]
+            messages = [{"role": "system", "content": f"ICW ATTACHMENTS (compact):\n{attn_compact}"}] + messages
+        # 2) Conversation history snapshot (compact rolling window)
+        try:
+            # Build a deterministic rolling window: last 50 user/assistant turns flattened
+            hist_lines: list[str] = []
+            kept = 0
+            for m in reversed(normalized_msgs):
+                role = (m.get("role") or "").strip()
+                content = (m.get("content") or "").strip()
+                if role in ("user", "assistant") and content:
+                    hist_lines.append(f"{role}: {content}")
+                    kept += 1
+                if kept >= 50:
+                    break
+            hist_text = "\n".join(reversed(hist_lines))[:16000]
+            if hist_text:
+                messages = [{"role": "system", "content": f"ICW HISTORY (rolling window):\n{hist_text}"}] + messages
+        except Exception:
+            pass
+    except Exception:
+        pass
 
     # If client supplies tool results (role=tool) we include them verbatim for the planner/executors
 
