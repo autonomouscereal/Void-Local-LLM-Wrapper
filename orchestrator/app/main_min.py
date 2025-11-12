@@ -7,10 +7,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from typing import Any, Dict
 
 # Absolute imports to avoid relative/cycle resolution issues under Uvicorn
-from app.routes import run_all as run_all_routes
-from app.routes import logs as logs_routes
-from app.routes import tools as tools_routes
-from app.routes import toolrun as toolrun_routes
+from .routes import run_all as run_all_routes
+from .routes import logs as logs_routes
+from .routes import tools as tools_routes
+from .routes import toolrun as toolrun_routes
 from app.middleware.ws_permissive import PermissiveWebSocketMiddleware
 from app.middleware.pna import AllowPrivateNetworkMiddleware
 from app.middleware.cors_extra import AppendCommonHeadersMiddleware
