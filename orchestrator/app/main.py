@@ -5749,6 +5749,9 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                         status = err_obj.get("status") or err_obj.get("_http_status") or err_obj.get("http_status")
                     message = (err_obj.get("message") if isinstance(err_obj, dict) else None) or ""
                     tool_errors.append({"tool": str(name_t), "code": (code or ""), "status": status, "message": message})
+            # If we have assets, prefer success copy even if some tool error records exist
+            if asset_urls:
+                tool_errors = []
             summary_lines: List[str] = []
             if tool_errors:
                 # Compose an explicit failure report
