@@ -5206,6 +5206,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 _failure_codes.append(code)
         _log("validate.repair.done", trace_id=trace_id, validated_count=len(validated or []), failures_count=len(pre_tool_failures or []), repairs_made=repairs_made, failure_codes=list(dict.fromkeys(_failure_codes))[:8])
         tool_calls = validated
+        _log("will_execute", trace_id=trace_id, steps=len(tool_calls or []))
 
     # 2) Optionally execute tools
     tool_results: List[Dict[str, Any]] = []
@@ -5226,25 +5227,27 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             if not isinstance(args, dict):
                 args = {"_raw": args}
             steps.append({"step_id": f"step-{idx+1}", "tool": n, "args": args})
-        # Emit exec.payload and hard-stop if any args_keys empty
+        # Emit exec.payload and filter invalid steps instead of nuking all
         payload_preview = [{"tool": s["tool"], "args_keys": list((s.get("args") or {}).keys())} for s in steps]
         _log("exec.payload", trace_id=trace_id, steps=payload_preview)
-        empty = [p for p in payload_preview if len(p.get("args_keys") or []) == 0]
-        if empty:
-            name_bad = (empty[0] or {}).get("tool") or "tool"
-            _log("exec.fail", trace_id=trace_id, tool=name_bad, reason="empty_arguments_before_execute", attempted_args_keys=[])
-            # Do not return early; drop tool calls to avoid execution
-            tool_calls = []
-        # Enforce required keys for image.dispatch (allow extras like seed)
-        for p in payload_preview:
-            if (p.get("tool") or "") == "image.dispatch":
-                ks = sorted([str(k) for k in (p.get("args_keys") or [])])
+        filtered_calls: List[Dict[str, Any]] = []
+        for idx, tc in enumerate(tool_calls[:5]):
+            n = (tc.get("name") or "").strip()
+            args = tc.get("arguments") if isinstance(tc.get("arguments"), dict) else {}
+            args_keys = list((args or {}).keys())
+            if not args_keys:
+                _log("exec.fail", trace_id=trace_id, tool=(n or "tool"), reason="empty_arguments_before_execute", attempted_args_keys=[])
+                continue
+            if n == "image.dispatch":
+                ks = sorted([str(k) for k in args_keys])
                 required = ["cfg","height","negative","prompt","steps","width"]
                 missing = [k for k in required if k not in ks]
                 if missing:
                     _log("exec.fail", trace_id=trace_id, tool="image.dispatch", reason="args_keys_incomplete", attempted_args_keys=ks)
-                    # Do not return early; drop tool calls to avoid execution
-                    tool_calls = []
+                    continue
+            filtered_calls.append(tc)
+        tool_calls = filtered_calls
+        _log("will_execute.filtered", trace_id=trace_id, steps=len(tool_calls or []))
         # Ordering guarantee: if repaired validate was 200, ensure patched payload was emitted
         if _repair_success_any and not _patched_payload_emitted:
             _log("exec.fail", trace_id=trace_id, tool="image.dispatch", reason="did_not_execute_after_repair", attempted_args_keys=[])

@@ -72,8 +72,12 @@ async def validate_and_repair(
 			vresp = await client.post(base + "/tool.validate", content=vpayload, headers={"content-type": "application/json"})
 			parser = JSONParser()
 			vobj = parser.parse(vresp.text or "", {"ok": bool, "error": {"code": str, "message": str, "details": dict}})
-			log_fn("validate.result", trace_id=trace_id, status=int(getattr(vresp, "status_code", 0) or 0), tool=name, detail=((vobj or {}).get("error") or {}))
-			if isinstance(vobj, dict) and (vobj.get("ok") is True):
+			status_code = int(getattr(vresp, "status_code", 0) or 0)
+			log_fn("validate.result", trace_id=trace_id, status=status_code, tool=name, detail=((vobj or {}).get("error") or {}))
+			ok_http = 200 <= status_code < 300
+			ok_body = (isinstance(vobj, dict) and (vobj.get("ok") is True))
+			# Accept HTTP 2xx as OK unless body explicitly sets ok False
+			if ok_http and not (isinstance(vobj, dict) and (vobj.get("ok") is False)):
 				validated.append(tc)
 				continue
 			# Repair once
@@ -129,8 +133,11 @@ async def validate_and_repair(
 			v2 = await client.post(base + "/tool.validate", content=v2payload, headers={"content-type": "application/json"})
 			parser2 = JSONParser()
 			v2obj = parser2.parse(v2.text or "", {"ok": bool, "error": {"code": str, "message": str, "details": dict}})
-			log_fn("validate.result.repair", trace_id=trace_id, status=int(getattr(v2, "status_code", 0) or 0), tool=name, detail=((v2obj or {}).get("error") or {}))
-			if isinstance(v2obj, dict) and (v2obj.get("ok") is True):
+			status_code2 = int(getattr(v2, "status_code", 0) or 0)
+			log_fn("validate.result.repair", trace_id=trace_id, status=status_code2, tool=name, detail=((v2obj or {}).get("error") or {}))
+			ok_http2 = 200 <= status_code2 < 300
+			ok_body2 = (isinstance(v2obj, dict) and (v2obj.get("ok") is True))
+			if ok_http2 and not (isinstance(v2obj, dict) and (v2obj.get("ok") is False)):
 				validated.append(patched)
 				repairs_made = True
 				_repair_success_any = True
