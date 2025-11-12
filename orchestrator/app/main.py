@@ -4691,6 +4691,8 @@ async def chat_completions(body: Dict[str, Any], request: Request):
 
     # ICW pack (always-on) — inline; record pack_hash for traces
     pack_hash = None
+    # Derive ICW seed deterministically from normalized messages
+    msgs_for_seed = json.dumps([{"role": (m.get("role")), "content": (m.get("content"))} for m in (normalized_msgs or [])], ensure_ascii=False, separators=(",", ":"))
     seed_icw = _derive_seed("icw", msgs_for_seed)
     icw = _icw_pack(normalized_msgs, seed_icw, budget_tokens=3500)
     pack_text = icw.get("pack") or ""
