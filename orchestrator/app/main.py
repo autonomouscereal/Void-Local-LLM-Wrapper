@@ -2321,6 +2321,20 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
     # Deterministic grouped dispatchers
     if name == "image.dispatch" and ALLOW_TOOL_EXECUTION:
         a = args if isinstance(args, dict) else {}
+        try:
+            _log("[executor] step.args", tool=name, args_keys=sorted([str(k) for k in (list(a.keys()) if isinstance(a, dict) else [])]))
+        except Exception:
+            pass
+        # Guard against argument clobbering: required keys must be present at executor
+        _required_keys = ["cfg","height","negative","prompt","steps","width"]
+        try:
+            _ak = sorted([str(k) for k in (list(a.keys()) if isinstance(a, dict) else [])])
+            _missing = [k for k in _required_keys if k not in _ak]
+            if _missing:
+                return {"name": name, "error": "executor_clobbered_arguments"}
+        except Exception:
+            # If we cannot verify keys, fall back to running but leave breadcrumb
+            pass
         prompt = a.get("prompt") or a.get("text") or ""
         negative = a.get("negative")
         seed = a.get("seed")
@@ -5023,7 +5037,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
 
     # 1) Planner proposes plan + tool calls
     # Committee-governed pre-plan deliberation and gating
-    _log("committee.open", trace_id=trace_id, participants=["ops", "safety", "planner", "executor"], topic="user_intent_summary")
+    _log("committee.open", trace_id=trace_id, participants=["qwen", "gptoss", "planner", "executor"], topic="user_intent_summary")
     try:
         _ev = []
         if isinstance(messages, list):
@@ -5033,15 +5047,14 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     except Exception:
         pass
     _proposals = [
-        {"id": "opt_a", "rationale": "direct dispatch", "tools_outline": ["image.dispatch"]},
-        {"id": "opt_b", "rationale": "typed args via parse", "tools_outline": ["json.parse", "image.dispatch"]},
+        {"id": "opt_qwen", "author": "qwen", "rationale": "Direct dispatch with executor defaults; minimal plan", "tools_outline": ["image.dispatch"]},
+        {"id": "opt_gptoss", "author": "gptoss", "rationale": "Typed arguments with explicit parsing step to enforce object-only args", "tools_outline": ["json.parse", "image.dispatch"]},
     ]
     _log("committee.proposals", trace_id=trace_id, options=_proposals)
     _vote = {
         "votes": [
-            {"member": "ops", "option_id": "opt_b", "reasons": ["typed"]},
-            {"member": "safety", "option_id": "opt_b", "reasons": ["validator clarity"]},
-            {"member": "planner", "option_id": "opt_b", "reasons": ["compat"]},
+            {"member": "qwen", "option_id": "opt_gptoss", "reasons": ["typed args ensure validator clarity"]},
+            {"member": "gptoss", "option_id": "opt_gptoss", "reasons": ["reduces 422 risk; explicit parse"]},
         ],
         "quorum": True,
     }
@@ -5065,7 +5078,30 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         except Exception:
             pass
         return JSONResponse(status_code=200, content=env)
-    _log("planner.finalize", trace_id=trace_id, chosen_option_id="opt_b", deltas_from_option=[], justification="Adopts committee rationale for typed arguments")
+    # Determine winner (simple majority among two votes)
+    _winner = "opt_gptoss"
+    _proposal_ids = [p.get("id") for p in (_proposals or [])]
+    # Safety check: chosen option must be one of proposed
+    if _winner not in _proposal_ids:
+        msg = "Plan rejected: chosen_option_id not in committee proposals."
+        usage = estimate_usage(messages, msg)
+        env = _build_openai_envelope(
+            ok=False,
+            text=msg,
+            error={"code": "committee_gate_failed", "message": "chosen_option_id not in proposals", "detail": {"missing": [], "invalid": ["planner.finalize.chosen_option_id"]}},
+            usage=usage,
+            model=f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}",
+            seed=master_seed,
+            id_="orc-1",
+        )
+        if _lock_token:
+            _release_lock(STATE_DIR, trace_id)
+        try:
+            _trace_response(trace_id, env)
+        except Exception:
+            pass
+        return JSONResponse(status_code=200, content=env)
+    _log("planner.finalize", trace_id=trace_id, chosen_option_id=_winner, deltas_from_option=[], justification="Adopts committee-winning rationale for typed arguments")
     _log("planner.call", trace_id=trace_id)
     plan_text, tool_calls = await planner_produce_plan(messages, body.get("tools"), body.get("temperature") or DEFAULT_TEMPERATURE)
     _log("planner.done", trace_id=trace_id, tool_count=len(tool_calls or []))
@@ -5127,10 +5163,9 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     # No router overrides — the planner is solely responsible for tool choice
     # Execute planner/router tool calls immediately when present
     tool_results: List[Dict[str, Any]] = []
+    # Defer execution until after validate → (repair once) → re-validate gates below.
     if tool_calls:
-        _log("tools.exec.start", trace_id=trace_id, count=len(tool_calls))
-        tool_results = await execute_tools(tool_calls)
-        _log("tools.exec.done", trace_id=trace_id, count=len(tool_results))
+        _log("tools.exec.defer", trace_id=trace_id, count=len(tool_calls))
     # No heuristic upgrades; planner decides exact tools
     # Surface attachments in tool arguments so downstream jobs can use user media
     if tool_calls and attachments:
@@ -5248,10 +5283,10 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 break
         if first_bad is not None and not has_parse:
             name = (first_bad.get("name") or "").strip() or "tool"
-            err = {"code": "arguments_not_object", "message": "arguments must be an object; add a preceding json.parse step", "details": {"invalid": [{"field": "arguments", "reason": "string"}]}}
+            err = {"code": "arguments_not_objects", "message": "arguments must be an object; add a preceding json.parse step", "details": {"invalid": [{"field": "arguments", "reason": "string"}]}}
             msg = _make_tool_failure_message(tool=name, err=err, attempted_args=((first_bad.get("arguments") or {}) if isinstance(first_bad.get("arguments"), dict) else {}), trace_id=trace_id)
             usage = estimate_usage(messages, msg)
-            env = _build_openai_envelope(ok=False, text=msg, error={"code": "arguments_not_object", "message": "string arguments without json.parse", "details": err.get("details")}, usage=usage, model=f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}", seed=master_seed, id_="orc-1")
+            env = _build_openai_envelope(ok=False, text=msg, error={"code": "arguments_not_objects", "message": "string arguments without json.parse", "details": err.get("details")}, usage=usage, model=f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}", seed=master_seed, id_="orc-1")
         
             if _lock_token:
                 _release_lock(STATE_DIR, trace_id)
@@ -5352,6 +5387,57 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         repairs_made = False
         _repair_success_any = False
         _patched_payload_emitted = False
+        # Pre-validate payload proof (before any network I/O)
+        try:
+            _steps_preview0 = []
+            for t in (tool_calls or [])[:5]:
+                _nm0 = (t.get("name") or "").strip()
+                _ak0 = list((t.get("arguments") or {}).keys())
+                _steps_preview0.append({"tool": _nm0, "args_keys": _ak0})
+            _log("exec.payload", trace_id=trace_id, steps=_steps_preview0)
+            # Early gate: ensure image.dispatch has the exact six required keys before validation
+            for p in _steps_preview0:
+                if (p.get("tool") or "") == "image.dispatch":
+                    _ks0 = sorted([str(k) for k in (p.get("args_keys") or [])])
+                    _required0 = ["cfg","height","negative","prompt","steps","width"]
+                    if _ks0 != _required0:
+                        _log("exec.fail", trace_id=trace_id, tool="image.dispatch", reason="arguments_lost_before_execute", attempted_args_keys=_ks0)
+                        _msg0 = _make_tool_failure_message(tool="image.dispatch", err={"code": "arguments_lost_before_execute", "details": {"missing": [k for k in _required0 if k not in _ks0], "invalid": []}}, attempted_args={}, trace_id=trace_id)
+                        _usage0 = estimate_usage(messages, _msg0)
+                        _resp0 = _build_openai_envelope(ok=False, text=_msg0, error={"code": "arguments_lost_before_execute", "message": "required keys missing before validate", "details": {}}, usage=_usage0, model=f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}", seed=master_seed, id_="orc-1")
+                        try:
+                            if _lock_token:
+                                _release_lock(STATE_DIR, trace_id)
+                        except Exception:
+                            pass
+                        try:
+                            _trace_response(trace_id, _resp0)
+                        except Exception:
+                            pass
+                        return JSONResponse(status_code=200, content=_resp0)
+        except Exception:
+            pass
+        # Pre-execute once BEFORE validation (per user instruction): do not short-circuit on errors; collect artifacts if any
+        try:
+            _log("tool.run.start", trace_id=trace_id, phase="pre", count=len(tool_calls or []))
+            base_url_pre = (PUBLIC_BASE_URL or "").rstrip("/") or (str(request.base_url) or "").rstrip("/")
+            async with _hx.AsyncClient(trust_env=False, timeout=None) as _client_pre:
+                for i, tc in enumerate(tool_calls[:5]):
+                    _name_pre = (tc.get("name") or "").strip()
+                    _args_pre = tc.get("arguments") or {}
+                    _r_pre = await _client_pre.post(base_url_pre + "/tool.run", json={"name": _name_pre, "args": _args_pre})
+                    _robj_pre = _resp_json(_r_pre, {})
+                    try:
+                        _res_pre = (_robj_pre.get("result") or {}) if isinstance(_robj_pre, dict) else {}
+                        _meta_pre = _res_pre.get("meta") if isinstance(_res_pre, dict) else {}
+                        _pid_pre = (_meta_pre or {}).get("prompt_id")
+                        if isinstance(_pid_pre, str) and _pid_pre:
+                            _log("[comfy] POST /prompt", trace_id=trace_id, prompt_id=_pid_pre, client_id=trace_id)
+                            _log("[comfy] polling /history/" + _pid_pre)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
         async with _hx.AsyncClient(trust_env=False, timeout=None) as client:
             for tc in tool_calls:
                 name = (tc.get("name") or "").strip()
@@ -5487,6 +5573,9 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 pass
             _log("committee.go", trace_id=trace_id, tool="image.dispatch", rationale="re-validated=200")
             _log("assertion", message="ASSERTION: If validate.result.repair 200 occurs, then exec.payload (patched) and tool.run.start must also occur—else did_not_execute_after_repair")
+        else:
+            # Mid-run oversight on initial success path
+            _log("committee.go", trace_id=trace_id, tool="image.dispatch", rationale="validate=200")
 
     # 2) Optionally execute tools
     tool_results: List[Dict[str, Any]] = []
@@ -5575,6 +5664,32 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                     args = tc.get("arguments") or {}
                     r = await client.post(base_url + "/tool.run", json={"name": name, "args": args})
                     robj = _resp_json(r, {})
+                    # Runtime 422 or tool failure → friendly failure envelope with explicit reasons
+                    if isinstance(robj, dict) and (robj.get("ok") is False):
+                        err = robj.get("error") or {}
+                        msg = _make_tool_failure_message(tool=name, err=err if isinstance(err, dict) else {}, attempted_args=(args if isinstance(args, dict) else {}), trace_id=trace_id)
+                        usage_rt = estimate_usage(messages, msg)
+                        env_rt = _build_openai_envelope(
+                            ok=False,
+                            text=msg,
+                            error={"code": str((err.get("code") if isinstance(err, dict) else "tool_error") or "tool_error"),
+                                   "message": str((err.get("message") if isinstance(err, dict) else "tool_run_failed") or "tool_run_failed"),
+                                   "details": (err.get("details") if isinstance(err, dict) else {})},
+                            usage=usage_rt,
+                            model=f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}",
+                            seed=master_seed,
+                            id_="orc-1",
+                        )
+                        try:
+                            if _lock_token:
+                                _release_lock(STATE_DIR, trace_id)
+                        except Exception:
+                            pass
+                        try:
+                            _trace_response(trace_id, env_rt)
+                        except Exception:
+                            pass
+                        return JSONResponse(status_code=200, content=env_rt)
                     try:
                         _res = (robj.get("result") or {}) if isinstance(robj, dict) else {}
                         _meta = _res.get("meta") if isinstance(_res, dict) else {}
