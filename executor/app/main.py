@@ -365,10 +365,16 @@ async def run_steps(trace_id: str, request_id: str, steps: list[dict]) -> Dict[s
                 k += 1
             sid = f"{base}_{k}"
         used_ids.add(sid)
+        # Accept both "inputs" (canonical) and "args" (compat with orchestrator payload)
+        raw_inputs = s.get("inputs")
+        if raw_inputs is None:
+            raw_inputs = s.get("args")
+        if raw_inputs is None:
+            raw_inputs = {}
         step = {
             "id": sid,
             "tool": (s.get("tool") or "").strip(),
-            "inputs": dict(s.get("inputs") or {}),
+            "inputs": dict(raw_inputs or {}),
             "needs": list(s.get("needs") or []),
         }
         norm_steps[sid] = step
