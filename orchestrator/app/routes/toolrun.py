@@ -9,6 +9,7 @@ import base64 as _b64
 from app.main import execute_tool_call as _execute_tool_call
 from app.state.checkpoints import append_event as checkpoints_append_event
 from app.trace_utils import emit_trace as _emit_trace
+import httpx
 
 
 router = APIRouter()
@@ -26,17 +27,25 @@ def err_envelope(code: str, message: str, rid: str, status: int = 422, details: 
 	)
 
 
-def _post_json(url: str, obj: dict) -> dict:
-	data = json.dumps(obj).encode("utf-8")
-	req = urllib.request.Request(url, data=data, headers={"content-type": "application/json"}, method="POST")
-	with urllib.request.urlopen(req) as resp:
-		return json.loads(resp.read().decode("utf-8"))
+async def _post_json(url: str, obj: dict) -> dict:
+	async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
+		resp = await client.post(url, json=obj)
+		resp.raise_for_status()
+		ct = resp.headers.get("content-type","")
+		if "application/json" in ct:
+			return resp.json()
+		# Fallback for ComfyUI text/json without header
+		return json.loads(resp.text)
 
 
-def _get_json(url: str) -> dict:
-	req = urllib.request.Request(url, headers={"accept": "application/json"}, method="GET")
-	with urllib.request.urlopen(req) as resp:
-		return json.loads(resp.read().decode("utf-8"))
+async def _get_json(url: str) -> dict:
+	async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
+		resp = await client.get(url, headers={"accept": "application/json"})
+		resp.raise_for_status()
+		ct = resp.headers.get("content-type","")
+		if "application/json" in ct:
+			return resp.json()
+		return json.loads(resp.text)
 
 
 def _read_text(path: str) -> str:
@@ -411,7 +420,11 @@ async def tool_run(req: Request):
 	client_id = _client_id
 	_emit_trace(STATE_DIR_LOCAL, "global", "comfyui.submit", {"t": int(time.time()*1000), "base": COMFY_BASE, "workflow_path": wf_path})
 	log.info("[comfy] POST /prompt url=%s", COMFY_BASE.rstrip("/") + "/prompt")
-	submit_res = _post_json(COMFY_BASE.rstrip("/") + "/prompt", {"prompt": prompt_graph, "client_id": client_id})
+	try:
+		submit_res = await _post_json(COMFY_BASE.rstrip("/") + "/prompt", {"prompt": prompt_graph, "client_id": client_id})
+	except httpx.HTTPError as ex:
+		# Return a structured error so the assistant can report the failure
+		return err_envelope("http_error", f"comfy submit failed: {str(ex)}", rid="tool.run", status=500, details={"_http_status": getattr(getattr(ex, 'response', None), 'status_code', None)})
 	prompt_id = submit_res.get("prompt_id") or submit_res.get("promptId") or ""
 	log.info("[comfy] prompt_id=%s client_id=%s", prompt_id, client_id)
 
@@ -422,7 +435,10 @@ async def tool_run(req: Request):
 	while True:
 		await asyncio.sleep(_poll_delay)
 		log.info("[comfy] polling /history/%s", prompt_id)
-		hist = _get_json(f"{COMFY_BASE.rstrip('/')}/history/{prompt_id}")
+		try:
+			hist = await _get_json(f"{COMFY_BASE.rstrip('/')}/history/{prompt_id}")
+		except httpx.HTTPError as ex:
+			return err_envelope("http_error", f"comfy history failed: {str(ex)}", rid="tool.run", status=500, details={"prompt_id": prompt_id, "_http_status": getattr(getattr(ex, 'response', None), 'status_code', None)})
 		if _first_hist:
 			_emit_trace(STATE_DIR_LOCAL, "global", "comfyui.history", {"t": int(time.time()*1000), "prompt_id": prompt_id})
 			_first_hist = False
@@ -501,24 +517,25 @@ async def tool_run(req: Request):
 	}
 	# Persist artifacts under orchestrator /uploads and return absolute URLs for UI
 	from app.main import UPLOAD_DIR as _UPLOAD_DIR, PUBLIC_BASE_URL as _PUBLIC_BASE_URL  # type: ignore
-	import urllib.request as _u
 	import os as _os
 	save_dir = _os.path.join(_UPLOAD_DIR, "artifacts", "image", prompt_id or client_id)
 	_os.makedirs(save_dir, exist_ok=True)
 	orch_urls: list[str] = []
-	for im in images:
-		fn = im.get("filename")
-		sf = im.get("subfolder") or ""
-		tp = im.get("type") or "output"
-		if not fn:
-			continue
-		src = f"{COMFY_BASE.rstrip('/')}/view?filename={fn}&subfolder={sf}&type={tp}"
-		raw = _u.urlopen(src).read()
-		dst = _os.path.join(save_dir, fn)
-		with open(dst, "wb") as _f:
-			_f.write(raw)
-		rel = _os.path.relpath(dst, _UPLOAD_DIR).replace("\\", "/")
-		orch_urls.append(f"{_PUBLIC_BASE_URL.rstrip('/')}/uploads/{rel}" if _PUBLIC_BASE_URL else f"/uploads/{rel}")
+	async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
+		for im in images:
+			fn = im.get("filename")
+			sf = im.get("subfolder") or ""
+			tp = im.get("type") or "output"
+			if not fn:
+				continue
+			src = f"{COMFY_BASE.rstrip('/')}/view?filename={fn}&subfolder={sf}&type={tp}"
+			resp = await client.get(src)
+			resp.raise_for_status()
+			dst = _os.path.join(save_dir, fn)
+			with open(dst, "wb") as _f:
+				_f.write(resp.content)
+			rel = _os.path.relpath(dst, _UPLOAD_DIR).replace("\\", "/")
+			orch_urls.append(f"{_PUBLIC_BASE_URL.rstrip('/')}/uploads/{rel}" if _PUBLIC_BASE_URL else f"/uploads/{rel}")
 	if orch_urls:
 		result["meta"]["orch_view_urls"] = orch_urls
 		# Trace for distillation: emit chat.append with media parts for this trace

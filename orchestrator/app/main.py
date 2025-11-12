@@ -983,32 +983,35 @@ async def minimal_same_origin():
 # Reflective CORS headers on all responses to satisfy browsers with credentials
 @app.middleware("http")
 async def _reflect_cors_headers(request: Request, call_next):
-    if request.method.upper() == "OPTIONS":
-        origin = request.headers.get("origin") or request.headers.get("Origin")
-        acrh = request.headers.get("access-control-request-headers") or request.headers.get("Access-Control-Request-Headers") or "*"
-        headers = {
-            "Access-Control-Allow-Origin": origin or "*",
-            "Vary": "Origin",
-            "Access-Control-Allow-Credentials": "true",
-            "Access-Control-Allow-Methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS",
-            "Access-Control-Allow-Headers": acrh,
-            "Access-Control-Expose-Headers": "*",
-            "Access-Control-Allow-Private-Network": "true",
-            "Access-Control-Max-Age": "600",
-        }
-        return Response(status_code=204, headers=headers)
-    response = await call_next(request)
-    origin = request.headers.get("origin") or request.headers.get("Origin")
-    if origin:
-        response.headers["Access-Control-Allow-Origin"] = origin
-        response.headers["Vary"] = "Origin"
-        response.headers["Access-Control-Allow-Credentials"] = "true"
-        response.headers.setdefault("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS")
-        response.headers.setdefault("Access-Control-Allow-Headers", request.headers.get("access-control-request-headers") or "*")
-        response.headers.setdefault("Access-Control-Expose-Headers", "*")
-        response.headers.setdefault("Access-Control-Allow-Private-Network", "true")
-    return response
-app.add_middleware(Preflight204Middleware)
+	if request.method.upper() == "OPTIONS":
+		origin = request.headers.get("origin") or request.headers.get("Origin")
+		acrh = request.headers.get("access-control-request-headers") or request.headers.get("Access-Control-Request-Headers") or "*"
+		headers = {
+			"Access-Control-Allow-Origin": origin or "*",
+			"Vary": "Origin",
+			"Access-Control-Allow-Credentials": "true",
+			"Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+			"Access-Control-Allow-Headers": acrh or "*",
+			"Access-Control-Expose-Headers": "*",
+			"Access-Control-Allow-Private-Network": "true",
+			"Access-Control-Max-Age": "86400",
+			"Connection": "close",
+			"Content-Length": "0",
+		}
+		# Return 200 with an explicit zero-length body to avoid chunked 204s confusing some browsers/proxies
+		return Response(content=b"", status_code=200, headers=headers, media_type="text/plain")
+	response = await call_next(request)
+	origin = request.headers.get("origin") or request.headers.get("Origin")
+	if origin:
+		response.headers["Access-Control-Allow-Origin"] = origin
+		response.headers["Vary"] = "Origin"
+		response.headers["Access-Control-Allow-Credentials"] = "true"
+		response.headers.setdefault("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+		response.headers.setdefault("Access-Control-Allow-Headers", request.headers.get("access-control-request-headers") or "*")
+		response.headers.setdefault("Access-Control-Expose-Headers", "*")
+		response.headers.setdefault("Access-Control-Allow-Private-Network", "true")
+	return response
+
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 try:
