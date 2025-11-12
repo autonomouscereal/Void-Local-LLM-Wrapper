@@ -314,7 +314,9 @@ async def _image_dispatch_run(prompt: str, negative: Optional[str], seed: Option
                 rel0 = os.path.basename(p0).replace("\\", "/")
             else:
                 rel0 = os.path.relpath(p0, UPLOAD_DIR).replace("\\", "/")
-            meta_obj["orch_view_url"] = f"/{rel0}"
+            # Ensure absolute under /uploads so StaticFiles serves it correctly
+            meta_obj["orch_view_url"] = f"/uploads/{rel0}"
+            meta_obj["orch_view_urls"] = [f"/uploads/{rel0}"]
     return {"cid": cid, "prompt_id": pid, "ids": ids_obj, "meta": meta_obj, "paths": [s.get("path") for s in saved], "images": comfy_items, "scores": scores}
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -1719,7 +1721,10 @@ def meta_prompt(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         "sweep_plan": ["0-90", "30-120", "60-150+wrap"],
     }
     co_out = _co_pack(co_env)
+    _rt = co_out.get("ratio_telemetry") or {}
+    _log("co.pack", call_kind="committee", alloc=_rt.get("alloc"), used_pct=_rt.get("used_pct"), free_pct=_rt.get("free_pct"))
     frames = _co_frames_to_msgs(co_out.get("frames") or [])
+    _log("co.frames", call_kind="committee", count=len(frames or []))
     if not frames:
         return messages
     # Insert policy/system frames just before the RoE tail (keep tail anchor)
@@ -1965,7 +1970,10 @@ async def planner_produce_plan(messages: List[Dict[str, Any]], tools: Optional[L
 	# Minimal planner/committee frames
 	planner_meta = (
 		"### [PLANNER / SYSTEM]\n"
-		"Honor CO ratios/RoE. Prefer tools over text. Construct strict JSON steps with all required args; snap sizes to /8."
+		"Honor CO ratios/RoE. Prefer tools over text. Construct strict JSON steps with all required args; snap sizes to /8.\n"
+		"- Image edits: do NOT use image.edit. Always use image.dispatch for both generation and editing.\n"
+		"- When editing, include the input image via attachments (preferred) or set args.images to an array of objects containing absolute /uploads/... URLs.\n"
+		"- For denoise/inpaint style edits, include a strength field (0.0–1.0) when applicable; keep the prompt aligned with the edit intent."
 	)
 	committee_review = (
 		"### [COMMITTEE REVIEW / SYSTEM]\n"
@@ -5555,10 +5563,13 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         "tsl_blocks": [],
         "tel_blocks": [],
     }
+    _log("compose.start", trace_id=trace_id, tool_results_count=len(tool_results or []))
     co_out_final = _co_pack(co_env_final)
     # Persist updated RoE digest for continuity across turns
     _roe_save(STATE_DIR, trace_id, co_out_final.get("roe_digest") or [])
     frames_final = _co_frames_to_msgs(co_out_final.get("frames") or [])
+    _rtf = co_out_final.get("ratio_telemetry") or {}
+    _log("co.pack", trace_id=trace_id, call_kind="compose", alloc=_rtf.get("alloc"), used_pct=_rtf.get("used_pct"), free_pct=_rtf.get("free_pct"))
     _finality = {"role": "system", "content": "### [FINALITY / SYSTEM]\nReturn exactly one final assistant message only."}
     _light_qa = {"role": "system", "content": (
         "### [LIGHT QA / SYSTEM]\n"
