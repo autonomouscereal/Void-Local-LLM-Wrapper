@@ -521,4 +521,18 @@ async def tool_run(req: Request):
 		orch_urls.append(f"{_PUBLIC_BASE_URL.rstrip('/')}/uploads/{rel}" if _PUBLIC_BASE_URL else f"/uploads/{rel}")
 	if orch_urls:
 		result["meta"]["orch_view_urls"] = orch_urls
+		# Trace for distillation: emit chat.append with media parts for this trace
+		trc = args.get("trace_id") or args.get("cid")
+		if isinstance(trc, str) and trc.strip():
+			try:
+				parts = [{"image": u} for u in orch_urls if isinstance(u, str) and u.strip()]
+				_append_jsonl(os.path.join(STATE_DIR_LOCAL, "traces", trc, "chat.jsonl"), {
+					"t": int(time.time()*1000),
+					"event": "chat.append",
+					"message": {"role": "assistant", "parts": parts},
+					"tool": "image.dispatch",
+					"prompt_id": prompt_id,
+				})
+			except Exception:
+				pass
 	return ok_envelope(result, rid="tool.run")

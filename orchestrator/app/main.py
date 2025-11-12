@@ -5388,14 +5388,15 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 _ak0 = list((t.get("arguments") or {}).keys())
                 _steps_preview0.append({"tool": _nm0, "args_keys": _ak0})
             _log("exec.payload", trace_id=trace_id, steps=_steps_preview0)
-            # Early gate: ensure image.dispatch has the exact six required keys before validation
+            # Early gate: ensure image.dispatch has at least the six required keys before validation
             for p in _steps_preview0:
                 if (p.get("tool") or "") == "image.dispatch":
                     _ks0 = sorted([str(k) for k in (p.get("args_keys") or [])])
                     _required0 = ["cfg","height","negative","prompt","steps","width"]
-                    if _ks0 != _required0:
+                    _missing0 = [k for k in _required0 if k not in _ks0]
+                    if _missing0:
                         _log("exec.fail", trace_id=trace_id, tool="image.dispatch", reason="arguments_lost_before_execute", attempted_args_keys=_ks0)
-                        _msg0 = _make_tool_failure_message(tool="image.dispatch", err={"code": "arguments_lost_before_execute", "details": {"missing": [k for k in _required0 if k not in _ks0], "invalid": []}}, attempted_args={}, trace_id=trace_id)
+                        _msg0 = _make_tool_failure_message(tool="image.dispatch", err={"code": "arguments_lost_before_execute", "details": {"missing": _missing0, "invalid": []}}, attempted_args={}, trace_id=trace_id)
                         _usage0 = estimate_usage(messages, _msg0)
                         _resp0 = _build_openai_envelope(ok=False, text=_msg0, error={"code": "arguments_lost_before_execute", "message": "required keys missing before validate", "details": {}}, usage=_usage0, model=f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}", seed=master_seed, id_="orc-1")
                         try:
@@ -5591,14 +5592,15 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 except Exception:
                     pass
                 return JSONResponse(status_code=200, content=response)
-            # Enforce required keys for image.dispatch exactly
+                # Enforce required keys for image.dispatch (allow extras like seed)
             for p in payload_preview:
                 if (p.get("tool") or "") == "image.dispatch":
                     ks = sorted([str(k) for k in (p.get("args_keys") or [])])
                     required = ["cfg","height","negative","prompt","steps","width"]
-                    if ks != required:
+                    missing = [k for k in required if k not in ks]
+                    if missing:
                         _log("exec.fail", trace_id=trace_id, tool="image.dispatch", reason="args_keys_incomplete", attempted_args_keys=ks)
-                        msg = _make_tool_failure_message(tool="image.dispatch", err={"code": "invalid_args", "details": {"missing": [k for k in required if k not in ks], "invalid": []}}, attempted_args={}, trace_id=trace_id)
+                        msg = _make_tool_failure_message(tool="image.dispatch", err={"code": "invalid_args", "details": {"missing": missing, "invalid": []}}, attempted_args={}, trace_id=trace_id)
                         usage3 = estimate_usage(messages, msg)
                         resp2 = _build_openai_envelope(ok=False, text=msg, error={"code": "args_keys_incomplete", "message": "required keys missing", "details": {}}, usage=usage3, model=f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}", seed=master_seed, id_="orc-1")
                         try:

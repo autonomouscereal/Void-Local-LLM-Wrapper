@@ -129,7 +129,7 @@ function App() {
   }
 
   // Orchestrator E2E (OpenAI-compatible): POST /v1/chat/completions (no WS required)
-  const runOrchestratorFlow = async (userText, thinkingId) => {
+  const runOrchestratorFlow = async (userText, thinkingId, conversationId) => {
     const updateThinking = (text) => setMsgs(prev => (prev.map(m => m.id === thinkingId ? { ...m, content: { text } } : m)))
     return fetch(`${ORCH_BASE}/v1/chat/completions`, {
       method: 'POST',
@@ -151,6 +151,16 @@ function App() {
             }
           } catch {}
           updateThinking(finalText || '(no content)')
+          // Persist assistant message
+          try {
+            if (conversationId) {
+              await fetch(`/api/conversations/${conversationId}/message`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ role: 'assistant', content: finalText })
+              })
+            }
+          } catch {}
         } finally {
           setSending(false)
         }
@@ -329,10 +339,18 @@ function App() {
     setMsgs(prev => ([...prev, { id: userId, role: 'user', content: { text: userText } }]))
     setText('')
     setSending(true)
+    // Persist user message
+    try {
+      await fetch(`/api/conversations/${conversationId}/message`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ role: 'user', content: userText })
+      })
+    } catch {}
     // Orchestrator-first path: POST /v1/chat/completions (OpenAI-compatible)
     const thinkingId = nextLocalId()
     setMsgs(prev => ([...prev, { id: thinkingId, role: 'assistant', content: { text: 'Thinking…' } }]))
-    await runOrchestratorFlow(userText, thinkingId)
+    await runOrchestratorFlow(userText, thinkingId, conversationId)
     return
   }
 
