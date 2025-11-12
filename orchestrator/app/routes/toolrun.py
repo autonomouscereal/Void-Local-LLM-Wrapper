@@ -6,7 +6,6 @@ import os, json, uuid, time, asyncio, urllib.request, os.path
 import logging, sys
 from urllib.parse import quote, urlsplit, urlparse
 import base64 as _b64
-from app.main import execute_tool_call as _execute_tool_call
 from app.state.checkpoints import append_event as checkpoints_append_event
 from app.trace_utils import emit_trace as _emit_trace
 import httpx
@@ -257,8 +256,8 @@ async def tool_validate(req: Request):
 	name = (body.get("name") or "").strip()
 	args = body.get("args") or {}
 	if name != "image.dispatch":
-		# Delegate validation to main catalog when not image.dispatch
-		return ok_envelope({"name": name, "valid": True, "args": args}, rid="tool.validate")
+		# For non-image tools, accept basic object-arg validation here
+		return ok_envelope({"name": name, "valid": isinstance(args, dict), "args": args}, rid="tool.validate")
 	# Real acceptance: require at least a prompt or a model/size combo
 	prompt = args.get("prompt")
 	if not isinstance(prompt, str) or not prompt.strip():
@@ -283,14 +282,23 @@ async def tool_run(req: Request):
 	name = (body.get("name") or "").strip()
 	args = body.get("args") or {}
 
-	# Delegate to the main tool runner for everything except image.dispatch,
-	# which we wire directly to ComfyUI in this minimal entrypoint.
+	# For non-image tools, route through the executor /execute to avoid local fast paths and circular imports
 	if name != "image.dispatch":
-		res = await _execute_tool_call({"name": name, "arguments": args})
-		if isinstance(res, dict) and res.get("error"):
-			return JSONResponse({"schema_version": 1, "request_id": "tool.run", "ok": False, "error": {"code": "tool_error", "message": str(res.get("error"))}}, status_code=422)
-		result = (res.get("result") if isinstance(res, dict) else res) or {}
-		return ok_envelope(result, rid="tool.run")
+		exec_base = os.getenv("EXECUTOR_BASE_URL", "http://127.0.0.1:8081").rstrip("/")
+		request_id = (args.get("trace_id") or args.get("cid") or uuid.uuid4().hex) if isinstance(args, dict) else uuid.uuid4().hex
+		step = {"id": "s1", "tool": name, "inputs": (args if isinstance(args, dict) else {})}
+		payload = {"schema_version": 1, "request_id": request_id, "trace_id": request_id, "steps": [step]}
+		async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
+			resp = await client.post(exec_base + "/execute", json=payload)
+			try:
+				env = resp.json()
+			except Exception:
+				env = {"ok": False, "error": {"code": "executor_bad_json", "message": resp.text}}
+		if isinstance(env, dict) and env.get("ok") and isinstance((env.get("result") or {}).get("produced"), dict):
+			produced = (env.get("result") or {}).get("produced") or {}
+			res1 = produced.get("s1") or {}
+			return ok_envelope(res1, rid="tool.run")
+		return err_envelope("executor_failed", "tool failed via executor", rid="tool.run", status=200, details=(env or {}))
 
 	# Use upstream global fixer (executor) for generic normalization; do not duplicate here
 
