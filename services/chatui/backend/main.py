@@ -400,60 +400,6 @@ async def config_js(request: Request):
     }
     return Response(content=body, media_type="application/javascript", headers=headers)
 
-
-@app.get("/api/conversations/{cid}/chat")
-async def chat_get(cid: int, content: str = ""):
-    # Convenience GET for environments where POST fetch is blocked; DO NOT use in production
-    user_content = content or ""
-    async with _pool().acquire() as conn:
-        await conn.execute("INSERT INTO messages (conversation_id, role, content) VALUES ($1, 'user', $2::jsonb)", cid, json.dumps({"text": user_content}))
-        atts = await conn.fetch("SELECT name, url, mime FROM attachments WHERE conversation_id=$1", cid)
-    oa_msgs = _build_openai_messages([{"role": "user", "content": user_content}], [dict(a) for a in atts])
-    payload = {"messages": oa_msgs, "stream": False}
-    async with httpx.AsyncClient(trust_env=False, timeout=None) as client:
-        rr = await client.post(ORCH_URL.rstrip("/") + "/v1/chat/completions", json=payload)
-        expected_response = {
-            "choices": [
-                {"message": {"content": str}}
-            ]
-        }
-        data = JSONParser().parse(rr.text, expected_response)
-    assistant = ((data.get("choices") or [{}])[0].get("message") or {}).get("content")
-    async with _pool().acquire() as conn:
-        await conn.execute("INSERT INTO messages (conversation_id, role, content) VALUES ($1, 'assistant', $2::jsonb)", cid, json.dumps({"text": assistant}))
-    body = json.dumps(data)
-    headers = {
-        "Cache-Control": "no-store",
-        "Connection": "close",
-        "Content-Length": str(len(body.encode("utf-8"))),
-        "Access-Control-Allow-Origin": "*",
-    }
-    return Response(content=body, media_type="application/json", headers=headers)
-
-
-@app.get("/api/jobs")
-async def list_jobs(status: Optional[str] = None, limit: int = 50, offset: int = 0):
-    return JSONResponse(status_code=410, content={"error": "proxy disabled; call orchestrator directly"})
-
-
-@app.websocket("/api/tool.ws")
-async def tool_ws_proxy(websocket: WebSocket):
-    await websocket.close(code=1008)
-
-@app.get("/api/jobs/{job_id}")
-async def get_job(job_id: str):
-    return JSONResponse(status_code=410, content={"error": "proxy disabled; call orchestrator directly"})
-
-
-@app.get("/api/jobs/{job_id}/stream")
-async def stream_job_proxy(job_id: str, interval_ms: Optional[int] = None):
-    return JSONResponse(status_code=410, content={"error": "proxy disabled; call orchestrator directly"})
-
-@app.post("/api/jobs/{job_id}/cancel")
-async def cancel_job_proxy(job_id: str):
-    return JSONResponse(status_code=410, content={"error": "proxy disabled; call orchestrator directly"})
-
-
 # Lightweight proxies for orchestrator admin/capabilities so the frontend can hit same-origin
 @app.get("/capabilities.json")
 async def capabilities_proxy():
