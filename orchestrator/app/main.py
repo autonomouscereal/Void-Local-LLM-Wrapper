@@ -1089,7 +1089,7 @@ async def global_cors_middleware(request: Request, call_next):
             "Access-Control-Allow-Origin": (origin or "*"),
             "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
             "Access-Control-Allow-Headers": request.headers.get("access-control-request-headers") or "*",
-            "Access-Control-Allow-Credentials": "false",
+            "Access-Control-Allow-Credentials": "true",
             "Access-Control-Expose-Headers": "*",
             "Access-Control-Max-Age": "86400",
             "Access-Control-Allow-Private-Network": "true",
@@ -1103,7 +1103,7 @@ async def global_cors_middleware(request: Request, call_next):
     resp.headers["Access-Control-Allow-Origin"] = origin or "*"
     resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
     resp.headers["Access-Control-Allow-Headers"] = "*"
-    resp.headers["Access-Control-Allow-Credentials"] = "false"
+    resp.headers["Access-Control-Allow-Credentials"] = "true"
     resp.headers["Access-Control-Expose-Headers"] = "*"
     resp.headers["Access-Control-Max-Age"] = "86400"
     resp.headers["Access-Control-Allow-Private-Network"] = "true"
@@ -6657,10 +6657,8 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         "env": {"public_base_url": PUBLIC_BASE_URL, "config_hash": WRAPPER_CONFIG_HASH},
         "privacy": {"vault_refs": 0, "secrets_in": 0, "secrets_out": 0},
     }
-    async def _send_trace():
-        async with httpx.AsyncClient() as client:
-            await client.post(TEACHER_API_URL.rstrip("/") + "/teacher/trace.append", json=trace_payload)
-    asyncio.create_task(_send_trace())
+    # Unified local trace only; no background network calls
+    emit_trace(STATE_DIR, trace_id, "chat.finish", {"ok": bool(response.get("ok")), "message_len": len(display_content or ""), "usage": usage or {}})
     # Persist response & metrics
     await _db_update_run_response(run_id, response, usage)
     checkpoints_append_event(STATE_DIR, trace_id, "halt", {"kind": "committee", "chars": len(display_content)})
