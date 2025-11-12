@@ -596,7 +596,7 @@ ENABLE_DEBATE = True
 MAX_DEBATE_TURNS = 1
 AUTO_EXECUTE_TOOLS = True
 # Always allow tool execution
-ALLOW_TOOL_EXECUTION = False
+ALLOW_TOOL_EXECUTION = True
 TIMEOUTS_FORBIDDEN = True
 STREAM_CHUNK_SIZE_CHARS = int(os.getenv("STREAM_CHUNK_SIZE_CHARS", "0"))
 STREAM_CHUNK_INTERVAL_MS = int(os.getenv("STREAM_CHUNK_INTERVAL_MS", "50"))
@@ -5165,7 +5165,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     tool_results: List[Dict[str, Any]] = []
     # Defer execution until after validate → (repair once) → re-validate gates below.
     if tool_calls:
-        _log("tools.exec.defer", trace_id=trace_id, count=len(tool_calls))
+        pass
     # No heuristic upgrades; planner decides exact tools
     # Surface attachments in tool arguments so downstream jobs can use user media
     if tool_calls and attachments:
@@ -5417,27 +5417,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                         return JSONResponse(status_code=200, content=_resp0)
         except Exception:
             pass
-        # Pre-execute once BEFORE validation (per user instruction): do not short-circuit on errors; collect artifacts if any
-        try:
-            _log("tool.run.start", trace_id=trace_id, phase="pre", count=len(tool_calls or []))
-            base_url_pre = (PUBLIC_BASE_URL or "").rstrip("/") or (str(request.base_url) or "").rstrip("/")
-            async with _hx.AsyncClient(trust_env=False, timeout=None) as _client_pre:
-                for i, tc in enumerate(tool_calls[:5]):
-                    _name_pre = (tc.get("name") or "").strip()
-                    _args_pre = tc.get("arguments") or {}
-                    _r_pre = await _client_pre.post(base_url_pre + "/tool.run", json={"name": _name_pre, "args": _args_pre})
-                    _robj_pre = _resp_json(_r_pre, {})
-                    try:
-                        _res_pre = (_robj_pre.get("result") or {}) if isinstance(_robj_pre, dict) else {}
-                        _meta_pre = _res_pre.get("meta") if isinstance(_res_pre, dict) else {}
-                        _pid_pre = (_meta_pre or {}).get("prompt_id")
-                        if isinstance(_pid_pre, str) and _pid_pre:
-                            _log("[comfy] POST /prompt", trace_id=trace_id, prompt_id=_pid_pre, client_id=trace_id)
-                            _log("[comfy] polling /history/" + _pid_pre)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+        # DO NOT pre-execute before validation — enforce validate-first ordering
         async with _hx.AsyncClient(trust_env=False, timeout=None) as client:
             for tc in tool_calls:
                 name = (tc.get("name") or "").strip()
@@ -5452,7 +5432,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 vresp = await client.post(base_url + "/tool.validate", json={"name": name, "args": args})
                 vobj = _resp_json(vresp, {})
                 _log("validate.result", trace_id=trace_id, status=int(getattr(vresp, "status_code", 0) or 0), tool=name, detail=((vobj or {}).get("error") or {}))
-                if (getattr(vresp, "status_code", 0) == 200) and isinstance(vobj, dict) and (vobj.get("ok") is True):
+                if (getattr(vresp, "status_code", 0) == 200) and isinstance(vobj, dict) and bool(vobj.get("ok")):
                     validated.append(tc)
                     continue
                 # 422 or invalid envelope → start repair once
@@ -5654,60 +5634,23 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                     return JSONResponse(status_code=200, content=resp3)
             except Exception:
                 pass
-            # Execute via orchestrator tool.run to avoid fast paths
-            _log("tool.run.start", trace_id=trace_id, count=len(tool_calls or []))
-            base_url = (PUBLIC_BASE_URL or "").rstrip("/") or (str(request.base_url) or "").rstrip("/")
-            async with _hx.AsyncClient(trust_env=False, timeout=None) as client:
-                produced: Dict[str, Any] = {}
-                for i, tc in enumerate(tool_calls[:5]):
-                    name = (tc.get("name") or "").strip()
-                    args = tc.get("arguments") or {}
-                    r = await client.post(base_url + "/tool.run", json={"name": name, "args": args})
-                    robj = _resp_json(r, {})
-                    # Runtime 422 or tool failure → friendly failure envelope with explicit reasons
-                    if isinstance(robj, dict) and (robj.get("ok") is False):
-                        err = robj.get("error") or {}
-                        msg = _make_tool_failure_message(tool=name, err=err if isinstance(err, dict) else {}, attempted_args=(args if isinstance(args, dict) else {}), trace_id=trace_id)
-                        usage_rt = estimate_usage(messages, msg)
-                        env_rt = _build_openai_envelope(
-                            ok=False,
-                            text=msg,
-                            error={"code": str((err.get("code") if isinstance(err, dict) else "tool_error") or "tool_error"),
-                                   "message": str((err.get("message") if isinstance(err, dict) else "tool_run_failed") or "tool_run_failed"),
-                                   "details": (err.get("details") if isinstance(err, dict) else {})},
-                            usage=usage_rt,
-                            model=f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}",
-                            seed=master_seed,
-                            id_="orc-1",
-                        )
-                        try:
-                            if _lock_token:
-                                _release_lock(STATE_DIR, trace_id)
-                        except Exception:
-                            pass
-                        try:
-                            _trace_response(trace_id, env_rt)
-                        except Exception:
-                            pass
-                        return JSONResponse(status_code=200, content=env_rt)
-                    try:
-                        _res = (robj.get("result") or {}) if isinstance(robj, dict) else {}
+            # Execute via external void executor to ensure Comfy is driven by the executor
+            _log("tool.run.start", trace_id=trace_id, executor="void", count=len(tool_calls or []))
+            # Reuse the executor client helper to call EXECUTOR_BASE_URL/execute
+            tool_results = await execute_tools(tool_calls)
+            # Log Comfy prompt ids if present in results
+            try:
+                for _tr in tool_results or []:
+                    _res = (_tr or {}).get("result") or {}
+                    if isinstance(_res, dict):
                         _meta = _res.get("meta") if isinstance(_res, dict) else {}
                         _pid = (_meta or {}).get("prompt_id")
                         if isinstance(_pid, str) and _pid:
                             _log("[comfy] POST /prompt", trace_id=trace_id, prompt_id=_pid, client_id=trace_id)
                             _log("comfy.submit", trace_id=trace_id, prompt_id=_pid, client_id=trace_id)
                             _log("[comfy] polling /history/" + _pid)
-                    except Exception:
-                        pass
-                    produced[f"step-{i+1}"] = {"result": ((robj.get("result") or {}) if isinstance(robj, dict) else {}), "ok": bool((robj.get("ok") if isinstance(robj, dict) else False))}
-            # Collect per-step results
-            if isinstance(produced, dict):
-                for _sid, step in produced.items():
-                    if not isinstance(step, dict):
-                        continue
-                    res = step.get("result") if isinstance(step.get("result"), dict) else {}
-                    tool_results.append({"name": (res.get("name") or "tool") if isinstance(res, dict) else "tool", "result": res})
+            except Exception:
+                pass
             # No executor aggregate error path; per-step results captured above
             try:
                 # Post-run QA checkpoint (lightweight)
