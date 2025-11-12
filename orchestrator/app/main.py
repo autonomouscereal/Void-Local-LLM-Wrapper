@@ -893,13 +893,38 @@ app.add_middleware(Preflight204Middleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=False,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["*"],
 )
 from .middleware.preflight import Preflight204Middleware
 # Must be outermost to short-circuit OPTIONS early
+
+# Reflective CORS headers on all responses to satisfy browsers with credentials
+@app.middleware("http")
+async def _reflect_cors_headers(request: Request, call_next):
+    if request.method.upper() == "OPTIONS":
+        origin = request.headers.get("origin") or request.headers.get("Origin")
+        acrh = request.headers.get("access-control-request-headers") or request.headers.get("Access-Control-Request-Headers") or "*"
+        headers = {
+            "Access-Control-Allow-Origin": origin or "*",
+            "Vary": "Origin",
+            "Access-Control-Allow-Credentials": "true",
+            "Access-Control-Allow-Methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS",
+            "Access-Control-Allow-Headers": acrh,
+            "Access-Control-Max-Age": "600",
+        }
+        return Response(status_code=204, headers=headers)
+    response = await call_next(request)
+    origin = request.headers.get("origin") or request.headers.get("Origin")
+    if origin:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Vary"] = "Origin"
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        response.headers.setdefault("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS")
+        response.headers.setdefault("Access-Control-Allow-Headers", request.headers.get("access-control-request-headers") or "*")
+    return response
 app.add_middleware(Preflight204Middleware)
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
@@ -1480,7 +1505,7 @@ async def call_ollama(base_url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
                 usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
                 data["_usage"] = usage
             return data
-        except httpx.HTTPError as e:
+        except Exception as e:
             return {"error": str(e), "_base_url": base_url}
 
 
@@ -2045,7 +2070,7 @@ def merge_tool_schemas(client_tools: Optional[List[Dict[str, Any]]]) -> List[Dic
             out.append(t)
     return out
 
-async def planner_produce_plan(messages: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]], temperature: float) -> Tuple[str, List[Dict[str, Any]]]:
+async def planner_produce_plan(messages: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]], temperature: float, trace_id: Optional[str] = None) -> Tuple[str, List[Dict[str, Any]]]:
     # Treat any 'qwen*' value as Qwen route (e.g., 'qwen3')
     use_qwen = str(PLANNER_MODEL or "qwen").lower().startswith("qwen")
     planner_id = QWEN_MODEL_ID if use_qwen else GPTOSS_MODEL_ID
@@ -2082,7 +2107,7 @@ async def planner_produce_plan(messages: List[Dict[str, Any]], tools: Optional[L
     # Log catalog hash for observability
     import hashlib as _hl
     _cat_hash = _hl.sha256((tool_catalog or "").encode("utf-8")).hexdigest()[:16]
-    _log("planner.catalog", trace_id=None, hash=_cat_hash)
+    _log("planner.catalog", trace_id=trace_id, hash=_cat_hash)
     # Install the planner contract and catalog into the planning context
     plan_messages = messages + [
         {"role": "system", "content": contract},
@@ -2091,6 +2116,9 @@ async def planner_produce_plan(messages: List[Dict[str, Any]], tools: Optional[L
     ]
     payload = build_ollama_payload(plan_messages, planner_id, DEFAULT_NUM_CTX, temperature)
     result = await call_ollama(planner_base, payload)
+    if isinstance(result.get("error"), str) and result.get("error"):
+        _log("planner.backend.error", trace_id=None, base=planner_base, error=result.get("error"))
+        return "", []
     text = result.get("response", "").strip()
     # Use custom parser to normalise the planner JSON
     parser = JSONParser()
@@ -2135,17 +2163,17 @@ async def planner_produce_plan(messages: List[Dict[str, Any]], tools: Optional[L
     steps = parsed_steps.get("steps") or []
     if steps:
         # Log final steps JSON verbatim and per-tool details for verification
-        _log("planner.steps", trace_id=None, steps=steps)
+        _log("planner.steps", trace_id=trace_id, steps=steps)
         for st in steps:
             if isinstance(st, dict) and st.get("tool") == "image.dispatch":
-                _log("planner.image.dispatch.args", trace_id=None, args=st.get("args") or {})
+                _log("planner.image.dispatch.args", trace_id=trace_id, args=st.get("args") or {})
         tool_calls = [{"name": s.get("tool"), "arguments": (s.get("args") or {})} for s in steps if isinstance(s, dict)]
         return "", tool_calls
     # Legacy path
     parsed = parser.parse(text, {"plan": str, "tool_calls": [{"name": str, "arguments": dict}]})
     plan = parsed.get("plan", "")
     tcs = parsed.get("tool_calls", []) or []
-    _log("planner.steps.legacy", trace_id=None, tool_calls=tcs)
+    _log("planner.steps.legacy", trace_id=trace_id, tool_calls=tcs)
     if tcs:
         return plan, tcs
     # Final hardening: one more pass forcing JSON mode at the backend with zero temperature
@@ -2153,13 +2181,13 @@ async def planner_produce_plan(messages: List[Dict[str, Any]], tools: Optional[L
     payload2 = build_ollama_payload(plan_messages_retry, planner_id, DEFAULT_NUM_CTX, 0.0)
     # Ollama supports 'format': 'json' to enforce JSON-only output
     payload2["format"] = "json"
-    _log("planner.retry", trace_id=None, reason="no_steps_first_pass")
+    _log("planner.retry", trace_id=trace_id, reason="no_steps_first_pass")
     result2 = await call_ollama(planner_base, payload2)
     text2 = result2.get("response", "").strip()
     parsed2 = parser.parse(text2, {"steps": [{"tool": str, "args": dict}]})
     steps2 = parsed2.get("steps") or []
     if steps2:
-        _log("planner.steps", trace_id=None, steps=steps2)
+        _log("planner.steps", trace_id=trace_id, steps=steps2)
         tool_calls2 = [{"name": s.get("tool"), "arguments": (s.get("args") or {})} for s in steps2 if isinstance(s, dict)]
         return "", tool_calls2
     # If still nothing, return empty plan deterministically (no exceptions)
@@ -5110,7 +5138,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         _log("committee.selection.warn", trace_id=trace_id, reason="chosen_option_not_in_proposals")
     _log("planner.finalize", trace_id=trace_id, chosen_option_id=_winner, deltas_from_option=[], justification="Adopts committee-winning rationale for typed arguments")
     _log("planner.call", trace_id=trace_id)
-    plan_text, tool_calls = await planner_produce_plan(messages, body.get("tools"), body.get("temperature") or DEFAULT_TEMPERATURE)
+    plan_text, tool_calls = await planner_produce_plan(messages, body.get("tools"), body.get("temperature") or DEFAULT_TEMPERATURE, trace_id=trace_id)
     _log("planner.done", trace_id=trace_id, tool_count=len(tool_calls or []))
     # Normalize planner tool calls into orchestrator internal schema {name, arguments}
     def _normalize_tool_calls(calls: Any) -> List[Dict[str, Any]]:
@@ -5321,7 +5349,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         )
         replan_messages = messages + [{"role": "system", "content": constraint}]
         _log("replan.start", trace_id=trace_id, reason="unknown_tool", unknown=unknown, allowed=allowed_sorted)
-        plan2, tool_calls2 = await planner_produce_plan(replan_messages, body.get("tools"), body.get("temperature") or DEFAULT_TEMPERATURE)
+        plan2, tool_calls2 = await planner_produce_plan(replan_messages, body.get("tools"), body.get("temperature") or DEFAULT_TEMPERATURE, trace_id=trace_id)
         # Normalize and filter
         tool_calls2 = _normalize_tool_calls(tool_calls2)
         # Re-check against allowed
@@ -5420,7 +5448,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 )
                 repair_messages = [{"role": "system", "content": repair_preamble}, {"role": "user", "content": json.dumps(brief, ensure_ascii=False)}]
                 _log("repair.start", trace_id=trace_id, tool=name, brief=brief)
-                _plan2, calls2 = await planner_produce_plan(repair_messages, body.get("tools"), body.get("temperature") or DEFAULT_TEMPERATURE)
+                _plan2, calls2 = await planner_produce_plan(repair_messages, body.get("tools"), body.get("temperature") or DEFAULT_TEMPERATURE, trace_id=trace_id)
                 # Normalize repair outputs to {name, arguments}
                 calls2_norm = _normalize_tool_calls(calls2)
                 patched = None
