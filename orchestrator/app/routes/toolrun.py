@@ -20,7 +20,7 @@ def ok_envelope(result, rid: str) -> JSONResponse:
 	return JSONResponse({"schema_version": 1, "request_id": rid, "ok": True, "result": result}, status_code=200)
 
 
-def err_envelope(code: str, message: str, rid: str, status: int = 422, details: dict | None = None) -> JSONResponse:
+def err_envelope(code: str, message: str, rid: str, status: int = 200, details: dict | None = None) -> JSONResponse:
 	return JSONResponse(
 		{"schema_version": 1, "request_id": rid, "ok": False, "error": {"code": code, "message": message, "details": (details or {})}},
 		status_code=status,

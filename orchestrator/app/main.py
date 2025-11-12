@@ -905,7 +905,6 @@ def _json_response(obj: Dict[str, Any], status_code: int = 200) -> Response:
     body = json.dumps(obj, ensure_ascii=False)
     headers = {
         "Cache-Control": "no-store",
-        "Connection": "close",
         "Content-Type": "application/json; charset=utf-8",
         "Content-Length": str(len(body.encode("utf-8"))),
     }
@@ -5365,21 +5364,12 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 }
             ],
         }
-        if body.get("stream"):
-            resp_id2 = response["id"]
-            async def _stream_once():
-                chunk = json.dumps({"id": resp_id2, "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": tool_calls_openai}, "finish_reason": None}]})
-                yield f"data: {chunk}\n\n"
-                yield "data: [DONE]\n\n"
-            if _lock_token:
-                _release_lock(STATE_DIR, trace_id)
-            return StreamingResponse(_stream_once(), media_type="text/event-stream")
-        # include usage estimate even in tool_calls path (no completion tokens yet)
-        response["usage"] = estimate_usage(messages, "")
-        response["seed"] = master_seed
+        # Do not stream; always return a single complete response after the entire flow finishes
         if _lock_token:
             _release_lock(STATE_DIR, trace_id)
         return _json_response(response)
+        # include usage estimate even in tool_calls path (no completion tokens yet)
+        # (dead code; we returned above)
 
     # Ensure arguments are objects; auto-parse JSON strings instead of returning early
     if tool_calls:
@@ -6320,9 +6310,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             yield f"data: {done}\n\n"
             yield "data: [DONE]\n\n"
         checkpoints_append_event(STATE_DIR, trace_id, "halt", {"kind": "committee", "chars": len(final_text)})
-        if _lock_token:
-            _release_lock(STATE_DIR, trace_id)
-        return StreamingResponse(_stream_with_stages(final_text), media_type="text/event-stream")
+        # Do not stream; proceed to build the full final response below
 
     # Merge exact usages if available, else approximate
     usage = merge_usages([
@@ -6861,65 +6849,12 @@ async def refs_compose_character(body: Dict[str, Any]):
         return JSONResponse(status_code=400, content={"error": str(ex)})
 
 
-# ---------- Direct Tool Runner (for UI) ----------
-@app.post("/tool.run")
-async def tool_run(body: Dict[str, Any]):
-    name = (body or {}).get("name")
-    args = (body or {}).get("args") or {}
-    stream = bool((body or {}).get("stream") or False)
-    if stream:
-        async def _gen():
-            # Start event
-            yield ("data: " + json.dumps({"event": "start", "name": name or "tool"}) + "\n\n").encode("utf-8")
-            # Set up progress queue and execution task
-            q: asyncio.Queue = asyncio.Queue()
-            set_progress_queue(q)
-            exec_task = asyncio.create_task(execute_tool_call({"name": name, "arguments": args}))
-            last_ka = 0.0
-            try:
-                while True:
-                    now = time.time()
-                    sent_any = False
-                    # Drain progress queue quickly
-                    while not q.empty():
-                        ev = await q.get()
-                        yield ("data: " + json.dumps({"event": "progress", **(ev if isinstance(ev, dict) else {"msg": str(ev)})}) + "\n\n").encode("utf-8")
-                        sent_any = True
-                    if exec_task.done():
-                        res = await exec_task
-                        payload = {"event": "result", "ok": (not (isinstance(res, dict) and res.get("error"))), "result": res}
-                        yield ("data: " + json.dumps(payload) + "\n\n").encode("utf-8")
-                        break
-                    if (now - last_ka) >= 10.0 and not sent_any:
-                        yield b"data: {\"keepalive\": true}\n\n"
-                        last_ka = now
-                    await asyncio.sleep(0.25)
-            finally:
-                set_progress_queue(None)
-            yield b"data: [DONE]\n\n"
-        return StreamingResponse(_gen(), media_type="text/event-stream")
-    # Standardized JSON envelope for non-stream calls
-    rid = _uuid.uuid4().hex
-    _append_jsonl(os.path.join(STATE_DIR, "tools", "tools.jsonl"), {"t": int(time.time()*1000), "event": "start", "tool": name, "args": args})
-    trace_id = args.get("trace_id") or args.get("cid")
-    if isinstance(trace_id, str) and trace_id:
-        checkpoints_append_event(STATE_DIR, trace_id, "tool_start", {"tool": (name or "tool"), "step_id": args.get("step_id")})
-    res = await execute_tool_call({"name": name, "arguments": args})
-    # Map to strict envelope
-    if isinstance(res, dict) and res.get("error"):
-        # Route error with traceback to errors corpus when trace_id present
-        trc = (args.get("trace_id") or args.get("cid")) if isinstance(args, dict) else None
-        if isinstance(trc, str) and trc and isinstance(res.get("traceback"), str):
-            try:
-                checkpoints_append_event(STATE_DIR, trc, "error", {"code": "tool_error", "message": str(res.get("error")), "traceback": res.get("traceback"), "tool": name})
-            except Exception:
-                logging.error(traceback.format_exc())
-        return JSONResponse(
-            status_code=422,
-            content={"schema_version": 1, "request_id": rid, "ok": False, "error": {"code": "tool_error", "message": str(res.get("error"))[:500], "traceback": (res.get("traceback") or None), "details": {"name": name}}},
-        )
-    result_obj = res.get("result") if isinstance(res, dict) else res
-    return JSONResponse(status_code=200, content={"schema_version": 1, "request_id": rid, "ok": True, "result": (result_obj or {})})
+# ---------- Direct Tool Runner helper (route centralized in routes/toolrun) ----------
+async def http_tool_run(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    base = (PUBLIC_BASE_URL or "http://127.0.0.1:8000").rstrip("/")
+    async with _hx.AsyncClient(trust_env=False, timeout=None) as client:
+        r = await client.post(base + "/tool.run", json={"name": name, "args": args})
+        return _resp_json(r, {})
 from fastapi import Request  # type: ignore
 from fastapi import Response  # type: ignore
 
@@ -7263,7 +7198,7 @@ async def jobs_start(body: Dict[str, Any]):
         jid = uuid.uuid4().hex
         name = (body or {}).get("tool") or (body or {}).get("name")
         args = (body or {}).get("args") or {}
-        res = await tool_run({"name": name, "args": args})
+        res = await http_tool_run(str(name or ""), args if isinstance(args, dict) else {})
         # Pass through result; include job_id for clients expecting it
         if isinstance(res, JSONResponse):
             # unwrap JSONResponse content
@@ -7354,10 +7289,7 @@ async def film2_qa(body: Dict[str, Any]):
             score = _qa_face(sb_meta, fin_meta, face_ref_embed=None)
             if score < T_FACE:
                 args = {"name": "image.dispatch", "args": {"mode": "gen", "prompt": shot.get("prompt") or "", "size": shot.get("size", "1024x1024"), "refs": snap.get("refs", {}), "seed": int(snap.get("seed") or 0), "film_cid": cid, "shot_id": sid}}
-                try:
-                    await tool_run(args)
-                except Exception:
-                    pass
+                _ = await http_tool_run(args.get("name") or "image.dispatch", args.get("args") or {})
                 issues.append({"shot": sid, "type": "image", "score": score})
         for ln in voice_lines:
             lid = ln.get("id") or ln.get("line_id")
@@ -7367,10 +7299,7 @@ async def film2_qa(body: Dict[str, Any]):
             score = _qa_voice({"voice_vec": None}, voice_ref_embed=None)
             if score < T_VOICE:
                 args = {"name": "tts.speak", "args": {"text": ln.get("text") or "", "voice_id": ln.get("voice_ref_id"), "voice_refs": snap.get("refs", {}), "seed": int(snap.get("seed") or 0), "film_cid": cid, "line_id": lid}}
-                try:
-                    await tool_run(args)
-                except Exception:
-                    pass
+                _ = await http_tool_run(args.get("name") or "tts.speak", args.get("args") or {})
                 issues.append({"line": lid, "type": "voice", "score": score})
         for cue in music_cues:
             cid2 = cue.get("id") or cue.get("cue_id")
@@ -7381,10 +7310,7 @@ async def film2_qa(body: Dict[str, Any]):
             if score < T_MUSIC:
                 # Prefer timed music generation for video scoring using SAO when available
                 args = {"name": "music.timed.sao", "args": {"text": cue.get("prompt") or "", "seconds": 8}}
-                try:
-                    await tool_run(args)
-                except Exception:
-                    pass
+                _ = await http_tool_run(args.get("name") or "music.timed.sao", args.get("args") or {})
                 issues.append({"cue": cid2, "type": "music", "score": score})
         return {"cid": cid, "issues": issues, "thresholds": {"face": T_FACE, "voice": T_VOICE, "music": T_MUSIC}}
     except Exception as ex:
