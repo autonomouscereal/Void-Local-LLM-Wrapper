@@ -440,7 +440,8 @@ services:
       - comfyui_models:/comfyui/models
       - ./assets/comfyui/models/upscale:/comfyui/models/upscale
       - ./assets/comfyui/input:/comfyui/input
-      - ./assets/comfyui/output:/comfyui/output
+      # Share uploads_data with orchestrator/executor so Comfy outputs are visible under /uploads
+      - uploads_data:/comfyui/output
     # For GPU deployments, create additional comfyui-* services and set COMFYUI_API_URLS accordingly
 
   # Optional additional ComfyUI replicas for dynamic distribution
@@ -471,7 +472,8 @@ services:
       - comfyui_models:/comfyui/models
       - ./assets/comfyui/models/upscale:/comfyui/models/upscale
       - ./assets/comfyui/input:/comfyui/input
-      - ./assets/comfyui/output:/comfyui/output
+      # Share uploads_data with orchestrator/executor so Comfy outputs are visible under /uploads
+      - uploads_data:/comfyui/output
 
   comfyui-2:
     build:
@@ -497,7 +499,8 @@ services:
       - comfyui_models:/comfyui/models
       - ./assets/comfyui/models/upscale:/comfyui/models/upscale
       - ./assets/comfyui/input:/comfyui/input
-      - ./assets/comfyui/output:/comfyui/output
+      # Share uploads_data with orchestrator/executor so Comfy outputs are visible under /uploads
+      - uploads_data:/comfyui/output
 
   comfyui_init:
     build:

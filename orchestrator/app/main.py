@@ -203,361 +203,6 @@ def _allowed_tools_for_mode(mode: Optional[str]) -> List[str]:
     # In job: full catalog
     return base
 
-async def _image_dispatch_run(
-    prompt: str,
-    negative: Optional[str],
-    seed: Optional[int],
-    width: Optional[int],
-    height: Optional[int],
-    size: Optional[str],
-    assets: Dict[str, Any],
-    steps: Optional[int] = None,
-    cfg_scale: Optional[float] = None,
-    lock_bundle: Optional[Dict[str, Any]] = None,
-    quality_profile: Optional[str] = None,
-    trace_id: Optional[str] = None,
-) -> Dict[str, Any]:
-    if not isinstance(prompt, str):
-        prompt = ""
-    # size normalization
-    w = None; h = None
-    if isinstance(size, str) and "x" in size:
-        parts = size.lower().split("x")
-        if len(parts) == 2 and parts[0].strip().isdigit() and parts[1].strip().isdigit():
-            w = int(parts[0].strip()); h = int(parts[1].strip())
-        else:
-            w = None; h = None
-    if isinstance(width, int) and width > 0: w = width
-    if isinstance(height, int) and height > 0: h = height
-    # New lock-rich pipeline: upload refs → build full graph → submit → poll → save
-    uploaded: Dict[str, str] = {}
-    locks = assets.get("locks") if isinstance(assets.get("locks"), dict) else {}
-    prompt_text = prompt
-    if isinstance(lock_bundle, dict) and lock_bundle:
-        derived = _lock_to_assets(lock_bundle)
-        if derived:
-            merged_locks: Dict[str, Any] = dict(locks or {})
-            for key, value in derived.items():
-                if key in ("faces", "poses", "depths", "layouts", "clothes_styles"):
-                    existing = list(merged_locks.get(key) or [])
-                    if isinstance(value, list):
-                        merged_locks[key] = existing + value
-                else:
-                    merged_locks[key] = value
-            locks = merged_locks
-            style_tags = derived.get("style_tags") if isinstance(derived.get("style_tags"), list) else []
-            if style_tags:
-                prompt_text = (prompt_text + ", " + ", ".join(style_tags)).strip(", ")
-            regions_map = derived.get("regions") if isinstance(derived.get("regions"), dict) else {}
-            region_prompt_tags: List[str] = []
-            if regions_map:
-                for region_id, region_data in regions_map.items():
-                    if not isinstance(region_data, dict):
-                        continue
-                    palette = region_data.get("color_palette") if isinstance(region_data.get("color_palette"), dict) else {}
-                    primary = palette.get("primary")
-                    if isinstance(primary, str) and primary:
-                        region_prompt_tags.append(f"{region_id} color {primary}")
-                    role = region_data.get("role")
-                    if isinstance(role, str) and role:
-                        region_prompt_tags.append(f"{role} details for {region_id}")
-            if region_prompt_tags:
-                prompt_text = (prompt_text + ", " + ", ".join(region_prompt_tags)).strip(", ")
-    prompt = prompt_text
-    # faces
-    for i, f in enumerate(locks.get("faces") or []):
-        b64p = f.get("ref_b64")
-        if isinstance(b64p, str) and b64p:
-            uploaded[f"face_{i}"] = await _comfy_upload_image(f"face{i}", b64p)
-    # styles
-    for i, s in enumerate(locks.get("clothes_styles") or []):
-        b64p = s.get("ref_b64")
-        if isinstance(b64p, str) and b64p:
-            uploaded[f"style_{i}"] = await _comfy_upload_image(f"style{i}", b64p)
-    # layout/depth/pose maps
-    for i, l in enumerate(locks.get("layouts") or []):
-        b64p = l.get("image_b64") or l.get("ref_b64")
-        if isinstance(b64p, str) and b64p:
-            uploaded[f"layout_{i}"] = await _comfy_upload_image(f"layout{i}", b64p)
-    for i, d in enumerate(locks.get("depths") or []):
-        b64p = d.get("image_b64") or d.get("ref_b64")
-        if isinstance(b64p, str) and b64p:
-            uploaded[f"depth_{i}"] = await _comfy_upload_image(f"depth{i}", b64p)
-    for i, p in enumerate(locks.get("poses") or []):
-        b64p = p.get("image_b64") or p.get("ref_b64")
-        if isinstance(b64p, str) and b64p:
-            uploaded[f"pose_{i}"] = await _comfy_upload_image(f"pose{i}", b64p)
-    region_assets: Dict[str, Any] = {}
-    if isinstance(locks.get("regions"), dict):
-        for region_id, region_data in locks.get("regions", {}).items():
-            if not isinstance(region_data, dict):
-                continue
-            mask_b64 = region_data.get("mask_b64")
-            if not isinstance(mask_b64, str) or not mask_b64:
-                continue
-            try:
-                upload_key = await _comfy_upload_image(f"region_{region_id}", mask_b64)
-            except Exception:
-                continue
-            asset_entry = dict(region_data)
-            asset_entry["mask_asset"] = upload_key
-            region_assets[str(region_id)] = asset_entry
-    if region_assets:
-        locks["region_assets"] = region_assets
-
-    # Resolve a valid sampler from this Comfy instance
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None)) as _s:
-        sampler_name = await _choose_sampler_name(_s)
-
-    graph_req: Dict[str, Any] = {
-        "prompt": prompt,
-        "negative_prompt": (negative or None),
-        "seed": (int(seed) if isinstance(seed, int) else None),
-        "width": (int(w) if isinstance(w, int) else None),
-        "height": (int(h) if isinstance(h, int) else None),
-        "sampler": sampler_name,
-        "locks": locks,
-        "steps": steps,
-        "cfg": cfg_scale,
-        "lock_bundle": lock_bundle,
-        "quality_profile": quality_profile,
-    }
-    graph = _build_full_graph(graph_req, uploaded)
-    # Log payload size and write last prompt for debugging
-    _write_text_atomic(os.path.join(UPLOAD_DIR, "last_prompt.json"), json.dumps({"client_id":"orc", "prompt": graph.get("prompt") or graph}, ensure_ascii=False))
-    _append_ledger({
-        "phase": "image.dispatch.start",
-        "request": {"prompt": prompt, "negative": (negative or None), "seed": (int(seed) if isinstance(seed, int) else None), "width": (int(w) if isinstance(w, int) else None), "height": (int(h) if isinstance(h, int) else None)},
-    })
-    out = await _comfy_submit_aio(graph)
-    pid = out.get("prompt_id")
-    if not isinstance(pid, str) or not pid:
-        raise RuntimeError("invalid_prompt_id")
-
-    files: List[Dict[str, str]] = []
-    for _ in range(600):
-        hist = await _comfy_history_aio(pid)
-        entry = hist.get(pid) or {}
-        outs = entry.get("outputs") or {}
-        if isinstance(outs, dict):
-            for v in outs.values():
-                for img in (v.get("images") or []):
-                    fn = img.get("filename"); sf = img.get("subfolder", ""); ty = img.get("type", "output")
-                    if isinstance(fn, str) and fn:
-                        files.append({"filename": fn, "subfolder": sf, "type": ty})
-        if files:
-            break
-        await asyncio.sleep(1)
-    if not files:
-        raise RuntimeError("no images returned from comfy history")
-
-    cid = "img-" + str(_now_ts())
-    outdir = os.path.join(UPLOAD_DIR, "artifacts", "image", cid)
-    _ensure_dir(outdir)
-    manifest = {"items": []}
-    saved: List[Dict[str, Any]] = []
-    base = (os.getenv("COMFYUI_API_URL", "http://comfyui:8188").rstrip("/"))
-    comfy_items: List[Dict[str, Any]] = []
-    for idx, f in enumerate(files):
-        fn = f.get("filename")
-        if not (isinstance(fn, str) and fn):
-            raise RuntimeError("image_filename_missing")
-        sf = f.get("subfolder") or ""
-        ty = f.get("type") or "output"
-        view_url = f"{base}/view?filename={fn}" + (f"&subfolder={sf}&type={ty}" if sf or ty else "")
-        data, ctype = await _comfy_view(fn)
-        # Build capped inline preview (<=512px) for immediate UI render
-        _src = BytesIO(data)
-        _im = Image.open(_src).convert("RGBA")
-        _im.thumbnail((512, 512))
-        _buf = BytesIO()
-        _im.save(_buf, format="PNG", optimize=True)
-        _img_b64 = _b64.b64encode(_buf.getvalue()).decode("ascii")
-        data_url = f"data:image/png;base64,{_img_b64}"
-        stem = f"dispatch_00_{idx:02d}"
-        png_path, meta_path = _make_outpaths(outdir, stem)
-        with open(png_path, "wb") as _f:
-            _f.write(data)
-        # Compatibility: also write a copy using the original Comfy filename so legacy UIs/links work
-        try:
-            _orig_name = os.path.basename(fn)
-            if isinstance(_orig_name, str) and _orig_name:
-                _orig_path = os.path.join(outdir, _orig_name)
-                with open(_orig_path, "wb") as _of:
-                    _of.write(data)
-        except Exception:
-            pass
-        _sidecar(png_path, {
-            "tool": "image.dispatch",
-            "prompt": prompt,
-            "negative": (negative or None),
-            "seed": (int(seed) if isinstance(seed, int) else None),
-            "width": (int(w) if isinstance(w, int) else None),
-            "height": (int(h) if isinstance(h, int) else None),
-            "prompt_id": pid,
-            "filename": fn,
-            "subfolder": sf,
-            "type": ty,
-            "comfy_view": view_url,
-        })
-        _man_add(manifest, png_path, step_id="image.dispatch")
-        try:
-            if "_orig_path" in locals() and isinstance(_orig_path, str) and os.path.exists(_orig_path):
-                _man_add(manifest, _orig_path, step_id="image.dispatch")
-        except Exception:
-            pass
-        ai = _analyze_image(png_path, prompt=str(prompt))
-        clip_s = float(ai.get("clip_score") or 0.0)
-        trace_append("image", {"cid": cid, "tool": "image.dispatch", "prompt": prompt, "path": png_path, "clip_score": clip_s, "tags": ai.get("tags") or []})
-        _ctx_add(cid, "image", png_path, _uri_from_upload_path(png_path), None, [], {"prompt": prompt, "clip_score": clip_s})
-        if isinstance(trace_id, str) and trace_id:
-            # Compute a safe relative path without raising (handle cross-drive on Windows)
-            rel: Optional[str] = None
-            if isinstance(png_path, str) and isinstance(UPLOAD_DIR, str) and png_path:
-                pdrv, sdrv = os.path.splitdrive(png_path)[0].lower(), os.path.splitdrive(UPLOAD_DIR)[0].lower()
-                if pdrv and sdrv and pdrv != sdrv:
-                    rel = os.path.basename(png_path).replace("\\", "/")
-                else:
-                    rel = os.path.relpath(png_path, UPLOAD_DIR).replace("\\", "/")
-            if isinstance(rel, str) and rel:
-                checkpoints_append_event(STATE_DIR, trace_id, "artifact", {
-                    "kind": "image",
-                    "path": rel,
-                    "prompt_id": pid,
-                    "filename": fn,
-                    "subfolder": sf,
-                    "view_url": view_url,
-                })
-            else:
-                checkpoints_append_event(STATE_DIR, trace_id, "error", {"message": "artifact_append_failed:bad_path", "path": png_path})
-        comfy_items.append({"filename": fn, "subfolder": sf, "type": ty, "view_url": view_url, "data_url": data_url})
-        saved.append({"path": png_path, "clip_score": clip_s, "filename": fn, "subfolder": sf, "type": ty, "comfy_view": view_url})
-    _man_write(outdir, manifest)
-
-    # RAG index
-    pool = await get_pg_pool()
-    if pool is not None and isinstance(prompt, str) and prompt.strip():
-        emb = get_embedder()
-        vec = emb.encode([prompt])[0]
-        async with pool.acquire() as conn:
-            for s in saved:
-                rel = os.path.relpath(s.get("path"), UPLOAD_DIR).replace("\\", "/")
-                await conn.execute("INSERT INTO rag_docs (path, chunk, embedding) VALUES ($1, $2, $3)", rel, prompt, list(vec))
-
-    locks_meta: Dict[str, Any] = {}
-    if lock_bundle:
-        face_scores: List[float] = []
-        pose_scores: List[float] = []
-        style_scores: List[float] = []
-        region_shape_scores: List[float] = []
-        region_texture_scores: List[float] = []
-        region_color_scores: List[float] = []
-        region_lock_details: Dict[str, Dict[str, Optional[float]]] = {}
-        scene_scores: List[float] = []
-        region_bundle = lock_bundle.get("regions") if isinstance(lock_bundle.get("regions"), dict) else {}
-        scene_bundle = lock_bundle.get("scene") if isinstance(lock_bundle.get("scene"), dict) else {}
-        for s in saved:
-            path = s.get("path")
-            if not isinstance(path, str) or not path:
-                continue
-            entry_locks: Dict[str, Any] = {}
-            face_ref = (lock_bundle.get("face") or {}).get("embedding") if isinstance(lock_bundle.get("face"), dict) else None
-            if isinstance(face_ref, list):
-                face_score = await _compute_face_lock_score(path, face_ref)
-                if face_score is not None:
-                    entry_locks["face_score"] = face_score
-                    face_scores.append(face_score)
-            pose_ref = lock_bundle.get("pose") if isinstance(lock_bundle.get("pose"), dict) else None
-            if pose_ref:
-                pose_score = await _compute_pose_similarity(path, pose_ref)
-                if pose_score is not None:
-                    entry_locks["pose_score"] = pose_score
-                    pose_scores.append(pose_score)
-            style_ref = (lock_bundle.get("style") or {}).get("palette") if isinstance(lock_bundle.get("style"), dict) else None
-            if isinstance(style_ref, dict):
-                style_score = await _compute_style_similarity(path, style_ref)
-                if style_score is not None:
-                    entry_locks["style_score"] = style_score
-                    style_scores.append(style_score)
-            if region_bundle:
-                region_scores_entry: Dict[str, Any] = {}
-                for region_id, region_data in region_bundle.items():
-                    if not isinstance(region_data, dict):
-                        continue
-                    metrics = await compute_region_scores(path, region_data)
-                    if metrics:
-                        region_scores_entry[region_id] = metrics
-                        shape_score = metrics.get("shape_score")
-                        texture_score = metrics.get("texture_score")
-                        color_score = metrics.get("color_score")
-                        if isinstance(shape_score, (int, float)):
-                            region_shape_scores.append(float(shape_score))
-                        if isinstance(texture_score, (int, float)):
-                            region_texture_scores.append(float(texture_score))
-                        if isinstance(color_score, (int, float)):
-                            region_color_scores.append(float(color_score))
-                if region_scores_entry:
-                    entry_locks["regions"] = region_scores_entry
-                    region_lock_details.update(region_scores_entry)
-            if scene_bundle:
-                scene_score = await compute_scene_score(path, scene_bundle)
-                if scene_score is not None:
-                    entry_locks["scene_score"] = scene_score
-                    scene_scores.append(scene_score)
-            if entry_locks:
-                s["locks"] = entry_locks
-        locks_meta = {
-            "bundle": lock_bundle,
-            "applied": True,
-            "quality_profile": quality_profile,
-            "face_score": (sum(face_scores) / len(face_scores)) if face_scores else None,
-            "pose_score": (sum(pose_scores) / len(pose_scores)) if pose_scores else None,
-            "style_score": (sum(style_scores) / len(style_scores)) if style_scores else None,
-            "region_shape_score": (sum(region_shape_scores) / len(region_shape_scores)) if region_shape_scores else None,
-            "region_texture_score": (sum(region_texture_scores) / len(region_texture_scores)) if region_texture_scores else None,
-            "region_color_score": (sum(region_color_scores) / len(region_color_scores)) if region_color_scores else None,
-            "scene_score": (sum(scene_scores) / len(scene_scores)) if scene_scores else None,
-            "regions": region_lock_details if region_lock_details else None,
-        }
-    elif isinstance(assets.get("lock_bundle"), dict):
-        locks_meta = {"bundle": assets.get("lock_bundle"), "applied": False}
-
-    scores = {"image": {"clip": max([s.get("clip_score") or 0.0 for s in saved] or [0.0])}}
-    # Provide direct IDs and view_url for UI convenience (first image)
-    ids_obj: Dict[str, Any] = {}
-    meta_obj: Dict[str, Any] = {"prompt_id": pid}
-    if quality_profile:
-        meta_obj["quality_profile"] = quality_profile
-    if comfy_items:
-        first = comfy_items[0]
-        sub = ""
-        if isinstance(first.get("subfolder"), str):
-            sub = first.get("subfolder").strip("/")
-        fnm = first.get("filename")
-        if isinstance(fnm, str):
-            image_id = (f"{sub}/{fnm}" if sub else fnm)
-            ids_obj["image_id"] = image_id
-        if isinstance(first.get("view_url"), str):
-            meta_obj["view_url"] = first.get("view_url")
-        if isinstance(first.get("data_url"), str):
-            meta_obj["data_url"] = first.get("data_url")
-        meta_obj["filename"] = first.get("filename")
-        meta_obj["subfolder"] = first.get("subfolder")
-    # Also expose an orchestrator-served URL (for CORS-safe fetch from UI)
-    if saved and isinstance(saved[0], dict):
-        p0 = saved[0].get("path")
-        if isinstance(p0, str) and p0:
-            pdrv, sdrv = os.path.splitdrive(p0)[0].lower(), os.path.splitdrive(UPLOAD_DIR)[0].lower()
-            if pdrv and sdrv and pdrv != sdrv:
-                rel0 = os.path.basename(p0).replace("\\", "/")
-            else:
-                rel0 = os.path.relpath(p0, UPLOAD_DIR).replace("\\", "/")
-            # Ensure absolute under /uploads so StaticFiles serves it correctly
-            meta_obj["orch_view_url"] = f"/uploads/{rel0}"
-            meta_obj["orch_view_urls"] = [f"/uploads/{rel0}"]
-    if locks_meta:
-        meta_obj["locks"] = locks_meta
-    return {"cid": cid, "prompt_id": pid, "ids": ids_obj, "meta": meta_obj, "paths": [s.get("path") for s in saved], "images": comfy_items, "scores": scores}
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 _level = getattr(logging, LOG_LEVEL, logging.INFO)
@@ -1119,6 +764,12 @@ QWEN_MODEL_ID = os.getenv("QWEN_MODEL_ID", "qwen3:32b-instruct-q6_K")
 GPTOSS_BASE_URL = os.getenv("GPTOSS_BASE_URL", "http://localhost:11435")
 GPTOSS_MODEL_ID = os.getenv("GPTOSS_MODEL_ID", "chatgpt-oss:latest")
 DEFAULT_NUM_CTX = int(os.getenv("DEFAULT_NUM_CTX", "8192"))
+
+# Committee participant → model routing (always use both models for committee work)
+COMMITTEE_PARTICIPANTS = [
+    {"id": "qwen", "base": QWEN_BASE_URL, "model": QWEN_MODEL_ID},
+    {"id": "gptoss", "base": GPTOSS_BASE_URL, "model": GPTOSS_MODEL_ID},
+]
 DEFAULT_TEMPERATURE = float(os.getenv("DEFAULT_TEMPERATURE", "0.3"))
 # Gates removed: defaults are always ON; API-key checks still apply where required
 ENABLE_WEBSEARCH = True
@@ -1653,6 +1304,10 @@ async def _perm_headers(request: Request, call_next):
 
 @app.post("/v1/image.generate")
 async def v1_image_generate(request: Request):
+    """
+    Canonical image generation endpoint.
+    Delegates to the image.dispatch tool (via /tool.run) instead of maintaining a separate Comfy path.
+    """
     rid = str(_uuid.uuid4())
     raw = await request.body()
     try:
@@ -1662,39 +1317,49 @@ async def v1_image_generate(request: Request):
     if not isinstance(body, dict):
         return _jerr(422, rid, "invalid_body_type", "Body must be an object")
     prompt = body.get("prompt") or body.get("text") or ""
-    negative = body.get("negative")
-    seed = body.get("seed")
-    width = body.get("width")
-    height = body.get("height")
-    size = body.get("size")
-    assets = body.get("assets") if isinstance(body.get("assets"), dict) else {}
-    lock_bundle_body = body.get("lock_bundle") if isinstance(body.get("lock_bundle"), dict) else None
-    quality_profile = body.get("quality_profile") if isinstance(body.get("quality_profile"), str) else None
-    steps_val = None
-    cfg_val = None
-    if isinstance(body.get("steps"), int):
-        steps_val = int(body.get("steps"))
-    if isinstance(body.get("cfg"), (int, float)):
-        cfg_val = float(body.get("cfg"))
     if not isinstance(prompt, str):
         return _jerr(422, rid, "invalid_prompt", "prompt must be a string")
-    try:
-        res = await _image_dispatch_run(
-            str(prompt),
-            negative if isinstance(negative, str) else None,
-            int(seed) if isinstance(seed, int) else None,
-            int(width) if isinstance(width, int) else None,
-            int(height) if isinstance(height, int) else None,
-            str(size) if isinstance(size, str) else None,
-            assets,
-            steps=steps_val,
-            cfg_scale=cfg_val,
-            lock_bundle=lock_bundle_body,
-            quality_profile=quality_profile,
+    # Shape args for image.dispatch; keep contract minimal and forwards-compatible
+    args: Dict[str, Any] = {
+        "prompt": prompt,
+    }
+    if isinstance(body.get("negative"), str):
+        args["negative"] = body.get("negative")
+    if isinstance(body.get("seed"), int):
+        args["seed"] = body.get("seed")
+    if isinstance(body.get("width"), int):
+        args["width"] = body.get("width")
+    if isinstance(body.get("height"), int):
+        args["height"] = body.get("height")
+    if isinstance(body.get("size"), str):
+        args["size"] = body.get("size")
+    if isinstance(body.get("assets"), dict):
+        args["assets"] = body.get("assets")
+    if isinstance(body.get("lock_bundle"), dict):
+        args["lock_bundle"] = body.get("lock_bundle")
+    if isinstance(body.get("quality_profile"), str):
+        args["quality_profile"] = body.get("quality_profile")
+    if isinstance(body.get("steps"), int):
+        args["steps"] = int(body.get("steps"))
+    if isinstance(body.get("cfg"), (int, float)):
+        args["cfg"] = float(body.get("cfg"))
+    # Route through canonical image.dispatch tool
+    res = await http_tool_run("image.dispatch", args)
+    if isinstance(res, dict) and isinstance(res.get("result"), dict):
+        result_obj = res.get("result") or {}
+        # Preserve legacy shape: prompt_id, cid, paths
+        paths = result_obj.get("paths") if isinstance(result_obj.get("paths"), list) else []
+        return _ok(
+            {
+                "prompt_id": result_obj.get("prompt_id") or (result_obj.get("ids") or {}).get("prompt_id"),
+                "cid": result_obj.get("cid") or (result_obj.get("ids") or {}).get("client_id"),
+                "paths": paths,
+            },
+            rid,
         )
-        return _ok({"prompt_id": res.get("prompt_id"), "cid": res.get("cid"), "paths": res.get("paths")}, rid)
-    except Exception as ex:
-        return _jerr(422, rid, "image_generate_failed", str(ex))
+    # Tool failed; surface as envelope error but keep HTTP 200
+    err_msg = res.get("error") if isinstance(res, dict) else "image_dispatch_failed"
+    return _jerr(422, rid, "image_generate_failed", str(err_msg))
 def _origin_norm(s: str) -> str:
     s = (s or "").strip()
     if s.startswith("ws://"): s = "http://" + s[5:]
@@ -1832,30 +1497,23 @@ async def post_image_dispatch(request: Request):
     steps_val = obj.get("steps") if isinstance(obj.get("steps"), int) else None
     cfg_val = obj.get("cfg")
     cfg_num = float(cfg_val) if isinstance(cfg_val, (int, float)) else None
-    try:
-        result = await _image_dispatch_run(
-            prompt,
-            negative,
-            seed,
-            width,
-            height,
-            size,
-            assets,
-            steps=steps_val,
-            cfg_scale=cfg_num,
-            lock_bundle=lock_bundle,
-            quality_profile=quality_profile,
-        )
-    except Exception as ex:
-        return ToolEnvelope.failure(
-            "image_dispatch_failed",
-            str(ex),
-            status=500,
-            request_id=rid,
-        )
-    # For dispatcher, surface the raw tool result in the envelope result
+    # For dispatcher, surface the raw tool result in the envelope result via the canonical tool.run path.
+    args = {
+        "prompt": prompt,
+        "negative": negative,
+        "seed": seed,
+        "width": width,
+        "height": height,
+        "size": size,
+        "assets": assets,
+        "lock_bundle": lock_bundle,
+        "quality_profile": quality_profile,
+        "steps": steps_val,
+        "cfg": cfg_num,
+    }
+    res = await http_tool_run("image.dispatch", args)
     return ToolEnvelope.success(
-        result if isinstance(result, dict) else {"value": result},
+        res.get("result") if isinstance(res, dict) and isinstance(res.get("result"), dict) else res,
         request_id=rid,
     )
 _characters_mem: Dict[str, Dict[str, Any]] = {}
@@ -2926,19 +2584,57 @@ async def postrun_committee_decide(
         {"role": "user", "content": json.dumps(user_blob, ensure_ascii=False)},
         {"role": "system", "content": "Return ONLY a single JSON object with keys: action, rationale, patch_plan."},
     ]
-    # Reuse planner backend for committee call
-    use_qwen = str(PLANNER_MODEL or "qwen").lower().startswith("qwen")
-    committee_id = QWEN_MODEL_ID if use_qwen else GPTOSS_MODEL_ID
-    committee_base = QWEN_BASE_URL if use_qwen else GPTOSS_BASE_URL
-    payload = build_ollama_payload(msgs, committee_id, DEFAULT_NUM_CTX, 0.0)
-    _log("committee.postrun.call", trace_id=trace_id, base=committee_base, model=committee_id)
-    res = await call_ollama(committee_base, payload)
-    text = (res.get("response") or "").strip() if isinstance(res, dict) else ""
-    obj = parser.parse(text, {"action": str, "rationale": str, "patch_plan": [{"tool": str, "args": dict}]})
-    action = (obj.get("action") or "").strip().lower()
-    rationale = (obj.get("rationale") or "") if isinstance(obj.get("rationale"), str) else ""
-    steps = obj.get("patch_plan") or []
-    out = {"action": (action or "go"), "rationale": rationale, "patch_plan": (steps if isinstance(steps, list) else [])}
+    # Two-model postrun committee: gather decisions from all participants and merge.
+    decisions: List[Dict[str, Any]] = []
+    for p in COMMITTEE_PARTICIPANTS:
+        member = p.get("id") or "member"
+        base = (p.get("base") or "").rstrip("/") or QWEN_BASE_URL
+        model = p.get("model") or QWEN_MODEL_ID
+        payload = build_ollama_payload(msgs, model, DEFAULT_NUM_CTX, 0.0)
+        _log("committee.postrun.call", trace_id=trace_id, base=base, model=model, member=member)
+        try:
+            res = await call_ollama(base, payload)
+            text = (res.get("response") or "").strip() if isinstance(res, dict) else ""
+            obj = parser.parse(text, {"action": str, "rationale": str, "patch_plan": [{"tool": str, "args": dict}]})
+            action = (obj.get("action") or "").strip().lower() or "go"
+            rationale = (obj.get("rationale") or "") if isinstance(obj.get("rationale"), str) else ""
+            steps = obj.get("patch_plan") or []
+            decisions.append(
+                {
+                    "member": member,
+                    "action": action,
+                    "rationale": rationale,
+                    "patch_plan": steps if isinstance(steps, list) else [],
+                }
+            )
+            _log("committee.postrun.member", trace_id=trace_id, member=member, action=action)
+        except Exception as ex:
+            _log("committee.postrun.member.error", trace_id=trace_id, member=member, message=str(ex))
+
+    if not decisions:
+        out = {"action": "go", "rationale": "committee_unavailable", "patch_plan": []}
+        _log("committee.postrun.ok", trace_id=trace_id, action=out.get("action"), rationale=out.get("rationale"))
+        return out
+
+    # Merge decisions: prefer more conservative actions when disagreeing.
+    rank = {"go": 0, "revise": 1, "fail": 2}
+    best = max(decisions, key=lambda d: rank.get(d.get("action") or "go", 0))
+    merged_action = best.get("action") or "go"
+    # Merge rationales and patch plans (cap patch_plan length to 2 steps).
+    merged_rationale_parts: List[str] = []
+    merged_patch_plan: List[Dict[str, Any]] = []
+    for d in decisions:
+        r = d.get("rationale") or ""
+        if isinstance(r, str) and r.strip():
+            merged_rationale_parts.append(f"{d.get('member')}: {r.strip()[:256]}")
+        if d.get("action") in ("revise", "fail"):
+            for step in (d.get("patch_plan") or []):
+                if len(merged_patch_plan) >= 2:
+                    break
+                if isinstance(step, dict):
+                    merged_patch_plan.append(step)
+    merged_rationale = " | ".join(merged_rationale_parts) if merged_rationale_parts else best.get("rationale") or ""
+    out = {"action": merged_action, "rationale": merged_rationale, "patch_plan": merged_patch_plan}
     _log("committee.postrun.ok", trace_id=trace_id, action=out.get("action"), rationale=out.get("rationale"))
     try:
         _trace_log_event(
@@ -3224,21 +2920,22 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         assets = dict(a.get("assets") if isinstance(a.get("assets"), dict) else {})
         if lock_bundle:
             assets["lock_bundle"] = lock_bundle
-        res = await _image_dispatch_run(
-            str(prompt),
-            negative if isinstance(negative, str) else None,
-            seed if isinstance(seed, int) else None,
-            width if isinstance(width, int) else None,
-            height if isinstance(height, int) else None,
-            size if isinstance(size, str) else None,
-            assets,
-            steps=steps_val,
-            cfg_scale=cfg_num,
-            lock_bundle=lock_bundle,
-            quality_profile=quality_profile,
-            trace_id=a.get("trace_id") if isinstance(a.get("trace_id"), str) else None,
-        )
-        return {"name": name, "result": res}
+        args = {
+            "prompt": str(prompt),
+            "negative": negative if isinstance(negative, str) else None,
+            "seed": seed if isinstance(seed, int) else None,
+            "width": width if isinstance(width, int) else None,
+            "height": height if isinstance(height, int) else None,
+            "size": size if isinstance(size, str) else None,
+            "assets": assets,
+            "lock_bundle": lock_bundle,
+            "quality_profile": quality_profile,
+            "steps": steps_val,
+            "cfg": cfg_num,
+            "trace_id": a.get("trace_id") if isinstance(a.get("trace_id"), str) else None,
+        }
+        res = await http_tool_run("image.dispatch", args)
+        return {"name": name, "result": res.get("result") if isinstance(res, dict) and isinstance(res.get("result"), dict) else res}
     if name == "film2.run" and ALLOW_TOOL_EXECUTION:
         # Unified Film-2 shot runner. Executes internal video passes and writes distilled traces/artifacts.
         a = raw_args if isinstance(raw_args, dict) else {}
@@ -6101,29 +5798,62 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     _log("committee.context", trace_id=trace_id, evidence=_ev, risks=_risks)
     # Pre-review checkpoint
     checkpoints_append_event(STATE_DIR, trace_id, "committee.review.pre", {"evidence": _ev, "risks": _risks})
-    _proposals = [
-        {"id": "opt_qwen", "author": "qwen", "rationale": "Direct dispatch with executor defaults; minimal plan", "tools_outline": ["image.dispatch"]},
-        {"id": "opt_gptoss", "author": "gptoss", "rationale": "Typed arguments with explicit parsing step to enforce object-only args", "tools_outline": ["json.parse", "image.dispatch"]},
+
+    # Run a lightweight two-model committee to propose planning strategies.
+    preplan_options: List[Dict[str, Any]] = []
+    parser = JSONParser()
+    # Compact summary of the current conversation for committee members
+    committee_user_text = (last_user_text or "").strip()
+    committee_msgs = [
+        {"role": "system", "content": "You are a planning committee member. Propose a high-level tool strategy as JSON: {\"rationale\": str, \"tools_outline\": [str]}."},
+        {"role": "user", "content": committee_user_text or "No user text available."},
     ]
-    _log("committee.proposals", trace_id=trace_id, options=_proposals)
-    _vote = {
-        "votes": [
-            {"member": "qwen", "option_id": "opt_gptoss", "reasons": ["typed args ensure validator clarity"]},
-            {"member": "gptoss", "option_id": "opt_gptoss", "reasons": ["reduces 422 risk; explicit parse"]},
-        ],
-        "quorum": True,
-    }
-    _log("committee.vote", trace_id=trace_id, votes=_vote.get("votes"), quorum=bool(_vote.get("quorum")))
-    checkpoints_append_event(STATE_DIR, trace_id, "committee.decision.pre", {"votes": _vote.get("votes"), "quorum": bool(_vote.get("quorum"))})
-    if not bool(_vote.get("quorum")):
+    for p in COMMITTEE_PARTICIPANTS:
+        member = p.get("id") or "member"
+        base = (p.get("base") or "").rstrip("/") or QWEN_BASE_URL
+        model = p.get("model") or QWEN_MODEL_ID
+        payload = build_ollama_payload(committee_msgs, model, DEFAULT_NUM_CTX, DEFAULT_TEMPERATURE)
+        try:
+            _log("committee.preplan.call", trace_id=trace_id, member=member, base=base, model=model)
+            res = await call_ollama(base, payload)
+            text = (res.get("response") or "").strip() if isinstance(res, dict) else ""
+            parsed = parser.parse(text or "{}", {"rationale": str, "tools_outline": [str]})
+            rationale = (parsed.get("rationale") or text or "").strip()
+            tools_outline = parsed.get("tools_outline") or []
+        except Exception as ex:
+            rationale = f"(committee error: {ex})"
+            tools_outline = []
+        opt_id = f"opt_{member}"
+        preplan_options.append(
+            {
+                "id": opt_id,
+                "author": member,
+                "rationale": rationale,
+                "tools_outline": tools_outline,
+            }
+        )
+    _log("committee.proposals", trace_id=trace_id, options=preplan_options)
+    # Simple heuristic vote: prefer any option that explicitly mentions typed args/json.parse, otherwise first option wins.
+    winner_id = None
+    for opt in preplan_options:
+        outline = " ".join(opt.get("tools_outline") or [])
+        rat = (opt.get("rationale") or "").lower()
+        if "json.parse" in outline or "typed" in rat:
+            winner_id = opt.get("id")
+            break
+    if not winner_id and preplan_options:
+        winner_id = preplan_options[0].get("id")
+    votes = [{"member": opt.get("author") or "member", "option_id": winner_id or opt.get("id"), "reasons": [opt.get("rationale") or ""]} for opt in preplan_options]
+    vote_env = {"votes": votes, "quorum": bool(preplan_options)}
+    _log("committee.vote", trace_id=trace_id, votes=vote_env.get("votes"), quorum=bool(vote_env.get("quorum")))
+    checkpoints_append_event(STATE_DIR, trace_id, "committee.decision.pre", {"votes": vote_env.get("votes"), "quorum": bool(vote_env.get("quorum"))})
+    if not bool(vote_env.get("quorum")):
         _log("committee.quorum.fail", trace_id=trace_id)
-    # Determine winner (simple majority among two votes)
-    _winner = "opt_gptoss"
-    _proposal_ids = [p.get("id") for p in (_proposals or [])]
-    # Safety check: chosen option must be one of proposed
+    _winner = winner_id or (preplan_options[0].get("id") if preplan_options else "opt_qwen")
+    _proposal_ids = [p.get("id") for p in (preplan_options or [])]
     if _winner not in _proposal_ids:
         _log("committee.selection.warn", trace_id=trace_id, reason="chosen_option_not_in_proposals")
-    _log("planner.finalize", trace_id=trace_id, chosen_option_id=_winner, deltas_from_option=[], justification="Adopts committee-winning rationale for typed arguments")
+    _log("planner.finalize", trace_id=trace_id, chosen_option_id=_winner, deltas_from_option=[], justification="Chosen by two-model committee")
     _log("planner.call", trace_id=trace_id)
     plan_text, tool_calls = await planner_produce_plan(messages, body.get("tools"), body.get("temperature") or DEFAULT_TEMPERATURE, trace_id=trace_id, mode=mode)
     _log("planner.done", trace_id=trace_id, tool_count=len(tool_calls or []))

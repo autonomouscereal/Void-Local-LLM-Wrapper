@@ -409,7 +409,7 @@ async def tool_run(req: Request):
 				details=(env or {}),
 			)
 
-		# Use upstream global fixer (executor) for generic normalization; do not duplicate here
+		# Use the existing Comfy pipeline below for image.dispatch; do not import app.main._image_dispatch_run.
 
 		# Inline graph or path
 		inline = args.get("workflow_graph")
@@ -693,7 +693,9 @@ async def tool_run(req: Request):
 		# Persist artifacts under orchestrator /uploads and return absolute URLs for UI
 		from app.main import UPLOAD_DIR as _UPLOAD_DIR, PUBLIC_BASE_URL as _PUBLIC_BASE_URL  # type: ignore
 		import os as _os
-		save_dir = _os.path.join(_UPLOAD_DIR, "artifacts", "image", prompt_id or client_id)
+		# Use prompt_id as the canonical image cid for artifact paths
+		_cid = prompt_id or client_id
+		save_dir = _os.path.join(_UPLOAD_DIR, "artifacts", "image", _cid)
 		_os.makedirs(save_dir, exist_ok=True)
 		orch_urls: list[str] = []
 		async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
@@ -719,7 +721,24 @@ async def tool_run(req: Request):
 				rel = _os.path.relpath(dst, _UPLOAD_DIR).replace("\\", "/")
 				orch_urls.append(f"{_PUBLIC_BASE_URL.rstrip('/')}/uploads/{rel}" if _PUBLIC_BASE_URL else f"/uploads/{rel}")
 		if orch_urls:
+			# Attach orchestrator-served URLs and artifact descriptors for downstream consumers
 			result["meta"]["orch_view_urls"] = orch_urls
+			result["meta"]["cid"] = _cid
+			arts: list[dict[str, object]] = []
+			for im, url in zip(images, orch_urls):
+				fn = im.get("filename")
+				if not isinstance(fn, str) or not fn:
+					continue
+				arts.append(
+					{
+						"id": fn,
+						"kind": "image",
+						"path": f"/uploads/artifacts/image/{_cid}/{fn}",
+						"view_url": url,
+					}
+				)
+			if arts:
+				result["artifacts"] = arts
 			# Trace for distillation: emit chat.append with media parts for this trace
 			trc = args.get("trace_id") or args.get("cid")
 			if isinstance(trc, str) and trc.strip():
