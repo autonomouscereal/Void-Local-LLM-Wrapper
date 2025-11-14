@@ -5395,11 +5395,18 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     res["exact"] = _sp.sstr(ie)
                     res["latex"] = _sp.latex(ie)
                 elif task in ("limit",):
+                    # For limits, require an explicit point; if missing, return a structured error
                     if point is None:
-                        raise ValueError("point required for limit")
-                    le = _sp.limit(e, x, point)
-                    res["exact"] = _sp.sstr(le)
-                    res["latex"] = _sp.latex(le)
+                        res["error"] = {
+                            "code": "point_required",
+                            "message": "limit tasks require a finite point; provide args.point",
+                            "status": 0,
+                            "details": {},
+                        }
+                    else:
+                        le = _sp.limit(e, x, point)
+                        res["exact"] = _sp.sstr(le)
+                        res["latex"] = _sp.latex(le)
                 elif task in ("series",):
                     pe = e.series(x, 0 if point is None else point, order)
                     res["exact"] = _sp.sstr(pe)
