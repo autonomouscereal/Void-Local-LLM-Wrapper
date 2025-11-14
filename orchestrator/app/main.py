@@ -5876,6 +5876,13 @@ async def execute_tools(tool_calls: List[Dict[str, Any]], trace_id: str | None =
             )
     rid = str(trace_id or _uuid.uuid4().hex)
     payload = {"schema_version": 1, "request_id": rid, "trace_id": rid, "steps": steps}
+    # Trace executor calls explicitly so we can confirm that validated steps reach the executor
+    _log(
+        "executor.call",
+        trace_id=str(trace_id or rid),
+        base=EXECUTOR_BASE_URL,
+        steps_count=len(steps),
+    )
     async with _hx.AsyncClient(timeout=None) as client:
         try:
             r = await client.post(EXECUTOR_BASE_URL.rstrip("/") + "/execute", json=payload)
@@ -8085,8 +8092,28 @@ async def tool_validate(body: Dict[str, Any]):
         )
     name = (body or {}).get("name") or ""
     args = (body or {}).get("args") or {}
-    meta = _TOOL_SCHEMAS.get(name.strip())
+    tool_name = (str(name or "")).strip()
+    meta = _TOOL_SCHEMAS.get(tool_name)
     if not meta:
+        # Log unknown-tool cases for image.dispatch explicitly so validation failures are debuggable
+        if tool_name == "image.dispatch":
+            env = {
+                "schema_version": 1,
+                "request_id": rid,
+                "ok": False,
+                "result": None,
+                "error": {
+                    "code": "unknown_tool",
+                    "message": tool_name,
+                    "status": 404,
+                    "details": {},
+                },
+            }
+            _log(
+                "tool.validate.debug.image.dispatch",
+                trace_id=str(args.get("trace_id") or ""),
+                envelope=env,
+            )
         return ToolEnvelope.failure(
             "unknown_tool",
             f"{name}",
@@ -8150,6 +8177,25 @@ async def tool_validate(body: Dict[str, Any]):
         if method not in ("GET","POST","PUT","PATCH","DELETE","HEAD","OPTIONS"):
             errors.append({"code": "enum_mismatch", "path": "method", "allowed": ["GET","POST","PUT","PATCH","DELETE","HEAD","OPTIONS"], "got": method})
     if errors:
+        # Surface structured schema errors and log the full envelope for image.dispatch
+        if tool_name == "image.dispatch":
+            env = {
+                "schema_version": 1,
+                "request_id": rid,
+                "ok": False,
+                "result": None,
+                "error": {
+                    "code": "schema_validation",
+                    "message": "Invalid args",
+                    "status": 422,
+                    "details": {"errors": errors},
+                },
+            }
+            _log(
+                "tool.validate.debug.image.dispatch",
+                trace_id=str(args.get("trace_id") or ""),
+                envelope=env,
+            )
         return ToolEnvelope.failure(
             "schema_validation",
             "Invalid args",
