@@ -219,7 +219,25 @@ def get_builtin_tools_schema() -> List[Dict[str, Any]]:
 			"type": "function",
 			"function": {
 				"name": "image.dispatch",
-				"parameters": {"type": "object", "properties": {"mode": {"type": "string"}, "prompt": {"type": "string"}, "scale": {"type": "integer"}}, "required": []}
+				"parameters": {
+					"type": "object",
+					"properties": {
+						"prompt": {"type": "string"},
+						"negative": {"type": "string"},
+						"width": {"type": "integer"},
+						"height": {"type": "integer"},
+						"steps": {"type": "integer"},
+						"cfg": {"type": "number"},
+						"seed": {"type": "integer"},
+						"sampler": {"type": "string"},
+						"sampler_name": {"type": "string"},
+						"scheduler": {"type": "string"},
+						"workflow_path": {"type": "string"},
+						"workflow_graph": {"type": "object"},
+						"autofix_422": {"type": "boolean", "default": True}
+					},
+					"required": ["prompt"]
+				}
 			}
 		},
 		{
