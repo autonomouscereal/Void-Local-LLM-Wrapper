@@ -22,14 +22,14 @@ from ..datasets.trace import append_sample as _trace_append
 
 
 def _cosine_similarity(vec_a, vec_b):
-	if not vec_a or not vec_b or len(vec_a) != len(vec_b):
-		return None
-	num = sum(float(x) * float(y) for x, y in zip(vec_a, vec_b))
-	den_a = math.sqrt(sum(float(x) * float(x) for x in vec_a))
-	den_b = math.sqrt(sum(float(y) * float(y) for y in vec_b))
-	if den_a == 0.0 or den_b == 0.0:
-		return None
-	return num / (den_a * den_b)
+    if not vec_a or not vec_b or len(vec_a) != len(vec_b):
+        return None
+    num = sum(float(x) * float(y) for x, y in zip(vec_a, vec_b))
+    den_a = math.sqrt(sum(float(x) * float(x) for x in vec_a))
+    den_b = math.sqrt(sum(float(y) * float(y) for y in vec_b))
+    if den_a == 0.0 or den_b == 0.0:
+        return None
+    return num / (den_a * den_b)
 
 
 def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
@@ -52,11 +52,14 @@ def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
     cid = job.get("cid") or f"tts-{now_ts()}"
     outdir = os.path.join("/workspace", "uploads", "artifacts", "audio", "tts", cid)
     ensure_dir(outdir)
-    params = tts_edge_defaults({
-        "sample_rate": job.get("sample_rate"),
-        "max_seconds": job.get("max_seconds"),
-        "voice": job.get("voice"),
-    }, edge=bool(job.get("edge")))
+    params = tts_edge_defaults(
+        {
+            "sample_rate": job.get("sample_rate"),
+            "max_seconds": job.get("max_seconds"),
+            "voice": job.get("voice"),
+        },
+        edge=bool(job.get("edge")),
+    )
     lock = resolve_voice_lock(job.get("voice_id"), job.get("voice_refs"))
     lock_bundle = job.get("lock_bundle") if isinstance(job.get("lock_bundle"), dict) else None
     quality_profile = job.get("quality_profile")
@@ -67,7 +70,7 @@ def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
         for it in reversed(recents):
             for t in (it.get("tags") or []):
                 if isinstance(t, str) and t.startswith("voice:"):
-                    inferred_voice = t.split(":",1)[1]
+                    inferred_voice = t.split(":", 1)[1]
                     break
             if inferred_voice:
                 break
@@ -82,23 +85,27 @@ def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
         "channels": 1,
         "max_seconds": int(params.get("max_seconds") or 20),
         "voice_lock": lock,
-	"seed": job.get("seed"),
-	"lock_bundle": lock_bundle,
-	"quality_profile": quality_profile,
+        "seed": job.get("seed"),
+        "lock_bundle": lock_bundle,
+        "quality_profile": quality_profile,
     }
     args = stamp_tool_args("tts.speak", args)
     res = provider.speak(args)
     wav_bytes = res.get("wav_bytes") or b""
     dur = float(res.get("duration_s") or 0.0)
     model = res.get("model", "unknown")
-    stem = f"tts_{now_ts()}"; wav_path = os.path.join(outdir, stem + ".wav")
+    stem = f"tts_{now_ts()}"
+    wav_path = os.path.join(outdir, stem + ".wav")
     with open(wav_path, "wb") as f:
         f.write(wav_bytes)
     # Committee QA: peak-normalize to -1 dBFS and hard-trim to max_seconds
     try:
         def _peak_normalize(path: str, target_dbfs: float = -1.0) -> dict:
             with wave.open(path, "rb") as wf:
-                ch = wf.getnchannels(); sr = wf.getframerate(); sw = wf.getsampwidth(); n = wf.getnframes()
+                ch = wf.getnchannels()
+                sr = wf.getframerate()
+                sw = wf.getsampwidth()
+                n = wf.getnframes()
                 pcm = wf.readframes(n)
             if sw != 2 or not pcm:
                 return {"normalized": False}
@@ -106,7 +113,7 @@ def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
             peak = 0
             for i in range(0, len(pcm), 2 * ch):
                 for c in range(ch):
-                    s = struct.unpack('<h', pcm[i + 2*c:i + 2*c + 2])[0]
+                    s = struct.unpack("<h", pcm[i + 2 * c : i + 2 * c + 2])[0]
                     peak = max(peak, abs(s))
             if peak <= 0:
                 return {"normalized": False}
@@ -117,76 +124,99 @@ def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
             out = bytearray(len(pcm))
             for i in range(0, len(pcm), 2 * ch):
                 for c in range(ch):
-                    s = struct.unpack('<h', pcm[i + 2*c:i + 2*c + 2])[0]
+                    s = struct.unpack("<h", pcm[i + 2 * c : i + 2 * c + 2])[0]
                     v = int(max(-32768, min(32767, s * gain)))
-                    out[i + 2*c:i + 2*c + 2] = struct.pack('<h', v)
+                    out[i + 2 * c : i + 2 * c + 2] = struct.pack("<h", v)
             with wave.open(path, "wb") as wf:
-                wf.setnchannels(ch); wf.setsampwidth(sw); wf.setframerate(sr)
+                wf.setnchannels(ch)
+                wf.setsampwidth(sw)
+                wf.setframerate(sr)
                 wf.writeframes(bytes(out))
             return {"normalized": True, "peak_dbfs": peak_dbfs, "applied_db": (target_dbfs - peak_dbfs)}
+
         def _hard_trim(path: str, max_seconds: float) -> dict:
             if max_seconds is None:
                 return {"trimmed": False}
             with wave.open(path, "rb") as wf:
-                ch = wf.getnchannels(); sr = wf.getframerate(); sw = wf.getsampwidth(); n = wf.getnframes()
+                ch = wf.getnchannels()
+                sr = wf.getframerate()
+                sw = wf.getsampwidth()
+                n = wf.getnframes()
                 max_frames = int(max(0, max_seconds) * sr)
                 if n <= max_frames:
                     return {"trimmed": False}
                 wf.rewind()
                 data = wf.readframes(max_frames)
             with wave.open(path, "wb") as wf2:
-                wf2.setnchannels(ch); wf2.setsampwidth(sw); wf2.setframerate(sr)
+                wf2.setnchannels(ch)
+                wf2.setsampwidth(sw)
+                wf2.setframerate(sr)
                 wf2.writeframes(data)
             return {"trimmed": True, "old_frames": n, "new_frames": max_frames}
-	qa_norm = {"normalized": False}
-	# Optional peak normalize only if requested
-	if bool(job.get("normalize")):
-		qa_norm = _peak_normalize(wav_path, -1.0)
-	qa_trim = _hard_trim(wav_path, float(params.get("max_seconds") or 0))
-	# Analyze LUFS always, normalize only if requested
-	ainfo = analyze_audio(wav_path)
-	if isinstance(ainfo, dict):
-		qa_norm["lufs_before"] = ainfo.get("lufs")
-	if bool(job.get("normalize_lufs")):
-		applied = normalize_lufs(wav_path, -16.0)
-		if applied is not None:
-			qa_norm["lufs_gain_db"] = float(applied)
+
+        qa_norm = {"normalized": False}
+        # Optional peak normalize only if requested
+        if bool(job.get("normalize")):
+            qa_norm = _peak_normalize(wav_path, -1.0)
+        qa_trim = _hard_trim(wav_path, float(params.get("max_seconds") or 0))
+        # Analyze LUFS always, normalize only if requested
+        ainfo = analyze_audio(wav_path)
+        if isinstance(ainfo, dict):
+            qa_norm["lufs_before"] = ainfo.get("lufs")
+        if bool(job.get("normalize_lufs")):
+            applied = normalize_lufs(wav_path, -16.0)
+            if applied is not None:
+                qa_norm["lufs_gain_db"] = float(applied)
     except Exception:
-        qa_norm = {"normalized": False}; qa_trim = {"trimmed": False}
-locks_meta: Dict[str, Any] = {}
-if lock_bundle:
-	locks_meta["bundle"] = lock_bundle
-	audio_section = lock_bundle.get("audio") if isinstance(lock_bundle.get("audio"), dict) else {}
-	ref_voice = audio_section.get("voice_embedding")
-	if isinstance(ref_voice, list):
-		voice_embed = voice_embedding_from_path(wav_path)
-		if isinstance(voice_embed, list):
-			sim = _cosine_similarity(ref_voice, voice_embed)
-			if sim is not None:
-				locks_meta["voice_score"] = max(0.0, min((sim + 1.0) / 2.0, 1.0))
-				locks_meta["voice_embedding"] = voice_embed
-	lyrics_segments = audio_section.get("lyrics_segments") if isinstance(audio_section.get("lyrics_segments"), list) else []
-	hard_segments = [seg for seg in lyrics_segments if isinstance(seg, dict) and (seg.get("lock_mode") or "hard").lower() == "hard"]
-	if hard_segments:
-		text_lower = (args.get("text") or "").lower()
-		matched = 0
-		for seg in hard_segments:
-			seg_text = (seg.get("text") or "").lower()
-			if seg_text and seg_text in text_lower:
-				matched += 1
-		locks_meta["lyrics_score"] = matched / len(hard_segments) if hard_segments else None
-if quality_profile:
-	locks_meta.setdefault("quality_profile", quality_profile)
-sidecar_payload = {
-	"tool": "tts.speak", "text": args.get("text"), "voice": args.get("voice"),
-	"rate": args.get("rate"), "pitch": args.get("pitch"), "sample_rate": args.get("sample_rate"),
-	"max_seconds": args.get("max_seconds"), "seed": args.get("seed"), "voice_lock": lock,
-	"model": model, "duration_s": dur,
-	"committee": {"peak_normalize": qa_norm, "hard_trim": qa_trim},
-}
-if locks_meta:
-	sidecar_payload["locks"] = locks_meta
-sidecar(wav_path, sidecar_payload)
+        qa_norm = {"normalized": False}
+        qa_trim = {"trimmed": False}
+    locks_meta: Dict[str, Any] = {}
+    if lock_bundle:
+        locks_meta["bundle"] = lock_bundle
+    audio_section = lock_bundle.get("audio") if isinstance(lock_bundle.get("audio"), dict) else {}
+    ref_voice = audio_section.get("voice_embedding")
+    if isinstance(ref_voice, list):
+        voice_embed = voice_embedding_from_path(wav_path)
+        if isinstance(voice_embed, list):
+            sim = _cosine_similarity(ref_voice, voice_embed)
+            if sim is not None:
+                locks_meta["voice_score"] = max(0.0, min((sim + 1.0) / 2.0, 1.0))
+                locks_meta["voice_embedding"] = voice_embed
+    lyrics_segments = (
+        audio_section.get("lyrics_segments") if isinstance(audio_section.get("lyrics_segments"), list) else []
+    )
+    hard_segments = [
+        seg
+        for seg in lyrics_segments
+        if isinstance(seg, dict) and (seg.get("lock_mode") or "hard").lower() == "hard"
+    ]
+    if hard_segments:
+        text_lower = (args.get("text") or "").lower()
+        matched = 0
+        for seg in hard_segments:
+            seg_text = (seg.get("text") or "").lower()
+            if seg_text and seg_text in text_lower:
+                matched += 1
+        locks_meta["lyrics_score"] = matched / len(hard_segments) if hard_segments else None
+    if quality_profile:
+        locks_meta.setdefault("quality_profile", quality_profile)
+    sidecar_payload = {
+        "tool": "tts.speak",
+        "text": args.get("text"),
+        "voice": args.get("voice"),
+        "rate": args.get("rate"),
+        "pitch": args.get("pitch"),
+        "sample_rate": args.get("sample_rate"),
+        "max_seconds": args.get("max_seconds"),
+        "seed": args.get("seed"),
+        "voice_lock": lock,
+        "model": model,
+        "duration_s": dur,
+        "committee": {"peak_normalize": qa_norm, "hard_trim": qa_trim},
+    }
+    if locks_meta:
+        sidecar_payload["locks"] = locks_meta
+    sidecar(wav_path, sidecar_payload)
     # Emotion/pace gate: single revision to match target emotion if provided
     try:
         target_emotion = None
@@ -208,7 +238,10 @@ sidecar(wav_path, sidecar_payload)
                 if wb2:
                     with open(wav_path, "wb") as f:
                         f.write(wb2)
-                    sidecar(wav_path, {"tool": "tts.speak.committee", "target_emotion": target_emotion, "adjusted": True})
+                    sidecar(
+                        wav_path,
+                        {"tool": "tts.speak.committee", "target_emotion": target_emotion, "adjusted": True},
+                    )
             if target_emotion == "calm" and cur != "calm":
                 adj = dict(args)
                 adj["rate"] = max(0.5, float(args.get("rate") or 1.0) * 0.9)
@@ -218,67 +251,99 @@ sidecar(wav_path, sidecar_payload)
                 if wb2:
                     with open(wav_path, "wb") as f:
                         f.write(wb2)
-                    sidecar(wav_path, {"tool": "tts.speak.committee", "target_emotion": target_emotion, "adjusted": True})
+                    sidecar(
+                        wav_path,
+                        {"tool": "tts.speak.committee", "target_emotion": target_emotion, "adjusted": True},
+                    )
     except Exception:
         pass
     try:
-        append_tts_sample(outdir, {
-            "text": args.get("text"),
-            "voice": args.get("voice"),
-            "rate": args.get("rate"),
-            "pitch": args.get("pitch"),
-            "sample_rate": args.get("sample_rate"),
-            "seed": int(args.get("seed") or 0),
-            "voice_lock": bool(lock),
-            "audio_ref": wav_path,
-            "duration_s": dur,
-            "model": model,
-            "created_at": now_ts(),
-        })
+        append_tts_sample(
+            outdir,
+            {
+                "text": args.get("text"),
+                "voice": args.get("voice"),
+                "rate": args.get("rate"),
+                "pitch": args.get("pitch"),
+                "sample_rate": args.get("sample_rate"),
+                "seed": int(args.get("seed") or 0),
+                "voice_lock": bool(lock),
+                "audio_ref": wav_path,
+                "duration_s": dur,
+                "model": model,
+                "created_at": now_ts(),
+            },
+        )
     except Exception:
         pass
     try:
         if job.get("voice_id"):
-            append_provenance(job.get("voice_id"), {"when": now_ts(), "tool": "tts.speak", "artifact": wav_path, "seed": int(args.get("seed") or 0)})
+            append_provenance(
+                job.get("voice_id"),
+                {"when": now_ts(), "tool": "tts.speak", "artifact": wav_path, "seed": int(args.get("seed") or 0)},
+            )
     except Exception:
         pass
     add_manifest_row(manifest, wav_path, step_id="tts.speak")
     try:
-        _ctx_add(cid, "audio", wav_path, None, None, ["voice", f"voice:{args.get('voice')}"] if args.get("voice") else ["voice"], {"model": model})
+        _ctx_add(
+            cid,
+            "audio",
+            wav_path,
+            None,
+            None,
+            ["voice", f"voice:{args.get('voice')}"] if args.get("voice") else ["voice"],
+            {"model": model},
+        )
     except Exception:
         pass
     env = {
-        "meta": {"model": model, "ts": now_ts(), "cid": cid, "step": 0, "state": "halt", "cont": {"present": False, "state_hash": None, "reason": None}},
+        "meta": {
+            "model": model,
+            "ts": now_ts(),
+            "cid": cid,
+            "step": 0,
+            "state": "halt",
+            "cont": {"present": False, "state_hash": None, "reason": None},
+        },
         "reasoning": {"goal": "tts", "constraints": ["json-only", "edge-safe"], "decisions": ["tts.speak done"]},
         "evidence": [],
         "message": {"role": "assistant", "type": "tool", "content": "tts generated"},
         "tool_calls": [{"tool": "tts.speak", "args": args, "status": "done", "result_ref": os.path.basename(wav_path)}],
-        "artifacts": [{"id": os.path.basename(wav_path), "kind": "audio-ref", "summary": stem, "bytes": len(wav_bytes)}],
+        "artifacts": [
+            {"id": os.path.basename(wav_path), "kind": "audio-ref", "summary": stem, "bytes": len(wav_bytes)}
+        ],
         "telemetry": {"window": {"input_bytes": 0, "output_target_tokens": 0}, "compression_passes": [], "notes": []},
     }
-env_meta = env.setdefault("meta", {})
-if quality_profile:
-	env_meta.setdefault("quality_profile", quality_profile)
-if locks_meta:
-	env_meta["locks"] = locks_meta
-env = normalize_to_envelope(json.dumps(env)); env = bump_envelope(env); assert_envelope(env); env = stamp_env(env, "tts.speak", model)
+    env_meta = env.setdefault("meta", {})
+    if quality_profile:
+        env_meta.setdefault("quality_profile", quality_profile)
+    if locks_meta:
+        env_meta["locks"] = locks_meta
+    env = normalize_to_envelope(json.dumps(env))
+    env = bump_envelope(env)
+    assert_envelope(env)
+    env = stamp_env(env, "tts.speak", model)
     # Trace row for distillation
     try:
         ainfo = analyze_audio(wav_path)
-        _trace_append("tts", {
-            "cid": cid,
-            "tool": "tts.speak",
-            "text": args.get("text"),
-            "voice": args.get("voice"),
-            "rate": args.get("rate"),
-            "pitch": args.get("pitch"),
-            "seed": int(args.get("seed") or 0),
-            "model": model,
-            "path": wav_path,
-            "lufs": ainfo.get("lufs") if isinstance(ainfo, dict) else None,
-            "tempo_bpm": ainfo.get("tempo_bpm") if isinstance(ainfo, dict) else None,
-            "emotion": ainfo.get("emotion") if isinstance(ainfo, dict) else None,
-        })
+        _trace_append(
+            "tts",
+            {
+                "cid": cid,
+                "tool": "tts.speak",
+                "text": args.get("text"),
+                "voice": args.get("voice"),
+                "rate": args.get("rate"),
+                "pitch": args.get("pitch"),
+                "seed": int(args.get("seed") or 0),
+                "model": model,
+                "path": wav_path,
+                "lufs": ainfo.get("lufs") if isinstance(ainfo, dict) else None,
+                "tempo_bpm": ainfo.get("tempo_bpm") if isinstance(ainfo, dict) else None,
+                "emotion": ainfo.get("emotion") if isinstance(ainfo, dict) else None,
+            },
+        )
     except Exception:
         pass
     return env
