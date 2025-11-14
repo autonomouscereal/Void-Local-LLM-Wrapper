@@ -41,9 +41,12 @@ import imageio.v3 as iio  # type: ignore
 import asyncio
 import hashlib as _hl
 import json
-from typing import Any, Dict, List, Optional, Tuple, TypedDict
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, TypedDict
 import time
 import traceback
+import numpy as np  # type: ignore
+import math
+import librosa  # type: ignore
 
 from .ops.policy import enforce_core_policy
 enforce_core_policy()
@@ -108,11 +111,43 @@ from .artifacts.shard import newest_part as _art_newest_part, list_parts as _art
 from .artifacts.manifest import add_manifest_row as _art_manifest_add, write_manifest_atomic as _art_manifest_write
 from .datasets.trace import append_sample as _trace_append
 from .embeddings.core import build_embeddings_response as _build_embeddings_response
+from .traces.writer import (
+    log_request as _trace_log_request,
+    log_tool as _trace_log_tool,
+    log_event as _trace_log_event,
+    log_artifact as _trace_log_artifact,
+    log_response as _trace_log_response,
+    log_error as _trace_log_error,
+)
 from .analysis.media import analyze_image as _analyze_image, analyze_audio as _analyze_audio
 from .review.referee import build_delta_plan as _build_delta_plan
 from .review.ledger_writer import append_ledger as _append_ledger
 from .comfy.dispatcher import load_workflow as _comfy_load_wf, patch_workflow as _comfy_patch_wf, submit as _comfy_submit
 from .comfy.client_aio import comfy_submit as _comfy_submit_aio, comfy_history as _comfy_history_aio, comfy_upload_image as _comfy_upload_image, comfy_upload_mask as _comfy_upload_mask, comfy_view as _comfy_view, choose_sampler_name as _choose_sampler_name
+from .locks.store import locks_root as _locks_root, upsert_lock_bundle as _lock_save, get_lock_bundle as _lock_load
+from .locks.builder import (
+    build_image_bundle as _build_image_lock_bundle,
+    build_audio_bundle as _build_audio_lock_bundle,
+    build_region_locks as _build_region_lock_bundle,
+    apply_region_mode_updates as _apply_region_mode_updates,
+    apply_audio_mode_updates as _apply_audio_mode_updates,
+    voice_embedding_from_path as _lock_voice_embedding_from_path,
+)
+from .locks.runtime import (
+    apply_quality_profile as _lock_apply_profile,
+    bundle_to_image_locks as _lock_to_assets,
+    QUALITY_PRESETS as LOCK_QUALITY_PRESETS,
+    quality_thresholds as _lock_quality_thresholds,
+    update_bundle_from_hero_frame as _lock_update_from_hero,
+)
+from services.image.analysis.locks import (
+    compute_face_lock_score as _compute_face_lock_score,
+    compute_style_similarity as _compute_style_similarity,
+    compute_pose_similarity as _compute_pose_similarity,
+    compute_region_scores,
+    compute_scene_score,
+)
+from .film2.hero import choose_hero_frame
 from .image.graph_builder import build_full_graph as _build_full_graph
 from .tools_image.common import ensure_dir as _ensure_dir, sidecar as _sidecar, make_outpaths as _make_outpaths, now_ts as _now_ts
 from .analysis.media import analyze_image as _analyze_image
@@ -124,8 +159,64 @@ from .context.index import add_artifact as _ctx_add
 from .pipeline.subject_resolver import resolve_subject_canon as _resolve_subject_canon  # type: ignore
 from .pipeline.roe_store import load_roe_digest as _roe_load, save_roe_digest as _roe_save  # type: ignore
 from .pipeline.tool_evidence_store import load_recent_tool_evidence as _tel_load, append_tool_evidence as _tel_append  # type: ignore
+from .pipeline.validator import validate_and_repair as validator_validate_and_repair  # type: ignore
+from .http.client import HttpRequestConfig, perform_http_request, validate_remote_host  # type: ignore
+# Lightweight tool kind overlay for planner mode (reuses existing catalog/builtins)
+# Treat all tools as analysis by default; explicitly tag action/asset-creating tools.
+ACTION_TOOL_NAMES = {
+    # Front-door action tools only (planner-visible action surfaces)
+    "image.dispatch",
+    "music.compose",  # or "music.dispatch" if preferred as the single music surface
+    "film.run",       # Film-2 front door (planner-visible)
+    "tts.speak",
+}
 
-async def _image_dispatch_run(prompt: str, negative: Optional[str], seed: Optional[int], width: Optional[int], height: Optional[int], size: Optional[str], assets: Dict[str, Any], trace_id: Optional[str] = None) -> Dict[str, Any]:
+# Planner-visible tool whitelist: only expose front doors + analysis utilities
+PLANNER_VISIBLE_TOOLS = {
+    # Action front doors
+    "image.dispatch", "music.compose", "film.run", "tts.speak",
+    # Lock management
+    "locks.build_image_bundle", "locks.build_audio_bundle", "locks.get_bundle",
+    "locks.build_region_locks", "locks.update_region_modes", "locks.update_audio_modes",
+    # Analysis/search utilities
+    "rag_search", "research.run", "web_search", "metasearch.fuse", "web.smart_get", "source_fetch", "math.eval",
+}
+
+def _filter_tool_names_by_mode(names: List[str], mode: Optional[str]) -> List[str]:
+    m = (mode or "general").strip().lower()
+    base = sorted([n for n in (names or []) if isinstance(n, str) and n.strip()])
+    if m in ("general", "chat", "analysis"):
+        # In chat/analysis: hide only explicit action tools
+        return [n for n in base if n not in ACTION_TOOL_NAMES]
+    # In job/other modes: allow everything
+    return base
+
+def _allowed_tools_for_mode(mode: Optional[str]) -> List[str]:
+    # Start from existing catalog (routes + builtins) to avoid drift
+    allowed_set = catalog_allowed(get_builtin_tools_schema)
+    # Restrict to planner-visible tools only
+    base = sorted([n for n in allowed_set if isinstance(n, str) and n.strip() and n in PLANNER_VISIBLE_TOOLS])
+    m = (mode or "general").strip().lower()
+    if m in ("general", "chat", "analysis"):
+        # In chat: all catalog tools except explicit action tools
+        return [n for n in base if n not in ACTION_TOOL_NAMES]
+    # In job: full catalog
+    return base
+
+async def _image_dispatch_run(
+    prompt: str,
+    negative: Optional[str],
+    seed: Optional[int],
+    width: Optional[int],
+    height: Optional[int],
+    size: Optional[str],
+    assets: Dict[str, Any],
+    steps: Optional[int] = None,
+    cfg_scale: Optional[float] = None,
+    lock_bundle: Optional[Dict[str, Any]] = None,
+    quality_profile: Optional[str] = None,
+    trace_id: Optional[str] = None,
+) -> Dict[str, Any]:
     if not isinstance(prompt, str):
         prompt = ""
     # size normalization
@@ -141,6 +232,38 @@ async def _image_dispatch_run(prompt: str, negative: Optional[str], seed: Option
     # New lock-rich pipeline: upload refs → build full graph → submit → poll → save
     uploaded: Dict[str, str] = {}
     locks = assets.get("locks") if isinstance(assets.get("locks"), dict) else {}
+    prompt_text = prompt
+    if isinstance(lock_bundle, dict) and lock_bundle:
+        derived = _lock_to_assets(lock_bundle)
+        if derived:
+            merged_locks: Dict[str, Any] = dict(locks or {})
+            for key, value in derived.items():
+                if key in ("faces", "poses", "depths", "layouts", "clothes_styles"):
+                    existing = list(merged_locks.get(key) or [])
+                    if isinstance(value, list):
+                        merged_locks[key] = existing + value
+                else:
+                    merged_locks[key] = value
+            locks = merged_locks
+            style_tags = derived.get("style_tags") if isinstance(derived.get("style_tags"), list) else []
+            if style_tags:
+                prompt_text = (prompt_text + ", " + ", ".join(style_tags)).strip(", ")
+            regions_map = derived.get("regions") if isinstance(derived.get("regions"), dict) else {}
+            region_prompt_tags: List[str] = []
+            if regions_map:
+                for region_id, region_data in regions_map.items():
+                    if not isinstance(region_data, dict):
+                        continue
+                    palette = region_data.get("color_palette") if isinstance(region_data.get("color_palette"), dict) else {}
+                    primary = palette.get("primary")
+                    if isinstance(primary, str) and primary:
+                        region_prompt_tags.append(f"{region_id} color {primary}")
+                    role = region_data.get("role")
+                    if isinstance(role, str) and role:
+                        region_prompt_tags.append(f"{role} details for {region_id}")
+            if region_prompt_tags:
+                prompt_text = (prompt_text + ", " + ", ".join(region_prompt_tags)).strip(", ")
+    prompt = prompt_text
     # faces
     for i, f in enumerate(locks.get("faces") or []):
         b64p = f.get("ref_b64")
@@ -164,6 +287,23 @@ async def _image_dispatch_run(prompt: str, negative: Optional[str], seed: Option
         b64p = p.get("image_b64") or p.get("ref_b64")
         if isinstance(b64p, str) and b64p:
             uploaded[f"pose_{i}"] = await _comfy_upload_image(f"pose{i}", b64p)
+    region_assets: Dict[str, Any] = {}
+    if isinstance(locks.get("regions"), dict):
+        for region_id, region_data in locks.get("regions", {}).items():
+            if not isinstance(region_data, dict):
+                continue
+            mask_b64 = region_data.get("mask_b64")
+            if not isinstance(mask_b64, str) or not mask_b64:
+                continue
+            try:
+                upload_key = await _comfy_upload_image(f"region_{region_id}", mask_b64)
+            except Exception:
+                continue
+            asset_entry = dict(region_data)
+            asset_entry["mask_asset"] = upload_key
+            region_assets[str(region_id)] = asset_entry
+    if region_assets:
+        locks["region_assets"] = region_assets
 
     # Resolve a valid sampler from this Comfy instance
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None)) as _s:
@@ -177,6 +317,10 @@ async def _image_dispatch_run(prompt: str, negative: Optional[str], seed: Option
         "height": (int(h) if isinstance(h, int) else None),
         "sampler": sampler_name,
         "locks": locks,
+        "steps": steps,
+        "cfg": cfg_scale,
+        "lock_bundle": lock_bundle,
+        "quality_profile": quality_profile,
     }
     graph = _build_full_graph(graph_req, uploaded)
     # Log payload size and write last prompt for debugging
@@ -234,6 +378,15 @@ async def _image_dispatch_run(prompt: str, negative: Optional[str], seed: Option
         png_path, meta_path = _make_outpaths(outdir, stem)
         with open(png_path, "wb") as _f:
             _f.write(data)
+        # Compatibility: also write a copy using the original Comfy filename so legacy UIs/links work
+        try:
+            _orig_name = os.path.basename(fn)
+            if isinstance(_orig_name, str) and _orig_name:
+                _orig_path = os.path.join(outdir, _orig_name)
+                with open(_orig_path, "wb") as _of:
+                    _of.write(data)
+        except Exception:
+            pass
         _sidecar(png_path, {
             "tool": "image.dispatch",
             "prompt": prompt,
@@ -248,6 +401,11 @@ async def _image_dispatch_run(prompt: str, negative: Optional[str], seed: Option
             "comfy_view": view_url,
         })
         _man_add(manifest, png_path, step_id="image.dispatch")
+        try:
+            if "_orig_path" in locals() and isinstance(_orig_path, str) and os.path.exists(_orig_path):
+                _man_add(manifest, _orig_path, step_id="image.dispatch")
+        except Exception:
+            pass
         ai = _analyze_image(png_path, prompt=str(prompt))
         clip_s = float(ai.get("clip_score") or 0.0)
         trace_append("image", {"cid": cid, "tool": "image.dispatch", "prompt": prompt, "path": png_path, "clip_score": clip_s, "tags": ai.get("tags") or []})
@@ -286,10 +444,90 @@ async def _image_dispatch_run(prompt: str, negative: Optional[str], seed: Option
                 rel = os.path.relpath(s.get("path"), UPLOAD_DIR).replace("\\", "/")
                 await conn.execute("INSERT INTO rag_docs (path, chunk, embedding) VALUES ($1, $2, $3)", rel, prompt, list(vec))
 
+    locks_meta: Dict[str, Any] = {}
+    if lock_bundle:
+        face_scores: List[float] = []
+        pose_scores: List[float] = []
+        style_scores: List[float] = []
+        region_shape_scores: List[float] = []
+        region_texture_scores: List[float] = []
+        region_color_scores: List[float] = []
+        region_lock_details: Dict[str, Dict[str, Optional[float]]] = {}
+        scene_scores: List[float] = []
+        region_bundle = lock_bundle.get("regions") if isinstance(lock_bundle.get("regions"), dict) else {}
+        scene_bundle = lock_bundle.get("scene") if isinstance(lock_bundle.get("scene"), dict) else {}
+        for s in saved:
+            path = s.get("path")
+            if not isinstance(path, str) or not path:
+                continue
+            entry_locks: Dict[str, Any] = {}
+            face_ref = (lock_bundle.get("face") or {}).get("embedding") if isinstance(lock_bundle.get("face"), dict) else None
+            if isinstance(face_ref, list):
+                face_score = await _compute_face_lock_score(path, face_ref)
+                if face_score is not None:
+                    entry_locks["face_score"] = face_score
+                    face_scores.append(face_score)
+            pose_ref = lock_bundle.get("pose") if isinstance(lock_bundle.get("pose"), dict) else None
+            if pose_ref:
+                pose_score = await _compute_pose_similarity(path, pose_ref)
+                if pose_score is not None:
+                    entry_locks["pose_score"] = pose_score
+                    pose_scores.append(pose_score)
+            style_ref = (lock_bundle.get("style") or {}).get("palette") if isinstance(lock_bundle.get("style"), dict) else None
+            if isinstance(style_ref, dict):
+                style_score = await _compute_style_similarity(path, style_ref)
+                if style_score is not None:
+                    entry_locks["style_score"] = style_score
+                    style_scores.append(style_score)
+            if region_bundle:
+                region_scores_entry: Dict[str, Any] = {}
+                for region_id, region_data in region_bundle.items():
+                    if not isinstance(region_data, dict):
+                        continue
+                    metrics = await compute_region_scores(path, region_data)
+                    if metrics:
+                        region_scores_entry[region_id] = metrics
+                        shape_score = metrics.get("shape_score")
+                        texture_score = metrics.get("texture_score")
+                        color_score = metrics.get("color_score")
+                        if isinstance(shape_score, (int, float)):
+                            region_shape_scores.append(float(shape_score))
+                        if isinstance(texture_score, (int, float)):
+                            region_texture_scores.append(float(texture_score))
+                        if isinstance(color_score, (int, float)):
+                            region_color_scores.append(float(color_score))
+                if region_scores_entry:
+                    entry_locks["regions"] = region_scores_entry
+                    region_lock_details.update(region_scores_entry)
+            if scene_bundle:
+                scene_score = await compute_scene_score(path, scene_bundle)
+                if scene_score is not None:
+                    entry_locks["scene_score"] = scene_score
+                    scene_scores.append(scene_score)
+            if entry_locks:
+                s["locks"] = entry_locks
+        locks_meta = {
+            "bundle": lock_bundle,
+            "applied": True,
+            "quality_profile": quality_profile,
+            "face_score": (sum(face_scores) / len(face_scores)) if face_scores else None,
+            "pose_score": (sum(pose_scores) / len(pose_scores)) if pose_scores else None,
+            "style_score": (sum(style_scores) / len(style_scores)) if style_scores else None,
+            "region_shape_score": (sum(region_shape_scores) / len(region_shape_scores)) if region_shape_scores else None,
+            "region_texture_score": (sum(region_texture_scores) / len(region_texture_scores)) if region_texture_scores else None,
+            "region_color_score": (sum(region_color_scores) / len(region_color_scores)) if region_color_scores else None,
+            "scene_score": (sum(scene_scores) / len(scene_scores)) if scene_scores else None,
+            "regions": region_lock_details if region_lock_details else None,
+        }
+    elif isinstance(assets.get("lock_bundle"), dict):
+        locks_meta = {"bundle": assets.get("lock_bundle"), "applied": False}
+
     scores = {"image": {"clip": max([s.get("clip_score") or 0.0 for s in saved] or [0.0])}}
     # Provide direct IDs and view_url for UI convenience (first image)
     ids_obj: Dict[str, Any] = {}
     meta_obj: Dict[str, Any] = {"prompt_id": pid}
+    if quality_profile:
+        meta_obj["quality_profile"] = quality_profile
     if comfy_items:
         first = comfy_items[0]
         sub = ""
@@ -317,6 +555,8 @@ async def _image_dispatch_run(prompt: str, negative: Optional[str], seed: Option
             # Ensure absolute under /uploads so StaticFiles serves it correctly
             meta_obj["orch_view_url"] = f"/uploads/{rel0}"
             meta_obj["orch_view_urls"] = [f"/uploads/{rel0}"]
+    if locks_meta:
+        meta_obj["locks"] = locks_meta
     return {"cid": cid, "prompt_id": pid, "ids": ids_obj, "meta": meta_obj, "paths": [s.get("path") for s in saved], "images": comfy_items, "scores": scores}
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -339,6 +579,255 @@ def _log(event: str, **fields: Any) -> None:
             "notes": {k: v for k, v in fields.items() if k != "trace_id"},
         }
         checkpoints_append_event(STATE_DIR, tr, str(row.get("event") or "event"), row)
+
+
+def _infer_effective_mode(user_text: str) -> str:
+    text = (user_text or "").lower()
+    asset_triggers = [
+        "draw me an image",
+        "generate an image",
+        "make an image",
+        "make a picture",
+        "make a song",
+        "compose music",
+        "generate music",
+        "make a video",
+        "render video",
+        "film this",
+        "use comfy",
+        "image of",
+    ]
+    stop_triggers = [
+        "stop running tools",
+        "do not call any tools",
+        "just explain",
+        "just respond in text",
+    ]
+    wants_asset = any(trig in text for trig in asset_triggers) and not any(st in text for st in stop_triggers)
+    return "job" if wants_asset else "chat"
+
+
+def _inject_execution_context(tool_calls: List[Dict[str, Any]], trace_id: str, effective_mode: str) -> None:
+    for tc in tool_calls or []:
+        if not isinstance(tc, dict):
+            continue
+        args_tc = tc.get("arguments")
+        if isinstance(args_tc, dict):
+            if trace_id and not args_tc.get("trace_id"):
+                args_tc["trace_id"] = trace_id
+            args_tc.setdefault("_effective_mode", effective_mode)
+
+
+async def segment_qa_and_committee(
+    trace_id: str,
+    user_text: str,
+    tool_name: str,
+    segment_results: List[Dict[str, Any]],
+    mode: str,
+    *,
+    base_url: str,
+    executor_base_url: str,
+    temperature: float,
+    last_user_text: str,
+    tool_catalog_hash: str,
+    planner_callable: Callable[[List[Dict[str, Any]], Optional[List[Dict[str, Any]]], float, Optional[str]], Tuple[str, List[Dict[str, Any]]]],
+    normalize_fn: Callable[[Any], List[Dict[str, Any]]],
+    absolutize_url: Callable[[str], str],
+    quality_profile: Optional[str] = None,
+    max_refine_passes: int = 1,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any], List[Dict[str, Any]]]:
+    """
+    Run per-segment QA + committee review with an optional single patch pass.
+    Returns updated segment results, the committee outcome, and any patch call results.
+    """
+    if not segment_results:
+        outcome = {"action": "go", "rationale": "no_segment_results", "patch_plan": []}
+        return segment_results, outcome, []
+    thresholds = _lock_quality_thresholds(quality_profile)
+    attempt = 0
+    current_results = list(segment_results or [])
+    cumulative_patch_results: List[Dict[str, Any]] = []
+    committee_outcome: Dict[str, Any] = {"action": "go", "patch_plan": [], "rationale": ""}
+    while attempt <= max(0, int(max_refine_passes)):
+        counts = {
+            "images": int(assets_count_images(current_results)),
+            "videos": int(assets_count_video(current_results)),
+            "audio": int(assets_count_audio(current_results)),
+        }
+        domain_qa = assets_compute_domain_qa(current_results)
+        violations: Dict[str, float] = {}
+        images_domain = domain_qa.get("images") or {}
+        audio_domain = domain_qa.get("audio") or {}
+        if images_domain.get("face_lock") is not None and images_domain.get("face_lock") < thresholds["face_min"]:
+            violations["images.face_lock"] = images_domain.get("face_lock")
+        if images_domain.get("region_shape_min") is not None and images_domain.get("region_shape_min") < thresholds["region_shape_min"]:
+            violations["images.region_shape_min"] = images_domain.get("region_shape_min")
+        if images_domain.get("region_texture_mean") is not None and images_domain.get("region_texture_mean") < thresholds["region_texture_min"]:
+            violations["images.region_texture_mean"] = images_domain.get("region_texture_mean")
+        if images_domain.get("scene_lock") is not None and images_domain.get("scene_lock") < thresholds["scene_min"]:
+            violations["images.scene_lock"] = images_domain.get("scene_lock")
+        if audio_domain.get("voice_lock") is not None and audio_domain.get("voice_lock") < thresholds["voice_min"]:
+            violations["audio.voice_lock"] = audio_domain.get("voice_lock")
+        if audio_domain.get("tempo_lock") is not None and audio_domain.get("tempo_lock") < thresholds["tempo_min"]:
+            violations["audio.tempo_lock"] = audio_domain.get("tempo_lock")
+        if audio_domain.get("key_lock") is not None and audio_domain.get("key_lock") < thresholds["key_min"]:
+            violations["audio.key_lock"] = audio_domain.get("key_lock")
+        if audio_domain.get("stem_balance_lock") is not None and audio_domain.get("stem_balance_lock") < thresholds["stem_balance_min"]:
+            violations["audio.stem_balance_lock"] = audio_domain.get("stem_balance_lock")
+        if audio_domain.get("lyrics_lock") is not None and audio_domain.get("lyrics_lock") < thresholds["lyrics_min"]:
+            violations["audio.lyrics_lock"] = audio_domain.get("lyrics_lock")
+        qa_metrics_pre = {"counts": counts, "domain": domain_qa, "threshold_violations": violations}
+        _log("qa.metrics.segment", trace_id=trace_id, tool=tool_name, phase="pre", attempt=attempt, metrics=qa_metrics_pre)
+        try:
+            _trace_log_event(
+                STATE_DIR,
+                str(trace_id),
+                {
+                    "kind": "qa",
+                    "stage": "segment_pre",
+                    "data": qa_metrics_pre,
+                },
+            )
+        except Exception:
+            pass
+        committee_outcome = await postrun_committee_decide(
+            trace_id=trace_id,
+            user_text=user_text,
+            tool_results=current_results,
+            qa_metrics=qa_metrics_pre,
+            mode=mode,
+        )
+        action = str((committee_outcome.get("action") or "go")).strip().lower()
+        if violations and action == "go":
+            if attempt < max_refine_passes:
+                action = "revise"
+                committee_outcome["action"] = "revise"
+                rationale = committee_outcome.get("rationale") or ""
+                committee_outcome["rationale"] = (rationale + " | auto-revise: lock thresholds unmet").strip()
+                committee_outcome.setdefault("threshold_violations", {}).update(violations)
+            else:
+                committee_outcome["action"] = "fail"
+                committee_outcome.setdefault("threshold_violations", {}).update(violations)
+                action = "fail"
+        _log("committee.decision.segment", trace_id=trace_id, tool=tool_name, attempt=attempt, action=action, rationale=committee_outcome.get("rationale"), violations=violations)
+        if action != "revise":
+            break
+        allowed_mode_set = set(_allowed_tools_for_mode(mode))
+        filtered_patch_plan: List[Dict[str, Any]] = []
+        for step in committee_outcome.get("patch_plan") or []:
+            if not isinstance(step, dict):
+                continue
+            step_tool = (step.get("tool") or "").strip()
+            if not step_tool:
+                continue
+            if step_tool not in PLANNER_VISIBLE_TOOLS or step_tool not in allowed_mode_set:
+                continue
+            step_args = step.get("args") if isinstance(step.get("args"), dict) else {}
+            filtered_patch_plan.append({"tool": step_tool, "args": step_args})
+        committee_outcome["patch_plan"] = filtered_patch_plan
+        if not filtered_patch_plan:
+            break
+        patch_calls: List[Dict[str, Any]] = [{"name": item.get("tool"), "arguments": (item.get("args") or {})} for item in filtered_patch_plan]
+        _inject_execution_context(patch_calls, trace_id, mode)
+        vr = await validator_validate_and_repair(
+            patch_calls,
+            base_url=base_url,
+            trace_id=trace_id,
+            log_fn=_log,
+            state_dir=STATE_DIR,
+        )
+        patch_validated = vr.get("validated") or []
+        patch_failures = vr.get("pre_tool_failures") or []
+        patch_failure_results: List[Dict[str, Any]] = []
+        for failure in patch_failures or []:
+            env = failure.get("envelope") if isinstance(failure.get("envelope"), dict) else {}
+            args_snapshot = failure.get("arguments") if isinstance(failure.get("arguments"), dict) else {}
+            name_snapshot = str((failure.get("name") or "")).strip() or "tool"
+            error_snapshot = env.get("error") if isinstance(env, dict) else {}
+            patch_failure_results.append(
+                {
+                    "name": name_snapshot,
+                    "result": env,
+                    "error": error_snapshot,
+                    "args": args_snapshot,
+                }
+            )
+        exec_results: List[Dict[str, Any]] = []
+        if patch_validated:
+            _log("tool.run.start", trace_id=trace_id, executor="void", count=len(patch_validated or []), attempt=attempt)
+            for call in patch_validated:
+                tn = (call.get("name") or "tool")
+                args_call = call.get("arguments") if isinstance(call.get("arguments"), dict) else {}
+                _log("tool.run.before", trace_id=trace_id, tool=str(tn), args_keys=list((args_call or {}).keys()), attempt=attempt)
+            exec_results = await gateway_execute(patch_validated, trace_id, executor_base_url or "http://127.0.0.1:8081")
+        patch_results = list(patch_failure_results) + list(exec_results or [])
+        for pr in patch_results or []:
+            tname = str((pr or {}).get("name") or "tool")
+            result_obj = (pr or {}).get("result") if isinstance((pr or {}).get("result"), dict) else {}
+            err_obj = (pr or {}).get("error") or (result_obj.get("error") if isinstance(result_obj, dict) else None)
+            if isinstance(err_obj, (str, dict)):
+                code = (err_obj.get("code") if isinstance(err_obj, dict) else str(err_obj))
+                status = (err_obj.get("status") if isinstance(err_obj, dict) else None)
+                message = (err_obj.get("message") if isinstance(err_obj, dict) else "")
+                _log("tool.run.error", trace_id=trace_id, tool=tname, code=(code or ""), status=status, message=(message or ""), attempt=attempt)
+                _tel_append(STATE_DIR, trace_id, {
+                    "name": tname,
+                    "ok": False,
+                    "label": "failure",
+                    "raw": {
+                        "ts": None,
+                        "ok": False,
+                        "args": (pr.get("args") if isinstance(pr.get("args"), dict) else {}),
+                        "error": (err_obj if isinstance(err_obj, dict) else {"code": "error", "message": str(err_obj)}),
+                    }
+                })
+            else:
+                artifacts_summary: List[Dict[str, Any]] = []
+                arts = result_obj.get("artifacts") if isinstance(result_obj, dict) else None
+                if isinstance(arts, list):
+                    for art in arts:
+                        if isinstance(art, dict):
+                            aid = art.get("id")
+                            kind = art.get("kind")
+                            if isinstance(aid, str) and isinstance(kind, str):
+                                artifacts_summary.append({"id": aid, "kind": kind})
+                urls_local = assets_collect_urls([pr], absolutize_url)
+                _log("tool.run.after", trace_id=trace_id, tool=tname, artifacts=artifacts_summary, urls_count=len(urls_local or []), attempt=attempt)
+                meta_local = result_obj.get("meta") if isinstance(result_obj, dict) else {}
+                first_url = (urls_local[0] if isinstance(urls_local, list) and urls_local else None)
+                _tel_append(STATE_DIR, trace_id, {
+                    "name": tname,
+                    "ok": True,
+                    "label": "success",
+                    "raw": {
+                        "ts": None,
+                        "ok": True,
+                        "args": (pr.get("args") if isinstance(pr.get("args"), dict) else {}),
+                        "result": {
+                            "meta": (meta_local if isinstance(meta_local, dict) else {}),
+                            "artifact_url": first_url,
+                        }
+                    }
+                })
+        if filtered_patch_plan:
+            _log("committee.revision.segment", trace_id=trace_id, tool=tool_name, steps=len(patch_validated or []), failures=len(patch_failures or []), attempt=attempt)
+        if patch_results:
+            cumulative_patch_results.extend(patch_results)
+            current_results = (current_results or []) + patch_results
+        attempt += 1
+        _log("segment.refine.iteration", trace_id=trace_id, tool=tool_name, attempt=attempt)
+        if attempt > max_refine_passes:
+            break
+    if cumulative_patch_results:
+        counts_post = {
+            "images": int(assets_count_images(current_results)),
+            "videos": int(assets_count_video(current_results)),
+            "audio": int(assets_count_audio(current_results)),
+        }
+        domain_post = assets_compute_domain_qa(current_results)
+        qa_metrics_post = {"counts": counts_post, "domain": domain_post}
+        _log("qa.metrics.segment", trace_id=trace_id, tool=tool_name, phase="post", metrics=qa_metrics_post)
+    return current_results, committee_outcome, cumulative_patch_results
 
 def _append_jsonl(path: str, obj: dict) -> None:
     append_jsonl_compat(STATE_DIR, path, obj)
@@ -375,26 +864,32 @@ def _trace_response(trace_id: str, envelope: Dict[str, Any]) -> None:
     if isinstance(envelope.get("error"), dict):
         out["error"] = envelope.get("error")
     checkpoints_append_event(STATE_DIR, str(trace_id), "response", out)
+    try:
+        _trace_log_response(
+            STATE_DIR,
+            str(trace_id),
+            {
+                "request_id": str(trace_id),
+                "kind": "final_response",
+                "mode": "chat",
+                "content": content,
+                "meta": {
+                    "assets_count": int(assets_count),
+                },
+            },
+        )
+    except Exception:
+        # Tracing must not break response
+        pass
     _log("chat.finish", trace_id=str(trace_id), ok=bool(envelope is not None and not bool(envelope.get("error"))), assets_count=int(assets_count), message_len=int(len(content)))
 # CPU/GPU adaptive mode for ComfyUI graphs
 COMFY_CPU_MODE = (os.getenv("COMFY_CPU_MODE", "").strip().lower() in ("1", "true", "yes", "on"))
 
 def _cleanup_legacy_trace_files(trace_key: str) -> None:
     """
-    Remove legacy per-trace files now unified under trace.jsonl.
+    Legacy no-op: preserve per-trace JSONL files for distillation.
     """
-    try:
-        base = os.path.join(STATE_DIR, "traces", str(trace_key))
-        for fname in ("events.jsonl", "responses.jsonl", "artifacts.jsonl", "tools.jsonl", "errors.jsonl", "chat.jsonl", "requests.jsonl"):
-            fpath = os.path.join(base, fname)
-            if os.path.exists(fpath):
-                try:
-                    os.remove(fpath)
-                except Exception:
-                    continue
-    except Exception:
-        # Surface artifact export errors
-        raise
+    return
 def _comfy_is_completed(detail: Dict[str, Any]) -> bool:
     st = detail.get("status") or {}
     if st.get("completed") is True:
@@ -421,6 +916,165 @@ def _normalize_dict_body(body: Any, expected_schema: Dict[str, Any]) -> Dict[str
         except Exception:
             return {}
     return {}
+
+
+def _merge_lock_bundles(existing: Dict[str, Any], update: Dict[str, Any]) -> Dict[str, Any]:
+    base: Dict[str, Any] = dict(existing or {})
+    for key in ("schema_version", "character_id"):
+        if update.get(key) is not None:
+            base[key] = update[key]
+    for section in ("face", "pose", "style", "audio"):
+        existing_section = base.get(section) if isinstance(base.get(section), dict) else {}
+        update_section = update.get(section) if isinstance(update.get(section), dict) else {}
+        merged = dict(existing_section or {})
+        for subkey, value in update_section.items():
+            merged[subkey] = value
+        if merged:
+            base[section] = merged
+    existing_regions = base.get("regions") if isinstance(base.get("regions"), dict) else {}
+    update_regions = update.get("regions") if isinstance(update.get("regions"), dict) else {}
+    if update_regions:
+        merged_regions = dict(existing_regions or {})
+        for region_id, region_data in update_regions.items():
+            if isinstance(region_data, dict):
+                merged_regions[region_id] = dict(region_data)
+        base["regions"] = merged_regions
+    existing_scene = base.get("scene") if isinstance(base.get("scene"), dict) else {}
+    update_scene = update.get("scene") if isinstance(update.get("scene"), dict) else {}
+    if update_scene:
+        merged_scene = dict(existing_scene or {})
+        merged_scene.update(update_scene)
+        base["scene"] = merged_scene
+    return base
+
+
+def _cosine_similarity(vec_a: Iterable[float], vec_b: Iterable[float]) -> Optional[float]:
+    a = list(vec_a or [])
+    b = list(vec_b or [])
+    if not a or not b or len(a) != len(b):
+        return None
+    num = sum(x * y for x, y in zip(a, b))
+    den_a = math.sqrt(sum(x * x for x in a))
+    den_b = math.sqrt(sum(y * y for y in b))
+    if den_a == 0.0 or den_b == 0.0:
+        return None
+    return num / (den_a * den_b)
+
+
+def _frame_meta_payload(frame: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(frame, dict):
+        return {}
+    meta = frame.get("meta")
+    if isinstance(meta, dict):
+        return meta
+    result_obj = frame.get("result")
+    if isinstance(result_obj, dict):
+        meta_obj = result_obj.get("meta")
+        if isinstance(meta_obj, dict):
+            return meta_obj
+    return {}
+
+
+def _frame_image_path(frame: Dict[str, Any]) -> Optional[str]:
+    result_obj = frame.get("result") if isinstance(frame, dict) else None
+    if isinstance(result_obj, dict):
+        paths = result_obj.get("paths")
+        if isinstance(paths, list) and paths:
+            first = paths[0]
+            if isinstance(first, str) and first:
+                return first
+    meta = _frame_meta_payload(frame)
+    candidate = meta.get("image_path") or meta.get("path")
+    if isinstance(candidate, str) and candidate:
+        return candidate
+    return None
+
+
+def _audio_detect_tempo(wav_path: str) -> Optional[float]:
+    try:
+        y, sr = librosa.load(wav_path, sr=22050)
+        if y.size == 0:
+            return None
+        tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
+        if tempo > 0:
+            return float(tempo)
+        return None
+    except Exception as ex:
+        _log("audio.tempo.detect.fail", error=str(ex), path=wav_path)
+        return None
+
+
+def _audio_detect_key(wav_path: str) -> Optional[str]:
+    try:
+        y, sr = librosa.load(wav_path, sr=22050)
+        if y.size == 0:
+            return None
+        chroma = librosa.feature.chroma_stft(y=y, sr=sr)
+        if chroma.size == 0:
+            return None
+        chroma_mean = chroma.mean(axis=1)
+        pitch_classes = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+        idx = int(np.argmax(chroma_mean))
+        return pitch_classes[idx % len(pitch_classes)]
+    except Exception as ex:
+        _log("audio.key.detect.fail", error=str(ex), path=wav_path)
+        return None
+
+
+def _key_similarity(target: Optional[str], detected: Optional[str]) -> Optional[float]:
+    if not target or not detected:
+        return None
+    target_norm = target.split()[0].upper()
+    detected_norm = detected.upper()
+    return 1.0 if target_norm == detected_norm else 0.0
+
+
+def _audio_band_energy_profile(wav_path: str, band_map: Dict[str, Tuple[float, float]]) -> Dict[str, float]:
+    try:
+        y, sr = librosa.load(wav_path, sr=22050)
+        if y.size == 0:
+            return {}
+        stft = librosa.stft(y)
+        magnitude = np.abs(stft)
+        freqs = librosa.fft_frequencies(sr=sr)
+        profile: Dict[str, float] = {}
+        for name, (low, high) in band_map.items():
+            mask = (freqs >= low) & (freqs < high)
+            if not np.any(mask):
+                profile[name] = 0.0
+                continue
+            energy = float(np.mean(magnitude[mask, :]))
+            profile[name] = energy
+        total = sum(profile.values())
+        if total > 0:
+            profile = {k: v / total for k, v in profile.items()}
+        return profile
+    except Exception as ex:
+        _log("audio.stem.detect.fail", error=str(ex), path=wav_path)
+        return {}
+
+
+def _stem_balance_score(target_profile: Dict[str, float], detected_profile: Dict[str, float]) -> Optional[float]:
+    if not target_profile or not detected_profile:
+        return None
+    keys = [k for k in target_profile.keys() if k in detected_profile]
+    if not keys:
+        return None
+    target_vec = [float(target_profile[k]) for k in keys]
+    detected_vec = [float(detected_profile[k]) for k in keys]
+    sim = _cosine_similarity(target_vec, detected_vec)
+    if sim is None:
+        return None
+    return max(0.0, min((sim + 1.0) / 2.0, 1.0))
+
+
+DEFAULT_STEM_BANDS: Dict[str, Tuple[float, float]] = {
+    "bass": (20.0, 150.0),
+    "drums": (150.0, 800.0),
+    "guitars": (800.0, 3000.0),
+    "pads": (200.0, 2000.0),
+    "vocals": (300.0, 4000.0),
+}
 
 # ---------- ICW/OmniContext helpers ----------
 def _proj_dir(job_id: str) -> str:
@@ -505,7 +1159,20 @@ VLM_API_URL = os.getenv("VLM_API_URL")        # e.g., http://vlm:8050
 OCR_API_URL = os.getenv("OCR_API_URL")        # e.g., http://ocr:8070
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/workspace/uploads")
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+# Ensure UPLOAD_DIR exists; if not creatable (e.g., missing /workspace mount), fall back.
+try:
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+except Exception:
+    for _cand in ("/app/uploads", "/tmp/uploads"):
+        try:
+            os.makedirs(_cand, exist_ok=True)
+            UPLOAD_DIR = _cand
+            break
+        except Exception:
+            pass
+    # Final guarantee (raises if completely impossible, which signals a real env issue)
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+LOCKS_ROOT_DIR = _locks_root(UPLOAD_DIR)
 FILM2_MODELS_DIR = os.getenv("FILM2_MODELS", "/opt/models")
 FILM2_DATA_DIR = os.getenv("FILM2_DATA", "/srv/film2")
 N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL")  # optional external workflow orchestration
@@ -557,18 +1224,28 @@ def _resp_json(resp, expected: Any) -> Any:
     return _hl.sha256(b).hexdigest()
 
 
-# ---- JSON response helpers: 400 parse error; 422 schema/semantics ----
+# ---- JSON response helpers (legacy): kept for compatibility but backed by ToolEnvelope ----
 import uuid as _uuid
+
 def _ok(data: Any, rid: str) -> JSONResponse:
-    return JSONResponse({"schema_version": 1, "request_id": rid, "ok": True, "data": data}, status_code=200)
+    """
+    Legacy helper used by older routes; now a thin shim over ToolEnvelope.success.
+    """
+    return ToolEnvelope.success({"data": data}, request_id=rid)
+
 
 def _jerr(status: int, rid: str, code: str, msg: str, details: Any | None = None) -> JSONResponse:
-    return JSONResponse({
-        "schema_version": 1,
-        "request_id": rid,
-        "ok": False,
-        "error": {"code": code, "message": msg, "details": details},
-    }, status_code=status)
+    """
+    Legacy error helper now implemented via ToolEnvelope.failure.
+    HTTP response is always 200; semantic status is embedded in error.status.
+    """
+    return ToolEnvelope.failure(
+        code,
+        msg,
+        status=status,
+        request_id=rid,
+        details=details if isinstance(details, dict) else {"details": details} if details is not None else {},
+    )
 
 def _build_openai_envelope(*, ok: bool, text: str, error: Dict[str, Any] | None, usage: Dict[str, Any], model: str, seed: int, id_: str) -> Dict[str, Any]:
     return {
@@ -742,6 +1419,7 @@ app = FastAPI(title="Void Orchestrator", version="0.1.0")
 # Mount canonical tool routes (validate/run) so /tool.run is served by the orchestrator
 from app.routes import toolrun as _toolrun_routes  # type: ignore
 app.include_router(_toolrun_routes.router)
+ToolEnvelope = _toolrun_routes.ToolEnvelope
 # Middleware order matters: last added runs first.
 # We want Preflight to run FIRST, so add it LAST.
 from .middleware.ws_permissive import PermissiveWebSocketMiddleware
@@ -762,7 +1440,7 @@ def _json_response(obj: Dict[str, Any], status_code: int = 200) -> Response:
 # ---- Pipeline imports (extracted helpers) ----
 from .pipeline.trace_locks import acquire_lock as trace_acquire_lock, release_lock as trace_release_lock  # type: ignore
 from .pipeline.args_prep import ensure_object_args as args_ensure_object_args, fill_min_defaults as args_fill_min_defaults  # type: ignore
-from .pipeline.assets import collect_urls as assets_collect_urls, count_images as assets_count_images  # type: ignore
+from .pipeline.assets import collect_urls as assets_collect_urls, count_images as assets_count_images, count_video as assets_count_video, count_audio as assets_count_audio, compute_domain_qa as assets_compute_domain_qa  # type: ignore
 from .pipeline.executor_gateway import execute as gateway_execute  # type: ignore
 from .pipeline.catalog import build_allowed_tool_names as catalog_allowed, validate_tool_names as catalog_validate  # type: ignore
 from .pipeline.finalize import finalize_tool_phase as finalize_tool_phase, compose_openai_response as compose_openai_response  # type: ignore
@@ -987,10 +1665,30 @@ async def v1_image_generate(request: Request):
     height = body.get("height")
     size = body.get("size")
     assets = body.get("assets") if isinstance(body.get("assets"), dict) else {}
+    lock_bundle_body = body.get("lock_bundle") if isinstance(body.get("lock_bundle"), dict) else None
+    quality_profile = body.get("quality_profile") if isinstance(body.get("quality_profile"), str) else None
+    steps_val = None
+    cfg_val = None
+    if isinstance(body.get("steps"), int):
+        steps_val = int(body.get("steps"))
+    if isinstance(body.get("cfg"), (int, float)):
+        cfg_val = float(body.get("cfg"))
     if not isinstance(prompt, str):
         return _jerr(422, rid, "invalid_prompt", "prompt must be a string")
     try:
-        res = await _image_dispatch_run(str(prompt), negative if isinstance(negative, str) else None, int(seed) if isinstance(seed, int) else None, int(width) if isinstance(width, int) else None, int(height) if isinstance(height, int) else None, str(size) if isinstance(size, str) else None, assets)
+        res = await _image_dispatch_run(
+            str(prompt),
+            negative if isinstance(negative, str) else None,
+            int(seed) if isinstance(seed, int) else None,
+            int(width) if isinstance(width, int) else None,
+            int(height) if isinstance(height, int) else None,
+            str(size) if isinstance(size, str) else None,
+            assets,
+            steps=steps_val,
+            cfg_scale=cfg_val,
+            lock_bundle=lock_bundle_body,
+            quality_profile=quality_profile,
+        )
         return _ok({"prompt_id": res.get("prompt_id"), "cid": res.get("cid"), "paths": res.get("paths")}, rid)
     except Exception as ex:
         return _jerr(422, rid, "image_generate_failed", str(ex))
@@ -1069,7 +1767,16 @@ _films_mem: Dict[str, Dict[str, Any]] = {}
 
 @app.post("/v1/image/dispatch")
 async def post_image_dispatch(request: Request):
-    body = await request.json()
+    rid = _uuid.uuid4().hex
+    try:
+        body = await request.json()
+    except Exception as ex:
+        return ToolEnvelope.failure(
+            "invalid_json",
+            f"Body must be valid JSON: {ex}",
+            status=400,
+            request_id=rid,
+        )
     parser = JSONParser()
     expected = {
         "prompt": (str),
@@ -1079,8 +1786,12 @@ async def post_image_dispatch(request: Request):
         "height": (int),
         "size": (str),
         "assets": (dict),
+        "lock_bundle": (dict),
+        "quality_profile": (str),
+        "steps": (int),
+        "cfg": (float),
     }
-    obj = parser.parse(body, expected)
+    obj = parser.parse(body, expected) if isinstance(body, (str, bytes)) else parser.parse(json.dumps(body or {}), expected)
     # core fields
     prompt = obj.get("prompt")
     negative = obj.get("negative")
@@ -1089,13 +1800,61 @@ async def post_image_dispatch(request: Request):
     height = obj.get("height")
     size = obj.get("size")
     if not (isinstance(prompt, str) and prompt.strip()):
-        return JSONResponse(status_code=422, content={"error": "invalid_prompt", "detail": "prompt must be non-empty string"})
+        return ToolEnvelope.failure(
+            "invalid_prompt",
+            "prompt must be non-empty string",
+            status=422,
+            request_id=rid,
+            details={},
+        )
     if negative is not None and not isinstance(negative, str):
-        return JSONResponse(status_code=422, content={"error": "invalid_negative"})
+        return ToolEnvelope.failure(
+            "invalid_negative",
+            "negative prompt must be a string when provided",
+            status=422,
+            request_id=rid,
+            details={},
+        )
     if seed is not None and not (isinstance(seed, int) and seed >= 0):
-        return JSONResponse(status_code=422, content={"error": "invalid_seed"})
+        return ToolEnvelope.failure(
+            "invalid_seed",
+            "seed must be a non-negative integer",
+            status=422,
+            request_id=rid,
+            details={},
+        )
     assets = obj.get("assets") if isinstance(obj.get("assets"), dict) else {}
-    return await _image_dispatch_run(prompt, negative, seed, width, height, size, assets)
+    lock_bundle = obj.get("lock_bundle") if isinstance(obj.get("lock_bundle"), dict) else None
+    quality_profile = obj.get("quality_profile") if isinstance(obj.get("quality_profile"), str) else None
+    steps_val = obj.get("steps") if isinstance(obj.get("steps"), int) else None
+    cfg_val = obj.get("cfg")
+    cfg_num = float(cfg_val) if isinstance(cfg_val, (int, float)) else None
+    try:
+        result = await _image_dispatch_run(
+            prompt,
+            negative,
+            seed,
+            width,
+            height,
+            size,
+            assets,
+            steps=steps_val,
+            cfg_scale=cfg_num,
+            lock_bundle=lock_bundle,
+            quality_profile=quality_profile,
+        )
+    except Exception as ex:
+        return ToolEnvelope.failure(
+            "image_dispatch_failed",
+            str(ex),
+            status=500,
+            request_id=rid,
+        )
+    # For dispatcher, surface the raw tool result in the envelope result
+    return ToolEnvelope.success(
+        result if isinstance(result, dict) else {"value": result},
+        request_id=rid,
+    )
 _characters_mem: Dict[str, Dict[str, Any]] = {}
 _scenes_mem: Dict[str, Dict[str, Any]] = {}
 
@@ -1663,7 +2422,7 @@ def meta_prompt(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "7) TOOL / EXECUTOR / ORCHESTRATOR PATH INVARIANTS\n"
             "==================================================\n"
             "- Public routes MUST NOT call /tool.run directly. Valid flow: Planner → Executor (/execute) → Orchestrator /tool.validate → /tool.run.\n"
-            "- On 422: one repair round only (Validate → Repair → Re-validate once → Run).\n"
+            "- Validation runs exactly once; executor never auto-repairs or retries. Failures surface as ok=false envelopes for committee/planner handling.\n"
             "- Do not clobber provided args; add defaults only if missing. Do not delete/overwrite user keys arbitrarily.\n"
             "- After repaired validate=200: Executor MUST run repaired steps; traces MUST include exec.payload (patched), repair.executing, tool.run.start, etc.\n\n"
             "==================================================\n"
@@ -1894,174 +2653,307 @@ def merge_tool_schemas(client_tools: Optional[List[Dict[str, Any]]]) -> List[Dic
             out.append(t)
     return out
 
-async def planner_produce_plan(messages: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]], temperature: float, trace_id: Optional[str] = None) -> Tuple[str, List[Dict[str, Any]]]:
-	# Treat any 'qwen*' value as Qwen route (e.g., 'qwen3')
-	use_qwen = str(PLANNER_MODEL or "qwen").lower().startswith("qwen")
-	planner_id = QWEN_MODEL_ID if use_qwen else GPTOSS_MODEL_ID
-	planner_base = QWEN_BASE_URL if use_qwen else GPTOSS_BASE_URL
-	# Resolve subject canon from latest user text
-	# subject canon and RoE digest now imported at module top
-	# Build CO frames with curated tool context (prompt-only; no gating)
-	all_tools = merge_tool_schemas(tools)
-	tool_names: List[str] = []
-	for t in all_tools or []:
-		fn = (t.get("function") or {})
-		nm = fn.get("name") or t.get("name")
-		if isinstance(nm, str) and nm.strip():
-			tool_names.append(nm.strip())
-	# Detect repair intent from messages
-	_is_repair = any(isinstance(m, dict) and isinstance(m.get("content"), str) and "repair mode" in m.get("content", "").lower() for m in (messages or []))
-	# Curate RAW schema blocks (TSL) for likely-selected tools
-	tsl_blocks: List[Dict[str, Any]] = []
-	if "image.dispatch" in tool_names:
-		tsl_blocks.append({
-			"name": "image.dispatch",
-			"raw": {
-				"name": "image.dispatch",
-				"args": {
-					"required": ["prompt","width","height","steps","cfg","negative"],
-					"properties": {
-						"prompt": {"type":"string","notes":"literal subject + identity tokens"},
-						"negative": {"type":"string"},
-						"width": {"type":"integer","multipleOf":8,"min":256,"max":2048},
-						"height": {"type":"integer","multipleOf":8,"min":256,"max":2048},
-						"steps": {"type":"integer","min":1,"max":150,"default":32},
-						"cfg": {"type":"number","min":1,"max":20,"default":5.5},
-						"seed": {"type":"integer","optional":True}
-					}
-				},
-				"returns": {"result":{"meta":{},"artifacts":["// omitted"]}},
-				"schema_ref": "image.dispatch@builtin"
-			}
-		})
-	# Evidence blocks (TEL): none yet at plan time (available post-exec)
-	tel_blocks: List[Dict[str, Any]] = []
-	# CO envelope
-	last_user = ""
-	for m in reversed(messages or []):
-		if isinstance(m, dict) and m.get("role") == "user" and isinstance(m.get("content"), str) and m.get("content").strip():
-			last_user = m.get("content").strip()
-			break
-	subject_canon = _resolve_subject_canon(last_user)
-	roe_prev = _roe_load(STATE_DIR, str(trace_id or ""))
-	# Load recent TEL evidence (failures/successes) to aid planner/repair (no try/except)
-	_tel_recent = _tel_load(STATE_DIR, str(trace_id or ""), limit=4)
-	co_env = {
-		"schema_version": 1,
-		"trace_id": trace_id or "",
-		"call_kind": "repair" if _is_repair else "planner",
-		"model_caps": {"num_ctx": DEFAULT_NUM_CTX},
-		"user_turn": {"role": "user", "content": last_user},
-		"history": messages or [],
-		"attachments": [],
-		"tool_memory": [],
-		"rag_hints": [],
-		"roe_incoming_instructions": (roe_prev or []),
-		"subject_canon": subject_canon,
-		"percent_budget": {"icw_pct": [65, 70], "tools_pct": [18, 20], "roe_pct": [5, 10], "misc_pct": [3, 5], "buffer_pct": 5},
-		"sweep_plan": ["0-90", "30-120", "60-150+wrap"],
-		"tools_names": tool_names,
-		"tools_recent_lines": [],
-		"tsl_blocks": tsl_blocks,
-		"tel_blocks": (_tel_recent or tel_blocks),
-	}
-	co_out = _co_pack(co_env)
-	frames_msgs = _co_frames_to_msgs(co_out.get("frames") or [])
-	# Minimal planner/committee frames
-	planner_meta = (
-		"### [PLANNER / SYSTEM]\n"
-		"Honor CO ratios/RoE. Prefer tools over text. Construct strict JSON steps with all required args; snap sizes to /8.\n"
-		"- Image edits: do NOT use image.edit. Always use image.dispatch for both generation and editing.\n"
-		"- When editing, include the input image via attachments (preferred) or set args.images to an array of objects containing absolute /uploads/... URLs.\n"
-		"- For denoise/inpaint style edits, include a strength field (0.0–1.0) when applicable; keep the prompt aligned with the edit intent."
-	)
-	committee_review = (
-		"### [COMMITTEE REVIEW / SYSTEM]\n"
-		"If plan conflicts with RoE/subject, apply a one-pass prompt revision (minimal) then proceed."
-	)
-	contract_return = (
-		"Return ONLY strict JSON: {\"steps\":[{\"tool\":\"<name>\",\"args\":{...}}]} — no extra keys or commentary."
-	)
-	plan_messages = frames_msgs + [
-		{"role": "system", "content": planner_meta},
-		{"role": "system", "content": committee_review},
-		{"role": "system", "content": contract_return},
-	]
-	payload = build_ollama_payload(plan_messages, planner_id, DEFAULT_NUM_CTX, temperature)
-	_log("planner.backend.call", trace_id=trace_id, base=planner_base, model=planner_id)
-	result = await call_ollama(planner_base, payload)
-	_log("planner.backend.ok", trace_id=trace_id, base=planner_base, have_response=bool(result and result.get("response")))
-	if isinstance(result.get("error"), str) and result.get("error"):
-		_log("planner.backend.error", trace_id=None, base=planner_base, error=result.get("error"))
-		return "", []
-	text = result.get("response", "").strip()
-	# Use custom parser to normalise the planner JSON
-	parser = JSONParser()
-	# Prefer strict steps format; fallback to legacy 'tool_calls'
-	parsed_steps: Dict[str, Any] = {}
-	# 1) Direct parse
-	parsed_steps = parser.parse(text, {"steps": [{"tool": str, "args": dict}]})
-	# 2) If direct parse fails to produce steps, attempt to extract a JSON block (e.g., from a fenced code block)
-	steps = parsed_steps.get("steps") or []
-	if not steps:
-		def _extract_json_candidate(s: str) -> str:
-			s = s.strip()
-			if "```" in s:
-				parts = s.split("```")
-				for i in range(0, len(parts) - 1, 2):
-					fence_lang = parts[i+0].split()[-1] if i == 0 else ""
-					block = parts[i+1]
-					if block is None:
-						continue
-					b = block.strip()
-					if b:
-						return b
-			start = s.find("{")
-			if start == -1:
-				return s
-			depth = 0
-			for j in range(start, len(s)):
-				ch = s[j]
-				if ch == "{":
-					depth += 1
-				elif ch == "}":
-					depth -= 1
-					if depth == 0:
-						return s[start:j+1]
-			return s
-		candidate = _extract_json_candidate(text)
-		if candidate and candidate != text:
-			parsed_steps = parser.parse(candidate, {"steps": [{"tool": str, "args": dict}]})
-	steps = parsed_steps.get("steps") or []
-	if steps:
-		_log("planner.steps", trace_id=trace_id, steps=steps)
-		for st in steps:
-			if isinstance(st, dict) and st.get("tool") == "image.dispatch":
-				_log("planner.image.dispatch.args", trace_id=trace_id, args=st.get("args") or {})
-		tool_calls = [{"name": s.get("tool"), "arguments": (s.get("args") or {})} for s in steps if isinstance(s, dict)]
-		return "", tool_calls
-	# Legacy path
-	parsed = parser.parse(text, {"plan": str, "tool_calls": [{"name": str, "arguments": dict}]})
-	plan = parsed.get("plan", "")
-	tcs = parsed.get("tool_calls", []) or []
-	_log("planner.steps.legacy", trace_id=trace_id, tool_calls=tcs)
-	if tcs:
-		return plan, tcs
-	# Final hardening: one more pass forcing JSON mode at the backend with zero temperature
-	plan_messages_retry = plan_messages + [{"role": "system", "content": "Return ONLY a single minified JSON object matching the schema {\"steps\":[{\"tool\":\"<name>\",\"args\":{...}}]}. NO code fences. NO prose."}]
-	payload2 = build_ollama_payload(plan_messages_retry, planner_id, DEFAULT_NUM_CTX, 0.0)
-	payload2["format"] = "json"
-	_log("planner.retry", trace_id=trace_id, reason="no_steps_first_pass")
-	result2 = await call_ollama(planner_base, payload2)
-	text2 = result2.get("response", "").strip()
-	parsed2 = parser.parse(text2, {"steps": [{"tool": str, "args": dict}]})
-	steps2 = parsed2.get("steps") or []
-	if steps2:
-		_log("planner.steps", trace_id=trace_id, steps=steps2)
-		tool_calls2 = [{"name": s.get("tool"), "arguments": (s.get("args") or {})} for s in steps2 if isinstance(s, dict)]
-		return "", tool_calls2
-	return "", []
+async def planner_produce_plan(messages: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]], temperature: float, trace_id: Optional[str] = None, mode: Optional[str] = None) -> Tuple[str, List[Dict[str, Any]]]:
+    # Treat any 'qwen*' value as Qwen route (e.g., 'qwen3')
+    use_qwen = str(PLANNER_MODEL or "qwen").lower().startswith("qwen")
+    planner_id = QWEN_MODEL_ID if use_qwen else GPTOSS_MODEL_ID
+    planner_base = QWEN_BASE_URL if use_qwen else GPTOSS_BASE_URL
+    # Resolve subject canon from latest user text
+    # subject canon and RoE digest now imported at module top
+    # Build CO frames with curated tool context (prompt-only; no gating)
+    all_tools = merge_tool_schemas(tools)
+    tool_names: List[str] = []
+    for t in all_tools or []:
+        fn = (t.get("function") or {})
+        nm = fn.get("name") or t.get("name")
+        if isinstance(nm, str):
+            nm_clean = nm.strip()
+            if nm_clean and (nm_clean in PLANNER_VISIBLE_TOOLS):
+                tool_names.append(nm_clean)
+    # Determine the latest user message for mode inference and subject canon
+    last_user = ""
+    for m in reversed(messages or []):
+        if isinstance(m, dict) and m.get("role") == "user" and isinstance(m.get("content"), str) and m.get("content").strip():
+            last_user = m.get("content").strip()
+            break
+    mode_local = _infer_effective_mode(last_user)
+    tool_palette = "full" if mode_local == "job" else "analysis_only"
+    effective_mode = mode_local
+    # Mode-based tool palette for the planner prompt (analysis vs action)
+    tool_names_mode: List[str] = _filter_tool_names_by_mode(tool_names, effective_mode)
+    # Allowed tool names for this mode (catalog ∩ palette)
+    _allowed_for_mode = _allowed_tools_for_mode(effective_mode)
+    # Detect repair intent from messages
+    _is_repair = any(isinstance(m, dict) and isinstance(m.get("content"), str) and "repair mode" in m.get("content", "").lower() for m in (messages or []))
+    # Curate RAW schema blocks (TSL) for likely-selected tools
+    tsl_blocks: List[Dict[str, Any]] = []
+    if "image.dispatch" in tool_names_mode:
+        tsl_blocks.append({
+            "name": "image.dispatch",
+            "raw": {
+                "name": "image.dispatch",
+                "args": {
+                    "required": ["prompt","width","height","steps","cfg","negative"],
+                    "properties": {
+                        "prompt": {"type":"string","notes":"literal subject + identity tokens"},
+                        "negative": {"type":"string"},
+                        "width": {"type":"integer","multipleOf":8,"min":256,"max":2048},
+                        "height": {"type":"integer","multipleOf":8,"min":256,"max":2048},
+                        "steps": {"type":"integer","min":1,"max":150,"default":32},
+                        "cfg": {"type":"number","min":1,"max":20,"default":5.5},
+                        "seed": {"type":"integer","optional":True}
+                    }
+                },
+                "returns": {"result":{"meta":{},"artifacts":["// omitted"]}},
+                "schema_ref": "image.dispatch@builtin"
+            }
+        })
+    # Evidence blocks (TEL): recent runs — filter to planner-visible and allowed-for-mode tools
+    tel_blocks: List[Dict[str, Any]] = []
+    # CO envelope
+    subject_canon = _resolve_subject_canon(last_user)
+    roe_prev = _roe_load(STATE_DIR, str(trace_id or ""))
+    # Load recent TEL evidence (failures/successes) to aid planner/repair (no try/except)
+    _tel_recent = _tel_load(STATE_DIR, str(trace_id or ""), limit=4)
+    # Apply planner-visible and mode-allowed filter to TEL
+    _allowed_for_mode_set = set(_allowed_for_mode)
+    if _tel_recent:
+        for b in _tel_recent:
+            if not isinstance(b, dict):
+                continue
+            name_raw = b.get("name")
+            if not isinstance(name_raw, str):
+                continue
+            name_clean = name_raw.strip()
+            if not name_clean:
+                continue
+            if (name_clean in PLANNER_VISIBLE_TOOLS) and (name_clean in _allowed_for_mode_set):
+                tel_blocks.append(b)
+    co_env = {
+        "schema_version": 1,
+        "trace_id": trace_id or "",
+        "call_kind": "repair" if _is_repair else "planner",
+        "model_caps": {"num_ctx": DEFAULT_NUM_CTX},
+        "user_turn": {"role": "user", "content": last_user},
+        "history": messages or [],
+        "attachments": [],
+        "tool_memory": [],
+        "rag_hints": [],
+        "roe_incoming_instructions": (roe_prev or []),
+        "subject_canon": subject_canon,
+        "percent_budget": {"icw_pct": [65, 70], "tools_pct": [18, 20], "roe_pct": [5, 10], "misc_pct": [3, 5], "buffer_pct": 5},
+        "sweep_plan": ["0-90", "30-120", "60-150+wrap"],
+        "tools_names": tool_names_mode,
+        "tools_recent_lines": [],
+        "tsl_blocks": tsl_blocks,
+        "tel_blocks": (_tel_recent or tel_blocks),
+    }
+    co_out = _co_pack(co_env)
+    frames_msgs = _co_frames_to_msgs(co_out.get("frames") or [])
+    # Minimal planner/committee frames
+    # Add Mode/Palette and allowed tools guidance
+    _mode_palette = (
+        "### [PLANNER MODE / SYSTEM]\n"
+        f"Mode and tool palette:\n"
+        f"- mode: {mode_local}\n"
+        f"- tool_palette: {tool_palette}\n"
+        f"Allowed tools in this mode: " + (", ".join(_allowed_for_mode) if _allowed_for_mode else "(none)") + "\n"
+        "\n"
+        "Tool kinds:\n"
+        "- analysis tools: non-side-effect tools such as json.parse, web.search, math.eval, memory.query.\n"
+        "- action tools: asset-creating tools such as image.dispatch, music.compose, film.run (if present), etc.\n"
+        "\n"
+        "Rules:\n"
+        "- In mode=\"chat\" with tool_palette=\"analysis_only\":\n"
+        "  - You MAY call analysis tools to improve your understanding (web.search, json.parse, etc.).\n"
+        "  - You MUST NOT call action tools (image.dispatch, music.compose, film.*) unless the user explicitly requested an asset and the tool_palette is \"full\".\n"
+        "  - It is allowed to produce a plan with ZERO tools if you can answer directly.\n"
+        "- In mode=\"job\" with tool_palette=\"full\":\n"
+        "  - You may call any tools (analysis + action) as needed to produce the requested artifacts."
+    )
+    planner_meta = (
+        "### [PLANNER / SYSTEM]\n"
+        "Honor CO ratios/RoE. Prefer tools over text. Construct strict JSON steps with all required args; snap sizes to /8.\n"
+        "- Image edits: do NOT use image.edit. Always use image.dispatch for both generation and editing.\n"
+        "- When editing, include the input image via attachments (preferred) or set args.images to an array of objects containing absolute /uploads/... URLs.\n"
+        "- For denoise/inpaint style edits, include a strength field (0.0–1.0) when applicable; keep the prompt aligned with the edit intent.\n"
+        "- You MAY produce multiple steps in one plan in the 'steps' array; preserve the intended order. Use analysis tools first (rag_search, research.run, math.eval) to gather context, then call exactly one front-door action tool (image.dispatch, music.compose, film.run, tts.speak) if the user requested an artifact.\n"
+        "- In chat/analysis mode you MAY return steps with analysis tools only, or an empty 'steps' list if a direct textual answer suffices. Do NOT propose action tools in analysis mode."
+    )
+    committee_review = (
+        "### [COMMITTEE REVIEW / SYSTEM]\n"
+        "If plan conflicts with RoE/subject, apply a one-pass prompt revision (minimal) then proceed."
+    )
+    contract_return = (
+        "Return ONLY strict JSON: {\"steps\":[{\"tool\":\"<name>\",\"args\":{...}}]} — no extra keys or commentary."
+    )
+    plan_messages = frames_msgs + [
+        {"role": "system", "content": _mode_palette},
+        {"role": "system", "content": planner_meta},
+        {"role": "system", "content": committee_review},
+        {"role": "system", "content": contract_return},
+    ]
+    payload = build_ollama_payload(plan_messages, planner_id, DEFAULT_NUM_CTX, temperature)
+    _log("planner.backend.call", trace_id=trace_id, base=planner_base, model=planner_id)
+    result = await call_ollama(planner_base, payload)
+    _log("planner.backend.ok", trace_id=trace_id, base=planner_base, have_response=bool(result and result.get("response")))
+    if isinstance(result.get("error"), str) and result.get("error"):
+        _log("planner.backend.error", trace_id=None, base=planner_base, error=result.get("error"))
+        return "", []
+    text = result.get("response", "").strip()
+    # Use custom parser to normalise the planner JSON
+    parser = JSONParser()
+    # Prefer strict steps format; fallback to legacy 'tool_calls'
+    parsed_steps: Dict[str, Any] = {}
+    # 1) Direct parse
+    parsed_steps = parser.parse(text, {"steps": [{"tool": str, "args": dict}]})
+    # 2) If direct parse fails to produce steps, attempt to extract a JSON block (e.g., from a fenced code block)
+    steps = parsed_steps.get("steps") or []
+    if not steps:
+        def _extract_json_candidate(s: str) -> str:
+            s = s.strip()
+            if "```" in s:
+                parts = s.split("```")
+                for i in range(0, len(parts) - 1, 2):
+                    fence_lang = parts[i+0].split()[-1] if i == 0 else ""
+                    block = parts[i+1]
+                    if block is None:
+                        continue
+                    b = block.strip()
+                    if b:
+                        return b
+            start = s.find("{")
+            if start == -1:
+                return s
+            depth = 0
+            for j in range(start, len(s)):
+                ch = s[j]
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return s[start:j+1]
+            return s
+        candidate = _extract_json_candidate(text)
+        if candidate and candidate != text:
+            parsed_steps = parser.parse(candidate, {"steps": [{"tool": str, "args": dict}]})
+    steps = parsed_steps.get("steps") or []
+    if steps:
+        _log("planner.steps", trace_id=trace_id, steps=steps)
+        for st in steps:
+            if isinstance(st, dict) and st.get("tool") == "image.dispatch":
+                _log("planner.image.dispatch.args", trace_id=trace_id, args=st.get("args") or {})
+        tool_calls = [{"name": s.get("tool"), "arguments": (s.get("args") or {})} for s in steps if isinstance(s, dict)]
+        return "", tool_calls
+    # Legacy path
+    parsed = parser.parse(text, {"plan": str, "tool_calls": [{"name": str, "arguments": dict}]})
+    plan = parsed.get("plan", "")
+    tcs = parsed.get("tool_calls", []) or []
+    _log("planner.steps.legacy", trace_id=trace_id, tool_calls=tcs)
+    if tcs:
+        return plan, tcs
+    # Final hardening: one more pass forcing JSON mode at the backend with zero temperature
+    plan_messages_retry = plan_messages + [{"role": "system", "content": "Return ONLY a single minified JSON object matching the schema {\"steps\":[{\"tool\":\"<name>\",\"args\":{...}}]}. NO code fences. NO prose."}]
+    payload2 = build_ollama_payload(plan_messages_retry, planner_id, DEFAULT_NUM_CTX, 0.0)
+    payload2["format"] = "json"
+    _log("planner.retry", trace_id=trace_id, reason="no_steps_first_pass")
+    result2 = await call_ollama(planner_base, payload2)
+    text2 = result2.get("response", "").strip()
+    parsed2 = parser.parse(text2, {"steps": [{"tool": str, "args": dict}]})
+    steps2 = parsed2.get("steps") or []
+    if steps2:
+        _log("planner.steps", trace_id=trace_id, steps=steps2)
+        tool_calls2 = [{"name": s.get("tool"), "arguments": (s.get("args") or {})} for s in steps2 if isinstance(s, dict)]
+        return "", tool_calls2
+    return "", []
 
+
+async def postrun_committee_decide(
+    trace_id: str,
+    user_text: str,
+    tool_results: List[Dict[str, Any]],
+    qa_metrics: Dict[str, Any],
+    mode: str,
+) -> Dict[str, Any]:
+    """
+    Post-run committee decision: returns {"action": "go|revise|fail", "rationale": str, "patch_plan": [ {tool,args} ]}.
+    Reuses the same backend route as planner; strict JSON response required.
+    """
+    # Summarize tools used and artifact urls
+    tools_used: List[str] = []
+    for tr in (tool_results or []):
+        if isinstance(tr, dict):
+            nm = (tr.get("name") or tr.get("tool") or "")
+            if isinstance(nm, str) and nm.strip():
+                tools_used.append(nm.strip())
+    tools_used = list(dict.fromkeys(tools_used))
+    artifact_urls = assets_collect_urls(tool_results, lambda u: u)
+    # Allowed tools for this mode (front-door only)
+    allowed_for_mode = _allowed_tools_for_mode(mode)
+    # Build committee prompt
+    sys_hdr = (
+        "### [COMMITTEE POSTRUN / SYSTEM]\n"
+        "Decide whether to accept artifacts (go) or run one small revision (revise), or fail. "
+        "Return strict JSON only: {\"action\":\"go|revise|fail\",\"rationale\":\"...\"," 
+        "\"patch_plan\":[{\"tool\":\"<name>\",\"args\":{...}}]}.\n"
+        "- Inspect qa_metrics.counts and qa_metrics.domain.* to judge quality. Example triggers: "
+        "missing required modalities; images hands_ok_ratio < 0.85 or face/id/region/scene locks below profile thresholds; "
+        "videos seam_ok_ratio < 0.90; audio clipping_ratio > 0.0, tempo/key/stem/lyrics/voice lock scores below threshold, or LUFS far from -14.\n"
+        "- When any hard lock metric (face_lock, region_shape_min, scene_lock, voice_lock, tempo_lock, key_lock, stem_balance_lock, lyrics_lock) is below the quality_profile threshold, prefer action=\"revise\" with a patch_plan that increases lock strength or updates mode/inputs via locks.update_region_modes or locks.update_audio_modes; escalate to \"fail\" if refinement budget is exhausted.\n"
+        "- When tool_results contain errors (tr.error or tr.result.error), treat them as canonical envelope errors: read error.code, error.status, and error.details to understand what failed and why before deciding.\n"
+        "- Keep patch_plan minimal (<=2 steps) and prefer lock adjustment tools or a single regeneration step that reuses existing bundles. Tools must be chosen only from the planner-visible front-door set and allowed for the current mode. In chat/analysis mode, do not include any action tools in patch_plan.\n"
+        "- In chat/analysis mode, do not include any action tools in patch_plan.\n"
+        "- The executor validates once and runs each tool step once. It does NOT retry or repair automatically; any retries must be explicit new steps in patch_plan based on the observed errors and QA metrics.\n"
+        "- Document threshold violations, tool errors, and key metrics in rationale so humans understand why content was revised or failed.\n"
+    )
+    allowed_list = ", ".join(allowed_for_mode or [])
+    mode_note = f"mode={mode}"
+    user_blob = {
+        "user_text": (user_text or ""),
+        "qa_metrics": (qa_metrics or {}),
+        "tools_used": tools_used,
+        "artifact_urls": artifact_urls[:8],
+        "allowed_tools_for_mode": allowed_for_mode,
+        "mode": mode,
+    }
+    parser = JSONParser()
+    msgs = [
+        {"role": "system", "content": sys_hdr + f"Allowed tools: {allowed_list}\nCurrent {mode_note}."},
+        {"role": "user", "content": json.dumps(user_blob, ensure_ascii=False)},
+        {"role": "system", "content": "Return ONLY a single JSON object with keys: action, rationale, patch_plan."},
+    ]
+    # Reuse planner backend for committee call
+    use_qwen = str(PLANNER_MODEL or "qwen").lower().startswith("qwen")
+    committee_id = QWEN_MODEL_ID if use_qwen else GPTOSS_MODEL_ID
+    committee_base = QWEN_BASE_URL if use_qwen else GPTOSS_BASE_URL
+    payload = build_ollama_payload(msgs, committee_id, DEFAULT_NUM_CTX, 0.0)
+    _log("committee.postrun.call", trace_id=trace_id, base=committee_base, model=committee_id)
+    res = await call_ollama(committee_base, payload)
+    text = (res.get("response") or "").strip() if isinstance(res, dict) else ""
+    obj = parser.parse(text, {"action": str, "rationale": str, "patch_plan": [{"tool": str, "args": dict}]})
+    action = (obj.get("action") or "").strip().lower()
+    rationale = (obj.get("rationale") or "") if isinstance(obj.get("rationale"), str) else ""
+    steps = obj.get("patch_plan") or []
+    out = {"action": (action or "go"), "rationale": rationale, "patch_plan": (steps if isinstance(steps, list) else [])}
+    _log("committee.postrun.ok", trace_id=trace_id, action=out.get("action"), rationale=out.get("rationale"))
+    try:
+        _trace_log_event(
+            STATE_DIR,
+            str(trace_id),
+            {
+                "kind": "committee",
+                "stage": "decision",
+                "data": {
+                    "action": out.get("action"),
+                    "patch_steps_count": len(out.get("patch_plan") or []),
+                    "rationale": (rationale[:512] if isinstance(rationale, str) else ""),
+                },
+            },
+        )
+    except Exception:
+        pass
+    return out
 
 async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
     name = call.get("name")
@@ -2075,101 +2967,27 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         return {"name": name, "skipped": True, "reason": "film1_disabled"}
     # Generic HTTP API request tool (public APIs only; no internal SSRF)
     if name == "api.request":
-        from urllib.parse import urlsplit, urlencode
-        u = str(raw_args.get("url") or "")
-        method = str(raw_args.get("method") or "").upper()
-        headers = raw_args.get("headers") if isinstance(raw_args.get("headers"), dict) else {}
-        params = raw_args.get("params") if isinstance(raw_args.get("params"), dict) else {}
-        body = raw_args.get("body")
-        expect = (str(raw_args.get("expect") or "json")).lower()
-        follow_redirects = True if raw_args.get("follow_redirects") is None else bool(raw_args.get("follow_redirects"))
-        try:
-            max_bytes = int(raw_args.get("max_bytes") or 10485760)
-        except Exception:
-            max_bytes = 10485760
-        sp = urlsplit(u)
-        if sp.scheme not in ("http", "https"):
-            return {"name": name, "error": "scheme_not_allowed"}
-        host_low = (sp.hostname or "").lower()
-        if host_low in ("localhost",) or host_low.startswith("127.") or host_low == "::1":
-            return {"name": name, "error": "host_not_allowed"}
-        # Resolve and block RFC1918/link-local/loopback ranges
-        try:
-            import socket, ipaddress
-            addrs = set()
-            for family, _, _, _, sockaddr in socket.getaddrinfo(host_low, None):
-                ip = sockaddr[0]
-                addrs.add(ip)
-            for ip in addrs:
-                ip_obj = ipaddress.ip_address(ip)
-                if ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local:
-                    return {"name": name, "error": "host_not_allowed"}
-        except Exception:
-            # If resolution fails, proceed; validator already guards obvious hosts
-            pass
-        def _host_of(v: str) -> str:
-            try:
-                from urllib.parse import urlsplit as _us
-                return (_us(v).hostname or "").lower()
-            except Exception:
-                return ""
-        forbidden_hosts = set(filter(None, [
-            _host_of(os.getenv("EXECUTOR_BASE_URL", "")),
-            _host_of(os.getenv("COMFYUI_API_URL", "")),
-            _host_of(os.getenv("DRT_API_URL", "")),
-            _host_of(os.getenv("ORCHESTRATOR_BASE_URL", "")),
-        ]))
-        if host_low in forbidden_hosts:
-            return {"name": name, "error": "internal_host_not_allowed"}
-        # Build request
-        import httpx  # type: ignore
-        url = u
-        if params:
-            from urllib.parse import urlencode as _enc
-            qs = _enc({k: str(v) for k, v in params.items()})
-            sep = "&" if ("?" in url) else "?"
-            url = url + (("" if qs == "" else (sep + qs)))
-        # Prepare json/content
-        json_payload = None
-        content_payload = None
-        if isinstance(body, (dict, list)):
-            json_payload = body
-        elif isinstance(body, str):
-            content_payload = body.encode("utf-8")
-        elif body is None:
-            pass
-        # Perform request (no client timeouts)
-        async with httpx.AsyncClient(timeout=None, follow_redirects=follow_redirects, trust_env=False) as client:
-            resp = await client.request(method, url, headers={str(k): str(v) for k, v in (headers or {}).items()}, json=json_payload, content=content_payload)
-        # Enforce max_bytes
-        raw = resp.content or b""
-        if len(raw) > max_bytes:
-            return {"name": name, "result": {"status": int(resp.status_code), "headers": {k: v for k, v in resp.headers.items()}, "body_json": None, "body_text": None, "body_bytes_b64": None, "error": {"code": "body_too_large"}}}
-        # Extract body based on expectation
-        body_json = None
-        body_text = None
-        body_b64 = None
-        if expect == "bytes":
-            import base64 as _b64
-            body_b64 = _b64.b64encode(raw).decode("ascii")
-        elif expect == "text":
-            body_text = raw.decode(resp.encoding or "utf-8", errors="replace")
-        else:
-            # expect json: detect via simple heuristic to avoid broad try/except
-            txt = raw.decode(resp.encoding or "utf-8", errors="replace")
-            s = txt.lstrip()
-            if not (s.startswith("{") or s.startswith("[")):
-                return {"name": name, "result": {"status": int(resp.status_code), "headers": {k: v for k, v in resp.headers.items()}, "body_json": None, "body_text": txt[:2048], "body_bytes_b64": None, "error": {"code": "invalid_json"}}}
-            # attempt parse via JSONParser to avoid exceptions
-            body_json = _parse_json_text(txt, {})
-        result = {
-            "status": int(resp.status_code),
-            "headers": {k: v for k, v in resp.headers.items()},
-            "body_json": body_json,
-            "body_text": body_text,
-            "body_bytes_b64": body_b64,
+        # Backwards-compatible shim: route api.request to http.request implementation.
+        http_config: HttpRequestConfig = {
+            "url": str(raw_args.get("url") or ""),
+            "method": str(raw_args.get("method") or "").upper() or "GET",
+            "headers": raw_args.get("headers") if isinstance(raw_args.get("headers"), dict) else {},
+            "query": raw_args.get("params") if isinstance(raw_args.get("params"), dict) else {},
+            "body": raw_args.get("body"),
+            "expect_json": (str(raw_args.get("expect") or "json")).lower() != "text",
         }
-        return {"name": name, "result": result}
+        ok, payload = await perform_http_request(http_config)
+        if ok:
+            return {"name": "api.request", "result": payload}
+        return {
+            "name": "api.request",
+            "error": {
+                "code": payload.get("code"),
+                "message": payload.get("message"),
+                "status": payload.get("status"),
+                "details": payload.get("details"),
+            },
+        }
     # DB pool (may be None if PG not configured)
     pool = await get_pg_pool()
     # Normalize tool arguments using the custom parser and strong coercion
@@ -2280,9 +3098,98 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         return out
 
     args = _normalize_tool_args(raw_args)
+    if name == "locks.build_image_bundle":
+        a = args if isinstance(args, dict) else {}
+        character_id = str(a.get("character_id") or "").strip()
+        image_url = str(a.get("image_url") or "").strip()
+        options = a.get("options") if isinstance(a.get("options"), dict) else {}
+        if not character_id:
+            return {"name": name, "error": "missing_character_id"}
+        if not image_url:
+            return {"name": name, "error": "missing_image_url"}
+        bundle = await _build_image_lock_bundle(character_id, image_url, options, locks_root_dir=LOCKS_ROOT_DIR)
+        existing = await _lock_load(character_id) or {}
+        merged = _merge_lock_bundles(existing, bundle)
+        await _lock_save(character_id, merged)
+        return {"name": name, "result": {"lock_bundle": merged}}
+    if name == "locks.build_audio_bundle":
+        a = args if isinstance(args, dict) else {}
+        character_id = str(a.get("character_id") or "").strip()
+        audio_url = str(a.get("audio_url") or "").strip()
+        if not character_id:
+            return {"name": name, "error": "missing_character_id"}
+        if not audio_url:
+            return {"name": name, "error": "missing_audio_url"}
+        bundle = await _build_audio_lock_bundle(character_id, audio_url, locks_root_dir=LOCKS_ROOT_DIR)
+        existing = await _lock_load(character_id) or {}
+        merged = _merge_lock_bundles(existing, bundle)
+        await _lock_save(character_id, merged)
+        return {"name": name, "result": {"lock_bundle": merged}}
+    if name == "locks.build_region_locks":
+        a = args if isinstance(args, dict) else {}
+        character_id = str(a.get("character_id") or "").strip()
+        image_url = str(a.get("image_url") or "").strip()
+        regions_arg = a.get("regions") if isinstance(a.get("regions"), list) else None
+        if not character_id:
+            return {"name": name, "error": "missing_character_id"}
+        if not image_url:
+            return {"name": name, "error": "missing_image_url"}
+        bundle = await _build_region_lock_bundle(character_id, image_url, regions_arg, locks_root_dir=LOCKS_ROOT_DIR)
+        existing = await _lock_load(character_id) or {}
+        merged = _merge_lock_bundles(existing, bundle)
+        await _lock_save(character_id, merged)
+        return {"name": name, "result": {"lock_bundle": merged}}
+    if name == "locks.update_region_modes":
+        a = args if isinstance(args, dict) else {}
+        character_id = str(a.get("character_id") or "").strip()
+        updates = a.get("updates") if isinstance(a.get("updates"), list) else []
+        if not character_id:
+            return {"name": name, "error": "missing_character_id"}
+        existing = await _lock_load(character_id) or {}
+        updated_bundle = _apply_region_mode_updates(existing, updates)
+        await _lock_save(character_id, updated_bundle)
+        return {"name": name, "result": {"lock_bundle": updated_bundle}}
+    if name == "locks.update_audio_modes":
+        a = args if isinstance(args, dict) else {}
+        character_id = str(a.get("character_id") or "").strip()
+        update_payload = a.get("update") if isinstance(a.get("update"), dict) else {}
+        if not character_id:
+            return {"name": name, "error": "missing_character_id"}
+        existing = await _lock_load(character_id) or {}
+        updated_bundle = _apply_audio_mode_updates(existing, update_payload)
+        await _lock_save(character_id, updated_bundle)
+        return {"name": name, "result": {"lock_bundle": updated_bundle}}
+    if name == "locks.get_bundle":
+        a = args if isinstance(args, dict) else {}
+        character_id = str(a.get("character_id") or "").strip()
+        if not character_id:
+            return {"name": name, "error": "missing_character_id"}
+        bundle = await _lock_load(character_id)
+        if bundle is None:
+            return {"name": name, "result": {"lock_bundle": None, "found": False}}
+        return {"name": name, "result": {"lock_bundle": bundle, "found": True}}
     # Deterministic grouped dispatchers
     if name == "image.dispatch" and ALLOW_TOOL_EXECUTION:
         a = args if isinstance(args, dict) else {}
+        quality_profile = (a.get("quality_profile") or a.get("profile") or "standard")
+        preset_name = quality_profile.lower()
+        preset = LOCK_QUALITY_PRESETS.get(preset_name, LOCK_QUALITY_PRESETS["standard"])
+        if "steps" not in a or a.get("steps") is None:
+            a["steps"] = preset["steps"]
+        if "cfg" not in a or a.get("cfg") is None:
+            a["cfg"] = preset["cfg"]
+        bundle_arg = a.get("lock_bundle")
+        lock_bundle: Optional[Dict[str, Any]] = None
+        if isinstance(bundle_arg, dict):
+            lock_bundle = bundle_arg
+        elif isinstance(bundle_arg, str) and bundle_arg.strip():
+            lock_bundle = await _lock_load(bundle_arg.strip()) or {}
+        if not lock_bundle:
+            char_key = str(a.get("character_id") or a.get("lock_character_id") or "").strip()
+            if char_key:
+                lock_bundle = await _lock_load(char_key) or {}
+        if lock_bundle:
+            lock_bundle = _lock_apply_profile(quality_profile, lock_bundle)
         try:
             _log("[executor] step.args", tool=name, args_keys=sorted([str(k) for k in (list(a.keys()) if isinstance(a, dict) else [])]))
         except Exception:
@@ -2303,8 +3210,31 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         size = a.get("size")
         width = a.get("width")
         height = a.get("height")
-        assets = a.get("assets") if isinstance(a.get("assets"), dict) else {}
-        res = await _image_dispatch_run(str(prompt), negative if isinstance(negative, str) else None, seed if isinstance(seed, int) else None, width if isinstance(width, int) else None, height if isinstance(height, int) else None, size if isinstance(size, str) else None, assets, a.get("trace_id") if isinstance(a.get("trace_id"), str) else None)
+        steps_val = None
+        if "steps" in a:
+            try:
+                steps_val = int(a.get("steps"))
+            except Exception:
+                steps_val = None
+        cfg_val = a.get("cfg")
+        cfg_num = float(cfg_val) if isinstance(cfg_val, (int, float)) else None
+        assets = dict(a.get("assets") if isinstance(a.get("assets"), dict) else {})
+        if lock_bundle:
+            assets["lock_bundle"] = lock_bundle
+        res = await _image_dispatch_run(
+            str(prompt),
+            negative if isinstance(negative, str) else None,
+            seed if isinstance(seed, int) else None,
+            width if isinstance(width, int) else None,
+            height if isinstance(height, int) else None,
+            size if isinstance(size, str) else None,
+            assets,
+            steps=steps_val,
+            cfg_scale=cfg_num,
+            lock_bundle=lock_bundle,
+            quality_profile=quality_profile,
+            trace_id=a.get("trace_id") if isinstance(a.get("trace_id"), str) else None,
+        )
         return {"name": name, "result": res}
     if name == "film2.run" and ALLOW_TOOL_EXECUTION:
         # Unified Film-2 shot runner. Executes internal video passes and writes distilled traces/artifacts.
@@ -2317,6 +3247,21 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         do_interpolate = bool(a.get("interpolate") or False)
         target_scale = a.get("scale")  # optional
         result: Dict[str, Any] = {"ids": {}, "meta": {"shots": []}}
+        profile_name = (a.get("quality_profile") or "standard")
+        result["meta"]["quality_profile"] = profile_name
+        thresholds_lock = _lock_quality_thresholds(profile_name)
+        locks_arg = a.get("locks") if isinstance(a.get("locks"), dict) else {}
+        character_entries = locks_arg.get("characters") if isinstance(locks_arg.get("characters"), list) else []
+        character_ids: List[str] = []
+        for entry in character_entries:
+            char_id = entry.get("id")
+            if isinstance(char_id, str) and char_id.strip():
+                character_ids.append(char_id.strip())
+        current_character_bundles: Dict[str, Dict[str, Any]] = {}
+        for character_id in character_ids:
+            bundle_existing = await _lock_load(character_id)
+            if bundle_existing is not None:
+                current_character_bundles[character_id] = bundle_existing
         def _ev(e: Dict[str, Any]) -> None:
             if trace_id:
                 row = {"t": int(time.time()*1000), **e}
@@ -2333,9 +3278,12 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             if clips:
                 for i, src in enumerate(clips):
                     shot_meta: Dict[str, Any] = {"index": i, "source": src}
+                    segment_log: List[Dict[str, Any]] = []
                     # Cleanup
                     _ev({"event": "film2.pass_cleanup_start", "src": src})
                     cc = await execute_tool_call({"name": "video.cleanup", "arguments": {"__film2_internal": True, "src": src, "cid": cid, "trace_id": trace_id}})
+                    if isinstance(cc, dict):
+                        segment_log.append(cc)
                     ccr = (cc.get("result") or {}) if isinstance(cc, dict) else {}
                     clean_path = ccr.get("path") if isinstance(ccr, dict) else None
                     if isinstance(clean_path, str):
@@ -2347,6 +3295,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     if do_interpolate and isinstance(current, str):
                         _ev({"event": "film2.pass_interpolate_start"})
                         ic = await execute_tool_call({"name": "video.interpolate", "arguments": {"__film2_internal": True, "src": current, "cid": cid, "trace_id": trace_id}})
+                        if isinstance(ic, dict):
+                            segment_log.append(ic)
                         icr = (ic.get("result") or {}) if isinstance(ic, dict) else {}
                         interp_path = icr.get("path") if isinstance(icr, dict) else None
                         if isinstance(interp_path, str):
@@ -2358,20 +3308,75 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     if isinstance(current, str):
                         _ev({"event": "film2.pass_upscale_start"})
                         uc_args = {"__film2_internal": True, "src": current, "cid": cid, "trace_id": trace_id}
-                        if target_scale: uc_args["scale"] = target_scale
+                        if target_scale:
+                            uc_args["scale"] = target_scale
                         uc = await execute_tool_call({"name": "video.upscale", "arguments": uc_args})
+                        if isinstance(uc, dict):
+                            segment_log.append(uc)
                         up = (uc.get("result") or {}) if isinstance(uc, dict) else {}
                         up_path = up.get("path") if isinstance(up, dict) else None
                         if isinstance(up_path, str):
                             _artifact_video(up_path)
                             shot_meta["upscaled_path"] = up_path
                         _ev({"event": "film2.pass_upscale_finish"})
+                    if segment_log:
+                        shot_meta["segment_results"] = segment_log
+                        frames_for_hero = segment_log
+                        hero_pick = choose_hero_frame(frames_for_hero, thresholds_lock)
+                        hero_record: Dict[str, Any] = {}
+                        hero_path_value: Optional[str] = None
+                        if hero_pick is not None:
+                            hero_frame = hero_pick.get("frame") if isinstance(hero_pick, dict) else None
+                            hero_index = int(hero_pick.get("index")) if isinstance(hero_pick.get("index"), int) else hero_pick.get("index")
+                            hero_meta_payload = _frame_meta_payload(hero_frame) if isinstance(hero_frame, dict) else {}
+                            hero_record = {
+                                "index": int(hero_index) if isinstance(hero_index, int) else hero_pick.get("index"),
+                                "score": hero_pick.get("score"),
+                                "locks": hero_meta_payload.get("locks") if isinstance(hero_meta_payload.get("locks"), dict) else {},
+                            }
+                            hero_path_value = _frame_image_path(hero_frame) if isinstance(hero_frame, dict) else None
+                        elif frames_for_hero:
+                            fallback_frame = frames_for_hero[-1]
+                            fallback_meta = _frame_meta_payload(fallback_frame)
+                            hero_record = {
+                                "index": len(frames_for_hero) - 1,
+                                "score": None,
+                                "locks": fallback_meta.get("locks") if isinstance(fallback_meta.get("locks"), dict) else {},
+                                "fallback": True,
+                            }
+                            hero_path_value = _frame_image_path(fallback_frame)
+                        if hero_record:
+                            if isinstance(hero_path_value, str) and hero_path_value:
+                                if os.path.isabs(hero_path_value):
+                                    hero_abs = hero_path_value
+                                else:
+                                    hero_abs = os.path.join(UPLOAD_DIR, hero_path_value.lstrip("/"))
+                                hero_record["image_path"] = hero_abs
+                            shot_meta["hero_frame"] = hero_record
+                            hero_abs_path = hero_record.get("image_path")
+                            if isinstance(hero_abs_path, str) and hero_abs_path and character_ids:
+                                for character_id in character_ids:
+                                    existing_bundle = current_character_bundles.get(character_id)
+                                    if existing_bundle is not None:
+                                        updated_bundle = await _lock_update_from_hero(
+                                            character_id,
+                                            hero_abs_path,
+                                            existing_bundle,
+                                            locks_root_dir=LOCKS_ROOT_DIR,
+                                        )
+                                        current_character_bundles[character_id] = updated_bundle
+                                        hero_record.setdefault("bundle_versions", {})[character_id] = {
+                                            "schema_version": updated_bundle.get("schema_version"),
+                                        }
                     result["meta"]["shots"].append(shot_meta)
             # Image-to-video path via SVD (if images provided)
             elif images:
                 for i, img in enumerate(images):
                     _ev({"event": "film2.pass_gen_start", "adapter": "svd.i2v", "image": img})
                     gv = await execute_tool_call({"name": "video.svd.i2v", "arguments": {"__film2_internal": True, "src": img, "cid": cid, "trace_id": trace_id}})
+                    segment_log: List[Dict[str, Any]] = []
+                    if isinstance(gv, dict):
+                        segment_log.append(gv)
                     gvr = (gv.get("result") or {}) if isinstance(gv, dict) else {}
                     gen_path = gvr.get("path") if isinstance(gvr, dict) else None
                     shot_meta: Dict[str, Any] = {"index": i, "gen_path": gen_path}
@@ -2382,6 +3387,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                         if do_interpolate:
                             _ev({"event": "film2.pass_interpolate_start"})
                             ic = await execute_tool_call({"name": "video.interpolate", "arguments": {"__film2_internal": True, "src": current, "cid": cid, "trace_id": trace_id}})
+                            if isinstance(ic, dict):
+                                segment_log.append(ic)
                             icr = (ic.get("result") or {}) if isinstance(ic, dict) else {}
                             interp_path = icr.get("path") if isinstance(icr, dict) else None
                             if isinstance(interp_path, str):
@@ -2392,6 +3399,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                         # Upscale
                         _ev({"event": "film2.pass_upscale_start"})
                         uc = await execute_tool_call({"name": "video.upscale", "arguments": {"__film2_internal": True, "src": current, "cid": cid, "trace_id": trace_id}})
+                        if isinstance(uc, dict):
+                            segment_log.append(uc)
                         up = (uc.get("result") or {}) if isinstance(uc, dict) else {}
                         up_path = up.get("path") if isinstance(up, dict) else None
                         if isinstance(up_path, str):
@@ -2399,6 +3408,55 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                             shot_meta["upscaled_path"] = up_path
                         _ev({"event": "film2.pass_upscale_finish"})
                     _ev({"event": "film2.pass_gen_finish"})
+                    if segment_log:
+                        shot_meta["segment_results"] = segment_log
+                        frames_for_hero = segment_log
+                        hero_pick = choose_hero_frame(frames_for_hero, thresholds_lock)
+                        hero_record = {}
+                        hero_path_value = None
+                        if hero_pick is not None:
+                            hero_frame = hero_pick.get("frame") if isinstance(hero_pick, dict) else None
+                            hero_index = int(hero_pick.get("index")) if isinstance(hero_pick.get("index"), int) else hero_pick.get("index")
+                            hero_meta_payload = _frame_meta_payload(hero_frame) if isinstance(hero_frame, dict) else {}
+                            hero_record = {
+                                "index": int(hero_index) if isinstance(hero_index, int) else hero_pick.get("index"),
+                                "score": hero_pick.get("score"),
+                                "locks": hero_meta_payload.get("locks") if isinstance(hero_meta_payload.get("locks"), dict) else {},
+                            }
+                            hero_path_value = _frame_image_path(hero_frame) if isinstance(hero_frame, dict) else None
+                        elif frames_for_hero:
+                            fallback_frame = frames_for_hero[-1]
+                            fallback_meta = _frame_meta_payload(fallback_frame)
+                            hero_record = {
+                                "index": len(frames_for_hero) - 1,
+                                "score": None,
+                                "locks": fallback_meta.get("locks") if isinstance(fallback_meta.get("locks"), dict) else {},
+                                "fallback": True,
+                            }
+                            hero_path_value = _frame_image_path(fallback_frame)
+                        if hero_record:
+                            if isinstance(hero_path_value, str) and hero_path_value:
+                                if os.path.isabs(hero_path_value):
+                                    hero_abs = hero_path_value
+                                else:
+                                    hero_abs = os.path.join(UPLOAD_DIR, hero_path_value.lstrip("/"))
+                                hero_record["image_path"] = hero_abs
+                            shot_meta["hero_frame"] = hero_record
+                            hero_abs_path = hero_record.get("image_path")
+                            if isinstance(hero_abs_path, str) and hero_abs_path and character_ids:
+                                for character_id in character_ids:
+                                    existing_bundle = current_character_bundles.get(character_id)
+                                    if existing_bundle is not None:
+                                        updated_bundle = await _lock_update_from_hero(
+                                            character_id,
+                                            hero_abs_path,
+                                            existing_bundle,
+                                            locks_root_dir=LOCKS_ROOT_DIR,
+                                        )
+                                        current_character_bundles[character_id] = updated_bundle
+                                        hero_record.setdefault("bundle_versions", {})[character_id] = {
+                                            "schema_version": updated_bundle.get("schema_version"),
+                                        }
                     result["meta"].setdefault("shots", []).append(shot_meta)
             else:
                 # Nothing to do without sources; later we can add HV t2v when proper inputs provided
@@ -2488,6 +3546,21 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         manifest = {"items": []}
         try:
             a = args if isinstance(args, dict) else {}
+            quality_profile = (a.get("quality_profile") or "standard")
+            bundle_arg = a.get("lock_bundle")
+            lock_bundle: Optional[Dict[str, Any]] = None
+            if isinstance(bundle_arg, dict):
+                lock_bundle = bundle_arg
+            elif isinstance(bundle_arg, str) and bundle_arg.strip():
+                lock_bundle = await _lock_load(bundle_arg.strip()) or {}
+            if not lock_bundle:
+                char_id = str(a.get("character_id") or "").strip()
+                if char_id:
+                    lock_bundle = await _lock_load(char_id) or {}
+            if lock_bundle:
+                lock_bundle = _lock_apply_profile(quality_profile, lock_bundle)
+                a["lock_bundle"] = lock_bundle
+            a["quality_profile"] = quality_profile
             env = run_tts_speak(a, provider, manifest)
             # Persist audio artifact to memory + RAG; distilled artifact row
             wav = env.get("wav_bytes") if isinstance(env, dict) else None
@@ -2554,6 +3627,9 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 out_res["meta"]["preview_duration_s"] = float(len(frames) / (sw * fr))
                 if env.get("duration_s") is not None:
                     out_res["meta"]["full_duration_s"] = float(env.get("duration_s"))
+                locks_block = out_res.setdefault("meta", {}).setdefault("locks", {})
+                if isinstance(locks_block, dict) and quality_profile:
+                    locks_block.setdefault("quality_profile", quality_profile)
             return {"name": name, "result": out_res}
         except Exception as ex:
             _tb = traceback.format_exc()
@@ -2714,7 +3790,13 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     return _as.get_event_loop().run_until_complete(self._compose(args))
             provider = _MusicProvider(); manifest = {"items": []}
             try:
-                env = run_music_compose(args if isinstance(args, dict) else {}, provider, manifest)
+                compose_args = args if isinstance(args, dict) else {}
+                profile_name = (compose_args.get("quality_profile") or "standard")
+                env = run_music_compose(compose_args, provider, manifest)
+                if isinstance(env, dict):
+                    meta_env = env.setdefault("meta", {})
+                    if isinstance(meta_env, dict):
+                        meta_env.setdefault("quality_profile", profile_name)
                 return {"name": name, "result": env}
             except Exception as ex:
                 return {"name": name, "error": str(ex)}
@@ -2761,6 +3843,19 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         manifest = {"items": []}
         try:
             a = args if isinstance(args, dict) else {}
+            quality_profile = (a.get("quality_profile") or "standard")
+            bundle_arg = a.get("lock_bundle")
+            lock_bundle: Optional[Dict[str, Any]] = None
+            if isinstance(bundle_arg, dict):
+                lock_bundle = bundle_arg
+            elif isinstance(bundle_arg, str) and bundle_arg.strip():
+                lock_bundle = await _lock_load(bundle_arg.strip()) or {}
+            if not lock_bundle:
+                char_id = str(a.get("character_id") or "").strip()
+                if char_id:
+                    lock_bundle = await _lock_load(char_id) or {}
+            if lock_bundle:
+                a["lock_bundle"] = lock_bundle
             env = run_music_compose(a, provider, manifest)
             wav = env.get("wav_bytes") if isinstance(env, dict) else None
             if isinstance(wav, (bytes, bytearray)) and len(wav) > 0:
@@ -2771,7 +3866,57 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 wav_path = os.path.join(outdir, stem + ".wav")
                 with open(wav_path, "wb") as _wf:
                     _wf.write(wav)
-                _sidecar(wav_path, {"tool": "music.compose", "prompt": a.get("prompt")})
+                locks_meta: Dict[str, Any] = {}
+                if lock_bundle:
+                    locks_meta["bundle"] = lock_bundle
+                    locks_meta["quality_profile"] = quality_profile
+                    audio_section = lock_bundle.get("audio") if isinstance(lock_bundle.get("audio"), dict) else {}
+                    ref_voice = audio_section.get("voice_embedding")
+                    if isinstance(ref_voice, list):
+                        voice_embed = await _lock_voice_embedding_from_path(wav_path)
+                        if voice_embed:
+                            sim = _cosine_similarity(ref_voice, voice_embed)
+                            if sim is not None:
+                                voice_score = max(0.0, min((sim + 1.0) / 2.0, 1.0))
+                                locks_meta["voice_score"] = voice_score
+                                locks_meta["voice_embedding"] = voice_embed
+                    tempo_target = audio_section.get("tempo_bpm")
+                    tempo_mode = audio_section.get("tempo_lock_mode", "off")
+                    if tempo_target is not None and tempo_mode != "off":
+                        try:
+                            tempo_target_f = float(tempo_target)
+                            tempo_detected = _audio_detect_tempo(wav_path)
+                            if tempo_detected is not None and tempo_target_f > 0:
+                                tempo_score = max(0.0, min(1.0 - (abs(tempo_detected - tempo_target_f) / tempo_target_f), 1.0))
+                                locks_meta["tempo_detected"] = tempo_detected
+                                locks_meta["tempo_score"] = tempo_score
+                                locks_meta["tempo_lock_mode"] = tempo_mode
+                        except Exception:
+                            pass
+                    key_target = audio_section.get("key")
+                    key_mode = audio_section.get("key_lock_mode", "off")
+                    if isinstance(key_target, str) and key_mode != "off":
+                        detected_key = _audio_detect_key(wav_path)
+                        locks_meta["key_detected"] = detected_key
+                        score_key = _key_similarity(key_target, detected_key)
+                        if score_key is not None:
+                            locks_meta["key_score"] = score_key
+                            locks_meta["key_lock_mode"] = key_mode
+                    stem_profile = audio_section.get("stem_profile") if isinstance(audio_section.get("stem_profile"), dict) else {}
+                    if stem_profile and audio_section.get("stem_lock_mode", "off") != "off":
+                        total_target = sum(float(v) for v in stem_profile.values() if isinstance(v, (int, float)))
+                        normalized_target = {k: (float(v) / total_target) if total_target else float(v) for k, v in stem_profile.items() if isinstance(v, (int, float))}
+                        detected_profile = _audio_band_energy_profile(wav_path, DEFAULT_STEM_BANDS)
+                        score_stem = _stem_balance_score(normalized_target, detected_profile)
+                        if score_stem is not None:
+                            locks_meta["stem_balance_score"] = score_stem
+                            locks_meta["stem_detected_profile"] = detected_profile
+                            locks_meta["stem_lock_mode"] = audio_section.get("stem_lock_mode")
+                    locks_meta.setdefault("lyrics_score", None)
+                sidecar_meta = {"tool": "music.compose", "prompt": a.get("prompt")}
+                if locks_meta:
+                    sidecar_meta["locks"] = locks_meta
+                _sidecar(wav_path, sidecar_meta)
                 _ctx_add(cid, "audio", wav_path, _uri_from_upload_path(wav_path), None, [], {"prompt": a.get("prompt")})
                 tr = (a.get("trace_id") if isinstance(a.get("trace_id"), str) else None)
                 if tr:
@@ -2789,6 +3934,16 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     async with pool.acquire() as conn:
                         rel = os.path.relpath(wav_path, UPLOAD_DIR).replace("\\", "/")
                         await conn.execute("INSERT INTO rag_docs (path, chunk, embedding) VALUES ($1, $2, $3)", rel, txt, list(vec))
+                if isinstance(env, dict):
+                    meta_env = env.setdefault("meta", {})
+                    if isinstance(meta_env, dict) and quality_profile:
+                        meta_env.setdefault("quality_profile", quality_profile)
+                if isinstance(env, dict) and locks_meta:
+                    meta_block = env.get("meta")
+                    if not isinstance(meta_block, dict):
+                        meta_block = {}
+                        env["meta"] = meta_block
+                    meta_block["locks"] = locks_meta
             return {"name": name, "result": env}
         except Exception as ex:
             return {"name": name, "error": str(ex)}
@@ -2796,6 +3951,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         manifest = {"items": []}
         try:
             a = args if isinstance(args, dict) else {}
+            profile_name = (a.get("quality_profile") or "standard")
             env = run_music_variation(a, manifest)
             wav = env.get("wav_bytes") if isinstance(env, dict) else None
             if isinstance(wav, (bytes, bytearray)) and len(wav) > 0:
@@ -2815,6 +3971,10 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                         checkpoints_append_event(STATE_DIR, tr, "artifact", {"kind": "audio", "path": rel, "bytes": int(len(wav))})
                     except Exception:
                         pass
+                if isinstance(env, dict):
+                    meta_env = env.setdefault("meta", {})
+                    if isinstance(meta_env, dict):
+                        meta_env.setdefault("quality_profile", profile_name)
             return {"name": name, "result": env}
         except Exception as ex:
             return {"name": name, "error": str(ex)}
@@ -2822,6 +3982,19 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         manifest = {"items": []}
         try:
             a = args if isinstance(args, dict) else {}
+            quality_profile = (a.get("quality_profile") or "standard")
+            bundle_arg = a.get("lock_bundle")
+            lock_bundle: Optional[Dict[str, Any]] = None
+            if isinstance(bundle_arg, dict):
+                lock_bundle = bundle_arg
+            elif isinstance(bundle_arg, str) and bundle_arg.strip():
+                lock_bundle = await _lock_load(bundle_arg.strip()) or {}
+            if not lock_bundle:
+                char_id = str(a.get("character_id") or "").strip()
+                if char_id:
+                    lock_bundle = await _lock_load(char_id) or {}
+            if lock_bundle:
+                a["lock_bundle"] = lock_bundle
             env = run_music_mixdown(a, manifest)
             wav = env.get("wav_bytes") if isinstance(env, dict) else None
             if isinstance(wav, (bytes, bytearray)) and len(wav) > 0:
@@ -2832,7 +4005,56 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 wav_path = os.path.join(outdir, stem + ".wav")
                 with open(wav_path, "wb") as _wf:
                     _wf.write(wav)
-                _sidecar(wav_path, {"tool": "music.mixdown"})
+                locks_meta: Dict[str, Any] = {}
+                if lock_bundle:
+                    locks_meta["bundle"] = lock_bundle
+                    locks_meta["quality_profile"] = quality_profile
+                    audio_section = lock_bundle.get("audio") if isinstance(lock_bundle.get("audio"), dict) else {}
+                    ref_voice = audio_section.get("voice_embedding")
+                    if isinstance(ref_voice, list):
+                        voice_embed = await _lock_voice_embedding_from_path(wav_path)
+                        if voice_embed:
+                            sim = _cosine_similarity(ref_voice, voice_embed)
+                            if sim is not None:
+                                locks_meta["voice_score"] = max(0.0, min((sim + 1.0) / 2.0, 1.0))
+                                locks_meta["voice_embedding"] = voice_embed
+                    tempo_target = audio_section.get("tempo_bpm")
+                    tempo_mode = audio_section.get("tempo_lock_mode", "off")
+                    if tempo_target is not None and tempo_mode != "off":
+                        try:
+                            tempo_target_f = float(tempo_target)
+                            tempo_detected = _audio_detect_tempo(wav_path)
+                            if tempo_detected is not None and tempo_target_f > 0:
+                                tempo_score = max(0.0, min(1.0 - (abs(tempo_detected - tempo_target_f) / tempo_target_f), 1.0))
+                                locks_meta["tempo_detected"] = tempo_detected
+                                locks_meta["tempo_score"] = tempo_score
+                                locks_meta["tempo_lock_mode"] = tempo_mode
+                        except Exception:
+                            pass
+                    key_target = audio_section.get("key")
+                    key_mode = audio_section.get("key_lock_mode", "off")
+                    if isinstance(key_target, str) and key_mode != "off":
+                        detected_key = _audio_detect_key(wav_path)
+                        locks_meta["key_detected"] = detected_key
+                        key_score = _key_similarity(key_target, detected_key)
+                        if key_score is not None:
+                            locks_meta["key_score"] = key_score
+                            locks_meta["key_lock_mode"] = key_mode
+                    stem_profile = audio_section.get("stem_profile") if isinstance(audio_section.get("stem_profile"), dict) else {}
+                    if stem_profile and audio_section.get("stem_lock_mode", "off") != "off":
+                        total_target = sum(float(v) for v in stem_profile.values() if isinstance(v, (int, float)))
+                        normalized_target = {k: (float(v) / total_target) if total_target else float(v) for k, v in stem_profile.items() if isinstance(v, (int, float))}
+                        detected_profile = _audio_band_energy_profile(wav_path, DEFAULT_STEM_BANDS)
+                        stem_score = _stem_balance_score(normalized_target, detected_profile)
+                        if stem_score is not None:
+                            locks_meta["stem_balance_score"] = stem_score
+                            locks_meta["stem_detected_profile"] = detected_profile
+                            locks_meta["stem_lock_mode"] = audio_section.get("stem_lock_mode")
+                    locks_meta.setdefault("lyrics_score", None)
+                sidecar_meta = {"tool": "music.mixdown"}
+                if locks_meta:
+                    sidecar_meta["locks"] = locks_meta
+                _sidecar(wav_path, sidecar_meta)
                 _ctx_add(cid, "audio", wav_path, _uri_from_upload_path(wav_path), None, [], {})
                 tr = (a.get("trace_id") if isinstance(a.get("trace_id"), str) else None)
                 if tr:
@@ -2841,6 +4063,10 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                         checkpoints_append_event(STATE_DIR, tr, "artifact", {"kind": "audio", "path": rel, "bytes": int(len(wav))})
                     except Exception:
                         pass
+                if isinstance(env, dict):
+                    meta_env = env.setdefault("meta", {})
+                    if isinstance(meta_env, dict) and quality_profile:
+                        meta_env.setdefault("quality_profile", quality_profile)
             return {"name": name, "result": env}
         except Exception as ex:
             return {"name": name, "error": str(ex)}
@@ -4628,12 +5854,26 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
 async def execute_tools(tool_calls: List[Dict[str, Any]], trace_id: str | None = None) -> List[Dict[str, Any]]:
     # Route all tool execution through the executor only.
     steps: List[Dict[str, Any]] = []
-    for call in tool_calls[:5]:
+    for idx, call in enumerate(tool_calls[:5]):
         name = (call or {}).get("name")
         args = (call or {}).get("arguments") or {}
         if not isinstance(args, dict):
             args = {}
-        steps.append({"tool": str(name or ""), "args": args})
+        step_id = f"s{idx+1}"
+        steps.append({"id": step_id, "tool": str(name or ""), "args": args})
+        if trace_id:
+            _trace_log_tool(
+                STATE_DIR,
+                str(trace_id),
+                {
+                    "request_id": str(trace_id),
+                    "step_id": step_id,
+                    "tool": str(name or ""),
+                    "phase": "pre",
+                    "args": args,
+                    "meta": {"retry_index": 0},
+                },
+            )
     rid = str(trace_id or _uuid.uuid4().hex)
     payload = {"schema_version": 1, "request_id": rid, "trace_id": rid, "steps": steps}
     async with _hx.AsyncClient(timeout=None) as client:
@@ -4642,15 +5882,65 @@ async def execute_tools(tool_calls: List[Dict[str, Any]], trace_id: str | None =
             env = _resp_json(r, {})
         except Exception as ex:
             env = {"ok": False, "error": {"code": "executor_connect_error", "message": str(ex)}, "result": {"produced": {}}}
+            if trace_id:
+                _trace_log_error(
+                    STATE_DIR,
+                    str(trace_id),
+                    {
+                        "context": "executor",
+                        "code": "executor_connect_error",
+                        "message": str(ex),
+                        "status": 0,
+                        "details": {},
+                    },
+                )
     results: List[Dict[str, Any]] = []
     if isinstance(env, dict) and env.get("ok") and isinstance((env.get("result") or {}).get("produced"), dict):
-        for _, step in (env.get("result") or {}).get("produced", {}).items():
+        for sid, step in (env.get("result") or {}).get("produced", {}).items():
             if isinstance(step, dict):
                 res = step.get("result") if isinstance(step.get("result"), dict) else {}
                 results.append({"name": (res.get("name") or "tool") if isinstance(res, dict) else "tool", "result": res})
+                if trace_id:
+                    envelope = {
+                        "ok": True,
+                        "result": res,
+                        "error": None,
+                    }
+                    _trace_log_tool(
+                        STATE_DIR,
+                        str(trace_id),
+                        {
+                            "request_id": rid,
+                            "step_id": str(sid),
+                            "tool": str(step.get("name") or "tool"),
+                            "phase": "post",
+                            "envelope": envelope,
+                            "duration_ms": int(step.get("duration_ms") or 0),
+                            "meta": {"retry_index": 0},
+                        },
+                    )
         return results
     # Error path: surface a single executor error record
     err = (env or {}).get("error") or (env.get("result") or {}).get("error") or {}
+    if trace_id:
+        envelope_err = {
+            "ok": False,
+            "result": None,
+            "error": err,
+        }
+        _trace_log_tool(
+            STATE_DIR,
+            str(trace_id),
+            {
+                "request_id": rid,
+                "step_id": "executor",
+                "tool": "executor",
+                "phase": "post",
+                "envelope": envelope_err,
+                "duration_ms": 0,
+                "meta": {"retry_index": 0},
+            },
+        )
     return [{"name": "executor", "error": (err.get("message") or "executor_failed")}]
 
 
@@ -4673,6 +5963,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     normalized_msgs = shaped.get("normalized_msgs") or []
     attachments = shaped.get("attachments") or []
     last_user_text = shaped.get("last_user_text") or ""
+    effective_mode = _infer_effective_mode(last_user_text)
     conv_cid = shaped.get("conv_cid")
     mode = shaped.get("mode") or "general"
     master_seed = int(shaped.get("master_seed") or 0)
@@ -4693,8 +5984,28 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         )
         response_prebuilt = env
     first_user_len = len((last_user_text or "")) if isinstance(last_user_text, str) else 0
-    # Purge legacy trace files for this trace to enforce unified format
+    # Purge legacy trace files for this trace to enforce unified format (no-op for new traces layout)
     _cleanup_legacy_trace_files(trace_id)
+    # High-level request trace (distillation-friendly)
+    try:
+        _trace_log_request(
+            STATE_DIR,
+            str(trace_id),
+            {
+                "request_id": str(trace_id),
+                "kind": "chat",
+                "route": str(request.url.path),
+                "payload": {"messages_count": len(normalized_msgs or []), "first_user_text_len": first_user_len},
+                "meta": {
+                    "mode": mode,
+                    "effective_mode": effective_mode,
+                    "schema_version": 1,
+                },
+            },
+        )
+    except Exception:
+        # Tracing must not break request handling
+        pass
     checkpoints_append_event(STATE_DIR, trace_id, "request", {
         "trace_id": trace_id,
         "route": "/v1/chat/completions",
@@ -4702,7 +6013,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         "seed": int(master_seed),
         "model_declared": (body.get("model") if isinstance(body.get("model"), str) else None),
     })
-    _log("chat.start", trace_id=trace_id, mode=mode, stream=bool(body.get("stream")), cid=conv_cid)
+    _log("chat.start", trace_id=trace_id, mode=mode, effective_mode=effective_mode, stream=bool(body.get("stream")), cid=conv_cid)
     # Helper: build absolute URLs for any same-origin artifact paths
     def _abs_url(u: str) -> str:
         if isinstance(u, str) and u.startswith("/"):
@@ -4714,7 +6025,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         return u
     # Acquire per-trace lock and record start event
     _lock_token = trace_acquire_lock(STATE_DIR, trace_id, timeout_s=10)
-    checkpoints_append_event(STATE_DIR, trace_id, "start", {"seed": int(master_seed), "mode": mode})
+    checkpoints_append_event(STATE_DIR, trace_id, "start", {"seed": int(master_seed), "mode": mode, "effective_mode": effective_mode})
 
     # ICW pack (always-on) — inline; record pack_hash for traces
     pack_hash = None
@@ -4726,6 +6037,21 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     if isinstance(pack_text, str) and pack_text.strip():
         messages = [{"role": "system", "content": f"ICW PACK (hash tracked):\n{pack_text[:12000]}"}] + messages
     pack_hash = icw.get("hash")
+    try:
+        _trace_log_event(
+            STATE_DIR,
+            str(trace_id),
+            {
+                "kind": "co",
+                "stage": "pack",
+                "data": {
+                    "frames_count": len(icw.get("frames") or []),
+                    "approx_chars": len(str(pack_text)) if isinstance(pack_text, str) else 0,
+                },
+            },
+        )
+    except Exception:
+        pass
     run_id = await _db_insert_run(trace_id=trace_id, mode=mode, seed=master_seed, pack_hash=pack_hash, request_json=body)
     await _db_insert_icw_log(run_id=run_id, pack_hash=pack_hash or None, budget_tokens=int(icw.get("budget_tokens") or 0), scores_json=icw.get("scores_summary") or {})
 
@@ -4789,7 +6115,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         _log("committee.selection.warn", trace_id=trace_id, reason="chosen_option_not_in_proposals")
     _log("planner.finalize", trace_id=trace_id, chosen_option_id=_winner, deltas_from_option=[], justification="Adopts committee-winning rationale for typed arguments")
     _log("planner.call", trace_id=trace_id)
-    plan_text, tool_calls = await planner_produce_plan(messages, body.get("tools"), body.get("temperature") or DEFAULT_TEMPERATURE, trace_id=trace_id)
+    plan_text, tool_calls = await planner_produce_plan(messages, body.get("tools"), body.get("temperature") or DEFAULT_TEMPERATURE, trace_id=trace_id, mode=mode)
     _log("planner.done", trace_id=trace_id, tool_count=len(tool_calls or []))
     # Normalize planner tool calls into orchestrator internal schema {name, arguments}
     def _normalize_tool_calls(calls: Any) -> List[Dict[str, Any]]:
@@ -4912,8 +6238,27 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         nm = fn.get("name")
         if nm:
             allowed_tools.add(str(nm))
-    need_name_fix = (len(tool_calls or []) == 0) or any(not str((tc or {}).get("name") or "").strip() for tc in (tool_calls or []))
-    if need_name_fix:
+    # Derive effective mode for this routing pass based on latest user text (align with planner inference)
+    _latest_lower_route = (last_user_text or "").lower()
+    _asset_triggers_route = [
+        "draw me an image","generate an image","make an image","make a picture",
+        "make a song","compose music","generate music",
+        "make a video","render video","film this","use comfy","image of",
+    ]
+    _stop_triggers_route = [
+        "stop running tools","do not call any tools","just explain","just respond in text",
+    ]
+    _wants_asset_route = any((tr in _latest_lower_route) for tr in _asset_triggers_route) and not any((st in _latest_lower_route) for st in _stop_triggers_route)
+    effective_mode = "job" if _wants_asset_route else "chat"
+    # Restrict to planner-visible tools first
+    allowed_tools = {n for n in allowed_tools if n in PLANNER_VISIBLE_TOOLS}
+    # Intersect with mode-allowed palette for this planning pass
+    allowed_by_mode = set(_allowed_tools_for_mode(effective_mode))
+    allowed_tools = allowed_tools & allowed_by_mode
+    no_steps = (len(tool_calls or []) == 0)
+    names_missing = any(not str((tc or {}).get("name") or "").strip() for tc in (tool_calls or []))
+    # In chat/analysis mode: accept zero steps; in job mode: retry if zero or names missing
+    if (no_steps and (effective_mode == "job")) or (not no_steps and names_missing):
         allowed_sorted = sorted(list(allowed_tools))
         constraint = (
             "Your previous output omitted tool names. You MUST choose only from the allowed tool catalog:\n- "
@@ -4923,7 +6268,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         )
         replan_messages = messages + [{"role": "system", "content": constraint}]
         _log("replan.start", trace_id=trace_id, reason="empty_or_unnamed_tools", allowed=allowed_sorted)
-        plan2, calls2 = await planner_produce_plan(replan_messages, body.get("tools"), body.get("temperature") or DEFAULT_TEMPERATURE, trace_id=trace_id)
+        plan2, calls2 = await planner_produce_plan(replan_messages, body.get("tools"), body.get("temperature") or DEFAULT_TEMPERATURE, trace_id=trace_id, mode=effective_mode)
         calls2_norm = _normalize_tool_calls(calls2)
         # Filter out any unknown tools
         filtered = []
@@ -4968,10 +6313,17 @@ async def chat_completions(body: Dict[str, Any], request: Request):
 
     # Pre-validate tool names against the registered catalog to avoid executor 404s
     allowed_tools = catalog_allowed(get_builtin_tools_schema)
+    # Restrict catalog to planner-visible tools only
+    allowed_tools = {n for n in allowed_tools if n in PLANNER_VISIBLE_TOOLS}
+    # Intersect catalog with mode-based palette when constraining re-plans
+    _allowed_mode_set = set(_allowed_tools_for_mode(effective_mode))
     _, unknown = catalog_validate(tool_calls or [], allowed_tools)
     if unknown:
         # Attempt a single re-plan constrained to allowed tool names
-        allowed_sorted = sorted(list(allowed_tools))
+        if _allowed_mode_set:
+            allowed_sorted = sorted([n for n in list(allowed_tools) if n in _allowed_mode_set])
+        else:
+            allowed_sorted = sorted(list(allowed_tools))
         constraint = (
             "Tool selection invalid. You must choose only from the allowed tool catalog:\n- "
             + "\n- ".join(allowed_sorted)
@@ -4979,7 +6331,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         )
         replan_messages = messages + [{"role": "system", "content": constraint}]
         _log("replan.start", trace_id=trace_id, reason="unknown_tool", unknown=unknown, allowed=allowed_sorted)
-        plan2, tool_calls2 = await planner_produce_plan(replan_messages, body.get("tools"), body.get("temperature") or DEFAULT_TEMPERATURE, trace_id=trace_id)
+        plan2, tool_calls2 = await planner_produce_plan(replan_messages, body.get("tools"), body.get("temperature") or DEFAULT_TEMPERATURE, trace_id=trace_id, mode=effective_mode)
         # Normalize and filter
         tool_calls2 = _normalize_tool_calls(tool_calls2)
         # Re-check against allowed
@@ -4992,215 +6344,354 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         _log("replan.done", trace_id=trace_id, count=len(tool_calls2 or []))
         tool_calls = tool_calls2
 
-    # Orchestrator repair manager (single AI round): pre-validate, and on 422 call planner once to repair args
-    if tool_calls:
-        import hashlib as _hl
-        # Compute catalog hash for brief (names-only, unified with CO)
-        def _compute_tools_hash() -> str:
-            names = set()
-            client_tools = body.get("tools") if isinstance(body.get("tools"), list) else []
-            for t in (client_tools or []):
-                if isinstance(t, dict):
-                    nm = (t.get("function") or {}).get("name") or t.get("name")
-                    if isinstance(nm, str) and nm.strip():
-                        names.add(nm.strip())
-            builtins = get_builtin_tools_schema()
-            for t in (builtins or []):
-                fn = (t.get("function") or {})
-                nm = fn.get("name")
-                if nm:
-                    names.add(str(nm))
-            src = "|".join(sorted(list(names)))
-            return _hl.sha256(src.encode("utf-8")).hexdigest()[:16]
-        _cat_hash = _compute_tools_hash()
-        base_url = (PUBLIC_BASE_URL or "").rstrip("/") or (str(request.base_url) or "").rstrip("/")
-        validated: List[Dict[str, Any]] = []
-        pre_tool_failures: List[Dict[str, Any]] = []
-        repairs_made = False
-        _repair_success_any = False
-        _patched_payload_emitted = False
-        # Pre-validate payload proof (before any network I/O)
-        _steps_preview0 = []
-        for t in (tool_calls or [])[:5]:
-            _nm0 = (t.get("name") or "").strip()
-            _ak0 = list((t.get("arguments") or {}).keys())
-            _steps_preview0.append({"tool": _nm0, "args_keys": _ak0})
-        _log("exec.payload", trace_id=trace_id, steps=_steps_preview0)
-        # Early gate: ensure image.dispatch has at least the six required keys before validation
-        for p in _steps_preview0:
-            if (p.get("tool") or "") == "image.dispatch":
-                _ks0 = sorted([str(k) for k in (p.get("args_keys") or [])])
-                _required0 = ["cfg","height","negative","prompt","steps","width"]
-                _missing0 = [k for k in _required0 if k not in _ks0]
-                if _missing0:
-                    _log("exec.fail", trace_id=trace_id, tool="image.dispatch", reason="arguments_lost_before_execute", attempted_args_keys=_ks0)
-                    # Do not return early; drop all tool calls to avoid execution
-                    tool_calls = []
-        # DO NOT pre-execute before validation — enforce validate-first ordering
-        from .pipeline.validator import validate_and_repair as validator_validate_and_repair  # type: ignore
-        # Log start of validate+repair with tool names
-        _log("validate.repair.start", trace_id=trace_id, tools=[(t.get("name") or "") for t in (tool_calls or [])])
-        vr = await validator_validate_and_repair(
-            tool_calls,
-            base_url=base_url,
-            temperature=(body.get("temperature") or DEFAULT_TEMPERATURE),
-            last_user_text=last_user_text,
-            tool_catalog_hash=_cat_hash,
-            trace_id=trace_id,
-            state_dir=STATE_DIR,
-            planner_fn=lambda msgs, tools, temp, tid: planner_produce_plan(msgs, body.get("tools"), temp, tid),
-            normalize_fn=_normalize_tool_calls,
-            log_fn=_log,
-            checkpoints_append_event=checkpoints_append_event,
-        )
-        validated = vr.get("validated") or []
-        pre_tool_failures = vr.get("pre_tool_failures") or []
-        repairs_made = bool(vr.get("repairs_made"))
-        _repair_success_any = bool(vr.get("_repair_success_any"))
-        _patched_payload_emitted = bool(vr.get("_patched_payload_emitted"))
-        # Log completion of validate+repair with outcome summary
-        _failure_codes = []
-        for f in (pre_tool_failures or []):
-            err = ((f.get("result") or {}).get("error") or {})
-            code = err.get("code") if isinstance(err, dict) else None
-            if isinstance(code, str) and code:
-                _failure_codes.append(code)
-        _log("validate.repair.done", trace_id=trace_id, validated_count=len(validated or []), failures_count=len(pre_tool_failures or []), repairs_made=repairs_made, failure_codes=list(dict.fromkeys(_failure_codes))[:8])
-        tool_calls = validated
-        _log("will_execute", trace_id=trace_id, steps=len(tool_calls or []))
+    def _compute_tools_hash() -> str:
+        names = set()
+        client_tools = body.get("tools") if isinstance(body.get("tools"), list) else []
+        for t in (client_tools or []):
+            if isinstance(t, dict):
+                nm = (t.get("function") or {}).get("name") or t.get("name")
+                if isinstance(nm, str) and nm.strip():
+                    names.add(nm.strip())
+        builtins = get_builtin_tools_schema()
+        for t in (builtins or []):
+            fn = (t.get("function") or {})
+            nm = fn.get("name")
+            if nm:
+                names.add(str(nm))
+        src = "|".join(sorted(list(names)))
+        return _hl.sha256(src.encode("utf-8")).hexdigest()[:16]
 
-    # 2) Optionally execute tools
+    _cat_hash = _compute_tools_hash()
+
+    base_url = (PUBLIC_BASE_URL or "").rstrip("/") or (str(request.base_url) or "").rstrip("/")
+    executor_endpoint = EXECUTOR_BASE_URL or "http://127.0.0.1:8081"
+    exec_temperature = (body.get("temperature") or DEFAULT_TEMPERATURE)
+    planner_callable = lambda msgs, tools, temp, tid: planner_produce_plan(msgs, body.get("tools"), temp, tid, mode=effective_mode)
+
+    validation_failures: List[Dict[str, Any]] = []
     tool_results: List[Dict[str, Any]] = []
     tool_exec_meta: List[Dict[str, Any]] = []
-    # Artifacts ledger (lazy-open)
     _ledger_shard = None
     _ledger_root = os.path.join(UPLOAD_DIR, "artifacts", "runs", trace_id)
     _ledger_name = "ledger"
-    # No caps — never enforce caps inline (no tool call limit enforced)
+
     if tool_calls:
-        # Announce executor handoff (ordering: this must appear before any run)
-        _log("tools.exec.start", trace_id=trace_id, count=len(tool_calls or []))
-        # Build executor steps view from (repaired) tool_calls and prove payload before any network call
-        steps = []
-        for idx, tc in enumerate(tool_calls[:5]):
-            n = (tc.get("name") or "tool").strip()
-            args = tc.get("arguments") or {}
-            if not isinstance(args, dict):
-                args = {"_raw": args}
-            steps.append({"step_id": f"step-{idx+1}", "tool": n, "args": args})
-        # Emit exec.payload and filter invalid steps instead of nuking all
-        payload_preview = [{"tool": s["tool"], "args_keys": list((s.get("args") or {}).keys())} for s in steps]
-        _log("exec.payload", trace_id=trace_id, steps=payload_preview)
-        filtered_calls: List[Dict[str, Any]] = []
-        for idx, tc in enumerate(tool_calls[:5]):
-            n = (tc.get("name") or "").strip()
+        _steps_preview0 = []
+        for t in (tool_calls or [])[:5]:
+            name_preview = (t.get("name") or "").strip()
+            arg_keys_preview = list((t.get("arguments") or {}).keys()) if isinstance(t.get("arguments"), dict) else []
+            _steps_preview0.append({"tool": name_preview, "args_keys": arg_keys_preview})
+        if _steps_preview0:
+            _log("exec.payload", trace_id=trace_id, steps=_steps_preview0)
+
+        normalized_tool_calls: List[Dict[str, Any]] = []
+        for tc in tool_calls:
             args_field = tc.get("arguments")
             if not isinstance(args_field, dict):
-                _log("exec.fail", trace_id=trace_id, tool=(n or "tool"), reason="string_args_not_allowed", attempted_args_raw=("" if isinstance(args_field, dict) else str(type(args_field).__name__)))
+                tool_name = str((tc.get("name") or "")).strip()
+                err_env = {
+                    "schema_version": 1,
+                    "request_id": _uuid.uuid4().hex,
+                    "ok": False,
+                    "error": {
+                        "code": "arguments_not_object",
+                        "message": "Tool arguments must be an object",
+                        "details": {"received_type": type(args_field).__name__},
+                        "status": 0,
+                    },
+                }
+                validation_failures.append(
+                    {"name": tool_name, "arguments": {}, "status": 0, "envelope": err_env}
+                )
+                _log(
+                    "validate.precheck.fail",
+                    trace_id=trace_id,
+                    tool=tool_name,
+                    reason="arguments_not_object",
+                    received_type=type(args_field).__name__,
+                )
+                _tel_append(
+                    STATE_DIR,
+                    trace_id,
+                    {
+                        "name": tool_name,
+                        "ok": False,
+                        "label": "failure",
+                        "raw": {
+                            "ts": None,
+                            "ok": False,
+                            "args": {},
+                            "error": err_env["error"],
+                        },
+                    },
+                )
                 continue
-            args = args_field
-            args_keys = list((args or {}).keys())
-            if not args_keys:
-                _log("exec.fail", trace_id=trace_id, tool=(n or "tool"), reason="empty_arguments_before_execute", attempted_args_keys=[])
-                continue
-            if n == "image.dispatch":
-                ks = sorted([str(k) for k in args_keys])
-                required = ["cfg","height","negative","prompt","steps","width"]
-                missing = [k for k in required if k not in ks]
-                if missing:
-                    _log("exec.fail", trace_id=trace_id, tool="image.dispatch", reason="args_keys_incomplete", attempted_args_keys=ks)
-                    continue
-            filtered_calls.append(tc)
-        tool_calls = filtered_calls
-        _log("will_execute.filtered", trace_id=trace_id, steps=len(tool_calls or []))
-        # Ordering guarantee: if repaired validate was 200, ensure patched payload was emitted
-        if _repair_success_any and not _patched_payload_emitted:
-            _log("exec.fail", trace_id=trace_id, tool="image.dispatch", reason="did_not_execute_after_repair", attempted_args_keys=[])
-            # Do not return early; proceed without executing tools
-            tool_calls = []
-        # Execute via external void executor to ensure Comfy is driven by the executor
-        _log("tool.run.start", trace_id=trace_id, executor="void", count=len(tool_calls or []))
-        # Per-tool BEFORE logs
-        for tc in (tool_calls or []):
+            normalized_tool_calls.append(tc)
+        tool_calls = normalized_tool_calls
+
+        if tool_calls:
+            vr = await validator_validate_and_repair(
+                tool_calls,
+                base_url=base_url,
+                trace_id=trace_id,
+                log_fn=_log,
+                state_dir=STATE_DIR,
+            )
+            tool_calls = vr.get("validated") or []
+            validation_failures.extend(vr.get("pre_tool_failures") or [])
+        _log(
+            "validate.completed",
+            trace_id=trace_id,
+            validated_count=len(tool_calls or []),
+            failure_count=len(validation_failures or []),
+        )
+    else:
+        _log("validate.skip", trace_id=trace_id, reason="no_tool_calls")
+
+    if validation_failures:
+        for vf in validation_failures:
+            env = vf.get("envelope") if isinstance(vf.get("envelope"), dict) else {}
+            args_snapshot = vf.get("arguments") if isinstance(vf.get("arguments"), dict) else {}
+            name_snapshot = str((vf.get("name") or "")).strip() or "tool"
+            error_snapshot = env.get("error") if isinstance(env, dict) else {}
+            tool_results.append(
+                {
+                    "name": name_snapshot,
+                    "result": env,
+                    "error": error_snapshot,
+                    "args": args_snapshot,
+                }
+            )
+
+    if tool_calls:
+        _log("tools.exec.start", trace_id=trace_id, count=len(tool_calls or []))
+        _inject_execution_context(tool_calls, trace_id, effective_mode)
+        for tc in tool_calls:
             tn = (tc.get("name") or "tool")
             ta = tc.get("arguments") if isinstance(tc.get("arguments"), dict) else {}
             _log("tool.run.before", trace_id=trace_id, tool=str(tn), args_keys=list((ta or {}).keys()))
-        # Execute via executor gateway
-        tool_results = await gateway_execute(tool_calls, trace_id, EXECUTOR_BASE_URL or "http://127.0.0.1:8081")
-        # Per-tool AFTER/ERROR logs + TEL evidence append
-        for tr in (tool_results or []):
-            tname = str((tr or {}).get("name") or "tool")
-            res = (tr or {}).get("result") if isinstance((tr or {}).get("result"), dict) else {}
-            err_obj = (tr or {}).get("error")
-            if not err_obj and isinstance(res, dict):
-                err_obj = res.get("error")
-            if isinstance(err_obj, (str, dict)):
-                code = (err_obj.get("code") if isinstance(err_obj, dict) else str(err_obj))
-                status = (err_obj.get("status") if isinstance(err_obj, dict) else None)
-                message = (err_obj.get("message") if isinstance(err_obj, dict) else "")
-                _log("tool.run.error", trace_id=trace_id, tool=tname, code=(code or ""), status=status, message=(message or ""))
-                _tel_append(STATE_DIR, trace_id, {
-                    "name": tname,
-                    "ok": False,
-                    "label": "failure",
-                    "raw": {
-                        "ts": None,
-                        "ok": False,
-                        "args": (tr.get("args") if isinstance(tr.get("args"), dict) else {}),
-                        "error": (err_obj if isinstance(err_obj, dict) else {"code": "error", "message": str(err_obj)}),
-                    }
-                })
-            else:
-                arts_summary = []
-                arts = res.get("artifacts") if isinstance(res, dict) else None
-                if isinstance(arts, list):
-                    for a in arts:
-                        if isinstance(a, dict):
-                            aid = a.get("id")
-                            kind = a.get("kind")
-                            if isinstance(aid, str) and isinstance(kind, str):
-                                arts_summary.append({"id": aid, "kind": kind})
-                urls_this = assets_collect_urls([tr], _abs_url)
-                _log("tool.run.after", trace_id=trace_id, tool=tname, artifacts=arts_summary, urls_count=len(urls_this or []))
-                meta = res.get("meta") if isinstance(res, dict) else {}
-                first_url = (urls_this[0] if isinstance(urls_this, list) and urls_this else None)
-                _tel_append(STATE_DIR, trace_id, {
-                    "name": tname,
-                    "ok": True,
-                    "label": "success",
-                    "raw": {
-                        "ts": None,
-                        "ok": True,
-                        "args": (tr.get("args") if isinstance(tr.get("args"), dict) else {}),
-                        "result": {
-                            "meta": (meta if isinstance(meta, dict) else {}),
-                            "artifact_url": first_url,
-                            # artifacts possibly many; we keep first URL only
-                        }
-                    }
-                })
-        # Log Comfy prompt ids if present in results
-        for _tr in tool_results or []:
-            _res = (_tr or {}).get("result") or {}
-            if isinstance(_res, dict):
-                _meta = _res.get("meta") if isinstance(_res, dict) else {}
-                _pid = (_meta or {}).get("prompt_id")
-                if isinstance(_pid, str) and _pid:
-                    _log("[comfy] POST /prompt", trace_id=trace_id, prompt_id=_pid, client_id=trace_id)
-                    _log("comfy.submit", trace_id=trace_id, prompt_id=_pid, client_id=trace_id)
-                    _log("[comfy] polling /history/" + _pid)
-        # Merge any pre-validation failures so the final composer can report them
-        if isinstance(locals().get("pre_tool_failures"), list) and locals().get("pre_tool_failures"):
-            tool_results.extend(locals().get("pre_tool_failures") or [])
-        # No executor aggregate error path; per-step results captured above
+            exec_batch = await gateway_execute([tc], trace_id, executor_endpoint)
+            for tr in exec_batch or []:
+                tname = str((tr or {}).get("name") or "tool")
+                res = (tr or {}).get("result") if isinstance((tr or {}).get("result"), dict) else {}
+                err_obj = (tr or {}).get("error")
+                if not err_obj and isinstance(res, dict):
+                    err_obj = res.get("error")
+                if isinstance(err_obj, (str, dict)):
+                    code = (err_obj.get("code") if isinstance(err_obj, dict) else str(err_obj))
+                    status = (err_obj.get("status") if isinstance(err_obj, dict) else None)
+                    message = (err_obj.get("message") if isinstance(err_obj, dict) else "")
+                    _log("tool.run.error", trace_id=trace_id, tool=tname, code=(code or ""), status=status, message=(message or ""))
+                    _tel_append(
+                        STATE_DIR,
+                        trace_id,
+                        {
+                            "name": tname,
+                            "ok": False,
+                            "label": "failure",
+                            "raw": {
+                                "ts": None,
+                                "ok": False,
+                                "args": (tr.get("args") if isinstance(tr.get("args"), dict) else {}),
+                                "error": (err_obj if isinstance(err_obj, dict) else {"code": "error", "message": str(err_obj)}),
+                            },
+                        },
+                    )
+                else:
+                    arts_summary: List[Dict[str, Any]] = []
+                    arts = res.get("artifacts") if isinstance(res, dict) else None
+                    if isinstance(arts, list):
+                        for a in arts:
+                            if isinstance(a, dict):
+                                aid = a.get("id")
+                                kind = a.get("kind")
+                                if isinstance(aid, str) and isinstance(kind, str):
+                                    arts_summary.append({"id": aid, "kind": kind})
+                    urls_this = assets_collect_urls([tr], _abs_url)
+                    _log("tool.run.after", trace_id=trace_id, tool=tname, artifacts=arts_summary, urls_count=len(urls_this or []))
+                    meta = res.get("meta") if isinstance(res, dict) else {}
+                    first_url = urls_this[0] if isinstance(urls_this, list) and urls_this else None
+                    _tel_append(
+                        STATE_DIR,
+                        trace_id,
+                        {
+                            "name": tname,
+                            "ok": True,
+                            "label": "success",
+                            "raw": {
+                                "ts": None,
+                                "ok": True,
+                                "args": (tr.get("args") if isinstance(tr.get("args"), dict) else {}),
+                                "result": {"meta": (meta if isinstance(meta, dict) else {}), "artifact_url": first_url},
+                            },
+                        },
+                    )
+                extra_results: List[Dict[str, Any]] = []
+                if tname == "film.run":
+                    meta_obj = res.get("meta") if isinstance(res, dict) else {}
+                    shots = meta_obj.get("shots") if isinstance(meta_obj, dict) else None
+                    profile_name = meta_obj.get("quality_profile") if isinstance(meta_obj, dict) and isinstance(meta_obj.get("quality_profile"), str) else None
+                    preset = LOCK_QUALITY_PRESETS.get((profile_name or "standard").lower(), LOCK_QUALITY_PRESETS["standard"])
+                    refine_budget = int(preset.get("max_refine_passes", 1))
+                    if isinstance(shots, list):
+                        for shot in shots:
+                            if not isinstance(shot, dict):
+                                continue
+                            seg_results = shot.get("segment_results")
+                            if isinstance(seg_results, list) and seg_results:
+                                updated_seg, seg_outcome, seg_patch = await segment_qa_and_committee(
+                                    trace_id=trace_id,
+                                    user_text=last_user_text,
+                                    tool_name="film.run",
+                                    segment_results=seg_results,
+                                    mode=effective_mode,
+                                    base_url=base_url,
+                                    executor_base_url=executor_endpoint,
+                                    temperature=exec_temperature,
+                                    last_user_text=last_user_text,
+                                    tool_catalog_hash=_cat_hash,
+                                    planner_callable=planner_callable,
+                                    normalize_fn=_normalize_tool_calls,
+                                    absolutize_url=_abs_url,
+                                    quality_profile=profile_name,
+                                    max_refine_passes=refine_budget,
+                                )
+                                shot["segment_results"] = updated_seg
+                                shot["segment_committee"] = seg_outcome
+                                if seg_patch:
+                                    shot["segment_patch_results"] = seg_patch
+                                    extra_results.extend(seg_patch)
+                elif tname in ("music.compose", "music.dispatch", "music.variation", "music.mixdown"):
+                    meta_block = res.get("meta") if isinstance(res, dict) else {}
+                    profile_name = meta_block.get("quality_profile") if isinstance(meta_block, dict) and isinstance(meta_block.get("quality_profile"), str) else None
+                    preset_music = LOCK_QUALITY_PRESETS.get((profile_name or "standard").lower(), LOCK_QUALITY_PRESETS["standard"])
+                    refine_budget_music = int(preset_music.get("max_refine_passes", 1))
+                    updated_seg, seg_outcome, seg_patch = await segment_qa_and_committee(
+                        trace_id=trace_id,
+                        user_text=last_user_text,
+                        tool_name=tname,
+                        segment_results=[tr],
+                        mode=effective_mode,
+                        base_url=base_url,
+                        executor_base_url=executor_endpoint,
+                        temperature=exec_temperature,
+                        last_user_text=last_user_text,
+                        tool_catalog_hash=_cat_hash,
+                        planner_callable=planner_callable,
+                        normalize_fn=_normalize_tool_calls,
+                        absolutize_url=_abs_url,
+                        quality_profile=profile_name,
+                        max_refine_passes=refine_budget_music,
+                    )
+                    if isinstance(res, dict):
+                        meta_music = res.setdefault("meta", {})
+                        if isinstance(meta_music, dict):
+                            meta_music["segment_committee"] = seg_outcome
+                            if seg_patch:
+                                meta_music["segment_patch_results"] = seg_patch
+                    if seg_patch:
+                        extra_results.extend(seg_patch)
+                tool_results.append(tr)
+                if extra_results:
+                    tool_results.extend(extra_results)
+
+    for _tr in tool_results or []:
+        _res = (_tr or {}).get("result") or {}
+        if isinstance(_res, dict):
+            _meta = _res.get("meta") if isinstance(_res, dict) else {}
+            _pid = (_meta or {}).get("prompt_id")
+            if isinstance(_pid, str) and _pid:
+                _log("[comfy] POST /prompt", trace_id=trace_id, prompt_id=_pid, client_id=trace_id)
+                _log("comfy.submit", trace_id=trace_id, prompt_id=_pid, client_id=trace_id)
+                _log("[comfy] polling /history/" + _pid)
+
         # Post-run QA checkpoint (lightweight)
         _img_count = assets_count_images(tool_results)
-        _log("qa.metrics", trace_id=trace_id, tool="image.dispatch", metrics={"images": _img_count})
-        _log("committee.postrun.review", trace_id=trace_id, summary={"images": _img_count})
-        final_action = "go" if int(_img_count) > 0 else "revise"
-        _log("committee.decision", trace_id=trace_id, action=final_action, rationale=("assets_present" if _img_count > 0 else "no_assets"))
-        checkpoints_append_event(STATE_DIR, trace_id, "committee.review.final", {"summary": {"images": _img_count}})
-        checkpoints_append_event(STATE_DIR, trace_id, "committee.decision.final", {"action": final_action})
+        _vid_count = assets_count_video(tool_results)
+        _aud_count = assets_count_audio(tool_results)
+        counts_summary = {"images": int(_img_count), "videos": int(_vid_count), "audio": int(_aud_count)}
+        domain_qa = assets_compute_domain_qa(tool_results)
+        qa_metrics = {"counts": counts_summary, "domain": domain_qa}
+        _log("qa.metrics", trace_id=trace_id, tool="postrun", metrics=qa_metrics)
+        _log("committee.postrun.review", trace_id=trace_id, summary=qa_metrics)
+        # Committee decision with optional single revision
+        committee_outcome = await postrun_committee_decide(
+            trace_id=trace_id,
+            user_text=last_user_text,
+            tool_results=tool_results,
+            qa_metrics=qa_metrics,
+            mode=effective_mode,
+        )
+        committee_action = str((committee_outcome.get("action") or "go")).strip().lower()
+        committee_rationale = str(committee_outcome.get("rationale") or "")
+        patch_plan = committee_outcome.get("patch_plan") or []
+        _log("committee.decision", trace_id=trace_id, action=committee_action, rationale=committee_rationale)
+        checkpoints_append_event(STATE_DIR, trace_id, "committee.review.final", {"summary": qa_metrics})
+        checkpoints_append_event(STATE_DIR, trace_id, "committee.decision.final", {"action": committee_action})
+        # Optional one-pass revision
+        if committee_action == "revise" and isinstance(patch_plan, list) and patch_plan:
+            # Filter patch plan by front-door + mode rules
+            _allowed_mode_set = set(_allowed_tools_for_mode(effective_mode))
+            filtered_patch_plan: List[Dict[str, Any]] = []
+            for st in patch_plan:
+                if not isinstance(st, dict):
+                    continue
+                tl = (st.get("tool") or "").strip() if isinstance(st.get("tool"), str) else ""
+                if not tl or tl not in PLANNER_VISIBLE_TOOLS or tl not in _allowed_mode_set:
+                    continue
+                args_st = st.get("args") if isinstance(st.get("args"), dict) else {}
+                filtered_patch_plan.append({"tool": tl, "args": args_st})
+            if filtered_patch_plan:
+                # Normalize to internal tool_calls schema
+                patch_calls: List[Dict[str, Any]] = [{"name": s.get("tool"), "arguments": (s.get("args") or {})} for s in filtered_patch_plan]
+                _inject_execution_context(patch_calls, trace_id, effective_mode)
+                # Validate and repair once (reuse validator)
+                base_url = (PUBLIC_BASE_URL or "").rstrip("/") or (str(request.base_url) or "").rstrip("/")
+                _cat_hash = "postrun"
+                vr2 = await validator_validate_and_repair(
+                    patch_calls,
+                    base_url=base_url,
+                    trace_id=trace_id,
+                    log_fn=_log,
+                    state_dir=STATE_DIR,
+                )
+                patch_validated = vr2.get("validated") or []
+                patch_failures = vr2.get("pre_tool_failures") or []
+                # Execute validated patch steps
+                patch_failure_results: List[Dict[str, Any]] = []
+                for failure in patch_failures or []:
+                    env = failure.get("envelope") if isinstance(failure.get("envelope"), dict) else {}
+                    args_snapshot = failure.get("arguments") if isinstance(failure.get("arguments"), dict) else {}
+                    name_snapshot = str((failure.get("name") or "")).strip() or "tool"
+                    error_snapshot = env.get("error") if isinstance(env, dict) else {}
+                    patch_failure_results.append(
+                        {
+                            "name": name_snapshot,
+                            "result": env,
+                            "error": error_snapshot,
+                            "args": args_snapshot,
+                        }
+                    )
+                exec_results: List[Dict[str, Any]] = []
+                if patch_validated:
+                    _log("tool.run.start", trace_id=trace_id, executor="void", count=len(patch_validated or []))
+                    for tc in (patch_validated or []):
+                        tn = (tc.get("name") or "tool")
+                        ta = tc.get("arguments") if isinstance(tc.get("arguments"), dict) else {}
+                        _log("tool.run.before", trace_id=trace_id, tool=str(tn), args_keys=list((ta or {}).keys()))
+                    exec_results = await gateway_execute(patch_validated, trace_id, EXECUTOR_BASE_URL or "http://127.0.0.1:8081")
+                patch_results = list(patch_failure_results) + list(exec_results or [])
+                tool_results = (tool_results or []) + patch_results
+                _log("committee.revision.executed", trace_id=trace_id, steps=len(patch_validated or []), failures=len(patch_failures or []))
+                # Recompute QA metrics after revision
+                _img_count = assets_count_images(tool_results)
+                _vid_count = assets_count_video(tool_results)
+                _aud_count = assets_count_audio(tool_results)
+                counts_summary = {"images": int(_img_count), "videos": int(_vid_count), "audio": int(_aud_count)}
+                domain_qa = assets_compute_domain_qa(tool_results)
+                qa_metrics = {"counts": counts_summary, "domain": domain_qa}
+            _log("qa.metrics", trace_id=trace_id, tool="postrun.revise", metrics=qa_metrics)
+        # Pass committee context into finalizer
         if tool_results:
             messages = [{"role": "system", "content": "Tool results:\n" + json.dumps(tool_results, indent=2)}] + messages
             # If tools produced media artifacts, return them immediately (skip waiting on models)
@@ -5288,6 +6779,9 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 absolutize_url=_abs_url,
                 estimate_usage_fn=estimate_usage,
                 envelope_builder=_build_openai_envelope,
+                state_dir=STATE_DIR,
+                committee_info={"action": committee_action, "rationale": committee_rationale},
+                qa_metrics=qa_metrics,
             )
             if _lock_token:
                 trace_release_lock(STATE_DIR, trace_id)
@@ -6289,7 +7783,11 @@ async def http_tool_run(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     base = (PUBLIC_BASE_URL or "http://127.0.0.1:8000").rstrip("/")
     async with _hx.AsyncClient(trust_env=False, timeout=None) as client:
         r = await client.post(base + "/tool.run", json={"name": name, "args": args})
-        return _resp_json(r, {})
+        env = _resp_json(r, {})
+        # Canonical consumer: interpret ok/error from envelope
+        if isinstance(env, dict) and env.get("ok") and isinstance(env.get("result"), dict):
+            return {"name": name, "result": env["result"]}
+        return {"name": name, "error": (env.get("error") or {}).get("message") if isinstance(env, dict) else "tool_failed"}
 from fastapi import Request  # type: ignore
 from fastapi import Response  # type: ignore
 
@@ -6516,8 +8014,27 @@ def _schema_type_ok(value: Any, spec: Any) -> bool:
 @app.get("/tool.list")
 async def tool_list():
     rid = _uuid.uuid4().hex
-    tools = [{"name": n, "version": s.get("version"), "kind": (s.get("kind") or ("video" if n.startswith("film2") else "image" if n.startswith("image.") else "audio" if n.startswith("audio.") or n.startswith("tts.") else "utility")), "describe_url": f"/tool.describe?name={n}"} for n, s in _TOOL_SCHEMAS.items()]
-    return {"schema_version": 1, "request_id": rid, "ok": True, "result": {"tools": tools}}
+    tools = [
+        {
+            "name": n,
+            "version": s.get("version"),
+            "kind": (
+                s.get("kind")
+                or (
+                    "video"
+                    if n.startswith("film2")
+                    else "image"
+                    if n.startswith("image.")
+                    else "audio"
+                    if n.startswith("audio.") or n.startswith("tts.")
+                    else "utility"
+                )
+            ),
+            "describe_url": f"/tool.describe?name={n}",
+        }
+        for n, s in _TOOL_SCHEMAS.items()
+    ]
+    return ToolEnvelope.success({"tools": tools}, request_id=rid)
 
 
 from fastapi import Response  # type: ignore
@@ -6527,7 +8044,13 @@ async def tool_describe(name: str, response: Response):
     rid = _uuid.uuid4().hex
     meta = _TOOL_SCHEMAS.get((name or "").strip())
     if not meta:
-        return JSONResponse(status_code=422, content={"schema_version": 1, "request_id": rid, "ok": False, "error": {"code": "unknown_tool", "message": f"{name}"}})
+        return ToolEnvelope.failure(
+            "unknown_tool",
+            f"{name}",
+            status=404,
+            request_id=rid,
+            details={},
+        )
     sch = meta["schema"]
     import hashlib as _hl, json as _json
     compact = _json.dumps(sch, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -6536,11 +8059,8 @@ async def tool_describe(name: str, response: Response):
         response.headers["ETag"] = f'W/"{shash}"'
     except Exception:
         pass
-    return {
-        "schema_version": 1,
-        "request_id": rid,
-        "ok": True,
-        "result": {
+    return ToolEnvelope.success(
+        {
             "name": meta["name"],
             "version": meta.get("version"),
             "kind": meta.get("kind"),
@@ -6549,19 +8069,31 @@ async def tool_describe(name: str, response: Response):
             "notes": meta.get("notes"),
             "examples": meta.get("examples", []),
         },
-    }
+        request_id=rid,
+    )
 
 
 @app.post("/tool.validate")
 async def tool_validate(body: Dict[str, Any]):
     rid = _uuid.uuid4().hex
     if not isinstance(body, dict) or "name" not in body or "args" not in body:
-        return JSONResponse(status_code=400, content={"schema_version": 1, "request_id": rid, "ok": False, "error": {"code": "parse_error", "message": "Expected {name, args}"}})
+        return ToolEnvelope.failure(
+            "parse_error",
+            "Expected {name, args}",
+            status=400,
+            request_id=rid,
+        )
     name = (body or {}).get("name") or ""
     args = (body or {}).get("args") or {}
     meta = _TOOL_SCHEMAS.get(name.strip())
     if not meta:
-        return JSONResponse(status_code=422, content={"schema_version": 1, "request_id": rid, "ok": False, "error": {"code": "unknown_tool", "message": f"{name}"}})
+        return ToolEnvelope.failure(
+            "unknown_tool",
+            f"{name}",
+            status=404,
+            request_id=rid,
+            details={},
+        )
     schema = meta["schema"]
     errors: List[Dict[str, Any]] = []
     for req in (schema.get("required") or []):
@@ -6618,8 +8150,14 @@ async def tool_validate(body: Dict[str, Any]):
         if method not in ("GET","POST","PUT","PATCH","DELETE","HEAD","OPTIONS"):
             errors.append({"code": "enum_mismatch", "path": "method", "allowed": ["GET","POST","PUT","PATCH","DELETE","HEAD","OPTIONS"], "got": method})
     if errors:
-        return JSONResponse(status_code=422, content={"schema_version": 1, "request_id": rid, "ok": False, "error": {"code": "schema_validation", "message": "Invalid args", "details": {"errors": errors}}})
-    return {"schema_version": 1, "request_id": rid, "ok": True, "result": {"validated": True}}
+        return ToolEnvelope.failure(
+            "schema_validation",
+            "Invalid args",
+            status=422,
+            request_id=rid,
+            details={"errors": errors},
+        )
+    return ToolEnvelope.success({"validated": True}, request_id=rid)
 
 
 @app.post("/jobs/start")
@@ -6974,13 +8512,24 @@ async def v1_video_state(capsule_id: str):
 
 @app.post("/v1/video/generate")
 async def v1_video_generate(body: Dict[str, Any]):
+    rid = _uuid.uuid4().hex
     if not HUNYUAN_VIDEO_API_URL:
-        return JSONResponse(status_code=400, content={"error": "HUNYUAN_VIDEO_API_URL not configured"})
+        return ToolEnvelope.failure(
+            "hunyuan_not_configured",
+            "HUNYUAN_VIDEO_API_URL not configured",
+            status=500,
+            request_id=rid,
+        )
     expected = {"prompt": str, "refs": dict, "locks": dict, "duration_s": int, "fps": int, "size": list, "seed": int, "icw": dict}
     payload = _normalize_dict_body(body, expected)
     prompt = (payload.get("prompt") or "").strip()
     if not prompt:
-        return JSONResponse(status_code=400, content={"error": "missing prompt"})
+        return ToolEnvelope.failure(
+            "missing_prompt",
+            "missing prompt",
+            status=400,
+            request_id=rid,
+        )
     w,h = 1920,1080
     try:
         sz = payload.get("size") or [1920,1080]
@@ -7007,20 +8556,39 @@ async def v1_video_generate(body: Dict[str, Any]):
     icw = payload.get("icw") or {}
     cap = {"capsule_id": icw.get("capsule_id") or None, "scene": icw.get("scene"), "shot": icw.get("shot"), "window_idx": icw.get("window_idx"), "timecode": {"start_s": 0.0, "end_s": float(seconds), "fps": fps}, "locks": locks, "manifests": {"seeds": {"window": seed}}}
     cid = _save_capsule(cap)
-    return {"ok": True, "result": res, "capsule_id": cid}
+    return ToolEnvelope.success(
+        {"result": res, "capsule_id": cid},
+        request_id=rid,
+    )
 
 @app.post("/v1/video/edit")
 async def v1_video_edit(body: Dict[str, Any]):
+    rid = _uuid.uuid4().hex
     if not HUNYUAN_VIDEO_API_URL:
-        return JSONResponse(status_code=400, content={"error": "HUNYUAN_VIDEO_API_URL not configured"})
+        return ToolEnvelope.failure(
+            "hunyuan_not_configured",
+            "HUNYUAN_VIDEO_API_URL not configured",
+            status=500,
+            request_id=rid,
+        )
     expected = {"image_url": str, "instruction": str, "locks": dict, "fps": int, "size": list, "seconds": int, "seed": int}
     payload = _normalize_dict_body(body, expected)
     init_image = payload.get("image_url")
     if not init_image:
-        return JSONResponse(status_code=400, content={"error": "missing image_url"})
+        return ToolEnvelope.failure(
+            "missing_image_url",
+            "missing image_url",
+            status=400,
+            request_id=rid,
+        )
     instruction = (payload.get("instruction") or "").strip()
     if not instruction:
-        return JSONResponse(status_code=400, content={"error": "missing instruction"})
+        return ToolEnvelope.failure(
+            "missing_instruction",
+            "missing instruction",
+            status=400,
+            request_id=rid,
+        )
     w,h = 1024,1024
     try:
         sz = payload.get("size") or [1024,1024]
@@ -7045,12 +8613,12 @@ async def v1_video_edit(body: Dict[str, Any]):
         "latent_reinit_every": 48,
     }
     res = await execute_tool_call({"name": "video.hv.i2v", "arguments": hv_args})
-    return {"ok": True, "result": res}
+    return ToolEnvelope.success({"result": res}, request_id=rid)
 
 
-# ---- Audio endpoints (local-first; JSON-only) ----
 @app.post("/v1/audio/lyrics-to-song")
 async def v1_audio_lyrics_to_song(body: Dict[str, Any]):
+    rid = _uuid.uuid4().hex
     expected = {"lyrics": str, "style_prompt": str, "ref_audio_ids": list, "lock_ids": list, "duration_s": int, "seed": int, "bpm": int, "key": str}
     payload = _normalize_dict_body(body, expected)
     lyrics = (payload.get("lyrics") or "").strip()
@@ -7060,22 +8628,37 @@ async def v1_audio_lyrics_to_song(body: Dict[str, Any]):
     key = payload.get("key")
     seed = payload.get("seed")
     if not lyrics:
-        return JSONResponse(status_code=400, content={"error": "missing lyrics"})
+        return ToolEnvelope.failure(
+            "missing_lyrics",
+            "missing lyrics",
+            status=400,
+            request_id=rid,
+        )
     if not YUE_API_URL:
-        return JSONResponse(status_code=400, content={"error": "YUE_API_URL not configured"})
+        return ToolEnvelope.failure(
+            "yue_not_configured",
+            "YUE_API_URL not configured",
+            status=500,
+            request_id=rid,
+        )
     call = {"name": "music.song.yue", "arguments": {"lyrics": lyrics, "style_tags": ([style] if style else []), "bpm": bpm, "key": key, "seed": seed}}
     res = await execute_tool_call(call)
-    return {"ok": True, "result": res}
+    return ToolEnvelope.success({"result": res}, request_id=rid)
 
 @app.post("/v1/audio/edit")
 async def v1_audio_edit(body: Dict[str, Any]):
+    rid = _uuid.uuid4().hex
     expected = {"audio_url": str, "ops": list}
     payload = _normalize_dict_body(body, expected)
     audio_url = payload.get("audio_url")
     ops = payload.get("ops") or []
     if not audio_url:
-        return JSONResponse(status_code=400, content={"error": "missing audio_url"})
-    # Try stems separation via Demucs service when available
+        return ToolEnvelope.failure(
+            "missing_audio_url",
+            "missing audio_url",
+            status=400,
+            request_id=rid,
+        )
     stems_info: Dict[str, Any] = {"ok": False}
     try:
         if DEMUCS_API_URL:
@@ -7083,16 +8666,24 @@ async def v1_audio_edit(body: Dict[str, Any]):
             stems_info = {"ok": True, "stems": sep}
     except Exception as ex:
         stems_info = {"ok": False, "error": str(ex)}
-    # Record edit graph (beat-aware DSP would apply here in a dedicated engine)
-    return {"ok": True, "ingest": {"audio_url": audio_url}, "stems": stems_info, "ops_applied": ops}
+    return ToolEnvelope.success(
+        {"ingest": {"audio_url": audio_url}, "stems": stems_info, "ops_applied": ops},
+        request_id=rid,
+    )
 
 @app.post("/v1/audio/tts-sing")
 async def v1_audio_tts_sing(body: Dict[str, Any]):
+    rid = _uuid.uuid4().hex
     expected = {"script": list, "style_lock_id": str, "structure": dict}
     payload = _normalize_dict_body(body, expected)
     script = payload.get("script") or []
     if not isinstance(script, list) or not script:
-        return JSONResponse(status_code=400, content={"error": "missing script"})
+        return ToolEnvelope.failure(
+            "missing_script",
+            "missing script",
+            status=400,
+            request_id=rid,
+        )
     outputs: List[Dict[str, Any]] = []
     for item in script:
         kind = (item or {}).get("type")
@@ -7102,23 +8693,42 @@ async def v1_audio_tts_sing(body: Dict[str, Any]):
             outputs.append({"type": "tts", "result": res})
         elif kind == "sing":
             if not YUE_API_URL:
-                return JSONResponse(status_code=400, content={"error": "YUE_API_URL not configured"})
+                return ToolEnvelope.failure(
+                    "yue_not_configured",
+                    "YUE_API_URL not configured",
+                    status=500,
+                    request_id=rid,
+                )
             lyrics = (item.get("lyrics") or "")
             res = await execute_tool_call({"name": "music.song.yue", "arguments": {"lyrics": lyrics, "style_tags": [], "seed": item.get("seed")}})
             outputs.append({"type": "sing", "result": res})
-    return {"ok": True, "parts": outputs, "structure": (payload.get("structure") or {})}
+    return ToolEnvelope.success(
+        {"parts": outputs, "structure": (payload.get("structure") or {})},
+        request_id=rid,
+    )
 
 @app.post("/v1/audio/score-video")
 async def v1_audio_score_video(body: Dict[str, Any]):
+    rid = _uuid.uuid4().hex
     expected = {"video_url": str, "markers": list, "style_prompt": str, "voice_lock_id": str, "accept_edits": bool}
     payload = _normalize_dict_body(body, expected)
     video_url = payload.get("video_url")
     markers = payload.get("markers") or []
     style_prompt = payload.get("style_prompt") or ""
     if not video_url:
-        return JSONResponse(status_code=400, content={"error": "missing video_url"})
+        return ToolEnvelope.failure(
+            "missing_video_url",
+            "missing video_url",
+            status=400,
+            request_id=rid,
+        )
     if not SAO_API_URL:
-        return JSONResponse(status_code=400, content={"error": "SAO_API_URL not configured"})
+        return ToolEnvelope.failure(
+            "sao_not_configured",
+            "SAO_API_URL not configured",
+            status=500,
+            request_id=rid,
+        )
     seconds = 30
     try:
         if isinstance(markers, list) and markers:
@@ -7128,17 +8738,26 @@ async def v1_audio_score_video(body: Dict[str, Any]):
         seconds = 30
     text = (style_prompt or "").strip() or "video score"
     res = await execute_tool_call({"name": "music.timed.sao", "arguments": {"text": text, "seconds": seconds}})
-    return {"ok": True, "video": video_url, "markers": markers, "music": res}
+    return ToolEnvelope.success(
+        {"video": video_url, "markers": markers, "music": res},
+        request_id=rid,
+    )
 
 @app.post("/v1/locks/create")
 async def v1_locks_create(body: Dict[str, Any]):
+    rid = _uuid.uuid4().hex
     expected = {"type": str, "refs": list, "tags": list}
     payload = _normalize_dict_body(body, expected)
     lk_type = (payload.get("type") or "").strip().lower()
     refs = payload.get("refs") or []
     tags = payload.get("tags") or []
     if lk_type not in ("voice", "music", "sfx", "music_style", "sfx_identity"):
-        return JSONResponse(status_code=400, content={"error": "invalid lock type"})
+        return ToolEnvelope.failure(
+            "invalid_lock_type",
+            "invalid lock type",
+            status=400,
+            request_id=rid,
+        )
     files: Dict[str, Any] = {}
     if lk_type == "voice":
         files = {"voice_samples": [r.get("audio_url") for r in refs if isinstance(r, dict) and r.get("audio_url")]}
@@ -7148,7 +8767,7 @@ async def v1_locks_create(body: Dict[str, Any]):
         files = {"sfx_samples": [r.get("audio_url") for r in refs if isinstance(r, dict) and r.get("audio_url")]}
     title = f"lock:{lk_type}:{int(time.time())}"
     saved = _refs_save({"kind": lk_type, "title": title, "files": files, "tags": tags, "compute_embeds": True})
-    return {"ok": True, "lock": saved}
+    return ToolEnvelope.success({"lock": saved}, request_id=rid)
 
 # ---- Audio endpoints (local-first; JSON-only) ----
 @app.post("/v1/audio/lyrics-to-song")
@@ -7173,23 +8792,30 @@ async def v1_audio_lyrics_to_song(body: Dict[str, Any]):
 
 @app.post("/v1/tts")
 async def v1_tts(body: Dict[str, Any]):
+    rid = _uuid.uuid4().hex
     expected = {"text": str, "voice_ref_url": str, "voice_id": str, "lang": str, "prosody": dict, "seed": int}
     payload = _normalize_dict_body(body, expected)
     text = (payload.get("text") or "").strip()
     if not text:
-        return JSONResponse(status_code=400, content={"error": "missing text"})
+        return ToolEnvelope.failure(
+            "missing_text",
+            "missing text",
+            status=400,
+            request_id=rid,
+        )
     args = {"text": text, "voice_id": payload.get("voice_id"), "voice_refs": ({"voice_ref_url": payload.get("voice_ref_url")} if payload.get("voice_ref_url") else {}), "seed": payload.get("seed")}
     res = await execute_tool_call({"name": "tts.speak", "arguments": args})
-    return {"ok": True, "result": res}
+    return ToolEnvelope.success({"result": res}, request_id=rid)
 
 @app.post("/v1/audio/sfx")
 async def v1_audio_sfx(body: Dict[str, Any]):
+    rid = _uuid.uuid4().hex
     expected = {"type": str, "length_s": float, "pitch": float, "seed": int}
     payload = _normalize_dict_body(body, expected)
     args = {"type": payload.get("type"), "length_s": payload.get("length_s"), "pitch": payload.get("pitch"), "seed": payload.get("seed")}
     manifest = {"items": []}
     env = run_sfx_compose(args, manifest)
-    return {"ok": True, "result": env}
+    return ToolEnvelope.success({"result": env}, request_id=rid)
 # Lightweight in-memory job controls for orchestrator-run tools (research.run, etc.)
 @app.get("/orcjobs/{job_id}")
 async def orcjob_get(job_id: str):

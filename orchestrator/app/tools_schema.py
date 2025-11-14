@@ -30,6 +30,31 @@ def get_builtin_tools_schema() -> List[Dict[str, Any]]:
 		{
 			"type": "function",
 			"function": {
+				"name": "api.request",
+				"description": "Deprecated alias for http.request.",
+				"parameters": {
+					"type": "object",
+					"properties": {
+						"url": {"type": "string"},
+						"method": {"type": "string", "enum": ["GET", "POST", "PUT", "DELETE", "PATCH"]},
+						"headers": {"type": "object"},
+						"query": {"type": "object"},
+						"body": {
+							"oneOf": [
+								{"type": "string"},
+								{"type": "object"},
+								{"type": "array"}
+							]
+						},
+						"expect_json": {"type": "boolean"}
+					},
+					"required": ["url", "method"]
+				}
+			}
+		},
+		{
+			"type": "function",
+			"function": {
 				"name": "film.run",
 				"parameters": {
 					"type": "object",
@@ -141,6 +166,31 @@ def get_builtin_tools_schema() -> List[Dict[str, Any]]:
 			"function": {
 				"name": "source_fetch",
 				"parameters": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}
+			}
+		},
+		{
+			"type": "function",
+			"function": {
+				"name": "http.request",
+				"description": "Call an external HTTP API and normalize the response.",
+				"parameters": {
+					"type": "object",
+					"properties": {
+						"url": {"type": "string"},
+						"method": {"type": "string", "enum": ["GET", "POST", "PUT", "DELETE", "PATCH"]},
+						"headers": {"type": "object"},
+						"query": {"type": "object"},
+						"body": {
+							"oneOf": [
+								{"type": "string"},
+								{"type": "object"},
+								{"type": "array"}
+							]
+						},
+						"expect_json": {"type": "boolean"}
+					},
+					"required": ["url", "method"]
+				}
 			}
 		},
 		{
@@ -331,6 +381,128 @@ def get_builtin_tools_schema() -> List[Dict[str, Any]]:
 			"function": {
 				"name": "code.super_loop",
 				"parameters": {"type": "object", "properties": {"task": {"type": "string"}, "repo_root": {"type": "string"}}, "required": ["task"]}
+			}
+		},
+		{
+			"type": "function",
+			"function": {
+				"name": "locks.build_image_bundle",
+				"description": "Build an identity/style/pose lock bundle from a reference image.",
+				"parameters": {
+					"type": "object",
+					"properties": {
+						"character_id": {"type": "string"},
+						"image_url": {"type": "string"},
+						"options": {
+							"type": "object",
+							"properties": {
+								"detect_pose": {"type": "boolean"},
+								"extract_style": {"type": "boolean"},
+								"face_strength": {"type": "number"}
+							}
+						}
+					},
+					"required": ["character_id", "image_url"]
+				}
+			}
+		},
+		{
+			"type": "function",
+			"function": {
+				"name": "locks.build_audio_bundle",
+				"description": "Build a voice lock bundle from a reference audio clip.",
+				"parameters": {
+					"type": "object",
+					"properties": {
+						"character_id": {"type": "string"},
+						"audio_url": {"type": "string"}
+					},
+					"required": ["character_id", "audio_url"]
+				}
+			}
+		},
+		{
+			"type": "function",
+			"function": {
+				"name": "locks.get_bundle",
+				"description": "Fetch a previously stored lock bundle for a character.",
+				"parameters": {
+					"type": "object",
+					"properties": {
+						"character_id": {"type": "string"}
+					},
+					"required": ["character_id"]
+				}
+			}
+		},
+		{
+			"type": "function",
+			"function": {
+				"name": "locks.build_region_locks",
+				"description": "Build region-level locks such as clothing, props, textures, or scenery from a reference image.",
+				"parameters": {
+					"type": "object",
+					"properties": {
+						"character_id": {"type": "string"},
+						"image_url": {"type": "string"},
+						"regions": {
+							"type": "array",
+							"items": {
+								"type": "object",
+								"properties": {
+									"region_id": {"type": "string"},
+									"role": {"type": "string"},
+									"bbox": {"type": "array", "items": {"type": "number"}},
+									"lock_mode": {"type": "object"},
+									"strength": {"type": "number"}
+								}
+							}
+						}
+					},
+					"required": ["character_id", "image_url"]
+				}
+			}
+		},
+		{
+			"type": "function",
+			"function": {
+				"name": "locks.update_region_modes",
+				"description": "Update lock modes or strengths for existing regions in a lock bundle.",
+				"parameters": {
+					"type": "object",
+					"properties": {
+						"character_id": {"type": "string"},
+						"updates": {
+							"type": "array",
+							"items": {
+								"type": "object",
+								"properties": {
+									"region_id": {"type": "string"},
+									"lock_mode": {"type": "object"},
+									"strength": {"type": "number"},
+									"color_palette": {"type": "object"}
+								},
+								"required": ["region_id"]
+							}
+						}
+					},
+					"required": ["character_id", "updates"]
+				}
+			}
+		},
+		{
+			"type": "function",
+			"function": {
+				"name": "locks.update_audio_modes",
+				"description": "Update audio lock targets such as tempo, key, stems, or lyric segments.",
+				"parameters": {
+					"type": "object",
+					"properties": {
+						"character_id": {"type": "string"},
+						"update": {"type": "object"}
+					},
+					"required": ["character_id", "update"]
+				}
 			}
 		}
 	]

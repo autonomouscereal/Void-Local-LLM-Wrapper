@@ -15,15 +15,67 @@ router = APIRouter()
 log = logging.getLogger("orchestrator.toolrun")
 
 
-def ok_envelope(result, rid: str) -> JSONResponse:
-	return JSONResponse({"schema_version": 1, "request_id": rid, "ok": True, "result": result}, status_code=200)
+def _build_success_envelope(result: dict | None, rid: str) -> dict:
+	"""
+	Canonical success envelope for tool-ish routes.
+	Always includes schema_version, request_id, ok, result, error.
+	"""
+	return {
+		"schema_version": 1,
+		"request_id": rid,
+		"ok": True,
+		"result": result or {},
+		"error": None,
+	}
 
 
-def err_envelope(code: str, message: str, rid: str, status: int = 200, details: dict | None = None) -> JSONResponse:
-	return JSONResponse(
-		{"schema_version": 1, "request_id": rid, "ok": False, "error": {"code": code, "message": message, "details": (details or {})}},
-		status_code=status,
-	)
+def _build_error_envelope(code: str, message: str, rid: str, status: int, details: dict | None = None) -> dict:
+	"""
+	Canonical error envelope for tool-ish routes.
+	HTTP status is always 200; semantic status lives on error.status.
+	"""
+	err_details = dict(details or {})
+	err_details.setdefault("status", int(status))
+	return {
+		"schema_version": 1,
+		"request_id": rid,
+		"ok": False,
+		"result": None,
+		"error": {
+			"code": code,
+			"message": message,
+			"status": int(status),
+			"details": err_details,
+		},
+	}
+
+
+def _ok_response(result: dict | None, rid: str) -> JSONResponse:
+	return JSONResponse(_build_success_envelope(result or {}, rid), status_code=200)
+
+
+def _err_response(code: str, message: str, rid: str, status: int = 200, details: dict | None = None) -> JSONResponse:
+	env = _build_error_envelope(code, message, rid, status=status, details=details)
+	return JSONResponse(env, status_code=200)
+
+
+class ToolEnvelope:
+	@staticmethod
+	def success(result: dict, *, request_id: str | None = None) -> JSONResponse:
+		rid = request_id or uuid.uuid4().hex
+		return _ok_response(result, rid)
+
+	@staticmethod
+	def failure(
+		code: str,
+		message: str,
+		*,
+		status: int,
+		details: dict | None = None,
+		request_id: str | None = None,
+	) -> JSONResponse:
+		rid = request_id or uuid.uuid4().hex
+		return _err_response(code, message, rid, status=int(status), details=details)
 
 
 def _ok_env(ok: bool, **kwargs) -> dict:
@@ -252,12 +304,38 @@ def _append_jsonl(path: str, obj: dict) -> None:
 
 @router.post("/tool.validate")
 async def tool_validate(req: Request):
-	body = await req.json()
+	rid = "tool.validate"
+	try:
+		body = await req.json()
+	except Exception as ex:
+		return ToolEnvelope.failure(
+			"invalid_json",
+			f"Body must be valid JSON: {ex}",
+			status=400,
+			request_id=rid,
+		)
+	if not isinstance(body, dict):
+		return ToolEnvelope.failure(
+			"invalid_body_type",
+			"Body must be a JSON object",
+			status=422,
+			request_id=rid,
+		)
 	name = (body.get("name") or "").strip()
 	args = body.get("args") or {}
+	if not isinstance(args, dict):
+		return ToolEnvelope.failure(
+			"invalid_args_type",
+			"args must be an object",
+			status=422,
+			request_id=rid,
+		)
 	if name != "image.dispatch":
 		# For non-image tools, accept basic object-arg validation here
-		return ok_envelope({"name": name, "valid": isinstance(args, dict), "args": args}, rid="tool.validate")
+		return ToolEnvelope.success(
+			{"name": name, "valid": True, "args": args},
+			request_id=rid,
+		)
 	# Real acceptance: require at least a prompt or a model/size combo
 	prompt = args.get("prompt")
 	if not isinstance(prompt, str) or not prompt.strip():
@@ -265,20 +343,44 @@ async def tool_validate(req: Request):
 			"tool": name,
 			"missing": ["prompt"],
 			"invalid": [],
-			"schema": {"required": ["prompt"], "notes": "image.dispatch minimal validator"},
+			"schema": {
+				"required": ["prompt"],
+				"notes": "image.dispatch minimal validator",
+			},
 			"args": args,
 		}
-		return JSONResponse(
-			{"schema_version": 1, "request_id": "tool.validate", "ok": False,
-			 "error": {"code": "invalid_args", "message": "prompt required for image.dispatch", "details": detail}},
-			status_code=422
+		return ToolEnvelope.failure(
+			"invalid_args",
+			"prompt required for image.dispatch",
+			status=422,
+			request_id=rid,
+			details=detail,
 		)
-	return ok_envelope({"name": name, "valid": True, "args": args}, rid="tool.validate")
+	return ToolEnvelope.success(
+		{"name": name, "valid": True, "args": args},
+		request_id=rid,
+	)
 
 
 @router.post("/tool.run")
 async def tool_run(req: Request):
-	body = await req.json()
+	rid = "tool.run"
+	try:
+		body = await req.json()
+	except Exception as ex:
+		return ToolEnvelope.failure(
+			"invalid_json",
+			f"Body must be valid JSON: {ex}",
+			status=400,
+			request_id=rid,
+		)
+	if not isinstance(body, dict):
+		return ToolEnvelope.failure(
+			"invalid_body_type",
+			"Body must be a JSON object",
+			status=422,
+			request_id=rid,
+		)
 	name = (body.get("name") or "").strip()
 	args = body.get("args") or {}
 
@@ -297,8 +399,14 @@ async def tool_run(req: Request):
 		if isinstance(env, dict) and env.get("ok") and isinstance((env.get("result") or {}).get("produced"), dict):
 			produced = (env.get("result") or {}).get("produced") or {}
 			res1 = produced.get("s1") or {}
-			return ok_envelope(res1, rid="tool.run")
-		return err_envelope("executor_failed", "tool failed via executor", rid="tool.run", status=200, details=(env or {}))
+			return ToolEnvelope.success(res1 if isinstance(res1, dict) else {"value": res1}, request_id=rid)
+		return ToolEnvelope.failure(
+			"executor_failed",
+			"tool failed via executor",
+			status=500,
+			request_id=rid,
+			details=(env or {}),
+		)
 
 	# Use upstream global fixer (executor) for generic normalization; do not duplicate here
 
@@ -467,7 +575,13 @@ async def tool_run(req: Request):
 	log.info("[comfy] POST /prompt url=%s", COMFY_BASE.rstrip("/") + "/prompt")
 	submit_res = await _post_json(COMFY_BASE.rstrip("/") + "/prompt", {"prompt": prompt_graph, "client_id": client_id})
 	if not bool(submit_res.get("ok")):
-		return err_envelope("http_error", "comfy submit failed", rid="tool.run", status=200, details=submit_res)
+		return ToolEnvelope.failure(
+			"http_error",
+			"comfy submit failed",
+			status=502,
+			request_id=rid,
+			details=submit_res,
+		)
 	prompt_id = submit_res.get("prompt_id") or submit_res.get("promptId") or ""
 	log.info("[comfy] prompt_id=%s client_id=%s", prompt_id, client_id)
 
@@ -480,7 +594,13 @@ async def tool_run(req: Request):
 		log.info("[comfy] polling /history/%s", prompt_id)
 		hist = await _get_json(f"{COMFY_BASE.rstrip('/')}/history/{prompt_id}")
 		if not bool(hist.get("ok")):
-			return err_envelope("http_error", "comfy history failed", rid="tool.run", status=200, details={"prompt_id": prompt_id, **hist})
+			return ToolEnvelope.failure(
+				"http_error",
+				"comfy history failed",
+				status=502,
+				request_id=rid,
+				details={"prompt_id": prompt_id, **hist},
+			)
 		if _first_hist:
 			_emit_trace(STATE_DIR_LOCAL, "global", "comfyui.history", {"t": int(time.time()*1000), "prompt_id": prompt_id})
 			_first_hist = False
@@ -491,7 +611,13 @@ async def tool_run(req: Request):
 		status_obj = entry.get("status") or {}
 		state = str((status_obj.get("status") or "")).lower()
 		if state in ("error", "failed", "canceled", "cancelled"):
-			return err_envelope("comfy_error", "workflow reported error state", rid="tool.run", status=422, details={"prompt_id": prompt_id, "status": status_obj})
+			return ToolEnvelope.failure(
+				"comfy_error",
+				"workflow reported error state",
+				status=422,
+				request_id=rid,
+				details={"prompt_id": prompt_id, "status": status_obj},
+			)
 		outs = entry.get("outputs") or {}
 		if not outs:
 			# progressive backoff to avoid busy spin
@@ -499,8 +625,14 @@ async def tool_run(req: Request):
 			# If history reports a completed/executed state but no outputs, fail deterministically
 			status_obj = entry.get("status") or {}
 			state = str((status_obj.get("status") or "")).lower()
-			if state in ("completed", "success", "executed"):
-				return err_envelope("no_outputs", "workflow completed without outputs", rid="tool.run", status=422, details={"prompt_id": prompt_id, "status": status_obj})
+				if state in ("completed", "success", "executed"):
+					return ToolEnvelope.failure(
+						"no_outputs",
+						"workflow completed without outputs",
+						status=422,
+						request_id=rid,
+						details={"prompt_id": prompt_id, "status": status_obj},
+					)
 			continue
 		for _, out in outs.items():
 			for im in (out.get("images") or []):
@@ -573,7 +705,13 @@ async def tool_run(req: Request):
 			src = f"{COMFY_BASE.rstrip('/')}/view?filename={fn}&subfolder={sf}&type={tp}"
 			resp = await client.get(src)
 			if int(getattr(resp, "status_code", 0) or 0) != 200:
-				return err_envelope("fetch_failed", f"download failed for {src}", rid="tool.run", status=200, details={"status": int(getattr(resp, "status_code", 0) or 0)})
+				return ToolEnvelope.failure(
+					"fetch_failed",
+					f"download failed for {src}",
+					status=int(getattr(resp, "status_code", 0) or 0) or 500,
+					request_id=rid,
+					details={"status": int(getattr(resp, "status_code", 0) or 0)},
+				)
 			dst = _os.path.join(save_dir, fn)
 			with open(dst, "wb") as _f:
 				_f.write(resp.content)
@@ -591,4 +729,4 @@ async def tool_run(req: Request):
 				"tool": "image.dispatch",
 				"prompt_id": prompt_id,
 			})
-	return ok_envelope(result, rid="tool.run")
+	return ToolEnvelope.success(result, request_id=rid)

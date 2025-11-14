@@ -176,6 +176,16 @@ async def get_pg_pool() -> Optional[asyncpg.pool.Pool]:
             );
             """
         )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS lock_bundle (
+              character_id TEXT PRIMARY KEY,
+              bundle_json JSONB NOT NULL,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+            """
+        )
     return pg_pool
 
 

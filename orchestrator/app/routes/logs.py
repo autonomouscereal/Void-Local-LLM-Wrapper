@@ -4,16 +4,12 @@ import os
 import json
 import time
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse
+from app.routes.toolrun import ToolEnvelope  # canonical envelope
 from app.trace_utils import emit_trace as _emit_trace
 
 
 router = APIRouter()
 STATE_DIR = os.environ.get("STATE_DIR_LOCAL", "/workspace/state")
-
-
-def ok_envelope(result, rid: str = "logs.tools.append") -> JSONResponse:
-	return JSONResponse({"schema_version": 1, "request_id": rid, "ok": True, "result": result}, status_code=200)
 
 
 @router.post("/logs/tools.append")
@@ -29,6 +25,6 @@ async def tools_append(req: Request):
 		"payload": body.get("payload"),
 	}
 	_emit_trace(STATE_DIR, trace_id, str(entry.get("event") or "tool"), entry)
-	return ok_envelope({"appended": True})
+	return ToolEnvelope.success({"appended": True}, request_id="logs.tools.append")
 
 

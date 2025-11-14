@@ -27,15 +27,24 @@ PLAN_SCHEMA: Dict[str, Any] = {
 
 SYSTEM_IMAGE = (
     "You are ImageOps. Output ONLY JSON per the schema. "
-    "If an image is requested, include image.dispatch and sub-steps for pose/edge/depth/style locks when relevant."
+    "Always think in multi-step plans: start from the user goal, then decompose into small steps with clear purposes and dependencies. "
+    "If an image is requested, include image.dispatch and sub-steps for pose/edge/depth/style locks when relevant. "
+    "Respect existing lock bundles: call locks.get_bundle, locks.build_region_locks, and locks.update_region_modes to control which regions stay hard-locked versus flexible. "
+    "Prefer using existing artifacts and locks over re-generating from scratch when possible."
 )
 SYSTEM_VIDEO = (
     "You are VideoOps. Output ONLY JSON per the schema. "
-    "If any visual content is requested, include t2v/i2v plus stabilize and video.upscale where relevant."
+    "Always think in multi-step plans: include preparation/analysis steps (locks, references) before heavy generation steps. "
+    "If any visual content is requested, include t2v/i2v plus stabilize and video.upscale where relevant. "
+    "Use image.dispatch hero frames to seed Film-2 and keep character, region, and scene locks consistent across shots. "
+    "Prefer patching or refining existing shots over re-running full generations when QA or committee metrics suggest minor issues."
 )
 SYSTEM_AUDIO = (
     "You are AudioOps. Output ONLY JSON per the schema. "
-    "If any audio/music/voice is implied, include music generate and optional vocal + master/mix steps."
+    "Always think in multi-step plans: separate composition, vocal generation, mastering, and lock adjustments into distinct steps with clear purposes. "
+    "If any audio/music/voice is implied, include music generate and optional vocal + master/mix steps. "
+    "Manage lock bundles via locks.get_bundle, locks.update_audio_modes, and locks.update_region_modes (for visuals linked to audio). "
+    "Keep tempo/key/stem/lyrics/voice locks aligned with the user directive and with any committee/QA metrics from prior runs."
 )
 
 
@@ -80,7 +89,22 @@ async def _plan_with_role(system: str, user_text: str, request_id: str) -> Dict[
         + f"Your role: {system}\n"
         + "Include ALL relevant steps for your modality; do not omit sub-steps.\n"
         + "### [PLANNER / SYSTEM]\n"
-        + "Plan minimal steps, prefer tools over text; for image.dispatch integrate subject canon when applicable and key args; merge to single plan and note uncertainties.\n"
+        + "- Think in explicit plans, not single shots. For each step, decide its purpose, which tool to call (or if it is reasoning-only), and what it depends on.\n"
+        + "- Plan minimal but complete steps, prefer tools over pure text when external data, media generation, or locks are involved.\n"
+        + "- When prior tool results are available in the CO/TOOLS frames, read their summaries (success/fail, key args, artifact ids, short diagnosis) and incorporate failures into the new plan.\n"
+        + "- If a previous step failed (ok=false or error present), do NOT assume it will be retried automatically; instead, add a new step that fixes the inputs or uses a different tool.\n"
+        + "### [LOCK ENGINE DIRECTIVES]\n"
+        + "- Fetch existing lock bundles with locks.get_bundle when the user references prior characters, outfits, props, scenery, or voices.\n"
+        + "- Use locks.build_region_locks when new reference images define clothing/props/background regions to preserve.\n"
+        + "- Adjust lock modes instead of re-prompting: locks.update_region_modes for vision regions (shape/texture/color hard|soft|off) and locks.update_audio_modes for tempo/key/stem/lyrics.\n"
+        + "- When user requests partial changes (e.g., \"same coat shape, new color\"), keep shape hard and relax color/texture via the update tools; carry forward the bundle ID into downstream image.dispatch/film.run/music/tts calls.\n"
+        + "- Always pass lock_bundle and quality_profile into image.dispatch, film.run, music.*, and tts.speak so downstream QA can enforce thresholds.\n"
+        + "### [HTTP TOOL]\n"
+        + "- Use http.request (or api.request where exposed) to call external APIs when needed. Provide url, method, headers/query/body, and set expect_json=false if the endpoint returns plain text.\n"
+        + "- Treat http.request results as envelopes: ok=true means success; ok=false responses include error.status and error.details.remote_* fields. Plan a new step with corrected args instead of assuming automatic retries.\n"
+        + "### [EXECUTOR / VALIDATION INVARIANTS]\n"
+        + "- The executor validates once and runs each tool step once. It will NOT automatically retry or repair; all retries must be explicit new steps you plan.\n"
+        + "- Do not count on hidden retries or side effects; always assume tools are run exactly as you specify them.\n"
         + "### [FINALITY / SYSTEM]\n"
         + "Do not output assistant content until committee consensus; one final answer only."
     )

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import os
 import json
+from typing import Any, Dict
 from .common import now_ts, ensure_dir, tts_edge_defaults, sidecar, stamp_env
+from ..locks import voice_embedding_from_path
 from ..determinism.seeds import stamp_tool_args
 from ..artifacts.manifest import add_manifest_row
 from ..jsonio.normalize import normalize_to_envelope
@@ -17,6 +19,17 @@ import struct
 import math
 from ..analysis.media import analyze_audio, normalize_lufs
 from ..datasets.trace import append_sample as _trace_append
+
+
+def _cosine_similarity(vec_a, vec_b):
+	if not vec_a or not vec_b or len(vec_a) != len(vec_b):
+		return None
+	num = sum(float(x) * float(y) for x, y in zip(vec_a, vec_b))
+	den_a = math.sqrt(sum(float(x) * float(x) for x in vec_a))
+	den_b = math.sqrt(sum(float(y) * float(y) for y in vec_b))
+	if den_a == 0.0 or den_b == 0.0:
+		return None
+	return num / (den_a * den_b)
 
 
 def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
@@ -45,6 +58,8 @@ def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
         "voice": job.get("voice"),
     }, edge=bool(job.get("edge")))
     lock = resolve_voice_lock(job.get("voice_id"), job.get("voice_refs"))
+    lock_bundle = job.get("lock_bundle") if isinstance(job.get("lock_bundle"), dict) else None
+    quality_profile = job.get("quality_profile")
     # If no explicit voice provided, try to reuse last voice from context
     inferred_voice = None
     try:
@@ -67,7 +82,9 @@ def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
         "channels": 1,
         "max_seconds": int(params.get("max_seconds") or 20),
         "voice_lock": lock,
-        "seed": job.get("seed"),
+	"seed": job.get("seed"),
+	"lock_bundle": lock_bundle,
+	"quality_profile": quality_profile,
     }
     args = stamp_tool_args("tts.speak", args)
     res = provider.speak(args)
@@ -121,28 +138,55 @@ def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
                 wf2.setnchannels(ch); wf2.setsampwidth(sw); wf2.setframerate(sr)
                 wf2.writeframes(data)
             return {"trimmed": True, "old_frames": n, "new_frames": max_frames}
-        qa_norm = {"normalized": False}
-        # Optional peak normalize only if requested
-        if bool(job.get("normalize")):
-            qa_norm = _peak_normalize(wav_path, -1.0)
-        qa_trim = _hard_trim(wav_path, float(params.get("max_seconds") or 0))
-        # Analyze LUFS always, normalize only if requested
-        ainfo = analyze_audio(wav_path)
-        if isinstance(ainfo, dict):
-            qa_norm["lufs_before"] = ainfo.get("lufs")
-        if bool(job.get("normalize_lufs")):
-            applied = normalize_lufs(wav_path, -16.0)
-            if applied is not None:
-                qa_norm["lufs_gain_db"] = float(applied)
+	qa_norm = {"normalized": False}
+	# Optional peak normalize only if requested
+	if bool(job.get("normalize")):
+		qa_norm = _peak_normalize(wav_path, -1.0)
+	qa_trim = _hard_trim(wav_path, float(params.get("max_seconds") or 0))
+	# Analyze LUFS always, normalize only if requested
+	ainfo = analyze_audio(wav_path)
+	if isinstance(ainfo, dict):
+		qa_norm["lufs_before"] = ainfo.get("lufs")
+	if bool(job.get("normalize_lufs")):
+		applied = normalize_lufs(wav_path, -16.0)
+		if applied is not None:
+			qa_norm["lufs_gain_db"] = float(applied)
     except Exception:
         qa_norm = {"normalized": False}; qa_trim = {"trimmed": False}
-    sidecar(wav_path, {
-        "tool": "tts.speak", "text": args.get("text"), "voice": args.get("voice"),
-        "rate": args.get("rate"), "pitch": args.get("pitch"), "sample_rate": args.get("sample_rate"),
-        "max_seconds": args.get("max_seconds"), "seed": args.get("seed"), "voice_lock": lock,
-        "model": model, "duration_s": dur,
-        "committee": {"peak_normalize": qa_norm, "hard_trim": qa_trim},
-    })
+locks_meta: Dict[str, Any] = {}
+if lock_bundle:
+	locks_meta["bundle"] = lock_bundle
+	audio_section = lock_bundle.get("audio") if isinstance(lock_bundle.get("audio"), dict) else {}
+	ref_voice = audio_section.get("voice_embedding")
+	if isinstance(ref_voice, list):
+		voice_embed = voice_embedding_from_path(wav_path)
+		if isinstance(voice_embed, list):
+			sim = _cosine_similarity(ref_voice, voice_embed)
+			if sim is not None:
+				locks_meta["voice_score"] = max(0.0, min((sim + 1.0) / 2.0, 1.0))
+				locks_meta["voice_embedding"] = voice_embed
+	lyrics_segments = audio_section.get("lyrics_segments") if isinstance(audio_section.get("lyrics_segments"), list) else []
+	hard_segments = [seg for seg in lyrics_segments if isinstance(seg, dict) and (seg.get("lock_mode") or "hard").lower() == "hard"]
+	if hard_segments:
+		text_lower = (args.get("text") or "").lower()
+		matched = 0
+		for seg in hard_segments:
+			seg_text = (seg.get("text") or "").lower()
+			if seg_text and seg_text in text_lower:
+				matched += 1
+		locks_meta["lyrics_score"] = matched / len(hard_segments) if hard_segments else None
+if quality_profile:
+	locks_meta.setdefault("quality_profile", quality_profile)
+sidecar_payload = {
+	"tool": "tts.speak", "text": args.get("text"), "voice": args.get("voice"),
+	"rate": args.get("rate"), "pitch": args.get("pitch"), "sample_rate": args.get("sample_rate"),
+	"max_seconds": args.get("max_seconds"), "seed": args.get("seed"), "voice_lock": lock,
+	"model": model, "duration_s": dur,
+	"committee": {"peak_normalize": qa_norm, "hard_trim": qa_trim},
+}
+if locks_meta:
+	sidecar_payload["locks"] = locks_meta
+sidecar(wav_path, sidecar_payload)
     # Emotion/pace gate: single revision to match target emotion if provided
     try:
         target_emotion = None
@@ -212,7 +256,12 @@ def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
         "artifacts": [{"id": os.path.basename(wav_path), "kind": "audio-ref", "summary": stem, "bytes": len(wav_bytes)}],
         "telemetry": {"window": {"input_bytes": 0, "output_target_tokens": 0}, "compression_passes": [], "notes": []},
     }
-    env = normalize_to_envelope(json.dumps(env)); env = bump_envelope(env); assert_envelope(env); env = stamp_env(env, "tts.speak", model)
+env_meta = env.setdefault("meta", {})
+if quality_profile:
+	env_meta.setdefault("quality_profile", quality_profile)
+if locks_meta:
+	env_meta["locks"] = locks_meta
+env = normalize_to_envelope(json.dumps(env)); env = bump_envelope(env); assert_envelope(env); env = stamp_env(env, "tts.speak", model)
     # Trace row for distillation
     try:
         ainfo = analyze_audio(wav_path)

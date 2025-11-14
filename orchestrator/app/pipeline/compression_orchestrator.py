@@ -155,7 +155,11 @@ def _co_frames_baseline() -> Dict[str, str]:
 			"- Decision Ledger: bullets of settled choices.\n"
 			"- Artifact Index: [type, short_name, purpose, key params, url/hash].\n"
 			"- Thread Map: who/what produced what; open TODOs.\n"
-			"If ICW exceeds its ratio, trim: Thread Map → Artifact Index → Decision Ledger → Episodic → Session Tail (last)."
+			"If ICW exceeds its ratio, trim: Thread Map → Artifact Index → Decision Ledger → Episodic → Session Tail (last).\n"
+			"\n"
+			"You are given separate 'recent_summary' and 'recent_raw' frames for the latest user request.\n"
+			"When compressing history, focus ICW on messages before the latest user request; do not override\n"
+			"or contradict the latest request with older instructions."
 		),
 		"tools": (
 			"### [TOOLS CONTEXT / SYSTEM]\n"
@@ -214,6 +218,65 @@ def _build_roe_digest_lines(incoming: List[str], globals_: List[str]) -> List[st
 		seen.add(ln)
 		out.append(ln)
 	return out[:16]
+
+
+def split_previous_and_last_user(messages: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, Any] | None]:
+	"""
+	Split the provided messages into all messages before the last user message
+	and the last user message itself. If no user message exists, return all
+	messages as previous and None for last.
+	"""
+	last_user_index = -1
+	index = len(messages) - 1
+	while index >= 0 and last_user_index == -1:
+		m = messages[index]
+		role = (m.get("role") if isinstance(m, dict) else None)
+		if role == "user":
+			last_user_index = index
+		index -= 1
+	if last_user_index == -1:
+		return messages, None
+	return messages[:last_user_index], messages[last_user_index]
+
+
+RECENT_RAW_MAX_CHARS = 4000
+RECENT_HEAD_CHARS = 2000
+RECENT_TAIL_CHARS = 1500
+RECENT_SUMMARY_MAX_CHARS = 512
+
+
+def build_recent_summary(last_user_message: Dict[str, Any] | None) -> Dict[str, str] | None:
+	"""
+	Build a short system frame summarizing the last user message.
+	Simple truncation-based summary if no summarizer is available.
+	"""
+	if not isinstance(last_user_message, dict):
+		return None
+	content = str(last_user_message.get("content") or "")
+	if not content:
+		return None
+	snippet = content[:RECENT_SUMMARY_MAX_CHARS]
+	summary_text = "Latest user request (compressed):\n" + snippet
+	return {"role": "system", "name": "recent_summary", "content": summary_text}
+
+
+def build_recent_raw(last_user_message: Dict[str, Any] | None) -> Dict[str, str] | None:
+	"""
+	Build a user frame with head+tail clipping to preserve intro and instructions.
+	"""
+	if not isinstance(last_user_message, dict):
+		return None
+	content = str(last_user_message.get("content") or "")
+	if not content:
+		return None
+	length = len(content)
+	if length <= RECENT_RAW_MAX_CHARS:
+		clipped = content
+	else:
+		head = content[:RECENT_HEAD_CHARS]
+		tail = content[-RECENT_TAIL_CHARS:] if RECENT_TAIL_CHARS > 0 else ""
+		clipped = head + "\n...\n" + tail
+	return {"role": "user", "name": "recent_raw", "content": clipped}
 
 
 def co_pack(envelope: Dict[str, Any]) -> Dict[str, Any]:
@@ -299,18 +362,27 @@ def co_pack(envelope: Dict[str, Any]) -> Dict[str, Any]:
 	# Optional subject canon
 	if isinstance(subject_canon, dict) and (subject_canon.get("literal") or subject_canon.get("tokens")):
 		frames.append({"role": "system", "content": blocks["subject"]})
-	# RoE capture before the user turn
-	frames.append({"role": "system", "content": blocks["roe_capture"]})
-	# User turn (current)
-	if isinstance(user_turn, dict) and user_turn.get("content"):
-		frames.append({"role": "user", "content": str(user_turn.get("content"))})
-	else:
-		# Fallback: try to pull from history tail
-		for m in reversed(history):
-			if isinstance(m, dict) and m.get("role") == "user" and m.get("content"):
-				frames.append({"role": "user", "content": str(m.get("content"))})
-				break
+
+	# Determine previous vs last user message for recency handling
+	messages_for_split: List[Dict[str, Any]] = list(history or [])
+	if isinstance(user_turn, dict) and user_turn.get("role") == "user" and user_turn.get("content"):
+		messages_for_split = list(messages_for_split) + [user_turn]
+	previous_messages, last_user_message = split_previous_and_last_user(messages_for_split)
+	# Note: ICW compression should consider only previous_messages. The CO 'icw' frame above
+	# provides instructions for the model to compress history; we intentionally do not include
+	# last_user_message in that compression and instead add it as recent frames below.
+
+	# Insert recency frames immediately before RoE tail
+	recent_summary_frame = build_recent_summary(last_user_message)
+	recent_raw_frame = build_recent_raw(last_user_message)
+	if recent_summary_frame is not None:
+		frames.append(recent_summary_frame)
+	if recent_raw_frame is not None:
+		frames.append(recent_raw_frame)
+
 	# Tail-anchored RoE digest
+	# Keep RoE small and at the tail. Place capture/digest after recent frames.
+	frames.append({"role": "system", "content": blocks["roe_capture"]})
 	global_rules = [
 		"- scope:user must: one final answer only (reason:user policy)",
 		"- scope:user must: use image.dispatch for image requests (reason:tool-first)",

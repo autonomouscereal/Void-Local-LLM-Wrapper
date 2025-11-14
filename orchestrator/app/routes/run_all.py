@@ -11,7 +11,7 @@ import uuid
 from typing import Any, Dict, List
 
 from fastapi import APIRouter, Request, WebSocket
-from fastapi.responses import JSONResponse
+from app.routes.toolrun import ToolEnvelope  # canonical envelope
 
 from ..json_parser import JSONParser
 from ..plan.committee import make_full_plan
@@ -65,14 +65,6 @@ def _soften_plan(plan: Dict[str, Any], user_text: str) -> Dict[str, Any]:
 router = APIRouter()
 
 
-def ok_envelope(result: Any, rid: str) -> JSONResponse:
-    return JSONResponse({"schema_version": 1, "request_id": rid, "ok": True, "result": result}, status_code=200)
-
-
-def jerr(status: int, rid: str, code: str, msg: str, details: Any | None = None) -> JSONResponse:
-    return JSONResponse({"schema_version": 1, "request_id": rid, "ok": False, "error": {"code": code, "message": msg, "details": details}}, status_code=status)
-
-
 @router.get("/jobs")
 async def jobs(req: Request):
     app = req.app
@@ -82,7 +74,7 @@ async def jobs(req: Request):
         for rid, info in jobs.items():
             if isinstance(info, dict):
                 items.append({"request_id": rid, "status": info.get("status"), "trace_id": info.get("trace_id")})
-    return ok_envelope({"jobs": items}, rid="jobs")
+    return ToolEnvelope.success({"jobs": items}, request_id="jobs")
 
 
 def _strip_data_urls(obj: Any) -> None:

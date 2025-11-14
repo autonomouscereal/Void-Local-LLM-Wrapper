@@ -326,6 +326,7 @@ services:
     command: ["uvicorn","app.main:app","--host","0.0.0.0","--port","8000","--log-level","info","--access-log","--use-colors"]
     volumes:
       - ./:/workspace
+      - uploads_data:/workspace/uploads
       - film2_models:/opt/models:ro
       - film2_data:/srv/film2
       - ./assets/comfyui/input:/comfyui/input
@@ -637,6 +638,7 @@ services:
       - ORCHESTRATOR_BASE_URL=http://127.0.0.1:8000
     volumes:
       - ./:/workspace
+      - uploads_data:/workspace/uploads
 
   drt:
     build:
@@ -734,5 +736,6 @@ volumes:
   film2_models: {}
   film2_data: {}
   comfyui_input: {}
+  uploads_data: {}
 
 

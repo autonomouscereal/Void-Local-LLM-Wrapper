@@ -1,16 +1,12 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Query
-from fastapi.responses import JSONResponse
 from app.main import _TOOL_SCHEMAS as _SCHEMAS
+from app.routes.toolrun import ToolEnvelope  # canonical envelope
 from typing import Any, Dict
 
 
 router = APIRouter()
-
-
-def ok_envelope(result, rid: str = "tool.describe") -> JSONResponse:
-	return JSONResponse({"schema_version": 1, "request_id": rid, "ok": True, "result": result}, status_code=200)
 
 
 _REGISTRY = {
@@ -46,19 +42,28 @@ async def tool_describe(name: str = Query(..., alias="name")):
 	# Prefer the full schema from app.main when available
 	meta = _SCHEMAS.get(key) if isinstance(_SCHEMAS, dict) else None
 	if meta and isinstance(meta.get("schema"), dict):
-		return ok_envelope({
-			"name": meta.get("name") or key,
-			"version": meta.get("version"),
-			"kind": meta.get("kind"),
-			"schema": meta.get("schema"),
-			"notes": meta.get("notes"),
-			"examples": meta.get("examples", []),
-		})
+		return ToolEnvelope.success(
+			{
+				"name": meta.get("name") or key,
+				"version": meta.get("version"),
+				"kind": meta.get("kind"),
+				"schema": meta.get("schema"),
+				"notes": meta.get("notes"),
+				"examples": meta.get("examples", []),
+			},
+			request_id="tool.describe",
+		)
 	# Fallback to local minimal registry entries
 	sch = _REGISTRY.get(key)
 	if not sch:
-		return JSONResponse({"schema_version": 1, "request_id": "tool.describe", "ok": False, "error": {"code": "tool_not_found", "message": f"unknown tool '{name}'", "details": {}}}, status_code=404)
-	return ok_envelope({"schema": sch})
+		return ToolEnvelope.failure(
+			"tool_not_found",
+			f"unknown tool '{name}'",
+			status=404,
+			request_id="tool.describe",
+			details={},
+		)
+	return ToolEnvelope.success({"schema": sch}, request_id="tool.describe")
 
 
 @router.post("/tool.describe")
@@ -67,7 +72,10 @@ async def tool_describe_post(body: Dict[str, Any]):
 	meta = _SCHEMAS.get(name) if isinstance(_SCHEMAS, dict) else None
 	# Preferred: expose input_schema for executor auto-fix use
 	if meta and isinstance(meta.get("schema"), dict):
-		return ok_envelope({"input_schema": meta.get("schema")}, rid="tool.describe")
+		return ToolEnvelope.success(
+			{"input_schema": meta.get("schema")},
+			request_id="tool.describe",
+		)
 	# Fallback: construct input_schema for image.dispatch locally
 	if name == "image.dispatch":
 		input_schema = {
@@ -90,5 +98,14 @@ async def tool_describe_post(body: Dict[str, Any]):
 			},
 			"required": ["prompt"],
 		}
-		return ok_envelope({"input_schema": input_schema}, rid="tool.describe")
-	return JSONResponse({"schema_version": 1, "request_id": "tool.describe", "ok": False, "error": {"code": "tool_not_found", "message": f"unknown tool '{name}'"}}, status_code=404)
+		return ToolEnvelope.success(
+			{"input_schema": input_schema},
+			request_id="tool.describe",
+		)
+	return ToolEnvelope.failure(
+		"tool_not_found",
+		f"unknown tool '{name}'",
+		status=404,
+		request_id="tool.describe",
+		details={},
+	)

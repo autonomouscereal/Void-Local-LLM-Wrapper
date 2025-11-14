@@ -18,6 +18,13 @@ REQUIRED_INPUTS: Dict[str, List[str]] = {
     "audio.vocal.synthesis": ["lyrics"],
     "audio.master": ["audio_id"],
     "audio.stems.demucs": ["audio_id"],
+    "locks.build_image_bundle": ["character_id", "image_url"],
+    "locks.build_audio_bundle": ["character_id", "audio_url"],
+    "locks.get_bundle": ["character_id"],
+	"locks.build_region_locks": ["character_id", "image_url"],
+	"locks.update_region_modes": ["character_id", "updates"],
+	"locks.update_audio_modes": ["character_id", "update"],
+	"http.request": ["url", "method"],
 }
 
 
