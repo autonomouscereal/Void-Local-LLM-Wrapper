@@ -366,65 +366,66 @@ async def tool_validate(req: Request):
 async def tool_run(req: Request):
 	rid = "tool.run"
 	try:
-		body = await req.json()
-	except Exception as ex:
-		return ToolEnvelope.failure(
-			"invalid_json",
-			f"Body must be valid JSON: {ex}",
-			status=400,
-			request_id=rid,
-		)
-	if not isinstance(body, dict):
-		return ToolEnvelope.failure(
-			"invalid_body_type",
-			"Body must be a JSON object",
-			status=422,
-			request_id=rid,
-		)
-	name = (body.get("name") or "").strip()
-	args = body.get("args") or {}
+		try:
+			body = await req.json()
+		except Exception as ex:
+			return ToolEnvelope.failure(
+				"invalid_json",
+				f"Body must be valid JSON: {ex}",
+				status=400,
+				request_id=rid,
+			)
+		if not isinstance(body, dict):
+			return ToolEnvelope.failure(
+				"invalid_body_type",
+				"Body must be a JSON object",
+				status=422,
+				request_id=rid,
+			)
+		name = (body.get("name") or "").strip()
+		args = body.get("args") or {}
 
-	# For non-image tools, route through the executor /execute to avoid local fast paths and circular imports
-	if name != "image.dispatch":
-		exec_base = os.getenv("EXECUTOR_BASE_URL", "http://127.0.0.1:8081").rstrip("/")
-		request_id = (args.get("trace_id") or args.get("cid") or uuid.uuid4().hex) if isinstance(args, dict) else uuid.uuid4().hex
-		step = {"id": "s1", "tool": name, "inputs": (args if isinstance(args, dict) else {})}
-		payload = {"schema_version": 1, "request_id": request_id, "trace_id": request_id, "steps": [step]}
-		async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
-			resp = await client.post(exec_base + "/execute", json=payload)
-			try:
-				env = resp.json()
-			except Exception:
-				env = {"ok": False, "error": {"code": "executor_bad_json", "message": resp.text}}
-		if isinstance(env, dict) and env.get("ok") and isinstance((env.get("result") or {}).get("produced"), dict):
-			produced = (env.get("result") or {}).get("produced") or {}
-			res1 = produced.get("s1") or {}
-			return ToolEnvelope.success(res1 if isinstance(res1, dict) else {"value": res1}, request_id=rid)
-		return ToolEnvelope.failure(
-			"executor_failed",
-			"tool failed via executor",
-			status=500,
-			request_id=rid,
-			details=(env or {}),
-		)
+		# For non-image tools, route through the executor /execute to avoid local fast paths and circular imports
+		if name != "image.dispatch":
+			exec_base = os.getenv("EXECUTOR_BASE_URL", "http://127.0.0.1:8081").rstrip("/")
+			request_id = (args.get("trace_id") or args.get("cid") or uuid.uuid4().hex) if isinstance(args, dict) else uuid.uuid4().hex
+			step = {"id": "s1", "tool": name, "inputs": (args if isinstance(args, dict) else {})}
+			payload = {"schema_version": 1, "request_id": request_id, "trace_id": request_id, "steps": [step]}
+			async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
+				resp = await client.post(exec_base + "/execute", json=payload)
+				try:
+					env = resp.json()
+				except Exception:
+					env = {"ok": False, "error": {"code": "executor_bad_json", "message": resp.text}}
+			if isinstance(env, dict) and env.get("ok") and isinstance((env.get("result") or {}).get("produced"), dict):
+				produced = (env.get("result") or {}).get("produced") or {}
+				res1 = produced.get("s1") or {}
+				return ToolEnvelope.success(res1 if isinstance(res1, dict) else {"value": res1}, request_id=rid)
+			return ToolEnvelope.failure(
+				"executor_failed",
+				"tool failed via executor",
+				status=500,
+				request_id=rid,
+				details=(env or {}),
+			)
 
-	# Use upstream global fixer (executor) for generic normalization; do not duplicate here
+		# Use upstream global fixer (executor) for generic normalization; do not duplicate here
 
-	# Inline graph or path
-	inline = args.get("workflow_graph")
-	if inline is not None:
-		wf_obj = inline
-		wf_path = "(inline)"
-	else:
-		wf_path = (args.get("workflow_path")
-		           or os.getenv("COMFY_WORKFLOW_PATH")
-		           or "/workspace/services/image/workflows/stock_smoke.json")
-		if os.path.exists(wf_path):
-			wf_text = _read_text(wf_path)
-			wf_obj = json.loads(wf_text)
+		# Inline graph or path
+		inline = args.get("workflow_graph")
+		if inline is not None:
+			wf_obj = inline
+			wf_path = "(inline)"
 		else:
-			# Fallback: proceed without file; we'll synthesize a valid graph below
-			wf_obj = {}
+			wf_path = (args.get("workflow_path")
+			           or os.getenv("COMFY_WORKFLOW_PATH")
+			           or "/workspace/services/image/workflows/stock_smoke.json")
+			if os.path.exists(wf_path):
+				wf_text = _read_text(wf_path)
+				wf_obj = json.loads(wf_text)
+			else:
+				# Fallback: proceed without file; we'll synthesize a valid graph below
+				wf_obj = {}
 
 	# Try to ensure API prompt mapping, with optional coercion/subset
 	prompt_graph = None
@@ -730,3 +731,14 @@ async def tool_run(req: Request):
 				"prompt_id": prompt_id,
 			})
 	return ToolEnvelope.success(result, request_id=rid)
+
+	# Last-resort guardrail: never let unexpected exceptions escape /tool.run
+	# (outer try/except at function level)
+	except Exception as ex:
+		return ToolEnvelope.failure(
+			"toolrun_exception",
+			f"{type(ex).__name__}: {ex}",
+			status=500,
+			request_id=rid,
+			details={},
+		)

@@ -753,13 +753,16 @@ async def segment_qa_and_committee(
                 }
             )
         exec_results: List[Dict[str, Any]] = []
-        if patch_validated:
-            _log("tool.run.start", trace_id=trace_id, executor="void", count=len(patch_validated or []), attempt=attempt)
-            for call in patch_validated:
+        # Advisory-only semantics: always execute the planner's patch plan once,
+        # using any argument adjustments from validator when available.
+        exec_batch = patch_validated or patch_calls
+        if exec_batch:
+            _log("tool.run.start", trace_id=trace_id, executor="void", count=len(exec_batch or []), attempt=attempt)
+            for call in exec_batch:
                 tn = (call.get("name") or "tool")
                 args_call = call.get("arguments") if isinstance(call.get("arguments"), dict) else {}
                 _log("tool.run.before", trace_id=trace_id, tool=str(tn), args_keys=list((args_call or {}).keys()), attempt=attempt)
-            exec_results = await gateway_execute(patch_validated, trace_id, executor_base_url or "http://127.0.0.1:8081")
+            exec_results = await gateway_execute(exec_batch, trace_id, executor_base_url or "http://127.0.0.1:8081")
         patch_results = list(patch_failure_results) + list(exec_results or [])
         for pr in patch_results or []:
             tname = str((pr or {}).get("name") or "tool")
@@ -6444,7 +6447,8 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 log_fn=_log,
                 state_dir=STATE_DIR,
             )
-            tool_calls = vr.get("validated") or []
+            # Advisory-only: keep executor inputs aligned to planner calls, but
+            # retain validator hints/evidence separately.
             validation_failures.extend(vr.get("pre_tool_failures") or [])
         _log(
             "validate.completed",
@@ -6680,13 +6684,16 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                         }
                     )
                 exec_results: List[Dict[str, Any]] = []
-                if patch_validated:
-                    _log("tool.run.start", trace_id=trace_id, executor="void", count=len(patch_validated or []))
-                    for tc in (patch_validated or []):
+                # Advisory-only: always execute the patch plan once, with any arg
+                # adjustments from validator when present.
+                exec_batch = patch_validated or patch_calls
+                if exec_batch:
+                    _log("tool.run.start", trace_id=trace_id, executor="void", count=len(exec_batch or []))
+                    for tc in exec_batch:
                         tn = (tc.get("name") or "tool")
                         ta = tc.get("arguments") if isinstance(tc.get("arguments"), dict) else {}
                         _log("tool.run.before", trace_id=trace_id, tool=str(tn), args_keys=list((ta or {}).keys()))
-                    exec_results = await gateway_execute(patch_validated, trace_id, EXECUTOR_BASE_URL or "http://127.0.0.1:8081")
+                    exec_results = await gateway_execute(exec_batch, trace_id, EXECUTOR_BASE_URL or "http://127.0.0.1:8081")
                 patch_results = list(patch_failure_results) + list(exec_results or [])
                 tool_results = (tool_results or []) + patch_results
                 _log("committee.revision.executed", trace_id=trace_id, steps=len(patch_validated or []), failures=len(patch_failures or []))
@@ -7893,13 +7900,15 @@ _TOOL_SCHEMAS: Dict[str, Dict[str, Any]] = {
         "schema": {
             "type": "object",
             "properties": {
-                "mode": {"type": "string", "enum": ["gen", "edit", "upscale"]},
                 "prompt": {"type": "string"},
                 "negative": {"type": "string"},
-                "seed": {"type": "integer"},
-                "size": {"type": "string"},
                 "width": {"type": "integer"},
                 "height": {"type": "integer"},
+                "steps": {"type": "integer"},
+                "cfg": {"type": "number"},
+                "seed": {"type": "integer"},
+                "mode": {"type": "string", "enum": ["gen", "edit", "upscale"]},
+                "size": {"type": "string"},
                 "assets": {"type": "object"},
                 "trace_id": {"type": "string"},
             },
@@ -8083,127 +8092,138 @@ async def tool_describe(name: str, response: Response):
 @app.post("/tool.validate")
 async def tool_validate(body: Dict[str, Any]):
     rid = _uuid.uuid4().hex
-    if not isinstance(body, dict) or "name" not in body or "args" not in body:
-        return ToolEnvelope.failure(
-            "parse_error",
-            "Expected {name, args}",
-            status=400,
-            request_id=rid,
-        )
-    name = (body or {}).get("name") or ""
-    args = (body or {}).get("args") or {}
-    tool_name = (str(name or "")).strip()
-    meta = _TOOL_SCHEMAS.get(tool_name)
-    if not meta:
-        # Log unknown-tool cases for image.dispatch explicitly so validation failures are debuggable
-        if tool_name == "image.dispatch":
-            env = {
-                "schema_version": 1,
-                "request_id": rid,
-                "ok": False,
-                "result": None,
-                "error": {
-                    "code": "unknown_tool",
-                    "message": tool_name,
-                    "status": 404,
-                    "details": {},
-                },
-            }
-            _log(
-                "tool.validate.debug.image.dispatch",
-                trace_id=str(args.get("trace_id") or ""),
-                envelope=env,
+    tool_name = ""
+    try:
+        if not isinstance(body, dict) or "name" not in body or "args" not in body:
+            return ToolEnvelope.failure(
+                "parse_error",
+                "Expected {name, args}",
+                status=400,
+                request_id=rid,
             )
-        return ToolEnvelope.failure(
-            "unknown_tool",
-            f"{name}",
-            status=404,
-            request_id=rid,
-            details={},
-        )
-    schema = meta["schema"]
-    errors: List[Dict[str, Any]] = []
-    for req in (schema.get("required") or []):
-        if args.get(req) is None:
-            errors.append({"code": "required_missing", "path": req, "expected": "present", "got": None})
-    props = schema.get("properties") or {}
-    for k, v in (args or {}).items():
-        ps = props.get(k)
-        if ps and not _schema_type_ok(v, ps):
-            errors.append({"code": "type_mismatch", "path": k, "expected": ps.get("type"), "got": type(v).__name__})
-        if ps and isinstance(ps.get("enum"), list) and v not in ps.get("enum"):
-            errors.append({"code": "enum_mismatch", "path": k, "allowed": ps.get("enum"), "got": v})
-    # api.request extra validation and guardrails (no network IO here)
-    if name.strip() == "api.request":
-        from urllib.parse import urlsplit
-        u = str(args.get("url") or "")
-        method = str(args.get("method") or "").upper()
-        sp = urlsplit(u)
-        if sp.scheme not in ("http", "https"):
-            errors.append({"code": "scheme_not_allowed", "path": "url", "expected": "http|https", "got": sp.scheme or ""})
-        # Disallow obvious loopback hostnames
-        host_low = (sp.hostname or "").lower()
-        if host_low in ("localhost",) or host_low.startswith("127.") or host_low == "::1":
-            errors.append({"code": "host_not_allowed", "path": "url", "got": host_low})
-        # Disallow calling our own internal services by host if provided via env
-        def _host_of(env_name: str) -> str:
-            v = os.getenv(env_name, "") or ""
-            try:
-                from urllib.parse import urlsplit as _us
-                return (_us(v).hostname or "").lower()
-            except Exception:
-                return ""
-        forbidden_hosts = set(filter(None, [
-            _host_of("EXECUTOR_BASE_URL"),
-            _host_of("COMFYUI_API_URL"),
-            _host_of("DRT_API_URL"),
-            _host_of("ORCHESTRATOR_BASE_URL"),
-        ]))
-        if host_low in forbidden_hosts:
-            errors.append({"code": "internal_host_not_allowed", "path": "url", "got": host_low})
-        # follow_redirects default allowed; validate max_bytes if present
-        if args.get("max_bytes") is not None:
-            try:
-                mb = int(args.get("max_bytes"))
-                if mb <= 0:
-                    errors.append({"code": "invalid_max_bytes", "path": "max_bytes", "expected": ">0", "got": mb})
-            except Exception:
-                errors.append({"code": "type_mismatch", "path": "max_bytes", "expected": "integer", "got": type(args.get("max_bytes")).__name__})
-        # headers shape
-        if isinstance(args.get("headers"), dict):
-            for hk, hv in (args.get("headers") or {}).items():
-                if not isinstance(hk, str) or not isinstance(hv, str):
-                    errors.append({"code": "type_mismatch", "path": f"headers.{hk}", "expected": "string", "got": type(hv).__name__})
-        if method not in ("GET","POST","PUT","PATCH","DELETE","HEAD","OPTIONS"):
-            errors.append({"code": "enum_mismatch", "path": "method", "allowed": ["GET","POST","PUT","PATCH","DELETE","HEAD","OPTIONS"], "got": method})
-    if errors:
-        # Surface structured schema errors and log the full envelope for image.dispatch
-        if tool_name == "image.dispatch":
-            env = {
-                "schema_version": 1,
-                "request_id": rid,
-                "ok": False,
-                "result": None,
-                "error": {
-                    "code": "schema_validation",
-                    "message": "Invalid args",
-                    "status": 422,
-                    "details": {"errors": errors},
-                },
-            }
-            _log(
-                "tool.validate.debug.image.dispatch",
-                trace_id=str(args.get("trace_id") or ""),
-                envelope=env,
+        name = (body or {}).get("name") or ""
+        args = (body or {}).get("args") or {}
+        tool_name = (str(name or "")).strip()
+        meta = _TOOL_SCHEMAS.get(tool_name)
+        if not meta:
+            # Log unknown-tool cases for image.dispatch explicitly so validation failures are debuggable
+            if tool_name == "image.dispatch":
+                env = {
+                    "schema_version": 1,
+                    "request_id": rid,
+                    "ok": False,
+                    "result": None,
+                    "error": {
+                        "code": "unknown_tool",
+                        "message": tool_name,
+                        "status": 404,
+                        "details": {},
+                    },
+                }
+                _log(
+                    "tool.validate.debug.image.dispatch",
+                    trace_id=str(args.get("trace_id") or ""),
+                    envelope=env,
+                )
+            return ToolEnvelope.failure(
+                "unknown_tool",
+                f"{name}",
+                status=404,
+                request_id=rid,
+                details={},
             )
+        schema = meta["schema"]
+        errors: List[Dict[str, Any]] = []
+        for req in (schema.get("required") or []):
+            if args.get(req) is None:
+                errors.append({"code": "required_missing", "path": req, "expected": "present", "got": None})
+        props = schema.get("properties") or {}
+        for k, v in (args or {}).items():
+            ps = props.get(k)
+            if ps and not _schema_type_ok(v, ps):
+                errors.append({"code": "type_mismatch", "path": k, "expected": ps.get("type"), "got": type(v).__name__})
+            if ps and isinstance(ps.get("enum"), list) and v not in ps.get("enum"):
+                errors.append({"code": "enum_mismatch", "path": k, "allowed": ps.get("enum"), "got": v})
+        # api.request extra validation and guardrails (no network IO here)
+        if name.strip() == "api.request":
+            from urllib.parse import urlsplit
+            u = str(args.get("url") or "")
+            method = str(args.get("method") or "").upper()
+            sp = urlsplit(u)
+            if sp.scheme not in ("http", "https"):
+                errors.append({"code": "scheme_not_allowed", "path": "url", "expected": "http|https", "got": sp.scheme or ""})
+            # Disallow obvious loopback hostnames
+            host_low = (sp.hostname or "").lower()
+            if host_low in ("localhost",) or host_low.startswith("127.") or host_low == "::1":
+                errors.append({"code": "host_not_allowed", "path": "url", "got": host_low})
+            # Disallow calling our own internal services by host if provided via env
+            def _host_of(env_name: str) -> str:
+                v = os.getenv(env_name, "") or ""
+                try:
+                    from urllib.parse import urlsplit as _us
+                    return (_us(v).hostname or "").lower()
+                except Exception:
+                    return ""
+            forbidden_hosts = set(filter(None, [
+                _host_of("EXECUTOR_BASE_URL"),
+                _host_of("COMFYUI_API_URL"),
+                _host_of("DRT_API_URL"),
+                _host_of("ORCHESTRATOR_BASE_URL"),
+            ]))
+            if host_low in forbidden_hosts:
+                errors.append({"code": "internal_host_not_allowed", "path": "url", "got": host_low})
+            # follow_redirects default allowed; validate max_bytes if present
+            if args.get("max_bytes") is not None:
+                try:
+                    mb = int(args.get("max_bytes"))
+                    if mb <= 0:
+                        errors.append({"code": "invalid_max_bytes", "path": "max_bytes", "expected": ">0", "got": mb})
+                except Exception:
+                    errors.append({"code": "type_mismatch", "path": "max_bytes", "expected": "integer", "got": type(args.get("max_bytes")).__name__})
+            # headers shape
+            if isinstance(args.get("headers"), dict):
+                for hk, hv in (args.get("headers") or {}).items():
+                    if not isinstance(hk, str) or not isinstance(hv, str):
+                        errors.append({"code": "type_mismatch", "path": f"headers.{hk}", "expected": "string", "got": type(hv).__name__})
+            if method not in ("GET","POST","PUT","PATCH","DELETE","HEAD","OPTIONS"):
+                errors.append({"code": "enum_mismatch", "path": "method", "allowed": ["GET","POST","PUT","PATCH","DELETE","HEAD","OPTIONS"], "got": method})
+        if errors:
+            # Surface structured schema errors and log the full envelope for image.dispatch
+            if tool_name == "image.dispatch":
+                env = {
+                    "schema_version": 1,
+                    "request_id": rid,
+                    "ok": False,
+                    "result": None,
+                    "error": {
+                        "code": "schema_validation",
+                        "message": "Invalid args",
+                        "status": 422,
+                        "details": {"errors": errors},
+                    },
+                }
+                _log(
+                    "tool.validate.debug.image.dispatch",
+                    trace_id=str(args.get("trace_id") or ""),
+                    envelope=env,
+                )
+            return ToolEnvelope.failure(
+                "schema_validation",
+                "Invalid args",
+                status=422,
+                request_id=rid,
+                details={"errors": errors},
+            )
+        return ToolEnvelope.success({"validated": True}, request_id=rid)
+    except Exception as ex:
+        # Last-resort guardrail: never let validation errors break the HTTP transport.
         return ToolEnvelope.failure(
-            "schema_validation",
-            "Invalid args",
-            status=422,
+            "validator_exception",
+            f"{type(ex).__name__}: {ex}",
+            status=500,
             request_id=rid,
-            details={"errors": errors},
+            details={"tool": tool_name},
         )
-    return ToolEnvelope.success({"validated": True}, request_id=rid)
 
 
 @app.post("/jobs/start")
