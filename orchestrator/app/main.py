@@ -5404,9 +5404,9 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                             "details": {},
                         }
                     else:
-                        le = _sp.limit(e, x, point)
-                        res["exact"] = _sp.sstr(le)
-                        res["latex"] = _sp.latex(le)
+                    le = _sp.limit(e, x, point)
+                    res["exact"] = _sp.sstr(le)
+                    res["latex"] = _sp.latex(le)
                 elif task in ("series",):
                     pe = e.series(x, 0 if point is None else point, order)
                     res["exact"] = _sp.sstr(pe)

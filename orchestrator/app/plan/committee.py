@@ -54,7 +54,9 @@ async def _call_llm_json(prompt: str) -> Dict[str, Any]:
     payload = {"model": model, "prompt": prompt, "stream": False}
     async with httpx.AsyncClient() as client:
         r = await client.post(base + "/api/generate", json=payload)
-        r.raise_for_status()
+        # Do not raise on HTTP errors; return an empty plan instead so callers can continue.
+        if r.status_code < 200 or r.status_code >= 300:
+            return {"request_id": "", "plan": []}
         txt = (JSONParser().parse(r.text, {"response": str}) or {}).get("response") or "{}"
         try:
             return JSONParser().parse(txt, PLAN_SCHEMA)

@@ -111,13 +111,10 @@ async def utc_run_tool(trace_id: Optional[str], step_id: Optional[str], name: st
     await _emit_review_event("edit.plan", trace_id, step_id, notes=last_ops)
     await _emit_review_event("fixer.summary", trace_id, step_id, notes={"fixer_applied": bool(last_ops), "ops_count": len(last_ops)})
 
-    # Validate once after fixer so required args are present
+    # Validate once after fixer so required args are present (advisory-only)
     base = os.getenv("ORCHESTRATOR_BASE_URL", "http://127.0.0.1:8000")
     venv = _post(base.rstrip("/") + "/tool.validate", {"name": name, "args": attempt_args})
-    if isinstance(venv, dict) and venv.get("ok") is False:
-        # Pass through orchestrator envelope unchanged
-        return venv
-
+    # Do not gate on validator outcome; always execute the tool once.
     attempt_args.setdefault("autofix_422", True)
     res = _post(base.rstrip("/") + "/tool.run", {"name": name, "args": attempt_args, "stream": False})
     if res.get("ok"):

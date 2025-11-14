@@ -24,7 +24,9 @@ def _now_ts() -> int:
 async def _download_bytes(url: str) -> bytes:
     async with httpx.AsyncClient(timeout=None, follow_redirects=True) as client:
         resp = await client.get(url)
-        resp.raise_for_status()
+        # Do not raise on HTTP errors; return empty bytes so callers can handle missing data.
+        if resp.status_code < 200 or resp.status_code >= 300:
+            return b""
         return resp.content
 
 

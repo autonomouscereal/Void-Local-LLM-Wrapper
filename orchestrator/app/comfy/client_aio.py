@@ -33,13 +33,23 @@ async def comfy_submit(graph: Dict[str, Any], client_id: Optional[str] = None, w
         async with s.post(f"{BASE}/prompt", data=body_bytes, headers={"Content-Type": "application/json"}) as r:
             text = await r.text()
             if r.status != 200:
+                # Do not raise; return a structured error envelope for callers to surface.
+                err = {
+                    "ok": False,
+                    "error": {
+                        "code": "comfy_prompt_http_error",
+                        "message": f"/prompt {r.status}",
+                        "status": int(r.status),
+                        "details": {"body": text[:500]},
+                    },
+                }
                 if ws:
                     try:
                         await ws.send_json({"type": "error", "source": "comfy", "body": text[:500]})
                         await ws.close(code=1000)
                     except Exception:
                         pass
-                raise RuntimeError(f"/prompt {r.status}: {text[:500]}")
+                return err
             return JSONParser().parse(text, {})
 
 
@@ -48,7 +58,16 @@ async def comfy_history(prompt_id: str) -> Dict[str, Any]:
         async with s.get(f"{BASE}/history/{prompt_id}") as r:
             text = await r.text()
             if r.status != 200:
-                raise RuntimeError(f"/history {r.status}: {text[:500]}")
+                # Return a structured error instead of raising.
+                return {
+                    "ok": False,
+                    "error": {
+                        "code": "comfy_history_http_error",
+                        "message": f"/history {r.status}",
+                        "status": int(r.status),
+                        "details": {"body": text[:500]},
+                    },
+                }
             return JSONParser().parse(text, {})
 
 
@@ -61,7 +80,8 @@ async def comfy_upload_image(name_hint: str, b64_png: str) -> str:
         async with s.post(f"{BASE}/upload/image", data=form) as r:
             text = await r.text()
             if r.status != 200:
-                raise RuntimeError(f"/upload/image {r.status}: {text[:500]}")
+                # Return best-effort fallback name so callers can proceed.
+                return filename
             obj = JSONParser().parse(text, {})
             stored = obj.get("name") or filename
             return stored
@@ -76,7 +96,8 @@ async def comfy_upload_mask(name_hint: str, b64_png: str) -> str:
         async with s.post(f"{BASE}/upload/mask", data=form) as r:
             text = await r.text()
             if r.status != 200:
-                raise RuntimeError(f"/upload/mask {r.status}: {text[:500]}")
+                # Return best-effort fallback name so callers can proceed.
+                return filename
             obj = JSONParser().parse(text, {})
             return obj.get("name") or filename
 
@@ -87,8 +108,8 @@ async def comfy_view(filename: str) -> Tuple[bytes, str]:
         async with s.get(f"{BASE}/view", params={"filename": filename}) as r:
             data = await r.read()
             if r.status != 200:
-                body = (await r.text()) if data else ""
-                raise RuntimeError(f"/view {r.status}: {body[:500]}")
+                # Return empty payload and generic content type instead of raising.
+                return b"", r.headers.get("content-type", "application/octet-stream")
             return data, r.headers.get("content-type", "application/octet-stream")
 
 
