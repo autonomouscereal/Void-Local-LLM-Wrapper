@@ -19,14 +19,14 @@ def finalize_tool_phase(
     committee_info: Optional[Dict[str, Any]] = None,
     qa_metrics: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-	"""
-	Compose an OpenAI-compatible envelope from tool results with warnings and asset links.
-	- Never raises
-	- Always returns a dict with optional _meta.errors
-	"""
+    """
+    Compose an OpenAI-compatible envelope from tool results with warnings and asset links.
+    - Never raises
+    - Always returns a dict with optional _meta.errors
+    """
     # Build asset URLs
     asset_urls = assets_collect_urls(tool_results, absolutize_url)
-	# Derive prompt/params when available
+    # Derive prompt/params when available
     prompt_text = ""
     meta_used: Dict[str, Any] = {}
     if isinstance(tool_results, list) and tool_results:
@@ -186,36 +186,36 @@ def finalize_tool_phase(
 
 
 def compose_openai_response(
-	text: str,
-	usage: Dict[str, Any],
-	model_name: str,
-	seed: int,
-	id_: str,
-	*,
-	envelope_builder: Callable[..., Dict[str, Any]],
-	prebuilt: Optional[Dict[str, Any]] = None,
-	artifacts: Optional[Dict[str, Any]] = None,
-	final_env: Optional[Dict[str, Any]] = None,
+    text: str,
+    usage: Dict[str, Any],
+    model_name: str,
+    seed: int,
+    id_: str,
+    *,
+    envelope_builder: Callable[..., Dict[str, Any]],
+    prebuilt: Optional[Dict[str, Any]] = None,
+    artifacts: Optional[Dict[str, Any]] = None,
+    final_env: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-	"""
-	Compose the final OpenAI-compatible response envelope with optional artifacts and embedded final_env.
-	Does not perform I/O. Returns the response dict.
-	"""
-	response = envelope_builder(
-		ok=True,
-		text=text,
-		error=None,
-		usage=usage,
-		model=model_name,
-		seed=seed,
-		id_=id_ or "orc-1",
-	)
-	if isinstance(prebuilt, dict) and prebuilt:
-		response = prebuilt
-	if isinstance(artifacts, dict) and artifacts:
-		response["artifacts"] = artifacts
-	if isinstance(final_env, dict) and final_env:
-		response["envelope"] = final_env
-	return response
+    """
+    Compose the final OpenAI-compatible response envelope with optional artifacts and embedded final_env.
+    Does not perform I/O. Returns the response dict.
+    """
+    response = envelope_builder(
+        ok=True,
+        text=text,
+        error=None,
+        usage=usage,
+        model=model_name,
+        seed=seed,
+        id_=id_ or "orc-1",
+    )
+    if isinstance(prebuilt, dict) and prebuilt:
+        response = prebuilt
+    if isinstance(artifacts, dict) and artifacts:
+        response["artifacts"] = artifacts
+    if isinstance(final_env, dict) and final_env:
+        response["envelope"] = final_env
+    return response
 
 
