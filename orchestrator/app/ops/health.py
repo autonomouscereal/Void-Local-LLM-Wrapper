@@ -11,7 +11,8 @@ START_TS = time.time()
 def get_capabilities() -> Dict[str, Any]:
     models = [
         {"name": os.getenv("QWEN_MODEL_ID", "qwen3:32b"), "ctx_tokens": int(os.getenv("DEFAULT_NUM_CTX", "4096")), "step_tokens": int(os.getenv("ICW_STEP_TOKENS", "900"))},
-        {"name": os.getenv("GPTOSS_MODEL_ID", "gpt-oss:20b"), "ctx_tokens": int(os.getenv("DEFAULT_NUM_CTX", "4096")), "step_tokens": int(os.getenv("ICW_STEP_TOKENS", "900"))},
+        {"name": os.getenv("GLM_MODEL_ID", "glm4:9b"), "ctx_tokens": int(os.getenv("DEFAULT_NUM_CTX", "4096")), "step_tokens": int(os.getenv("ICW_STEP_TOKENS", "900"))},
+        {"name": os.getenv("DEEPSEEK_CODER_MODEL_ID", "deepseek-coder-v2:lite"), "ctx_tokens": int(os.getenv("DEFAULT_NUM_CTX", "4096")), "step_tokens": int(os.getenv("ICW_STEP_TOKENS", "900"))},
     ]
     tools = [
         "film.run",

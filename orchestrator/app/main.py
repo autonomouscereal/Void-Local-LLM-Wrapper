@@ -13,14 +13,14 @@ from __future__ import annotations
 #   BEFORE any .get or type‑dependent access to prevent 'str'.get type errors.
 #
 # Historical/rationale (orchestrator):
-# - Planner/Executors (Qwen + GPT-OSS) are coordinated with explicit system guidance to avoid refusals.
+# - Planner/Executors (Qwen + GLM4-9B) are coordinated with explicit system guidance to avoid refusals.
 # - Tools are selected SEMANTICALLY (not keywords). On refusal, we may force a single best-match tool
 #   with minimal arguments, but we never overwrite model output; we only append a short Status.
 # - JSON parsing uses a hardened JSONParser with expected structures to survive malformed LLM JSON.
 # - All DB access is via asyncpg; JSONB writes use json.dumps and ::jsonb to avoid type issues.
 # - RAG (pgvector) initializes extension + indexes at startup and uses a simple cache.
 # - OpenAI-compatible /v1/chat/completions returns full Markdown: main answer first, then "### Tool Results"
-#   (film_id, job_id(s), errors), then an "### Appendix — Model Answers" with raw Qwen/GPT-OSS responses (trimmed).
+#   (film_id, job_id(s), errors), then an "### Appendix — Model Answers" with raw Qwen/GLM4-9B responses (trimmed).
 # - We never replace the main content with status; instead we append a Status block only when empty/refusal.
 # - Long-running film pipeline: film_create → film_add_scene (ComfyUI jobs via /jobs) → film_compile (n8n or local assembler).
 # - Keep LLM models warm: we set options.keep_alive=24h on every Ollama call to avoid reloading between requests.
@@ -760,10 +760,13 @@ def _write_json_safe(path: str, obj: Dict[str, Any]) -> None:
 
 
 QWEN_BASE_URL = os.getenv("QWEN_BASE_URL", "http://localhost:11434")
-QWEN_MODEL_ID = os.getenv("QWEN_MODEL_ID", "qwen3:32b-instruct-q6_K")
-GPTOSS_BASE_URL = os.getenv("GPTOSS_BASE_URL", "http://localhost:11435")
-GPTOSS_MODEL_ID = os.getenv("GPTOSS_MODEL_ID", "chatgpt-oss:latest")
+QWEN_MODEL_ID = os.getenv("QWEN_MODEL_ID", "qwen3:30b-a3b-instruct-2507-q4_K_M")
+GLM_OLLAMA_BASE_URL = os.getenv("GLM_OLLAMA_BASE_URL", "http://localhost:11434")
+GLM_MODEL_ID = os.getenv("GLM_MODEL_ID", "glm4:9b")
+DEEPSEEK_CODER_OLLAMA_BASE_URL = os.getenv("DEEPSEEK_CODER_OLLAMA_BASE_URL", "http://localhost:11436")
+DEEPSEEK_CODER_MODEL_ID = os.getenv("DEEPSEEK_CODER_MODEL_ID", "deepseek-coder-v2:lite")
 DEFAULT_NUM_CTX = int(os.getenv("DEFAULT_NUM_CTX", "8192"))
+COMMITTEE_MODEL_ID = os.getenv("COMMITTEE_MODEL_ID") or f"committee:{QWEN_MODEL_ID}+{GLM_MODEL_ID}+{DEEPSEEK_CODER_MODEL_ID}"
 
 # Committee participant → model routing (always use both models for committee work)
 PARTICIPANT_MODELS: Dict[str, Dict[str, str]] = {
@@ -771,9 +774,13 @@ PARTICIPANT_MODELS: Dict[str, Dict[str, str]] = {
         "base": QWEN_BASE_URL,
         "model": QWEN_MODEL_ID,
     },
-    "gptoss": {
-        "base": GPTOSS_BASE_URL,
-        "model": GPTOSS_MODEL_ID,
+    "glm": {
+        "base": GLM_OLLAMA_BASE_URL,
+        "model": GLM_MODEL_ID,
+    },
+    "deepseek": {
+        "base": DEEPSEEK_CODER_OLLAMA_BASE_URL,
+        "model": DEEPSEEK_CODER_MODEL_ID,
     },
 }
 COMMITTEE_PARTICIPANTS = [
@@ -785,7 +792,7 @@ DEFAULT_TEMPERATURE = float(os.getenv("DEFAULT_TEMPERATURE", "0.3"))
 ENABLE_WEBSEARCH = True
 MCP_HTTP_BRIDGE_URL = os.getenv("MCP_HTTP_BRIDGE_URL")  # e.g., http://host.docker.internal:9999
 EXECUTOR_BASE_URL = os.getenv("EXECUTOR_BASE_URL", "http://127.0.0.1:8081")
-PLANNER_MODEL = os.getenv("PLANNER_MODEL", "qwen")  # qwen | gptoss
+PLANNER_MODEL = os.getenv("PLANNER_MODEL", "qwen")  # qwen | glm
 ENABLE_DEBATE = True
 MAX_DEBATE_TURNS = 1
 AUTO_EXECUTE_TOOLS = True
@@ -1177,7 +1184,7 @@ def finalize_response(trace_id: str, messages: List[Dict[str, Any]], state: RunS
         text=final_text,
         error=err_payload,
         usage=usage,
-        model=f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}",
+        model=COMMITTEE_MODEL_ID,
         seed=seed,
         id_="orc-1",
     )
@@ -2163,11 +2170,11 @@ def meta_prompt(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return head + policy_frames + tail
 
 
-def merge_responses(request: Dict[str, Any], qwen_text: str, gptoss_text: str) -> str:
+def merge_responses(request: Dict[str, Any], qwen_text: str, glm_text: str) -> str:
     return (
         "Committee Synthesis:\n\n"
         "Qwen perspective:\n" + qwen_text.strip() + "\n\n"
-        "GPT-OSS perspective:\n" + gptoss_text.strip() + "\n\n"
+        "GLM4-9B perspective:\n" + glm_text.strip() + "\n\n"
         "Final answer (synthesize both; prefer correctness and specificity):\n"
     )
 
@@ -2327,8 +2334,8 @@ def merge_tool_schemas(client_tools: Optional[List[Dict[str, Any]]]) -> List[Dic
 async def planner_produce_plan(messages: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]], temperature: float, trace_id: Optional[str] = None, mode: Optional[str] = None) -> Tuple[str, List[Dict[str, Any]]]:
     # Treat any 'qwen*' value as Qwen route (e.g., 'qwen3')
     use_qwen = str(PLANNER_MODEL or "qwen").lower().startswith("qwen")
-    planner_id = QWEN_MODEL_ID if use_qwen else GPTOSS_MODEL_ID
-    planner_base = QWEN_BASE_URL if use_qwen else GPTOSS_BASE_URL
+    planner_id = QWEN_MODEL_ID if use_qwen else GLM_MODEL_ID
+    planner_base = QWEN_BASE_URL if use_qwen else GLM_OLLAMA_BASE_URL
     # Resolve subject canon from latest user text
     # subject canon and RoE digest now imported at module top
     # Build CO frames with curated tool context (prompt-only; no gating)
@@ -5404,9 +5411,9 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                             "details": {},
                         }
                     else:
-                    le = _sp.limit(e, x, point)
-                    res["exact"] = _sp.sstr(le)
-                    res["latex"] = _sp.latex(le)
+                        le = _sp.limit(e, x, point)
+                        res["exact"] = _sp.sstr(le)
+                        res["latex"] = _sp.latex(le)
                 elif task in ("series",):
                     pe = e.series(x, 0 if point is None else point, order)
                     res["exact"] = _sp.sstr(pe)
@@ -5703,7 +5710,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             text=msg,
             error={"code": "bad_request", "message": "messages must be a list"},
             usage=usage0,
-            model=f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}",
+            model=COMMITTEE_MODEL_ID,
             seed=0,
             id_="orc-1",
         )
@@ -5808,7 +5815,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
 
     # 1) Planner proposes plan + tool calls
     # Committee-governed pre-plan deliberation and gating
-    _log("committee.open", trace_id=trace_id, participants=["qwen", "gptoss", "planner", "executor"], topic="user_intent_summary")
+    _log("committee.open", trace_id=trace_id, participants=["qwen", "glm", "deepseek", "planner", "executor"], topic="user_intent_summary")
     _ev = []
     if isinstance(messages, list):
         _ev = [("msg", i) for i, _ in enumerate(messages[:3])]
@@ -6048,7 +6055,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         response = {
             "id": "orc-1",
             "object": "chat.completion",
-            "model": f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}",
+            "model": COMMITTEE_MODEL_ID,
             "choices": [
                 {
                     "index": 0,
@@ -6548,7 +6555,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 tool_results=tool_results,
                 master_seed=master_seed,
                 trace_id=trace_id,
-                model_name=f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}",
+                model_name=COMMITTEE_MODEL_ID,
                 absolutize_url=_abs_url,
                 estimate_usage_fn=estimate_usage,
                 envelope_builder=_build_openai_envelope,
@@ -6628,15 +6635,19 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     qwen_payload = build_ollama_payload(
         messages=exec_messages, model=QWEN_MODEL_ID, num_ctx=DEFAULT_NUM_CTX, temperature=body.get("temperature") or DEFAULT_TEMPERATURE
     )
-    gptoss_payload = build_ollama_payload(
-        messages=exec_messages, model=GPTOSS_MODEL_ID, num_ctx=DEFAULT_NUM_CTX, temperature=body.get("temperature") or DEFAULT_TEMPERATURE
+    glm_payload = build_ollama_payload(
+        messages=exec_messages, model=GLM_MODEL_ID, num_ctx=DEFAULT_NUM_CTX, temperature=body.get("temperature") or DEFAULT_TEMPERATURE
+    )
+    deepseek_payload = build_ollama_payload(
+        messages=exec_messages, model=DEEPSEEK_CODER_MODEL_ID, num_ctx=DEFAULT_NUM_CTX, temperature=body.get("temperature") or DEFAULT_TEMPERATURE
     )
 
     qwen_task = asyncio.create_task(call_ollama(QWEN_BASE_URL, qwen_payload))
-    gptoss_task = asyncio.create_task(call_ollama(GPTOSS_BASE_URL, gptoss_payload))
-    qwen_result, gptoss_result = await asyncio.gather(qwen_task, gptoss_task)
+    glm_task = asyncio.create_task(call_ollama(GLM_OLLAMA_BASE_URL, glm_payload))
+    deepseek_task = asyncio.create_task(call_ollama(DEEPSEEK_CODER_OLLAMA_BASE_URL, deepseek_payload))
+    qwen_result, glm_result, deepseek_result = await asyncio.gather(qwen_task, glm_task, deepseek_task)
     # If backends errored but we have tool results (e.g., image job still running/finishing), degrade gracefully
-    if qwen_result.get("error") or gptoss_result.get("error"):
+    if qwen_result.get("error") or glm_result.get("error") or deepseek_result.get("error"):
         if tool_results:
             # Build a minimal assets block so the UI can render generated media even if models errored
             def _asset_urls_from_tools(results: List[Dict[str, Any]]) -> List[str]:
@@ -6705,7 +6716,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             response = {
                 "id": "orc-1",
                 "object": "chat.completion",
-                "model": f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}",
+                "model": COMMITTEE_MODEL_ID,
                 "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": final_text}}],
                 "usage": usage,
                 "seed": master_seed,
@@ -6717,7 +6728,8 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             # Do not return early; finalize at unified tail
         detail = {
             "qwen": {k: v for k, v in qwen_result.items() if k in ("error", "_base_url")},
-            "gptoss": {k: v for k, v in gptoss_result.items() if k in ("error", "_base_url")},
+            "glm": {k: v for k, v in glm_result.items() if k in ("error", "_base_url")},
+            "deepseek": {k: v for k, v in deepseek_result.items() if k in ("error", "_base_url")},
         }
         if _lock_token:
             trace_release_lock(STATE_DIR, trace_id)
@@ -6729,7 +6741,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             text=msg,
             error={"code": "backend_failed", "message": "one or more backends failed", "detail": detail},
             usage=usage,
-            model=f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}",
+            model=COMMITTEE_MODEL_ID,
             seed=master_seed,
             id_="orc-1",
         )
@@ -6738,10 +6750,11 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         # Do not return; finalize at the unified tail
 
     qwen_text = qwen_result.get("response", "")
-    gptoss_text = gptoss_result.get("response", "")
+    glm_text = glm_result.get("response", "")
+    deepseek_text = deepseek_result.get("response", "")
     # Preserve the first-pass model outputs for robust fallback in final composition
     orig_qwen_text = qwen_text
-    orig_gptoss_text = gptoss_text
+    orig_glm_text = glm_text
 
     # No synthetic tool forcing; the planner alone selects tools
 
@@ -6758,7 +6771,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         "i can't",
         "sorry, i",
     ]
-    final_refusal = any(tok in (qwen_text.lower() + "\n" + gptoss_text.lower()) for tok in refusal_markers)
+    final_refusal = any(tok in (qwen_text.lower() + "\n" + glm_text.lower() + "\n" + (deepseek_text or "").lower()) for tok in refusal_markers)
     if final_refusal:
         # Try to extract a film_id or any success info from tool results
         film_id = None
@@ -6783,24 +6796,77 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         )
         # Do not modify model texts here; the final composer will only append status
 
+    # Build per-model "other answers" context for cross-critique
+    other_for_qwen = ""
+    other_for_glm = ""
+    other_for_deepseek = ""
+
+    if glm_text:
+        other_for_qwen += "GLM4-9B answer:\n" + str(glm_text) + "\n\n"
+    if deepseek_text:
+        other_for_qwen += "DeepSeek Coder answer:\n" + str(deepseek_text) + "\n"
+
+    if qwen_text:
+        other_for_glm += "Qwen answer:\n" + str(qwen_text) + "\n\n"
+    if deepseek_text:
+        other_for_glm += "DeepSeek Coder answer:\n" + str(deepseek_text) + "\n"
+
+    if qwen_text:
+        other_for_deepseek += "Qwen answer:\n" + str(qwen_text) + "\n\n"
+    if glm_text:
+        other_for_deepseek += "GLM4-9B answer:\n" + str(glm_text) + "\n"
+
+    qcrit_text = ""
+    gcrit_text = ""
+    dcrit_text = ""
+
     # 4) Optional brief debate (cross-critique)
     if ENABLE_DEBATE and MAX_DEBATE_TURNS > 0:
         critique_prompt = (
-            "Critique the other model's answer. Identify mistakes, missing considerations, or improvements. "
+            "Critique the other model(s) answers. Identify mistakes, missing considerations, or improvements. "
             "Return a concise bullet list."
         )
-        qwen_critique_msg = exec_messages + [{"role": "user", "content": critique_prompt + f"\nOther answer:\n{gptoss_text}"}]
-        gptoss_critique_msg = exec_messages + [{"role": "user", "content": critique_prompt + f"\nOther answer:\n{qwen_text}"}]
-        qwen_crit_payload = build_ollama_payload(qwen_critique_msg, QWEN_MODEL_ID, DEFAULT_NUM_CTX, (body.get("temperature") or DEFAULT_TEMPERATURE))
-        gptoss_crit_payload = build_ollama_payload(gptoss_critique_msg, GPTOSS_MODEL_ID, DEFAULT_NUM_CTX, (body.get("temperature") or DEFAULT_TEMPERATURE))
+
+        qwen_critique_msg = exec_messages + [
+            {"role": "user", "content": critique_prompt + "\n\nOther answers:\n" + other_for_qwen}
+        ]
+        glm_critique_msg = exec_messages + [
+            {"role": "user", "content": critique_prompt + "\n\nOther answers:\n" + other_for_glm}
+        ]
+        deepseek_critique_msg = exec_messages + [
+            {"role": "user", "content": critique_prompt + "\n\nOther answers:\n" + other_for_deepseek}
+        ]
+
+        qwen_crit_payload = build_ollama_payload(
+            qwen_critique_msg,
+            QWEN_MODEL_ID,
+            DEFAULT_NUM_CTX,
+            body.get("temperature") or DEFAULT_TEMPERATURE,
+        )
+        glm_crit_payload = build_ollama_payload(
+            glm_critique_msg,
+            GLM_MODEL_ID,
+            DEFAULT_NUM_CTX,
+            body.get("temperature") or DEFAULT_TEMPERATURE,
+        )
+        deepseek_crit_payload = build_ollama_payload(
+            deepseek_critique_msg,
+            DEEPSEEK_CODER_MODEL_ID,
+            DEFAULT_NUM_CTX,
+            body.get("temperature") or DEFAULT_TEMPERATURE,
+        )
+
         qcrit_task = asyncio.create_task(call_ollama(QWEN_BASE_URL, qwen_crit_payload))
-        gcrit_task = asyncio.create_task(call_ollama(GPTOSS_BASE_URL, gptoss_crit_payload))
-        qcrit_res, gcrit_res = await asyncio.gather(qcrit_task, gcrit_task)
+        gcrit_task = asyncio.create_task(call_ollama(GLM_OLLAMA_BASE_URL, glm_crit_payload))
+        dcrit_task = asyncio.create_task(call_ollama(DEEPSEEK_CODER_OLLAMA_BASE_URL, deepseek_crit_payload))
+        qcrit_res, gcrit_res, dcrit_res = await asyncio.gather(qcrit_task, gcrit_task, dcrit_task)
         qcrit_text = qcrit_res.get("response", "")
         gcrit_text = gcrit_res.get("response", "")
+        dcrit_text = dcrit_res.get("response", "")
         exec_messages = exec_messages + [
             {"role": "system", "content": "Cross-critique from Qwen:\n" + qcrit_text},
-            {"role": "system", "content": "Cross-critique from GPT-OSS:\n" + gcrit_text},
+            {"role": "system", "content": "Cross-critique from GLM4-9B:\n" + gcrit_text},
+            {"role": "system", "content": "Cross-critique from DeepSeek Coder:\n" + dcrit_text},
         ]
 
     # 5) Final synthesis via CO (compose). Build CO frames, insert FINALITY + LIGHT QA + COMPOSE before RoE tail.
@@ -6848,18 +6914,43 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         "Return a single assistant message. Include Assets: with only absolute /uploads/artifacts/... URLs. "
         "If minor issues: add Warnings: lines; keep the answer helpful. Append Applied RoE: with 1–3 short items actually followed."
     )}
+    committee_summary_parts: List[str] = []
+    committee_summary_parts.append("You are the committee synthesizer. Merge the following model answers and critiques into a single best answer.\n")
+    committee_summary_parts.append("### Candidate Answers\n")
+    if (qwen_text or "").strip():
+        committee_summary_parts.append("#### Qwen\n" + str(qwen_text).strip() + "\n")
+    if (glm_text or "").strip():
+        committee_summary_parts.append("#### GLM4-9B\n" + str(glm_text).strip() + "\n")
+    if (deepseek_text or "").strip():
+        committee_summary_parts.append("#### DeepSeek Coder\n" + str(deepseek_text).strip() + "\n")
+    if (ENABLE_DEBATE and MAX_DEBATE_TURNS > 0) and ((qcrit_text or "").strip() or (gcrit_text or "").strip() or (dcrit_text or "").strip()):
+        committee_summary_parts.append("\n### Critiques\n")
+        if (qcrit_text or "").strip():
+            committee_summary_parts.append("#### Qwen's critique\n" + str(qcrit_text).strip() + "\n")
+        if (gcrit_text or "").strip():
+            committee_summary_parts.append("#### GLM4-9B's critique\n" + str(gcrit_text).strip() + "\n")
+        if (dcrit_text or "").strip():
+            committee_summary_parts.append("#### DeepSeek Coder's critique\n" + str(dcrit_text).strip() + "\n")
+    committee_summary_parts.append(
+        "\n### Task\n"
+        "Synthesize one final answer that is as correct, specific, and useful as possible. "
+        "Fix any mistakes that were identified, and prefer answers that are logically consistent and tool-correct. "
+        "Do not mention the existence of multiple models or the committee; just answer."
+    )
+    committee_summary = "\n".join(committee_summary_parts)
+    committee_frame = {"role": "system", "content": committee_summary}
     if frames_final:
         _head = frames_final[:-1]
         _tail = frames_final[-1:]
-        final_request = _head + [_finality, _light_qa, _compose] + _tail
+        final_request = _head + [_finality, _light_qa, _compose, committee_frame] + _tail
     else:
-        final_request = [_finality, _light_qa, _compose, {"role": "user", "content": _compose_instruction}]
+        final_request = [_finality, _light_qa, _compose, committee_frame, {"role": "user", "content": _compose_instruction}]
 
-    planner_id = QWEN_MODEL_ID if PLANNER_MODEL.lower() == "qwen" else GPTOSS_MODEL_ID
-    planner_base = QWEN_BASE_URL if PLANNER_MODEL.lower() == "qwen" else GPTOSS_BASE_URL
+    planner_id = QWEN_MODEL_ID if PLANNER_MODEL.lower() == "qwen" else GLM_MODEL_ID
+    planner_base = QWEN_BASE_URL if PLANNER_MODEL.lower() == "qwen" else GLM_OLLAMA_BASE_URL
     synth_payload = build_ollama_payload(final_request, planner_id, DEFAULT_NUM_CTX, (body.get("temperature") or DEFAULT_TEMPERATURE))
     synth_result = await call_ollama(planner_base, synth_payload)
-    final_text = synth_result.get("response", "") or qwen_text or gptoss_text
+    final_text = synth_result.get("response", "") or qwen_text or glm_text or deepseek_text
     # Append discovered asset URLs from tool results so users see concrete outputs inline
     asset_urls = assets_collect_urls(tool_results, _abs_url)
     # Fallback: if no URLs surfaced from tool results (e.g. async image jobs that finished out-of-band),
@@ -6922,7 +7013,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             "seed": master_seed,
             "request": {"messages": req_dict.get("messages", []), "tools_allowed": [t.get("function", {}).get("name") for t in (body.get("tools") or []) if isinstance(t, dict)]},
             "context": ({"pack_hash": pack_hash} if ("pack_hash" in locals() and pack_hash) else {}),
-            "routing": {"planner_model": planner_id, "executors": [QWEN_MODEL_ID, GPTOSS_MODEL_ID], "seed_router": seed_router},
+            "routing": {"planner_model": planner_id, "executors": [QWEN_MODEL_ID, GLM_MODEL_ID, DEEPSEEK_CODER_MODEL_ID], "seed_router": seed_router},
             "tool_calls": _tc,
             "response": {"text": (final_text or "")[:4000]},
             "metrics": usage_stream,
@@ -6938,7 +7029,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         async def _stream_with_stages(text: str):
             # Open the stream with assistant role
             now = int(time.time())
-            model_id = f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}"
+            model_id = COMMITTEE_MODEL_ID
             head = json.dumps({"id": "orc-1", "object": "chat.completion.chunk", "created": now, "model": model_id, "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]})
             yield f"data: {head}\n\n"
             # Progress events as content JSON lines to match example
@@ -7041,7 +7132,8 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     # Merge exact usages if available, else approximate
     usage = merge_usages([
         qwen_result.get("_usage"),
-        gptoss_result.get("_usage"),
+        glm_result.get("_usage"),
+        deepseek_result.get("_usage"),
         synth_result.get("_usage"),
     ])
     if usage["total_tokens"] == 0:
@@ -7059,8 +7151,8 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         merged_main = []
         if (qwen_text or '').strip():
             merged_main.append("### Qwen\n" + qwen_text.strip())
-        if (gptoss_text or '').strip():
-            merged_main.append("### GPT‑OSS\n" + gptoss_text.strip())
+        if (glm_text or '').strip():
+            merged_main.append("### GLM4-9B\n" + glm_text.strip())
         if merged_main:
             cleaned = "\n\n".join(merged_main)
     # Ensure asset URLs are appended even if we fell back to merged model answers
@@ -7235,16 +7327,19 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     # Provide an appendix with raw model answers to avoid any perception of truncation
     try:
         raw_q = (qwen_text or "").strip()
-        raw_g = (gptoss_text or "").strip()
+        raw_g = (glm_text or "").strip()
+        raw_d = (deepseek_text or "").strip()
         appendix_parts: List[str] = []
         def _shorten(s: str, max_len: int = 12000) -> str:
             return s if len(s) <= max_len else (s[:max_len] + "\n... [truncated]")
-        if raw_q or raw_g:
+        if raw_q or raw_g or raw_d:
             appendix_parts.append("\n\n### Appendix — Model Answers")
         if raw_q:
             appendix_parts.append("\n\n#### Qwen\n" + _shorten(raw_q))
         if raw_g:
-            appendix_parts.append("\n\n#### GPT‑OSS\n" + _shorten(raw_g))
+            appendix_parts.append("\n\n#### GLM4-9B\n" + _shorten(raw_g))
+        if raw_d:
+            appendix_parts.append("\n\n#### DeepSeek Coder\n" + _shorten(raw_d))
         if appendix_parts:
             display_content += "".join(appendix_parts)
     except Exception:
@@ -7292,8 +7387,10 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 pass
         if isinstance(qwen_text, str) and qwen_text.strip():
             step_texts.append(qwen_text)
-        if isinstance(gptoss_text, str) and gptoss_text.strip():
-            step_texts.append(gptoss_text)
+        if isinstance(glm_text, str) and glm_text.strip():
+            step_texts.append(glm_text)
+        if isinstance(deepseek_text, str) and deepseek_text.strip():
+            step_texts.append(deepseek_text)
         if isinstance(display_content, str) and display_content.strip():
             step_texts.append(display_content)
         step_envs = [normalize_to_envelope(t) for t in step_texts]
@@ -7325,7 +7422,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     response = compose_openai_response(
         display_content,
         usage_with_wall,
-        f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}",
+        COMMITTEE_MODEL_ID,
         master_seed,
         "orc-1",
         envelope_builder=_build_openai_envelope,
@@ -7336,7 +7433,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     if isinstance(final_env, dict) and final_env:
         try:
             final_env = _env_bump(final_env); _env_assert(final_env)
-            final_env = _env_stamp(final_env, tool=None, model=f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}")
+            final_env = _env_stamp(final_env, tool=None, model=COMMITTEE_MODEL_ID)
         except Exception:
             logging.debug("final_env bump/assert/stamp failed:\n%s", traceback.format_exc())
         # Optional ablation: extract grounded facts and export
@@ -7387,7 +7484,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         "seed": master_seed,
         "request": {"messages": req_dict.get("messages", []), "tools_allowed": [t.get("function", {}).get("name") for t in (body.get("tools") or []) if isinstance(t, dict)]},
         "context": ({"pack_hash": pack_hash} if pack_hash else {}),
-        "routing": {"planner_model": planner_id, "executors": [QWEN_MODEL_ID, GPTOSS_MODEL_ID], "seed_router": det_seed_router(trace_id, master_seed)},
+        "routing": {"planner_model": planner_id, "executors": [QWEN_MODEL_ID, GLM_MODEL_ID, DEEPSEEK_CODER_MODEL_ID], "seed_router": det_seed_router(trace_id, master_seed)},
         "tool_calls": _tc2,
         "response": {"text": (display_content or "")[:4000]},
         "metrics": usage,
@@ -8700,11 +8797,19 @@ async def orcjob_stream(job_id: str, interval_ms: Optional[int] = None):
 
 @app.get("/debug")
 async def debug():
-    # sanity checks to both backends
+    # sanity checks to all three backends
     try:
         qr = await call_ollama(QWEN_BASE_URL, {"model": QWEN_MODEL_ID, "prompt": "ping", "stream": False})
-        gr = await call_ollama(GPTOSS_BASE_URL, {"model": GPTOSS_MODEL_ID, "prompt": "ping", "stream": False})
-        return {"qwen_ok": "response" in qr and not qr.get("error"), "gptoss_ok": "response" in gr and not gr.get("error"), "qwen_detail": qr.get("error"), "gptoss_detail": gr.get("error")}
+        gr = await call_ollama(GLM_OLLAMA_BASE_URL, {"model": GLM_MODEL_ID, "prompt": "ping", "stream": False})
+        dr = await call_ollama(DEEPSEEK_CODER_OLLAMA_BASE_URL, {"model": DEEPSEEK_CODER_MODEL_ID, "prompt": "ping", "stream": False})
+        return {
+            "qwen_ok": "response" in qr and not qr.get("error"),
+            "glm_ok": "response" in gr and not gr.get("error"),
+            "deepseek_ok": "response" in dr and not dr.get("error"),
+            "qwen_detail": qr.get("error"),
+            "glm_detail": gr.get("error"),
+            "deepseek_detail": dr.get("error"),
+        }
     except Exception as ex:
         return JSONResponse(status_code=500, content={"error": str(ex)})
 
@@ -8714,9 +8819,10 @@ async def list_models():
     return {
         "object": "list",
         "data": [
-            {"id": f"committee:{QWEN_MODEL_ID}+{GPTOSS_MODEL_ID}", "object": "model"},
+            {"id": COMMITTEE_MODEL_ID, "object": "model"},
             {"id": QWEN_MODEL_ID, "object": "model"},
-            {"id": GPTOSS_MODEL_ID, "object": "model"},
+            {"id": GLM_MODEL_ID, "object": "model"},
+            {"id": DEEPSEEK_CODER_MODEL_ID, "object": "model"},
         ],
     }
 
@@ -8889,7 +8995,7 @@ async def completions_legacy(body: Dict[str, Any]):
         "choices": [{"index": 0, "finish_reason": "stop", "text": content_txt}],
         "usage": obj.get("usage") or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         "created": obj.get("created") or int(time.time()),
-        "system_fingerprint": obj.get("system_fingerprint") or _hl.sha256((str(QWEN_MODEL_ID) + "+" + str(GPTOSS_MODEL_ID)).encode("utf-8")).hexdigest()[:16],
+        "system_fingerprint": obj.get("system_fingerprint") or _hl.sha256((str(QWEN_MODEL_ID) + "+" + str(GLM_MODEL_ID) + "+" + str(DEEPSEEK_CODER_MODEL_ID)).encode("utf-8")).hexdigest()[:16],
     }
     return JSONResponse(content=out)
 

@@ -215,10 +215,10 @@ services:
       - QWEN_MODEL_ID=${QWEN_MODEL_ID:-qwen3:30b-a3b-instruct-2507-q4_K_M}
     command: ["sh","-lc","until curl -sf http://127.0.0.1:11435/api/tags >/dev/null; do sleep 2; done; echo Pulling $QWEN_MODEL_ID; curl -sf -X POST http://127.0.0.1:11435/api/pull -H 'Content-Type: application/json' -d '{\"name\":\"${QWEN_MODEL_ID}\"}'; echo Pulled $QWEN_MODEL_ID"]
 
-  ollama_gptoss:
+  glm_ollama:
     network_mode: host
     image: ollama/ollama:latest
-    container_name: ollama_gptoss
+    container_name: glm_ollama
     restart: unless-stopped
     runtime: nvidia
     devices:
@@ -229,21 +229,51 @@ services:
     environment:
       - OLLAMA_HOST=0.0.0.0:11434
       - OLLAMA_KEEP_ALIVE=24h
-      - NVIDIA_VISIBLE_DEVICES=${OLLAMA_GPTOSS_GPU:-all}
+      - NVIDIA_VISIBLE_DEVICES=${OLLAMA_GLM_GPU:-all}
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     volumes:
-      - ollama_gptoss_data:/root/.ollama
-    
+      - ollama_glm_data:/root/.ollama
 
-  init_gptoss:
+
+  deepseek_ollama:
+    network_mode: host
+    image: ollama/ollama:latest
+    container_name: deepseek_ollama
+    restart: unless-stopped
+    runtime: nvidia
+    devices:
+      - "nvidia.com/gpu=all"
+    depends_on:
+      - nvidia_init
+    # host networking: no ports mapping needed
+    environment:
+      - OLLAMA_HOST=0.0.0.0:11436
+      - OLLAMA_KEEP_ALIVE=24h
+      - NVIDIA_VISIBLE_DEVICES=${OLLAMA_DEEPSEEK_GPU:-all}
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    volumes:
+      - ollama_deepseek_data:/root/.ollama
+
+  init_glm:
     image: curlimages/curl:8.7.1
-    container_name: init_gptoss
+    container_name: init_glm
     network_mode: host
     depends_on:
-      - ollama_gptoss
+      - glm_ollama
     environment:
-      - GPTOSS_MODEL_ID=${GPTOSS_MODEL_ID}
-    command: ["sh","-lc","until curl -s http://127.0.0.1:11434/api/tags >/dev/null; do sleep 2; done; curl -s -X POST http://127.0.0.1:11434/api/pull -H 'Content-Type: application/json' -d '{\"name\":\"${GPTOSS_MODEL_ID}\"}'"]
+      - GLM_MODEL_ID=${GLM_MODEL_ID:-glm4:9b}
+    command: ["sh","-lc","until curl -s http://127.0.0.1:11434/api/tags >/dev/null; do sleep 2; done; echo Pulling $GLM_MODEL_ID; curl -s -X POST http://127.0.0.1:11434/api/pull -H 'Content-Type: application/json' -d '{\"name\":\"${GLM_MODEL_ID}\"}'; echo Pulled $GLM_MODEL_ID"]
+
+
+  init_deepseek:
+    image: curlimages/curl:8.7.1
+    container_name: init_deepseek
+    network_mode: host
+    depends_on:
+      - deepseek_ollama
+    environment:
+      - DEEPSEEK_CODER_MODEL_ID=${DEEPSEEK_CODER_MODEL_ID:-deepseek-coder-v2:lite}
+    command: ["sh","-lc","until curl -s http://127.0.0.1:11436/api/tags >/dev/null; do sleep 2; done; echo Pulling $DEEPSEEK_CODER_MODEL_ID; curl -s -X POST http://127.0.0.1:11436/api/pull -H 'Content-Type: application/json' -d '{\"name\":\"${DEEPSEEK_CODER_MODEL_ID}\"}'; echo Pulled $DEEPSEEK_CODER_MODEL_ID"]
 
   init_qwen_vl:
     image: curlimages/curl:8.7.1
@@ -276,8 +306,10 @@ services:
       - FILM2_DATA=/srv/film2
       - QWEN_BASE_URL=http://127.0.0.1:11435
       - QWEN_MODEL_ID=${QWEN_MODEL_ID:-qwen3:30b-a3b-instruct-2507-q4_K_M}
-      - GPTOSS_BASE_URL=http://127.0.0.1:11434
-      - GPTOSS_MODEL_ID=${GPTOSS_MODEL_ID}
+      - GLM_OLLAMA_BASE_URL=${GLM_OLLAMA_BASE_URL:-http://127.0.0.1:11434}
+      - GLM_MODEL_ID=${GLM_MODEL_ID:-glm4:9b}
+      - DEEPSEEK_CODER_OLLAMA_BASE_URL=${DEEPSEEK_CODER_OLLAMA_BASE_URL:-http://127.0.0.1:11436}
+      - DEEPSEEK_CODER_MODEL_ID=${DEEPSEEK_CODER_MODEL_ID:-deepseek-coder-v2:lite}
       # Enable ICW + Committee + Tools by default
       - ICW_MODE=${ICW_MODE:-committee}
       - ICW_DISABLE=0
@@ -727,7 +759,7 @@ services:
 
 volumes:
   ollama_qwen_data: {}
-  ollama_gptoss_data: {}
+  ollama_glm_data: {}
   pgvector_data: {}
   comfyui_models: {}
   comfyui_custom_nodes: {}
