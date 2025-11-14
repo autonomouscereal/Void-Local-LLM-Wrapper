@@ -140,7 +140,7 @@ from .locks.runtime import (
     quality_thresholds as _lock_quality_thresholds,
     update_bundle_from_hero_frame as _lock_update_from_hero,
 )
-from services.image.analysis.locks import (
+from .services.image.analysis.locks import (
     compute_face_lock_score as _compute_face_lock_score,
     compute_style_similarity as _compute_style_similarity,
     compute_pose_similarity as _compute_pose_similarity,
