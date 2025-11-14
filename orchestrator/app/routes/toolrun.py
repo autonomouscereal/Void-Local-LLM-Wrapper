@@ -625,14 +625,14 @@ async def tool_run(req: Request):
 			# If history reports a completed/executed state but no outputs, fail deterministically
 			status_obj = entry.get("status") or {}
 			state = str((status_obj.get("status") or "")).lower()
-				if state in ("completed", "success", "executed"):
-					return ToolEnvelope.failure(
-						"no_outputs",
-						"workflow completed without outputs",
-						status=422,
-						request_id=rid,
-						details={"prompt_id": prompt_id, "status": status_obj},
-					)
+			if state in ("completed", "success", "executed"):
+				return ToolEnvelope.failure(
+					"no_outputs",
+					"workflow completed without outputs",
+					status=422,
+					request_id=rid,
+					details={"prompt_id": prompt_id, "status": status_obj},
+				)
 			continue
 		for _, out in outs.items():
 			for im in (out.get("images") or []):
