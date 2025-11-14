@@ -766,9 +766,19 @@ GPTOSS_MODEL_ID = os.getenv("GPTOSS_MODEL_ID", "chatgpt-oss:latest")
 DEFAULT_NUM_CTX = int(os.getenv("DEFAULT_NUM_CTX", "8192"))
 
 # Committee participant → model routing (always use both models for committee work)
+PARTICIPANT_MODELS: Dict[str, Dict[str, str]] = {
+    "qwen": {
+        "base": QWEN_BASE_URL,
+        "model": QWEN_MODEL_ID,
+    },
+    "gptoss": {
+        "base": GPTOSS_BASE_URL,
+        "model": GPTOSS_MODEL_ID,
+    },
+}
 COMMITTEE_PARTICIPANTS = [
-    {"id": "qwen", "base": QWEN_BASE_URL, "model": QWEN_MODEL_ID},
-    {"id": "gptoss", "base": GPTOSS_BASE_URL, "model": GPTOSS_MODEL_ID},
+    {"id": name, "base": cfg["base"], "model": cfg["model"]}
+    for name, cfg in PARTICIPANT_MODELS.items()
 ]
 DEFAULT_TEMPERATURE = float(os.getenv("DEFAULT_TEMPERATURE", "0.3"))
 # Gates removed: defaults are always ON; API-key checks still apply where required
@@ -2591,6 +2601,7 @@ async def postrun_committee_decide(
         base = (p.get("base") or "").rstrip("/") or QWEN_BASE_URL
         model = p.get("model") or QWEN_MODEL_ID
         payload = build_ollama_payload(msgs, model, DEFAULT_NUM_CTX, 0.0)
+        _log("committee.backend.call", trace_id=trace_id, member=member, base=base, model=model)
         _log("committee.postrun.call", trace_id=trace_id, base=base, model=model, member=member)
         try:
             res = await call_ollama(base, payload)
@@ -5814,6 +5825,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         model = p.get("model") or QWEN_MODEL_ID
         payload = build_ollama_payload(committee_msgs, model, DEFAULT_NUM_CTX, DEFAULT_TEMPERATURE)
         try:
+            _log("committee.backend.call", trace_id=trace_id, member=member, base=base, model=model)
             _log("committee.preplan.call", trace_id=trace_id, member=member, base=base, model=model)
             res = await call_ollama(base, payload)
             text = (res.get("response") or "").strip() if isinstance(res, dict) else ""
@@ -5857,6 +5869,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     _log("planner.call", trace_id=trace_id)
     plan_text, tool_calls = await planner_produce_plan(messages, body.get("tools"), body.get("temperature") or DEFAULT_TEMPERATURE, trace_id=trace_id, mode=mode)
     _log("planner.done", trace_id=trace_id, tool_count=len(tool_calls or []))
+    _log("flow.after_plan", trace_id=trace_id, tool_count=len(tool_calls or []))
     # Normalize planner tool calls into orchestrator internal schema {name, arguments}
     def _normalize_tool_calls(calls: Any) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
@@ -6186,6 +6199,12 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             validated_count=len(tool_calls or []),
             failure_count=len(validation_failures or []),
         )
+        _log(
+            "flow.after_validate",
+            trace_id=trace_id,
+            tool_count=len(tool_calls or []),
+            failures_count=len(validation_failures or []),
+        )
     else:
         _log("validate.skip", trace_id=trace_id, reason="no_tool_calls")
 
@@ -6336,6 +6355,8 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 if extra_results:
                     tool_results.extend(extra_results)
 
+    _log("flow.after_execute", trace_id=trace_id, tool_results_count=len(tool_results or []))
+
     for _tr in tool_results or []:
         _res = (_tr or {}).get("result") or {}
         if isinstance(_res, dict):
@@ -6367,6 +6388,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         committee_rationale = str(committee_outcome.get("rationale") or "")
         patch_plan = committee_outcome.get("patch_plan") or []
         _log("committee.decision", trace_id=trace_id, action=committee_action, rationale=committee_rationale)
+        _log("flow.after_committee", trace_id=trace_id, action=committee_action)
         checkpoints_append_event(STATE_DIR, trace_id, "committee.review.final", {"summary": qa_metrics})
         checkpoints_append_event(STATE_DIR, trace_id, "committee.decision.final", {"action": committee_action})
         # Optional one-pass revision
