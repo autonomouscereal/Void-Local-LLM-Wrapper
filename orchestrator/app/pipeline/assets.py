@@ -145,6 +145,8 @@ def compute_domain_qa(tool_results: List[Dict[str, Any]]) -> Dict[str, Any]:
 	image_region_texture_vals: List[float] = []
 	image_region_color_vals: List[float] = []
 	image_scene_vals: List[float] = []
+	image_text_readable_vals: List[float] = []
+	image_background_quality_vals: List[float] = []
 	# Optional per-entity lock metrics (if tools emit them)
 	image_entity_clip_vals: List[float] = []
 	image_entity_texture_vals: List[float] = []
@@ -285,6 +287,14 @@ def compute_domain_qa(tool_results: List[Dict[str, Any]]) -> Dict[str, Any]:
 			for val in scene_score:
 				if isinstance(val, (int, float)):
 					image_scene_vals.append(float(val))
+			text_readable_vals = _collect_key_values(root_candidates, ["text_readable_lock"])
+			for val in text_readable_vals:
+				if isinstance(val, (int, float)):
+					image_text_readable_vals.append(float(val))
+			background_quality_vals = _collect_key_values(root_candidates, ["background_quality"])
+			for val in background_quality_vals:
+				if isinstance(val, (int, float)):
+					image_background_quality_vals.append(float(val))
 			# Optional entity-level QA: result["qa"]["images"]["entities"]
 			entity_blocks = _collect_key_values(root_candidates, ["entities"])
 			for ent_block in entity_blocks:
@@ -613,6 +623,8 @@ def compute_domain_qa(tool_results: List[Dict[str, Any]]) -> Dict[str, Any]:
 			"region_texture_mean": region_texture_avg,
 			"region_color_mean": region_color_avg,
 			"scene_lock": scene_avg,
+			"text_readable_lock": (sum(image_text_readable_vals) / len(image_text_readable_vals)) if image_text_readable_vals else None,
+			"background_quality": (sum(image_background_quality_vals) / len(image_background_quality_vals)) if image_background_quality_vals else None,
 			# Optional aggregated per-entity lock scores
 			"entity_clip_lock_mean": entity_clip_avg,
 			"entity_texture_lock_mean": entity_texture_avg,

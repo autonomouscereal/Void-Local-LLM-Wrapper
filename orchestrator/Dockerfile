@@ -16,6 +16,10 @@ RUN apt-get update && \
         libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
+# Default path for LAION aesthetic head weights (can be overridden via env)
+ENV AESTHETIC_HEAD_PATH=/opt/models/aesthetic/laion_v2_linear_L14.pt
+RUN mkdir -p /opt/models/aesthetic
+
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 

@@ -82,6 +82,35 @@ MANDATORY_DIRS = [
 # Do not require 'yue' as mandatory; removed from bootstrap scope
 
 
+def ensure_aesthetic_head() -> None:
+    """
+    Ensure the LAION aesthetic head weights are present under MODELS_DIR/aesthetic.
+
+    This uses AESTHETIC_HEAD_URL if provided; otherwise it is a no-op. The orchestrator
+    will look for the file at AESTHETIC_HEAD_PATH (defaulting to /opt/models/aesthetic/...),
+    which should map into this directory via docker-compose volumes.
+    """
+    url = os.environ.get("AESTHETIC_HEAD_URL", "").strip()
+    if not url:
+        return
+    import urllib.request  # noqa: S310
+
+    target_dir = os.path.join(MODELS_DIR, "aesthetic")
+    os.makedirs(target_dir, exist_ok=True)
+    target_path = os.path.join(target_dir, "laion_v2_linear_L14.pt")
+    if os.path.exists(target_path) and os.path.getsize(target_path) > 0:
+        log("exists", "aesthetic_head", "->", target_path)
+        return
+    log("START-AESTHETIC", url, "->", target_path)
+    try:
+        with urllib.request.urlopen(url) as resp:  # nosec: B310 – trusted URL configured by user
+            with open(target_path, "wb") as f:
+                f.write(resp.read())
+        log("DONE-AESTHETIC", url, "->", target_path)
+    except Exception as ex:
+        log("ERROR-AESTHETIC", url, "->", target_path, ":", ex)
+
+
 def log(*a: object) -> None:
     print("[bootstrap]", *a, flush=True)
 
@@ -203,6 +232,8 @@ def main() -> None:
             snapshot(rid, key, allow)
         for url, key in GIT_REPOS:
             git_clone(url, key)
+        # Optional: aesthetic head weights for orchestrator image scoring
+        ensure_aesthetic_head()
     manifest = {
         "hf": {rid: key for rid, key, _ in HF_MODELS},
         "git": {url: key for url, key in GIT_REPOS},

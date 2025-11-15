@@ -61,7 +61,8 @@ async def compute_face_lock_score(image_path: str, ref_embedding: List[float]) -
     info = analyze_image(image_path)
     if not isinstance(info, dict):
         return None
-    emb = (info.get("emb") or {}).get("clip")
+    sem = info.get("semantics") or {}
+    emb = sem.get("clip_emb")
     if not isinstance(emb, list):
         return None
     img_vec: List[float] = []
@@ -86,7 +87,8 @@ async def compute_style_similarity(image_path: str, style_ref: Dict[str, Any]) -
     info = analyze_image(image_path)
     if not isinstance(info, dict):
         return None
-    emb = (info.get("emb") or {}).get("clip")
+    sem = info.get("semantics") or {}
+    emb = sem.get("clip_emb")
     if not isinstance(emb, list):
         return None
     img_vec: List[float] = []
@@ -111,7 +113,8 @@ async def compute_pose_similarity(image_path: str, pose_ref: Dict[str, Any]) -> 
     info = analyze_image(image_path)
     if not isinstance(info, dict):
         return None
-    emb = (info.get("emb") or {}).get("clip")
+    sem = info.get("semantics") or {}
+    emb = sem.get("clip_emb")
     if not isinstance(emb, list):
         return None
     img_vec: List[float] = []
@@ -141,7 +144,8 @@ async def compute_region_scores(image_path: str, region_data: Dict[str, Any]) ->
             "color_score": None,
             "clip_lock": None,
         }
-    emb = (info.get("emb") or {}).get("clip")
+    sem = info.get("semantics") or {}
+    emb = sem.get("clip_emb")
     img_vec: Optional[List[float]] = None
     if isinstance(emb, list):
         floats: List[float] = []

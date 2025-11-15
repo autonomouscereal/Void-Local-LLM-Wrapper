@@ -354,12 +354,13 @@ services:
       - VLM_API_URL=http://127.0.0.1:8050
       - OCR_API_URL=http://127.0.0.1:8070
       - TEACHER_API_URL=http://127.0.0.1:8097
+      - AESTHETIC_HEAD_PATH=/opt/models/aesthetic/laion_v2_linear_L14.pt
     # Run the canonical orchestrator application
     command: ["uvicorn","app.main:app","--host","0.0.0.0","--port","8000","--log-level","info","--access-log","--use-colors"]
     volumes:
       - ./:/workspace
       - uploads_data:/workspace/uploads
-      - film2_models:/opt/models:ro
+      - film2_models:/opt/models
       - film2_data:/srv/film2
       - ./assets/comfyui/input:/comfyui/input
 

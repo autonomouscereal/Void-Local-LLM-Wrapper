@@ -8,6 +8,7 @@ from urllib.parse import quote, urlsplit, urlparse
 import base64 as _b64
 from app.state.checkpoints import append_event as checkpoints_append_event
 from app.trace_utils import emit_trace as _emit_trace
+from app.analysis.media import analyze_image as _qa_analyze_image, analyze_image_regions as _qa_analyze_image_regions  # type: ignore
 import httpx
 
 
@@ -709,6 +710,65 @@ async def tool_run(req: Request):
 				)
 			if arts:
 				result["artifacts"] = arts
+		# Global + per-region QA for the first image (full-fat analyzer)
+		if saved_paths:
+			if _qa_analyze_image is not None and _qa_analyze_image_regions is not None:
+				first_image_path = saved_paths[0]
+				try:
+					prompt_str = str(args.get("prompt") or "")
+					global_info = _qa_analyze_image(first_image_path, prompt_str)
+					region_info = _qa_analyze_image_regions(first_image_path, prompt_str, global_info)
+				except Exception:
+					global_info = {}
+					region_info = {}
+				# Attach global scores/semantics into result["qa"]["images"]
+				img_qa = result.setdefault("qa", {}).setdefault("images", {})
+				if isinstance(img_qa, dict) and isinstance(global_info, dict):
+					score_block = global_info.get("score") or {}
+					sem_block = global_info.get("semantics") or {}
+					if isinstance(score_block, dict):
+						img_qa["overall"] = float(score_block.get("overall") or 0.0)
+						img_qa["semantic"] = float(score_block.get("semantic") or 0.0)
+						img_qa["technical"] = float(score_block.get("technical") or 0.0)
+						img_qa["aesthetic"] = float(score_block.get("aesthetic") or 0.0)
+					if isinstance(sem_block, dict):
+						cs = sem_block.get("clip_score")
+						if isinstance(cs, (int, float)):
+							img_qa["clip_score"] = float(cs)
+				# Attach region aggregates into QA so compute_domain_qa can see them
+				if isinstance(region_info, dict):
+					agg = region_info.get("aggregates") or {}
+					if isinstance(agg, dict) and isinstance(img_qa, dict):
+						fl = agg.get("face_lock")
+						if isinstance(fl, (int, float)):
+							img_qa["face_lock"] = float(fl)
+						il = agg.get("id_lock")
+						if isinstance(il, (int, float)):
+							img_qa["id_lock"] = float(il)
+						hr = agg.get("hands_ok_ratio")
+						if isinstance(hr, (int, float)):
+							img_qa["hands_ok_ratio"] = float(hr)
+						tr = agg.get("text_readable_lock")
+						if isinstance(tr, (int, float)):
+							img_qa["text_readable_lock"] = float(tr)
+						bq = agg.get("background_quality")
+						if isinstance(bq, (int, float)):
+							img_qa["background_quality"] = float(bq)
+						# Expose full regions_info to the committee for region-aware patch planning
+						img_qa["regions_info"] = region_info
+					# Emit a distillation trace row for global + region QA
+					trc = args.get("trace_id") or args.get("cid")
+					if isinstance(trc, str) and trc.strip():
+						_emit_trace(STATE_DIR_LOCAL, trc, "image.region.qa", {
+							"path": first_image_path,
+							"prompt": prompt_str,
+							"global": {
+								"score": global_info.get("score") if isinstance(global_info, dict) else {},
+								"semantics": global_info.get("semantics") if isinstance(global_info, dict) else {},
+							},
+							"aggregates": agg if isinstance(region_info, dict) else {},
+						})
+
 		# Populate basic per-entity QA metrics when a lock bundle is present.
 		lock_bundle = args.get("lock_bundle") if isinstance(args.get("lock_bundle"), dict) else None
 		if lock_bundle and saved_paths:

@@ -75,7 +75,7 @@ enforce_core_policy()
 ## httpx imported above as _hx
 import requests
 
-from .analysis.media import score_image_clip, analyze_audio, analyze_image  # type: ignore
+from .analysis.media import analyze_audio, analyze_image  # type: ignore
 from .ingest.core import ingest_file
 import re
 import asyncpg  # type: ignore
@@ -151,6 +151,7 @@ from .traces.writer import (
     log_error as _trace_log_error,
 )
 from .analysis.media import analyze_image as _analyze_image, analyze_audio as _analyze_audio
+from .analysis.media import analyze_image_regions as _analyze_image_regions
 from .review.referee import build_delta_plan as _build_delta_plan
 from .review.ledger_writer import append_ledger as _append_ledger
 from .comfy.dispatcher import load_workflow as _comfy_load_wf, patch_workflow as _comfy_patch_wf, submit as _comfy_submit
@@ -6058,10 +6059,12 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     cid = (res.get("meta") or {}).get("cid")
                     if aid and cid:
                         if kind.startswith("image") or base_tool.startswith("image"):
-                            # Prefer image score
-                            url = f"/uploads/artifacts/image/{cid}/{aid}"
+                            # Prefer full image score from the local artifact path
+                            img_path = os.path.join(UPLOAD_DIR, "artifacts", "image", cid, aid)
                             try:
-                                return float(score_image_clip(url) or 0.0)
+                                ai = _analyze_image(img_path, prompt=None)
+                                score_block = ai.get("score") or {}
+                                return float(score_block.get("overall") or 0.0)
                             except Exception:
                                 return 0.0
                         if kind.startswith("audio") or base_tool.startswith("music"):
@@ -6200,6 +6203,58 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
     if name == "video.temporal_clip_qa" and ALLOW_TOOL_EXECUTION:
         # Lightweight drift score placeholder (no heavy deps): report a high score by default
         return {"name": name, "result": {"drift_score": 0.95, "notes": "basic check"}}
+    if name == "image.qa" and ALLOW_TOOL_EXECUTION:
+        a = args if isinstance(args, dict) else {}
+        src = a.get("path") or a.get("src") or a.get("image_path") or ""
+        if not isinstance(src, str) or not src:
+            return {"name": name, "error": "missing_image_path"}
+        prompt = str(a.get("prompt") or "").strip()
+        # src is expected to be an absolute path under UPLOAD_DIR; callers are responsible for resolving URLs.
+        try:
+            global_info = _analyze_image(src, prompt)
+            region_info = _analyze_image_regions(src, prompt, global_info)
+        except Exception as ex:
+            return {"name": name, "error": f"image_qa_error:{ex}"}
+        # Attach a QA-shaped summary so compute_domain_qa can consume it if needed
+        qa_block: Dict[str, Any] = {}
+        if isinstance(global_info, dict):
+            sb = global_info.get("score") or {}
+            sem = global_info.get("semantics") or {}
+            if isinstance(sb, dict):
+                qa_block["overall"] = float(sb.get("overall") or 0.0)
+                qa_block["semantic"] = float(sb.get("semantic") or 0.0)
+                qa_block["technical"] = float(sb.get("technical") or 0.0)
+                qa_block["aesthetic"] = float(sb.get("aesthetic") or 0.0)
+            if isinstance(sem, dict):
+                cs = sem.get("clip_score")
+                if isinstance(cs, (int, float)):
+                    qa_block["clip_score"] = float(cs)
+        if isinstance(region_info, dict):
+            agg = region_info.get("aggregates") or {}
+            if isinstance(agg, dict):
+                fl = agg.get("face_lock")
+                if isinstance(fl, (int, float)):
+                    qa_block["face_lock"] = float(fl)
+                il = agg.get("id_lock")
+                if isinstance(il, (int, float)):
+                    qa_block["id_lock"] = float(il)
+                hr = agg.get("hands_ok_ratio")
+                if isinstance(hr, (int, float)):
+                    qa_block["hands_ok_ratio"] = float(hr)
+                tr = agg.get("text_readable_lock")
+                if isinstance(tr, (int, float)):
+                    qa_block["text_readable_lock"] = float(tr)
+                bq = agg.get("background_quality")
+                if isinstance(bq, (int, float)):
+                    qa_block["background_quality"] = float(bq)
+        return {
+            "name": name,
+            "result": {
+                "global": global_info,
+                "regions": region_info,
+                "qa": {"images": qa_block},
+            },
+        }
     if name == "music.motif_keeper" and ALLOW_TOOL_EXECUTION:
         # Record intent to preserve motifs; return a baseline recurrence score
         return {"name": name, "result": {"motif_recurrence": 0.9, "notes": "baseline motif keeper active"}}
@@ -7060,9 +7115,11 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     sub_path = _os.path.join(UPLOAD_DIR, "artifacts", "image", scid, srid) if (scid and srid) else None
                     if sub_path and _os.path.exists(sub_path):
                         tile = Image.open(sub_path).convert("RGB")
-                        # object-level CLIP score
+                        # object-level CLIP score via full analyzer
                         try:
-                            sc = float((analyze_image(sub_path, refined_prompt) or {}).get("clip_score") or 0.0)
+                            ai = _analyze_image(sub_path, prompt=refined_prompt)
+                            sem = ai.get("semantics") or {}
+                            sc = float(sem.get("clip_score") or 0.0)
                         except Exception:
                             sc = 1.0
                         best_tile = tile if (best_tile is None or sc >= 0.35) else best_tile
@@ -10977,7 +11034,16 @@ async def v1_review_score(body: Dict[str, Any]):
     scores: Dict[str, Any] = {}
     if kind == "image":
         ai = _analyze_image(path, prompt=prompt)
-        scores = {"image": {"clip": float(ai.get("clip_score") or 0.0)}}
+        sem = ai.get("semantics") or {}
+        score_block = ai.get("score") or {}
+        scores = {
+            "image": {
+                "overall": float(score_block.get("overall") or 0.0),
+                "semantic": float(score_block.get("semantic") or 0.0),
+                "technical": float(score_block.get("technical") or 0.0),
+                "clip": float(sem.get("clip_score") or 0.0),
+            }
+        }
     else:
         aa = _analyze_audio(path)
         scores = {"audio": {"lufs": aa.get("lufs"), "tempo_bpm": aa.get("tempo_bpm")}}
@@ -11003,7 +11069,14 @@ async def v1_review_loop(body: Dict[str, Any]):
         scores: Dict[str, Any] = {}
         if img and isinstance(img.get("path"), str):
             ai = _analyze_image(img.get("path"), prompt=prompt)
-            scores["image"] = {"clip": float(ai.get("clip_score") or 0.0)}
+            sem = ai.get("semantics") or {}
+            score_block = ai.get("score") or {}
+            scores["image"] = {
+                "overall": float(score_block.get("overall") or 0.0),
+                "semantic": float(score_block.get("semantic") or 0.0),
+                "technical": float(score_block.get("technical") or 0.0),
+                "clip": float(sem.get("clip_score") or 0.0),
+            }
         if aud and isinstance(aud.get("path"), str):
             aa = _analyze_audio(aud.get("path"))
             scores["audio"] = {"lufs": aa.get("lufs"), "tempo_bpm": aa.get("tempo_bpm")}
