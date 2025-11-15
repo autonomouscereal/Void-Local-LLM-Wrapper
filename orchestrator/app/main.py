@@ -139,6 +139,14 @@ from .locks.runtime import (
     QUALITY_PRESETS as LOCK_QUALITY_PRESETS,
     quality_thresholds as _lock_quality_thresholds,
     update_bundle_from_hero_frame as _lock_update_from_hero,
+    migrate_visual_bundle as _lock_migrate_visual,
+    migrate_music_bundle as _lock_migrate_music,
+    migrate_tts_bundle as _lock_migrate_tts,
+    migrate_sfx_bundle as _lock_migrate_sfx,
+    migrate_film2_bundle as _lock_migrate_film2,
+    visual_get_entities as _lock_visual_get_entities,
+    visual_freeze_entities as _lock_visual_freeze,
+    visual_refresh_all_except as _lock_visual_refresh_all_except,
 )
 from .services.image.analysis.locks import (
     compute_face_lock_score as _compute_face_lock_score,
@@ -150,10 +158,13 @@ from .services.image.analysis.locks import (
 from .film2.hero import choose_hero_frame
 from .image.graph_builder import build_full_graph as _build_full_graph
 from .tools_image.common import ensure_dir as _ensure_dir, sidecar as _sidecar, make_outpaths as _make_outpaths, now_ts as _now_ts
+from .tools_image.refine import build_image_refine_dispatch_args
 from .analysis.media import analyze_image as _analyze_image
 from .artifacts.manifest import add_manifest_row as _man_add, write_manifest_atomic as _man_write
 from .datasets.trace import append_sample as _trace_append
 from .review.referee import build_delta_plan as _committee
+from .qa.segments import build_segments_for_tool, ALLOWED_PATCH_TOOLS, filter_patch_plan, apply_patch_plan, enrich_patch_plan_for_image_segments
+from functools import partial
 from .context.index import add_artifact as _ctx_add
 
 from .pipeline.subject_resolver import resolve_subject_canon as _resolve_subject_canon  # type: ignore
@@ -167,14 +178,14 @@ ACTION_TOOL_NAMES = {
     # Front-door action tools only (planner-visible action surfaces)
     "image.dispatch",
     "music.compose",  # or "music.dispatch" if preferred as the single music surface
-    "film.run",       # Film-2 front door (planner-visible)
+    "film2.run",      # Film-2 front door (planner-visible)
     "tts.speak",
 }
 
 # Planner-visible tool whitelist: only expose front doors + analysis utilities
 PLANNER_VISIBLE_TOOLS = {
     # Action front doors
-    "image.dispatch", "music.compose", "film.run", "tts.speak",
+    "image.dispatch", "image.refine.segment", "music.compose", "film2.run", "tts.speak",
     # Lock management
     "locks.build_image_bundle", "locks.build_audio_bundle", "locks.get_bundle",
     "locks.build_region_locks", "locks.update_region_modes", "locks.update_audio_modes",
@@ -263,6 +274,61 @@ def _inject_execution_context(tool_calls: List[Dict[str, Any]], trace_id: str, e
             args_tc.setdefault("_effective_mode", effective_mode)
 
 
+async def _run_patch_call(
+    call: Dict[str, Any],
+    trace_id: str,
+    mode: str,
+    base_url: str,
+    executor_base_url: str,
+) -> Dict[str, Any]:
+    """
+    Execute a single patch tool call via the existing validator and executor path.
+    """
+    if not isinstance(call, dict):
+        raise ValueError("invalid patch tool call")
+    patch_calls: List[Dict[str, Any]] = [call]
+    _inject_execution_context(patch_calls, trace_id, mode)
+    vr = await validator_validate_and_repair(
+        patch_calls,
+        base_url=base_url,
+        trace_id=trace_id,
+        log_fn=_log,
+        state_dir=STATE_DIR,
+    )
+    patch_validated = vr.get("validated") or []
+    patch_failures = vr.get("pre_tool_failures") or []
+    patch_failure_results: List[Dict[str, Any]] = []
+    for failure in patch_failures or []:
+        env = failure.get("envelope") if isinstance(failure.get("envelope"), dict) else {}
+        args_snapshot = failure.get("arguments") if isinstance(failure.get("arguments"), dict) else {}
+        name_snapshot = str((failure.get("name") or "")).strip() or "tool"
+        error_snapshot = env.get("error") if isinstance(env, dict) else {}
+        patch_failure_results.append(
+            {
+                "name": name_snapshot,
+                "result": env,
+                "error": error_snapshot,
+                "args": args_snapshot,
+            }
+        )
+    exec_results: List[Dict[str, Any]] = []
+    exec_batch = patch_validated or patch_calls
+    if exec_batch:
+        _log("tool.run.start", trace_id=trace_id, executor="void", count=len(exec_batch or []), attempt=0)
+        for c in exec_batch:
+            tn = (c.get("name") or "tool")
+            args_call = c.get("arguments") if isinstance(c.get("arguments"), dict) else {}
+            _log("tool.run.before", trace_id=trace_id, tool=str(tn), args_keys=list((args_call or {}).keys()), attempt=0)
+        exec_results = await gateway_execute(exec_batch, trace_id, executor_base_url or "http://127.0.0.1:8081")
+    # Prefer executor results; if none, return first failure snapshot
+    if exec_results:
+        return exec_results[0]
+    if patch_failure_results:
+        return patch_failure_results[0]
+    # If nothing executed or failed, echo the call back
+    return {"name": call.get("name") or "tool", "result": {}, "error": {"code": "no_result", "message": "no patch result"}}
+
+
 async def segment_qa_and_committee(
     trace_id: str,
     user_text: str,
@@ -294,6 +360,77 @@ async def segment_qa_and_committee(
     cumulative_patch_results: List[Dict[str, Any]] = []
     committee_outcome: Dict[str, Any] = {"action": "go", "patch_plan": [], "rationale": ""}
     while attempt <= max(0, int(max_refine_passes)):
+        # Build per-segment structures and standalone QA scores for committee input
+        segments_summary: List[Dict[str, Any]] = []
+        segments_for_committee: List[Dict[str, Any]] = []
+        for idx, tr in enumerate(current_results):
+            if not isinstance(tr, dict):
+                continue
+            result_obj = tr.get("result")
+            if not isinstance(result_obj, dict):
+                continue
+            parent_cid = None
+            meta_part = result_obj.get("meta")
+            if isinstance(meta_part, dict) and isinstance(meta_part.get("cid"), str):
+                parent_cid = meta_part.get("cid")
+            segs = build_segments_for_tool(tool_name, parent_cid or trace_id, result_obj)
+            for seg in (segs or []):
+                if not isinstance(seg, dict):
+                    continue
+                # Compute standalone QA for this segment using existing domain QA helper
+                seg_result = seg.get("result") if isinstance(seg.get("result"), dict) else {}
+                single_tool_results: List[Dict[str, Any]] = []
+                if seg_result:
+                    single_tool_results.append({"name": seg.get("tool"), "result": seg_result})
+                if single_tool_results:
+                    seg_domain_qa = assets_compute_domain_qa(single_tool_results)
+                    domain_name = str(seg.get("domain") or "").strip().lower()
+                    scores: Dict[str, Any] = {}
+                    if domain_name == "image":
+                        scores = seg_domain_qa.get("images") or {}
+                    elif domain_name in ("music", "tts", "sfx", "audio"):
+                        scores = seg_domain_qa.get("audio") or {}
+                    elif domain_name in ("video", "film2"):
+                        scores = seg_domain_qa.get("videos") or {}
+                    qa_block = seg.setdefault("qa", {})
+                    if isinstance(qa_block, dict):
+                        qa_block["scores"] = scores
+                segments_for_committee.append(seg)
+        for seg in segments_for_committee:
+            qa_block = seg.get("qa") if isinstance(seg.get("qa"), dict) else {}
+            scores = qa_block.get("scores") if isinstance(qa_block.get("scores"), dict) else {}
+            segments_summary.append(
+                {
+                    "id": seg.get("id"),
+                    "domain": seg.get("domain"),
+                    "qa": scores,
+                    "locks": seg.get("locks") if isinstance(seg.get("locks"), dict) else None,
+                }
+            )
+            # Per-segment QA trace row for forensic analysis
+            try:
+                seg_meta = seg.get("meta") if isinstance(seg.get("meta"), dict) else {}
+                profile_val = seg_meta.get("profile") if isinstance(seg_meta.get("profile"), str) else None
+                locks_val = seg.get("locks") if isinstance(seg.get("locks"), dict) else None
+                parent_cid = seg.get("parent_cid")
+                _trace_append(
+                    "segments",
+                    {
+                        "trace_id": trace_id,
+                        "tool": tool_name,
+                        "segment_id": seg.get("id"),
+                        "domain": seg.get("domain"),
+                        "profile": profile_val,
+                        "attempt": attempt,
+                        "event": "qa",
+                        "parent_cid": parent_cid,
+                        "locks": locks_val,
+                        "qa_scores": scores,
+                    },
+                )
+            except Exception:
+                # Tracing must never break the QA/committee path
+                pass
         counts = {
             "images": int(assets_count_images(current_results)),
             "videos": int(assets_count_video(current_results)),
@@ -321,7 +458,12 @@ async def segment_qa_and_committee(
             violations["audio.stem_balance_lock"] = audio_domain.get("stem_balance_lock")
         if audio_domain.get("lyrics_lock") is not None and audio_domain.get("lyrics_lock") < thresholds["lyrics_min"]:
             violations["audio.lyrics_lock"] = audio_domain.get("lyrics_lock")
-        qa_metrics_pre = {"counts": counts, "domain": domain_qa, "threshold_violations": violations}
+        qa_metrics_pre = {
+            "counts": counts,
+            "domain": domain_qa,
+            "threshold_violations": violations,
+            "segments": segments_summary,
+        }
         _log("qa.metrics.segment", trace_id=trace_id, tool=tool_name, phase="pre", attempt=attempt, metrics=qa_metrics_pre)
         try:
             _trace_log_event(
@@ -358,57 +500,41 @@ async def segment_qa_and_committee(
         if action != "revise":
             break
         allowed_mode_set = set(_allowed_tools_for_mode(mode))
+        raw_patch_plan = committee_outcome.get("patch_plan") or []
+        # First, apply segment-aware filtering using the canonical helpers.
+        segment_filtered = filter_patch_plan(raw_patch_plan, segments_for_committee)
         filtered_patch_plan: List[Dict[str, Any]] = []
-        for step in committee_outcome.get("patch_plan") or []:
-            if not isinstance(step, dict):
-                continue
+        for step in segment_filtered:
             step_tool = (step.get("tool") or "").strip()
             if not step_tool:
                 continue
             if step_tool not in PLANNER_VISIBLE_TOOLS or step_tool not in allowed_mode_set:
                 continue
-            step_args = step.get("args") if isinstance(step.get("args"), dict) else {}
-            filtered_patch_plan.append({"tool": step_tool, "args": step_args})
+            filtered_patch_plan.append(step)
         committee_outcome["patch_plan"] = filtered_patch_plan
         if not filtered_patch_plan:
             break
-        patch_calls: List[Dict[str, Any]] = [{"name": item.get("tool"), "arguments": (item.get("args") or {})} for item in filtered_patch_plan]
-        _inject_execution_context(patch_calls, trace_id, mode)
-        vr = await validator_validate_and_repair(
-            patch_calls,
-            base_url=base_url,
-            trace_id=trace_id,
-            log_fn=_log,
-            state_dir=STATE_DIR,
+        # Enrich image.refine.segment steps with per-segment context before execution.
+        enriched_patch_plan = enrich_patch_plan_for_image_segments(
+            filtered_patch_plan,
+            segments_for_committee,
         )
-        patch_validated = vr.get("validated") or []
-        patch_failures = vr.get("pre_tool_failures") or []
-        patch_failure_results: List[Dict[str, Any]] = []
-        for failure in patch_failures or []:
-            env = failure.get("envelope") if isinstance(failure.get("envelope"), dict) else {}
-            args_snapshot = failure.get("arguments") if isinstance(failure.get("arguments"), dict) else {}
-            name_snapshot = str((failure.get("name") or "")).strip() or "tool"
-            error_snapshot = env.get("error") if isinstance(env, dict) else {}
-            patch_failure_results.append(
-                {
-                    "name": name_snapshot,
-                    "result": env,
-                    "error": error_snapshot,
-                    "args": args_snapshot,
-                }
-            )
-        exec_results: List[Dict[str, Any]] = []
-        # Advisory-only semantics: always execute the planner's patch plan once,
-        # using any argument adjustments from validator when available.
-        exec_batch = patch_validated or patch_calls
-        if exec_batch:
-            _log("tool.run.start", trace_id=trace_id, executor="void", count=len(exec_batch or []), attempt=attempt)
-            for call in exec_batch:
-                tn = (call.get("name") or "tool")
-                args_call = call.get("arguments") if isinstance(call.get("arguments"), dict) else {}
-                _log("tool.run.before", trace_id=trace_id, tool=str(tn), args_keys=list((args_call or {}).keys()), attempt=attempt)
-            exec_results = await gateway_execute(exec_batch, trace_id, executor_base_url or "http://127.0.0.1:8081")
-        patch_results = list(patch_failure_results) + list(exec_results or [])
+        # Execute enriched patch plan via central patch executor.
+        tool_runner = partial(
+            _run_patch_call,
+            trace_id=trace_id,
+            mode=mode,
+            base_url=base_url,
+            executor_base_url=executor_base_url,
+        )
+        updated_segments, patch_results = await apply_patch_plan(
+            enriched_patch_plan,
+            segments_for_committee,
+            tool_runner,
+            trace_id,
+            tool_name,
+        )
+        # Log patch execution results for telemetry/debugging.
         for pr in patch_results or []:
             tname = str((pr or {}).get("name") or "tool")
             result_obj = (pr or {}).get("result") if isinstance((pr or {}).get("result"), dict) else {}
@@ -458,7 +584,7 @@ async def segment_qa_and_committee(
                     }
                 })
         if filtered_patch_plan:
-            _log("committee.revision.segment", trace_id=trace_id, tool=tool_name, steps=len(patch_validated or []), failures=len(patch_failures or []), attempt=attempt)
+            _log("committee.revision.segment", trace_id=trace_id, tool=tool_name, steps=len(filtered_patch_plan), failures=0, attempt=attempt)
         if patch_results:
             cumulative_patch_results.extend(patch_results)
             current_results = (current_results or []) + patch_results
@@ -593,7 +719,362 @@ def _merge_lock_bundles(existing: Dict[str, Any], update: Dict[str, Any]) -> Dic
         merged_scene = dict(existing_scene or {})
         merged_scene.update(update_scene)
         base["scene"] = merged_scene
+    # Ensure any newer branches (visual/music/tts/sfx/film2) are present and schema_version bumped.
+    base = _lock_migrate_visual(base)
+    base = _lock_migrate_music(base)
+    base = _lock_migrate_tts(base)
+    base = _lock_migrate_sfx(base)
+    base = _lock_migrate_film2(base)
     return base
+
+
+def _summarize_visual_bundle_for_context(character_id: str, bundle: Dict[str, Any]) -> None:
+    """
+    Emit lightweight text/symbol summaries of visual locks into OmniContext.
+
+    This creates per-entity artifacts keyed by entity_id so natural-language
+    references like "that flower on the left" can be resolved to entities.
+    """
+    if not isinstance(character_id, str) or not character_id:
+        return
+    vis = bundle.get("visual")
+    if not isinstance(vis, dict):
+        return
+    entities = vis.get("entities")
+    if not isinstance(entities, list):
+        return
+    for ent in entities:
+        if not isinstance(ent, dict):
+            continue
+        ent_id = ent.get("entity_id")
+        if not isinstance(ent_id, str) or not ent_id:
+            continue
+        ent_type = ent.get("entity_type") or "object"
+        role = ent.get("role") or ""
+        region = ent.get("region") if isinstance(ent.get("region"), dict) else {}
+        bbox = region.get("bbox")
+        tags: List[str] = ["entity", f"entity_type:{ent_type}"]
+        if isinstance(role, str) and role:
+            tags.append(f"role:{role}")
+        text_desc = f"{ent_type} {role} (entity_id={ent_id}) for character {character_id}"
+        meta = {
+            "text": text_desc,
+            "entity_id": ent_id,
+            "entity_type": ent_type,
+            "role": role,
+            "bbox": bbox,
+        }
+        # Use entity_id as a synthetic path key; context index does not require an actual file.
+        _ctx_add(character_id, "image.entity", ent_id, None, None, tags, meta)
+
+
+def _summarize_music_bundle_for_context(character_id: str, bundle: Dict[str, Any]) -> None:
+    """
+    Emit lightweight summaries of music locks (voices/sections/motifs) into OmniContext.
+    """
+    if not isinstance(character_id, str) or not character_id:
+        return
+    mus = bundle.get("music")
+    if not isinstance(mus, dict):
+        return
+    # Voices
+    voices = mus.get("voices")
+    if isinstance(voices, list):
+        for v in voices:
+            if not isinstance(v, dict):
+                continue
+            vid = v.get("voice_id")
+            if not isinstance(vid, str) or not vid:
+                continue
+            role = v.get("role") or ""
+            tags: List[str] = ["music.voice"]
+            if isinstance(role, str) and role:
+                tags.append(f"role:{role}")
+            text_desc = f"music voice {vid} ({role}) for character {character_id}"
+            meta = {
+                "text": text_desc,
+                "voice_id": vid,
+                "role": role,
+                "style_tags": list(v.get("style_tags") or []),
+            }
+            _ctx_add(character_id, "audio.voice", vid, None, None, tags, meta)
+    # Sections
+    sections = mus.get("sections")
+    if isinstance(sections, list):
+        for sec in sections:
+            if not isinstance(sec, dict):
+                continue
+            sid = sec.get("section_id")
+            if not isinstance(sid, str) or not sid:
+                continue
+            stype = sec.get("type") or ""
+            tags = ["music.section"]
+            if isinstance(stype, str) and stype:
+                tags.append(f"type:{stype}")
+            text_desc = f"music section {sid} ({stype}) for character {character_id}"
+            meta = {
+                "text": text_desc,
+                "section_id": sid,
+                "type": stype,
+                "order_index": sec.get("order_index"),
+                "bar_start": sec.get("bar_start"),
+                "bar_end": sec.get("bar_end"),
+            }
+            _ctx_add(character_id, "audio.section", sid, None, None, tags, meta)
+    # Motifs
+    motifs = mus.get("motifs")
+    if isinstance(motifs, list):
+        for m in motifs:
+            if not isinstance(m, dict):
+                continue
+            mid = m.get("motif_id")
+            if not isinstance(mid, str) or not mid:
+                continue
+            role = m.get("role") or ""
+            tags = ["music.motif"]
+            if isinstance(role, str) and role:
+                tags.append(f"role:{role}")
+            text_desc = f"music motif {mid} ({role}) for character {character_id}"
+            meta = {
+                "text": text_desc,
+                "motif_id": mid,
+                "role": role,
+                "source_section_id": m.get("source_section_id"),
+            }
+            _ctx_add(character_id, "audio.motif", mid, None, None, tags, meta)
+
+
+def _summarize_tts_bundle_for_context(character_id: str, bundle: Dict[str, Any]) -> None:
+    """
+    Summarize TTS voices/styles/segments into OmniContext.
+    """
+    if not isinstance(character_id, str) or not character_id:
+        return
+    tts = bundle.get("tts")
+    if not isinstance(tts, dict):
+        return
+    # Voices
+    voices = tts.get("voices")
+    if isinstance(voices, list):
+        for v in voices:
+            if not isinstance(v, dict):
+                continue
+            vid = v.get("voice_id")
+            if not isinstance(vid, str) or not vid:
+                continue
+            role = v.get("role") or ""
+            tags = ["tts.voice"]
+            if isinstance(role, str) and role:
+                tags.append(f"role:{role}")
+            text_desc = f"tts voice {vid} ({role}) for character {character_id}"
+            meta = {
+                "text": text_desc,
+                "voice_id": vid,
+                "role": role,
+                "style_tags": list(v.get("style_tags") or []),
+            }
+            _ctx_add(character_id, "tts.voice", vid, None, None, tags, meta)
+    # Styles
+    styles = tts.get("styles")
+    if isinstance(styles, list):
+        for s in styles:
+            if not isinstance(s, dict):
+                continue
+            sid = s.get("style_id")
+            if not isinstance(sid, str) or not sid:
+                continue
+            name = s.get("name") or ""
+            tags = ["tts.style"]
+            text_desc = f"tts style {sid} ({name})"
+            meta = {
+                "text": text_desc,
+                "style_id": sid,
+                "name": name,
+                "tags": list(s.get("tags") or []),
+            }
+            _ctx_add(character_id, "tts.style", sid, None, None, tags, meta)
+    # Segments
+    segments = tts.get("segments")
+    if isinstance(segments, list):
+        for seg in segments:
+            if not isinstance(seg, dict):
+                continue
+            seg_id = seg.get("segment_id")
+            if not isinstance(seg_id, str) or not seg_id:
+                continue
+            text_ref = seg.get("text_ref") if isinstance(seg.get("text_ref"), dict) else {}
+            txt = text_ref.get("text") or ""
+            tags = ["tts.segment"]
+            text_desc = f"tts segment {seg_id} text={txt!r}"
+            meta = {
+                "text": text_desc,
+                "segment_id": seg_id,
+                "scene_id": seg.get("scene_id"),
+                "line_index": seg.get("line_index"),
+            }
+            _ctx_add(character_id, "tts.segment", seg_id, None, None, tags, meta)
+
+
+def _summarize_sfx_bundle_for_context(character_id: str, bundle: Dict[str, Any]) -> None:
+    """
+    Summarize SFX assets/layers/events/ambiences into OmniContext.
+    """
+    if not isinstance(character_id, str) or not character_id:
+        return
+    sfx = bundle.get("sfx")
+    if not isinstance(sfx, dict):
+        return
+    assets = sfx.get("assets")
+    if isinstance(assets, list):
+        for a in assets:
+            if not isinstance(a, dict):
+                continue
+            aid = a.get("asset_id")
+            if not isinstance(aid, str) or not aid:
+                continue
+            tags = ["sfx.asset"]
+            tags.extend(list(a.get("tags") or []))
+            text_desc = f"sfx asset {aid} for character {character_id}"
+            meta = {
+                "text": text_desc,
+                "asset_id": aid,
+                "ucs": a.get("ucs"),
+                "tags": a.get("tags"),
+            }
+            _ctx_add(character_id, "sfx.asset", aid, None, None, tags, meta)
+    layers = sfx.get("layers")
+    if isinstance(layers, list):
+        for layer in layers:
+            if not isinstance(layer, dict):
+                continue
+            lid = layer.get("layer_id")
+            if not isinstance(lid, str) or not lid:
+                continue
+            role = layer.get("role") or ""
+            tags = ["sfx.layer"]
+            if isinstance(role, str) and role:
+                tags.append(f"role:{role}")
+            text_desc = f"sfx layer {lid} ({role}) for character {character_id}"
+            meta = {
+                "text": text_desc,
+                "layer_id": lid,
+                "role": role,
+                "components": layer.get("components"),
+            }
+            _ctx_add(character_id, "sfx.layer", lid, None, None, tags, meta)
+    events = sfx.get("events")
+    if isinstance(events, list):
+        for ev in events:
+            if not isinstance(ev, dict):
+                continue
+            eid = ev.get("event_id")
+            if not isinstance(eid, str) or not eid:
+                continue
+            role = ev.get("role") or ""
+            tags = ["sfx.event"]
+            if isinstance(role, str) and role:
+                tags.append(f"role:{role}")
+            text_desc = f"sfx event {eid} ({role})"
+            meta = {
+                "text": text_desc,
+                "event_id": eid,
+                "scene_id": ev.get("scene_id"),
+                "shot_id": ev.get("shot_id"),
+            }
+            _ctx_add(character_id, "sfx.event", eid, None, None, tags, meta)
+    ambs = sfx.get("ambiences")
+    if isinstance(ambs, list):
+        for amb in ambs:
+            if not isinstance(amb, dict):
+                continue
+            amb_id = amb.get("ambience_id")
+            if not isinstance(amb_id, str) or not amb_id:
+                continue
+            tags = ["sfx.ambience"]
+            tags.extend(list(amb.get("tags") or []))
+            text_desc = f"sfx ambience {amb_id} for character {character_id}"
+            meta = {
+                "text": text_desc,
+                "ambience_id": amb_id,
+                "scene_id": amb.get("scene_id"),
+            }
+            _ctx_add(character_id, "sfx.ambience", amb_id, None, None, tags, meta)
+
+
+def _summarize_film2_bundle_for_context(character_id: str, bundle: Dict[str, Any]) -> None:
+    """
+    Summarize film scenes/shots/segments into OmniContext.
+    """
+    if not isinstance(character_id, str) or not character_id:
+        return
+    film2 = bundle.get("film2")
+    if not isinstance(film2, dict):
+        return
+    scenes = film2.get("scenes")
+    if isinstance(scenes, list):
+        for sc in scenes:
+            if not isinstance(sc, dict):
+                continue
+            sid = sc.get("scene_id")
+            if not isinstance(sid, str) or not sid:
+                continue
+            slug = ((sc.get("script_ref") or {}) or {}).get("slugline")
+            tags = ["film2.scene"]
+            text_desc = f"film2 scene {sid} slugline={slug!r}"
+            meta = {
+                "text": text_desc,
+                "scene_id": sid,
+                "sequence_id": sc.get("sequence_id"),
+                "tags": sc.get("tags"),
+            }
+            _ctx_add(character_id, "film2.scene", sid, None, None, tags, meta)
+    shots = film2.get("shots")
+    if isinstance(shots, list):
+        for sh in shots:
+            if not isinstance(sh, dict):
+                continue
+            shot_id = sh.get("shot_id")
+            if not isinstance(shot_id, str) or not shot_id:
+                continue
+            scene_id = sh.get("scene_id")
+            tags = ["film2.shot"]
+            text_desc = f"film2 shot {shot_id} in scene {scene_id}"
+            meta = {
+                "text": text_desc,
+                "shot_id": shot_id,
+                "scene_id": scene_id,
+                "dominant_characters": sh.get("dominant_characters"),
+            }
+            _ctx_add(character_id, "film2.shot", shot_id, None, None, tags, meta)
+    segments = film2.get("segments")
+    if isinstance(segments, list):
+        for seg in segments:
+            if not isinstance(seg, dict):
+                continue
+            seg_id = seg.get("segment_id")
+            if not isinstance(seg_id, str) or not seg_id:
+                continue
+            shot_id = seg.get("shot_id")
+            tags = ["film2.segment"]
+            text_desc = f"film2 segment {seg_id} (shot {shot_id})"
+            meta = {
+                "text": text_desc,
+                "segment_id": seg_id,
+                "shot_id": shot_id,
+                "scene_id": seg.get("scene_id"),
+            }
+            _ctx_add(character_id, "film2.segment", seg_id, None, None, tags, meta)
+
+
+def _summarize_all_locks_for_context(character_id: str, bundle: Dict[str, Any]) -> None:
+    """
+    Convenience helper: summarize all lock branches into context for a character.
+    """
+    _summarize_visual_bundle_for_context(character_id, bundle)
+    _summarize_music_bundle_for_context(character_id, bundle)
+    _summarize_tts_bundle_for_context(character_id, bundle)
+    _summarize_sfx_bundle_for_context(character_id, bundle)
+    _summarize_film2_bundle_for_context(character_id, bundle)
 
 
 def _cosine_similarity(vec_a: Iterable[float], vec_b: Iterable[float]) -> Optional[float]:
@@ -2231,7 +2712,7 @@ def build_compact_tool_catalog() -> str:
             "args": "Planner must emit all required args; snap sizes to /8.",
             "sequence_examples": [
                 {"intent": "generate image", "steps": ["image.dispatch", "image.qa"]},
-                {"intent": "generate video", "steps": ["film.run"]},
+                {"intent": "generate video", "steps": ["film2.run"]},
                 {"intent": "tts", "steps": ["tts.speak", "tts.eval"]},
                 {"intent": "music", "steps": ["music.compose"]},
                 {"intent": "sfx", "steps": ["audio.sfx.compose"]},
@@ -2439,7 +2920,7 @@ async def planner_produce_plan(messages: List[Dict[str, Any]], tools: Optional[L
         "\n"
         "Tool kinds:\n"
         "- analysis tools: non-side-effect tools such as json.parse, web.search, math.eval, memory.query.\n"
-        "- action tools: asset-creating tools such as image.dispatch, music.compose, film.run (if present), etc.\n"
+        "- action tools: asset-creating tools such as image.dispatch, music.compose, film2.run (if present), etc.\n"
         "\n"
         "Rules:\n"
         "- In mode=\"chat\" with tool_palette=\"analysis_only\":\n"
@@ -2455,7 +2936,7 @@ async def planner_produce_plan(messages: List[Dict[str, Any]], tools: Optional[L
         "- Image edits: do NOT use image.edit. Always use image.dispatch for both generation and editing.\n"
         "- When editing, include the input image via attachments (preferred) or set args.images to an array of objects containing absolute /uploads/... URLs.\n"
         "- For denoise/inpaint style edits, include a strength field (0.0–1.0) when applicable; keep the prompt aligned with the edit intent.\n"
-        "- You MAY produce multiple steps in one plan in the 'steps' array; preserve the intended order. Use analysis tools first (rag_search, research.run, math.eval) to gather context, then call exactly one front-door action tool (image.dispatch, music.compose, film.run, tts.speak) if the user requested an artifact.\n"
+        "- You MAY produce multiple steps in one plan in the 'steps' array; preserve the intended order. Use analysis tools first (rag_search, research.run, math.eval) to gather context, then call exactly one front-door action tool (image.dispatch, music.compose, film2.run, tts.speak) if the user requested an artifact.\n"
         "- In chat/analysis mode you MAY return steps with analysis tools only, or an empty 'steps' list if a direct textual answer suffices. Do NOT propose action tools in analysis mode."
     )
     committee_review = (
@@ -2826,7 +3307,13 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             return {"name": name, "error": "missing_image_url"}
         bundle = await _build_image_lock_bundle(character_id, image_url, options, locks_root_dir=LOCKS_ROOT_DIR)
         existing = await _lock_load(character_id) or {}
+        existing = _lock_migrate_visual(existing)
+        existing = _lock_migrate_music(existing)
+        existing = _lock_migrate_tts(existing)
+        existing = _lock_migrate_sfx(existing)
+        existing = _lock_migrate_film2(existing)
         merged = _merge_lock_bundles(existing, bundle)
+        _summarize_all_locks_for_context(character_id, merged)
         await _lock_save(character_id, merged)
         return {"name": name, "result": {"lock_bundle": merged}}
     if name == "locks.build_audio_bundle":
@@ -2839,7 +3326,13 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             return {"name": name, "error": "missing_audio_url"}
         bundle = await _build_audio_lock_bundle(character_id, audio_url, locks_root_dir=LOCKS_ROOT_DIR)
         existing = await _lock_load(character_id) or {}
+        existing = _lock_migrate_visual(existing)
+        existing = _lock_migrate_music(existing)
+        existing = _lock_migrate_tts(existing)
+        existing = _lock_migrate_sfx(existing)
+        existing = _lock_migrate_film2(existing)
         merged = _merge_lock_bundles(existing, bundle)
+        _summarize_all_locks_for_context(character_id, merged)
         await _lock_save(character_id, merged)
         return {"name": name, "result": {"lock_bundle": merged}}
     if name == "locks.build_region_locks":
@@ -2853,7 +3346,13 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             return {"name": name, "error": "missing_image_url"}
         bundle = await _build_region_lock_bundle(character_id, image_url, regions_arg, locks_root_dir=LOCKS_ROOT_DIR)
         existing = await _lock_load(character_id) or {}
+        existing = _lock_migrate_visual(existing)
+        existing = _lock_migrate_music(existing)
+        existing = _lock_migrate_tts(existing)
+        existing = _lock_migrate_sfx(existing)
+        existing = _lock_migrate_film2(existing)
         merged = _merge_lock_bundles(existing, bundle)
+        _summarize_all_locks_for_context(character_id, merged)
         await _lock_save(character_id, merged)
         return {"name": name, "result": {"lock_bundle": merged}}
     if name == "locks.update_region_modes":
@@ -2863,7 +3362,13 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         if not character_id:
             return {"name": name, "error": "missing_character_id"}
         existing = await _lock_load(character_id) or {}
+        existing = _lock_migrate_visual(existing)
+        existing = _lock_migrate_music(existing)
+        existing = _lock_migrate_tts(existing)
+        existing = _lock_migrate_sfx(existing)
+        existing = _lock_migrate_film2(existing)
         updated_bundle = _apply_region_mode_updates(existing, updates)
+        _summarize_all_locks_for_context(character_id, updated_bundle)
         await _lock_save(character_id, updated_bundle)
         return {"name": name, "result": {"lock_bundle": updated_bundle}}
     if name == "locks.update_audio_modes":
@@ -2873,7 +3378,13 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         if not character_id:
             return {"name": name, "error": "missing_character_id"}
         existing = await _lock_load(character_id) or {}
+        existing = _lock_migrate_visual(existing)
+        existing = _lock_migrate_music(existing)
+        existing = _lock_migrate_tts(existing)
+        existing = _lock_migrate_sfx(existing)
+        existing = _lock_migrate_film(existing)
         updated_bundle = _apply_audio_mode_updates(existing, update_payload)
+        _summarize_all_locks_for_context(character_id, updated_bundle)
         await _lock_save(character_id, updated_bundle)
         return {"name": name, "result": {"lock_bundle": updated_bundle}}
     if name == "locks.get_bundle":
@@ -2884,6 +3395,11 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         bundle = await _lock_load(character_id)
         if bundle is None:
             return {"name": name, "result": {"lock_bundle": None, "found": False}}
+        bundle = _lock_migrate_visual(bundle)
+        bundle = _lock_migrate_music(bundle)
+        bundle = _lock_migrate_tts(bundle)
+        bundle = _lock_migrate_sfx(bundle)
+        bundle = _lock_migrate_film2(bundle)
         return {"name": name, "result": {"lock_bundle": bundle, "found": True}}
     # Deterministic grouped dispatchers
     if name == "image.dispatch" and ALLOW_TOOL_EXECUTION:
@@ -2906,7 +3422,22 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             if char_key:
                 lock_bundle = await _lock_load(char_key) or {}
         if lock_bundle:
+            # Apply quality profile and normalize visual branch for this request
             lock_bundle = _lock_apply_profile(quality_profile, lock_bundle)
+            lock_bundle = _lock_migrate_visual(lock_bundle)
+            # If any entities are marked hard, freeze them and relax others.
+            ents = _lock_visual_get_entities(lock_bundle)
+            hard_ids = []
+            for ent in ents:
+                if not isinstance(ent, dict):
+                    continue
+                ent_id = ent.get("entity_id")
+                c = ent.get("constraints") if isinstance(ent.get("constraints"), dict) else {}
+                if isinstance(ent_id, str) and c.get("lock_mode") == "hard":
+                    hard_ids.append(ent_id)
+            if hard_ids:
+                _lock_visual_freeze(lock_bundle, hard_ids)
+                _lock_visual_refresh_all_except(lock_bundle, hard_ids)
         try:
             _log("[executor] step.args", tool=name, args_keys=sorted([str(k) for k in (list(a.keys()) if isinstance(a, dict) else [])]))
         except Exception:
@@ -2954,6 +3485,93 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         }
         res = await http_tool_run("image.dispatch", args)
         return {"name": name, "result": res.get("result") if isinstance(res, dict) and isinstance(res.get("result"), dict) else res}
+    if name == "image.refine.segment" and ALLOW_TOOL_EXECUTION:
+        a = args if isinstance(args, dict) else {}
+        segment_id_raw = a.get("segment_id")
+        segment_id = str(segment_id_raw or "").strip() if segment_id_raw is not None else ""
+        if not segment_id:
+            return {
+                "name": name,
+                "error": {
+                    "code": "missing_segment_id",
+                    "message": "image.refine.segment requires a non-empty segment_id",
+                    "status": 422,
+                },
+            }
+        prompt_val = a.get("prompt")
+        prompt = str(prompt_val or "").strip() if prompt_val is not None else ""
+        if not prompt:
+            return {
+                "name": name,
+                "error": {
+                    "code": "missing_prompt",
+                    "message": "image.refine.segment requires prompt to be provided for Step 2",
+                    "status": 422,
+                },
+            }
+        source_image_val = a.get("source_image")
+        source_image = str(source_image_val or "").strip() if source_image_val is not None else ""
+        if not source_image:
+            return {
+                "name": name,
+                "error": {
+                    "code": "no_source_image",
+                    "message": "image.refine.segment requires source_image for refinement in Step 2",
+                    "status": 422,
+                },
+            }
+        quality_profile = (a.get("quality_profile") or a.get("profile") or "standard")
+        preset_name = str(quality_profile or "standard").lower()
+        preset = LOCK_QUALITY_PRESETS.get(preset_name, LOCK_QUALITY_PRESETS["standard"])
+        if "steps" not in a or a.get("steps") is None:
+            a["steps"] = preset["steps"]
+        if "cfg" not in a or a.get("cfg") is None:
+            a["cfg"] = preset["cfg"]
+        bundle_arg = a.get("lock_bundle")
+        lock_bundle: Optional[Dict[str, Any]] = None
+        if isinstance(bundle_arg, dict):
+            lock_bundle = bundle_arg
+        elif isinstance(bundle_arg, str) and bundle_arg.strip():
+            lock_bundle = await _lock_load(bundle_arg.strip()) or {}
+        if lock_bundle:
+            lock_bundle = _lock_apply_profile(quality_profile, lock_bundle)
+            lock_bundle = _lock_migrate_visual(lock_bundle)
+        dispatch_args = build_image_refine_dispatch_args(a, lock_bundle, str(quality_profile or "standard"))
+        res = await http_tool_run("image.dispatch", dispatch_args)
+        if isinstance(res, dict) and isinstance(res.get("result"), dict):
+            env = res.get("result") or {}
+        else:
+            error_payload: Dict[str, Any] = {}
+            if isinstance(res, dict) and res.get("error") is not None:
+                if isinstance(res.get("error"), dict):
+                    error_payload = res.get("error")  # type: ignore[assignment]
+                else:
+                    error_payload = {
+                        "code": "image_dispatch_failed",
+                        "message": str(res.get("error")),
+                        "status": 422,
+                    }
+            else:
+                error_payload = {
+                    "code": "image_dispatch_failed",
+                    "message": "image.dispatch refine call failed",
+                    "status": 422,
+                }
+            return {"name": name, "error": error_payload}
+        if isinstance(env, dict):
+            meta_block = env.setdefault("meta", {})
+            if isinstance(meta_block, dict):
+                if isinstance(lock_bundle, dict):
+                    locks_meta = meta_block.get("locks") if isinstance(meta_block.get("locks"), dict) else {}
+                    if isinstance(locks_meta, dict):
+                        if "bundle" not in locks_meta:
+                            locks_meta["bundle"] = lock_bundle
+                        meta_block["locks"] = locks_meta
+                    else:
+                        meta_block["locks"] = {"bundle": lock_bundle}
+                meta_block.setdefault("quality_profile", quality_profile)
+                meta_block["refined_from_segment"] = segment_id
+        return {"name": name, "result": env}
     if name == "film2.run" and ALLOW_TOOL_EXECUTION:
         # Unified Film-2 shot runner. Executes internal video passes and writes distilled traces/artifacts.
         a = raw_args if isinstance(raw_args, dict) else {}
@@ -2969,6 +3587,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         result["meta"]["quality_profile"] = profile_name
         thresholds_lock = _lock_quality_thresholds(profile_name)
         locks_arg = a.get("locks") if isinstance(a.get("locks"), dict) else {}
+        if locks_arg:
+            result["meta"]["locks"] = locks_arg
         character_entries = locks_arg.get("characters") if isinstance(locks_arg.get("characters"), list) else []
         character_ids: List[str] = []
         for entry in character_entries:
@@ -2978,7 +3598,12 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         current_character_bundles: Dict[str, Dict[str, Any]] = {}
         for character_id in character_ids:
             bundle_existing = await _lock_load(character_id)
-            if bundle_existing is not None:
+            if isinstance(bundle_existing, dict):
+                bundle_existing = _lock_migrate_visual(bundle_existing)
+                bundle_existing = _lock_migrate_music(bundle_existing)
+                bundle_existing = _lock_migrate_tts(bundle_existing)
+                bundle_existing = _lock_migrate_sfx(bundle_existing)
+                bundle_existing = _lock_migrate_film2(bundle_existing)
                 current_character_bundles[character_id] = bundle_existing
         def _ev(e: Dict[str, Any]) -> None:
             if trace_id:
@@ -3357,6 +3982,16 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         manifest = {"items": []}
         try:
             a = args if isinstance(args, dict) else {}
+            # Optional: resolve lock bundle for SFX jobs
+            bundle_arg = a.get("lock_bundle")
+            lock_bundle: Optional[Dict[str, Any]] = None
+            if isinstance(bundle_arg, dict):
+                lock_bundle = bundle_arg
+            elif isinstance(bundle_arg, str) and bundle_arg.strip():
+                lock_bundle = await _lock_load(bundle_arg.strip()) or {}
+            if lock_bundle:
+                # Ensure branch migrations and profile application happen inside the tool if needed
+                a["lock_bundle"] = _lock_migrate_sfx(_lock_migrate_visual(_lock_migrate_music(_lock_migrate_tts(_lock_migrate_film2(lock_bundle)))))
             env = run_sfx_compose(a, manifest)
             # Persist if a wav payload present
             wav = env.get("wav_bytes") if isinstance(env, dict) else None
@@ -3573,6 +4208,9 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 if char_id:
                     lock_bundle = await _lock_load(char_id) or {}
             if lock_bundle:
+                lock_bundle = _lock_migrate_visual(lock_bundle)
+                lock_bundle = _lock_migrate_music(lock_bundle)
+                lock_bundle = _lock_migrate_tts(lock_bundle)
                 a["lock_bundle"] = lock_bundle
             env = run_music_compose(a, provider, manifest)
             wav = env.get("wav_bytes") if isinstance(env, dict) else None
@@ -3630,9 +4268,23 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                             locks_meta["stem_balance_score"] = score_stem
                             locks_meta["stem_detected_profile"] = detected_profile
                             locks_meta["stem_lock_mode"] = audio_section.get("stem_lock_mode")
+                    # Simple motif lock: reuse existing lock scores as a coarse proxy when available
+                    if "tempo_score" in locks_meta and "key_score" in locks_meta:
+                        ts = locks_meta.get("tempo_score")
+                        ks = locks_meta.get("key_score")
+                        if isinstance(ts, (int, float)) and isinstance(ks, (int, float)):
+                            locks_meta["motif_lock"] = min(float(ts), float(ks))
                     locks_meta.setdefault("lyrics_score", None)
                 sidecar_meta = {"tool": "music.compose", "prompt": a.get("prompt")}
                 if locks_meta:
+                    # Composite music lock score for this track
+                    components: List[float] = []
+                    for k in ("voice_score", "tempo_score", "key_score", "stem_balance_score", "motif_lock", "lyrics_score"):
+                        v = locks_meta.get(k)
+                        if isinstance(v, (int, float)):
+                            components.append(float(v))
+                    if components:
+                        locks_meta["lock_score_music"] = min(components)
                     sidecar_meta["locks"] = locks_meta
                 _sidecar(wav_path, sidecar_meta)
                 _ctx_add(cid, "audio", wav_path, _uri_from_upload_path(wav_path), None, [], {"prompt": a.get("prompt")})
@@ -3670,6 +4322,15 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         try:
             a = args if isinstance(args, dict) else {}
             profile_name = (a.get("quality_profile") or "standard")
+            # Optional: attach lock bundle for variation jobs (no additional metrics yet)
+            bundle_arg = a.get("lock_bundle")
+            lock_bundle: Optional[Dict[str, Any]] = None
+            if isinstance(bundle_arg, dict):
+                lock_bundle = bundle_arg
+            elif isinstance(bundle_arg, str) and bundle_arg.strip():
+                lock_bundle = await _lock_load(bundle_arg.strip()) or {}
+            if lock_bundle:
+                a["lock_bundle"] = lock_bundle
             env = run_music_variation(a, manifest)
             wav = env.get("wav_bytes") if isinstance(env, dict) else None
             if isinstance(wav, (bytes, bytearray)) and len(wav) > 0:
@@ -3693,6 +4354,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     meta_env = env.setdefault("meta", {})
                     if isinstance(meta_env, dict):
                         meta_env.setdefault("quality_profile", profile_name)
+                        if lock_bundle:
+                            meta_env.setdefault("locks", {"bundle": lock_bundle})
             return {"name": name, "result": env}
         except Exception as ex:
             return {"name": name, "error": str(ex)}
@@ -4394,161 +5057,6 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 return {"name": name, "result": js}
         except Exception as ex:
             return {"name": name, "error": str(ex)}
-    if name == "film.run":
-        # Orchestrate Film 2.0 via film2 service endpoints
-        # Normalize core args
-        title = (args.get("title") or "Untitled").strip()
-        duration_s = int(args.get("duration_s") or _parse_duration_seconds_dynamic(args.get("duration") or args.get("duration_text"), 10))
-        seed = int(args.get("seed") or _derive_seed("film", title, str(duration_s)))
-        _requested_res = args.get("res")
-        res = str(_requested_res or "1920x1080").lower()
-        _requested_refresh = args.get("refresh")
-        refresh = int(_requested_refresh or _parse_fps_dynamic(args.get("fps") or args.get("frame_rate") or "60fps", 60))
-        base_fps = int(args.get("base_fps") or 30)
-        # map common res synonyms
-        if res in ("4k", "uhd", "2160p"): res = "3840x2160"
-        if res in ("1080p", "fhd"): res = "1920x1080"
-        # post defaults
-        post = args.get("post") or {}
-        interp = (post.get("interpolate") or {}) if isinstance(post, dict) else {}
-        upscale = (post.get("upscale") or {}) if isinstance(post, dict) else {}
-        if not interp.get("factor"):
-            # compute factor from refresh/base_fps → prefer 2 or 4
-            fac = 2 if refresh >= base_fps * 2 else 1
-            if refresh >= base_fps * 4: fac = 4
-            interp = {**interp, "factor": fac}
-        # ensure upscale defaults include tile/overlap
-        if not upscale.get("scale"):
-            upscale = {**upscale, "scale": 2 if res == "3840x2160" else 1}
-        if upscale.get("scale", 1) > 1:
-            upscale.setdefault("tile", 512)
-            upscale.setdefault("overlap", 16)
-        # Aggregate style references and character images dynamically if present
-        style_refs = args.get("style_refs") or []
-        # If the planner passed generic images list, allow using them as style refs by default
-        if not style_refs and isinstance(args.get("images"), list):
-            try:
-                style_refs = [it.get("url") for it in args.get("images") if isinstance(it, dict) and it.get("url")]
-            except Exception:
-                style_refs = []
-        character_images = args.get("character_images") or []
-        # Additional quality/format preferences passthrough
-        quality = args.get("quality") or {}
-        codec = args.get("codec") or quality.get("codec")
-        container = args.get("container") or quality.get("container")
-        bitrate = args.get("bitrate") or quality.get("bitrate")
-        audio = args.get("audio") or {}
-        audio_sr = audio.get("sr") or quality.get("audio_sr")
-        lufs_target = audio.get("lufs_target") or quality.get("lufs_target")
-        requested_meta = {
-            "res": _requested_res,
-            "refresh": _requested_refresh,
-            "base_fps": base_fps,
-            "post": (args.get("post") or {}),
-            "style_refs": style_refs,
-            "character_images": character_images,
-            "duration_s": duration_s,
-            "codec": codec,
-            "container": container,
-            "bitrate": bitrate,
-            "audio_sr": audio_sr,
-            "lufs_target": lufs_target,
-        }
-        effective_meta = {
-            "res": res,
-            "refresh": refresh,
-            "post": {"interpolate": interp, "upscale": upscale},
-            "codec": codec,
-            "container": container,
-            "bitrate": bitrate,
-            "audio_sr": audio_sr,
-            "lufs_target": lufs_target,
-        }
-        # Plan → Final → QC → Export
-        project_id = f"prj_{seed}"
-        try:
-            async with httpx.AsyncClient() as client:
-                base_url = os.getenv("FILM2_API_URL","http://film2:8090")
-                outputs_payload = args.get("outputs") or {"fps": refresh, "resolution": res, "codec": codec, "container": container, "bitrate": bitrate, "audio": {"sr": audio_sr, "lufs_target": lufs_target}}
-                rules_payload = args.get("rules") or {}
-                plan_payload = {"project_id": project_id, "seed": seed, "title": title, "duration_s": duration_s, "outputs": outputs_payload}
-                # Pass through reference locks if provided: {"characters":[{"id","image_ref_id","voice_ref_id","music_ref_id"}], "globals":{...}}
-                locks_payload = args.get("locks") or args.get("ref_locks") or {}
-                if not (isinstance(locks_payload, dict) and locks_payload):
-                    try:
-                        if bool(args.get("use_context_refs")) or isinstance(args.get("cid"), str):
-                            locks_payload = _build_locks_from_context(str(args.get("cid") or "")) or {}
-                    except Exception:
-                        locks_payload = {}
-                if isinstance(locks_payload, dict) and locks_payload:
-                    plan_payload["locks"] = locks_payload
-                ideas = args.get("ideas") or []
-                if ideas:
-                    plan_payload["ideas"] = ideas
-                if style_refs:
-                    plan_payload["style_refs"] = style_refs
-                if character_images:
-                    plan_payload["character_images"] = character_images
-                await client.post(f"{base_url}/film/plan", json=plan_payload)
-                br = await client.post(f"{base_url}/film/breakdown", json={"project_id": project_id, "rules": rules_payload})
-                shots = []
-                try:
-                    js = JSONParser().parse(br.text, {}) if br.status_code == 200 else {}
-                    shots = [s.get("id") for s in (js.get("shots") or []) if isinstance(s, dict) and s.get("id")]
-                except Exception:
-                    shots = []
-                if not shots:
-                    # Fallback to minimal deterministic guess
-                    shots = [f"S1_SH{i+1:02d}" for i in range(max(1, min(6, int(duration_s // 3) or 1)))]
-                await client.post(f"{base_url}/film/storyboard", json={"project_id": project_id, "shots": shots})
-                await client.post(f"{base_url}/film/animatic", json={"project_id": project_id, "shots": shots, "outputs": {"fps": outputs_payload.get("fps", 12), "res": outputs_payload.get("resolution", "512x288")}})
-                # Include locks again for idempotency even if plan stored them
-                _locks = locks_payload if isinstance(locks_payload, dict) else {}
-                await client.post(f"{base_url}/film/final", json={"project_id": project_id, "shots": shots, "outputs": outputs_payload, "post": {"interpolate": interp, "upscale": upscale}, "locks": _locks})
-                # QA loop: evaluate, optionally reseed failing shots, retry up to 2x
-                reseed: Dict[str, int] = {}
-                for attempt in range(0, 2):
-                    qr = await client.post(f"{base_url}/film/qc", json={"project_id": project_id})
-                    try:
-                        rep = JSONParser().parse(qr.text, {}) if qr.status_code == 200 else {}
-                    except Exception:
-                        rep = {}
-                    suggested = rep.get("suggested_fixes") or []
-                    if not suggested:
-                        break
-                    # Build reseed deltas map from suggestions
-                    reseed.clear()
-                    for fix in suggested:
-                        sid = (fix or {}).get("shot_id")
-                        adj = (fix or {}).get("seed_adj")
-                        if isinstance(sid, str) and adj is not None:
-                            try:
-                                if isinstance(adj, str):
-                                    reseed[sid] = int(adj.replace("+", ""))
-                                else:
-                                    reseed[sid] = int(adj)
-                            except Exception:
-                                continue
-                    if not reseed:
-                        break
-                    # Re-render only failing shots with reseed map
-                    fail_ids = [str((fx or {}).get("shot_id")) for fx in suggested if (fx or {}).get("shot_id")]
-                    await client.post(
-                        f"{base_url}/film/final",
-                        json={
-                            "project_id": project_id,
-                            "shots": fail_ids,
-                            "outputs": outputs_payload,
-                            "post": {"interpolate": interp, "upscale": upscale},
-                            "locks": _locks,
-                            "reseed": reseed,
-                        },
-                    )
-                exp = await client.post(f"{base_url}/film/export", json={"project_id": project_id, "post": {"interpolate": interp, "upscale": upscale}, "refresh": refresh, "requested": requested_meta, "effective": effective_meta})
-                resj = JSONParser().parse(exp.text, {}) if exp.status_code == 200 else {"error": exp.text}
-        except Exception as ex:
-            return {"name": name, "error": str(ex)}
-        return {"name": name, "result": resj}
     if name == "source_fetch" and ALLOW_TOOL_EXECUTION:
         url = args.get("url") or ""
         if not url:
@@ -6301,12 +6809,13 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                         },
                     )
                 extra_results: List[Dict[str, Any]] = []
-                if tname == "film.run":
+                if tname == "film2.run":
                     meta_obj = res.get("meta") if isinstance(res, dict) else {}
                     shots = meta_obj.get("shots") if isinstance(meta_obj, dict) else None
                     profile_name = meta_obj.get("quality_profile") if isinstance(meta_obj, dict) and isinstance(meta_obj.get("quality_profile"), str) else None
                     preset = LOCK_QUALITY_PRESETS.get((profile_name or "standard").lower(), LOCK_QUALITY_PRESETS["standard"])
-                    refine_budget = int(preset.get("max_refine_passes", 1))
+                    # Clamp to a single refinement pass for segment-level film QA
+                    refine_budget = min(1, int(preset.get("max_refine_passes", 1)))
                     if isinstance(shots, list):
                         for shot in shots:
                             if not isinstance(shot, dict):
@@ -6316,7 +6825,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                                 updated_seg, seg_outcome, seg_patch = await segment_qa_and_committee(
                                     trace_id=trace_id,
                                     user_text=last_user_text,
-                                    tool_name="film.run",
+                                    tool_name="film2.run",
                                     segment_results=seg_results,
                                     mode=effective_mode,
                                     base_url=base_url,
@@ -6339,7 +6848,8 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                     meta_block = res.get("meta") if isinstance(res, dict) else {}
                     profile_name = meta_block.get("quality_profile") if isinstance(meta_block, dict) and isinstance(meta_block.get("quality_profile"), str) else None
                     preset_music = LOCK_QUALITY_PRESETS.get((profile_name or "standard").lower(), LOCK_QUALITY_PRESETS["standard"])
-                    refine_budget_music = int(preset_music.get("max_refine_passes", 1))
+                    # Clamp to a single refinement pass for music QA
+                    refine_budget_music = min(1, int(preset_music.get("max_refine_passes", 1)))
                     updated_seg, seg_outcome, seg_patch = await segment_qa_and_committee(
                         trace_id=trace_id,
                         user_text=last_user_text,
@@ -6363,6 +6873,109 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                             meta_music["segment_committee"] = seg_outcome
                             if seg_patch:
                                 meta_music["segment_patch_results"] = seg_patch
+                    if seg_patch:
+                        extra_results.extend(seg_patch)
+                elif tname.startswith("image."):
+                    # Optional: run segment-level QA/committee for image tools as well.
+                    profile_name = None
+                    if isinstance(res, dict):
+                        meta_block = res.get("meta")
+                        if isinstance(meta_block, dict) and isinstance(meta_block.get("quality_profile"), str):
+                            profile_name = meta_block.get("quality_profile")
+                    preset_img = LOCK_QUALITY_PRESETS.get((profile_name or "standard").lower(), LOCK_QUALITY_PRESETS["standard"])
+                    # Clamp to a single refinement pass for image QA
+                    refine_budget_img = min(1, int(preset_img.get("max_refine_passes", 0)))
+                    updated_seg, seg_outcome, seg_patch = await segment_qa_and_committee(
+                        trace_id=trace_id,
+                        user_text=last_user_text,
+                        tool_name=tname,
+                        segment_results=[tr],
+                        mode=effective_mode,
+                        base_url=base_url,
+                        executor_base_url=executor_endpoint,
+                        temperature=exec_temperature,
+                        last_user_text=last_user_text,
+                        tool_catalog_hash=_cat_hash,
+                        planner_callable=planner_callable,
+                        normalize_fn=_normalize_tool_calls,
+                        absolutize_url=_abs_url,
+                        quality_profile=profile_name,
+                        max_refine_passes=refine_budget_img,
+                    )
+                    if isinstance(res, dict):
+                        meta_img = res.setdefault("meta", {})
+                        if isinstance(meta_img, dict):
+                            meta_img["segment_committee"] = seg_outcome
+                            if seg_patch:
+                                meta_img["segment_patch_results"] = seg_patch
+                    if seg_patch:
+                        extra_results.extend(seg_patch)
+                elif tname == "tts.speak":
+                    # Segment-level QA/committee for TTS segments
+                    profile_name = None
+                    if isinstance(res, dict):
+                        meta_block = res.get("meta")
+                        if isinstance(meta_block, dict) and isinstance(meta_block.get("quality_profile"), str):
+                            profile_name = meta_block.get("quality_profile")
+                    preset_tts = LOCK_QUALITY_PRESETS.get((profile_name or "standard").lower(), LOCK_QUALITY_PRESETS["standard"])
+                    refine_budget_tts = min(1, int(preset_tts.get("max_refine_passes", 1)))
+                    updated_seg, seg_outcome, seg_patch = await segment_qa_and_committee(
+                        trace_id=trace_id,
+                        user_text=last_user_text,
+                        tool_name=tname,
+                        segment_results=[tr],
+                        mode=effective_mode,
+                        base_url=base_url,
+                        executor_base_url=executor_endpoint,
+                        temperature=exec_temperature,
+                        last_user_text=last_user_text,
+                        tool_catalog_hash=_cat_hash,
+                        planner_callable=planner_callable,
+                        normalize_fn=_normalize_tool_calls,
+                        absolutize_url=_abs_url,
+                        quality_profile=profile_name,
+                        max_refine_passes=refine_budget_tts,
+                    )
+                    if isinstance(res, dict):
+                        meta_tts = res.setdefault("meta", {})
+                        if isinstance(meta_tts, dict):
+                            meta_tts["segment_committee"] = seg_outcome
+                            if seg_patch:
+                                meta_tts["segment_patch_results"] = seg_patch
+                    if seg_patch:
+                        extra_results.extend(seg_patch)
+                elif tname == "audio.sfx.compose":
+                    # Optional: SFX QA/committee wiring (currently metrics are sparse)
+                    profile_name = None
+                    if isinstance(res, dict):
+                        meta_block = res.get("meta")
+                        if isinstance(meta_block, dict) and isinstance(meta_block.get("quality_profile"), str):
+                            profile_name = meta_block.get("quality_profile")
+                    preset_sfx = LOCK_QUALITY_PRESETS.get((profile_name or "standard").lower(), LOCK_QUALITY_PRESETS["standard"])
+                    refine_budget_sfx = min(1, int(preset_sfx.get("max_refine_passes", 0)))
+                    updated_seg, seg_outcome, seg_patch = await segment_qa_and_committee(
+                        trace_id=trace_id,
+                        user_text=last_user_text,
+                        tool_name=tname,
+                        segment_results=[tr],
+                        mode=effective_mode,
+                        base_url=base_url,
+                        executor_base_url=executor_endpoint,
+                        temperature=exec_temperature,
+                        last_user_text=last_user_text,
+                        tool_catalog_hash=_cat_hash,
+                        planner_callable=planner_callable,
+                        normalize_fn=_normalize_tool_calls,
+                        absolutize_url=_abs_url,
+                        quality_profile=profile_name,
+                        max_refine_passes=refine_budget_sfx,
+                    )
+                    if isinstance(res, dict):
+                        meta_sfx = res.setdefault("meta", {})
+                        if isinstance(meta_sfx, dict):
+                            meta_sfx["segment_committee"] = seg_outcome
+                            if seg_patch:
+                                meta_sfx["segment_patch_results"] = seg_patch
                     if seg_patch:
                         extra_results.extend(seg_patch)
                 tool_results.append(tr)
@@ -7348,12 +7961,12 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     if looks_empty or looks_refusal:
         # Suppress status blocks entirely; do not append any status text
         pass
-    # Build artifacts block from tool_results (prefer film.run)
+    # Build artifacts block from tool_results (prefer film2.run)
     artifacts: Dict[str, Any] = {}
     try:
         film_run = None
         for tr in (tool_results or []):
-            if isinstance(tr, dict) and tr.get("name") == "film.run" and isinstance(tr.get("result"), dict):
+            if isinstance(tr, dict) and tr.get("name") == "film2.run" and isinstance(tr.get("result"), dict):
                 film_run = tr.get("result")
         if film_run:
             master_uri = film_run.get("master_uri") or (film_run.get("master") or {}).get("uri")
@@ -7772,6 +8385,27 @@ _TOOL_SCHEMAS: Dict[str, Dict[str, Any]] = {
             "additionalProperties": True,
         },
         "notes": "Comfy pipeline; requires either size or width/height. Returns ids.image_id and meta.{data_url,view_url,orch_view_url}.",
+    },
+    "image.refine.segment": {
+        "name": "image.refine.segment",
+        "version": "1",
+        "kind": "image",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "segment_id": {"type": "string"},
+                "cid": {"type": "string"},
+                "prompt": {"type": "string"},
+                "lock_bundle": {"type": "object"},
+                "quality_profile": {"type": "string"},
+                "refine_mode": {"type": "string"},
+                "seed": {"type": "integer"},
+                "source_image": {"type": "string"},
+            },
+            "required": ["segment_id"],
+            "additionalProperties": True,
+        },
+        "notes": "Segment-level image refinement entrypoint; reuses image.dispatch path with lock-aware settings.",
     },
     "api.request": {
         "name": "api.request",

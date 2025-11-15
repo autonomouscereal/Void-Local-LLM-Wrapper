@@ -39,16 +39,37 @@ def run_sfx_compose(job: dict, manifest: dict) -> dict:
         "length_s": float(job.get("length_s") or 1.0),
         "pitch": float(job.get("pitch") or 440.0),
         "seed": job.get("seed"),
+        # Optional lock-related hints for future SFX engines
+        "lock_bundle": job.get("lock_bundle") if isinstance(job.get("lock_bundle"), dict) else None,
+        "sfx_event_ids": job.get("sfx_event_ids") if isinstance(job.get("sfx_event_ids"), list) else None,
     }
     args = stamp_tool_args("audio.sfx.compose", args)
     wav = _sine_wav_bytes(freq=float(args.get("pitch") or 440.0), length_s=float(args.get("length_s") or 1.0))
     model = "builtin:sfx"
     stem = f"sfx_{now_ts()}"; path = os.path.join(outdir, stem + ".wav")
     with open(path, "wb") as f: f.write(wav)
-    sidecar(path, {"tool": "audio.sfx.compose", **args, "model": model})
+    # Minimal lock metadata placeholder for distillation
+    sfx_locks = {}
+    if isinstance(args.get("lock_bundle"), dict):
+        sfx_locks["bundle"] = args.get("lock_bundle")
+    # Initial placeholder SFX lock metrics (to be refined with real analysis)
+    if sfx_locks:
+        sfx_locks.setdefault("sfx_timbre_lock", 0.5)
+        sfx_locks.setdefault("sfx_timing_lock", 1.0)
+    sidecar_payload = {"tool": "audio.sfx.compose", **args, "model": model}
+    if sfx_locks:
+        sidecar_payload["locks"] = sfx_locks
+    sidecar(path, sidecar_payload)
     add_manifest_row(manifest, path, step_id="audio.sfx.compose")
     env = {
-        "meta": {"model": model, "ts": now_ts(), "cid": cid, "step": 0, "state": "halt", "cont": {"present": False, "state_hash": None, "reason": None}},
+        "meta": {
+            "model": model,
+            "ts": now_ts(),
+            "cid": cid,
+            "step": 0,
+            "state": "halt",
+            "cont": {"present": False, "state_hash": None, "reason": None},
+        },
         "reasoning": {"goal": "sfx", "constraints": ["json-only"], "decisions": ["sfx done"]},
         "evidence": [],
         "message": {"role": "assistant", "type": "tool", "content": "sfx generated"},
@@ -56,6 +77,10 @@ def run_sfx_compose(job: dict, manifest: dict) -> dict:
         "artifacts": [{"id": os.path.basename(path), "kind": "audio-ref", "summary": stem, "bytes": len(wav)}],
         "telemetry": {"window": {"input_bytes": 0, "output_target_tokens": 0}, "compression_passes": [], "notes": []},
     }
+    if sfx_locks:
+        meta_block = env.setdefault("meta", {})
+        if isinstance(meta_block, dict):
+            meta_block["locks"] = sfx_locks
     env = normalize_to_envelope(json.dumps(env)); env = bump_envelope(env); assert_envelope(env); env = stamp_env(env, "audio.sfx.compose", model)
     return env
 

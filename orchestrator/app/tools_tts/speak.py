@@ -4,7 +4,7 @@ import os
 import json
 from typing import Any, Dict
 from .common import now_ts, ensure_dir, tts_edge_defaults, sidecar, stamp_env
-from ..locks import voice_embedding_from_path
+from ..locks import voice_embedding_from_path, tts_get_global, tts_get_voices
 from ..determinism.seeds import stamp_tool_args
 from ..artifacts.manifest import add_manifest_row
 from ..jsonio.normalize import normalize_to_envelope
@@ -63,6 +63,15 @@ def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
     lock = resolve_voice_lock(job.get("voice_id"), job.get("voice_refs"))
     lock_bundle = job.get("lock_bundle") if isinstance(job.get("lock_bundle"), dict) else None
     quality_profile = job.get("quality_profile")
+    # TTS-specific lock defaults from lock_bundle.tts when present
+    tts_global: Dict[str, Any] = {}
+    tts_voice_id: str | None = None
+    if lock_bundle:
+        tts_global = tts_get_global(lock_bundle)
+        if isinstance(tts_global, dict):
+            dv = tts_global.get("default_voice_id")
+            if isinstance(dv, str) and dv.strip():
+                tts_voice_id = dv.strip()
     # If no explicit voice provided, try to reuse last voice from context
     inferred_voice = None
     try:
@@ -78,9 +87,9 @@ def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
         inferred_voice = None
     args = {
         "text": job.get("text") or "",
-        "voice": params.get("voice") or inferred_voice,
-        "rate": float(job.get("rate") or 1.0),
-        "pitch": float(job.get("pitch") or 0.0),
+        "voice": params.get("voice") or tts_voice_id or inferred_voice,
+        "rate": float(job.get("rate") or tts_global.get("default_speaking_rate") or 1.0),
+        "pitch": float(job.get("pitch") or tts_global.get("default_pitch_shift_semitones") or 0.0),
         "sample_rate": int(params.get("sample_rate") or 22050),
         "channels": 1,
         "max_seconds": int(params.get("max_seconds") or 20),
@@ -198,6 +207,66 @@ def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
             if seg_text and seg_text in text_lower:
                 matched += 1
         locks_meta["lyrics_score"] = matched / len(hard_segments) if hard_segments else None
+    # TTS prosody/emotion/timing QA from lock_bundle.tts when available
+    if lock_bundle:
+        ainfo3 = analyze_audio(wav_path)
+        if isinstance(ainfo3, dict):
+            pitch_mean = ainfo3.get("pitch_mean_hz")
+            # Voice-level baseline
+            tts_section = lock_bundle.get("tts") if isinstance(lock_bundle.get("tts"), dict) else {}
+            voices = tts_get_voices(lock_bundle)
+            # Select voice entry by default_voice_id or first voice
+            target_voice_id = tts_voice_id
+            voice_entry: Dict[str, Any] | None = None
+            if isinstance(target_voice_id, str):
+                for v in voices:
+                    if isinstance(v, dict) and v.get("voice_id") == target_voice_id:
+                        voice_entry = v
+                        break
+            if voice_entry is None and voices:
+                first = voices[0]
+                if isinstance(first, dict):
+                    voice_entry = first
+            # Prosody pitch lock
+            if isinstance(pitch_mean, (int, float)) and voice_entry:
+                base_pros = voice_entry.get("baseline_prosody") if isinstance(voice_entry.get("baseline_prosody"), dict) else {}
+                base_pitch = base_pros.get("mean_pitch_hz")
+                if isinstance(base_pitch, (int, float)) and base_pitch > 0.0:
+                    err = abs(float(pitch_mean) - float(base_pitch)) / float(base_pitch)
+                    prosody_pitch_lock = max(0.0, min(1.0 - err, 1.0))
+                    locks_meta["prosody_pitch_lock"] = prosody_pitch_lock
+            # Segment-level timing lock (match by exact text when possible)
+            segments = tts_section.get("segments") if isinstance(tts_section.get("segments"), list) else []
+            seg_match: Dict[str, Any] | None = None
+            text_full = (args.get("text") or "").strip()
+            if text_full and segments:
+                for seg in segments:
+                    if not isinstance(seg, dict):
+                        continue
+                    tref = seg.get("text_ref") if isinstance(seg.get("text_ref"), dict) else {}
+                    txt = (tref.get("text") or "").strip()
+                    if txt and txt == text_full:
+                        seg_match = seg
+                        break
+            if seg_match:
+                timing = seg_match.get("timing_targets") if isinstance(seg_match.get("timing_targets"), dict) else {}
+                expected_dur = timing.get("expected_duration_s")
+                max_dev = timing.get("max_deviation_s")
+                if isinstance(expected_dur, (int, float)) and expected_dur > 0.0 and isinstance(max_dev, (int, float)):
+                    err_t = abs(dur - float(expected_dur))
+                    if err_t <= float(max_dev):
+                        timing_lock = 1.0
+                    else:
+                        timing_lock = max(0.0, min(1.0 - (err_t / float(expected_dur)), 1.0))
+                    locks_meta["timing_lock"] = timing_lock
+    # Composite TTS lock score for distillation
+    components: list[float] = []
+    for key in ("voice_score", "lyrics_score", "prosody_pitch_lock", "timing_lock"):
+        v = locks_meta.get(key)
+        if isinstance(v, (int, float)):
+            components.append(float(v))
+    if components:
+        locks_meta["lock_score_tts"] = min(components)
     if quality_profile:
         locks_meta.setdefault("quality_profile", quality_profile)
     sidecar_payload = {
@@ -327,23 +396,23 @@ def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
     # Trace row for distillation
     try:
         ainfo = analyze_audio(wav_path)
-        _trace_append(
-            "tts",
-            {
-                "cid": cid,
-                "tool": "tts.speak",
-                "text": args.get("text"),
-                "voice": args.get("voice"),
-                "rate": args.get("rate"),
-                "pitch": args.get("pitch"),
-                "seed": int(args.get("seed") or 0),
-                "model": model,
-                "path": wav_path,
-                "lufs": ainfo.get("lufs") if isinstance(ainfo, dict) else None,
-                "tempo_bpm": ainfo.get("tempo_bpm") if isinstance(ainfo, dict) else None,
-                "emotion": ainfo.get("emotion") if isinstance(ainfo, dict) else None,
-            },
-        )
+        trace_row = {
+            "cid": cid,
+            "tool": "tts.speak",
+            "text": args.get("text"),
+            "voice": args.get("voice"),
+            "rate": args.get("rate"),
+            "pitch": args.get("pitch"),
+            "seed": int(args.get("seed") or 0),
+            "model": model,
+            "path": wav_path,
+            "lufs": ainfo.get("lufs") if isinstance(ainfo, dict) else None,
+            "tempo_bpm": ainfo.get("tempo_bpm") if isinstance(ainfo, dict) else None,
+            "emotion": ainfo.get("emotion") if isinstance(ainfo, dict) else None,
+        }
+        if locks_meta:
+            trace_row["locks"] = locks_meta
+        _trace_append("tts", trace_row)
     except Exception:
         pass
     return env

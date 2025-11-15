@@ -385,28 +385,29 @@ async def tool_run(req: Request):
 		name = (body.get("name") or "").strip()
 		args = body.get("args") or {}
 
-		# For non-image tools, route through the executor /execute to avoid local fast paths and circular imports
+		# For non-image tools, call the internal orchestrator tool implementation directly
+		# instead of routing back through the executor. This avoids recursion
+		# (executor → /tool.run → executor) and ensures each planned step executes once.
 		if name != "image.dispatch":
-			exec_base = os.getenv("EXECUTOR_BASE_URL", "http://127.0.0.1:8081").rstrip("/")
-			request_id = (args.get("trace_id") or args.get("cid") or uuid.uuid4().hex) if isinstance(args, dict) else uuid.uuid4().hex
-			step = {"id": "s1", "tool": name, "inputs": (args if isinstance(args, dict) else {})}
-			payload = {"schema_version": 1, "request_id": request_id, "trace_id": request_id, "steps": [step]}
-			async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
-				resp = await client.post(exec_base + "/execute", json=payload)
-				try:
-					env = resp.json()
-				except Exception:
-					env = {"ok": False, "error": {"code": "executor_bad_json", "message": resp.text}}
-			if isinstance(env, dict) and env.get("ok") and isinstance((env.get("result") or {}).get("produced"), dict):
-				produced = (env.get("result") or {}).get("produced") or {}
-				res1 = produced.get("s1") or {}
-				return ToolEnvelope.success(res1 if isinstance(res1, dict) else {"value": res1}, request_id=rid)
+			from app.main import execute_tool_call  # type: ignore
+			call = {"name": name, "arguments": (args if isinstance(args, dict) else {})}
+			res = await execute_tool_call(call)
+			if isinstance(res, dict) and isinstance(res.get("result"), dict):
+				return ToolEnvelope.success(res["result"], request_id=rid)
+			err_obj = res.get("error") if isinstance(res, dict) else None
+			if isinstance(err_obj, dict):
+				code = str(err_obj.get("code") or "tool_error")
+				message = str(err_obj.get("message") or "")
+				status = int(err_obj.get("status") or err_obj.get("_http_status") or 422)
+				return ToolEnvelope.failure(code, message, status=status, request_id=rid, details=err_obj)
+			if isinstance(err_obj, str):
+				return ToolEnvelope.failure("tool_error", err_obj, status=422, request_id=rid, details={})
 			return ToolEnvelope.failure(
-				"executor_failed",
-				"tool failed via executor",
-				status=500,
+				"tool_error",
+				"tool failed",
+				status=422,
 				request_id=rid,
-				details=(env or {}),
+				details={},
 			)
 
 		# Use the existing Comfy pipeline below for image.dispatch; do not import app.main._image_dispatch_run.
@@ -692,12 +693,15 @@ async def tool_run(req: Request):
 		}
 		# Persist artifacts under orchestrator /uploads and return absolute URLs for UI
 		from app.main import UPLOAD_DIR as _UPLOAD_DIR, PUBLIC_BASE_URL as _PUBLIC_BASE_URL  # type: ignore
+		from app.locks.runtime import bundle_to_image_locks as _lock_to_assets  # type: ignore
+		from app.services.image.analysis.locks import compute_region_scores as _qa_region_scores  # type: ignore
 		import os as _os
 		# Use prompt_id as the canonical image cid for artifact paths
 		_cid = prompt_id or client_id
 		save_dir = _os.path.join(_UPLOAD_DIR, "artifacts", "image", _cid)
 		_os.makedirs(save_dir, exist_ok=True)
 		orch_urls: list[str] = []
+		saved_paths: list[str] = []
 		async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
 			for im in images:
 				fn = im.get("filename")
@@ -718,6 +722,7 @@ async def tool_run(req: Request):
 				dst = _os.path.join(save_dir, fn)
 				with open(dst, "wb") as _f:
 					_f.write(resp.content)
+				saved_paths.append(dst)
 				rel = _os.path.relpath(dst, _UPLOAD_DIR).replace("\\", "/")
 				orch_urls.append(f"{_PUBLIC_BASE_URL.rstrip('/')}/uploads/{rel}" if _PUBLIC_BASE_URL else f"/uploads/{rel}")
 		if orch_urls:
@@ -739,6 +744,57 @@ async def tool_run(req: Request):
 				)
 			if arts:
 				result["artifacts"] = arts
+		# Populate basic per-entity QA metrics when a lock bundle is present.
+		lock_bundle = args.get("lock_bundle") if isinstance(args.get("lock_bundle"), dict) else None
+		if lock_bundle and saved_paths:
+			locks = _lock_to_assets(lock_bundle)
+			regions = locks.get("regions") if isinstance(locks.get("regions"), dict) else {}
+			entities_qa: dict[str, dict[str, float]] = {}
+			first_image_path = saved_paths[0]
+			for region_id, region_data in regions.items():
+				if not isinstance(region_data, dict):
+					continue
+				metrics = await _qa_region_scores(first_image_path, region_data)
+				if not isinstance(metrics, dict):
+					continue
+				ent_metrics: dict[str, float] = {}
+				clip_lock_val = metrics.get("clip_lock")
+				texture_score_val = metrics.get("texture_score")
+				shape_score_val = metrics.get("shape_score")
+				if isinstance(clip_lock_val, (int, float)):
+					ent_metrics["clip_lock"] = float(clip_lock_val)
+				if isinstance(texture_score_val, (int, float)):
+					ent_metrics["texture_lock"] = float(texture_score_val)
+				if isinstance(shape_score_val, (int, float)):
+					ent_metrics["shape_lock"] = float(shape_score_val)
+				if ent_metrics:
+					entities_qa[str(region_id)] = ent_metrics
+			if entities_qa:
+				img_qa = result.setdefault("qa", {}).setdefault("images", {})
+				if isinstance(img_qa, dict):
+					img_qa["entities"] = entities_qa
+				# Attach per-call lock metadata for distillation
+				locks_meta: dict[str, object] = {"bundle": lock_bundle}
+				qp = args.get("quality_profile")
+				if isinstance(qp, str) and qp:
+					locks_meta["quality_profile"] = qp
+				# Simple composite entity lock score: average of per-entity minima
+				entity_scores: list[float] = []
+				for ent in entities_qa.values():
+					if not isinstance(ent, dict):
+						continue
+					vals: list[float] = []
+					for k in ("clip_lock", "texture_lock", "shape_lock"):
+						v = ent.get(k)
+						if isinstance(v, (int, float)):
+							vals.append(float(v))
+					if vals:
+						entity_scores.append(min(vals))
+				if entity_scores:
+					locks_meta["entity_lock_score"] = sum(entity_scores) / len(entity_scores)
+				meta_block = result.setdefault("meta", {})
+				if isinstance(meta_block, dict):
+					meta_block["locks"] = locks_meta
 			# Trace for distillation: emit chat.append with media parts for this trace
 			trc = args.get("trace_id") or args.get("cid")
 			if isinstance(trc, str) and trc.strip():

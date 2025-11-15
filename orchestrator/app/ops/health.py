@@ -15,7 +15,7 @@ def get_capabilities() -> Dict[str, Any]:
         {"name": os.getenv("DEEPSEEK_CODER_MODEL_ID", "deepseek-coder-v2:lite"), "ctx_tokens": int(os.getenv("DEFAULT_NUM_CTX", "4096")), "step_tokens": int(os.getenv("ICW_STEP_TOKENS", "900"))},
     ]
     tools = [
-        "film.run",
+        "film2.run",
         "rag_search",
         "research.run",
         "image.dispatch",

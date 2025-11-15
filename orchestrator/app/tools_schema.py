@@ -55,23 +55,19 @@ def get_builtin_tools_schema() -> List[Dict[str, Any]]:
 		{
 			"type": "function",
 			"function": {
-				"name": "film.run",
+				"name": "film2.run",
 				"parameters": {
 					"type": "object",
 					"properties": {
-						"title": {"type": "string"},
-						"duration_s": {"type": "integer"},
-						"seed": {"type": "integer"},
-						"style_refs": {"type": "array", "items": {"type": "string"}},
-						"character_images": {"type": "array", "items": {"type": "object"}},
-						"res": {"type": "string"},
-						"refresh": {"type": "integer"},
-						"base_fps": {"type": "integer"},
-						"codec": {"type": "string"},
-						"container": {"type": "string"},
-						"post": {"type": "object"},
-						"audio": {"type": "object"},
-						"safety": {"type": "object"}
+						"prompt": {"type": "string"},
+						"clips": {"type": "array", "items": {"type": "string"}},
+						"images": {"type": "array", "items": {"type": "object"}},
+						"interpolate": {"type": "boolean"},
+						"scale": {"type": "number"},
+						"quality_profile": {"type": "string"},
+						"locks": {"type": "object"},
+						"cid": {"type": "string"},
+						"trace_id": {"type": "string"}
 					},
 					"required": []
 				}
@@ -237,6 +233,26 @@ def get_builtin_tools_schema() -> List[Dict[str, Any]]:
 						"autofix_422": {"type": "boolean", "default": True}
 					},
 					"required": ["prompt"]
+				}
+			}
+		},
+		{
+			"type": "function",
+			"function": {
+				"name": "image.refine.segment",
+				"parameters": {
+					"type": "object",
+					"properties": {
+						"segment_id": {"type": "string"},
+						"cid": {"type": "string"},
+						"prompt": {"type": "string"},
+						"lock_bundle": {"type": "object"},
+						"quality_profile": {"type": "string"},
+						"refine_mode": {"type": "string"},
+						"seed": {"type": "integer"},
+						"source_image": {"type": "string"}
+					},
+					"required": ["segment_id"]
 				}
 			}
 		},

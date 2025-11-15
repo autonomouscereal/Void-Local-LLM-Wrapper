@@ -760,6 +760,7 @@ services:
 volumes:
   ollama_qwen_data: {}
   ollama_glm_data: {}
+  ollama_deepseek_data: {}
   pgvector_data: {}
   comfyui_models: {}
   comfyui_custom_nodes: {}

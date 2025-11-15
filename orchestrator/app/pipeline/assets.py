@@ -145,6 +145,10 @@ def compute_domain_qa(tool_results: List[Dict[str, Any]]) -> Dict[str, Any]:
 	image_region_texture_vals: List[float] = []
 	image_region_color_vals: List[float] = []
 	image_scene_vals: List[float] = []
+	# Optional per-entity lock metrics (if tools emit them)
+	image_entity_clip_vals: List[float] = []
+	image_entity_texture_vals: List[float] = []
+	image_entity_shape_vals: List[float] = []
 
 	video_seam_ratio_vals: List[float] = []
 	video_seam_true = 0.0
@@ -152,6 +156,15 @@ def compute_domain_qa(tool_results: List[Dict[str, Any]]) -> Dict[str, Any]:
 	video_art_ratio_vals: List[float] = []
 	video_art_true = 0.0
 	video_art_total = 0.0
+	# Optional higher-level video/film metrics
+	video_fvd_vals: List[float] = []
+	video_fvmd_vals: List[float] = []
+	video_frame_lpips_vals: List[float] = []
+	video_temporal_lpips_vals: List[float] = []
+	video_flow_consistency_vals: List[float] = []
+	video_face_drift_vals: List[float] = []
+	video_object_drift_vals: List[float] = []
+	video_color_consistency_vals: List[float] = []
 
 	audio_lufs_vals: List[float] = []
 	audio_clip_true = 0.0
@@ -164,6 +177,20 @@ def compute_domain_qa(tool_results: List[Dict[str, Any]]) -> Dict[str, Any]:
 	audio_key_vals: List[float] = []
 	audio_stem_vals: List[float] = []
 	audio_lyrics_vals: List[float] = []
+	# Optional higher-level music/tts/SFX lock metrics
+	audio_motif_vals: List[float] = []
+	audio_prosody_pitch_vals: List[float] = []
+	audio_prosody_energy_vals: List[float] = []
+	audio_prosody_duration_vals: List[float] = []
+	audio_emotion_vals: List[float] = []
+	audio_style_vals: List[float] = []
+	audio_timing_vals: List[float] = []
+	audio_sfx_timbre_vals: List[float] = []
+	audio_sfx_envelope_vals: List[float] = []
+	audio_sfx_spatial_vals: List[float] = []
+	audio_sfx_timing_vals: List[float] = []
+	audio_sfx_loudness_vals: List[float] = []
+	audio_sfx_density_vals: List[float] = []
 
 	for tr in tool_results or []:
 		if not isinstance(tr, dict):
@@ -258,8 +285,29 @@ def compute_domain_qa(tool_results: List[Dict[str, Any]]) -> Dict[str, Any]:
 			for val in scene_score:
 				if isinstance(val, (int, float)):
 					image_scene_vals.append(float(val))
+			# Optional entity-level QA: result["qa"]["images"]["entities"]
+			entity_blocks = _collect_key_values(root_candidates, ["entities"])
+			for ent_block in entity_blocks:
+				if isinstance(ent_block, dict):
+					iterable = ent_block.values()
+				elif isinstance(ent_block, list):
+					iterable = ent_block
+				else:
+					continue
+				for metrics in iterable:
+					if not isinstance(metrics, dict):
+						continue
+					cv = metrics.get("clip_lock")
+					tv = metrics.get("texture_lock")
+					sv = metrics.get("shape_lock")
+					if isinstance(cv, (int, float)):
+						image_entity_clip_vals.append(float(cv))
+					if isinstance(tv, (int, float)):
+						image_entity_texture_vals.append(float(tv))
+					if isinstance(sv, (int, float)):
+						image_entity_shape_vals.append(float(sv))
 
-		if name.startswith("video.") or name in ("film.run", "film2.run"):
+		if name.startswith("video.") or name == "film2.run":
 			seam_dicts = _collect_key_values(root_candidates, ["seam", "seams"])
 			for sd in seam_dicts:
 				if isinstance(sd, dict):
@@ -300,6 +348,39 @@ def compute_domain_qa(tool_results: List[Dict[str, Any]]) -> Dict[str, Any]:
 						video_art_true += 1.0
 				elif isinstance(val, (int, float)):
 					video_art_ratio_vals.append(float(val))
+			# Optional film/video-specific metrics
+			fvd_val = _collect_key_values(root_candidates, ["fvd"])
+			for v in fvd_val:
+				if isinstance(v, (int, float)):
+					video_fvd_vals.append(float(v))
+			fvmd_val = _collect_key_values(root_candidates, ["fvmd"])
+			for v in fvmd_val:
+				if isinstance(v, (int, float)):
+					video_fvmd_vals.append(float(v))
+			frame_lpips_val = _collect_key_values(root_candidates, ["frame_lpips_mean"])
+			for v in frame_lpips_val:
+				if isinstance(v, (int, float)):
+					video_frame_lpips_vals.append(float(v))
+			temp_lpips_val = _collect_key_values(root_candidates, ["temporal_lpips_mean"])
+			for v in temp_lpips_val:
+				if isinstance(v, (int, float)):
+					video_temporal_lpips_vals.append(float(v))
+			flow_cons_val = _collect_key_values(root_candidates, ["optical_flow_consistency"])
+			for v in flow_cons_val:
+				if isinstance(v, (int, float)):
+					video_flow_consistency_vals.append(float(v))
+			face_drift_val = _collect_key_values(root_candidates, ["face_track_drift_mean"])
+			for v in face_drift_val:
+				if isinstance(v, (int, float)):
+					video_face_drift_vals.append(float(v))
+			obj_drift_val = _collect_key_values(root_candidates, ["object_track_drift_mean"])
+			for v in obj_drift_val:
+				if isinstance(v, (int, float)):
+					video_object_drift_vals.append(float(v))
+			color_cons_val = _collect_key_values(root_candidates, ["color_grade_consistency"])
+			for v in color_cons_val:
+				if isinstance(v, (int, float)):
+					video_color_consistency_vals.append(float(v))
 
 		if name.startswith("music.") or name.startswith("audio.") or name.startswith("tts."):
 			committee_values = _collect_key_values(root_candidates, ["peak_normalize", "hard_trim", "qa", "committee"])
@@ -362,6 +443,48 @@ def compute_domain_qa(tool_results: List[Dict[str, Any]]) -> Dict[str, Any]:
 			lyrics_score_val = meta.get("lyrics_score") or locks.get("lyrics_score")
 			if isinstance(lyrics_score_val, (int, float)):
 				audio_lyrics_vals.append(float(lyrics_score_val))
+			# Optional motif-level lock scores if tools emit them
+			motif_score_val = meta.get("motif_lock") or locks.get("motif_lock")
+			if isinstance(motif_score_val, (int, float)):
+				audio_motif_vals.append(float(motif_score_val))
+			# Optional TTS prosody/emotion/style/timing locks
+			pros_pitch_val = meta.get("prosody_pitch_lock") or locks.get("prosody_pitch_lock")
+			if isinstance(pros_pitch_val, (int, float)):
+				audio_prosody_pitch_vals.append(float(pros_pitch_val))
+			pros_energy_val = meta.get("prosody_energy_lock") or locks.get("prosody_energy_lock")
+			if isinstance(pros_energy_val, (int, float)):
+				audio_prosody_energy_vals.append(float(pros_energy_val))
+			pros_dur_val = meta.get("prosody_duration_lock") or locks.get("prosody_duration_lock")
+			if isinstance(pros_dur_val, (int, float)):
+				audio_prosody_duration_vals.append(float(pros_dur_val))
+			emotion_val = meta.get("emotion_lock") or locks.get("emotion_lock")
+			if isinstance(emotion_val, (int, float)):
+				audio_emotion_vals.append(float(emotion_val))
+			style_val = meta.get("style_lock") or locks.get("style_lock")
+			if isinstance(style_val, (int, float)):
+				audio_style_vals.append(float(style_val))
+			timing_val = meta.get("timing_lock") or locks.get("timing_lock")
+			if isinstance(timing_val, (int, float)):
+				audio_timing_vals.append(float(timing_val))
+			# Optional SFX-specific locks
+			sfx_timbre_val = meta.get("sfx_timbre_lock") or locks.get("sfx_timbre_lock")
+			if isinstance(sfx_timbre_val, (int, float)):
+				audio_sfx_timbre_vals.append(float(sfx_timbre_val))
+			sfx_env_val = meta.get("sfx_envelope_lock") or locks.get("sfx_envelope_lock")
+			if isinstance(sfx_env_val, (int, float)):
+				audio_sfx_envelope_vals.append(float(sfx_env_val))
+			sfx_spatial_val = meta.get("sfx_spatial_lock") or locks.get("sfx_spatial_lock")
+			if isinstance(sfx_spatial_val, (int, float)):
+				audio_sfx_spatial_vals.append(float(sfx_spatial_val))
+			sfx_timing_val = meta.get("sfx_timing_lock") or locks.get("sfx_timing_lock")
+			if isinstance(sfx_timing_val, (int, float)):
+				audio_sfx_timing_vals.append(float(sfx_timing_val))
+			sfx_loud_val = meta.get("sfx_loudness_lock") or locks.get("sfx_loudness_lock")
+			if isinstance(sfx_loud_val, (int, float)):
+				audio_sfx_loudness_vals.append(float(sfx_loud_val))
+			sfx_density_val = meta.get("sfx_density_lock") or locks.get("sfx_density_lock")
+			if isinstance(sfx_density_val, (int, float)):
+				audio_sfx_density_vals.append(float(sfx_density_val))
 
 	image_face_avg = sum(image_face_vals) / len(image_face_vals) if image_face_vals else None
 	image_id_avg = sum(image_id_vals) / len(image_id_vals) if image_id_vals else None
@@ -383,6 +506,9 @@ def compute_domain_qa(tool_results: List[Dict[str, Any]]) -> Dict[str, Any]:
 	region_texture_avg = sum(image_region_texture_vals) / len(image_region_texture_vals) if image_region_texture_vals else None
 	region_color_avg = sum(image_region_color_vals) / len(image_region_color_vals) if image_region_color_vals else None
 	scene_avg = sum(image_scene_vals) / len(image_scene_vals) if image_scene_vals else None
+	entity_clip_avg = sum(image_entity_clip_vals) / len(image_entity_clip_vals) if image_entity_clip_vals else None
+	entity_texture_avg = sum(image_entity_texture_vals) / len(image_entity_texture_vals) if image_entity_texture_vals else None
+	entity_shape_avg = sum(image_entity_shape_vals) / len(image_entity_shape_vals) if image_entity_shape_vals else None
 
 	video_seam_ratio = None
 	if video_seam_ratio_vals:
@@ -395,6 +521,14 @@ def compute_domain_qa(tool_results: List[Dict[str, Any]]) -> Dict[str, Any]:
 		video_art_ratio = sum(video_art_ratio_vals) / len(video_art_ratio_vals)
 	elif video_art_total:
 		video_art_ratio = video_art_true / video_art_total
+	video_fvd_avg = sum(video_fvd_vals) / len(video_fvd_vals) if video_fvd_vals else None
+	video_fvmd_avg = sum(video_fvmd_vals) / len(video_fvmd_vals) if video_fvmd_vals else None
+	video_frame_lpips_avg = sum(video_frame_lpips_vals) / len(video_frame_lpips_vals) if video_frame_lpips_vals else None
+	video_temporal_lpips_avg = sum(video_temporal_lpips_vals) / len(video_temporal_lpips_vals) if video_temporal_lpips_vals else None
+	video_flow_consistency_avg = sum(video_flow_consistency_vals) / len(video_flow_consistency_vals) if video_flow_consistency_vals else None
+	video_face_drift_avg = sum(video_face_drift_vals) / len(video_face_drift_vals) if video_face_drift_vals else None
+	video_object_drift_avg = sum(video_object_drift_vals) / len(video_object_drift_vals) if video_object_drift_vals else None
+	video_color_consistency_avg = sum(video_color_consistency_vals) / len(video_color_consistency_vals) if video_color_consistency_vals else None
 
 	audio_mean_lufs = sum(audio_lufs_vals) / len(audio_lufs_vals) if audio_lufs_vals else None
 	audio_clip_ratio = (audio_clip_true / audio_clip_total) if audio_clip_total else None
@@ -409,6 +543,64 @@ def compute_domain_qa(tool_results: List[Dict[str, Any]]) -> Dict[str, Any]:
 	audio_key_avg = sum(audio_key_vals) / len(audio_key_vals) if audio_key_vals else None
 	audio_stem_avg = sum(audio_stem_vals) / len(audio_stem_vals) if audio_stem_vals else None
 	audio_lyrics_avg = sum(audio_lyrics_vals) / len(audio_lyrics_vals) if audio_lyrics_vals else None
+	audio_motif_avg = sum(audio_motif_vals) / len(audio_motif_vals) if audio_motif_vals else None
+	audio_prosody_pitch_avg = sum(audio_prosody_pitch_vals) / len(audio_prosody_pitch_vals) if audio_prosody_pitch_vals else None
+	audio_prosody_energy_avg = sum(audio_prosody_energy_vals) / len(audio_prosody_energy_vals) if audio_prosody_energy_vals else None
+	audio_prosody_duration_avg = sum(audio_prosody_duration_vals) / len(audio_prosody_duration_vals) if audio_prosody_duration_vals else None
+	audio_emotion_avg = sum(audio_emotion_vals) / len(audio_emotion_vals) if audio_emotion_vals else None
+	audio_style_avg = sum(audio_style_vals) / len(audio_style_vals) if audio_style_vals else None
+	audio_timing_avg = sum(audio_timing_vals) / len(audio_timing_vals) if audio_timing_vals else None
+audio_sfx_timbre_avg = sum(audio_sfx_timbre_vals) / len(audio_sfx_timbre_vals) if audio_sfx_timbre_vals else None
+audio_sfx_envelope_avg = sum(audio_sfx_envelope_vals) / len(audio_sfx_envelope_vals) if audio_sfx_envelope_vals else None
+audio_sfx_spatial_avg = sum(audio_sfx_spatial_vals) / len(audio_sfx_spatial_vals) if audio_sfx_spatial_vals else None
+audio_sfx_timing_avg = sum(audio_sfx_timing_vals) / len(audio_sfx_timing_vals) if audio_sfx_timing_vals else None
+audio_sfx_loudness_avg = sum(audio_sfx_loudness_vals) / len(audio_sfx_loudness_vals) if audio_sfx_loudness_vals else None
+audio_sfx_density_avg = sum(audio_sfx_density_vals) / len(audio_sfx_density_vals) if audio_sfx_density_vals else None
+
+# Optional overall lock health scores for dashboarding / training targets
+image_lock_overall = None
+_image_lock_components: list[float] = []
+for v in (image_face_avg, image_id_avg, entity_shape_avg):
+	if isinstance(v, (int, float)):
+		_image_lock_components.append(float(v))
+if _image_lock_components:
+	image_lock_overall = min(_image_lock_components)
+
+video_lock_overall = None
+_video_lock_components: list[float] = []
+for v in (video_seam_ratio, video_art_ratio, video_fvmd_avg, video_flow_consistency_avg, video_color_consistency_avg):
+	if isinstance(v, (int, float)):
+		_video_lock_components.append(float(v))
+if _video_lock_components:
+	# Higher is better for seam_ok_ratio, fvmd, flow_consistency, color_consistency; lower is better for artifact_ok_ratio.
+	# Use the minimum after flipping artifact_ok_ratio so that 1.0 is best.
+	flip_art = None
+	if isinstance(video_art_ratio, (int, float)):
+		flip_art = max(0.0, min(1.0 - float(video_art_ratio), 1.0))
+		_video_lock_components.append(flip_art)
+	video_lock_overall = min(_video_lock_components)
+
+audio_lock_overall = None
+_audio_lock_components: list[float] = []
+for v in (
+	audio_voice_avg,
+	audio_tempo_avg,
+	audio_key_avg,
+	audio_stem_avg,
+	audio_lyrics_avg,
+	audio_motif_avg,
+	audio_prosody_pitch_avg,
+	audio_prosody_energy_avg,
+	audio_prosody_duration_avg,
+	audio_emotion_avg,
+	audio_style_avg,
+	audio_timing_avg,
+	audio_sfx_timing_avg,
+):
+	if isinstance(v, (int, float)):
+		_audio_lock_components.append(float(v))
+if _audio_lock_components:
+	audio_lock_overall = min(_audio_lock_components)
 
 	return {
 		"images": {
@@ -421,10 +613,24 @@ def compute_domain_qa(tool_results: List[Dict[str, Any]]) -> Dict[str, Any]:
 			"region_texture_mean": region_texture_avg,
 			"region_color_mean": region_color_avg,
 			"scene_lock": scene_avg,
+			# Optional aggregated per-entity lock scores
+			"entity_clip_lock_mean": entity_clip_avg,
+			"entity_texture_lock_mean": entity_texture_avg,
+			"entity_shape_lock_mean": entity_shape_avg,
+			"lock_overall": image_lock_overall,
 		},
 		"videos": {
 			"seam_ok_ratio": video_seam_ratio,
 			"artifact_ok_ratio": video_art_ratio,
+			"fvd": video_fvd_avg,
+			"fvmd": video_fvmd_avg,
+			"frame_lpips_mean": video_frame_lpips_avg,
+			"temporal_lpips_mean": video_temporal_lpips_avg,
+			"optical_flow_consistency": video_flow_consistency_avg,
+			"face_track_drift_mean": video_face_drift_avg,
+			"object_track_drift_mean": video_object_drift_avg,
+			"color_grade_consistency": video_color_consistency_avg,
+			"lock_overall": video_lock_overall,
 		},
 		"audio": {
 			"mean_lufs": audio_mean_lufs,
@@ -435,6 +641,20 @@ def compute_domain_qa(tool_results: List[Dict[str, Any]]) -> Dict[str, Any]:
 			"key_lock": audio_key_avg,
 			"stem_balance_lock": audio_stem_avg,
 			"lyrics_lock": audio_lyrics_avg,
+			"motif_lock": audio_motif_avg,
+			"prosody_pitch_lock": audio_prosody_pitch_avg,
+			"prosody_energy_lock": audio_prosody_energy_avg,
+			"prosody_duration_lock": audio_prosody_duration_avg,
+			"emotion_lock": audio_emotion_avg,
+			"style_lock": audio_style_avg,
+			"timing_lock": audio_timing_avg,
+			"sfx_timbre_lock": audio_sfx_timbre_avg,
+			"sfx_envelope_lock": audio_sfx_envelope_avg,
+			"sfx_spatial_lock": audio_sfx_spatial_avg,
+			"sfx_timing_lock": audio_sfx_timing_avg,
+			"sfx_loudness_lock": audio_sfx_loudness_avg,
+			"sfx_density_lock": audio_sfx_density_avg,
+			"lock_overall": audio_lock_overall,
 		},
 	}
 
