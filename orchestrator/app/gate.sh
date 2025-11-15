@@ -6,20 +6,20 @@ for s in "${REQS[@]:-}"; do
   [ -n "${s:-}" ] || continue
   echo "[gate] waiting for $s health..."
   case "$s" in
-    music)  URL="http://music:7860/healthz" ;;
-    yue)    URL="${YUE_API_URL:-http://yue:9001}/healthz" ;;
-    xtts)   URL="${XTTS_API_URL:-http://xtts:8020}/healthz" ;;
-    demucs) URL="http://demucs:9101/healthz" ;;
-    film2)  URL="http://film2:8090/healthz" ;;
-    melody) URL="http://melody:7861/healthz" ;;
-    dsinger) URL="http://dsinger:7862/healthz" ;;
-    rvc)    URL="http://rvc:7863/healthz" ;;
-    vocalfix) URL="http://vocalfix:7864/healthz" ;;
-    sfx)    URL="http://sfx:7866/healthz" ;;
-    master)  URL="http://master:7865/healthz" ;;
-    mfa)     URL="http://mfa:7867/healthz" ;;
-    prosody) URL="http://prosody:7868/healthz" ;;
-    *)      echo "[gate] unknown service $s"; exit 22 ;;
+    music)    URL="${MUSIC_API_URL:-http://127.0.0.1:7860}/healthz" ;;
+    yue)      URL="${YUE_API_URL:-http://yue:9001}/healthz" ;;
+    xtts)     URL="${XTTS_API_URL:-http://127.0.0.1:8020}/healthz" ;;
+    demucs)   URL="${DEMUCS_API_URL:-http://127.0.0.1:9101}/healthz" ;;
+    film2)    URL="${FILM2_API_URL:-http://127.0.0.1:8090}/healthz" ;;
+    melody)   URL="${MELODY_API_URL:-http://127.0.0.1:7861}/healthz" ;;
+    dsinger)  URL="${SINGER_API_URL:-http://127.0.0.1:7862}/healthz" ;;
+    rvc)      URL="${RVC_API_URL:-http://127.0.0.1:7863}/healthz" ;;
+    vocalfix) URL="${VOCALFIX_API_URL:-http://127.0.0.1:7864}/healthz" ;;
+    sfx)      URL="${SFX_API_URL:-http://127.0.0.1:7866}/healthz" ;;
+    master)   URL="${MASTER_API_URL:-http://127.0.0.1:7865}/healthz" ;;
+    mfa)      URL="${MFA_API_URL:-http://127.0.0.1:7867}/healthz" ;;
+    prosody)  URL="${PROSODY_API_URL:-http://127.0.0.1:7868}/healthz" ;;
+    *)        echo "[gate] unknown service $s"; exit 22 ;;
   esac
   ok=0
   for i in $(seq 1 120); do

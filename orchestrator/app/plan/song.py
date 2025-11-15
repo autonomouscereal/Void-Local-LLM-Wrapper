@@ -147,7 +147,7 @@ async def plan_song_graph(
         + "Use section_ids and motif_ids that are stable and reusable.\n"
     )
 
-    base = os.getenv("QWEN_BASE_URL", "http://ollama_qwen:11434").rstrip("/")
+    base = os.getenv("QWEN_BASE_URL", "http://ollama_qwen:11435").rstrip("/")
     model = os.getenv("QWEN_MODEL_ID", "qwen2.5:14b").strip() or "qwen2.5:14b"
     payload = {"model": model, "prompt": prompt, "stream": False}
     try:

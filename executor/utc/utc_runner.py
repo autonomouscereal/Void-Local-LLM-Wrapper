@@ -9,7 +9,6 @@ import os
 import random
 from urllib.error import HTTPError
 from .schema_fetcher import fetch as fetch_schema
-from .validator import check as validate_args
 from .universal_adapter import repair as repair_args
 from .patch_store import preapply as preapply_patch, persist_success as persist_patch
 from .db import get_pg_pool
@@ -102,19 +101,15 @@ async def utc_run_tool(trace_id: Optional[str], step_id: Optional[str], name: st
     # WS narration start
     await _emit_review_event("review.start", trace_id, step_id, notes={"tool": name})
 
-    # Single global fixer pass (schema-driven), then validate and run
-    v = validate_args(name, attempt_args, schema)
-    # Use the universal adapter once to normalize based on schema/errors
-    decision = repair_args(attempt_args, v.get("errors") or [], schema)
+    # Single global fixer pass (schema-driven), then run (validator disabled)
+    decision = repair_args(attempt_args, [], schema)
     attempt_args = decision.get("fixed_args") or attempt_args
     last_ops = decision.get("ops") or []
     await _emit_review_event("edit.plan", trace_id, step_id, notes=last_ops)
     await _emit_review_event("fixer.summary", trace_id, step_id, notes={"fixer_applied": bool(last_ops), "ops_count": len(last_ops)})
 
-    # Validate once after fixer so required args are present (advisory-only)
+    # Directly execute the tool once via /tool.run (no /tool.validate pre-check).
     base = os.getenv("ORCHESTRATOR_BASE_URL", "http://127.0.0.1:8000")
-    venv = _post(base.rstrip("/") + "/tool.validate", {"name": name, "args": attempt_args})
-    # Do not gate on validator outcome; always execute the tool once.
     attempt_args.setdefault("autofix_422", True)
     res = _post(base.rstrip("/") + "/tool.run", {"name": name, "args": attempt_args, "stream": False})
     if res.get("ok"):

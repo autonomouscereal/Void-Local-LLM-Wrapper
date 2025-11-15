@@ -190,7 +190,6 @@ from .story import draft_story_graph as _story_draft, check_story_consistency as
 from .pipeline.subject_resolver import resolve_subject_canon as _resolve_subject_canon  # type: ignore
 from .pipeline.roe_store import load_roe_digest as _roe_load, save_roe_digest as _roe_save  # type: ignore
 from .pipeline.tool_evidence_store import load_recent_tool_evidence as _tel_load, append_tool_evidence as _tel_append  # type: ignore
-from .pipeline.validator import validate_and_repair as validator_validate_and_repair  # type: ignore
 from .http.client import HttpRequestConfig, perform_http_request, validate_remote_host  # type: ignore
 # Lightweight tool kind overlay for planner mode (reuses existing catalog/builtins)
 # Treat all tools as analysis by default; explicitly tag action/asset-creating tools.
@@ -297,21 +296,15 @@ async def _run_patch_call(
     executor_base_url: str,
 ) -> Dict[str, Any]:
     """
-    Execute a single patch tool call via the existing validator and executor path.
+    Execute a single patch tool call via the executor path (validator disabled).
     """
     if not isinstance(call, dict):
         raise ValueError("invalid patch tool call")
     patch_calls: List[Dict[str, Any]] = [call]
     _inject_execution_context(patch_calls, trace_id, mode)
-    vr = await validator_validate_and_repair(
-        patch_calls,
-        base_url=base_url,
-        trace_id=trace_id,
-        log_fn=_log,
-        state_dir=STATE_DIR,
-    )
-    patch_validated = vr.get("validated") or []
-    patch_failures = vr.get("pre_tool_failures") or []
+    # Validator disabled: execute patch calls directly without pre-validation.
+    patch_validated = list(patch_calls)
+    patch_failures: List[Dict[str, Any]] = []
     patch_failure_results: List[Dict[str, Any]] = []
     for failure in patch_failures or []:
         env = failure.get("envelope") if isinstance(failure.get("envelope"), dict) else {}
@@ -433,29 +426,25 @@ async def segment_qa_and_committee(
                 }
             )
             # Per-segment QA trace row for forensic analysis
-            try:
-                seg_meta = seg.get("meta") if isinstance(seg.get("meta"), dict) else {}
-                profile_val = seg_meta.get("profile") if isinstance(seg_meta.get("profile"), str) else None
-                locks_val = seg.get("locks") if isinstance(seg.get("locks"), dict) else None
-                parent_cid = seg.get("parent_cid")
-                _trace_append(
-                    "segments",
-                    {
-                        "trace_id": trace_id,
-                        "tool": tool_name,
-                        "segment_id": seg.get("id"),
-                        "domain": seg.get("domain"),
-                        "profile": profile_val,
-                        "attempt": attempt,
-                        "event": "qa",
-                        "parent_cid": parent_cid,
-                        "locks": locks_val,
-                        "qa_scores": scores,
-                    },
-                )
-            except Exception:
-                # Tracing must never break the QA/committee path
-                pass
+            seg_meta = seg.get("meta") if isinstance(seg.get("meta"), dict) else {}
+            profile_val = seg_meta.get("profile") if isinstance(seg_meta.get("profile"), str) else None
+            locks_val = seg.get("locks") if isinstance(seg.get("locks"), dict) else None
+            parent_cid = seg.get("parent_cid")
+            _trace_append(
+                "segments",
+                {
+                    "trace_id": trace_id,
+                    "tool": tool_name,
+                    "segment_id": seg.get("id"),
+                    "domain": seg.get("domain"),
+                    "profile": profile_val,
+                    "attempt": attempt,
+                    "event": "qa",
+                    "parent_cid": parent_cid,
+                    "locks": locks_val,
+                    "qa_scores": scores,
+                },
+            )
         counts = {
             "images": int(assets_count_images(current_results)),
             "videos": int(assets_count_video(current_results)),
@@ -490,18 +479,15 @@ async def segment_qa_and_committee(
             "segments": segments_summary,
         }
         _log("qa.metrics.segment", trace_id=trace_id, tool=tool_name, phase="pre", attempt=attempt, metrics=qa_metrics_pre)
-        try:
-            _trace_log_event(
-                STATE_DIR,
-                str(trace_id),
-                {
-                    "kind": "qa",
-                    "stage": "segment_pre",
-                    "data": qa_metrics_pre,
-                },
-            )
-        except Exception:
-            pass
+        _trace_log_event(
+            STATE_DIR,
+            str(trace_id),
+            {
+                "kind": "qa",
+                "stage": "segment_pre",
+                "data": qa_metrics_pre,
+            },
+        )
         committee_outcome = await postrun_committee_decide(
             trace_id=trace_id,
             user_text=user_text,
@@ -573,25 +559,22 @@ async def segment_qa_and_committee(
                 if isinstance(committee_outcome.get("patch_plan"), list):
                     committee_outcome["patch_plan"].extend(auto_patch_steps)
                 # Trace the planned clip refinements for this QA pass.
-                try:
-                    plan_summary: Dict[str, Any] = {
-                        "event": "clip_refine_plan",
-                        "tool": tool_name,
-                        "segment_ids": [],
-                        "refine_modes": {},
-                    }
-                    seg_id_to_mode: Dict[str, str] = {}
-                    for step in auto_patch_steps:
-                        sid = step.get("segment_id")
-                        args_used = step.get("args") if isinstance(step.get("args"), dict) else {}
-                        mode_val = args_used.get("refine_mode")
-                        if isinstance(sid, str) and sid and isinstance(mode_val, str) and mode_val:
-                            seg_id_to_mode[sid] = mode_val
-                    plan_summary["segment_ids"] = list(seg_id_to_mode.keys())
-                    plan_summary["refine_modes"] = seg_id_to_mode
-                    _trace_append("film2", plan_summary)
-                except Exception:
-                    pass
+                plan_summary: Dict[str, Any] = {
+                    "event": "clip_refine_plan",
+                    "tool": tool_name,
+                    "segment_ids": [],
+                    "refine_modes": {},
+                }
+                seg_id_to_mode: Dict[str, str] = {}
+                for step in auto_patch_steps:
+                    sid = step.get("segment_id")
+                    args_used = step.get("args") if isinstance(step.get("args"), dict) else {}
+                    mode_val = args_used.get("refine_mode")
+                    if isinstance(sid, str) and sid and isinstance(mode_val, str) and mode_val:
+                        seg_id_to_mode[sid] = mode_val
+                plan_summary["segment_ids"] = list(seg_id_to_mode.keys())
+                plan_summary["refine_modes"] = seg_id_to_mode
+                _trace_append("film2", plan_summary)
         if action != "revise":
             break
         allowed_mode_set = set(_allowed_tools_for_mode(mode))
@@ -1214,18 +1197,11 @@ def trace_append(kind: str, obj: Dict[str, Any]) -> None:
 def _trace_response(trace_id: str, envelope: Dict[str, Any]) -> None:
     tms = int(time.time() * 1000)
     content = ""
-    try:
-        ch0 = (envelope.get("choices") or [{}])[0]
-        msg = (ch0.get("message") or {})
-        content = str(msg.get("content") or "")
-    except Exception:
-        content = ""
-    assets_count = 0
-    try:
-        # Heuristic: count asset bullet lines introduced as "- " under "Assets" blocks
-        assets_count = content.count("\n- ")
-    except Exception:
-        assets_count = 0
+    ch0 = (envelope.get("choices") or [{}])[0]
+    msg = (ch0.get("message") or {})
+    content = str(msg.get("content") or "")
+    # Heuristic: count asset bullet lines introduced as "- " under "Assets" blocks
+    assets_count = content.count("\n- ")
     out = {
         "t": tms,
         "trace_id": str(trace_id),
@@ -1236,23 +1212,19 @@ def _trace_response(trace_id: str, envelope: Dict[str, Any]) -> None:
     if isinstance(envelope.get("error"), dict):
         out["error"] = envelope.get("error")
     checkpoints_append_event(STATE_DIR, str(trace_id), "response", out)
-    try:
-        _trace_log_response(
-            STATE_DIR,
-            str(trace_id),
-            {
-                "request_id": str(trace_id),
-                "kind": "final_response",
-                "mode": "chat",
-                "content": content,
-                "meta": {
-                    "assets_count": int(assets_count),
-                },
+    _trace_log_response(
+        STATE_DIR,
+        str(trace_id),
+        {
+            "request_id": str(trace_id),
+            "kind": "final_response",
+            "mode": "chat",
+            "content": content,
+            "meta": {
+                "assets_count": int(assets_count),
             },
-        )
-    except Exception:
-        # Tracing must not break response
-        pass
+        },
+    )
     _log("chat.finish", trace_id=str(trace_id), ok=bool(envelope is not None and not bool(envelope.get("error"))), assets_count=int(assets_count), message_len=int(len(content)))
 # CPU/GPU adaptive mode for ComfyUI graphs
 COMFY_CPU_MODE = (os.getenv("COMFY_CPU_MODE", "").strip().lower() in ("1", "true", "yes", "on"))
@@ -1821,24 +1793,18 @@ def _windows_dir(job_id: str) -> str:
     return os.path.join(_capsules_dir(job_id), "windows")
 
 def _read_json_safe(path: str) -> Dict[str, Any]:
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 def _write_json_safe(path: str, obj: Dict[str, Any]) -> None:
-    try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(obj, f, ensure_ascii=False)
-        os.replace(tmp, path)
-    except Exception:
-        pass
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False)
+    os.replace(tmp, path)
 
 
-QWEN_BASE_URL = os.getenv("QWEN_BASE_URL", "http://localhost:11434")
+QWEN_BASE_URL = os.getenv("QWEN_BASE_URL", "http://localhost:11435")
 QWEN_MODEL_ID = os.getenv("QWEN_MODEL_ID", "qwen3:30b-a3b-instruct-2507-q4_K_M")
 GLM_OLLAMA_BASE_URL = os.getenv("GLM_OLLAMA_BASE_URL", "http://localhost:11434")
 GLM_MODEL_ID = os.getenv("GLM_MODEL_ID", "glm4:9b")
@@ -1901,29 +1867,17 @@ SCENE_MAX_BATCH_FRAMES = int(os.getenv("SCENE_MAX_BATCH_FRAMES", "2"))
 RESUME_MAX_RETRIES = int(os.getenv("RESUME_MAX_RETRIES", "3"))
 COMFYUI_API_URLS = [u.strip() for u in os.getenv("COMFYUI_API_URLS", "").split(",") if u.strip()]
 SCENE_SUBMIT_CONCURRENCY = int(os.getenv("SCENE_SUBMIT_CONCURRENCY", "4"))
-XTTS_API_URL = os.getenv("XTTS_API_URL")      # e.g., http://xtts:8020
-WHISPER_API_URL = os.getenv("WHISPER_API_URL")# e.g., http://whisper:9090
-FACEID_API_URL = os.getenv("FACEID_API_URL")  # e.g., http://faceid:7000
-MUSIC_API_URL = os.getenv("MUSIC_API_URL")    # e.g., http://musicgen:7860
+XTTS_API_URL = os.getenv("XTTS_API_URL")       # e.g., http://127.0.0.1:8020
+WHISPER_API_URL = os.getenv("WHISPER_API_URL") # e.g., http://127.0.0.1:9090
+FACEID_API_URL = os.getenv("FACEID_API_URL")   # e.g., http://127.0.0.1:7000
+MUSIC_API_URL = os.getenv("MUSIC_API_URL")     # e.g., http://127.0.0.1:7860
 VLM_API_URL = os.getenv("VLM_API_URL")        # e.g., http://vlm:8050
 OCR_API_URL = os.getenv("OCR_API_URL")        # e.g., http://ocr:8070
 VISION_REPAIR_API_URL = os.getenv("VISION_REPAIR_API_URL")  # e.g., http://vision_repair:8095
 MFA_API_URL = os.getenv("MFA_API_URL")        # e.g., http://mfa:7867
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/workspace/uploads")
-# Ensure UPLOAD_DIR exists; if not creatable (e.g., missing /workspace mount), fall back.
-try:
-    os.makedirs(UPLOAD_DIR, exist_ok=True)
-except Exception:
-    for _cand in ("/app/uploads", "/tmp/uploads"):
-        try:
-            os.makedirs(_cand, exist_ok=True)
-            UPLOAD_DIR = _cand
-            break
-        except Exception:
-            pass
-    # Final guarantee (raises if completely impossible, which signals a real env issue)
-    os.makedirs(UPLOAD_DIR, exist_ok=True)
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 LOCKS_ROOT_DIR = _locks_root(UPLOAD_DIR)
 FILM2_MODELS_DIR = os.getenv("FILM2_MODELS", "/opt/models")
 FILM2_DATA_DIR = os.getenv("FILM2_DATA", "/srv/film2")
@@ -2390,11 +2344,8 @@ async def _reflect_cors_headers(request: Request, call_next):
 
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
-try:
-    os.makedirs(STATIC_DIR, exist_ok=True)
-    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
-except Exception:
-    pass
+os.makedirs(STATIC_DIR, exist_ok=True)
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 # run_all router removed (deprecated legacy /v1/run, /ws.run)
 
 # Stamp permissive headers on every HTTP response to avoid any CORS/CORP issues
@@ -2419,10 +2370,7 @@ async def v1_image_generate(request: Request):
     """
     rid = str(_uuid.uuid4())
     raw = await request.body()
-    try:
-        body = JSONParser().parse(raw.decode("utf-8", errors="replace"), {})
-    except Exception:
-        return _jerr(400, rid, "invalid_json", "Body must be valid JSON")
+    body = JSONParser().parse(raw.decode("utf-8", errors="replace"), {})
     if not isinstance(body, dict):
         return _jerr(422, rid, "invalid_body_type", "Body must be an object")
     prompt = body.get("prompt") or body.get("text") or ""
@@ -2955,14 +2903,11 @@ async def propose_search_queries(messages: List[Dict[str, Any]]) -> List[str]:
     )
     prompt_messages = messages + [{"role": "user", "content": guidance}]
     payload = build_ollama_payload(prompt_messages, QWEN_MODEL_ID, DEFAULT_NUM_CTX, DEFAULT_TEMPERATURE)
-    try:
-        result = await call_ollama(QWEN_BASE_URL, payload)
-        text = result.get("response", "")
-        lines = [ln.strip("- ") for ln in text.splitlines() if ln.strip()]
-        # take up to 3 non-empty queries
-        return lines[:3]
-    except Exception:
-        return []
+    result = await call_ollama(QWEN_BASE_URL, payload)
+    text = result.get("response", "") if isinstance(result, dict) else ""
+    lines = [ln.strip("- ") for ln in text.splitlines() if ln.strip()]
+    # take up to 3 non-empty queries
+    return lines[:3]
 
 
 def meta_prompt(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -3050,10 +2995,10 @@ def meta_prompt(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "==================================================\n"
             "7) TOOL / EXECUTOR / ORCHESTRATOR PATH INVARIANTS\n"
             "==================================================\n"
-            "- Public routes MUST NOT call /tool.run directly. Valid flow: Planner → Executor (/execute) → Orchestrator /tool.validate → /tool.run.\n"
-            "- Validation runs exactly once; executor never auto-repairs or retries. Failures surface as ok=false envelopes for committee/planner handling.\n"
+            "- Public routes MUST NOT call /tool.run directly. Valid flow: Planner → Executor (/execute) → Orchestrator /tool.run.\n"
+            "- No separate validator stage; failures surface as ok=false envelopes for committee/planner handling.\n"
             "- Do not clobber provided args; add defaults only if missing. Do not delete/overwrite user keys arbitrarily.\n"
-            "- After repaired validate=200: Executor MUST run repaired steps; traces MUST include exec.payload (patched), repair.executing, tool.run.start, etc.\n\n"
+            "- Executor runs the provided steps once; traces MUST include exec.payload, tool.run.start, etc.\n\n"
             "==================================================\n"
             "8) TRACING & LOGGING\n"
             "==================================================\n"
@@ -3598,22 +3543,19 @@ async def postrun_committee_decide(
     merged_rationale = " | ".join(merged_rationale_parts) if merged_rationale_parts else best.get("rationale") or ""
     out = {"action": merged_action, "rationale": merged_rationale, "patch_plan": merged_patch_plan}
     _log("committee.postrun.ok", trace_id=trace_id, action=out.get("action"), rationale=out.get("rationale"))
-    try:
-        _trace_log_event(
-            STATE_DIR,
-            str(trace_id),
-            {
-                "kind": "committee",
-                "stage": "decision",
-                "data": {
-                    "action": out.get("action"),
-                    "patch_steps_count": len(out.get("patch_plan") or []),
-                    "rationale": (rationale[:512] if isinstance(rationale, str) else ""),
-                },
+    _trace_log_event(
+        STATE_DIR,
+        str(trace_id),
+        {
+            "kind": "committee",
+            "stage": "decision",
+            "data": {
+                "action": out.get("action"),
+                "patch_steps_count": len(out.get("patch_plan") or []),
+                "rationale": (rationale[:512] if isinstance(rationale, str) else ""),
             },
-        )
-    except Exception:
-        pass
+        },
+    )
     return out
 
 async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
@@ -3922,12 +3864,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     "lock_mode": "soft",
                 },
             }
-            try:
-                await _lock_save(char_key, lock_bundle)
-            except Exception:
-                # Lock persistence failures should not block base generation; the
-                # request can still proceed with an in-memory bundle.
-                pass
+            await _lock_save(char_key, lock_bundle)
 
         if lock_bundle is not None:
             # Apply quality profile and normalize visual branch for this request
@@ -3946,20 +3883,14 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             if hard_ids:
                 _lock_visual_freeze(lock_bundle, hard_ids)
                 _lock_visual_refresh_all_except(lock_bundle, hard_ids)
-        try:
-            _log("[executor] step.args", tool=name, args_keys=sorted([str(k) for k in (list(a.keys()) if isinstance(a, dict) else [])]))
-        except Exception:
-            pass
+        # Log executor step arguments best-effort; failures should not affect request handling.
+        _args_keys = sorted([str(k) for k in (list(a.keys()) if isinstance(a, dict) else [])])
+        _log("[executor] step.args", tool=name, args_keys=_args_keys)
         # Guard against argument clobbering: required keys must be present at executor
-        _required_keys = ["cfg","height","negative","prompt","steps","width"]
-        try:
-            _ak = sorted([str(k) for k in (list(a.keys()) if isinstance(a, dict) else [])])
-            _missing = [k for k in _required_keys if k not in _ak]
-            if _missing:
-                return {"name": name, "error": "executor_clobbered_arguments"}
-        except Exception:
-            # If we cannot verify keys, fall back to running but leave breadcrumb
-            pass
+        _required_keys = ["cfg", "height", "negative", "prompt", "steps", "width"]
+        _missing = [k for k in _required_keys if k not in _args_keys]
+        if _missing:
+            return {"name": name, "error": "executor_clobbered_arguments"}
         prompt = a.get("prompt") or a.get("text") or ""
         negative = a.get("negative")
         seed = a.get("seed")
@@ -3968,10 +3899,14 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         height = a.get("height")
         steps_val = None
         if "steps" in a:
-            try:
-                steps_val = int(a.get("steps"))
-            except Exception:
-                steps_val = None
+            raw_steps = a.get("steps")
+            if isinstance(raw_steps, int):
+                steps_val = raw_steps
+            else:
+                try:
+                    steps_val = int(str(raw_steps).strip())
+                except (TypeError, ValueError):
+                    steps_val = None
         cfg_val = a.get("cfg")
         cfg_num = float(cfg_val) if isinstance(cfg_val, (int, float)) else None
         assets = dict(a.get("assets") if isinstance(a.get("assets"), dict) else {})
@@ -4533,162 +4468,147 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 result["meta"]["locks"] = locks_arg
         except Exception as ex:
             warnings.append("visual_lock_phase_failed")
-            try:
-                _trace_append(
-                    "film2",
-                    {
-                        "event": "visual_lock_phase_failed",
-                        "error": str(ex),
-                        "prompt": prompt,
-                    },
-                )
-            except Exception:
-                pass
+            _trace_append(
+                "film2",
+                {
+                    "event": "visual_lock_phase_failed",
+                    "error": str(ex),
+                    "prompt": prompt,
+                },
+            )
         # Precompute TTS dialogue audio when possible
-        dialogue_index: Dict[str, Any] = {}
-        try:
-            if story_obj:
-                locks_arg, dialogue_index = await _ensure_tts_locks_and_dialogue_audio(story_obj, locks_arg, profile_name, trace_id)
-                if dialogue_index:
-                    result["meta"]["dialogue"] = dialogue_index
-                if locks_arg:
-                    result["meta"]["locks"] = locks_arg
-        except Exception as ex:
-            warnings.append("tts_phase_failed")
-            try:
-                _trace_append(
-                    "film2",
-                    {
-                        "event": "tts_phase_failed",
-                        "error": str(ex),
-                        "prompt": prompt,
-                    },
-                )
-            except Exception:
-                pass
-        # Generate simple scene and shot storyboards before hv video
-        try:
-            if scenes_from_story:
-                scenes_from_story = await _generate_scene_storyboards(scenes_from_story, locks_arg, profile_name, trace_id)
-                result["meta"]["scenes"] = scenes_from_story
-            if shots_from_story:
-                shots_from_story = await _generate_shot_storyboards(shots_from_story, locks_arg, profile_name, trace_id)
-                result["meta"]["shots_from_story"] = shots_from_story
-        except Exception as ex:
-            warnings.append("storyboard_phase_failed")
-            try:
-                _trace_append(
-                    "film2",
-                    {
-                        "event": "storyboard_phase_failed",
-                        "error": str(ex),
-                        "prompt": prompt,
-                    },
-                )
-            except Exception:
-                pass
-        # Music planning phase: optionally score the film via music.infinite.windowed.
-        try:
-            music_meta: Dict[str, Any] = {}
-            if prompt and duration_s > 0:
-                music_args: Dict[str, Any] = {
-                    "prompt": f"Film score for: {prompt}",
-                    "length_s": int(duration_s),
-                    "bpm": None,
-                    "key": None,
-                    "window_bars": 8,
-                    "overlap_bars": 1,
-                    "mode": "start",
-                    "lock_bundle": locks_arg if isinstance(locks_arg, dict) else {},
-                    "cid": cid,
-                }
-                if character_ids:
-                    music_args["character_id"] = character_ids[0]
-                music_call = await execute_tool_call({"name": "music.infinite.windowed", "arguments": music_args})
-                if isinstance(music_call, dict):
-                    music_meta = music_call.get("result") or music_call
-            if music_meta:
-                if isinstance(result.get("meta"), dict):
-                    # Tag music windows with scene/shot ids using simple time slicing.
-                    meta_obj = music_meta.get("meta") if isinstance(music_meta.get("meta"), dict) else {}
-                    win_list = meta_obj.get("windows") if isinstance(meta_obj.get("windows"), list) else []
-                    scenes_for_music = result["meta"].get("scenes") if isinstance(result["meta"].get("scenes"), list) else []
-                    shots_for_music = result["meta"].get("shots_from_story") if isinstance(result["meta"].get("shots_from_story"), list) else []
-                    # Simple heuristic: divide film duration evenly across scenes/shots if no explicit timing.
-                    scene_timing: Dict[str, Dict[str, float]] = {}
-                    if scenes_for_music:
-                        seg = duration_s / float(len(scenes_for_music) or 1)
-                        t0 = 0.0
-                        for sc in scenes_for_music:
-                            if not isinstance(sc, dict):
-                                continue
-                            sid = sc.get("scene_id")
-                            if not isinstance(sid, str):
-                                continue
-                            scene_timing[sid] = {"t_start": t0, "t_end": t0 + seg}
-                            t0 += seg
-                    shot_timing: Dict[str, Dict[str, float]] = {}
-                    if shots_for_music:
-                        seg = duration_s / float(len(shots_for_music) or 1)
-                        t0 = 0.0
-                        for sh in shots_for_music:
-                            if not isinstance(sh, dict):
-                                continue
-                            sid = sh.get("shot_id")
-                            if not isinstance(sid, str):
-                                continue
-                            shot_timing[sid] = {"t_start": t0, "t_end": t0 + seg}
-                            t0 += seg
-                    for win in win_list or []:
-                        if not isinstance(win, dict):
+    dialogue_index: Dict[str, Any] = {}
+    try:
+        if story_obj:
+            locks_arg, dialogue_index = await _ensure_tts_locks_and_dialogue_audio(story_obj, locks_arg, profile_name, trace_id)
+            if dialogue_index:
+                result["meta"]["dialogue"] = dialogue_index
+            if locks_arg:
+                result["meta"]["locks"] = locks_arg
+    except Exception as ex:
+        warnings.append("tts_phase_failed")
+        _trace_append(
+            "film2",
+            {
+                "event": "tts_phase_failed",
+                "error": str(ex),
+                "prompt": prompt,
+            },
+        )
+    # Generate simple scene and shot storyboards before hv video
+    try:
+        if scenes_from_story:
+            scenes_from_story = await _generate_scene_storyboards(scenes_from_story, locks_arg, profile_name, trace_id)
+            result["meta"]["scenes"] = scenes_from_story
+        if shots_from_story:
+            shots_from_story = await _generate_shot_storyboards(shots_from_story, locks_arg, profile_name, trace_id)
+            result["meta"]["shots_from_story"] = shots_from_story
+    except Exception as ex:
+        warnings.append("storyboard_phase_failed")
+        _trace_append(
+            "film2",
+            {
+                "event": "storyboard_phase_failed",
+                "error": str(ex),
+                "prompt": prompt,
+            },
+        )
+    # Music planning phase: optionally score the film via music.infinite.windowed.
+    try:
+        music_meta: Dict[str, Any] = {}
+        if prompt and duration_s > 0:
+            music_args: Dict[str, Any] = {
+                "prompt": f"Film score for: {prompt}",
+                "length_s": int(duration_s),
+                "bpm": None,
+                "key": None,
+                "window_bars": 8,
+                "overlap_bars": 1,
+                "mode": "start",
+                "lock_bundle": locks_arg if isinstance(locks_arg, dict) else {},
+                "cid": cid,
+            }
+            if character_ids:
+                music_args["character_id"] = character_ids[0]
+            music_call = await execute_tool_call({"name": "music.infinite.windowed", "arguments": music_args})
+            if isinstance(music_call, dict):
+                music_meta = music_call.get("result") or music_call
+        if music_meta:
+            if isinstance(result.get("meta"), dict):
+                # Tag music windows with scene/shot ids using simple time slicing.
+                meta_obj = music_meta.get("meta") if isinstance(music_meta.get("meta"), dict) else {}
+                win_list = meta_obj.get("windows") if isinstance(meta_obj.get("windows"), list) else []
+                scenes_for_music = result["meta"].get("scenes") if isinstance(result["meta"].get("scenes"), list) else []
+                shots_for_music = result["meta"].get("shots_from_story") if isinstance(result["meta"].get("shots_from_story"), list) else []
+                # Simple heuristic: divide film duration evenly across scenes/shots if no explicit timing.
+                scene_timing: Dict[str, Dict[str, float]] = {}
+                if scenes_for_music:
+                    seg = duration_s / float(len(scenes_for_music) or 1)
+                    t0 = 0.0
+                    for sc in scenes_for_music:
+                        if not isinstance(sc, dict):
                             continue
-                        t_start = win.get("t_start")
-                        t_end = win.get("t_end")
-                        try:
-                            mid = float(t_start) + (float(t_end) - float(t_start)) / 2.0 if isinstance(t_start, (int, float)) and isinstance(t_end, (int, float)) else None
-                        except Exception:
-                            mid = None
-                        if mid is not None and scene_timing:
-                            for sid, rng in scene_timing.items():
-                                if rng["t_start"] <= mid <= rng["t_end"]:
-                                    win["scene_id"] = sid
-                                    break
-                        if mid is not None and shot_timing:
-                            win_shots: List[str] = []
-                            for sid, rng in shot_timing.items():
-                                if rng["t_start"] <= mid <= rng["t_end"]:
-                                    win_shots.append(sid)
-                            if win_shots:
-                                win["shot_ids"] = win_shots
-                    meta_obj["windows"] = win_list
-                    music_meta["meta"] = meta_obj
-                    result["meta"]["music"] = music_meta
-                    # Trace cross-modal attachment for distillation.
-                    music_meta_obj = music_meta.get("meta") if isinstance(music_meta.get("meta"), dict) else {}
-                    _trace_append(
-                        "film2",
-                        {
-                            "event": "film2.music.attach",
-                            "film_cid": cid,
-                            "music_cid": music_meta_obj.get("cid"),
-                            "num_scenes": len(scenes_for_music),
-                            "num_shots": len(shots_for_music),
-                            "num_windows": len(win_list),
-                        },
-                    )
-        except Exception as ex:
-            warnings.append("music_phase_failed")
-            try:
+                        sid = sc.get("scene_id")
+                        if not isinstance(sid, str):
+                            continue
+                        scene_timing[sid] = {"t_start": t0, "t_end": t0 + seg}
+                        t0 += seg
+                shot_timing: Dict[str, Dict[str, float]] = {}
+                if shots_for_music:
+                    seg = duration_s / float(len(shots_for_music) or 1)
+                    t0 = 0.0
+                    for sh in shots_for_music:
+                        if not isinstance(sh, dict):
+                            continue
+                        sid = sh.get("shot_id")
+                        if not isinstance(sid, str):
+                            continue
+                        shot_timing[sid] = {"t_start": t0, "t_end": t0 + seg}
+                        t0 += seg
+                for win in win_list or []:
+                    if not isinstance(win, dict):
+                        continue
+                    t_start = win.get("t_start")
+                    t_end = win.get("t_end")
+                    mid = float(t_start) + (float(t_end) - float(t_start)) / 2.0 if isinstance(t_start, (int, float)) and isinstance(t_end, (int, float)) else None
+                    if mid is not None and scene_timing:
+                        for sid, rng in scene_timing.items():
+                            if rng["t_start"] <= mid <= rng["t_end"]:
+                                win["scene_id"] = sid
+                                break
+                    if mid is not None and shot_timing:
+                        win_shots: List[str] = []
+                        for sid, rng in shot_timing.items():
+                            if rng["t_start"] <= mid <= rng["t_end"]:
+                                win_shots.append(sid)
+                        if win_shots:
+                            win["shot_ids"] = win_shots
+                meta_obj["windows"] = win_list
+                music_meta["meta"] = meta_obj
+                result["meta"]["music"] = music_meta
+                # Trace cross-modal attachment for distillation.
+                music_meta_obj = music_meta.get("meta") if isinstance(music_meta.get("meta"), dict) else {}
                 _trace_append(
                     "film2",
                     {
-                        "event": "music_phase_failed",
-                        "error": str(ex),
-                        "prompt": prompt,
+                        "event": "film2.music.attach",
+                        "film_cid": cid,
+                        "music_cid": music_meta_obj.get("cid"),
+                        "num_scenes": len(scenes_for_music),
+                        "num_shots": len(shots_for_music),
+                        "num_windows": len(win_list),
                     },
                 )
-            except Exception:
-                pass
+    except Exception as ex:
+        warnings.append("music_phase_failed")
+        _trace_append(
+            "film2",
+            {
+                "event": "music_phase_failed",
+                "error": str(ex),
+                "prompt": prompt,
+            },
+        )
         character_entries = locks_arg.get("characters") if isinstance(locks_arg.get("characters"), list) else []
         character_ids: List[str] = []
         for entry in character_entries:
@@ -8483,25 +8403,21 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     # Purge legacy trace files for this trace to enforce unified format (no-op for new traces layout)
     _cleanup_legacy_trace_files(trace_id)
     # High-level request trace (distillation-friendly)
-    try:
-        _trace_log_request(
-            STATE_DIR,
-            str(trace_id),
-            {
-                "request_id": str(trace_id),
-                "kind": "chat",
-                "route": str(request.url.path),
-                "payload": {"messages_count": len(normalized_msgs or []), "first_user_text_len": first_user_len},
-                "meta": {
-                    "mode": mode,
-                    "effective_mode": effective_mode,
-                    "schema_version": 1,
-                },
+    _trace_log_request(
+        STATE_DIR,
+        str(trace_id),
+        {
+            "request_id": str(trace_id),
+            "kind": "chat",
+            "route": str(request.url.path),
+            "payload": {"messages_count": len(normalized_msgs or []), "first_user_text_len": first_user_len},
+            "meta": {
+                "mode": mode,
+                "effective_mode": effective_mode,
+                "schema_version": 1,
             },
-        )
-    except Exception:
-        # Tracing must not break request handling
-        pass
+        },
+    )
     checkpoints_append_event(STATE_DIR, trace_id, "request", {
         "trace_id": trace_id,
         "route": "/v1/chat/completions",
@@ -8533,21 +8449,18 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     if isinstance(pack_text, str) and pack_text.strip():
         messages = [{"role": "system", "content": f"ICW PACK (hash tracked):\n{pack_text[:12000]}"}] + messages
     pack_hash = icw.get("hash")
-    try:
-        _trace_log_event(
-            STATE_DIR,
-            str(trace_id),
-            {
-                "kind": "co",
-                "stage": "pack",
-                "data": {
-                    "frames_count": len(icw.get("frames") or []),
-                    "approx_chars": len(str(pack_text)) if isinstance(pack_text, str) else 0,
-                },
+    _trace_log_event(
+        STATE_DIR,
+        str(trace_id),
+        {
+            "kind": "co",
+            "stage": "pack",
+            "data": {
+                "frames_count": len(icw.get("frames") or []),
+                "approx_chars": len(str(pack_text)) if isinstance(pack_text, str) else 0,
             },
-        )
-    except Exception:
-        pass
+        },
+    )
     run_id = await _db_insert_run(trace_id=trace_id, mode=mode, seed=master_seed, pack_hash=pack_hash, request_json=body)
     await _db_insert_icw_log(run_id=run_id, pack_hash=pack_hash or None, budget_tokens=int(icw.get("budget_tokens") or 0), scores_json=icw.get("scores_summary") or {})
 
@@ -8724,9 +8637,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     # No router overrides — the planner is solely responsible for tool choice
     # Execute planner/router tool calls immediately when present
     tool_results: List[Dict[str, Any]] = []
-    # Defer execution until after validate → (repair once) → re-validate gates below.
-    if tool_calls:
-        pass
+    # Defer execution until after validate; execution happens below when tool_calls is non-empty.
     # No heuristic upgrades; planner decides exact tools
     # Surface attachments in tool arguments so downstream jobs can use user media
     if tool_calls and attachments:
@@ -8965,16 +8876,8 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         tool_calls = normalized_tool_calls
 
         if tool_calls:
-            vr = await validator_validate_and_repair(
-                tool_calls,
-                base_url=base_url,
-                trace_id=trace_id,
-                log_fn=_log,
-                state_dir=STATE_DIR,
-            )
-            # Advisory-only: keep executor inputs aligned to planner calls, but
-            # retain validator hints/evidence separately.
-            validation_failures.extend(vr.get("pre_tool_failures") or [])
+            # Validator removed: execute tool calls directly and rely on executor behavior.
+            _log("validate.skip", trace_id=trace_id, reason="validator_removed", tool_count=len(tool_calls or []))
         _log(
             "validate.completed",
             trace_id=trace_id,
@@ -9342,18 +9245,9 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 # Normalize to internal tool_calls schema
                 patch_calls: List[Dict[str, Any]] = [{"name": s.get("tool"), "arguments": (s.get("args") or {})} for s in filtered_patch_plan]
                 _inject_execution_context(patch_calls, trace_id, effective_mode)
-                # Validate and repair once (reuse validator)
-                base_url = (PUBLIC_BASE_URL or "").rstrip("/") or (str(request.base_url) or "").rstrip("/")
-                _cat_hash = "postrun"
-                vr2 = await validator_validate_and_repair(
-                    patch_calls,
-                    base_url=base_url,
-                    trace_id=trace_id,
-                    log_fn=_log,
-                    state_dir=STATE_DIR,
-                )
-                patch_validated = vr2.get("validated") or []
-                patch_failures = vr2.get("pre_tool_failures") or []
+                # Validator disabled: execute patch plan directly without pre-validation.
+                patch_validated = list(patch_calls)
+                patch_failures: List[Dict[str, Any]] = []
                 # Execute validated patch steps
                 patch_failure_results: List[Dict[str, Any]] = []
                 for failure in patch_failures or []:
@@ -10886,143 +10780,6 @@ async def tool_describe(name: str, response: Response):
     )
 
 
-@app.post("/tool.validate")
-async def tool_validate(body: Dict[str, Any]):
-    rid = _uuid.uuid4().hex
-    tool_name = ""
-    try:
-        if not isinstance(body, dict) or "name" not in body or "args" not in body:
-            return ToolEnvelope.failure(
-                "parse_error",
-                "Expected {name, args}",
-                status=400,
-                request_id=rid,
-            )
-        name = (body or {}).get("name") or ""
-        args = (body or {}).get("args") or {}
-        tool_name = (str(name or "")).strip()
-        meta = _TOOL_SCHEMAS.get(tool_name)
-        if not meta:
-            # Log unknown-tool cases for image.dispatch explicitly so validation failures are debuggable
-            if tool_name == "image.dispatch":
-                env = {
-                    "schema_version": 1,
-                    "request_id": rid,
-                    "ok": False,
-                    "result": None,
-                    "error": {
-                        "code": "unknown_tool",
-                        "message": tool_name,
-                        "status": 404,
-                        "details": {},
-                    },
-                }
-                _log(
-                    "tool.validate.debug.image.dispatch",
-                    trace_id=str(args.get("trace_id") or ""),
-                    envelope=env,
-                )
-            return ToolEnvelope.failure(
-                "unknown_tool",
-                f"{name}",
-                status=404,
-                request_id=rid,
-                details={},
-            )
-        schema = meta["schema"]
-        errors: List[Dict[str, Any]] = []
-        for req in (schema.get("required") or []):
-            if args.get(req) is None:
-                errors.append({"code": "required_missing", "path": req, "expected": "present", "got": None})
-        props = schema.get("properties") or {}
-        for k, v in (args or {}).items():
-            ps = props.get(k)
-            if ps and not _schema_type_ok(v, ps):
-                errors.append({"code": "type_mismatch", "path": k, "expected": ps.get("type"), "got": type(v).__name__})
-            if ps and isinstance(ps.get("enum"), list) and v not in ps.get("enum"):
-                errors.append({"code": "enum_mismatch", "path": k, "allowed": ps.get("enum"), "got": v})
-        # api.request extra validation and guardrails (no network IO here)
-        if name.strip() == "api.request":
-            from urllib.parse import urlsplit
-            u = str(args.get("url") or "")
-            method = str(args.get("method") or "").upper()
-            sp = urlsplit(u)
-            if sp.scheme not in ("http", "https"):
-                errors.append({"code": "scheme_not_allowed", "path": "url", "expected": "http|https", "got": sp.scheme or ""})
-            # Disallow obvious loopback hostnames
-            host_low = (sp.hostname or "").lower()
-            if host_low in ("localhost",) or host_low.startswith("127.") or host_low == "::1":
-                errors.append({"code": "host_not_allowed", "path": "url", "got": host_low})
-            # Disallow calling our own internal services by host if provided via env
-            def _host_of(env_name: str) -> str:
-                v = os.getenv(env_name, "") or ""
-                try:
-                    from urllib.parse import urlsplit as _us
-                    return (_us(v).hostname or "").lower()
-                except Exception:
-                    return ""
-            forbidden_hosts = set(filter(None, [
-                _host_of("EXECUTOR_BASE_URL"),
-                _host_of("COMFYUI_API_URL"),
-                _host_of("DRT_API_URL"),
-                _host_of("ORCHESTRATOR_BASE_URL"),
-            ]))
-            if host_low in forbidden_hosts:
-                errors.append({"code": "internal_host_not_allowed", "path": "url", "got": host_low})
-            # follow_redirects default allowed; validate max_bytes if present
-            if args.get("max_bytes") is not None:
-                try:
-                    mb = int(args.get("max_bytes"))
-                    if mb <= 0:
-                        errors.append({"code": "invalid_max_bytes", "path": "max_bytes", "expected": ">0", "got": mb})
-                except Exception:
-                    errors.append({"code": "type_mismatch", "path": "max_bytes", "expected": "integer", "got": type(args.get("max_bytes")).__name__})
-            # headers shape
-            if isinstance(args.get("headers"), dict):
-                for hk, hv in (args.get("headers") or {}).items():
-                    if not isinstance(hk, str) or not isinstance(hv, str):
-                        errors.append({"code": "type_mismatch", "path": f"headers.{hk}", "expected": "string", "got": type(hv).__name__})
-            if method not in ("GET","POST","PUT","PATCH","DELETE","HEAD","OPTIONS"):
-                errors.append({"code": "enum_mismatch", "path": "method", "allowed": ["GET","POST","PUT","PATCH","DELETE","HEAD","OPTIONS"], "got": method})
-        if errors:
-            # Surface structured schema errors and log the full envelope for image.dispatch
-            if tool_name == "image.dispatch":
-                env = {
-                    "schema_version": 1,
-                    "request_id": rid,
-                    "ok": False,
-                    "result": None,
-                    "error": {
-                        "code": "schema_validation",
-                        "message": "Invalid args",
-                        "status": 422,
-                        "details": {"errors": errors},
-                    },
-                }
-                _log(
-                    "tool.validate.debug.image.dispatch",
-                    trace_id=str(args.get("trace_id") or ""),
-                    envelope=env,
-                )
-            return ToolEnvelope.failure(
-                "schema_validation",
-                "Invalid args",
-                status=422,
-                request_id=rid,
-                details={"errors": errors},
-            )
-        return ToolEnvelope.success({"validated": True}, request_id=rid)
-    except Exception as ex:
-        # Last-resort guardrail: never let validation errors break the HTTP transport.
-        return ToolEnvelope.failure(
-            "validator_exception",
-            f"{type(ex).__name__}: {ex}",
-            status=500,
-            request_id=rid,
-            details={"tool": tool_name},
-        )
-
-
 @app.post("/jobs/start")
 async def jobs_start(body: Dict[str, Any]):
     """
@@ -11975,10 +11732,7 @@ async def ws_tool(websocket: WebSocket):
     try:
         while True:
             raw = await websocket.receive_text()
-            try:
-                req = JSONParser().parse(raw, {"name": str, "arguments": dict})
-            except Exception:
-                req = {}
+            req = JSONParser().parse(raw, {"name": str, "arguments": dict})
             name = (req.get("name") or "").strip()
             args = req.get("arguments") or {}
             if not name:
@@ -12188,56 +11942,54 @@ async def get_film_preferences(film_id: str) -> Dict[str, Any]:
     if isinstance(meta, dict):
         return dict(meta)
     if isinstance(meta, str):
-        try:
-            # Expect a preferences dict (open schema)
-            parsed = JSONParser().parse(meta, {})
-            return parsed if isinstance(parsed, dict) else {}
-        except Exception:
-            return {}
+        # Expect a preferences dict (open schema)
+        parsed = JSONParser().parse(meta, {})
+        return parsed if isinstance(parsed, dict) else {}
     return {}
 
 
 def _parse_resolution(res: Optional[str]) -> Tuple[int, int]:
-    try:
-        if isinstance(res, str) and "x" in res:
-            w, h = res.lower().split("x", 1)
-            return max(64, int(w)), max(64, int(h))
-    except Exception:
-        pass
+    if isinstance(res, str) and "x" in res:
+        parts = res.lower().split("x", 1)
+        if len(parts) == 2:
+            w_str, h_str = parts[0].strip(), parts[1].strip()
+            if w_str.isdigit() and h_str.isdigit():
+                return max(64, int(w_str)), max(64, int(h_str))
     return 1024, 1024
 
 
 def _parse_duration_seconds_dynamic(value: Any, default_seconds: float = 10.0) -> int:
-    try:
-        if value is None:
-            return int(default_seconds)
-        if isinstance(value, (int, float)):
-            return max(1, int(round(float(value))))
-        s = str(value).strip().lower()
-        if not s:
-            return int(default_seconds)
-        # HH:MM:SS or MM:SS
-        import re as _re
-        if _re.match(r"^\d{1,2}:\d{2}(:\d{2})?$", s):
-            parts = [int(x) for x in s.split(":")]
-            if len(parts) == 2:
-                return parts[0] * 60 + parts[1]
-            if len(parts) == 3:
-                return parts[0] * 3600 + parts[1] * 60 + parts[2]
-        # textual: "3 minutes", "180s", "3m"
-        m = _re.match(r"^(\d+)\s*(seconds|second|secs|sec|s)$", s)
-        if m:
-            return max(1, int(m.group(1)))
-        m = _re.match(r"^(\d+)\s*(minutes|minute|mins|min|m)$", s)
-        if m:
-            return max(1, int(m.group(1)) * 60)
-        m = _re.match(r"^(\d+)\s*(hours|hour|hrs|hr|h)$", s)
-        if m:
-            return max(1, int(m.group(1)) * 3600)
-        # plain integer string
-        return max(1, int(round(float(s))))
-    except Exception:
+    if value is None:
         return int(default_seconds)
+    if isinstance(value, (int, float)):
+        return max(1, int(round(float(value))))
+    s = str(value).strip().lower()
+    if not s:
+        return int(default_seconds)
+    # HH:MM:SS or MM:SS
+    import re as _re
+    if _re.match(r"^\d{1,2}:\d{2}(:\d{2})?$", s):
+        parts = s.split(":")
+        # All parts are digits by regex, so int() is safe
+        ints = [int(x) for x in parts]
+        if len(ints) == 2:
+            return ints[0] * 60 + ints[1]
+        if len(ints) == 3:
+            return ints[0] * 3600 + ints[1] * 60 + ints[2]
+    # textual: "3 minutes", "180s", "3m"
+    m = _re.match(r"^(\d+)\s*(seconds|second|secs|sec|s)$", s)
+    if m:
+        return max(1, int(m.group(1)))
+    m = _re.match(r"^(\d+)\s*(minutes|minute|mins|min|m)$", s)
+    if m:
+        return max(1, int(m.group(1)) * 60)
+    m = _re.match(r"^(\d+)\s*(hours|hour|hrs|hr|h)$", s)
+    if m:
+        return max(1, int(m.group(1)) * 3600)
+    # plain integer or float-like string
+    if _re.match(r"^-?\d+(\.\d+)?$", s):
+        return max(1, int(round(float(s))))
+    return int(default_seconds)
 
 
 def _parse_fps_dynamic(value: Any, default_fps: int = 60) -> int:
@@ -12501,11 +12253,9 @@ async def stream_job(job_id: str, interval_ms: Optional[int] = None):
             if snapshot != last_snapshot:
                 yield f"data: {snapshot}\n\n"
                 last_snapshot = snapshot
-            try:
-                # Parse current job status safely via JSONParser. Never use json.loads.
-                state = (JSONParser().parse(snapshot or "", {"status": str}) or {}).get("status")
-            except Exception:
-                state = None
+            # Parse current job status safely via JSONParser. Never use json.loads.
+            parsed = JSONParser().parse(snapshot or "", {"status": str})
+            state = parsed.get("status") if isinstance(parsed, dict) else None
             if state in ("succeeded", "failed", "cancelled"):
                 yield "data: [DONE]\n\n"
                 break

@@ -390,6 +390,8 @@ services:
     depends_on:
       - nvidia_init
       - film2_bootstrap
+    # Run on host network so orchestrator and host can reach it at http://127.0.0.1:8020
+    network_mode: host
     environment:
       - XTTS_MODEL_NAME=tts_models/multilingual/multi-dataset/xtts_v2
       - NVIDIA_VISIBLE_DEVICES=all

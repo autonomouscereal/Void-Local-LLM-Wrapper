@@ -302,41 +302,6 @@ def _append_jsonl(path: str, obj: dict) -> None:
 		f.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
 
-@router.post("/tool.validate")
-async def tool_validate(req: Request):
-	rid = "tool.validate"
-	try:
-		body = await req.json()
-	except Exception as ex:
-		return ToolEnvelope.failure(
-			"invalid_json",
-			f"Body must be valid JSON: {ex}",
-			status=400,
-			request_id=rid,
-		)
-	if not isinstance(body, dict):
-		return ToolEnvelope.failure(
-			"invalid_body_type",
-			"Body must be a JSON object",
-			status=422,
-			request_id=rid,
-		)
-	name = (body.get("name") or "").strip()
-	args = body.get("args") or {}
-	if not isinstance(args, dict):
-		return ToolEnvelope.failure(
-			"invalid_args_type",
-			"args must be an object",
-			status=422,
-			request_id=rid,
-		)
-	if name != "image.dispatch":
-		# For non-image tools, accept basic object-arg validation here
-		return ToolEnvelope.success(
-			{"name": name, "valid": True, "args": args},
-			request_id=rid,
-		)
-	# Real acceptance: require at least a prompt or a model/size combo
 	prompt = args.get("prompt")
 	if not isinstance(prompt, str) or not prompt.strip():
 		detail = {

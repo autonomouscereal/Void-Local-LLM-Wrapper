@@ -49,7 +49,7 @@ SYSTEM_AUDIO = (
 
 
 async def _call_llm_json(prompt: str) -> Dict[str, Any]:
-    base = os.getenv("QWEN_BASE_URL", "http://ollama_qwen:11434").rstrip("/")
+    base = os.getenv("QWEN_BASE_URL", "http://ollama_qwen:11435").rstrip("/")
     model = os.getenv("QWEN_MODEL_ID", "qwen2.5:14b").strip() or "qwen2.5:14b"
     payload = {"model": model, "prompt": prompt, "stream": False}
     async with httpx.AsyncClient() as client:
