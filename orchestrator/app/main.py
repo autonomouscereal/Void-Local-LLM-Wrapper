@@ -34,31 +34,53 @@ from types import SimpleNamespace
 from io import BytesIO
 import base64 as _b64
 import base64 as _b
+import imageio.v3 as iio  # type: ignore
+from PIL import Image, ImageDraw, ImageFont  # type: ignore
 import asyncio as _as
 import contextlib
 import aiohttp  # type: ignore
 import httpx as _hx  # type: ignore
 import httpx  # type: ignore
-from PIL import Image  # type: ignore
-import imageio.v3 as iio  # type: ignore
-import asyncio
 import hashlib as _hl
+import hashlib as _h
 import json
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, TypedDict
-import time
-import traceback
+import re as _re
+import base64
+import uuid
+import subprocess
+from glob import glob as _glob
+import wave
+import audioop
+import colorsys
+import random as _rnd
+from urllib.parse import urlparse, urlencode
+import requests as _rq
+import tempfile
+import cv2  # type: ignore
+import mediapipe as mp  # type: ignore
 import numpy as np  # type: ignore
 import math
 import librosa  # type: ignore
+import shutil as _sh
+import websockets as _ws  # type: ignore
+import sympy as _sp  # type: ignore
+from sympy.parsing.sympy_parser import parse_expr as _parse  # type: ignore
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, TypedDict
+import time
+import traceback
 
 from .ops.policy import enforce_core_policy
 enforce_core_policy()
 
 ## httpx imported above as _hx
 import requests
+
+from .analysis.media import score_image_clip, analyze_audio, analyze_image  # type: ignore
+from .ingest.core import ingest_file
 import re
 import asyncpg  # type: ignore
 from sentence_transformers import SentenceTransformer  # type: ignore
+from .tools_schema import get_builtin_tools_schema as _ext
 from fastapi import FastAPI, Request, UploadFile, File, WebSocket, WebSocketDisconnect  # type: ignore
 from fastapi.responses import JSONResponse, StreamingResponse, Response  # type: ignore
 from fastapi.staticfiles import StaticFiles  # type: ignore
@@ -1924,20 +1946,6 @@ SVD_API_URL = os.getenv("SVD_API_URL")                        # http://svd:9008
 
 
 def _sha256_bytes(b: bytes) -> str:
-    import hashlib as _hl
-def _parse_json_text(text: str, expected: Any) -> Any:
-    try:
-        return JSONParser().parse(text, expected if expected is not None else {})
-    except Exception:
-        # As a last resort, return empty of same shape
-        if isinstance(expected, dict):
-            return {}
-        if isinstance(expected, list):
-            return []
-        return {}
-
-def _resp_json(resp, expected: Any) -> Any:
-    return _parse_json_text(getattr(resp, "text", "") or "", expected)
     return _hl.sha256(b).hexdigest()
 
 
@@ -2009,8 +2017,7 @@ def _friendly_failure_text(name: str, attempted_args: Dict[str, Any], err: Dict[
             lines.append("Invalid: " + ", ".join(_inv_parts))
     tried = {k: attempted_args.get(k) for k in ("prompt","negative","width","height","steps","cfg") if isinstance(attempted_args, dict) and (k in attempted_args)}
     if tried:
-        import json as _json
-        lines.append("AI tried args: `" + _json.dumps(tried, separators=(',',':'), default=str) + "`")
+        lines.append("AI tried args: `" + json.dumps(tried, separators=(',',':'), default=str) + "`")
     if trace_id:
         lines.append(f"trace: `{trace_id}`")
     lines.append("Tip: type any missing values (e.g., `prompt: ...`) and resend; the AI will fill the rest.")
@@ -2074,10 +2081,9 @@ def _make_tool_failure_message(*, tool: str, err: Dict[str, Any], attempted_args
     else:
         lines.append("**Reason:** See diagnostic details below.")
     if tried:
-        import json as _json
         lines.append("**AI attempted args:**")
         lines.append("```json")
-        lines.append(_json.dumps(tried, separators=(',',':'), ensure_ascii=False))
+        lines.append(json.dumps(tried, separators=(',',':'), ensure_ascii=False))
         lines.append("```")
     # Fix template
     fix_args = dict(tried)
@@ -2087,10 +2093,9 @@ def _make_tool_failure_message(*, tool: str, err: Dict[str, Any], attempted_args
         fix_args["width"]  = int(fix_args["width"])//8*8
     if "height" in fix_args and isinstance(fix_args.get("height"), (int, float)):
         fix_args["height"] = int(fix_args["height"])//8*8
-    import json as _json
     lines.append("**Try this and resend (the AI will fill the rest):**")
     lines.append("```json")
-    lines.append(_json.dumps({"tool": tool, "args": fix_args}, ensure_ascii=False))
+    lines.append(json.dumps({"tool": tool, "args": fix_args}, ensure_ascii=False))
     lines.append("```")
     auto: List[str] = []
     if code in ("schema_validation","invalid_args","required_missing","type_mismatch","enum_mismatch"):
@@ -2486,7 +2491,7 @@ _comfy_load: Dict[str, int] = {}
 COMFYUI_BACKOFF_MS = int(os.getenv("COMFYUI_BACKOFF_MS", "250"))
 COMFYUI_BACKOFF_MAX_MS = int(os.getenv("COMFYUI_BACKOFF_MAX_MS", "4000"))
 COMFYUI_MAX_RETRIES = int(os.getenv("COMFYUI_MAX_RETRIES", "6"))
-_comfy_sem = asyncio.Semaphore(max(1, int(SCENE_SUBMIT_CONCURRENCY))) if isinstance(SCENE_SUBMIT_CONCURRENCY, int) else asyncio.Semaphore(1)
+_comfy_sem = _as.Semaphore(max(1, int(SCENE_SUBMIT_CONCURRENCY))) if isinstance(SCENE_SUBMIT_CONCURRENCY, int) else _as.Semaphore(1)
 _films_mem: Dict[str, Dict[str, Any]] = {}
 
 
@@ -2589,12 +2594,10 @@ def _write_text_atomic(path: str, text: str) -> Dict[str, Any]:
     return {"uri": _uri_from_upload_path(path), "hash": f"sha256:{_sha256_bytes(text.encode('utf-8'))}"}
 
 def _write_json_atomic(path: str, obj: Any) -> Dict[str, Any]:
-    import json as _j
-    return _write_text_atomic(path, _j.dumps(obj, ensure_ascii=False, separators=(",", ":")))
+    return _write_text_atomic(path, json.dumps(obj, ensure_ascii=False, separators=(",", ":")))
 
 
 def get_builtin_tools_schema() -> List[Dict[str, Any]]:
-    from .tools_schema import get_builtin_tools_schema as _ext
     return _ext()
 
 @app.get("/capabilities.json")
@@ -2661,11 +2664,9 @@ def estimate_usage(messages: List[Dict[str, Any]], completion_text: str) -> Dict
 def _icw_pack(messages: List[Dict[str, Any]], seed: int, budget_tokens: int = 3500) -> Dict[str, Any]:
     # Inline, deterministic packer with simple multi-signal scoring and graded budget allocation.
     # No network; JSON-only; scores rounded to 1e-6; stable tie-break by sha256.
-    import hashlib as _hl
     def _round6(x: float) -> float:
         return float(f"{float(x):.6f}")
     def _tok(s: str) -> List[str]:
-        import re as _re
         return [w for w in _re.findall(r"[a-z0-9]{3,}", (s or "").lower())]
     def _jacc(a: List[str], b: List[str]) -> float:
         if not a or not b:
@@ -2754,7 +2755,6 @@ def merge_usages(usages: List[Optional[Dict[str, int]]]) -> Dict[str, int]:
 
 
 def _save_base64_file(b64: str, suffix: str) -> str:
-    import base64, uuid
     raw = base64.b64decode(b64)
     filename = f"{uuid.uuid4().hex}{suffix}"
     path = os.path.join(UPLOAD_DIR, filename)
@@ -2868,6 +2868,8 @@ async def call_ollama(base_url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
                 data["_usage"] = usage
             return data
         except Exception as e:
+            # Surface backend failures explicitly for callers; never swallow errors silently.
+            _log("ollama.call.error", base_url=base_url, error=str(e))
             return {"error": str(e), "_base_url": base_url}
 
 
@@ -3084,12 +3086,6 @@ def build_tools_section(tools: Optional[List[Dict[str, Any]]]) -> str:
 def build_compact_tool_catalog() -> str:
     # Build the catalog directly from the registered tool schemas so names are guaranteed valid
     _TOOL_REG: dict = {}
-    try_spec_module = f"{__package__}.routes.tools" if __package__ else None
-    if try_spec_module:
-        import importlib.util as _ilu
-        spec = _ilu.find_spec(try_spec_module)
-        if spec is not None:
-            from .routes.tools import _REGISTRY as _TOOL_REG  # type: ignore
     builtins = get_builtin_tools_schema()
     # Merge tool names + required args from both registries
     merged: dict[str, dict] = {}
@@ -3161,7 +3157,6 @@ def _derive_movie_prefs_from_text(text: str) -> Dict[str, Any]:
     elif "8k" in s:
         prefs["resolution"] = "7680x4320"
     # fps
-    import re as _re
     m_fps = _re.search(r"(\d{2,3})\s*fps", s)
     if m_fps and m_fps.group(1):
         num = m_fps.group(1)
@@ -4128,10 +4123,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         # First attempt: frame-level refinement using image tools and ffmpeg.
         refined_video_path: Optional[str] = None
         try:
-            import subprocess, time as _tm
-            from glob import glob as _glob
             # Extract clip frames for the target window.
-            outdir = os.path.join(UPLOAD_DIR, "artifacts", "video", "refine", segment_id or f"seg-{int(_tm.time())}")
+            outdir = os.path.join(UPLOAD_DIR, "artifacts", "video", "refine", segment_id or f"seg-{int(time.time())}")
             frames_dir = os.path.join(outdir, "frames")
             os.makedirs(frames_dir, exist_ok=True)
             ff_args = [
@@ -4395,31 +4388,25 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     story_obj = _story_fix(story_obj, last_issues)
                 if last_issues:
                     warnings.append("story_consistency_unresolved")
-                    try:
-                        _trace_append(
-                            "film2",
-                            {
-                                "event": "story_consistency_unresolved",
-                                "issues": last_issues,
-                                "prompt": prompt,
-                            },
-                        )
-                    except Exception:
-                        pass
-                scenes_from_story, shots_from_story = _story_derive(story_obj)
-            except Exception as ex:
-                warnings.append("story_phase_failed")
-                try:
                     _trace_append(
                         "film2",
                         {
-                            "event": "story_phase_failed",
-                            "error": str(ex),
+                            "event": "story_consistency_unresolved",
+                            "issues": last_issues,
                             "prompt": prompt,
                         },
                     )
-                except Exception:
-                    pass
+                scenes_from_story, shots_from_story = _story_derive(story_obj)
+            except Exception as ex:
+                warnings.append("story_phase_failed")
+                _trace_append(
+                    "film2",
+                    {
+                        "event": "story_phase_failed",
+                        "error": str(ex),
+                        "prompt": prompt,
+                    },
+                )
         if warnings:
             meta_warnings = result["meta"].setdefault("warnings", [])
             if isinstance(meta_warnings, list):
@@ -4913,201 +4900,198 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         finally:
             _ev({"event": "film2.shot_finish"})
         # Build a simple segment hierarchy: film -> scenes -> shots -> clips (one clip per shot for now)
-        try:
-            film_id = cid or f"film2_{str(trace_id or '')}"
-            film_segment: Dict[str, Any] = {
-                "segment_id": film_id,
-                "level": "film",
-                "children": [],
-                "meta": {
-                    "prompt": prompt,
-                    "duration_s": duration_s,
-                },
-            }
-            scene_segments: Dict[str, Dict[str, Any]] = {}
-            shot_segments: Dict[str, Dict[str, Any]] = {}
-            clip_segments: Dict[str, Dict[str, Any]] = {}
-            scenes_meta = result.get("meta", {}).get("scenes")
-            if isinstance(scenes_meta, list):
-                for sc in scenes_meta:
-                    if not isinstance(sc, dict):
-                        continue
-                    sid = sc.get("scene_id")
-                    if not isinstance(sid, str) or not sid:
-                        continue
-                    if sid in scene_segments:
-                        continue
-                    seg_scene: Dict[str, Any] = {
-                        "segment_id": sid,
-                        "level": "scene",
-                        "children": [],
-                        "meta": dict(sc),
-                    }
-                    scene_segments[sid] = seg_scene
-                    film_segment["children"].append(sid)
-            shots_meta = result.get("meta", {}).get("shots")
-            if isinstance(shots_meta, list):
-                # Build a simple dialogue mapping per shot using story-derived shots and dialogue_index when available.
-                meta_block = result.get("meta") if isinstance(result.get("meta"), dict) else {}
-                dialogue_index = meta_block.get("dialogue") if isinstance(meta_block.get("dialogue"), dict) else {}
-                shots_from_story_meta = meta_block.get("shots_from_story") if isinstance(meta_block.get("shots_from_story"), list) else []
-                story_shot_dialogue: Dict[str, List[Dict[str, Any]]] = {}
-                for s in shots_from_story_meta:
-                    if not isinstance(s, dict):
-                        continue
-                    sid = s.get("shot_id")
-                    if not isinstance(sid, str) or not sid:
-                        continue
-                    lines = s.get("dialogue") if isinstance(s.get("dialogue"), list) else []
-                    story_shot_dialogue[sid] = [ln for ln in lines if isinstance(ln, dict)]
-                for sh in shots_meta:
-                    if not isinstance(sh, dict):
-                        continue
-                    shot_id = sh.get("shot_id") or f"shot_{sh.get('index')}"
-                    if not isinstance(shot_id, str) or not shot_id:
-                        continue
-                    scene_id = sh.get("scene_id")
-                    act_id = sh.get("act_id")
-                    dur_s = float(sh.get("duration_s") or duration_s)
-                    gen_path = sh.get("gen_path")
-                    shot_seg: Dict[str, Any] = {
-                        "segment_id": shot_id,
-                        "level": "shot",
-                        "children": [],
+        film_id = cid or f"film2_{str(trace_id or '')}"
+        film_segment: Dict[str, Any] = {
+            "segment_id": film_id,
+            "level": "film",
+            "children": [],
+            "meta": {
+                "prompt": prompt,
+                "duration_s": duration_s,
+            },
+        }
+        scene_segments: Dict[str, Dict[str, Any]] = {}
+        shot_segments: Dict[str, Dict[str, Any]] = {}
+        clip_segments: Dict[str, Dict[str, Any]] = {}
+        scenes_meta = result.get("meta", {}).get("scenes")
+        if isinstance(scenes_meta, list):
+            for sc in scenes_meta:
+                if not isinstance(sc, dict):
+                    continue
+                sid = sc.get("scene_id")
+                if not isinstance(sid, str) or not sid:
+                    continue
+                if sid in scene_segments:
+                    continue
+                seg_scene: Dict[str, Any] = {
+                    "segment_id": sid,
+                    "level": "scene",
+                    "children": [],
+                    "meta": dict(sc),
+                }
+                scene_segments[sid] = seg_scene
+                film_segment["children"].append(sid)
+        shots_meta = result.get("meta", {}).get("shots")
+        if isinstance(shots_meta, list):
+            # Build a simple dialogue mapping per shot using story-derived shots and dialogue_index when available.
+            meta_block = result.get("meta") if isinstance(result.get("meta"), dict) else {}
+            dialogue_index = meta_block.get("dialogue") if isinstance(meta_block.get("dialogue"), dict) else {}
+            shots_from_story_meta = meta_block.get("shots_from_story") if isinstance(meta_block.get("shots_from_story"), list) else []
+            story_shot_dialogue: Dict[str, List[Dict[str, Any]]] = {}
+            for s in shots_from_story_meta:
+                if not isinstance(s, dict):
+                    continue
+                sid = s.get("shot_id")
+                if not isinstance(sid, str) or not sid:
+                    continue
+                lines = s.get("dialogue") if isinstance(s.get("dialogue"), list) else []
+                story_shot_dialogue[sid] = [ln for ln in lines if isinstance(ln, dict)]
+            for sh in shots_meta:
+                if not isinstance(sh, dict):
+                    continue
+                shot_id = sh.get("shot_id") or f"shot_{sh.get('index')}"
+                if not isinstance(shot_id, str) or not shot_id:
+                    continue
+                scene_id = sh.get("scene_id")
+                act_id = sh.get("act_id")
+                dur_s = float(sh.get("duration_s") or duration_s)
+                gen_path = sh.get("gen_path")
+                shot_seg: Dict[str, Any] = {
+                    "segment_id": shot_id,
+                    "level": "shot",
+                    "children": [],
+                    "meta": {
+                        "scene_id": scene_id,
+                        "act_id": act_id,
+                        "duration_s": dur_s,
+                        "gen_path": gen_path,
+                    },
+                }
+                shot_segments[shot_id] = shot_seg
+                if isinstance(scene_id, str) and scene_id in scene_segments:
+                    scene_segments[scene_id]["children"].append(shot_id)
+                # Split each shot into multiple logical clips based on a fixed window size.
+                clip_window_s = 2.0
+                if dur_s <= 0.0:
+                    dur_s = duration_s
+                    shot_seg["meta"]["duration_s"] = dur_s
+                # Align dialogue lines to this shot using a simple equal-partition policy when possible.
+                shot_lines = story_shot_dialogue.get(shot_id, [])
+                line_timing: Dict[str, Dict[str, float]] = {}
+                if shot_lines:
+                    per_line = dur_s / float(len(shot_lines))
+                    current_start = 0.0
+                    for ln in shot_lines:
+                        line_id = ln.get("line_id")
+                        if not isinstance(line_id, str) or not line_id:
+                            continue
+                        start_s = current_start
+                        end_s = min(dur_s, start_s + per_line)
+                        line_timing[line_id] = {"start_s": start_s, "end_s": end_s}
+                        current_start = end_s
+                        entry = dialogue_index.get(line_id) if isinstance(dialogue_index, dict) else None
+                        if isinstance(entry, dict):
+                            entry["shot_id"] = shot_id
+                            entry["start_s"] = start_s
+                            entry["end_s"] = end_s
+                num_clips = max(1, int(math.ceil(dur_s / clip_window_s)))
+                for clip_index in range(num_clips):
+                    start_s = clip_index * clip_window_s
+                    end_s = dur_s if clip_index == num_clips - 1 else min(dur_s, (clip_index + 1) * clip_window_s)
+                    clip_id = f"{shot_id}_clip_{clip_index}"
+                    clip_result: Dict[str, Any] = {
                         "meta": {
+                            "cid": cid,
+                            "film_id": film_id,
                             "scene_id": scene_id,
-                            "act_id": act_id,
-                            "duration_s": dur_s,
-                            "gen_path": gen_path,
+                            "shot_id": shot_id,
+                            "clip_index": clip_index,
+                            "timecode": {"start_s": start_s, "end_s": end_s, "fps": fps_val},
+                            "locks": locks_arg if isinstance(locks_arg, dict) else {},
+                            "prompt": sh.get("prompt"),
+                            "width": width_val,
+                            "height": height_val,
                         },
+                        "artifacts": [],
                     }
-                    shot_segments[shot_id] = shot_seg
-                    if isinstance(scene_id, str) and scene_id in scene_segments:
-                        scene_segments[scene_id]["children"].append(shot_id)
-                    # Split each shot into multiple logical clips based on a fixed window size.
-                    clip_window_s = 2.0
-                    if dur_s <= 0.0:
-                        dur_s = duration_s
-                        shot_seg["meta"]["duration_s"] = dur_s
-                    # Align dialogue lines to this shot using a simple equal-partition policy when possible.
-                    shot_lines = story_shot_dialogue.get(shot_id, [])
-                    line_timing: Dict[str, Dict[str, float]] = {}
-                    if shot_lines:
-                        per_line = dur_s / float(len(shot_lines))
-                        current_start = 0.0
+                    if isinstance(gen_path, str) and gen_path:
+                        clip_result["artifacts"].append({"kind": "video", "path": gen_path})
+                    # Compute a simple lipsync score based on dialogue durations overlapping this clip window.
+                    clip_lines: List[str] = []
+                    dialogue_total_s = 0.0
+                    if isinstance(dialogue_index, dict) and line_timing:
                         for ln in shot_lines:
                             line_id = ln.get("line_id")
                             if not isinstance(line_id, str) or not line_id:
                                 continue
-                            start_s = current_start
-                            end_s = min(dur_s, start_s + per_line)
-                            line_timing[line_id] = {"start_s": start_s, "end_s": end_s}
-                            current_start = end_s
-                            entry = dialogue_index.get(line_id) if isinstance(dialogue_index, dict) else None
-                            if isinstance(entry, dict):
-                                entry["shot_id"] = shot_id
-                                entry["start_s"] = start_s
-                                entry["end_s"] = end_s
-                    num_clips = max(1, int(math.ceil(dur_s / clip_window_s)))
-                    for clip_index in range(num_clips):
-                        start_s = clip_index * clip_window_s
-                        end_s = dur_s if clip_index == num_clips - 1 else min(dur_s, (clip_index + 1) * clip_window_s)
-                        clip_id = f"{shot_id}_clip_{clip_index}"
-                        clip_result: Dict[str, Any] = {
-                            "meta": {
-                                "cid": cid,
-                                "film_id": film_id,
-                                "scene_id": scene_id,
-                                "shot_id": shot_id,
-                                "clip_index": clip_index,
-                                "timecode": {"start_s": start_s, "end_s": end_s, "fps": fps_val},
-                                "locks": locks_arg if isinstance(locks_arg, dict) else {},
-                                "prompt": sh.get("prompt"),
-                                "width": width_val,
-                                "height": height_val,
-                            },
-                            "artifacts": [],
-                        }
-                        if isinstance(gen_path, str) and gen_path:
-                            clip_result["artifacts"].append({"kind": "video", "path": gen_path})
-                        # Compute a simple lipsync score based on dialogue durations overlapping this clip window.
-                        clip_lines: List[str] = []
-                        dialogue_total_s = 0.0
-                        if isinstance(dialogue_index, dict) and line_timing:
-                            for ln in shot_lines:
-                                line_id = ln.get("line_id")
-                                if not isinstance(line_id, str) or not line_id:
-                                    continue
-                                timing = line_timing.get(line_id)
-                                if not isinstance(timing, dict):
-                                    continue
-                                line_start = float(timing.get("start_s") or 0.0)
-                                line_end = float(timing.get("end_s") or 0.0)
-                                # Overlap between line window and clip window
-                                if line_end > start_s and line_start < end_s:
-                                    clip_lines.append(line_id)
-                                    entry = dialogue_index.get(line_id)
-                                    dur_val = None
-                                    if isinstance(entry, dict):
-                                        dur_raw = entry.get("duration_s")
-                                        if isinstance(dur_raw, (int, float)):
-                                            dur_val = float(dur_raw)
-                                    if dur_val is None:
-                                        dur_val = max(0.0, line_end - line_start)
-                                    dialogue_total_s += dur_val
-                        clip_length = max(0.0, end_s - start_s)
-                        lipsync_score = 0.0
-                        if clip_length > 0.0:
-                            ratio = dialogue_total_s / clip_length
-                            if ratio < 0.0:
-                                ratio = 0.0
-                            if ratio > 1.0:
-                                ratio = 1.0
-                            lipsync_score = ratio
-                        clip_result["meta"]["dialogue_lines"] = clip_lines
-                        clip_result["meta"]["lipsync_score"] = lipsync_score
-                        clip_seg: Dict[str, Any] = {
-                            "id": clip_id,
-                            "tool": "video.hv.t2v",
-                            "domain": "video",
-                            "name": clip_id,
-                            "index": clip_index,
-                            "parent_cid": cid,
-                            "result": clip_result,
-                            "meta": clip_result["meta"],
-                            "qa": {"scores": {}},
-                            "locks": clip_result["meta"].get("locks"),
-                            "artifacts": clip_result["artifacts"],
-                        }
-                        clip_seg["qa"]["scores"]["lipsync"] = lipsync_score
-                        clip_segments[clip_id] = clip_seg
-                        shot_seg["children"].append(clip_id)
-                        _trace_append(
-                            "film2",
-                            {
-                                "event": "segment_clip_built",
-                                "film_id": film_id,
-                                "scene_id": scene_id,
-                                "shot_id": shot_id,
-                                "clip_id": clip_id,
-                                "clip_index": clip_index,
-                                "start_s": start_s,
-                                "end_s": end_s,
-                                "fps": fps_val,
-                                "video_path": gen_path,
-                                "dialogue_total_s": dialogue_total_s,
-                                "lipsync_score": lipsync_score,
-                            },
-                        )
-            result.setdefault("meta", {})["segments"] = {
+                            timing = line_timing.get(line_id)
+                            if not isinstance(timing, dict):
+                                continue
+                            line_start = float(timing.get("start_s") or 0.0)
+                            line_end = float(timing.get("end_s") or 0.0)
+                            # Overlap between line window and clip window
+                            if line_end > start_s and line_start < end_s:
+                                clip_lines.append(line_id)
+                                entry = dialogue_index.get(line_id)
+                                dur_val = None
+                                if isinstance(entry, dict):
+                                    dur_raw = entry.get("duration_s")
+                                    if isinstance(dur_raw, (int, float)):
+                                        dur_val = float(dur_raw)
+                                if dur_val is None:
+                                    dur_val = max(0.0, line_end - line_start)
+                                dialogue_total_s += dur_val
+                    clip_length = max(0.0, end_s - start_s)
+                    lipsync_score = 0.0
+                    if clip_length > 0.0:
+                        ratio = dialogue_total_s / clip_length
+                        if ratio < 0.0:
+                            ratio = 0.0
+                        if ratio > 1.0:
+                            ratio = 1.0
+                        lipsync_score = ratio
+                    clip_result["meta"]["dialogue_lines"] = clip_lines
+                    clip_result["meta"]["lipsync_score"] = lipsync_score
+                    clip_seg: Dict[str, Any] = {
+                        "id": clip_id,
+                        "tool": "video.hv.t2v",
+                        "domain": "video",
+                        "name": clip_id,
+                        "index": clip_index,
+                        "parent_cid": cid,
+                        "result": clip_result,
+                        "meta": clip_result["meta"],
+                        "qa": {"scores": {}},
+                        "locks": clip_result["meta"].get("locks"),
+                        "artifacts": clip_result["artifacts"],
+                    }
+                    clip_seg["qa"]["scores"]["lipsync"] = lipsync_score
+                    clip_segments[clip_id] = clip_seg
+                    shot_seg["children"].append(clip_id)
+                    _trace_append(
+                        "film2",
+                        {
+                            "event": "segment_clip_built",
+                            "film_id": film_id,
+                            "scene_id": scene_id,
+                            "shot_id": shot_id,
+                            "clip_id": clip_id,
+                            "clip_index": clip_index,
+                            "start_s": start_s,
+                            "end_s": end_s,
+                            "fps": fps_val,
+                            "video_path": gen_path,
+                            "dialogue_total_s": dialogue_total_s,
+                            "lipsync_score": lipsync_score,
+                        },
+                    )
+        result.setdefault("meta", {})["segments"] = {
                 "film": film_segment,
                 "scenes": list(scene_segments.values()),
                 "shots": list(shot_segments.values()),
                 "clips": list(clip_segments.values()),
             }
-        except Exception:
-            # Segment hierarchy construction must not break film2.run
-            pass
+        # No error handling here: if segment hierarchy construction fails, let it surface.
         # Select a final video output and expose as ids/meta for UI
         final_path = None
         for sh in reversed(result.get("meta", {}).get("shots", [])):
@@ -5127,23 +5111,14 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 result.setdefault("ids", {})["video_id"] = rel
                 view_rel = rel if rel.startswith("uploads/") else f"uploads/{rel.lstrip('/')}"
                 result.setdefault("meta", {})["view_url"] = f"/{view_rel}"
-                # Best-effort poster preview (log and surface error if fails)
-                try:
-                    import imageio.v3 as iio  # type: ignore
-                    from PIL import Image  # type: ignore
-                    from io import BytesIO
-                    import base64 as _b64
-                    final_abs = final_path if os.path.isabs(final_path) else os.path.join(UPLOAD_DIR, rel)
-                    frame0 = iio.imread(final_abs, index=0)
-                    img = Image.fromarray(frame0).convert("RGB")
-                    img.thumbnail((512, 512))
-                    buf = BytesIO()
-                    img.save(buf, format="JPEG", quality=70, optimize=True)
-                    poster_b64 = _b64.b64encode(buf.getvalue()).decode("ascii")
-                    result.setdefault("meta", {})["poster_data_url"] = f"data:image/jpeg;base64,{poster_b64}"
-                except Exception:
-                    _tb = traceback.format_exc()
-                    logging.error(_tb)
+                final_abs = final_path if os.path.isabs(final_path) else os.path.join(UPLOAD_DIR, rel)
+                frame0 = iio.imread(final_abs, index=0)
+                img = Image.fromarray(frame0).convert("RGB")
+                img.thumbnail((512, 512))
+                buf = BytesIO()
+                img.save(buf, format="JPEG", quality=70, optimize=True)
+                poster_b64 = _b64.b64encode(buf.getvalue()).decode("ascii")
+                result.setdefault("meta", {})["poster_data_url"] = f"data:image/jpeg;base64,{poster_b64}"
         meta_obj = result.get("meta") if isinstance(result.get("meta"), dict) else {}
         segments_container = meta_obj.get("segments") if isinstance(meta_obj.get("segments"), dict) else {}
         clips_meta = segments_container.get("clips") if isinstance(segments_container, dict) else None
@@ -5164,21 +5139,18 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     cmeta["degraded"] = True
                     cmeta["degraded_reasons"] = degraded_reasons
                     clip["meta"] = cmeta
-                    try:
-                        _trace_append(
-                            "film2",
-                            {
-                                "event": "clip_refine_exhausted",
-                                "segment_id": clip.get("id"),
-                                "film_id": segments_container.get("film", {}).get("segment_id") if isinstance(segments_container.get("film"), dict) else None,
-                                "scene_id": cmeta.get("scene_id"),
-                                "shot_id": cmeta.get("shot_id"),
-                                "refined": refined_flag,
-                                "degraded_reasons": degraded_reasons,
-                            },
-                        )
-                    except Exception:
-                        pass
+                    _trace_append(
+                        "film2",
+                        {
+                            "event": "clip_refine_exhausted",
+                            "segment_id": clip.get("id"),
+                            "film_id": segments_container.get("film", {}).get("segment_id") if isinstance(segments_container.get("film"), dict) else None,
+                            "scene_id": cmeta.get("scene_id"),
+                            "shot_id": cmeta.get("shot_id"),
+                            "refined": refined_flag,
+                            "degraded_reasons": degraded_reasons,
+                        },
+                    )
     
         return {"name": name, "result": result}
     if name == "icw.pack_context":
@@ -5207,7 +5179,6 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     # Expected: wav_b64 or url
                     wav = b""
                     if isinstance(js.get("wav_b64"), str):
-                        import base64 as _b
                         wav = _b.b64decode(js.get("wav_b64"))
                     elif isinstance(js.get("url"), str):
                         rr = await client.get(js.get("url"))
@@ -5217,7 +5188,6 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     return {"wav_bytes": wav, "duration_s": float(js.get("duration_s") or 0.0), "model": js.get("model") or "xtts"}
             def speak(self, args: Dict[str, Any]) -> Dict[str, Any]:
                 # Bridge sync to async
-                import asyncio as _as
                 return _as.get_event_loop().run_until_complete(self._xtts(args))
         provider = _TTSProvider()
         manifest = {"items": []}
@@ -5309,8 +5279,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 out_res.setdefault("meta", {})["url"] = f"/{rel}"
                 out_res["meta"]["mime"] = "audio/wav"
                 # Build ~12s mono 22.05kHz preview data_url
-                import io, wave, audioop, base64 as _b64
-                r = wave.open(io.BytesIO(wav))
+                r = wave.open(BytesIO(wav))
                 nch = r.getnchannels(); sw = r.getsampwidth(); fr = r.getframerate()
                 frames = r.readframes(r.getnframes()); r.close()
                 if nch > 1:
@@ -5320,7 +5289,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     fr = 22050
                 max_frames = 12 * fr
                 frames = frames[:max_frames * sw]
-                b2 = io.BytesIO()
+                b2 = BytesIO()
                 w2 = wave.open(b2, "wb")
                 w2.setnchannels(1); w2.setsampwidth(sw); w2.setframerate(fr)
                 w2.writeframes(frames); w2.close()
@@ -5379,8 +5348,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 out_res.setdefault("ids", {})["audio_id"] = rel
                 out_res.setdefault("meta", {})["url"] = f"/{rel}"
                 out_res["meta"]["mime"] = "audio/wav"
-                import io, wave, audioop, base64 as _b64
-                r = wave.open(io.BytesIO(wav))
+                r = wave.open(BytesIO(wav))
                 nch = r.getnchannels(); sw = r.getsampwidth(); fr = r.getframerate()
                 frames = r.readframes(r.getnframes()); r.close()
                 if nch > 1:
@@ -5390,7 +5358,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     fr = 22050
                 max_frames = 12 * fr
                 frames = frames[:max_frames * sw]
-                b2 = io.BytesIO()
+                b2 = BytesIO()
                 w2 = wave.open(b2, "wb")
                 w2.setnchannels(1); w2.setsampwidth(sw); w2.setframerate(fr)
                 w2.writeframes(frames); w2.close()
@@ -5411,10 +5379,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             try:
                 async with httpx.AsyncClient() as client:
                     rr = await client.get(args.get("url").strip())
-                    import base64 as _b
                     b64 = _b.b64encode(rr.content).decode("ascii")
                     if not ext:
-                        from urllib.parse import urlparse
                         p = urlparse(args.get("url").strip()).path
                         if "." in p:
                             ext = "." + p.split(".")[-1].lower()
@@ -5428,7 +5394,6 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     return {"name": name, "error": "path escapes uploads"}
                 with open(full, "rb") as f:
                     data = f.read()
-                import base64 as _b
                 b64 = _b.b64encode(data).decode("ascii")
                 if not ext and "." in rel:
                     ext = "." + rel.split(".")[-1].lower()
@@ -5454,10 +5419,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             try:
                 async with httpx.AsyncClient() as client:
                     rr = await client.get(args.get("url").strip())
-                    import base64 as _b
                     b64 = _b.b64encode(rr.content).decode("ascii")
                     if not ext:
-                        from urllib.parse import urlparse
                         p = urlparse(args.get("url").strip()).path
                         if "." in p:
                             ext = "." + p.split(".")[-1].lower()
@@ -5471,7 +5434,6 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     return {"name": name, "error": "path escapes uploads"}
                 with open(full, "rb") as f:
                     data = f.read()
-                import base64 as _b
                 b64 = _b.b64encode(data).decode("ascii")
                 if not ext and "." in rel:
                     ext = "." + rel.split(".")[-1].lower()
@@ -5487,12 +5449,24 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         except Exception as ex:
             return {"name": name, "error": str(ex)}
     if name == "music.infinite.windowed" and ALLOW_TOOL_EXECUTION:
+        if not MUSIC_API_URL:
+            # Fail fast with a clear, structured error instead of burying the root cause.
+            return {
+                "name": name,
+                "error": {
+                    "code": "music_backend_unconfigured",
+                    "message": "MUSIC_API_URL not configured for music.infinite.windowed",
+                    "status": 500,
+                },
+            }
+
         class _WindowMusicProvider:
             async def _compose(self, payload: Dict[str, Any]) -> Dict[str, Any]:
                 async with httpx.AsyncClient() as client:
                     body = {
                         "prompt": payload.get("prompt"),
-                        "duration": int(payload.get("length_s") or 8),
+                        # Wire directly to the music service contract: it expects `seconds`.
+                        "seconds": int(payload.get("length_s") or 8),
                         "music_lock": payload.get("music_lock"),
                         "seed": payload.get("seed"),
                         "refs": payload.get("refs") or payload.get("music_refs"),
@@ -5508,102 +5482,113 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
 
         provider = _WindowMusicProvider()
         manifest = {"items": []}
-        try:
-            a = args if isinstance(args, dict) else {}
-            quality_profile = (a.get("quality_profile") or "standard")
-            # Derive a stable character identity for music locks when possible.
-            char_id = str(a.get("character_id") or "").strip()
-            if not char_id:
-                trace_val = a.get("trace_id")
-                if isinstance(trace_val, str) and trace_val.strip():
-                    char_id = f"char_{trace_val.strip()}"
-            if char_id and "character_id" not in a:
-                a["character_id"] = char_id
 
-            # Best-effort lock bundle resolution and Song Graph planning.
-            bundle_arg = a.get("lock_bundle")
-            lock_bundle: Optional[Dict[str, Any]] = None
-            if isinstance(bundle_arg, dict):
-                lock_bundle = bundle_arg
-            elif isinstance(bundle_arg, str) and bundle_arg.strip():
-                loaded = await _lock_load(bundle_arg.strip())
-                if isinstance(loaded, dict):
-                    lock_bundle = loaded
-            if lock_bundle is None and char_id:
-                loaded = await _lock_load(char_id)
-                if isinstance(loaded, dict):
-                    lock_bundle = loaded
-            if lock_bundle is None:
-                lock_bundle = {}
-            # Ensure the bundle carries character identity for downstream tools.
-            if char_id:
-                lock_bundle.setdefault("character_id", char_id)
-            # Normalize music branch shape.
-            lock_bundle = _lock_migrate_music(lock_bundle)
+        # NOTE: Intentionally avoid a broad try/except here so that real errors surface
+        # all the way up through /tool.run and the executor, instead of being flattened.
+        a = args if isinstance(args, dict) else {}
+        quality_profile = (a.get("quality_profile") or "standard")
 
-            prompt_text = str(a.get("prompt") or "").strip()
-            length_s = int(a.get("length_s") or 60)
-            bpm_val = a.get("bpm")
-            bpm_int: Optional[int] = None
-            if isinstance(bpm_val, (int, float)):
-                try:
-                    bpm_int = int(bpm_val)
-                except Exception:
-                    bpm_int = None
-            key_val = a.get("key")
-            key_txt: Optional[str] = None
-            if isinstance(key_val, str) and key_val.strip():
-                key_txt = key_val.strip()
+        # Derive a stable character identity for music locks when possible.
+        char_id = str(a.get("character_id") or "").strip()
+        if not char_id:
+            trace_val = a.get("trace_id")
+            if isinstance(trace_val, str) and trace_val.strip():
+                char_id = f"char_{trace_val.strip()}"
+        if char_id and "character_id" not in a:
+            a["character_id"] = char_id
 
-            music_branch = lock_bundle.get("music") if isinstance(lock_bundle.get("music"), dict) else {}
-            needs_song_graph = not isinstance(music_branch.get("global"), dict) or not isinstance(music_branch.get("sections"), list) or not music_branch.get("sections")
-            music_profile = None
-            # If any music references were attached in locks, build a profile for the planner.
-            refs_val = lock_bundle.get("music_refs") if isinstance(lock_bundle.get("music_refs"), dict) else {}
-            ref_ids = refs_val.get("ref_ids") if isinstance(refs_val.get("ref_ids"), list) else None
-            if ref_ids:
-                try:
-                    prof = _refs_music_profile({"ref_ids": ref_ids})
-                    if isinstance(prof, dict) and prof.get("ok") and isinstance(prof.get("profile"), dict):
-                        music_profile = prof.get("profile")
-                except Exception:
-                    music_profile = None
-            if needs_song_graph:
-                song_graph = await plan_song_graph(
-                    user_text=prompt_text,
-                    length_s=length_s,
-                    bpm=bpm_int,
-                    key=key_txt,
-                    trace_id=str(trace_id or ""),
-                    music_profile=music_profile,
-                )
-                if isinstance(song_graph, dict) and song_graph:
-                    music_branch = lock_bundle.setdefault("music", {})
-                    for k in ("global", "sections", "lyrics", "voices", "instruments", "motifs"):
-                        val = song_graph.get(k)
-                        if val is not None and k not in music_branch:
-                            music_branch[k] = val
-            if music_branch:
-                lock_bundle["music"] = music_branch
-            if lock_bundle:
-                a["lock_bundle"] = lock_bundle
+        # Best-effort lock bundle resolution and Song Graph planning.
+        bundle_arg = a.get("lock_bundle")
+        lock_bundle: Optional[Dict[str, Any]] = None
+        if isinstance(bundle_arg, dict):
+            lock_bundle = bundle_arg
+        elif isinstance(bundle_arg, str) and bundle_arg.strip():
+            loaded = await _lock_load(bundle_arg.strip())
+            if isinstance(loaded, dict):
+                lock_bundle = loaded
+        if lock_bundle is None and char_id:
+            loaded = await _lock_load(char_id)
+            if isinstance(loaded, dict):
+                lock_bundle = loaded
+        if lock_bundle is None:
+            lock_bundle = {}
 
-            env = run_music_infinite_windowed(a, provider, manifest)
-            # Persist updated lock bundle (including song graph and windows) when character_id present.
+        # Ensure the bundle carries character identity for downstream tools.
+        if char_id:
+            lock_bundle.setdefault("character_id", char_id)
+
+        # Normalize music branch shape.
+        lock_bundle = _lock_migrate_music(lock_bundle)
+
+        prompt_text = str(a.get("prompt") or "").strip()
+        length_s = int(a.get("length_s") or 60)
+        bpm_val = a.get("bpm")
+        bpm_int: Optional[int] = None
+        if isinstance(bpm_val, (int, float)):
             try:
-                if char_id and lock_bundle:
-                    await _lock_save(char_id, lock_bundle)
+                bpm_int = int(bpm_val)
             except Exception:
-                pass
-            return {"name": name, "result": env}
-        except Exception as ex:
-            return {"name": name, "error": str(ex)}
+                bpm_int = None
+        key_val = a.get("key")
+        key_txt: Optional[str] = None
+        if isinstance(key_val, str) and key_val.strip():
+            key_txt = key_val.strip()
+
+        music_branch = lock_bundle.get("music") if isinstance(lock_bundle.get("music"), dict) else {}
+        needs_song_graph = (
+            not isinstance(music_branch.get("global"), dict)
+            or not isinstance(music_branch.get("sections"), list)
+            or not music_branch.get("sections")
+        )
+        music_profile = None
+        # If any music references were attached in locks, build a profile for the planner.
+        refs_val = lock_bundle.get("music_refs") if isinstance(lock_bundle.get("music_refs"), dict) else {}
+        ref_ids = refs_val.get("ref_ids") if isinstance(refs_val.get("ref_ids"), list) else None
+        if ref_ids:
+            try:
+                prof = _refs_music_profile({"ref_ids": ref_ids})
+                if isinstance(prof, dict) and prof.get("ok") and isinstance(prof.get("profile"), dict):
+                    music_profile = prof.get("profile")
+            except Exception:
+                music_profile = None
+
+        if needs_song_graph:
+            song_graph = await plan_song_graph(
+                user_text=prompt_text,
+                length_s=length_s,
+                bpm=bpm_int,
+                key=key_txt,
+                trace_id=str(trace_id or ""),
+                music_profile=music_profile,
+            )
+            if isinstance(song_graph, dict) and song_graph:
+                music_branch = lock_bundle.setdefault("music", {})
+                for k in ("global", "sections", "lyrics", "voices", "instruments", "motifs"):
+                    val = song_graph.get(k)
+                    if val is not None and k not in music_branch:
+                        music_branch[k] = val
+
+        if music_branch:
+            lock_bundle["music"] = music_branch
+        if lock_bundle:
+            a["lock_bundle"] = lock_bundle
+
+        env = run_music_infinite_windowed(a, provider, manifest)
+
+        # Persist updated lock bundle (including song graph and windows) when character_id present.
+        try:
+            if char_id and lock_bundle:
+                await _lock_save(char_id, lock_bundle)
+        except Exception:
+            # Persistence failures should not hide the main music result.
+            pass
+
+        return {"name": name, "result": env}
     if name == "music.compose" and ALLOW_TOOL_EXECUTION:
         if not MUSIC_API_URL:
             return {"name": name, "error": "MUSIC_API_URL not configured"}
         class _MusicProvider:
             async def _compose(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-                import base64 as _b
                 async with httpx.AsyncClient() as client:
                     body = {
                         "prompt": payload.get("prompt"),
@@ -5619,7 +5604,6 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     wav = _b.b64decode(b64) if isinstance(b64, str) else b""
                     return {"wav_bytes": wav, "model": f"musicgen:{os.getenv('MUSIC_MODEL_ID','')}"}
             def compose(self, args: Dict[str, Any]) -> Dict[str, Any]:
-                import asyncio as _as
                 return _as.get_event_loop().run_until_complete(self._compose(args))
         provider = _MusicProvider()
         manifest = {"items": []}
@@ -6077,13 +6061,11 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                             # Prefer image score
                             url = f"/uploads/artifacts/image/{cid}/{aid}"
                             try:
-                                from .analysis.media import score_image_clip  # type: ignore
                                 return float(score_image_clip(url) or 0.0)
                             except Exception:
                                 return 0.0
                         if kind.startswith("audio") or base_tool.startswith("music"):
                             try:
-                                from .analysis.media import analyze_audio  # type: ignore
                                 m = analyze_audio(f"/uploads/artifacts/music/{cid}/{aid}")
                                 # Simple composite: louder within safe LUFS and richer spectrum
                                 return float((m.get("spectral_flatness") or 0.0))
@@ -6149,11 +6131,6 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         except Exception as ex:
             return {"name": name, "error": str(ex)}
     if name == "style.dna.extract" and ALLOW_TOOL_EXECUTION:
-        try:
-            import colorsys
-            from PIL import Image  # type: ignore
-        except Exception:
-            Image = None  # type: ignore
         imgs = args.get("images") if isinstance(args.get("images"), list) else []
         palette = []
         if Image and imgs:
@@ -6215,7 +6192,6 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             w,h = 1024,1024
         tokens = [t.strip(",. ") for t in prompt.replace(" and ", ",").split(",") if t.strip()]
         objs = []
-        import random as _rnd
         for t in tokens[:6]:
             x0 = _rnd.randint(0, max(0, w-200)); y0 = _rnd.randint(0, max(0, h-200))
             x1 = min(w, x0 + _rnd.randint(120, 300)); y1 = min(h, y0 + _rnd.randint(120, 300))
@@ -6302,7 +6278,6 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 # Persist stems if present
                 stems_obj = js.get("stems") if isinstance(js, dict) else None
                 if isinstance(stems_obj, dict):
-                    import base64 as _b
                     cid = "demucs-" + str(_now_ts())
                     outdir = os.path.join(UPLOAD_DIR, "artifacts", "audio", "demucs", cid)
                     _ensure_dir(outdir)
@@ -6990,18 +6965,13 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         prompt = (args.get("prompt") or "").strip()
         if not prompt:
             return {"name": name, "error": "missing prompt"}
-        try:
-            from PIL import Image, ImageDraw  # type: ignore
-        except Exception:
-            return {"name": name, "error": "Pillow not available"}
         size_text = args.get("size") or "1024x1024"
         try:
             w, h = [int(x) for x in size_text.lower().split("x")]
         except Exception:
             w, h = 1024, 1024
-        import time as _tm, os as _os
-        outdir = _os.path.join(UPLOAD_DIR, "artifacts", "image", f"super-{int(_tm.time())}")
-        _os.makedirs(outdir, exist_ok=True)
+        outdir = os.path.join(UPLOAD_DIR, "artifacts", "image", f"super-{int(time.time())}")
+        os.makedirs(outdir, exist_ok=True)
         # 1) Decompose prompt → object prompts (heuristic: split by commas/" and ")
         objs = []
         base_style = prompt
@@ -7032,7 +7002,6 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         wants_signage = any(kw in prompt.lower() for kw in signage_keywords)
         exact_text = None
         try:
-            import re as _re
             quoted = _re.findall(r"\"([^\"]{2,})\"|'([^']{2,})'", prompt)
             for a, b in quoted:
                 t = a or b
@@ -7093,8 +7062,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                         tile = Image.open(sub_path).convert("RGB")
                         # object-level CLIP score
                         try:
-                            from .analysis.media import analyze_image as _an_img  # type: ignore
-                            sc = float((_an_img(sub_path, refined_prompt) or {}).get("clip_score") or 0.0)
+                            sc = float((analyze_image(sub_path, refined_prompt) or {}).get("clip_score") or 0.0)
                         except Exception:
                             sc = 1.0
                         best_tile = tile if (best_tile is None or sc >= 0.35) else best_tile
@@ -7109,7 +7077,6 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         # 6) Final signage overlay (safety net) to strictly enforce text if requested
         try:
             if wants_signage and exact_text:
-                from PIL import ImageFont  # type: ignore
                 draw = ImageDraw.Draw(canvas)
                 # Choose a region likely to contain signage: first box with keyword, else center
                 target_box = None
@@ -7143,11 +7110,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         # Prefer local orchestrator; on failure, try DRT service if configured
         try:
             job_args = args if isinstance(args, dict) else {}
-            try:
-                import uuid as _uuid
-                job_args.setdefault("job_id", _uuid.uuid4().hex)
-            except Exception:
-                pass
+            job_args.setdefault("job_id", uuid.uuid4().hex)
             result = run_research(job_args)
             if isinstance(result, dict):
                 result.setdefault("job_id", job_args.get("job_id"))
@@ -7177,7 +7140,6 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 opts["num_predict"] = max(1, int(max_tokens or 900))
                 payload["options"] = opts
                 # reuse async call_ollama via blocking run
-                import requests as _rq
                 try:
                     r = _rq.post(self.base_url.rstrip("/") + "/api/generate", json=payload)
                     r.raise_for_status()
@@ -7199,7 +7161,6 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         k = int(args.get("k", 10))
         # Reuse the metasearch fuse logic directly
         engines: Dict[str, List[Dict[str, Any]]] = {}
-        import hashlib as _h
         def _mk(engine: str) -> List[Dict[str, Any]]:
             out = []
             for i in range(1, min(6, k) + 1):
@@ -7224,7 +7185,6 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         # Deterministic multi-engine placeholder only; SERPAPI removed in favor of internal metasearch
         engines: Dict[str, List[Dict[str, Any]]] = {}
         # deterministic synthetic engines
-        import hashlib as _h
         def _mk(engine: str) -> List[Dict[str, Any]]:
             out = []
             for i in range(1, min(6, k) + 1):
@@ -7262,7 +7222,6 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 r = await client.get(url)
             ct = r.headers.get("content-type", "")
             data = r.content or b""
-            import hashlib as _hl
             h = _hl.sha256(data).hexdigest()
             preview = None
             try:
@@ -7290,8 +7249,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         duration = str(args.get("duration") or "")
         if not src:
             return {"name": name, "error": "missing src"}
-        import os, subprocess, time as _tm
-        outdir = os.path.join(UPLOAD_DIR, "artifacts", "video", f"trim-{int(_tm.time())}")
+        outdir = os.path.join(UPLOAD_DIR, "artifacts", "video", f"trim-{int(time.time())}")
         os.makedirs(outdir, exist_ok=True)
         dst = os.path.join(outdir, "trimmed.mp4")
         ff = ["ffmpeg", "-y", "-i", src, "-ss", start]
@@ -7316,8 +7274,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         inputs = args.get("inputs") or []
         if not isinstance(inputs, list) or not inputs:
             return {"name": name, "error": "missing inputs"}
-        import os, subprocess, tempfile, time as _tm
-        outdir = os.path.join(UPLOAD_DIR, "artifacts", "video", f"concat-{int(_tm.time())}")
+        outdir = os.path.join(UPLOAD_DIR, "artifacts", "video", f"concat-{int(time.time())}")
         os.makedirs(outdir, exist_ok=True)
         listfile = os.path.join(outdir, "list.txt")
         with open(listfile, "w", encoding="utf-8") as f:
@@ -7335,8 +7292,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         a = args.get("a"); b = args.get("b"); vol_a = str(args.get("vol_a") or "1.0"); vol_b = str(args.get("vol_b") or "1.0")
         if not a or not b:
             return {"name": name, "error": "missing a/b"}
-        import os, subprocess, time as _tm
-        outdir = os.path.join(UPLOAD_DIR, "artifacts", "audio", f"mix-{int(_tm.time())}")
+        outdir = os.path.join(UPLOAD_DIR, "artifacts", "audio", f"mix-{int(time.time())}")
         os.makedirs(outdir, exist_ok=True)
         dst = os.path.join(outdir, "mix.wav")
         ff = ["ffmpeg", "-y", "-i", a, "-i", b, "-filter_complex", f"[0:a]volume={vol_a}[a0];[1:a]volume={vol_b}[a1];[a0][a1]amix=inputs=2:duration=longest", dst]
@@ -7351,8 +7307,6 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         if not src:
             return {"name": name, "error": "missing src"}
         try:
-            import cv2  # type: ignore
-            import numpy as np  # type: ignore
             img = cv2.imread(src, cv2.IMREAD_COLOR)
             if img is None:
                 return {"name": name, "error": "failed to read src"}
@@ -7373,8 +7327,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 cl = clahe.apply(l)
                 lab = cv2.merge((cl, a, b))
                 work = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
-            import time as _tm
-            outdir = os.path.join(UPLOAD_DIR, "artifacts", "image", f"cleanup-{int(_tm.time())}")
+            outdir = os.path.join(UPLOAD_DIR, "artifacts", "image", f"cleanup-{int(time.time())}")
             os.makedirs(outdir, exist_ok=True)
             dst = os.path.join(outdir, "clean.png")
             cv2.imwrite(dst, work)
@@ -7394,8 +7347,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         src = args.get("src") or ""
         if not src:
             return {"name": name, "error": "missing src"}
-        import os, subprocess, time as _tm
-        outdir = os.path.join(UPLOAD_DIR, "artifacts", "video", f"vclean-{int(_tm.time())}")
+        outdir = os.path.join(UPLOAD_DIR, "artifacts", "video", f"vclean-{int(time.time())}")
         os.makedirs(outdir, exist_ok=True)
         dst = os.path.join(outdir, "clean.mp4")
         # ffmpeg filter chain
@@ -7424,8 +7376,6 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         if not src or atype not in ("clock", "glass"):
             return {"name": name, "error": "missing src or unsupported type"}
         try:
-            import cv2  # type: ignore
-            import numpy as np  # type: ignore
             img = cv2.imread(src, cv2.IMREAD_COLOR)
             if img is None:
                 return {"name": name, "error": "failed to read src"}
@@ -7466,8 +7416,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 for yy in range(y + rh // 3, y + int(rh * 0.95)):
                     work[yy, x:x+rw] = cv2.addWeighted(work[yy, x:x+rw], 0.6, np.full((1, rw, 3), mean_color, dtype=np.uint8), 0.4, 0)
             work[y:y+rh, x:x+rw] = roi
-            import time as _tm, os
-            outdir = os.path.join(UPLOAD_DIR, "artifacts", "image", f"afix-{int(_tm.time())}")
+            outdir = os.path.join(UPLOAD_DIR, "artifacts", "image", f"afix-{int(time.time())}")
             os.makedirs(outdir, exist_ok=True)
             dst = os.path.join(outdir, "fixed.png")
             cv2.imwrite(dst, work)
@@ -7487,15 +7436,13 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         src = args.get("src") or ""; atype = (args.get("type") or "").strip().lower()
         if not src or atype not in ("clock", "glass"):
             return {"name": name, "error": "missing src or unsupported type"}
-        import os, subprocess, time as _tm
-        outdir = os.path.join(UPLOAD_DIR, "artifacts", "video", f"vafix-{int(_tm.time())}")
+        outdir = os.path.join(UPLOAD_DIR, "artifacts", "video", f"vafix-{int(time.time())}")
         frames_dir = os.path.join(outdir, "frames"); os.makedirs(frames_dir, exist_ok=True)
         dst = os.path.join(outdir, "fixed.mp4")
         try:
             # Extract frames
             subprocess.run(["ffmpeg", "-y", "-i", src, os.path.join(frames_dir, "%06d.png")], check=True)
             # Process frames with image.artifact_fix
-            from glob import glob as _glob
             frame_files = sorted(_glob(os.path.join(frames_dir, "*.png")))
             for fp in frame_files:
                 _ = await execute_tool_call({"name": "image.artifact_fix", "arguments": {"src": fp, "type": atype, "target_time": args.get("target_time"), "region": args.get("region"), "cid": args.get("cid")}})
@@ -7518,9 +7465,6 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         if not src:
             return {"name": name, "error": "missing src"}
         try:
-            import cv2  # type: ignore
-            import numpy as np  # type: ignore
-            import mediapipe as mp  # type: ignore
             img = cv2.imread(src, cv2.IMREAD_COLOR)
             if img is None:
                 return {"name": name, "error": "failed to read src"}
@@ -7573,8 +7517,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 roi_blend = (roi_inpaint.astype(np.float32) * alpha3 + roi_img.astype(np.float32) * (1.0 - alpha3)).astype(np.uint8)
                 work[y0:y1, x0:x1] = roi_blend
             out = work
-            import time as _tm, os
-            outdir = os.path.join(UPLOAD_DIR, "artifacts", "image", f"handsfix-{int(_tm.time())}")
+            outdir = os.path.join(UPLOAD_DIR, "artifacts", "image", f"handsfix-{int(time.time())}")
             os.makedirs(outdir, exist_ok=True)
             dst = os.path.join(outdir, "fixed.png")
             cv2.imwrite(dst, out)
@@ -7594,13 +7537,11 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         src = args.get("src") or ""
         if not src:
             return {"name": name, "error": "missing src"}
-        import os, subprocess, time as _tm
-        outdir = os.path.join(UPLOAD_DIR, "artifacts", "video", f"vhandsfix-{int(_tm.time())}")
+        outdir = os.path.join(UPLOAD_DIR, "artifacts", "video", f"vhandsfix-{int(time.time())}")
         frames_dir = os.path.join(outdir, "frames"); os.makedirs(frames_dir, exist_ok=True)
         dst = os.path.join(outdir, "fixed.mp4")
         try:
             subprocess.run(["ffmpeg", "-y", "-i", src, os.path.join(frames_dir, "%06d.png")], check=True)
-            from glob import glob as _glob
             frame_files = sorted(_glob(os.path.join(frames_dir, "*.png")))
             for fp in frame_files:
                 _ = await execute_tool_call({"name": "image.hands.fix", "arguments": {"src": fp, "cid": args.get("cid")}})
@@ -7622,8 +7563,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         target_fps = int(args.get("target_fps") or 60)
         if not src:
             return {"name": name, "error": "missing src"}
-        import os, subprocess, time as _tm
-        outdir = os.path.join(UPLOAD_DIR, "artifacts", "video", f"interp-{int(_tm.time())}")
+        outdir = os.path.join(UPLOAD_DIR, "artifacts", "video", f"interp-{int(time.time())}")
         os.makedirs(outdir, exist_ok=True)
         dst = os.path.join(outdir, "interpolated.mp4")
         vf = f"minterpolate=fps={target_fps}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1"
@@ -7688,7 +7628,6 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                             ej = _resp_json(er, {"embedding": list, "vec": list}); emb = ej.get("embedding") or ej.get("vec")
                     # 3) Per-frame InstantID apply with low denoise
                     if emb and isinstance(emb, list):
-                        from glob import glob as _glob
                         frame_files = sorted(_glob(os.path.join(frames_dir, "*.png")))
                         for fp in frame_files:
                             try:
@@ -7729,7 +7668,6 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                                                             it = items[0]
                                                             fn = it.get("filename"); sub = it.get("subfolder"); tp = it.get("type") or "output"
                                                             if fn:
-                                                                from urllib.parse import urlencode
                                                                 q = {"filename": fn, "type": tp}
                                                                 if sub: q["subfolder"] = sub
                                                                 vr = _c2.get(COMFYUI_API_URL.rstrip("/") + "/view?" + urlencode(q))
@@ -7739,8 +7677,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                                                                     got = True
                                                                     break
                                                     break
-                                            import time as __t
-                                            __t.sleep(0.5)
+                                            time.sleep(0.5)
                             except Exception:
                                 continue
                         # 4) Reassemble stabilized video
@@ -7762,12 +7699,6 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         except Exception as ex:
             return {"name": name, "error": str(ex)}
     if name == "video.flow.derive":
-        import os, time as _tm
-        try:
-            import cv2  # type: ignore
-            import numpy as np  # type: ignore
-        except Exception as ex:
-            return {"name": name, "error": f"opencv_missing: {str(ex)}"}
         frame_a = args.get("frame_a") or ""
         frame_b = args.get("frame_b") or ""
         src = args.get("src") or ""
@@ -7838,8 +7769,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         w = args.get("width"); h = args.get("height")
         if not src:
             return {"name": name, "error": "missing src"}
-        import os, subprocess, time as _tm
-        outdir = os.path.join(UPLOAD_DIR, "artifacts", "video", f"upscale-{int(_tm.time())}")
+        outdir = os.path.join(UPLOAD_DIR, "artifacts", "video", f"upscale-{int(time.time())}")
         os.makedirs(outdir, exist_ok=True)
         dst = os.path.join(outdir, "upscaled.mp4")
         if scale and scale > 1:
@@ -7900,7 +7830,6 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                         if er.status_code == 200:
                             ej = _resp_json(er, {"embedding": list, "vec": list}); emb = ej.get("embedding") or ej.get("vec")
                     if emb and isinstance(emb, list):
-                        from glob import glob as _glob
                         frame_files = sorted(_glob(os.path.join(frames_dir, "*.png")))
                         for fp in frame_files:
                             try:
@@ -7934,7 +7863,6 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                                                             it = items[0]
                                                             fn = it.get("filename"); sub = it.get("subfolder"); tp = it.get("type") or "output"
                                                             if fn:
-                                                                from urllib.parse import urlencode
                                                                 q = {"filename": fn, "type": tp}
                                                                 if sub: q["subfolder"] = sub
                                                                 vr = _c2.get(COMFYUI_API_URL.rstrip("/") + "/view?" + urlencode(q))
@@ -7943,9 +7871,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                                                                         wf.write(vr.content)
                                                                     got = True
                                                                     break
-                                                    
-                                            import time as __t
-                                            __t.sleep(0.5)
+                                            time.sleep(0.5)
                             except Exception:
                                 continue
                         dst2 = os.path.join(outdir, "upscaled_stabilized.mp4")
@@ -7971,14 +7897,11 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         if not src or not isinstance(texts, list) or not texts:
             return {"name": name, "error": "missing src|texts"}
         try:
-            import os, subprocess, time as _tm
-            from PIL import Image, ImageDraw, ImageFont  # type: ignore
             # Extract frames
             outdir = os.path.join(UPLOAD_DIR, "artifacts", "video", f"txtov-{int(_tm.time())}")
             frames_dir = os.path.join(outdir, "frames")
             os.makedirs(frames_dir, exist_ok=True)
             subprocess.run(["ffmpeg", "-y", "-i", src, os.path.join(frames_dir, "%06d.png")], check=True)
-            from glob import glob as _glob
             frame_files = sorted(_glob(os.path.join(frames_dir, "*.png")))
             # Helper to draw text on a PIL image
             def _draw_on(im: Image.Image, spec: dict) -> Image.Image:
@@ -8074,8 +7997,6 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         try:
             # Prefer SymPy for exact math; fallback to safe math eval
             try:
-                import sympy as _sp  # type: ignore
-                from sympy.parsing.sympy_parser import parse_expr as _parse  # type: ignore
                 x = _sp.symbols(var)
                 scope = {str(x): x, 'E': _sp.E, 'pi': _sp.pi}
                 e = _parse(str(expr), local_dict=scope, evaluate=True)
@@ -8127,8 +8048,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     pass
                 return {"name": name, "result": res}
             except Exception:
-                import math as _m
-                allowed = {k: getattr(_m, k) for k in dir(_m) if not k.startswith("_")}
+                allowed = {k: getattr(math, k) for k in dir(math) if not k.startswith("_")}
                 allowed.update({"__builtins__": {}})
                 val = eval(str(expr), allowed, {})  # noqa: S307 (safe namespace)
                 return {"name": name, "result": {"approx": float(val)}}
@@ -8513,6 +8433,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         {"role": "system", "content": "You are a planning committee member. Propose a high-level tool strategy as JSON: {\"rationale\": str, \"tools_outline\": [str]}."},
         {"role": "user", "content": committee_user_text or "No user text available."},
     ]
+    committee_errors: List[Dict[str, Any]] = []
     for p in COMMITTEE_PARTICIPANTS:
         member = p.get("id") or "member"
         base = (p.get("base") or "").rstrip("/") or QWEN_BASE_URL
@@ -8522,11 +8443,24 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             _log("committee.backend.call", trace_id=trace_id, member=member, base=base, model=model)
             _log("committee.preplan.call", trace_id=trace_id, member=member, base=base, model=model)
             res = await call_ollama(base, payload)
+            # Treat backend-level errors as hard failures for this committee member.
+            if isinstance(res, dict) and isinstance(res.get("error"), str) and res.get("error"):
+                raise RuntimeError(f"committee backend error for {member}: {res.get('error')}")
             text = (res.get("response") or "").strip() if isinstance(res, dict) else ""
             parsed = parser.parse(text or "{}", {"rationale": str, "tools_outline": [str]})
             rationale = (parsed.get("rationale") or text or "").strip()
             tools_outline = parsed.get("tools_outline") or []
         except Exception as ex:
+            # Log and track committee member failures instead of silently degrading.
+            _log("committee.backend.error", trace_id=trace_id, member=member, base=base, model=model, error=str(ex))
+            committee_errors.append(
+                {
+                    "member": member,
+                    "base": base,
+                    "model": model,
+                    "error": str(ex),
+                }
+            )
             rationale = f"(committee error: {ex})"
             tools_outline = []
         opt_id = f"opt_{member}"
@@ -8538,6 +8472,8 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 "tools_outline": tools_outline,
             }
         )
+    if committee_errors:
+        _log("committee.preplan.errors", trace_id=trace_id, errors=committee_errors)
     _log("committee.proposals", trace_id=trace_id, options=preplan_options)
     # Simple heuristic vote: prefer any option that explicitly mentions typed args/json.parse, otherwise first option wins.
     winner_id = None
@@ -8608,7 +8544,6 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     tool_calls = _normalize_tool_calls(tool_calls)
     _log("planner.tools.normalized", trace_id=trace_id, tool_count=len(tool_calls))
     # Emit planner.steps and catalog hash for traceability (derived from allowed tool names)
-    import hashlib as _hl
     def _compute_tools_hash() -> str:
         names = set()
         # include client-declared tool names if provided (planner-visible only)
@@ -9459,10 +9394,10 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         messages=exec_messages, model=DEEPSEEK_CODER_MODEL_ID, num_ctx=DEFAULT_NUM_CTX, temperature=body.get("temperature") or DEFAULT_TEMPERATURE
     )
 
-    qwen_task = asyncio.create_task(call_ollama(QWEN_BASE_URL, qwen_payload))
-    glm_task = asyncio.create_task(call_ollama(GLM_OLLAMA_BASE_URL, glm_payload))
-    deepseek_task = asyncio.create_task(call_ollama(DEEPSEEK_CODER_OLLAMA_BASE_URL, deepseek_payload))
-    qwen_result, glm_result, deepseek_result = await asyncio.gather(qwen_task, glm_task, deepseek_task)
+    qwen_task = _as.create_task(call_ollama(QWEN_BASE_URL, qwen_payload))
+    glm_task = _as.create_task(call_ollama(GLM_OLLAMA_BASE_URL, glm_payload))
+    deepseek_task = _as.create_task(call_ollama(DEEPSEEK_CODER_OLLAMA_BASE_URL, deepseek_payload))
+    qwen_result, glm_result, deepseek_result = await _as.gather(qwen_task, glm_task, deepseek_task)
     # If backends errored but we have tool results (e.g., image job still running/finishing), degrade gracefully
     if qwen_result.get("error") or glm_result.get("error") or deepseek_result.get("error"):
         if tool_results:
@@ -9673,10 +9608,10 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             body.get("temperature") or DEFAULT_TEMPERATURE,
         )
 
-        qcrit_task = asyncio.create_task(call_ollama(QWEN_BASE_URL, qwen_crit_payload))
-        gcrit_task = asyncio.create_task(call_ollama(GLM_OLLAMA_BASE_URL, glm_crit_payload))
-        dcrit_task = asyncio.create_task(call_ollama(DEEPSEEK_CODER_OLLAMA_BASE_URL, deepseek_crit_payload))
-        qcrit_res, gcrit_res, dcrit_res = await asyncio.gather(qcrit_task, gcrit_task, dcrit_task)
+        qcrit_task = _as.create_task(call_ollama(QWEN_BASE_URL, qwen_crit_payload))
+        gcrit_task = _as.create_task(call_ollama(GLM_OLLAMA_BASE_URL, glm_crit_payload))
+        dcrit_task = _as.create_task(call_ollama(DEEPSEEK_CODER_OLLAMA_BASE_URL, deepseek_crit_payload))
+        qcrit_res, gcrit_res, dcrit_res = await _as.gather(qcrit_task, gcrit_task, dcrit_task)
         qcrit_text = qcrit_res.get("response", "")
         gcrit_text = gcrit_res.get("response", "")
         dcrit_text = dcrit_res.get("response", "")
@@ -9841,7 +9776,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         async def _send_trace_stream():
             async with httpx.AsyncClient() as client:
                 await client.post(TEACHER_API_URL.rstrip("/") + "/teacher/trace.append", json=trace_payload_stream)
-        asyncio.create_task(_send_trace_stream())
+        _as.create_task(_send_trace_stream())
 
         async def _stream_with_stages(text: str):
             # Open the stream with assistant role
@@ -9936,7 +9871,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                     chunk = json.dumps({"id": "orc-1", "object": "chat.completion.chunk", "created": int(time.time()), "model": model_id, "choices": [{"index": 0, "delta": {"content": piece}, "finish_reason": None}]})
                     yield f"data: {chunk}\n\n"
                     if STREAM_CHUNK_INTERVAL_MS > 0:
-                        await asyncio.sleep(STREAM_CHUNK_INTERVAL_MS / 1000.0)
+                        await _as.sleep(STREAM_CHUNK_INTERVAL_MS / 1000.0)
             else:
                 content_chunk = json.dumps({"id": "orc-1", "object": "chat.completion.chunk", "created": int(time.time()), "model": model_id, "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}]})
                 yield f"data: {content_chunk}\n\n"
@@ -10762,8 +10697,7 @@ async def tool_describe(name: str, response: Response):
             details={},
         )
     sch = meta["schema"]
-    import hashlib as _hl, json as _json
-    compact = _json.dumps(sch, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    compact = json.dumps(sch, sort_keys=True, separators=(",", ":")).encode("utf-8")
     shash = _hl.sha256(compact).hexdigest()
     try:
         response.headers["ETag"] = f'W/"{shash}"'
@@ -10790,7 +10724,6 @@ async def jobs_start(body: Dict[str, Any]):
     Immediately executes the requested tool synchronously and returns the result with a synthetic job_id.
     """
     try:
-        import uuid
         jid = uuid.uuid4().hex
         name = (body or {}).get("tool") or (body or {}).get("name")
         args = (body or {}).get("args") or {}
@@ -10811,8 +10744,7 @@ async def jobs_start(body: Dict[str, Any]):
 async def datasets_start(body: Dict[str, Any]):
     try:
         # Stream via /orcjobs/{id}/stream
-        import time as _tm, uuid as _uuid
-        jid = body.get("id") or f"ds-{_uuid.uuid4().hex}"
+        jid = body.get("id") or f"ds-{uuid.uuid4().hex}"
         j = _orcjob_create(jid=jid, tool="datasets.export", args=body or {})
         _orcjob_set_state(j.id, "running", phase="start", progress=0.0)
         def _emit(ev: Dict[str, Any]):
@@ -10825,12 +10757,11 @@ async def datasets_start(body: Dict[str, Any]):
         async def _runner():
             try:
                 # Offload sync export to a thread to avoid blocking loop
-                import asyncio as _as
                 res = await _as.to_thread(_datasets_start, body or {}, _emit)
                 _orcjob_set_state(j.id, "done", phase="done", progress=1.0)
             except Exception as ex:
                 _orcjob_set_state(j.id, "failed", phase="error", progress=1.0, error=str(ex))
-        asyncio.create_task(_runner())
+        _as.create_task(_runner())
         return {"id": j.id}
     except Exception as ex:
         return JSONResponse(status_code=400, content={"error": str(ex)})
@@ -11500,7 +11431,7 @@ async def orcjob_stream(job_id: str, interval_ms: Optional[int] = None):
             if j.state in ("done", "failed", "cancelled"):
                 yield "data: [DONE]\n\n"
                 break
-            await asyncio.sleep(max(0.01, (interval_ms or 1000) / 1000.0))
+            await _as.sleep(max(0.01, (interval_ms or 1000) / 1000.0))
     return StreamingResponse(_gen(), media_type="text/event-stream")
 
 
@@ -11592,7 +11523,6 @@ async def v1_distill_pack(body: Dict[str, Any]):
         # Copy ledger tail and minimal manifests
         ledger_src = os.path.join(FILM2_DATA_DIR, "distill", "ledger.jsonl")
         if os.path.exists(ledger_src):
-            import shutil as _sh
             _sh.copyfile(ledger_src, os.path.join(out_dir, "ledger.jsonl"))
         with open(os.path.join(out_dir, "RESULTS.md"), "w", encoding="utf-8") as f:
             f.write("# RESULTS\n\nPack created. Fill with eval results.")
@@ -11606,7 +11536,6 @@ async def v1_replay(body: Dict[str, Any]):
     if not job_id:
         return JSONResponse(status_code=400, content={"error": "missing job_id"})
     # Minimal stub: compute sha256 of latest artifact file if present
-    import hashlib as _hl
     job_dir = _proj_dir(job_id)
     arts = []
     for root, _, files in os.walk(os.path.join(job_dir, "artifacts")):
@@ -11644,7 +11573,6 @@ async def completions_legacy(body: Dict[str, Any]):
     # Streaming: relay a single final chunk transformed to completions shape
     if stream:
         async def _gen():
-            import httpx as _hx  # type: ignore
             async with _hx.AsyncClient(trust_env=False, timeout=None) as client:
                 async with client.stream("POST", (PUBLIC_BASE_URL.rstrip("/") if PUBLIC_BASE_URL else "http://127.0.0.1:8000") + "/v1/chat/completions", json=payload) as r:
                     async for line in r.aiter_lines():
@@ -11680,7 +11608,6 @@ async def completions_legacy(body: Dict[str, Any]):
         return StreamingResponse(_gen(), media_type="text/event-stream")
 
     # Non-streaming: call locally and map envelope
-    import httpx as _hx  # type: ignore
     async with _hx.AsyncClient(trust_env=False, timeout=None) as client:
         rr = await client.post((PUBLIC_BASE_URL.rstrip("/") if PUBLIC_BASE_URL else "http://127.0.0.1:8000") + "/v1/chat/completions", json=payload)
     ct = rr.headers.get("content-type") or "application/json"
@@ -11745,20 +11672,18 @@ async def ws_tool(websocket: WebSocket):
                 # Keepalive while long tools run and stream start/result/done frames
                 live = True
                 async def _keepalive() -> None:
-                    import asyncio as _asyncio
                     while live:
                         try:
                             await websocket.send_text(json.dumps({"keepalive": True}))
                         except Exception:
                             break
-                        await _asyncio.sleep(10)
-                import asyncio as _asyncio
-                ka_task = _asyncio.create_task(_keepalive())
+                        await _as.sleep(10)
+                ka_task = _as.create_task(_keepalive())
                 await websocket.send_text(json.dumps({"event": "start", "name": name}))
                 # Progress queue wiring
-                q: asyncio.Queue = asyncio.Queue()
+                q: _as.Queue = _as.Queue()
                 set_progress_queue(q)
-                exec_task = _asyncio.create_task(execute_tool_call({"name": name, "arguments": args}))
+                exec_task = _as.create_task(execute_tool_call({"name": name, "arguments": args}))
                 while True:
                     sent = False
                     while not q.empty():
@@ -11769,7 +11694,7 @@ async def ws_tool(websocket: WebSocket):
                         res = await exec_task
                         break
                     if not sent:
-                        await _asyncio.sleep(0.25)
+                        await _as.sleep(0.25)
                 live = False
                 try: ka_task.cancel()
                 except Exception as _e_cancel:
@@ -11800,7 +11725,6 @@ async def ws_tool(websocket: WebSocket):
 
 @app.post("/upload")
 async def upload(file: UploadFile = File(...)):
-    import uuid
     suffix = ""
     if "." in file.filename:
         suffix = "." + file.filename.split(".")[-1]
@@ -11811,7 +11735,6 @@ async def upload(file: UploadFile = File(...)):
     url = f"{PUBLIC_BASE_URL.rstrip('/')}/uploads/{name}" if PUBLIC_BASE_URL else f"/uploads/{name}"
     # Ingest and index into RAG if possible
     try:
-        from .ingest.core import ingest_file
         texts_meta = ingest_file(path, vlm_url=VLM_API_URL, whisper_url=WHISPER_API_URL, ocr_url=OCR_API_URL)
         texts = texts_meta.get("texts") or []
         if texts:
@@ -11887,7 +11810,6 @@ async def _comfy_submit_workflow(workflow: Dict[str, Any]) -> Dict[str, Any]:
                             _job_endpoint[pid] = base
                             # Wait for execution via WS
                             ws_url = base.replace("http", "ws").rstrip("/") + f"/ws?clientId=wrapper-001"
-                            import websockets as _ws
                             async with _ws.connect(ws_url, ping_interval=None) as ws:
                                 # Drain until executed message for our pid
                                 while True:
@@ -11906,7 +11828,7 @@ async def _comfy_submit_workflow(workflow: Dict[str, Any]) -> Dict[str, Any]:
                 _comfy_load[base] = max(0, _comfy_load.get(base, 1) - 1)
         # backoff before next round
         try:
-            await asyncio.sleep(max(0.0, float(delay) / 1000.0))
+            await _as.sleep(max(0.0, float(delay) / 1000.0))
         except Exception:
             pass
         delay = min(delay * 2, COMFYUI_BACKOFF_MAX_MS)
@@ -11970,7 +11892,6 @@ def _parse_duration_seconds_dynamic(value: Any, default_seconds: float = 10.0) -
     if not s:
         return int(default_seconds)
     # HH:MM:SS or MM:SS
-    import re as _re
     if _re.match(r"^\d{1,2}:\d{2}(:\d{2})?$", s):
         parts = s.split(":")
         # All parts are digits by regex, so int() is safe
@@ -12002,7 +11923,6 @@ def _parse_fps_dynamic(value: Any, default_fps: int = 60) -> int:
         if isinstance(value, (int, float)):
             return max(1, min(240, int(round(float(value)))))
         s = str(value).strip().lower()
-        import re as _re
         m = _re.match(r"^(\d{1,3})\s*fps$", s)
         if m:
             return max(1, min(240, int(m.group(1))))
@@ -12043,8 +11963,7 @@ def build_default_scene_workflow(prompt: str, characters: List[Dict[str, Any]], 
 
 
 def _derive_seed(*parts: str) -> int:
-    import hashlib
-    h = hashlib.sha256("::".join(parts).encode("utf-8")).hexdigest()
+    h = _h.sha256("::".join(parts).encode("utf-8")).hexdigest()
     # 32-bit range for Comfy samplers
     return int(h[:8], 16)
 
@@ -12190,12 +12109,12 @@ async def _track_comfy_job(job_id: str, prompt_id: str) -> None:
                 _jobs_store[job_id]["state"] = "running"
                 if last_error:
                     _jobs_store[job_id]["error"] = last_error
-                await asyncio.sleep(2.0)
+                await _as.sleep(2.0)
                 continue
-            await asyncio.sleep(2.0)
+            await _as.sleep(2.0)
             continue
         # keep polling
-        await asyncio.sleep(2.0)
+        await _as.sleep(2.0)
 
 
 @app.post("/jobs")
@@ -12211,14 +12130,13 @@ async def create_job(body: Dict[str, Any]):
     prompt_id = submit.get("prompt_id") or submit.get("uuid") or submit.get("id")
     if not prompt_id:
         return JSONResponse(status_code=502, content={"error": "invalid comfy response", "detail": submit})
-    import uuid as _uuid
-    job_id = _uuid.uuid4().hex
+    job_id = uuid.uuid4().hex
     pool = await get_pg_pool()
     if pool is not None:
         async with pool.acquire() as conn:
             await conn.execute("INSERT INTO jobs (id, prompt_id, status, workflow) VALUES ($1, $2, 'queued', $3)", job_id, prompt_id, json.dumps(workflow))
     _jobs_store[job_id] = {"id": job_id, "prompt_id": prompt_id, "state": "queued", "created_at": time.time(), "updated_at": time.time(), "result": None}
-    asyncio.create_task(_track_comfy_job(job_id, prompt_id))
+    _as.create_task(_track_comfy_job(job_id, prompt_id))
     return {"job_id": job_id, "prompt_id": prompt_id}
 
 
@@ -12262,7 +12180,7 @@ async def stream_job(job_id: str, interval_ms: Optional[int] = None):
             if state in ("succeeded", "failed", "cancelled"):
                 yield "data: [DONE]\n\n"
                 break
-            await asyncio.sleep(max(0.01, (interval_ms or 1000) / 1000.0))
+            await _as.sleep(max(0.01, (interval_ms or 1000) / 1000.0))
 
     return StreamingResponse(_gen(), media_type="text/event-stream")
 
@@ -12393,7 +12311,6 @@ def _extract_comfy_asset_urls(detail: Dict[str, Any] | str, base_override: Optio
         return urls
     base = base_url.rstrip('/')
     def _url(fn: str, ftype: str, sub: Optional[str]) -> str:
-        from urllib.parse import urlencode
         q = {"filename": fn, "type": ftype or "output"}
         if sub:
             q["subfolder"] = sub
@@ -12547,15 +12464,13 @@ def _mean_normalize_embedding(embs: List[List[float]]) -> List[float]:
             sums[i] += float(v[i])
     mean = [x / len(embs) for x in sums]
     # L2 normalize
-    import math
     norm = math.sqrt(sum(x * x for x in mean)) or 1.0
     return [x / norm for x in mean]
 
 
 def _text_to_simple_srt(text: str, duration_seconds: int) -> str:
     # naive: split by sentences, distribute time evenly
-    import re
-    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+    sentences = [s.strip() for s in _re.split(r"(?<=[.!?])\s+", text) if s.strip()]
     if not sentences:
         sentences = [text]
     n = max(1, len(sentences))
