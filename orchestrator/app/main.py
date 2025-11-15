@@ -1806,7 +1806,7 @@ def _write_json_safe(path: str, obj: Dict[str, Any]) -> None:
 
 QWEN_BASE_URL = os.getenv("QWEN_BASE_URL", "http://localhost:11435")
 QWEN_MODEL_ID = os.getenv("QWEN_MODEL_ID", "qwen3:30b-a3b-instruct-2507-q4_K_M")
-GLM_OLLAMA_BASE_URL = os.getenv("GLM_OLLAMA_BASE_URL", "http://localhost:11434")
+GLM_OLLAMA_BASE_URL = os.getenv("GLM_OLLAMA_BASE_URL", "http://localhost:11433")
 GLM_MODEL_ID = os.getenv("GLM_MODEL_ID", "glm4:9b")
 DEEPSEEK_CODER_OLLAMA_BASE_URL = os.getenv("DEEPSEEK_CODER_OLLAMA_BASE_URL", "http://localhost:11436")
 DEEPSEEK_CODER_MODEL_ID = os.getenv("DEEPSEEK_CODER_MODEL_ID", "deepseek-coder-v2:lite")
@@ -4344,10 +4344,28 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         locks_arg = a.get("locks") if isinstance(a.get("locks"), dict) else {}
         if locks_arg:
             result["meta"]["locks"] = locks_arg
+        # Cross-branch locals used throughout the film2.run pipeline
         story_obj: Dict[str, Any] = {}
         scenes_from_story: List[Dict[str, Any]] = []
         shots_from_story: List[Dict[str, Any]] = []
         warnings: List[str] = []
+        # Character context derived from locks (if present); reused for music + hero updates
+        character_entries = locks_arg.get("characters") if isinstance(locks_arg.get("characters"), list) else []
+        character_ids: List[str] = []
+        for entry in character_entries:
+            char_id = entry.get("id")
+            if isinstance(char_id, str) and char_id.strip():
+                character_ids.append(char_id.strip())
+        current_character_bundles: Dict[str, Dict[str, Any]] = {}
+        for character_id in character_ids:
+            bundle_existing = await _lock_load(character_id)
+            if isinstance(bundle_existing, dict):
+                bundle_existing = _lock_migrate_visual(bundle_existing)
+                bundle_existing = _lock_migrate_music(bundle_existing)
+                bundle_existing = _lock_migrate_tts(bundle_existing)
+                bundle_existing = _lock_migrate_sfx(bundle_existing)
+                bundle_existing = _lock_migrate_film2(bundle_existing)
+                current_character_bundles[character_id] = bundle_existing
         if prompt:
             try:
                 story_obj = _story_draft(prompt, duration_s)
@@ -4530,7 +4548,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             }
             if character_ids:
                 music_args["character_id"] = character_ids[0]
-            music_call = await execute_tool_call({"name": "music.infinite.windowed", "arguments": music_args})
+            # Avoid recursion into execute_tool_call; call the canonical /tool.run bridge instead.
+            music_call = await http_tool_run("music.infinite.windowed", music_args)
             if isinstance(music_call, dict):
                 music_meta = music_call.get("result") or music_call
         if music_meta:
@@ -4609,22 +4628,6 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 "prompt": prompt,
             },
         )
-        character_entries = locks_arg.get("characters") if isinstance(locks_arg.get("characters"), list) else []
-        character_ids: List[str] = []
-        for entry in character_entries:
-            char_id = entry.get("id")
-            if isinstance(char_id, str) and char_id.strip():
-                character_ids.append(char_id.strip())
-        current_character_bundles: Dict[str, Dict[str, Any]] = {}
-        for character_id in character_ids:
-            bundle_existing = await _lock_load(character_id)
-            if isinstance(bundle_existing, dict):
-                bundle_existing = _lock_migrate_visual(bundle_existing)
-                bundle_existing = _lock_migrate_music(bundle_existing)
-                bundle_existing = _lock_migrate_tts(bundle_existing)
-                bundle_existing = _lock_migrate_sfx(bundle_existing)
-                bundle_existing = _lock_migrate_film2(bundle_existing)
-                current_character_bundles[character_id] = bundle_existing
         def _ev(e: Dict[str, Any]) -> None:
             if trace_id:
                 row = {"t": int(time.time()*1000), **e}
@@ -4644,7 +4647,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     segment_log: List[Dict[str, Any]] = []
                     # Cleanup
                     _ev({"event": "film2.pass_cleanup_start", "src": src})
-                    cc = await execute_tool_call({"name": "video.cleanup", "arguments": {"src": src, "cid": cid, "trace_id": trace_id}})
+                    cc = await http_tool_run("video.cleanup", {"src": src, "cid": cid, "trace_id": trace_id})
                     if isinstance(cc, dict):
                         segment_log.append(cc)
                     ccr = (cc.get("result") or {}) if isinstance(cc, dict) else {}
@@ -4657,7 +4660,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     current = clean_path or src
                     if do_interpolate and isinstance(current, str):
                         _ev({"event": "film2.pass_interpolate_start"})
-                        ic = await execute_tool_call({"name": "video.interpolate", "arguments": {"src": current, "cid": cid, "trace_id": trace_id}})
+                        ic = await http_tool_run("video.interpolate", {"src": current, "cid": cid, "trace_id": trace_id})
                         if isinstance(ic, dict):
                             segment_log.append(ic)
                         icr = (ic.get("result") or {}) if isinstance(ic, dict) else {}
@@ -4673,7 +4676,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                         uc_args = {"src": current, "cid": cid, "trace_id": trace_id}
                         if target_scale:
                             uc_args["scale"] = target_scale
-                        uc = await execute_tool_call({"name": "video.upscale", "arguments": uc_args})
+                        uc = await http_tool_run("video.upscale", uc_args)
                         if isinstance(uc, dict):
                             segment_log.append(uc)
                         up = (uc.get("result") or {}) if isinstance(uc, dict) else {}
@@ -4803,7 +4806,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                             "init_image": hv_args.get("init_image"),
                         },
                     )
-                    gv = await execute_tool_call({"name": hv_name, "arguments": hv_args})
+                    gv = await http_tool_run(hv_name, hv_args)
                     if isinstance(gv, dict):
                         segment_log.append(gv)
                     gvr = (gv.get("result") or {}) if isinstance(gv, dict) else {}
@@ -4851,7 +4854,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                         "cid": cid,
                     }
                     _ev({"event": "film2.pass_gen_start", "adapter": "hv.i2v", "image": img})
-                    gv = await execute_tool_call({"name": "video.hv.i2v", "arguments": hv_args_img})
+                    gv = await http_tool_run("video.hv.i2v", hv_args_img)
                     if isinstance(gv, dict):
                         segment_log.append(gv)
                     gvr = (gv.get("result") or {}) if isinstance(gv, dict) else {}

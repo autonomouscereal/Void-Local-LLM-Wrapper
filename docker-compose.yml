@@ -227,7 +227,7 @@ services:
       - nvidia_init
     # host networking: no ports mapping needed
     environment:
-      - OLLAMA_HOST=0.0.0.0:11434
+      - OLLAMA_HOST=0.0.0.0:11433
       - OLLAMA_KEEP_ALIVE=24h
       - NVIDIA_VISIBLE_DEVICES=${OLLAMA_GLM_GPU:-all}
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
@@ -262,7 +262,7 @@ services:
       - glm_ollama
     environment:
       - GLM_MODEL_ID=${GLM_MODEL_ID:-glm4:9b}
-    command: ["sh","-lc","until curl -s http://127.0.0.1:11434/api/tags >/dev/null; do sleep 2; done; echo Pulling $GLM_MODEL_ID; curl -s -X POST http://127.0.0.1:11434/api/pull -H 'Content-Type: application/json' -d '{\"name\":\"${GLM_MODEL_ID}\"}'; echo Pulled $GLM_MODEL_ID"]
+    command: ["sh","-lc","until curl -s http://127.0.0.1:11433/api/tags >/dev/null; do sleep 2; done; echo Pulling $GLM_MODEL_ID; curl -s -X POST http://127.0.0.1:11433/api/pull -H 'Content-Type: application/json' -d '{\"name\":\"${GLM_MODEL_ID}\"}'; echo Pulled $GLM_MODEL_ID"]
 
 
   init_deepseek:
@@ -306,7 +306,7 @@ services:
       - FILM2_DATA=/srv/film2
       - QWEN_BASE_URL=http://127.0.0.1:11435
       - QWEN_MODEL_ID=${QWEN_MODEL_ID:-qwen3:30b-a3b-instruct-2507-q4_K_M}
-      - GLM_OLLAMA_BASE_URL=${GLM_OLLAMA_BASE_URL:-http://127.0.0.1:11434}
+      - GLM_OLLAMA_BASE_URL=${GLM_OLLAMA_BASE_URL:-http://127.0.0.1:11433}
       - GLM_MODEL_ID=${GLM_MODEL_ID:-glm4:9b}
       - DEEPSEEK_CODER_OLLAMA_BASE_URL=${DEEPSEEK_CODER_OLLAMA_BASE_URL:-http://127.0.0.1:11436}
       - DEEPSEEK_CODER_MODEL_ID=${DEEPSEEK_CODER_MODEL_ID:-deepseek-coder-v2:lite}
