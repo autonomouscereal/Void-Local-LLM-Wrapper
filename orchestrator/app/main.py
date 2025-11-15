@@ -33,6 +33,8 @@ import logging
 from types import SimpleNamespace
 from io import BytesIO
 import base64 as _b64
+import base64 as _b
+import asyncio as _as
 import aiohttp  # type: ignore
 import httpx as _hx  # type: ignore
 import httpx  # type: ignore
@@ -87,7 +89,13 @@ from .jobs.state import get_job as _get_orcjob, request_cancel as _orcjob_cancel
 from .jsonio.versioning import bump_envelope as _env_bump, assert_envelope as _env_assert
 from .determinism.seeds import stamp_envelope as _env_stamp, stamp_tool_args as _tool_stamp
 from .ops.health import get_capabilities as _get_caps, get_health as _get_health
-from .refs.api import post_refs_save as _refs_save, post_refs_refine as _refs_refine, get_refs_list as _refs_list, post_refs_apply as _refs_apply
+from .refs.api import (
+    post_refs_save as _refs_save,
+    post_refs_refine as _refs_refine,
+    get_refs_list as _refs_list,
+    post_refs_apply as _refs_apply,
+    post_refs_music_profile as _refs_music_profile,
+)
 from .context.index import resolve_reference as _ctx_resolve, list_recent as _ctx_list, resolve_global as _glob_resolve, infer_audio_emotion as _infer_emotion
 from .datasets.api import post_datasets_start as _datasets_start, get_datasets_list as _datasets_list, get_datasets_versions as _datasets_versions, get_datasets_index as _datasets_index
 from .jobs.state import create_job as _orcjob_create, set_state as _orcjob_set_state
@@ -163,7 +171,17 @@ from .analysis.media import analyze_image as _analyze_image
 from .artifacts.manifest import add_manifest_row as _man_add, write_manifest_atomic as _man_write
 from .datasets.trace import append_sample as _trace_append
 from .review.referee import build_delta_plan as _committee
-from .qa.segments import build_segments_for_tool, ALLOWED_PATCH_TOOLS, filter_patch_plan, apply_patch_plan, enrich_patch_plan_for_image_segments, enrich_patch_plan_for_video_segments
+from .qa.segments import (
+    build_segments_for_tool,
+    ALLOWED_PATCH_TOOLS,
+    filter_patch_plan,
+    apply_patch_plan,
+    enrich_patch_plan_for_image_segments,
+    enrich_patch_plan_for_video_segments,
+    enrich_patch_plan_for_music_segments,
+)
+from .plan.song import plan_song_graph
+from .tools_music.windowed import run_music_infinite_windowed, restitch_music_from_windows
 from functools import partial
 from .context.index import add_artifact as _ctx_add
 from .story import draft_story_graph as _story_draft, check_story_consistency as _story_check, fix_story as _story_fix, derive_scenes_and_shots as _story_derive
@@ -178,7 +196,8 @@ from .http.client import HttpRequestConfig, perform_http_request, validate_remot
 ACTION_TOOL_NAMES = {
     # Front-door action tools only (planner-visible action surfaces)
     "image.dispatch",
-    "music.compose",  # or "music.dispatch" if preferred as the single music surface
+    "music.compose",
+    "music.infinite.windowed",
     "film2.run",      # Film-2 front door (planner-visible)
     "tts.speak",
 }
@@ -186,7 +205,7 @@ ACTION_TOOL_NAMES = {
 # Planner-visible tool whitelist: only expose front doors + analysis utilities
 PLANNER_VISIBLE_TOOLS = {
     # Action front doors
-    "image.dispatch", "image.refine.segment", "music.compose", "film2.run", "tts.speak",
+    "image.dispatch", "image.refine.segment", "music.compose", "music.infinite.windowed", "film2.run", "tts.speak",
     # Lock management
     "locks.build_image_bundle", "locks.build_audio_bundle", "locks.get_bundle",
     "locks.build_region_locks", "locks.update_region_modes", "locks.update_audio_modes",
@@ -595,12 +614,16 @@ async def segment_qa_and_committee(
         committee_outcome["patch_plan"] = filtered_patch_plan
         if not filtered_patch_plan:
             break
-        # Enrich image/video refine steps with per-segment context before execution.
+        # Enrich image/video/music refine steps with per-segment context before execution.
         enriched_patch_plan = enrich_patch_plan_for_image_segments(
             filtered_patch_plan,
             segments_for_committee,
         )
         enriched_patch_plan = enrich_patch_plan_for_video_segments(
+            enriched_patch_plan,
+            segments_for_committee,
+        )
+        enriched_patch_plan = enrich_patch_plan_for_music_segments(
             enriched_patch_plan,
             segments_for_committee,
         )
@@ -1929,11 +1952,22 @@ ARTIFACT_SHARD_BYTES = int(os.getenv("ARTIFACT_SHARD_BYTES", "200000"))
 ARTIFACT_LATEST_ONLY = os.getenv("ARTIFACT_LATEST_ONLY", "true").lower() == "true"
 
 # Music/Audio extended services (spec Step 18/Instruction Set)
-YUE_API_URL = os.getenv("YUE_API_URL")                  # http://yue:9001
-SAO_API_URL = os.getenv("SAO_API_URL")                  # http://sao:9002
-DEMUCS_API_URL = os.getenv("DEMUCS_API_URL")            # http://demucs:9003
-RVC_API_URL = os.getenv("RVC_API_URL")                  # http://rvc:9004
-DIFFSINGER_RVC_API_URL = os.getenv("DIFFSINGER_RVC_API_URL")  # http://dsrvc:9005
+# Primary full-song engine (historically YuE). We treat this as the generic
+# "primary music engine" and keep the YUE env for backwards compatibility.
+YUE_API_URL = os.getenv("YUE_API_URL")                  # e.g., http://yue:9001
+SAO_API_URL = os.getenv("SAO_API_URL")                  # e.g., http://sao:9002
+DEMUCS_API_URL = os.getenv("DEMUCS_API_URL")            # e.g., http://demucs:9003
+RVC_API_URL = os.getenv("RVC_API_URL")                  # e.g., http://rvc:9004
+DIFFSINGER_RVC_API_URL = os.getenv("DIFFSINGER_RVC_API_URL")  # e.g., http://dsrvc:9005
+
+# Generic primary music engine base URL. Prefer an explicit MUSIC_FULL_API_URL
+# when provided; fall back to the legacy YuE URL, then to the generic
+# MUSIC_API_URL used for shorter musicgen-style generations.
+PRIMARY_MUSIC_API_URL = (
+    os.getenv("MUSIC_FULL_API_URL")
+    or YUE_API_URL
+    or os.getenv("MUSIC_API_URL")
+)
 HUNYUAN_FOLEY_API_URL = os.getenv("HUNYUAN_FOLEY_API_URL")    # http://foley:9006
 HUNYUAN_VIDEO_API_URL = os.getenv("HUNYUAN_VIDEO_API_URL")    # http://hunyuan:9007
 SVD_API_URL = os.getenv("SVD_API_URL")                        # http://svd:9008
@@ -4653,6 +4687,108 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 )
             except Exception:
                 pass
+        # Music planning phase: optionally score the film via music.infinite.windowed.
+        try:
+            music_meta: Dict[str, Any] = {}
+            if prompt and duration_s > 0:
+                music_args: Dict[str, Any] = {
+                    "prompt": f"Film score for: {prompt}",
+                    "length_s": int(duration_s),
+                    "bpm": None,
+                    "key": None,
+                    "window_bars": 8,
+                    "overlap_bars": 1,
+                    "mode": "start",
+                    "lock_bundle": locks_arg if isinstance(locks_arg, dict) else {},
+                    "cid": cid,
+                }
+                if character_ids:
+                    music_args["character_id"] = character_ids[0]
+                music_call = await execute_tool_call({"name": "music.infinite.windowed", "arguments": music_args})
+                if isinstance(music_call, dict):
+                    music_meta = music_call.get("result") or music_call
+            if music_meta:
+                if isinstance(result.get("meta"), dict):
+                    # Tag music windows with scene/shot ids using simple time slicing.
+                    meta_obj = music_meta.get("meta") if isinstance(music_meta.get("meta"), dict) else {}
+                    win_list = meta_obj.get("windows") if isinstance(meta_obj.get("windows"), list) else []
+                    scenes_for_music = result["meta"].get("scenes") if isinstance(result["meta"].get("scenes"), list) else []
+                    shots_for_music = result["meta"].get("shots_from_story") if isinstance(result["meta"].get("shots_from_story"), list) else []
+                    # Simple heuristic: divide film duration evenly across scenes/shots if no explicit timing.
+                    scene_timing: Dict[str, Dict[str, float]] = {}
+                    if scenes_for_music:
+                        seg = duration_s / float(len(scenes_for_music) or 1)
+                        t0 = 0.0
+                        for sc in scenes_for_music:
+                            if not isinstance(sc, dict):
+                                continue
+                            sid = sc.get("scene_id")
+                            if not isinstance(sid, str):
+                                continue
+                            scene_timing[sid] = {"t_start": t0, "t_end": t0 + seg}
+                            t0 += seg
+                    shot_timing: Dict[str, Dict[str, float]] = {}
+                    if shots_for_music:
+                        seg = duration_s / float(len(shots_for_music) or 1)
+                        t0 = 0.0
+                        for sh in shots_for_music:
+                            if not isinstance(sh, dict):
+                                continue
+                            sid = sh.get("shot_id")
+                            if not isinstance(sid, str):
+                                continue
+                            shot_timing[sid] = {"t_start": t0, "t_end": t0 + seg}
+                            t0 += seg
+                    for win in win_list or []:
+                        if not isinstance(win, dict):
+                            continue
+                        t_start = win.get("t_start")
+                        t_end = win.get("t_end")
+                        try:
+                            mid = float(t_start) + (float(t_end) - float(t_start)) / 2.0 if isinstance(t_start, (int, float)) and isinstance(t_end, (int, float)) else None
+                        except Exception:
+                            mid = None
+                        if mid is not None and scene_timing:
+                            for sid, rng in scene_timing.items():
+                                if rng["t_start"] <= mid <= rng["t_end"]:
+                                    win["scene_id"] = sid
+                                    break
+                        if mid is not None and shot_timing:
+                            win_shots: List[str] = []
+                            for sid, rng in shot_timing.items():
+                                if rng["t_start"] <= mid <= rng["t_end"]:
+                                    win_shots.append(sid)
+                            if win_shots:
+                                win["shot_ids"] = win_shots
+                    meta_obj["windows"] = win_list
+                    music_meta["meta"] = meta_obj
+                    result["meta"]["music"] = music_meta
+                    # Trace cross-modal attachment for distillation.
+                    music_meta_obj = music_meta.get("meta") if isinstance(music_meta.get("meta"), dict) else {}
+                    _trace_append(
+                        "film2",
+                        {
+                            "event": "film2.music.attach",
+                            "film_cid": cid,
+                            "music_cid": music_meta_obj.get("cid"),
+                            "num_scenes": len(scenes_for_music),
+                            "num_shots": len(shots_for_music),
+                            "num_windows": len(win_list),
+                        },
+                    )
+        except Exception as ex:
+            warnings.append("music_phase_failed")
+            try:
+                _trace_append(
+                    "film2",
+                    {
+                        "event": "music_phase_failed",
+                        "error": str(ex),
+                        "prompt": prompt,
+                    },
+                )
+            except Exception:
+                pass
         character_entries = locks_arg.get("characters") if isinstance(locks_arg.get("characters"), list) else []
         character_ids: List[str] = []
         for entry in character_entries:
@@ -5544,6 +5680,100 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 return {"name": name, "error": str(ex)}
         else:
             return {"name": name, "error": f"unsupported music mode: {mode}"}
+    if name == "music.infinite.windowed" and ALLOW_TOOL_EXECUTION:
+        class _WindowMusicProvider:
+            async def _compose(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+                async with httpx.AsyncClient() as client:
+                    body = {
+                        "prompt": payload.get("prompt"),
+                        "duration": int(payload.get("length_s") or 8),
+                        "music_lock": payload.get("music_lock"),
+                        "seed": payload.get("seed"),
+                        "refs": payload.get("refs") or payload.get("music_refs"),
+                    }
+                    r = await client.post(MUSIC_API_URL.rstrip("/") + "/generate", json=body)
+                    js = _resp_json(r, {"audio_wav_base64": str, "wav_b64": str})
+                    b64 = js.get("audio_wav_base64") or js.get("wav_b64")
+                    wav = _b.b64decode(b64) if isinstance(b64, str) else b""
+                    return {"wav_bytes": wav, "model": f"musicgen:{os.getenv('MUSIC_MODEL_ID','')}"}
+
+            def compose(self, args: Dict[str, Any]) -> Dict[str, Any]:
+                return _as.get_event_loop().run_until_complete(self._compose(args))
+
+        provider = _WindowMusicProvider()
+        manifest = {"items": []}
+        try:
+            a = args if isinstance(args, dict) else {}
+            # Best-effort lock bundle resolution and Song Graph planning.
+            bundle_arg = a.get("lock_bundle")
+            lock_bundle: Optional[Dict[str, Any]] = None
+            if isinstance(bundle_arg, dict):
+                lock_bundle = bundle_arg
+            elif isinstance(bundle_arg, str) and bundle_arg.strip():
+                lock_bundle = await _lock_load(bundle_arg.strip()) or {}
+            if lock_bundle:
+                lock_bundle = _lock_migrate_music(lock_bundle)
+            else:
+                lock_bundle = {}
+
+            prompt_text = str(a.get("prompt") or "").strip()
+            length_s = int(a.get("length_s") or 60)
+            bpm_val = a.get("bpm")
+            bpm_int: Optional[int] = None
+            if isinstance(bpm_val, (int, float)):
+                try:
+                    bpm_int = int(bpm_val)
+                except Exception:
+                    bpm_int = None
+            key_val = a.get("key")
+            key_txt: Optional[str] = None
+            if isinstance(key_val, str) and key_val.strip():
+                key_txt = key_val.strip()
+
+            music_branch = lock_bundle.get("music") if isinstance(lock_bundle.get("music"), dict) else {}
+            needs_song_graph = not isinstance(music_branch.get("global"), dict) or not isinstance(music_branch.get("sections"), list) or not music_branch.get("sections")
+            music_profile = None
+            # If any music references were attached in locks, build a profile for the planner.
+            refs_val = lock_bundle.get("music_refs") if isinstance(lock_bundle.get("music_refs"), dict) else {}
+            ref_ids = refs_val.get("ref_ids") if isinstance(refs_val.get("ref_ids"), list) else None
+            if ref_ids:
+                try:
+                    prof = _refs_music_profile({"ref_ids": ref_ids})
+                    if isinstance(prof, dict) and prof.get("ok") and isinstance(prof.get("profile"), dict):
+                        music_profile = prof.get("profile")
+                except Exception:
+                    music_profile = None
+            if needs_song_graph:
+                song_graph = await plan_song_graph(
+                    user_text=prompt_text,
+                    length_s=length_s,
+                    bpm=bpm_int,
+                    key=key_txt,
+                    trace_id=str(trace_id or ""),
+                    music_profile=music_profile,
+                )
+                if isinstance(song_graph, dict) and song_graph:
+                    music_branch = lock_bundle.setdefault("music", {})
+                    for k in ("global", "sections", "lyrics", "voices", "instruments", "motifs"):
+                        val = song_graph.get(k)
+                        if val is not None and k not in music_branch:
+                            music_branch[k] = val
+            if music_branch:
+                lock_bundle["music"] = music_branch
+            if lock_bundle:
+                a["lock_bundle"] = lock_bundle
+
+            env = run_music_infinite_windowed(a, provider, manifest)
+            # Persist updated lock bundle (including song graph and windows) when character_id present.
+            try:
+                char_id = str(a.get("character_id") or "").strip()
+                if char_id and lock_bundle:
+                    await _lock_save(char_id, lock_bundle)
+            except Exception:
+                pass
+            return {"name": name, "result": env}
+        except Exception as ex:
+            return {"name": name, "error": str(ex)}
     if name == "music.compose" and ALLOW_TOOL_EXECUTION:
         if not MUSIC_API_URL:
             return {"name": name, "error": "MUSIC_API_URL not configured"}
@@ -5731,6 +5961,174 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                         meta_env.setdefault("quality_profile", profile_name)
                         if lock_bundle:
                             meta_env.setdefault("locks", {"bundle": lock_bundle})
+            return {"name": name, "result": env}
+        except Exception as ex:
+            return {"name": name, "error": str(ex)}
+    if name == "music.refine.window" and ALLOW_TOOL_EXECUTION:
+        if not MUSIC_API_URL:
+            return {"name": name, "error": "MUSIC_API_URL not configured"}
+        class _MusicRefineProvider:
+            async def _compose(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+                async with httpx.AsyncClient() as client:
+                    body = {
+                        "prompt": payload.get("prompt"),
+                        "duration": int(payload.get("length_s") or 8),
+                        "music_lock": payload.get("music_lock"),
+                        "seed": payload.get("seed"),
+                        "refs": payload.get("refs") or payload.get("music_refs"),
+                    }
+                    r = await client.post(MUSIC_API_URL.rstrip("/") + "/generate", json=body)
+                    js = _resp_json(r, {"audio_wav_base64": str, "wav_b64": str})
+                    b64 = js.get("audio_wav_base64") or js.get("wav_b64")
+                    wav = _b.b64decode(b64) if isinstance(b64, str) else b""
+                    return {"wav_bytes": wav, "model": f"musicgen:{os.getenv('MUSIC_MODEL_ID','')}"}
+
+            def compose(self, args: Dict[str, Any]) -> Dict[str, Any]:
+                return _as.get_event_loop().run_until_complete(self._compose(args))
+
+        provider = _MusicRefineProvider()
+        manifest = {"items": []}
+        try:
+            a = args if isinstance(args, dict) else {}
+            compose_args = {
+                "prompt": a.get("prompt") or "",
+                "bpm": a.get("bpm"),
+                "length_s": a.get("length_s") or 8,
+                "sample_rate": a.get("sample_rate"),
+                "channels": a.get("channels"),
+                "music_lock": a.get("music_lock"),
+                "seed": a.get("seed"),
+            }
+            res = provider.compose(compose_args)
+            wav_bytes = res.get("wav_bytes") or b""
+            cid = a.get("cid") or f"music-{_now_ts()}"
+            outdir = os.path.join(UPLOAD_DIR, "artifacts", "audio", "music", cid)
+            _ensure_dir(outdir)
+            stem = f"refine_{_now_ts()}"
+            path = os.path.join(outdir, f"{stem}.wav")
+            with wave.open(path, "wb") as wf:
+                wf.setnchannels(int(a.get("channels") or 2))
+                wf.setsampwidth(2)
+                wf.setframerate(int(a.get("sample_rate") or 44100))
+                wf.writeframes(wav_bytes)
+            _sidecar(path, {"tool": "music.refine.window", "segment_id": a.get("segment_id"), "window_id": a.get("window_id")})
+            add_manifest_row(manifest, path, step_id="music.refine.window")
+            # Best-effort: if a lock_bundle with a music.windows list is provided,
+            # update the corresponding window entry so future runs can restitch.
+            lock_bundle = a.get("lock_bundle") if isinstance(a.get("lock_bundle"), dict) else None
+            old_metrics: Optional[Dict[str, Any]] = None
+            new_metrics: Optional[Dict[str, Any]] = None
+            if lock_bundle:
+                music_branch = lock_bundle.get("music") if isinstance(lock_bundle.get("music"), dict) else {}
+                windows_list = music_branch.get("windows") if isinstance(music_branch.get("windows"), list) else []
+                win_id = a.get("window_id")
+                target_window: Optional[Dict[str, Any]] = None
+                for win in windows_list or []:
+                    if not isinstance(win, dict):
+                        continue
+                    if win.get("window_id") == win_id:
+                        target_window = win
+                        break
+                if target_window is not None:
+                    prev_metrics = target_window.get("metrics")
+                    if isinstance(prev_metrics, dict):
+                        old_metrics = dict(prev_metrics)
+                    target_window["artifact_path"] = path
+                    # Re-run audio analysis for refined clip to update metrics/locks.
+                    ainfo = _analyze_audio(path)
+                    if isinstance(ainfo, dict):
+                        new_metrics = dict(ainfo)
+                        # Recompute simple tempo/key lock scores using existing section/global targets when possible.
+                        section_index: Dict[str, Dict[str, Any]] = {}
+                        sections_music = music_branch.get("sections") if isinstance(music_branch.get("sections"), list) else []
+                        for sec in sections_music:
+                            if isinstance(sec, dict) and isinstance(sec.get("section_id"), str):
+                                section_index[str(sec.get("section_id"))] = sec
+                        sec_obj = section_index.get(target_window.get("section_id")) if isinstance(target_window.get("section_id"), str) else None
+                        tempo_target = None
+                        if isinstance(sec_obj, dict) and isinstance(sec_obj.get("tempo_bpm"), (int, float)):
+                            tempo_target = float(sec_obj.get("tempo_bpm"))
+                        else:
+                            g = music_branch.get("global") if isinstance(music_branch.get("global"), dict) else {}
+                            if isinstance(g.get("tempo_bpm"), (int, float)):
+                                tempo_target = float(g.get("tempo_bpm"))
+                        tempo_lock = None
+                        tempo_detected = ainfo.get("tempo_bpm")
+                        if isinstance(tempo_detected, (int, float)) and tempo_target and tempo_target > 0.0:
+                            tempo_lock = 1.0 - (abs(float(tempo_detected) - tempo_target) / tempo_target)
+                            if tempo_lock < 0.0:
+                                tempo_lock = 0.0
+                            if tempo_lock > 1.0:
+                                tempo_lock = 1.0
+                        key_target = None
+                        if isinstance(sec_obj, dict) and isinstance(sec_obj.get("key"), str):
+                            key_target = sec_obj.get("key")
+                        else:
+                            g = music_branch.get("global") if isinstance(music_branch.get("global"), dict) else {}
+                            if isinstance(g.get("key"), str):
+                                key_target = g.get("key")
+                        key_lock = None
+                        key_detected = ainfo.get("key")
+                        if isinstance(key_target, str) and key_target.strip() and isinstance(key_detected, str) and key_detected:
+                            key_lock = 1.0 if key_target.strip().lower() == key_detected.strip().lower() else 0.0
+                        new_metrics["tempo_lock"] = tempo_lock
+                        new_metrics["key_lock"] = key_lock
+                        target_window["metrics"] = new_metrics
+                music_branch["windows"] = windows_list
+                lock_bundle["music"] = music_branch
+                # Restitch full track from updated windows and persist bundle when possible.
+                restitched = restitch_music_from_windows(lock_bundle, cid)
+                if isinstance(restitched, str) and restitched:
+                    music_branch["full_track_path"] = restitched
+                    lock_bundle["music"] = music_branch
+                char_id = str(a.get("character_id") or lock_bundle.get("character_id") or "").strip()
+                if char_id:
+                    await _lock_save(char_id, lock_bundle)
+            env: Dict[str, Any] = {
+                "meta": {
+                    "model": res.get("model", "music"),
+                    "ts": _now_ts(),
+                    "cid": cid,
+                    "step": 0,
+                    "state": "halt",
+                    "cont": {"present": False, "state_hash": None, "reason": None},
+                },
+                "reasoning": {"goal": "music window refinement", "constraints": ["json-only"], "decisions": ["music.refine.window done"]},
+                "evidence": [],
+                "message": {"role": "assistant", "type": "tool", "content": "music window refined"},
+                "tool_calls": [
+                    {
+                        "tool": "music.refine.window",
+                        "args": a,
+                        "status": "done",
+                        "result_ref": os.path.basename(path),
+                    }
+                ],
+                "artifacts": [
+                    {"id": os.path.basename(path), "kind": "audio-ref", "summary": stem, "bytes": len(wav_bytes)}
+                ],
+                "telemetry": {
+                    "window": {"input_bytes": 0, "output_target_tokens": 0},
+                    "compression_passes": [],
+                    "notes": [],
+                },
+            }
+            env = normalize_to_envelope(env)
+            env = bump_envelope(env)
+            assert_envelope(env)
+            env = stamp_env(env, "music.refine.window", env.get("meta", {}).get("model"))
+            # Trace before/after metrics for training/distillation.
+            _trace_append(
+                "music",
+                {
+                    "event": "music.window.refine",
+                    "cid": cid,
+                    "segment_id": a.get("segment_id"),
+                    "window_id": a.get("window_id"),
+                    "old_metrics": old_metrics,
+                    "new_metrics": new_metrics,
+                },
+            )
             return {"name": name, "result": env}
         except Exception as ex:
             return {"name": name, "error": str(ex)}
@@ -6009,9 +6407,9 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         # Hook is already integrated in image.super_gen; this returns an explicit OK
         return {"name": name, "result": {"ok": True}}
     # --- Extended Music/Audio tools ---
-    if name == "music.song.yue" and ALLOW_TOOL_EXECUTION:
-        if not YUE_API_URL:
-            return {"name": name, "error": "YUE_API_URL not configured"}
+    if name in ("music.song.primary", "music.song.yue") and ALLOW_TOOL_EXECUTION:
+        if not PRIMARY_MUSIC_API_URL:
+            return {"name": name, "error": "PRIMARY_MUSIC_API_URL not configured"}
         try:
             async with httpx.AsyncClient() as client:
                 body = {
@@ -6024,7 +6422,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     "quality": "max",
                     "infinite": True,
                 }
-                r = await client.post(YUE_API_URL.rstrip("/") + "/v1/music/song", json=body)
+                r = await client.post(PRIMARY_MUSIC_API_URL.rstrip("/") + "/v1/music/song", json=body)
                 r.raise_for_status()
                 return {"name": name, "result": _resp_json(r, {})}
         except Exception as ex:
@@ -6116,6 +6514,229 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 return {"name": name, "result": js}
         except Exception as ex:
             return {"name": name, "error": str(ex)}
+    if name == "audio.stems.adjust" and ALLOW_TOOL_EXECUTION:
+        """
+        Convenience tool: take a mixed WAV, run Demucs to get stems (if needed),
+        apply simple gain changes per stem, and re-mix via music.mixdown.
+        """
+        mix_path = args.get("mix_wav")
+        if not isinstance(mix_path, str) or not mix_path.strip():
+            return {"name": name, "error": "missing mix_wav"}
+        mix_url = mix_path
+        try:
+            sep = await execute_tool_call(
+                {"name": "audio.stems.demucs", "arguments": {"mix_wav": mix_url, "stems": args.get("stems") or ["vocals", "drums", "bass", "other"]}}
+            )
+            stems_info = (sep.get("result") or sep) if isinstance(sep, dict) else {}
+            stems_obj = stems_info.get("stems") if isinstance(stems_info.get("stems"), dict) else stems_info
+            stem_gains = args.get("stem_gains") if isinstance(args.get("stem_gains"), dict) else {}
+            adjusted_stems: List[Dict[str, Any]] = []
+            if isinstance(stems_obj, dict):
+                for stem_name, val in stems_obj.items():
+                    stem_path = None
+                    if isinstance(val, str) and val.startswith("/"):
+                        stem_path = val
+                    elif isinstance(val, dict):
+                        stem_path = val.get("path") if isinstance(val.get("path"), str) else None
+                    if not stem_path:
+                        continue
+                    gain_db = 0.0
+                    g_val = stem_gains.get(stem_name)
+                    if isinstance(g_val, (int, float)):
+                        gain_db = float(g_val)
+                    adjusted_stems.append({"path": stem_path, "gain_db": gain_db})
+            mix_args = {
+                "stems": adjusted_stems,
+                "sample_rate": args.get("sample_rate"),
+                "channels": args.get("channels"),
+                "seed": args.get("seed"),
+            }
+            manifest = {"items": []}
+            env = run_music_mixdown(mix_args, manifest)
+            # Canonicalize edit into lock bundle when provided.
+            lock_bundle = args.get("lock_bundle") if isinstance(args.get("lock_bundle"), dict) else None
+            if lock_bundle and isinstance(env, dict):
+                music_branch = lock_bundle.get("music") if isinstance(lock_bundle.get("music"), dict) else {}
+                full_track = music_branch.get("full_track_path")
+                # Reconstruct new mix path from mixdown envelope.
+                meta_env = env.get("meta") if isinstance(env.get("meta"), dict) else {}
+                mix_cid = meta_env.get("cid") if isinstance(meta_env.get("cid"), str) else None
+                result_ref = None
+                tool_calls = env.get("tool_calls") if isinstance(env.get("tool_calls"), list) else []
+                if tool_calls:
+                    tc0 = tool_calls[0] if isinstance(tool_calls[0], dict) else {}
+                    result_ref = tc0.get("result_ref") if isinstance(tc0.get("result_ref"), str) else None
+                new_path = None
+                if mix_cid and result_ref:
+                    new_path = os.path.join(UPLOAD_DIR, "artifacts", "music", mix_cid, result_ref)
+                updated = False
+                if isinstance(new_path, str):
+                    # Update full track when this mix corresponds to the canonical track.
+                    if isinstance(full_track, str) and os.path.normpath(full_track) == os.path.normpath(mix_path):
+                        music_branch["full_track_path"] = new_path
+                        updated = True
+                    # Update any window whose artifact_path matches the edited mix.
+                    win_list = music_branch.get("windows") if isinstance(music_branch.get("windows"), list) else []
+                    for win in win_list:
+                        if not isinstance(win, dict):
+                            continue
+                        w_path = win.get("artifact_path")
+                        if isinstance(w_path, str) and os.path.normpath(w_path) == os.path.normpath(mix_path):
+                            win["artifact_path"] = new_path
+                            updated = True
+                    music_branch["windows"] = win_list
+                    # Persist stems summary on music branch.
+                    if adjusted_stems:
+                        music_branch["stems"] = [st.get("path") for st in adjusted_stems if isinstance(st.get("path"), str)]
+                if updated:
+                    lock_bundle["music"] = music_branch
+                    char_id = str(args.get("character_id") or lock_bundle.get("character_id") or "").strip()
+                    if char_id:
+                        await _lock_save(char_id, lock_bundle)
+                    # Surface updated music branch into envelope meta.locks for callers.
+                    meta_env = env.setdefault("meta", {})
+                    if isinstance(meta_env, dict):
+                        locks_meta = meta_env.setdefault("locks", {})
+                        if isinstance(locks_meta, dict):
+                            locks_meta["music"] = music_branch
+            # Trace stems adjustment usage for distillation.
+            _trace_append(
+                "music",
+                {
+                    "event": "audio.stems.adjust",
+                    "mix_path": mix_path,
+                    "stems_count": len(adjusted_stems),
+                    "stem_gains": stem_gains,
+                },
+            )
+            return {"name": name, "result": env}
+        except Exception as ex:
+            return {"name": name, "error": str(ex)}
+    if name == "audio.vocals.transform" and ALLOW_TOOL_EXECUTION:
+        """
+        Tool to adjust vocals in a mixed track: isolate vocals, apply pitch shift
+        and optional voice conversion, then re-mix with backing.
+        """
+        mix_path = args.get("mix_wav")
+        if not isinstance(mix_path, str) or not mix_path.strip():
+            return {"name": name, "error": "missing mix_wav"}
+        pitch_shift = args.get("pitch_shift_semitones")
+        voice_lock_id = args.get("voice_lock_id")
+        try:
+            # 1) Separate stems
+            sep = await execute_tool_call(
+                {"name": "audio.stems.demucs", "arguments": {"mix_wav": mix_path, "stems": ["vocals", "drums", "bass", "other"]}}
+            )
+            stems_info = (sep.get("result") or sep) if isinstance(sep, dict) else {}
+            stems_obj = stems_info.get("stems") if isinstance(stems_info.get("stems"), dict) else stems_info
+            if not isinstance(stems_obj, dict):
+                return {"name": name, "error": "stems_missing"}
+            vocals_path = None
+            backing_stems: List[Dict[str, Any]] = []
+            for stem_name, val in stems_obj.items():
+                stem_path = None
+                if isinstance(val, str) and val.startswith("/"):
+                    stem_path = val
+                elif isinstance(val, dict):
+                    stem_path = val.get("path") if isinstance(val.get("path"), str) else None
+                if not stem_path:
+                    continue
+                if stem_name == "vocals":
+                    vocals_path = stem_path
+                else:
+                    backing_stems.append({"path": stem_path, "gain_db": 0.0})
+            if not vocals_path:
+                return {"name": name, "error": "vocals_stem_missing"}
+            # 2) Apply VocalFix (pitch correction/shift) if configured
+            transformed_vocals = vocals_path
+            try:
+                if VOCAL_FIXER_API_URL:
+                    payload = {"wav_path": vocals_path}
+                    if isinstance(pitch_shift, (int, float)):
+                        payload["pitch_shift_semitones"] = float(pitch_shift)
+                    async with httpx.AsyncClient() as client:
+                        r = await client.post(VOCAL_FIXER_API_URL.rstrip("/") + "/vocal_fix_path", json=payload)
+                        js = _resp_json(r, {})
+                        new_path = js.get("path")
+                        if isinstance(new_path, str) and new_path.strip():
+                            transformed_vocals = new_path
+            except Exception:
+                transformed_vocals = vocals_path
+            # 3) Optional voice conversion via RVC
+            try:
+                if RVC_API_URL and isinstance(voice_lock_id, str) and voice_lock_id.strip():
+                    async with httpx.AsyncClient() as client:
+                        r = await client.post(RVC_API_URL.rstrip("/") + "/convert_path", json={"wav_path": transformed_vocals, "voice_lock_id": voice_lock_id})
+                        js = _resp_json(r, {})
+                        new_path = js.get("path")
+                        if isinstance(new_path, str) and new_path.strip():
+                            transformed_vocals = new_path
+            except Exception:
+                pass
+            # 4) Re-mix vocals with backing
+            stems_for_mix = [{"path": transformed_vocals, "gain_db": 0.0}] + backing_stems
+            mix_args = {
+                "stems": stems_for_mix,
+                "sample_rate": args.get("sample_rate"),
+                "channels": args.get("channels"),
+                "seed": args.get("seed"),
+            }
+            manifest = {"items": []}
+            env = run_music_mixdown(mix_args, manifest)
+            # Canonicalize edit into lock bundle when provided.
+            lock_bundle = args.get("lock_bundle") if isinstance(args.get("lock_bundle"), dict) else None
+            if lock_bundle and isinstance(env, dict):
+                music_branch = lock_bundle.get("music") if isinstance(lock_bundle.get("music"), dict) else {}
+                full_track = music_branch.get("full_track_path")
+                meta_env = env.get("meta") if isinstance(env.get("meta"), dict) else {}
+                mix_cid = meta_env.get("cid") if isinstance(meta_env.get("cid"), str) else None
+                result_ref = None
+                tool_calls = env.get("tool_calls") if isinstance(env.get("tool_calls"), list) else []
+                if tool_calls:
+                    tc0 = tool_calls[0] if isinstance(tool_calls[0], dict) else {}
+                    result_ref = tc0.get("result_ref") if isinstance(tc0.get("result_ref"), str) else None
+                new_path = None
+                if mix_cid and result_ref:
+                    new_path = os.path.join(UPLOAD_DIR, "artifacts", "music", mix_cid, result_ref)
+                updated = False
+                if isinstance(new_path, str):
+                    if isinstance(full_track, str) and os.path.normpath(full_track) == os.path.normpath(mix_path):
+                        music_branch["full_track_path"] = new_path
+                        updated = True
+                    win_list = music_branch.get("windows") if isinstance(music_branch.get("windows"), list) else []
+                    for win in win_list:
+                        if not isinstance(win, dict):
+                            continue
+                        w_path = win.get("artifact_path")
+                        if isinstance(w_path, str) and os.path.normpath(w_path) == os.path.normpath(mix_path):
+                            win["artifact_path"] = new_path
+                            updated = True
+                    music_branch["windows"] = win_list
+                    # Persist stems summary on music branch (vocals + backing).
+                    music_branch["stems"] = [st.get("path") for st in stems_for_mix if isinstance(st.get("path"), str)]
+                if updated:
+                    lock_bundle["music"] = music_branch
+                    char_id = str(args.get("character_id") or lock_bundle.get("character_id") or "").strip()
+                    if char_id:
+                        await _lock_save(char_id, lock_bundle)
+                    meta_env = env.setdefault("meta", {})
+                    if isinstance(meta_env, dict):
+                        locks_meta = meta_env.setdefault("locks", {})
+                        if isinstance(locks_meta, dict):
+                            locks_meta["music"] = music_branch
+            # Trace vocal transform usage.
+            _trace_append(
+                "music",
+                {
+                    "event": "audio.vocals.transform",
+                    "mix_path": mix_path,
+                    "pitch_shift_semitones": float(pitch_shift) if isinstance(pitch_shift, (int, float)) else None,
+                    "voice_lock_id": voice_lock_id if isinstance(voice_lock_id, str) else None,
+                },
+            )
+            return {"name": name, "result": env}
+        except Exception as ex:
+            return {"name": name, "error": str(ex)}
     if name == "audio.vc.rvc" and ALLOW_TOOL_EXECUTION:
         if not RVC_API_URL:
             return {"name": name, "error": "RVC_API_URL not configured"}
@@ -6147,6 +6768,334 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 return {"name": name, "result": _resp_json(r, {})}
         except Exception as ex:
             return {"name": name, "error": str(ex)}
+    if name == "refs.music.build_profile" and ALLOW_TOOL_EXECUTION:
+        try:
+            body = args if isinstance(args, dict) else {}
+            return {"name": name, "result": _refs_music_profile(body)}
+        except Exception as ex:
+            return {"name": name, "error": str(ex)}
+    if name == "music.lyrics.align" and ALLOW_TOOL_EXECUTION:
+        a = args if isinstance(args, dict) else {}
+        audio_path = a.get("audio_path")
+        lyrics_sections = a.get("lyrics_sections") if isinstance(a.get("lyrics_sections"), list) else []
+        changed_line_ids = a.get("changed_line_ids") if isinstance(a.get("changed_line_ids"), list) else []
+        if not isinstance(audio_path, str) or not audio_path.strip():
+            return {"name": name, "error": "missing_audio_path"}
+        if not lyrics_sections:
+            return {"name": name, "error": "missing_lyrics_sections"}
+        # Two-stage alignment:
+        # 1) Coarse section ranges from Song Graph or uniform over duration.
+        # 2) Fine line timings per section via MFA when available, else uniform within section.
+        full = audio_path
+        if not os.path.isabs(full):
+            full = os.path.join(UPLOAD_DIR, audio_path.lstrip("/"))
+        duration_s = 0.0
+        with contextlib.closing(wave.open(full, "rb")) as wf:  # type: ignore[arg-type]
+            frames = wf.getnframes()
+            sr = wf.getframerate() or 1
+            duration_s = float(frames) / float(sr)
+        # Stage 1: coarse section ranges
+        section_ranges: Dict[str, Dict[str, float]] = {}
+        lb_for_sections = a.get("lock_bundle") if isinstance(a.get("lock_bundle"), dict) else None
+        music_sections: List[Dict[str, Any]] = []
+        if isinstance(lb_for_sections, dict):
+            mus = lb_for_sections.get("music") if isinstance(lb_for_sections.get("music"), dict) else {}
+            secs = mus.get("sections") if isinstance(mus.get("sections"), list) else []
+            for sec in secs:
+                if not isinstance(sec, dict):
+                    continue
+                sid = sec.get("section_id")
+                t0 = sec.get("time_start")
+                t1 = sec.get("time_end")
+                if isinstance(sid, str) and isinstance(t0, (int, float)) and isinstance(t1, (int, float)):
+                    section_ranges[sid] = {"t_start": float(t0), "t_end": float(t1)}
+                    music_sections.append(sec)
+        # If no timing from Song Graph, fall back to uniform per section.
+        if not section_ranges:
+            # Divide duration across lyric sections
+            total_sections = len([s for s in lyrics_sections if isinstance(s, dict)]) or 1
+            sec_span = (duration_s / total_sections) if duration_s > 0 else 0.0
+            t0 = 0.0
+            idx = 0
+            for sec in lyrics_sections:
+                if not isinstance(sec, dict):
+                    continue
+                sec_id = sec.get("section_id")
+                if not isinstance(sec_id, str) or not sec_id:
+                    continue
+                start = t0
+                end = t0 + sec_span
+                section_ranges[sec_id] = {"t_start": start, "t_end": end}
+                t0 = end
+                idx += 1
+        # Pre-encode full audio once for MFA if configured.
+        full_b64: Optional[str] = None
+        if MFA_API_URL and isinstance(MFA_API_URL, str) and MFA_API_URL.strip():
+            with open(full, "rb") as f:
+                raw = f.read()
+            if raw:
+                full_b64 = _b64.b64encode(raw).decode("ascii")
+        alignment_sections: List[Dict[str, Any]] = []
+        alignment_method = "uniform"
+        # Stage 2: per-section fine alignment
+        for sec in lyrics_sections:
+            if not isinstance(sec, dict):
+                continue
+            sec_id = sec.get("section_id")
+            name = sec.get("name")
+            lines = sec.get("lines") if isinstance(sec.get("lines"), list) else []
+            if not isinstance(sec_id, str) or not lines:
+                continue
+            coarse = section_ranges.get(sec_id) or {"t_start": 0.0, "t_end": duration_s}
+            sec_t0 = float(coarse.get("t_start") or 0.0)
+            sec_t1 = float(coarse.get("t_end") or duration_s)
+            # Build section text
+            texts: List[str] = []
+            for ln in lines:
+                if isinstance(ln, dict):
+                    txt = ln.get("text")
+                    if isinstance(txt, str) and txt.strip():
+                        texts.append(txt.strip())
+            section_text = "\n".join(texts)
+            aligned_lines: List[Dict[str, Any]] = []
+            # Try MFA-based alignment when available
+            words: List[Dict[str, Any]] = []
+            if full_b64 and section_text.strip():
+                async with httpx.AsyncClient() as client:
+                    r = await client.post(
+                        MFA_API_URL.rstrip("/") + "/align",
+                        json={"lyrics": section_text, "wav_bytes": full_b64},
+                    )
+                js = JSONParser().parse(r.text, {"alignment": list}) or {}
+                raw_words = js.get("alignment")
+                if isinstance(raw_words, list):
+                    for w in raw_words:
+                        if not isinstance(w, dict):
+                            continue
+                        ws = w.get("start")
+                        we = w.get("end")
+                        if isinstance(ws, (int, float)) and isinstance(we, (int, float)):
+                            words.append({"start": float(ws), "end": float(we)})
+                if words:
+                    alignment_method = "mfa"
+            if words:
+                # Map words to lines in sequence
+                total_words = len(words)
+                line_objs = [ln for ln in lines if isinstance(ln, dict) and isinstance(ln.get("line_id"), str)]
+                n_lines_sec = len(line_objs) or 1
+                base = total_words // n_lines_sec
+                rem = total_words % n_lines_sec
+                idx_word = 0
+                for i, ln in enumerate(line_objs):
+                    line_id = ln.get("line_id")
+                    text = ln.get("text")
+                    if not isinstance(line_id, str) or not isinstance(text, str):
+                        continue
+                    count = base + (1 if i < rem else 0)
+                    if count <= 0:
+                        # fallback: uniform segment within section
+                        span = (sec_t1 - sec_t0) / float(n_lines_sec)
+                        start = sec_t0 + span * i
+                        end = start + span
+                        aligned_lines.append({"line_id": line_id, "text": text, "t_start": start, "t_end": end})
+                        continue
+                    start_idx = idx_word
+                    end_idx = min(idx_word + count - 1, total_words - 1)
+                    idx_word = end_idx + 1
+                    w0 = words[start_idx]
+                    w1 = words[end_idx]
+                    # MFA times are global; clamp into coarse range if needed
+                    g_start = max(sec_t0, float(w0["start"]))
+                    g_end = min(sec_t1, float(w1["end"]))
+                    aligned_lines.append({"line_id": line_id, "text": text, "t_start": g_start, "t_end": g_end})
+            else:
+                # Fallback: uniform distribution within section for this section
+                line_objs = [ln for ln in lines if isinstance(ln, dict) and isinstance(ln.get("line_id"), str)]
+                n_lines_sec = len(line_objs) or 1
+                span = (sec_t1 - sec_t0) / float(n_lines_sec) if sec_t1 > sec_t0 else 0.0
+                for i, ln in enumerate(line_objs):
+                    line_id = ln.get("line_id")
+                    text = ln.get("text")
+                    if not isinstance(line_id, str) or not isinstance(text, str):
+                        continue
+                    start = sec_t0 + span * i
+                    end = start + span
+                    aligned_lines.append({"line_id": line_id, "text": text, "t_start": start, "t_end": end})
+            alignment_sections.append({"section_id": sec_id, "name": name, "lines": aligned_lines})
+        alignment = {"sections": alignment_sections}
+        # Persist into lock bundle if provided
+        lock_bundle = a.get("lock_bundle") if isinstance(a.get("lock_bundle"), dict) else None
+        if lock_bundle:
+            music_branch = lock_bundle.get("music") if isinstance(lock_bundle.get("music"), dict) else {}
+            music_branch["lyrics_alignment"] = alignment
+            lock_bundle["music"] = music_branch
+            try:
+                char_id = str(a.get("character_id") or lock_bundle.get("character_id") or "").strip()
+                if char_id:
+                    await _lock_save(char_id, lock_bundle)
+            except Exception as ex:
+                logging.error(f"Failed to save lock bundle after music.lyrics.align: {ex}")
+        # Optional: if changed_line_ids are provided, map them to windows and trigger
+        # per-window refinements via music.refine.window.
+        refined_windows: List[str] = []
+        cid_val = a.get("cid")
+        if lock_bundle and changed_line_ids:
+            music_branch = lock_bundle.get("music") if isinstance(lock_bundle.get("music"), dict) else {}
+            windows_list = music_branch.get("windows") if isinstance(music_branch.get("windows"), list) else []
+            # Build lookup of changed line ids to time ranges from alignment.
+            changed_ranges: List[Dict[str, float]] = []
+            changed_lines_by_window: Dict[str, List[str]] = {}
+            for sec in alignment_sections:
+                if not isinstance(sec, dict):
+                    continue
+                lines = sec.get("lines") if isinstance(sec.get("lines"), list) else []
+                for ln in lines:
+                    if not isinstance(ln, dict):
+                        continue
+                    lid = ln.get("line_id")
+                    if not isinstance(lid, str) or not lid:
+                        continue
+                    if lid not in changed_line_ids:
+                        continue
+                    ts = ln.get("t_start")
+                    te = ln.get("t_end")
+                    if isinstance(ts, (int, float)) and isinstance(te, (int, float)):
+                        changed_ranges.append({"t_start": float(ts), "t_end": float(te)})
+            # Map time ranges to windows and collect window-level lyrics snippets.
+            window_ids: List[str] = []
+            for win in windows_list or []:
+                if not isinstance(win, dict):
+                    continue
+                wid = win.get("window_id")
+                if not isinstance(wid, str) or not wid:
+                    continue
+                wt0 = win.get("t_start")
+                wt1 = win.get("t_end")
+                if not isinstance(wt0, (int, float)) or not isinstance(wt1, (int, float)):
+                    continue
+                for cr in changed_ranges:
+                    # simple overlap check
+                    if cr["t_end"] <= float(wt0) or cr["t_start"] >= float(wt1):
+                        continue
+                    window_ids.append(wid)
+                    # Collect text of any changed lines overlapping this window for prompt/lyrics.
+                    for sec in alignment_sections:
+                        if not isinstance(sec, dict):
+                            continue
+                        lines = sec.get("lines") if isinstance(sec.get("lines"), list) else []
+                        for ln in lines:
+                            if not isinstance(ln, dict):
+                                continue
+                            lid = ln.get("line_id")
+                            if not isinstance(lid, str) or lid not in changed_line_ids:
+                                continue
+                            ts = ln.get("t_start")
+                            te = ln.get("t_end")
+                            if not isinstance(ts, (int, float)) or not isinstance(te, (int, float)):
+                                continue
+                            if te <= float(wt0) or ts >= float(wt1):
+                                continue
+                            txt = ln.get("text")
+                            if isinstance(txt, str) and txt.strip():
+                                existing = changed_lines_by_window.get(wid) or []
+                                if txt not in existing:
+                                    existing.append(txt)
+                                changed_lines_by_window[wid] = existing
+                    break
+            # Deduplicate
+            seen: Dict[str, bool] = {}
+            uniq_ids: List[str] = []
+            for wid in window_ids:
+                if wid in seen:
+                    continue
+                seen[wid] = True
+                uniq_ids.append(wid)
+            # If no cid provided, try to derive it from full_track_path in music branch.
+            if not isinstance(cid_val, str) or not cid_val.strip():
+                full_track = music_branch.get("full_track_path")
+                if isinstance(full_track, str) and full_track:
+                    # Expect .../artifacts/music/{cid}/file.wav
+                    parts = full_track.replace("\\", "/").split("/")
+                    if len(parts) >= 3:
+                        cid_val = parts[-2]
+            # Trigger per-window refine calls
+            for wid in uniq_ids:
+                refine_args: Dict[str, Any] = {
+                    "segment_id": wid,
+                    "window_id": wid,
+                    "cid": cid_val or "",
+                    "lock_bundle": lock_bundle,
+                }
+                # Inject updated lyrics into prompt to steer regeneration.
+                win_lines = changed_lines_by_window.get(wid) or []
+                if win_lines:
+                    snippet = " ".join(win_lines)
+                    base_prompt = a.get("prompt") if isinstance(a.get("prompt"), str) else ""
+                    if base_prompt:
+                        refine_args["prompt"] = f"{base_prompt} New lyrics for this window: {snippet}"
+                    else:
+                        refine_args["prompt"] = f"New lyrics for this window: {snippet}"
+                    refine_args["lyrics"] = snippet
+                res_ref = await execute_tool_call({"name": "music.refine.window", "arguments": refine_args})
+                if isinstance(res_ref, dict) and not res_ref.get("error"):
+                    refined_windows.append(wid)
+        env: Dict[str, Any] = {
+            "meta": {
+                "model": "lyrics-align",
+                "ts": _now_ts(),
+                "cid": cid_val or "",
+                "step": 0,
+                "state": "halt",
+                "cont": {"present": False, "state_hash": None, "reason": None},
+            },
+            "reasoning": {"goal": "music lyrics alignment", "constraints": ["json-only"], "decisions": ["music.lyrics.align done"]},
+            "evidence": [],
+            "message": {"role": "assistant", "type": "tool", "content": "lyrics aligned heuristically"},
+            "tool_calls": [
+                {
+                    "tool": "music.lyrics.align",
+                    "args": {"audio_path": audio_path},
+                    "status": "done",
+                    "result_ref": None,
+                }
+            ],
+            "artifacts": [],
+            "telemetry": {
+                "window": {"input_bytes": 0, "output_target_tokens": 0},
+                "compression_passes": [],
+                "notes": [],
+            },
+        }
+        env = normalize_to_envelope(env)
+        env = bump_envelope(env)
+        assert_envelope(env)
+        meta_block = env.get("meta") if isinstance(env.get("meta"), dict) else {}
+        if isinstance(meta_block, dict):
+            meta_block["alignment_method"] = alignment_method
+        env = stamp_env(env, "music.lyrics.align", env.get("meta", {}).get("model"))
+        env["alignment"] = alignment
+        if refined_windows:
+            meta_block = env.get("meta")
+            if isinstance(meta_block, dict):
+                meta_block["refined_windows"] = refined_windows
+        # Trace alignment usage for distillation.
+        _trace_append(
+            "music",
+            {
+                "event": "music.lyrics.align",
+                "cid": cid_val,
+                "alignment_method": alignment_method,
+                "num_sections": len(alignment_sections),
+                "num_lines": sum(
+                    len(sec.get("lines") or [])
+                    for sec in alignment_sections
+                    if isinstance(sec, dict)
+                ),
+                "changed_line_ids": changed_line_ids,
+                "refined_windows": refined_windows,
+            },
+        )
+        return {"name": name, "result": env}
     if name == "audio.foley.hunyuan" and ALLOW_TOOL_EXECUTION:
         if not HUNYUAN_FOLEY_API_URL:
             return {"name": name, "error": "HUNYUAN_FOLEY_API_URL not configured"}
@@ -8249,7 +9198,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                                     "action": seg_outcome.get("action"),
                                 },
                             )
-                elif tname in ("music.compose", "music.dispatch", "music.variation", "music.mixdown"):
+                elif tname in ("music.compose", "music.dispatch", "music.variation", "music.mixdown", "music.infinite.windowed"):
                     meta_block = res.get("meta") if isinstance(res, dict) else {}
                     profile_name = meta_block.get("quality_profile") if isinstance(meta_block, dict) and isinstance(meta_block.get("quality_profile"), str) else None
                     preset_music = LOCK_QUALITY_PRESETS.get((profile_name or "standard").lower(), LOCK_QUALITY_PRESETS["standard"])
@@ -10595,14 +11544,17 @@ async def v1_audio_lyrics_to_song(body: Dict[str, Any]):
             status=400,
             request_id=rid,
         )
-    if not YUE_API_URL:
-        return ToolEnvelope.failure(
-            "yue_not_configured",
-            "YUE_API_URL not configured",
-            status=500,
-            request_id=rid,
-        )
-    call = {"name": "music.song.yue", "arguments": {"lyrics": lyrics, "style_tags": ([style] if style else []), "bpm": bpm, "key": key, "seed": seed}}
+    if PRIMARY_MUSIC_API_URL:
+        call = {
+            "name": "music.song.primary",
+            "arguments": {"lyrics": lyrics, "style_tags": ([style] if style else []), "bpm": bpm, "key": key, "seed": seed},
+        }
+    else:
+        prompt = ((style + ": ") if style else "") + lyrics
+        call = {
+            "name": "music.compose",
+            "arguments": {"prompt": prompt, "length_s": duration_s, "bpm": bpm, "seed": seed},
+        }
     res = await execute_tool_call(call)
     return ToolEnvelope.success({"result": res}, request_id=rid)
 
@@ -10653,15 +11605,19 @@ async def v1_audio_tts_sing(body: Dict[str, Any]):
             res = await execute_tool_call({"name": "tts.speak", "arguments": args})
             outputs.append({"type": "tts", "result": res})
         elif kind == "sing":
-            if not YUE_API_URL:
-                return ToolEnvelope.failure(
-                    "yue_not_configured",
-                    "YUE_API_URL not configured",
-                    status=500,
-                    request_id=rid,
-                )
             lyrics = (item.get("lyrics") or "")
-            res = await execute_tool_call({"name": "music.song.yue", "arguments": {"lyrics": lyrics, "style_tags": [], "seed": item.get("seed")}})
+            if PRIMARY_MUSIC_API_URL:
+                call = {
+                    "name": "music.song.primary",
+                    "arguments": {"lyrics": lyrics, "style_tags": [], "seed": item.get("seed")},
+                }
+            else:
+                prompt = lyrics
+                call = {
+                    "name": "music.compose",
+                    "arguments": {"prompt": prompt, "length_s": 30, "seed": item.get("seed")},
+                }
+            res = await execute_tool_call(call)
             outputs.append({"type": "sing", "result": res})
     return ToolEnvelope.success(
         {"parts": outputs, "structure": (payload.get("structure") or {})},

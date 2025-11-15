@@ -97,6 +97,16 @@ def get_builtin_tools_schema() -> List[Dict[str, Any]]:
 		{
 			"type": "function",
 			"function": {
+				"name": "music.song.primary",
+				"parameters": {"type": "object", "properties": {"lyrics": {"type": "string"}, "style_tags": {"type": "array", "items": {"type": "string"}}, "bpm": {"type": "integer"}, "key": {"type": "string"}, "seed": {"type": "integer"}, "reference_song": {"type": "string"}, "infinite": {"type": "boolean"}}, "required": ["lyrics"]}
+			}
+		},
+		{
+			# Backwards-compatible alias for older plans/specs that still
+			# reference the YuE-specific tool name. Internally this is routed
+			# through the same primary music engine as music.song.primary.
+			"type": "function",
+			"function": {
 				"name": "music.song.yue",
 				"parameters": {"type": "object", "properties": {"lyrics": {"type": "string"}, "style_tags": {"type": "array", "items": {"type": "string"}}, "bpm": {"type": "integer"}, "key": {"type": "string"}, "seed": {"type": "integer"}, "reference_song": {"type": "string"}, "infinite": {"type": "boolean"}}, "required": ["lyrics"]}
 			}
@@ -132,8 +142,93 @@ def get_builtin_tools_schema() -> List[Dict[str, Any]]:
 		{
 			"type": "function",
 			"function": {
+				"name": "audio.stems.adjust",
+				"parameters": {
+					"type": "object",
+					"properties": {
+						"mix_wav": {"type": "string"},
+						"stem_gains": {"type": "object"},
+						"stems": {"type": "array", "items": {"type": "string"}},
+						"cid": {"type": "string"}
+					},
+					"required": ["mix_wav"]
+				}
+			}
+		},
+		{
+			"type": "function",
+			"function": {
+				"name": "audio.vocals.transform",
+				"parameters": {
+					"type": "object",
+					"properties": {
+						"mix_wav": {"type": "string"},
+						"pitch_shift_semitones": {"type": "number"},
+						"voice_lock_id": {"type": "string"},
+						"cid": {"type": "string"}
+					},
+					"required": ["mix_wav"]
+				}
+			}
+		},
+		{
+			"type": "function",
+			"function": {
 				"name": "audio.vc.rvc",
 				"parameters": {"type": "object", "properties": {"source_vocal_wav": {"type": "string"}, "target_voice_ref": {"type": "string"}}, "required": ["source_vocal_wav", "target_voice_ref"]}
+			}
+		},
+		{
+			"type": "function",
+			"function": {
+				"name": "music.lyrics.align",
+				"parameters": {
+					"type": "object",
+					"properties": {
+						"audio_path": {"type": "string"},
+						"lyrics_sections": {
+							"type": "array",
+							"items": {
+								"type": "object",
+								"properties": {
+									"section_id": {"type": "string"},
+									"name": {"type": "string"},
+									"lines": {
+										"type": "array",
+										"items": {
+											"type": "object",
+											"properties": {
+												"line_id": {"type": "string"},
+												"text": {"type": "string"}
+											},
+											"required": ["line_id", "text"]
+										}
+									}
+								},
+								"required": ["section_id", "lines"]
+							}
+						},
+						"changed_line_ids": {"type": "array", "items": {"type": "string"}},
+						"cid": {"type": "string"},
+						"character_id": {"type": "string"},
+						"lock_bundle": {"type": "object"}
+					},
+					"required": ["audio_path", "lyrics_sections"]
+				}
+			}
+		},
+		{
+			"type": "function",
+			"function": {
+				"name": "refs.music.build_profile",
+				"parameters": {
+					"type": "object",
+					"properties": {
+						"ref_ids": {"type": "array", "items": {"type": "string"}},
+						"audio_paths": {"type": "array", "items": {"type": "string"}}
+					},
+					"required": []
+				}
 			}
 		},
 		{
@@ -303,6 +398,49 @@ def get_builtin_tools_schema() -> List[Dict[str, Any]]:
 			"function": {
 				"name": "music.mixdown",
 				"parameters": {"type": "object", "properties": {"stems": {"type": "array", "items": {"type": "object"}}, "sample_rate": {"type": "integer"}, "channels": {"type": "integer"}, "seed": {"type": "integer"}, "cid": {"type": "string"}}, "required": ["stems"]}
+			}
+		},
+		{
+			"type": "function",
+			"function": {
+				"name": "music.infinite.windowed",
+				"parameters": {
+					"type": "object",
+					"properties": {
+						"prompt": {"type": "string"},
+						"length_s": {"type": "integer"},
+						"bpm": {"type": "integer"},
+						"key": {"type": "string"},
+						"window_bars": {"type": "integer"},
+						"overlap_bars": {"type": "integer"},
+						"mode": {"type": "string"},
+						"extra_length_s": {"type": "integer"},
+						"character_id": {"type": "string"},
+						"lock_bundle": {"type": "object"},
+						"quality_profile": {"type": "string"},
+						"seed": {"type": "integer"},
+						"cid": {"type": "string"}
+					},
+					"required": ["prompt", "length_s"]
+				}
+			}
+		},
+		{
+			"type": "function",
+			"function": {
+				"name": "music.refine.window",
+				"parameters": {
+					"type": "object",
+					"properties": {
+						"segment_id": {"type": "string"},
+						"window_id": {"type": "string"},
+						"cid": {"type": "string"},
+						"lock_bundle": {"type": "object"},
+						"quality_profile": {"type": "string"},
+						"reason": {"type": "string"}
+					},
+					"required": ["segment_id"]
+				}
 			}
 		},
 		{

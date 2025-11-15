@@ -219,11 +219,59 @@ def build_music_segments_from_result(
     parent_cid: Optional[str],
     result: Dict[str, Any],
 ) -> List[SegmentResult]:
-    """Build SegmentResult list for music tools. For now: one segment per full track."""
+    """
+    Build SegmentResult list for music tools.
+
+    For legacy tools (music.compose, music.mixdown, etc.) we emit a single
+    segment for the full track. For windowed tools that include a "windows"
+    list in result["meta"]["windows"], we emit one segment per window so the
+    committee can reason about and refine specific windows.
+    """
     if not isinstance(result, dict):
         return []
-    seg = _base_segment(tool_name, "music", parent_cid, 0, result)
-    return [seg]
+    meta_obj = result.get("meta") if isinstance(result.get("meta"), dict) else {}
+    windows = meta_obj.get("windows") if isinstance(meta_obj.get("windows"), list) else []
+    if not windows:
+        seg = _base_segment(tool_name, "music", parent_cid, 0, result)
+        return [seg]
+    segments: List[SegmentResult] = []
+    for index, win in enumerate(windows):
+        if not isinstance(win, dict):
+            continue
+        window_id = win.get("window_id") or f"win_{index}"
+        section_id = win.get("section_id")
+        t_start = win.get("t_start")
+        t_end = win.get("t_end")
+        clip_path = win.get("artifact_path")
+        win_meta: Dict[str, Any] = {
+            "window_id": window_id,
+            "section_id": section_id,
+            "timing": {
+                "start_s": float(t_start) if isinstance(t_start, (int, float)) else 0.0,
+                "end_s": float(t_end) if isinstance(t_end, (int, float)) else 0.0,
+            },
+            "locks": meta_obj.get("locks") if isinstance(meta_obj.get("locks"), dict) else None,
+            "extra": win.get("metrics") if isinstance(win.get("metrics"), dict) else {},
+        }
+        seg_result: Dict[str, Any] = {
+            "meta": win_meta,
+            "artifacts": [],
+        }
+        if isinstance(clip_path, str) and clip_path:
+            seg_result["artifacts"] = [
+                {
+                    "kind": "audio",
+                    "path": clip_path,
+                    "extra": {"window_id": window_id, "section_id": section_id},
+                }
+            ]
+        seg = _base_segment(tool_name, "music", parent_cid, index, seg_result)
+        seg["name"] = str(window_id)
+        segments.append(seg)
+    if not segments:
+        seg = _base_segment(tool_name, "music", parent_cid, 0, result)
+        return [seg]
+    return segments
 
 
 def build_tts_segments_from_result(
@@ -480,6 +528,76 @@ def enrich_patch_plan_for_video_segments(
             shot_id = meta.get("shot_id")
             if isinstance(shot_id, str) and shot_id.strip():
                 args["shot_id"] = shot_id
+        enriched.append({"tool": tool_name, "segment_id": seg_id, "args": args})
+    return enriched
+
+
+def enrich_patch_plan_for_music_segments(
+    patch_plan: List[Dict[str, Any]],
+    segments: List[SegmentResult],
+) -> List[Dict[str, Any]]:
+    """
+    Enrich music.refine.window steps with window/audio context derived from
+    the corresponding music segments.
+    """
+    index_by_id: Dict[str, SegmentResult] = {}
+    for seg in segments:
+        if not isinstance(seg, dict):
+            continue
+        seg_id = seg.get("id")
+        domain = seg.get("domain")
+        if isinstance(seg_id, str) and seg_id and isinstance(domain, str) and domain == "music":
+            index_by_id[seg_id] = seg
+    enriched: List[Dict[str, Any]] = []
+    for step in patch_plan or []:
+        if not isinstance(step, dict):
+            enriched.append(step)
+            continue
+        tool_name = (step.get("tool") or "").strip()
+        seg_id = step.get("segment_id")
+        args_obj = step.get("args") if isinstance(step.get("args"), dict) else {}
+        if tool_name != "music.refine.window":
+            enriched.append(step)
+            continue
+        if not isinstance(seg_id, str) or not seg_id:
+            enriched.append(step)
+            continue
+        seg = index_by_id.get(seg_id)
+        if not isinstance(seg, dict):
+            enriched.append(step)
+            continue
+        args: Dict[str, Any] = dict(args_obj)
+        seg_result = seg.get("result") if isinstance(seg.get("result"), dict) else {}
+        meta = seg_result.get("meta") if isinstance(seg_result.get("meta"), dict) else {}
+        artifacts = seg_result.get("artifacts") if isinstance(seg_result.get("artifacts"), list) else []
+        if "segment_id" not in args:
+            args["segment_id"] = seg_id
+        window_id_val = meta.get("window_id")
+        if isinstance(window_id_val, str) and window_id_val and "window_id" not in args:
+            args["window_id"] = window_id_val
+        if "src" not in args:
+            src_val = None
+            if artifacts:
+                first_art = artifacts[0]
+                if isinstance(first_art, dict):
+                    path_val = first_art.get("path")
+                    view_val = first_art.get("view_url")
+                    if isinstance(path_val, str) and path_val.strip():
+                        src_val = path_val
+                    elif isinstance(view_val, str) and view_val.strip():
+                        src_val = view_val
+            if isinstance(src_val, str) and src_val:
+                args["src"] = src_val
+        # Propagate lock bundle and cid where available so the refine tool can
+        # update mappings and optionally restitch a full track.
+        if "lock_bundle" not in args:
+            locks_val = seg.get("locks")
+            if isinstance(locks_val, dict):
+                args["lock_bundle"] = locks_val
+        if "cid" not in args:
+            parent_cid = seg.get("parent_cid")
+            if isinstance(parent_cid, str) and parent_cid:
+                args["cid"] = parent_cid
         enriched.append({"tool": tool_name, "segment_id": seg_id, "args": args})
     return enriched
 

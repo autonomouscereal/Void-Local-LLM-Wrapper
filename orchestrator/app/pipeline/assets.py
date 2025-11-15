@@ -428,61 +428,61 @@ def compute_domain_qa(tool_results: List[Dict[str, Any]]) -> Dict[str, Any]:
 					audio_seam_true += 1.0
 			elif isinstance(seam_val, (int, float)):
 				audio_seam_ratio_vals.append(float(seam_val))
-			voice_score_val = meta.get("voice_score") or locks.get("voice_score")
+			voice_score_val = meta.get("voice_score") or locks_block.get("voice_score")
 			if isinstance(voice_score_val, (int, float)):
 				audio_voice_vals.append(float(voice_score_val))
-			tempo_score_val = meta.get("tempo_score") or locks.get("tempo_score")
+			tempo_score_val = meta.get("tempo_score") or locks_block.get("tempo_score")
 			if isinstance(tempo_score_val, (int, float)):
 				audio_tempo_vals.append(float(tempo_score_val))
-			key_score_val = meta.get("key_score") or locks.get("key_score")
+			key_score_val = meta.get("key_score") or locks_block.get("key_score")
 			if isinstance(key_score_val, (int, float)):
 				audio_key_vals.append(float(key_score_val))
-			stem_score_val = meta.get("stem_balance_score") or locks.get("stem_balance_score")
+			stem_score_val = meta.get("stem_balance_score") or locks_block.get("stem_balance_score")
 			if isinstance(stem_score_val, (int, float)):
 				audio_stem_vals.append(float(stem_score_val))
-			lyrics_score_val = meta.get("lyrics_score") or locks.get("lyrics_score")
+			lyrics_score_val = meta.get("lyrics_score") or locks_block.get("lyrics_score")
 			if isinstance(lyrics_score_val, (int, float)):
 				audio_lyrics_vals.append(float(lyrics_score_val))
 			# Optional motif-level lock scores if tools emit them
-			motif_score_val = meta.get("motif_lock") or locks.get("motif_lock")
+			motif_score_val = meta.get("motif_lock") or locks_block.get("motif_lock")
 			if isinstance(motif_score_val, (int, float)):
 				audio_motif_vals.append(float(motif_score_val))
 			# Optional TTS prosody/emotion/style/timing locks
-			pros_pitch_val = meta.get("prosody_pitch_lock") or locks.get("prosody_pitch_lock")
+			pros_pitch_val = meta.get("prosody_pitch_lock") or locks_block.get("prosody_pitch_lock")
 			if isinstance(pros_pitch_val, (int, float)):
 				audio_prosody_pitch_vals.append(float(pros_pitch_val))
-			pros_energy_val = meta.get("prosody_energy_lock") or locks.get("prosody_energy_lock")
+			pros_energy_val = meta.get("prosody_energy_lock") or locks_block.get("prosody_energy_lock")
 			if isinstance(pros_energy_val, (int, float)):
 				audio_prosody_energy_vals.append(float(pros_energy_val))
-			pros_dur_val = meta.get("prosody_duration_lock") or locks.get("prosody_duration_lock")
+			pros_dur_val = meta.get("prosody_duration_lock") or locks_block.get("prosody_duration_lock")
 			if isinstance(pros_dur_val, (int, float)):
 				audio_prosody_duration_vals.append(float(pros_dur_val))
-			emotion_val = meta.get("emotion_lock") or locks.get("emotion_lock")
+			emotion_val = meta.get("emotion_lock") or locks_block.get("emotion_lock")
 			if isinstance(emotion_val, (int, float)):
 				audio_emotion_vals.append(float(emotion_val))
-			style_val = meta.get("style_lock") or locks.get("style_lock")
+			style_val = meta.get("style_lock") or locks_block.get("style_lock")
 			if isinstance(style_val, (int, float)):
 				audio_style_vals.append(float(style_val))
-			timing_val = meta.get("timing_lock") or locks.get("timing_lock")
+			timing_val = meta.get("timing_lock") or locks_block.get("timing_lock")
 			if isinstance(timing_val, (int, float)):
 				audio_timing_vals.append(float(timing_val))
 			# Optional SFX-specific locks
-			sfx_timbre_val = meta.get("sfx_timbre_lock") or locks.get("sfx_timbre_lock")
+			sfx_timbre_val = meta.get("sfx_timbre_lock") or locks_block.get("sfx_timbre_lock")
 			if isinstance(sfx_timbre_val, (int, float)):
 				audio_sfx_timbre_vals.append(float(sfx_timbre_val))
-			sfx_env_val = meta.get("sfx_envelope_lock") or locks.get("sfx_envelope_lock")
+			sfx_env_val = meta.get("sfx_envelope_lock") or locks_block.get("sfx_envelope_lock")
 			if isinstance(sfx_env_val, (int, float)):
 				audio_sfx_envelope_vals.append(float(sfx_env_val))
-			sfx_spatial_val = meta.get("sfx_spatial_lock") or locks.get("sfx_spatial_lock")
+			sfx_spatial_val = meta.get("sfx_spatial_lock") or locks_block.get("sfx_spatial_lock")
 			if isinstance(sfx_spatial_val, (int, float)):
 				audio_sfx_spatial_vals.append(float(sfx_spatial_val))
-			sfx_timing_val = meta.get("sfx_timing_lock") or locks.get("sfx_timing_lock")
+			sfx_timing_val = meta.get("sfx_timing_lock") or locks_block.get("sfx_timing_lock")
 			if isinstance(sfx_timing_val, (int, float)):
 				audio_sfx_timing_vals.append(float(sfx_timing_val))
-			sfx_loud_val = meta.get("sfx_loudness_lock") or locks.get("sfx_loudness_lock")
+			sfx_loud_val = meta.get("sfx_loudness_lock") or locks_block.get("sfx_loudness_lock")
 			if isinstance(sfx_loud_val, (int, float)):
 				audio_sfx_loudness_vals.append(float(sfx_loud_val))
-			sfx_density_val = meta.get("sfx_density_lock") or locks.get("sfx_density_lock")
+			sfx_density_val = meta.get("sfx_density_lock") or locks_block.get("sfx_density_lock")
 			if isinstance(sfx_density_val, (int, float)):
 				audio_sfx_density_vals.append(float(sfx_density_val))
 
@@ -550,57 +550,57 @@ def compute_domain_qa(tool_results: List[Dict[str, Any]]) -> Dict[str, Any]:
 	audio_emotion_avg = sum(audio_emotion_vals) / len(audio_emotion_vals) if audio_emotion_vals else None
 	audio_style_avg = sum(audio_style_vals) / len(audio_style_vals) if audio_style_vals else None
 	audio_timing_avg = sum(audio_timing_vals) / len(audio_timing_vals) if audio_timing_vals else None
-audio_sfx_timbre_avg = sum(audio_sfx_timbre_vals) / len(audio_sfx_timbre_vals) if audio_sfx_timbre_vals else None
-audio_sfx_envelope_avg = sum(audio_sfx_envelope_vals) / len(audio_sfx_envelope_vals) if audio_sfx_envelope_vals else None
-audio_sfx_spatial_avg = sum(audio_sfx_spatial_vals) / len(audio_sfx_spatial_vals) if audio_sfx_spatial_vals else None
-audio_sfx_timing_avg = sum(audio_sfx_timing_vals) / len(audio_sfx_timing_vals) if audio_sfx_timing_vals else None
-audio_sfx_loudness_avg = sum(audio_sfx_loudness_vals) / len(audio_sfx_loudness_vals) if audio_sfx_loudness_vals else None
-audio_sfx_density_avg = sum(audio_sfx_density_vals) / len(audio_sfx_density_vals) if audio_sfx_density_vals else None
+	audio_sfx_timbre_avg = sum(audio_sfx_timbre_vals) / len(audio_sfx_timbre_vals) if audio_sfx_timbre_vals else None
+	audio_sfx_envelope_avg = sum(audio_sfx_envelope_vals) / len(audio_sfx_envelope_vals) if audio_sfx_envelope_vals else None
+	audio_sfx_spatial_avg = sum(audio_sfx_spatial_vals) / len(audio_sfx_spatial_vals) if audio_sfx_spatial_vals else None
+	audio_sfx_timing_avg = sum(audio_sfx_timing_vals) / len(audio_sfx_timing_vals) if audio_sfx_timing_vals else None
+	audio_sfx_loudness_avg = sum(audio_sfx_loudness_vals) / len(audio_sfx_loudness_vals) if audio_sfx_loudness_vals else None
+	audio_sfx_density_avg = sum(audio_sfx_density_vals) / len(audio_sfx_density_vals) if audio_sfx_density_vals else None
 
-# Optional overall lock health scores for dashboarding / training targets
-image_lock_overall = None
-_image_lock_components: list[float] = []
-for v in (image_face_avg, image_id_avg, entity_shape_avg):
-	if isinstance(v, (int, float)):
-		_image_lock_components.append(float(v))
-if _image_lock_components:
-	image_lock_overall = min(_image_lock_components)
+	# Optional overall lock health scores for dashboarding / training targets
+	image_lock_overall = None
+	_image_lock_components: list[float] = []
+	for v in (image_face_avg, image_id_avg, entity_shape_avg):
+		if isinstance(v, (int, float)):
+			_image_lock_components.append(float(v))
+	if _image_lock_components:
+		image_lock_overall = min(_image_lock_components)
 
-video_lock_overall = None
-_video_lock_components: list[float] = []
-for v in (video_seam_ratio, video_art_ratio, video_fvmd_avg, video_flow_consistency_avg, video_color_consistency_avg):
-	if isinstance(v, (int, float)):
-		_video_lock_components.append(float(v))
-if _video_lock_components:
-	# Higher is better for seam_ok_ratio, fvmd, flow_consistency, color_consistency; lower is better for artifact_ok_ratio.
-	# Use the minimum after flipping artifact_ok_ratio so that 1.0 is best.
-	flip_art = None
-	if isinstance(video_art_ratio, (int, float)):
-		flip_art = max(0.0, min(1.0 - float(video_art_ratio), 1.0))
-		_video_lock_components.append(flip_art)
-	video_lock_overall = min(_video_lock_components)
+	video_lock_overall = None
+	_video_lock_components: list[float] = []
+	for v in (video_seam_ratio, video_art_ratio, video_fvmd_avg, video_flow_consistency_avg, video_color_consistency_avg):
+		if isinstance(v, (int, float)):
+			_video_lock_components.append(float(v))
+	if _video_lock_components:
+		# Higher is better for seam_ok_ratio, fvmd, flow_consistency, color_consistency; lower is better for artifact_ok_ratio.
+		# Use the minimum after flipping artifact_ok_ratio so that 1.0 is best.
+		flip_art = None
+		if isinstance(video_art_ratio, (int, float)):
+			flip_art = max(0.0, min(1.0 - float(video_art_ratio), 1.0))
+			_video_lock_components.append(flip_art)
+		video_lock_overall = min(_video_lock_components)
 
-audio_lock_overall = None
-_audio_lock_components: list[float] = []
-for v in (
-	audio_voice_avg,
-	audio_tempo_avg,
-	audio_key_avg,
-	audio_stem_avg,
-	audio_lyrics_avg,
-	audio_motif_avg,
-	audio_prosody_pitch_avg,
-	audio_prosody_energy_avg,
-	audio_prosody_duration_avg,
-	audio_emotion_avg,
-	audio_style_avg,
-	audio_timing_avg,
-	audio_sfx_timing_avg,
-):
-	if isinstance(v, (int, float)):
-		_audio_lock_components.append(float(v))
-if _audio_lock_components:
-	audio_lock_overall = min(_audio_lock_components)
+	audio_lock_overall = None
+	_audio_lock_components: list[float] = []
+	for v in (
+		audio_voice_avg,
+		audio_tempo_avg,
+		audio_key_avg,
+		audio_stem_avg,
+		audio_lyrics_avg,
+		audio_motif_avg,
+		audio_prosody_pitch_avg,
+		audio_prosody_energy_avg,
+		audio_prosody_duration_avg,
+		audio_emotion_avg,
+		audio_style_avg,
+		audio_timing_avg,
+		audio_sfx_timing_avg,
+	):
+		if isinstance(v, (int, float)):
+			_audio_lock_components.append(float(v))
+	if _audio_lock_components:
+		audio_lock_overall = min(_audio_lock_components)
 
 	return {
 		"images": {

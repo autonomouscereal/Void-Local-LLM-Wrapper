@@ -16,7 +16,9 @@ from .yue_engine import load_yue, generate_song
 
 YUE_DIR = os.getenv("YUE_MODEL_ID", "/opt/models/yue")
 
-app = FastAPI(title="YuE Music Service", version="0.2.0")
+# Treat this as the generic primary music service; the underlying engine may
+# still be YuE, but callers should not depend on that name.
+app = FastAPI(title="Music Service", version="0.2.0")
 
 _model = None
 _device = None
