@@ -248,13 +248,6 @@ def get_builtin_tools_schema() -> List[Dict[str, Any]]:
 		{
 			"type": "function",
 			"function": {
-				"name": "web_search",
-				"parameters": {"type": "object", "properties": {"q": {"type": "string"}}, "required": ["q"]}
-			}
-		},
-		{
-			"type": "function",
-			"function": {
 				"name": "source_fetch",
 				"parameters": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}
 			}
@@ -297,13 +290,6 @@ def get_builtin_tools_schema() -> List[Dict[str, Any]]:
 					},
 					"required": ["url"]
 				}
-			}
-		},
-		{
-			"type": "function",
-			"function": {
-				"name": "metasearch.fuse",
-				"parameters": {"type": "object", "properties": {"q": {"type": "string"}, "k": {"type": "integer"}}, "required": ["q"]}
 			}
 		},
 		{
@@ -370,20 +356,6 @@ def get_builtin_tools_schema() -> List[Dict[str, Any]]:
 			"function": {
 				"name": "image.super_gen",
 				"parameters": {"type": "object", "properties": {"prompt": {"type": "string"}, "size": {"type": "string"}, "refs": {"type": "object"}, "seed": {"type": "integer"}, "cid": {"type": "string"}}, "required": ["prompt"]}
-			}
-		},
-		{
-			"type": "function",
-			"function": {
-				"name": "music.dispatch",
-				"parameters": {"type": "object", "properties": {"prompt": {"type": "string"}}, "required": []}
-			}
-		},
-		{
-			"type": "function",
-			"function": {
-				"name": "music.compose",
-				"parameters": {"type": "object", "properties": {"prompt": {"type": "string"}, "bpm": {"type": "integer"}, "length_s": {"type": "integer"}, "structure": {"type": "array", "items": {"type": "string"}}, "sample_rate": {"type": "integer"}, "channels": {"type": "integer"}, "music_id": {"type": "string"}, "music_refs": {"type": "object"}, "seed": {"type": "integer"}, "cid": {"type": "string"}}, "required": ["prompt"]}
 			}
 		},
 		{

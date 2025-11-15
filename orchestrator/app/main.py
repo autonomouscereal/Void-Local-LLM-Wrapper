@@ -195,45 +195,39 @@ from .http.client import HttpRequestConfig, perform_http_request, validate_remot
 # Lightweight tool kind overlay for planner mode (reuses existing catalog/builtins)
 # Treat all tools as analysis by default; explicitly tag action/asset-creating tools.
 ACTION_TOOL_NAMES = {
-    # Front-door action tools only (planner-visible action surfaces)
+    # Front-door action tools only (planner-visible surfaces)
     "image.dispatch",
-    "music.compose",
     "music.infinite.windowed",
     "film2.run",      # Film-2 front door (planner-visible)
     "tts.speak",
 }
 
-# Planner-visible tool whitelist: only expose front doors + analysis utilities
+# Planner-visible tool whitelist: only expose the four generative front doors.
+# All other tools (locks, SFX, HTTP, search, analysis) remain internal-only.
 PLANNER_VISIBLE_TOOLS = {
-    # Action front doors
-    "image.dispatch", "image.refine.segment", "music.compose", "music.infinite.windowed", "film2.run", "tts.speak",
-    # Lock management
-    "locks.build_image_bundle", "locks.build_audio_bundle", "locks.get_bundle",
-    "locks.build_region_locks", "locks.update_region_modes", "locks.update_audio_modes",
-    # Analysis/search utilities
-    "rag_search", "research.run", "web_search", "metasearch.fuse", "web.smart_get", "source_fetch", "math.eval",
+    "image.dispatch",
+    "music.infinite.windowed",
+    "film2.run",
+    "tts.speak",
 }
 
+
 def _filter_tool_names_by_mode(names: List[str], mode: Optional[str]) -> List[str]:
-    m = (mode or "general").strip().lower()
-    base = sorted([n for n in (names or []) if isinstance(n, str) and n.strip()])
-    if m in ("general", "chat", "analysis"):
-        # In chat/analysis: hide only explicit action tools
-        return [n for n in base if n not in ACTION_TOOL_NAMES]
-    # In job/other modes: allow everything
-    return base
+    """
+    Legacy hook: no mode-based filtering.
+    The planner always sees the same fixed set of tools; this helper now just normalizes names.
+    """
+    return sorted({n for n in (names or []) if isinstance(n, str) and n.strip()})
+
 
 def _allowed_tools_for_mode(mode: Optional[str]) -> List[str]:
-    # Start from existing catalog (routes + builtins) to avoid drift
+    """
+    Legacy hook: no mode-based tool-set selection.
+    All planner-visible tools are allowed in all modes; mode may still affect prompts, not tool lists.
+    """
+    # Start from existing catalog (routes + builtins) and restrict to planner-visible tools only.
     allowed_set = catalog_allowed(get_builtin_tools_schema)
-    # Restrict to planner-visible tools only
-    base = sorted([n for n in allowed_set if isinstance(n, str) and n.strip() and n in PLANNER_VISIBLE_TOOLS])
-    m = (mode or "general").strip().lower()
-    if m in ("general", "chat", "analysis"):
-        # In chat: all catalog tools except explicit action tools
-        return [n for n in base if n not in ACTION_TOOL_NAMES]
-    # In job: full catalog
-    return base
+    return sorted([n for n in allowed_set if isinstance(n, str) and n.strip() and n in PLANNER_VISIBLE_TOOLS])
 
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -3312,11 +3306,10 @@ async def planner_produce_plan(messages: List[Dict[str, Any]], tools: Optional[L
             last_user = m.get("content").strip()
             break
     mode_local = _infer_effective_mode(last_user)
-    tool_palette = "full" if mode_local == "job" else "analysis_only"
     effective_mode = mode_local
-    # Mode-based tool palette for the planner prompt (analysis vs action)
+    # Normalize planner tool names; no mode-based filtering (fixed tool surface).
     tool_names_mode: List[str] = _filter_tool_names_by_mode(tool_names, effective_mode)
-    # Allowed tool names for this mode (catalog ∩ palette)
+    # Allowed tool names for planner use (fixed front-door surface).
     _allowed_for_mode = _allowed_tools_for_mode(effective_mode)
     # Detect repair intent from messages
     _is_repair = any(isinstance(m, dict) and isinstance(m.get("content"), str) and "repair mode" in m.get("content", "").lower() for m in (messages or []))
@@ -3389,31 +3382,25 @@ async def planner_produce_plan(messages: List[Dict[str, Any]], tools: Optional[L
     # Add Mode/Palette and allowed tools guidance
     _mode_palette = (
         "### [PLANNER MODE / SYSTEM]\n"
-        f"Mode and tool palette:\n"
+        f"Mode:\n"
         f"- mode: {mode_local}\n"
-        f"- tool_palette: {tool_palette}\n"
-        f"Allowed tools in this mode: " + (", ".join(_allowed_for_mode) if _allowed_for_mode else "(none)") + "\n"
-        "\n"
-        "Tool kinds:\n"
-        "- analysis tools: non-side-effect tools such as json.parse, web.search, math.eval, memory.query.\n"
-        "- action tools: asset-creating tools such as image.dispatch, music.compose, film2.run (if present), etc.\n"
-        "\n"
+        "Tool surface (fixed):\n"
+        "- The planner can ONLY call these tools: "
+        + (", ".join(_allowed_for_mode) if _allowed_for_mode else "(none)")
+        + "\n"
         "Rules:\n"
-        "- In mode=\"chat\" with tool_palette=\"analysis_only\":\n"
-        "  - You MAY call analysis tools to improve your understanding (web.search, json.parse, etc.).\n"
-        "  - You MUST NOT call action tools (image.dispatch, music.compose, film.*) unless the user explicitly requested an asset and the tool_palette is \"full\".\n"
-        "  - It is allowed to produce a plan with ZERO tools if you can answer directly.\n"
-        "- In mode=\"job\" with tool_palette=\"full\":\n"
-        "  - You may call any tools (analysis + action) as needed to produce the requested artifacts."
+        "- Do NOT invent or call any other tool names (no locks.*, no rag_search, no research.run, no web.smart_get, etc.).\n"
+        "- Internal helpers such as locks/QA/SFX/refine/http are invoked inside handlers, never directly by the planner.\n"
+        "- You may return an empty 'steps' list if a pure textual answer is sufficient.\n"
     )
     planner_meta = (
         "### [PLANNER / SYSTEM]\n"
-        "Honor CO ratios/RoE. Prefer tools over text. Construct strict JSON steps with all required args; snap sizes to /8.\n"
+        "Honor CO ratios/RoE. Prefer tools over text when media is requested. Construct strict JSON steps with all required args; snap sizes to /8.\n"
         "- Image edits: do NOT use image.edit. Always use image.dispatch for both generation and editing.\n"
         "- When editing, include the input image via attachments (preferred) or set args.images to an array of objects containing absolute /uploads/... URLs.\n"
         "- For denoise/inpaint style edits, include a strength field (0.0–1.0) when applicable; keep the prompt aligned with the edit intent.\n"
-        "- You MAY produce multiple steps in one plan in the 'steps' array; preserve the intended order. Use analysis tools first (rag_search, research.run, math.eval) to gather context, then call exactly one front-door action tool (image.dispatch, music.compose, film2.run, tts.speak) if the user requested an artifact.\n"
-        "- In chat/analysis mode you MAY return steps with analysis tools only, or an empty 'steps' list if a direct textual answer suffices. Do NOT propose action tools in analysis mode."
+        "- You MAY produce multiple steps in one plan in the 'steps' array; preserve the intended order. When the user requests media, choose one or more of the front-door tools (image.dispatch, music.infinite.windowed, film2.run, tts.speak) and do not reference any other tools.\n"
+        "- For purely textual questions with no media intent, you MAY return an empty 'steps' list. Do NOT propose internal tools such as locks.*, rag_search, research.run, web.smart_get, or http.request."
     )
     committee_review = (
         "### [COMMITTEE REVIEW / SYSTEM]\n"
@@ -3828,17 +3815,27 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         a = args if isinstance(args, dict) else {}
         character_id = str(a.get("character_id") or "").strip()
         updates = a.get("updates") if isinstance(a.get("updates"), list) else []
-        if not character_id:
+        bundle_arg = a.get("lock_bundle") if isinstance(a.get("lock_bundle"), dict) else None
+        # Allow callers to either target a persisted character lock bundle via
+        # character_id or operate on an explicit lock_bundle payload without
+        # requiring character identity. This avoids noisy failures in revise
+        # flows when only a bundle snapshot is available.
+        if not character_id and bundle_arg is None:
             return {"name": name, "error": "missing_character_id"}
-        existing = await _lock_load(character_id) or {}
+        if character_id:
+            existing = await _lock_load(character_id) or {}
+        else:
+            existing = dict(bundle_arg or {})
         existing = _lock_migrate_visual(existing)
         existing = _lock_migrate_music(existing)
         existing = _lock_migrate_tts(existing)
         existing = _lock_migrate_sfx(existing)
         existing = _lock_migrate_film2(existing)
         updated_bundle = _apply_region_mode_updates(existing, updates)
-        _summarize_all_locks_for_context(character_id, updated_bundle)
-        await _lock_save(character_id, updated_bundle)
+        # Persist and summarize only when operating on a character-scoped bundle.
+        if character_id:
+            _summarize_all_locks_for_context(character_id, updated_bundle)
+            await _lock_save(character_id, updated_bundle)
         return {"name": name, "result": {"lock_bundle": updated_bundle}}
     if name == "locks.update_audio_modes":
         a = args if isinstance(args, dict) else {}
@@ -3880,23 +3877,65 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             a["steps"] = preset["steps"]
         if "cfg" not in a or a.get("cfg") is None:
             a["cfg"] = preset["cfg"]
+
+        # Best-effort character identity for lock routing. Prefer explicit
+        # character_id / lock_character_id; fall back to a trace-scoped
+        # synthetic character id so that image generations participate in the
+        # lock bundle model even when the caller omits character metadata.
+        char_key = str(a.get("character_id") or a.get("lock_character_id") or "").strip()
+        if not char_key:
+            trace_val = a.get("trace_id")
+            if isinstance(trace_val, str) and trace_val.strip():
+                char_key = f"char_{trace_val.strip()}"
+        if char_key and "character_id" not in a:
+            a["character_id"] = char_key
+
         bundle_arg = a.get("lock_bundle")
         lock_bundle: Optional[Dict[str, Any]] = None
         if isinstance(bundle_arg, dict):
             lock_bundle = bundle_arg
         elif isinstance(bundle_arg, str) and bundle_arg.strip():
-            lock_bundle = await _lock_load(bundle_arg.strip()) or {}
-        if not lock_bundle:
-            char_key = str(a.get("character_id") or a.get("lock_character_id") or "").strip()
-            if char_key:
-                lock_bundle = await _lock_load(char_key) or {}
-        if lock_bundle:
+            loaded = await _lock_load(bundle_arg.strip())
+            if isinstance(loaded, dict):
+                lock_bundle = loaded
+        if lock_bundle is None and char_key:
+            loaded = await _lock_load(char_key)
+            if isinstance(loaded, dict):
+                lock_bundle = loaded
+        # Enforce a lock-first invariant for character-scoped image generation:
+        # when a character id is known but no bundle exists yet, create a
+        # minimal skeleton bundle so downstream QA and refinement can rely on a
+        # stable lock container.
+        if lock_bundle is None and char_key:
+            lock_bundle = {
+                "schema_version": 2,
+                "character_id": char_key,
+                "face": {},
+                "pose": {},
+                "style": {},
+                "audio": {},
+                "regions": {},
+                "scene": {
+                    "background_embedding": None,
+                    "camera_style_tags": [],
+                    "lighting_tags": [],
+                    "lock_mode": "soft",
+                },
+            }
+            try:
+                await _lock_save(char_key, lock_bundle)
+            except Exception:
+                # Lock persistence failures should not block base generation; the
+                # request can still proceed with an in-memory bundle.
+                pass
+
+        if lock_bundle is not None:
             # Apply quality profile and normalize visual branch for this request
             lock_bundle = _lock_apply_profile(quality_profile, lock_bundle)
             lock_bundle = _lock_migrate_visual(lock_bundle)
             # If any entities are marked hard, freeze them and relax others.
             ents = _lock_visual_get_entities(lock_bundle)
-            hard_ids = []
+            hard_ids: List[str] = []
             for ent in ents:
                 if not isinstance(ent, dict):
                     continue
@@ -3936,7 +3975,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         cfg_val = a.get("cfg")
         cfg_num = float(cfg_val) if isinstance(cfg_val, (int, float)) else None
         assets = dict(a.get("assets") if isinstance(a.get("assets"), dict) else {})
-        if lock_bundle:
+        if lock_bundle is not None:
             assets["lock_bundle"] = lock_bundle
         args = {
             "prompt": str(prompt),
@@ -5262,18 +5301,44 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         try:
             a = args if isinstance(args, dict) else {}
             quality_profile = (a.get("quality_profile") or "standard")
+            # Derive a stable character/voice identity when possible.
+            char_id = str(a.get("character_id") or a.get("voice_id") or a.get("voice_lock_id") or "").strip()
+            if not char_id:
+                trace_val = a.get("trace_id")
+                if isinstance(trace_val, str) and trace_val.strip():
+                    char_id = f"char_{trace_val.strip()}"
+            if char_id and "character_id" not in a:
+                a["character_id"] = char_id
+
             bundle_arg = a.get("lock_bundle")
             lock_bundle: Optional[Dict[str, Any]] = None
             if isinstance(bundle_arg, dict):
                 lock_bundle = bundle_arg
             elif isinstance(bundle_arg, str) and bundle_arg.strip():
-                lock_bundle = await _lock_load(bundle_arg.strip()) or {}
-            if not lock_bundle:
-                char_id = str(a.get("character_id") or "").strip()
-                if char_id:
-                    lock_bundle = await _lock_load(char_id) or {}
-            if lock_bundle:
+                loaded = await _lock_load(bundle_arg.strip())
+                if isinstance(loaded, dict):
+                    lock_bundle = loaded
+            if lock_bundle is None and char_id:
+                loaded = await _lock_load(char_id)
+                if isinstance(loaded, dict):
+                    lock_bundle = loaded
+            # Enforce a lock-first invariant for TTS when an identity is known:
+            # if no bundle exists yet, create a minimal skeleton so QA and
+            # refinement can rely on a stable lock container.
+            if lock_bundle is None and char_id:
+                lock_bundle = {
+                    "schema_version": 2,
+                    "character_id": char_id,
+                    "tts": {},
+                    "audio": {},
+                }
+                try:
+                    await _lock_save(char_id, lock_bundle)
+                except Exception:
+                    pass
+            if lock_bundle is not None:
                 lock_bundle = _lock_apply_profile(quality_profile, lock_bundle)
+                lock_bundle = _lock_migrate_tts(lock_bundle)
                 a["lock_bundle"] = lock_bundle
             a["quality_profile"] = quality_profile
             env = run_tts_speak(a, provider, manifest)
@@ -5498,49 +5563,6 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 return {"name": name, "result": js}
         except Exception as ex:
             return {"name": name, "error": str(ex)}
-    if name == "music.dispatch" and ALLOW_TOOL_EXECUTION:
-        mode = (args.get("mode") or "compose").strip().lower()
-        if mode == "compose":
-            if not MUSIC_API_URL:
-                return {"name": name, "error": "MUSIC_API_URL not configured"}
-            class _MusicProvider:
-                async def _compose(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-                    import base64 as _b
-                    async with httpx.AsyncClient() as client:
-                        emit_progress({"stage": "request", "target": "music"})
-                        r = await client.post(MUSIC_API_URL.rstrip("/") + "/generate", json={"prompt": payload.get("prompt"), "duration": int(payload.get("length_s") or 8)})
-                        js = _resp_json(r, {"audio_wav_base64": str, "wav_b64": str}); b64 = js.get("audio_wav_base64") or js.get("wav_b64"); wav = _b.b64decode(b64) if isinstance(b64, str) else b""; return {"wav_bytes": wav, "model": f"musicgen:{os.getenv('MUSIC_MODEL_ID','')}"}
-                def compose(self, args: Dict[str, Any]) -> Dict[str, Any]:
-                    import asyncio as _as
-                    return _as.get_event_loop().run_until_complete(self._compose(args))
-            provider = _MusicProvider(); manifest = {"items": []}
-            try:
-                compose_args = args if isinstance(args, dict) else {}
-                profile_name = (compose_args.get("quality_profile") or "standard")
-                env = run_music_compose(compose_args, provider, manifest)
-                if isinstance(env, dict):
-                    meta_env = env.setdefault("meta", {})
-                    if isinstance(meta_env, dict):
-                        meta_env.setdefault("quality_profile", profile_name)
-                return {"name": name, "result": env}
-            except Exception as ex:
-                return {"name": name, "error": str(ex)}
-        elif mode == "variation":
-            manifest = {"items": []}
-            try:
-                env = run_music_variation(args if isinstance(args, dict) else {}, manifest)
-                return {"name": name, "result": env}
-            except Exception as ex:
-                return {"name": name, "error": str(ex)}
-        elif mode == "mixdown":
-            manifest = {"items": []}
-            try:
-                env = run_music_mixdown(args if isinstance(args, dict) else {}, manifest)
-                return {"name": name, "result": env}
-            except Exception as ex:
-                return {"name": name, "error": str(ex)}
-        else:
-            return {"name": name, "error": f"unsupported music mode: {mode}"}
     if name == "music.infinite.windowed" and ALLOW_TOOL_EXECUTION:
         class _WindowMusicProvider:
             async def _compose(self, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -5565,17 +5587,36 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         manifest = {"items": []}
         try:
             a = args if isinstance(args, dict) else {}
+            quality_profile = (a.get("quality_profile") or "standard")
+            # Derive a stable character identity for music locks when possible.
+            char_id = str(a.get("character_id") or "").strip()
+            if not char_id:
+                trace_val = a.get("trace_id")
+                if isinstance(trace_val, str) and trace_val.strip():
+                    char_id = f"char_{trace_val.strip()}"
+            if char_id and "character_id" not in a:
+                a["character_id"] = char_id
+
             # Best-effort lock bundle resolution and Song Graph planning.
             bundle_arg = a.get("lock_bundle")
             lock_bundle: Optional[Dict[str, Any]] = None
             if isinstance(bundle_arg, dict):
                 lock_bundle = bundle_arg
             elif isinstance(bundle_arg, str) and bundle_arg.strip():
-                lock_bundle = await _lock_load(bundle_arg.strip()) or {}
-            if lock_bundle:
-                lock_bundle = _lock_migrate_music(lock_bundle)
-            else:
+                loaded = await _lock_load(bundle_arg.strip())
+                if isinstance(loaded, dict):
+                    lock_bundle = loaded
+            if lock_bundle is None and char_id:
+                loaded = await _lock_load(char_id)
+                if isinstance(loaded, dict):
+                    lock_bundle = loaded
+            if lock_bundle is None:
                 lock_bundle = {}
+            # Ensure the bundle carries character identity for downstream tools.
+            if char_id:
+                lock_bundle.setdefault("character_id", char_id)
+            # Normalize music branch shape.
+            lock_bundle = _lock_migrate_music(lock_bundle)
 
             prompt_text = str(a.get("prompt") or "").strip()
             length_s = int(a.get("length_s") or 60)
@@ -5627,7 +5668,6 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             env = run_music_infinite_windowed(a, provider, manifest)
             # Persist updated lock bundle (including song graph and windows) when character_id present.
             try:
-                char_id = str(a.get("character_id") or "").strip()
                 if char_id and lock_bundle:
                     await _lock_save(char_id, lock_bundle)
             except Exception:
@@ -8655,20 +8695,24 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     import hashlib as _hl
     def _compute_tools_hash() -> str:
         names = set()
-        # include client-declared tool names if provided
+        # include client-declared tool names if provided (planner-visible only)
         client_tools = body.get("tools") if isinstance(body.get("tools"), list) else []
         for t in (client_tools or []):
             if isinstance(t, dict):
                 nm = (t.get("function") or {}).get("name") or t.get("name")
-                if isinstance(nm, str) and nm.strip():
-                    names.add(nm.strip())
-        # include built-in tool names
+                if isinstance(nm, str):
+                    nm_clean = nm.strip()
+                    if nm_clean and nm_clean in PLANNER_VISIBLE_TOOLS:
+                        names.add(nm_clean)
+        # include built-in tool names (planner-visible only)
         builtins = get_builtin_tools_schema()
         for t in (builtins or []):
             fn = (t.get("function") or {})
             nm = fn.get("name")
-            if nm:
-                names.add(str(nm))
+            if isinstance(nm, str):
+                nm_clean = nm.strip()
+                if nm_clean and nm_clean in PLANNER_VISIBLE_TOOLS:
+                    names.add(nm_clean)
         src = "|".join(sorted(list(names)))
         return _hl.sha256(src.encode("utf-8")).hexdigest()[:16]
     _cat_hash = _compute_tools_hash()
@@ -11459,10 +11503,11 @@ async def v1_audio_lyrics_to_song(body: Dict[str, Any]):
             "arguments": {"lyrics": lyrics, "style_tags": ([style] if style else []), "bpm": bpm, "key": key, "seed": seed},
         }
     else:
+        # Route lyrics-to-song through the windowed music path instead of music.compose.
         prompt = ((style + ": ") if style else "") + lyrics
         call = {
-            "name": "music.compose",
-            "arguments": {"prompt": prompt, "length_s": duration_s, "bpm": bpm, "seed": seed},
+            "name": "music.infinite.windowed",
+            "arguments": {"prompt": prompt, "length_s": duration_s, "bpm": bpm, "key": key, "seed": seed},
         }
     res = await execute_tool_call(call)
     return ToolEnvelope.success({"result": res}, request_id=rid)
@@ -11523,7 +11568,7 @@ async def v1_audio_tts_sing(body: Dict[str, Any]):
             else:
                 prompt = lyrics
                 call = {
-                    "name": "music.compose",
+                    "name": "music.infinite.windowed",
                     "arguments": {"prompt": prompt, "length_s": 30, "seed": item.get("seed")},
                 }
             res = await execute_tool_call(call)

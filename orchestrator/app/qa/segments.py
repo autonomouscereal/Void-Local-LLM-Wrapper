@@ -373,8 +373,8 @@ def enrich_patch_plan_for_image_segments(
     segments: List[SegmentResult],
 ) -> List[Dict[str, Any]]:
     """
-    Enrich image.refine.segment steps with prompt, source_image, and lock_bundle
-    derived from the corresponding image segments.
+    Enrich image.refine.segment steps with segment_id, prompt, source_image,
+    and lock_bundle derived from the corresponding image segments.
     """
     index_by_id: Dict[str, SegmentResult] = {}
     for seg in segments:
@@ -402,6 +402,11 @@ def enrich_patch_plan_for_image_segments(
             enriched.append(step)
             continue
         args: Dict[str, Any] = dict(args_obj)
+        # Ensure the refine tool receives the segment identifier in-arguments.
+        # The executor for image.refine.segment validates segment_id from args
+        # rather than the outer patch-plan field, so we mirror it here.
+        if "segment_id" not in args:
+            args["segment_id"] = seg_id
         seg_result = seg.get("result") if isinstance(seg.get("result"), dict) else {}
         meta = seg_result.get("meta") if isinstance(seg_result.get("meta"), dict) else {}
         artifacts = seg_result.get("artifacts") if isinstance(seg_result.get("artifacts"), list) else []
