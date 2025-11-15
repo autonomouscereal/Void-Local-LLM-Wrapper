@@ -35,6 +35,7 @@ from io import BytesIO
 import base64 as _b64
 import base64 as _b
 import asyncio as _as
+import contextlib
 import aiohttp  # type: ignore
 import httpx as _hx  # type: ignore
 import httpx  # type: ignore
@@ -1913,6 +1914,7 @@ MUSIC_API_URL = os.getenv("MUSIC_API_URL")    # e.g., http://musicgen:7860
 VLM_API_URL = os.getenv("VLM_API_URL")        # e.g., http://vlm:8050
 OCR_API_URL = os.getenv("OCR_API_URL")        # e.g., http://ocr:8070
 VISION_REPAIR_API_URL = os.getenv("VISION_REPAIR_API_URL")  # e.g., http://vision_repair:8095
+MFA_API_URL = os.getenv("MFA_API_URL")        # e.g., http://mfa:7867
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/workspace/uploads")
 # Ensure UPLOAD_DIR exists; if not creatable (e.g., missing /workspace mount), fall back.
@@ -2647,147 +2649,6 @@ def _write_text_atomic(path: str, text: str) -> Dict[str, Any]:
 def _write_json_atomic(path: str, obj: Any) -> Dict[str, Any]:
     import json as _j
     return _write_text_atomic(path, _j.dumps(obj, ensure_ascii=False, separators=(",", ":")))
-
-
-# -------------------- Audio Router API (minimal hands-off pipeline) --------------------
-
-MUSIC_API_URL = os.getenv("MUSIC_API_URL", "http://music:7860").rstrip("/")
-MELODY_API_URL = os.getenv("MELODY_API_URL", "http://melody:7861").rstrip("/")
-DSINGER_API_URL = os.getenv("DSINGER_API_URL", "http://dsinger:7862").rstrip("/")
-RVC_API_URL = os.getenv("RVC_API_URL", "http://rvc:7863").rstrip("/")
-SFX_API_URL = os.getenv("SFX_API_URL", "http://sfx:7866").rstrip("/")
-VOCAL_FIXER_API_URL = os.getenv("VOCAL_FIXER_API_URL", "http://vocalfix:7864").rstrip("/")
-MASTERING_API_URL = os.getenv("MASTERING_API_URL", "http://master:7865").rstrip("/")
-MFA_API_URL = os.getenv("MFA_API_URL", "http://mfa:7867").rstrip("/")
-PROSODY_API_URL = os.getenv("PROSODY_API_URL", "http://prosody:7868").rstrip("/")
-
-
-@app.post("/v1/audio/lyrics-to-song")
-async def audio_lyrics_to_song(req: Request):
-    import uuid as _uuid
-    body = await req.json()
-    expected = {
-        "prompt": "",
-        "lyrics": "",
-        "seconds": 30,
-        "seed": None,
-        "voice_lock_id": None,
-        "sfx_prompt": None,
-    }
-    data = JSONParser().parse(body, expected) if isinstance(body, (str, bytes)) else {**expected, **(body or {})}
-    prompt = str(data.get("prompt") or "").strip()
-    lyrics = str(data.get("lyrics") or "").strip()
-    seconds = int(data.get("seconds") or 30)
-    seed = data.get("seed")
-    voice_lock_id = data.get("voice_lock_id")
-    sfx_prompt = data.get("sfx_prompt")
-    # minimal tracing: job start
-    try:
-        _job_id = str(_uuid.uuid4())
-        _append_ledger({"phase": "job.start", "job_id": _job_id, "route": "audio.lyrics_to_song", "inputs": {"prompt": prompt, "lyrics_len": len(lyrics or ""), "seconds": seconds, "seed": seed}})
-    except Exception:
-        _job_id = None
-    if not prompt and not lyrics:
-        return JSONResponse(status_code=400, content={"error": "missing prompt or lyrics"})
-
-    async with httpx.AsyncClient() as client:
-        # 1) Melody/score from lyrics
-        score = None
-        if lyrics:
-            try:
-                r = await client.post(f"{MELODY_API_URL}/score", json={"lyrics": lyrics, "bpm": 140, "key": "E minor"})
-                score_resp = JSONParser().parse(r.text, {"ok": (bool), "score_json": dict})
-                score = score_resp.get("score_json") or score_resp
-            except Exception:
-                score = None
-
-        # 1b) Prosody deltas
-        if score and lyrics:
-            try:
-                r = await client.post(f"{PROSODY_API_URL}/suggest", json={"lyrics": lyrics, "score_json": score, "style_tags": None})
-                pros = JSONParser().parse(r.text, {}) or {}
-                score["prosody_deltas"] = pros
-            except Exception:
-                pass
-
-        # 2) Backing track (Music service)
-        backing_b64 = None
-        try:
-            r = await client.post(f"{MUSIC_API_URL}/generate", json={"prompt": prompt or lyrics, "seconds": seconds, "seed": seed})
-            backing_b64 = (JSONParser().parse(r.text, {}) or {}).get("audio_wav_base64")
-        except Exception:
-            backing_b64 = None
-
-        # 3) Sing (DiffSinger) → dry vocal
-        vocal_b64 = None
-        if score:
-            try:
-                r = await client.post(f"{DSINGER_API_URL}/sing", json={"score_json": score, "seconds": seconds, "seed": seed})
-                vocal_b64 = (JSONParser().parse(r.text, {}) or {}).get("audio_wav_base64")
-            except Exception:
-                vocal_b64 = None
-
-        # 3b) MFA alignment
-        mfa = None
-        if vocal_b64 and lyrics:
-            try:
-                r = await client.post(f"{MFA_API_URL}/align", json={"lyrics": lyrics, "wav_bytes": vocal_b64})
-                mfa = JSONParser().parse(r.text, {}) or {}
-            except Exception:
-                mfa = None
-
-        # 4) Vocal fixer (auto-tune/align/de-ess)
-        if vocal_b64 and score:
-            try:
-                r = await client.post(f"{VOCAL_FIXER_API_URL}/vocal_fix", json={"wav_bytes": vocal_b64, "score_json": score, "key": "E minor"})
-                vocal_b64 = (JSONParser().parse(r.text, {}) or {}).get("audio_wav_base64") or vocal_b64
-            except Exception:
-                pass
-
-        # 5) Voice convert (RVC)
-        if vocal_b64 and voice_lock_id:
-            try:
-                r = await client.post(f"{RVC_API_URL}/convert", json={"wav_bytes": vocal_b64, "voice_lock_id": voice_lock_id})
-                vocal_b64 = (JSONParser().parse(r.text, {}) or {}).get("audio_wav_base64") or vocal_b64
-            except Exception:
-                pass
-
-        # 6) Optional SFX
-        sfx_items = []
-        if sfx_prompt:
-            try:
-                r = await client.post(f"{SFX_API_URL}/sfx", json={"prompt": sfx_prompt, "len_s": min(8, seconds)})
-                j = JSONParser().parse(r.text, {}) or {}
-                if isinstance(j.get("audio_wav_base64"), str):
-                    sfx_items.append(j["audio_wav_base64"])
-            except Exception:
-                sfx_items = []
-
-    # 7) Mastering (apply on backing as placeholder)
-    mastered_b64 = None
-    try:
-        if backing_b64:
-            r = await httpx.AsyncClient().post(f"{MASTERING_API_URL}/master", json={"wav_bytes": backing_b64, "lufs_target": -14.0, "tp_ceiling_db": -1.0})
-            mastered_b64 = (JSONParser().parse(r.text, {}) or {}).get("audio_wav_base64")
-    except Exception:
-        mastered_b64 = None
-
-    # Return components (mixing node can be added later)
-    resp = {
-        "backing_audio_wav_base64": backing_b64,
-        "mastered_backing_wav_base64": mastered_b64,
-        "vocal_audio_wav_base64": vocal_b64,
-        "score": score or {},
-        "sfx": sfx_items,
-        "seconds": seconds,
-    }
-    if 'mfa' in locals() and mfa:
-        resp["mfa_alignment"] = mfa
-    try:
-        _append_ledger({"phase": "job.finish", "job_id": _job_id, "route": "audio.lyrics_to_song", "outputs": {"has_backing": bool(backing_b64), "has_vocal": bool(vocal_b64), "has_sfx": bool(resp.get("sfx"))}})
-    except Exception:
-        pass
-    return resp
 
 
 def get_builtin_tools_schema() -> List[Dict[str, Any]]:
@@ -6790,10 +6651,18 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         if not os.path.isabs(full):
             full = os.path.join(UPLOAD_DIR, audio_path.lstrip("/"))
         duration_s = 0.0
+        sr = 1
+        n_channels = 1
+        sampwidth = 2
+        frames = 0
+        pcm_bytes: bytes = b""
         with contextlib.closing(wave.open(full, "rb")) as wf:  # type: ignore[arg-type]
             frames = wf.getnframes()
             sr = wf.getframerate() or 1
+            n_channels = wf.getnchannels()
+            sampwidth = wf.getsampwidth()
             duration_s = float(frames) / float(sr)
+            pcm_bytes = wf.readframes(frames)
         # Stage 1: coarse section ranges
         section_ranges: Dict[str, Dict[str, float]] = {}
         lb_for_sections = a.get("lock_bundle") if isinstance(a.get("lock_bundle"), dict) else None
@@ -6828,9 +6697,11 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 section_ranges[sec_id] = {"t_start": start, "t_end": end}
                 t0 = end
                 idx += 1
-        # Pre-encode full audio once for MFA if configured.
+        # Determine whether we have real Song Graph timings (vs uniform fallback).
+        has_graph_timings = bool(music_sections)
+        # Pre-encode full audio once for MFA in the fallback case.
         full_b64: Optional[str] = None
-        if MFA_API_URL and isinstance(MFA_API_URL, str) and MFA_API_URL.strip():
+        if MFA_API_URL and isinstance(MFA_API_URL, str) and MFA_API_URL.strip() and not has_graph_timings:
             with open(full, "rb") as f:
                 raw = f.read()
             if raw:
@@ -6860,24 +6731,62 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             aligned_lines: List[Dict[str, Any]] = []
             # Try MFA-based alignment when available
             words: List[Dict[str, Any]] = []
-            if full_b64 and section_text.strip():
-                async with httpx.AsyncClient() as client:
-                    r = await client.post(
-                        MFA_API_URL.rstrip("/") + "/align",
-                        json={"lyrics": section_text, "wav_bytes": full_b64},
-                    )
-                js = JSONParser().parse(r.text, {"alignment": list}) or {}
-                raw_words = js.get("alignment")
-                if isinstance(raw_words, list):
-                    for w in raw_words:
-                        if not isinstance(w, dict):
-                            continue
-                        ws = w.get("start")
-                        we = w.get("end")
-                        if isinstance(ws, (int, float)) and isinstance(we, (int, float)):
-                            words.append({"start": float(ws), "end": float(we)})
-                if words:
-                    alignment_method = "mfa"
+            if MFA_API_URL and isinstance(MFA_API_URL, str) and MFA_API_URL.strip() and section_text.strip():
+                if has_graph_timings and pcm_bytes and frames > 0 and sr > 0 and n_channels > 0 and sampwidth > 0:
+                    # Use a section-specific slice when Song Graph timings are available.
+                    bytes_per_frame = n_channels * sampwidth
+                    start_frame = int(max(0.0, sec_t0) * float(sr))
+                    end_frame = int(min(sec_t1, duration_s) * float(sr))
+                    if end_frame > frames:
+                        end_frame = frames
+                    if end_frame > start_frame:
+                        offset_bytes = start_frame * bytes_per_frame
+                        length_bytes = (end_frame - start_frame) * bytes_per_frame
+                        section_pcm = pcm_bytes[offset_bytes:offset_bytes + length_bytes]
+                        buf = BytesIO()
+                        with wave.open(buf, "wb") as wf_sec:
+                            wf_sec.setnchannels(n_channels)
+                            wf_sec.setsampwidth(sampwidth)
+                            wf_sec.setframerate(sr)
+                            wf_sec.writeframes(section_pcm)
+                        wav_b64 = _b64.b64encode(buf.getvalue()).decode("ascii")
+                        async with httpx.AsyncClient() as client:
+                            r = await client.post(
+                                MFA_API_URL.rstrip("/") + "/align",
+                                json={"lyrics": section_text, "wav_bytes": wav_b64},
+                            )
+                        js = JSONParser().parse(r.text, {"alignment": list}) or {}
+                        raw_words = js.get("alignment")
+                        if isinstance(raw_words, list):
+                            for w in raw_words:
+                                if not isinstance(w, dict):
+                                    continue
+                                ws = w.get("start")
+                                we = w.get("end")
+                                if isinstance(ws, (int, float)) and isinstance(we, (int, float)):
+                                    # Section-relative timings; convert to global seconds later.
+                                    words.append({"start": float(ws), "end": float(we)})
+                        if words:
+                            alignment_method = "mfa"
+                elif full_b64:
+                    # Fallback: use full-track audio when no graph timings are available.
+                    async with httpx.AsyncClient() as client:
+                        r = await client.post(
+                            MFA_API_URL.rstrip("/") + "/align",
+                            json={"lyrics": section_text, "wav_bytes": full_b64},
+                        )
+                    js = JSONParser().parse(r.text, {"alignment": list}) or {}
+                    raw_words = js.get("alignment")
+                    if isinstance(raw_words, list):
+                        for w in raw_words:
+                            if not isinstance(w, dict):
+                                continue
+                            ws = w.get("start")
+                            we = w.get("end")
+                            if isinstance(ws, (int, float)) and isinstance(we, (int, float)):
+                                words.append({"start": float(ws), "end": float(we)})
+                    if words:
+                        alignment_method = "mfa"
             if words:
                 # Map words to lines in sequence
                 total_words = len(words)
@@ -6904,9 +6813,9 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     idx_word = end_idx + 1
                     w0 = words[start_idx]
                     w1 = words[end_idx]
-                    # MFA times are global; clamp into coarse range if needed
-                    g_start = max(sec_t0, float(w0["start"]))
-                    g_end = min(sec_t1, float(w1["end"]))
+                    # MFA times are section-relative when using slices; convert to global seconds.
+                    g_start = sec_t0 + float(w0["start"])
+                    g_end = sec_t0 + float(w1["end"])
                     aligned_lines.append({"line_id": line_id, "text": text, "t_start": g_start, "t_end": g_end})
             else:
                 # Fallback: uniform distribution within section for this section

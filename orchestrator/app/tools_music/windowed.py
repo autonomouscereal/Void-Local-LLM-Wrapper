@@ -340,7 +340,42 @@ def run_music_infinite_windowed(job: Dict[str, Any], provider, manifest: Dict[st
             # Existing window from a prior run; rely on disk contents and metrics.
             window_clips.append((b"", sr_local, ch_local, win))
             continue
-        win_prompt = prompt
+        # Build a section-aware prompt for this window.
+        sec_obj = section_index.get(win.get("section_id")) if isinstance(win.get("section_id"), str) else None
+        base_prompt = prompt or ""
+        prompt_parts: List[str] = []
+        if base_prompt:
+            prompt_parts.append(base_prompt)
+        sec_type = str(sec_obj.get("type") or "").lower() if isinstance(sec_obj, dict) else ""
+        if sec_type:
+            prompt_parts.append(f"{sec_type} section of the song")
+        target_energy = sec_obj.get("target_energy") if isinstance(sec_obj, dict) else None
+        if isinstance(target_energy, (int, float)):
+            if target_energy <= 0.33:
+                prompt_parts.append("low energy, more relaxed feel")
+            elif target_energy >= 0.66:
+                prompt_parts.append("high energy, more intense feel")
+            else:
+                prompt_parts.append("medium energy")
+        target_emotion = sec_obj.get("target_emotion") if isinstance(sec_obj, dict) else None
+        if isinstance(target_emotion, str) and target_emotion.strip():
+            prompt_parts.append(f"emotion: {target_emotion.strip()}")
+        style_tags: List[str] = []
+        global_styles = global_block.get("style_tags")
+        if isinstance(global_styles, list):
+            style_tags = [s for s in global_styles if isinstance(s, str) and s.strip()]
+        elif isinstance(global_block.get("genre_tags"), list):
+            style_tags = [s for s in global_block.get("genre_tags") if isinstance(s, str) and s.strip()]
+        if style_tags:
+            prompt_parts.append("style: " + ", ".join(style_tags))
+        # Section-type specific hints.
+        if sec_type == "chorus":
+            prompt_parts.append("strong memorable hook, repeat the main motif")
+        elif sec_type == "intro":
+            prompt_parts.append("atmospheric build-up, introduce main motif softly")
+        elif sec_type == "bridge":
+            prompt_parts.append("contrast section, increase tension before final chorus")
+        win_prompt = ". ".join([p for p in prompt_parts if p]).strip() or (prompt or "song section")
         compose_args = {
             "prompt": win_prompt,
             "bpm": global_block.get("tempo_bpm") or bpm,
