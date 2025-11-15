@@ -446,7 +446,25 @@ services:
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     expose:
       - "7000"
-    
+
+  vision_repair:
+    build:
+      context: ./services/vision_repair
+      dockerfile: Dockerfile
+    container_name: vision_repair
+    restart: unless-stopped
+    runtime: nvidia
+    devices:
+      - "nvidia.com/gpu=all"
+    depends_on:
+      - nvidia_init
+      - film2_bootstrap
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=${VISION_REPAIR_GPU:-all}
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    network_mode: host
+    expose:
+      - "8095"
 
   comfyui:
     build:

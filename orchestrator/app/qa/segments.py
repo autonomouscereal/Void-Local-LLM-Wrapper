@@ -392,6 +392,98 @@ def enrich_patch_plan_for_image_segments(
     return enriched
 
 
+def enrich_patch_plan_for_video_segments(
+    patch_plan: List[Dict[str, Any]],
+    segments: List[SegmentResult],
+) -> List[Dict[str, Any]]:
+    """
+    Enrich video.refine.clip steps with src, timecode, prompt, and locks
+    derived from the corresponding video clip segments.
+    """
+    index_by_id: Dict[str, SegmentResult] = {}
+    for seg in segments:
+        if not isinstance(seg, dict):
+            continue
+        seg_id = seg.get("id")
+        domain = seg.get("domain")
+        if isinstance(seg_id, str) and seg_id and isinstance(domain, str) and domain in ("video", "film2"):
+            index_by_id[seg_id] = seg
+    enriched: List[Dict[str, Any]] = []
+    for step in patch_plan or []:
+        if not isinstance(step, dict):
+            continue
+        tool_name = (step.get("tool") or "").strip()
+        seg_id = step.get("segment_id")
+        args_obj = step.get("args") if isinstance(step.get("args"), dict) else {}
+        if tool_name != "video.refine.clip":
+            enriched.append(step)
+            continue
+        if not isinstance(seg_id, str) or not seg_id:
+            enriched.append(step)
+            continue
+        seg = index_by_id.get(seg_id)
+        if not isinstance(seg, dict):
+            enriched.append(step)
+            continue
+        args: Dict[str, Any] = dict(args_obj)
+        seg_result = seg.get("result") if isinstance(seg.get("result"), dict) else {}
+        meta = seg_result.get("meta") if isinstance(seg_result.get("meta"), dict) else {}
+        artifacts = seg_result.get("artifacts") if isinstance(seg_result.get("artifacts"), list) else []
+        # src from first artifact path or view_url
+        if "src" not in args:
+            src_val: Optional[str] = None
+            if artifacts:
+                first_art = artifacts[0]
+                if isinstance(first_art, dict):
+                    path_val = first_art.get("path")
+                    view_val = first_art.get("view_url")
+                    if isinstance(path_val, str) and path_val.strip():
+                        src_val = path_val
+                    elif isinstance(view_val, str) and view_val.strip():
+                        src_val = view_val
+            if isinstance(src_val, str) and src_val:
+                args["src"] = src_val
+        # timecode from meta.timecode
+        if "timecode" not in args:
+            timecode = meta.get("timecode")
+            if isinstance(timecode, dict):
+                args["timecode"] = timecode
+        # prompt from meta.prompt if present
+        if "prompt" not in args:
+            prompt_val = meta.get("prompt")
+            if isinstance(prompt_val, str) and prompt_val.strip():
+                args["prompt"] = prompt_val
+        # locks from meta.locks
+        if "locks" not in args:
+            locks_val = meta.get("locks")
+            if isinstance(locks_val, dict):
+                args["locks"] = locks_val
+        # propagate width/height if present
+        if "width" not in args:
+            width_val = meta.get("width")
+            if isinstance(width_val, (int, float)):
+                args["width"] = int(width_val)
+        if "height" not in args:
+            height_val = meta.get("height")
+            if isinstance(height_val, (int, float)):
+                args["height"] = int(height_val)
+        # propagate identifiers for richer tracing
+        if "film_id" not in args:
+            film_id = meta.get("film_id")
+            if isinstance(film_id, str) and film_id.strip():
+                args["film_id"] = film_id
+        if "scene_id" not in args:
+            scene_id = meta.get("scene_id")
+            if isinstance(scene_id, str) and scene_id.strip():
+                args["scene_id"] = scene_id
+        if "shot_id" not in args:
+            shot_id = meta.get("shot_id")
+            if isinstance(shot_id, str) and shot_id.strip():
+                args["shot_id"] = shot_id
+        enriched.append({"tool": tool_name, "segment_id": seg_id, "args": args})
+    return enriched
+
+
 async def apply_patch_plan(
     patch_plan: List[Dict[str, Any]],
     segments: List[SegmentResult],

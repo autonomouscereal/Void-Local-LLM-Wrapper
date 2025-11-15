@@ -163,9 +163,10 @@ from .analysis.media import analyze_image as _analyze_image
 from .artifacts.manifest import add_manifest_row as _man_add, write_manifest_atomic as _man_write
 from .datasets.trace import append_sample as _trace_append
 from .review.referee import build_delta_plan as _committee
-from .qa.segments import build_segments_for_tool, ALLOWED_PATCH_TOOLS, filter_patch_plan, apply_patch_plan, enrich_patch_plan_for_image_segments
+from .qa.segments import build_segments_for_tool, ALLOWED_PATCH_TOOLS, filter_patch_plan, apply_patch_plan, enrich_patch_plan_for_image_segments, enrich_patch_plan_for_video_segments
 from functools import partial
 from .context.index import add_artifact as _ctx_add
+from .story import draft_story_graph as _story_draft, check_story_consistency as _story_check, fix_story as _story_fix, derive_scenes_and_shots as _story_derive
 
 from .pipeline.subject_resolver import resolve_subject_canon as _resolve_subject_canon  # type: ignore
 from .pipeline.roe_store import load_roe_digest as _roe_load, save_roe_digest as _roe_save  # type: ignore
@@ -392,6 +393,16 @@ async def segment_qa_and_committee(
                         scores = seg_domain_qa.get("audio") or {}
                     elif domain_name in ("video", "film2"):
                         scores = seg_domain_qa.get("videos") or {}
+                    # Inject lipsync_score and sharpness from segment meta when available.
+                    seg_meta_local = seg.get("meta") if isinstance(seg.get("meta"), dict) else {}
+                    ls_val = seg_meta_local.get("lipsync_score")
+                    if isinstance(ls_val, (int, float)):
+                        scores = dict(scores or {})
+                        scores["lipsync"] = float(ls_val)
+                    sharp_val = seg_meta_local.get("sharpness")
+                    if isinstance(sharp_val, (int, float)):
+                        scores = dict(scores or {})
+                        scores["sharpness"] = float(sharp_val)
                     qa_block = seg.setdefault("qa", {})
                     if isinstance(qa_block, dict):
                         qa_block["scores"] = scores
@@ -497,6 +508,76 @@ async def segment_qa_and_committee(
                 committee_outcome.setdefault("threshold_violations", {}).update(violations)
                 action = "fail"
         _log("committee.decision.segment", trace_id=trace_id, tool=tool_name, attempt=attempt, action=action, rationale=committee_outcome.get("rationale"), violations=violations)
+        # Auto-suggest video.refine.clip steps for low-quality clips based on per-segment QA.
+        if action == "revise":
+            auto_patch_steps: List[Dict[str, Any]] = []
+            # Collect already proposed (tool, segment_id) pairs to avoid duplicates.
+            existing_pairs = set()
+            for st in committee_outcome.get("patch_plan") or []:
+                if not isinstance(st, dict):
+                    continue
+                t = (st.get("tool"), st.get("segment_id"))
+                existing_pairs.add(t)
+            for seg in segments_for_committee:
+                if not isinstance(seg, dict):
+                    continue
+                domain_name = str(seg.get("domain") or "").strip().lower()
+                if domain_name not in ("video", "film2"):
+                    continue
+                seg_id = seg.get("id")
+                if not isinstance(seg_id, str) or not seg_id:
+                    continue
+                qa_block = seg.get("qa") if isinstance(seg.get("qa"), dict) else {}
+                scores = qa_block.get("scores") if isinstance(qa_block.get("scores"), dict) else {}
+                refine_mode_auto: Optional[str] = None
+                ls_val = scores.get("lipsync")
+                if isinstance(ls_val, (int, float)) and ls_val < 0.5:
+                    refine_mode_auto = "fix_lipsync"
+                face_val = scores.get("face_lock")
+                if refine_mode_auto is None and isinstance(face_val, (int, float)) and face_val < thresholds.get("face_min", 0.0):
+                    refine_mode_auto = "fix_faces"
+                temporal_val = scores.get("frame_lpips_mean") or scores.get("temporal_stability")
+                if refine_mode_auto is None and isinstance(temporal_val, (int, float)) and temporal_val < 0.5:
+                    refine_mode_auto = "stabilize_motion"
+                sharpness_val = scores.get("sharpness")
+                if refine_mode_auto is None and isinstance(sharpness_val, (int, float)) and sharpness_val < 50.0:
+                    refine_mode_auto = "improve_quality"
+                if refine_mode_auto is None:
+                    continue
+                key = ("video.refine.clip", seg_id)
+                if key in existing_pairs:
+                    continue
+                auto_patch_steps.append(
+                    {
+                        "tool": "video.refine.clip",
+                        "segment_id": seg_id,
+                        "args": {"refine_mode": refine_mode_auto},
+                    }
+                )
+            if auto_patch_steps:
+                committee_outcome.setdefault("patch_plan", [])
+                if isinstance(committee_outcome.get("patch_plan"), list):
+                    committee_outcome["patch_plan"].extend(auto_patch_steps)
+                # Trace the planned clip refinements for this QA pass.
+                try:
+                    plan_summary: Dict[str, Any] = {
+                        "event": "clip_refine_plan",
+                        "tool": tool_name,
+                        "segment_ids": [],
+                        "refine_modes": {},
+                    }
+                    seg_id_to_mode: Dict[str, str] = {}
+                    for step in auto_patch_steps:
+                        sid = step.get("segment_id")
+                        args_used = step.get("args") if isinstance(step.get("args"), dict) else {}
+                        mode_val = args_used.get("refine_mode")
+                        if isinstance(sid, str) and sid and isinstance(mode_val, str) and mode_val:
+                            seg_id_to_mode[sid] = mode_val
+                    plan_summary["segment_ids"] = list(seg_id_to_mode.keys())
+                    plan_summary["refine_modes"] = seg_id_to_mode
+                    _trace_append("film2", plan_summary)
+                except Exception:
+                    pass
         if action != "revise":
             break
         allowed_mode_set = set(_allowed_tools_for_mode(mode))
@@ -514,9 +595,13 @@ async def segment_qa_and_committee(
         committee_outcome["patch_plan"] = filtered_patch_plan
         if not filtered_patch_plan:
             break
-        # Enrich image.refine.segment steps with per-segment context before execution.
+        # Enrich image/video refine steps with per-segment context before execution.
         enriched_patch_plan = enrich_patch_plan_for_image_segments(
             filtered_patch_plan,
+            segments_for_committee,
+        )
+        enriched_patch_plan = enrich_patch_plan_for_video_segments(
+            enriched_patch_plan,
             segments_for_committee,
         )
         # Execute enriched patch plan via central patch executor.
@@ -602,6 +687,501 @@ async def segment_qa_and_committee(
         qa_metrics_post = {"counts": counts_post, "domain": domain_post}
         _log("qa.metrics.segment", trace_id=trace_id, tool=tool_name, phase="post", metrics=qa_metrics_post)
     return current_results, committee_outcome, cumulative_patch_results
+
+
+async def _ensure_visual_locks_for_story(
+    story: Dict[str, Any],
+    locks_arg: Dict[str, Any],
+    quality_profile: str,
+    trace_id: Optional[str],
+) -> Dict[str, Any]:
+    """
+    Best-effort helper to ensure basic visual lock entries exist for characters, locations, and objects in a story.
+
+    This function does not block on failures; it returns the original locks_arg when errors occur.
+    """
+    if not isinstance(story, dict):
+        return locks_arg
+    if not isinstance(locks_arg, dict):
+        return locks_arg
+    updated_locks = dict(locks_arg)
+    visual_branch = updated_locks.get("visual")
+    if not isinstance(visual_branch, dict):
+        visual_branch = {}
+        updated_locks["visual"] = visual_branch
+    char_locks = visual_branch.get("characters")
+    if not isinstance(char_locks, dict):
+        char_locks = {}
+        visual_branch["characters"] = char_locks
+    loc_locks = visual_branch.get("locations")
+    if not isinstance(loc_locks, dict):
+        loc_locks = {}
+        visual_branch["locations"] = loc_locks
+    obj_locks = visual_branch.get("objects")
+    if not isinstance(obj_locks, dict):
+        obj_locks = {}
+        visual_branch["objects"] = obj_locks
+    # Discover character state values from story events so we can build per-state visual locks.
+    acts = story.get("acts") if isinstance(story.get("acts"), list) else []
+    char_state_values: Dict[str, Dict[str, List[Any]]] = {}
+    for act in acts:
+        scenes = act.get("scenes") if isinstance(act.get("scenes"), list) else []
+        for scene in scenes:
+            beats = scene.get("beats") if isinstance(scene.get("beats"), list) else []
+            for beat in beats:
+                events = beat.get("events") if isinstance(beat.get("events"), list) else []
+                for ev in events:
+                    if not isinstance(ev, dict):
+                        continue
+                    if ev.get("type") != "state_change":
+                        continue
+                    target = ev.get("target")
+                    state_delta = ev.get("state_delta") if isinstance(ev.get("state_delta"), dict) else {}
+                    if not isinstance(target, str) or not state_delta:
+                        continue
+                    state_for_char = char_state_values.get(target) or {}
+                    for key, val in state_delta.items():
+                        key_str = str(key)
+                        val_str = str(val)
+                        vals = state_for_char.get(key_str) or []
+                        if val_str not in vals:
+                            vals.append(val_str)
+                        state_for_char[key_str] = vals
+                    char_state_values[target] = state_for_char
+    characters = story.get("characters") if isinstance(story.get("characters"), list) else []
+    for char in characters:
+        if not isinstance(char, dict):
+            continue
+        char_id = char.get("char_id")
+        if not isinstance(char_id, str) or not char_id:
+            continue
+        entry = char_locks.get(char_id)
+        if not isinstance(entry, dict):
+            entry = {
+                "char_id": char_id,
+                "name": char.get("name"),
+                "description": char.get("description"),
+                "images": [],
+            }
+        if not isinstance(entry.get("images"), list):
+            entry["images"] = []
+        if not entry["images"]:
+            img_prompt = f"{char.get('description') or 'character'} cinematic portrait, film concept art"
+            args_img: Dict[str, Any] = {
+                "prompt": img_prompt,
+                "width": 1024,
+                "height": 1024,
+                "quality_profile": quality_profile,
+            }
+            res = await execute_tool_call({"name": "image.dispatch", "arguments": args_img})
+            if isinstance(res, dict) and isinstance(res.get("result"), dict):
+                r = res.get("result") or {}
+                arts = r.get("artifacts") if isinstance(r.get("artifacts"), list) else []
+                if arts:
+                    first = arts[0]
+                    if isinstance(first, dict):
+                        path_val = first.get("path") or first.get("view_url") or first.get("url")
+                        if isinstance(path_val, str) and path_val:
+                            entry["images"].append(path_val)
+                            _trace_append(
+                                "film2",
+                                {
+                                    "event": "visual_lock_image",
+                                    "entity_type": "character",
+                                    "entity_id": char_id,
+                                    "prompt": img_prompt,
+                                    "image_path": path_val,
+                                    "quality_profile": quality_profile,
+                                },
+                            )
+        # Build per-character state entries based on story state_change events.
+        state_values = char_state_values.get(char_id) or {}
+        states_branch = entry.get("states")
+        if not isinstance(states_branch, dict):
+            states_branch = {}
+            entry["states"] = states_branch
+        # Default/base state mirrors the generic character description.
+        if "default" not in states_branch:
+            states_branch["default"] = {
+                "state_id": "default",
+                "description": char.get("description"),
+                "traits": {},
+                "images": list(entry.get("images") or []),
+            }
+        for key, vals in state_values.items():
+            for val in vals:
+                state_id = f"{key}_{val}"
+                state_entry = states_branch.get(state_id)
+                if not isinstance(state_entry, dict):
+                    state_entry = {
+                        "state_id": state_id,
+                        "description": f"{char.get('name') or 'Character'} with {key.replace('_', ' ')} {val}",
+                        "traits": {key: val},
+                        "images": [],
+                    }
+                if not isinstance(state_entry.get("images"), list):
+                    state_entry["images"] = []
+                if not state_entry["images"]:
+                    state_prompt = f"{char.get('description') or 'character'} with {key.replace('_', ' ')} {val}, cinematic portrait, film concept art"
+                    args_state_img: Dict[str, Any] = {
+                        "prompt": state_prompt,
+                        "width": 1024,
+                        "height": 1024,
+                        "quality_profile": quality_profile,
+                    }
+                    res_state = await execute_tool_call({"name": "image.dispatch", "arguments": args_state_img})
+                    if isinstance(res_state, dict) and isinstance(res_state.get("result"), dict):
+                        rs = res_state.get("result") or {}
+                        arts_s = rs.get("artifacts") if isinstance(rs.get("artifacts"), list) else []
+                        if arts_s:
+                            first_s = arts_s[0]
+                            if isinstance(first_s, dict):
+                                path_state = first_s.get("path") or first_s.get("view_url") or first_s.get("url")
+                                if isinstance(path_state, str) and path_state:
+                                    state_entry["images"].append(path_state)
+                                    _trace_append(
+                                        "film2",
+                                        {
+                                            "event": "visual_state_lock_image",
+                                            "char_id": char_id,
+                                            "state_id": state_id,
+                                            "prompt": state_prompt,
+                                            "image_path": path_state,
+                                            "quality_profile": quality_profile,
+                                        },
+                                    )
+                states_branch[state_id] = state_entry
+        char_locks[char_id] = entry
+    locations = story.get("locations") if isinstance(story.get("locations"), list) else []
+    for loc in locations:
+        if not isinstance(loc, dict):
+            continue
+        loc_id = loc.get("loc_id")
+        if not isinstance(loc_id, str) or not loc_id:
+            continue
+        entry_loc = loc_locks.get(loc_id)
+        if not isinstance(entry_loc, dict):
+            entry_loc = {
+                "loc_id": loc_id,
+                "name": loc.get("name"),
+                "description": loc.get("description"),
+                "images": [],
+            }
+        if not isinstance(entry_loc.get("images"), list):
+            entry_loc["images"] = []
+        if not entry_loc["images"]:
+            img_prompt = f"{loc.get('description') or 'location'} cinematic wide shot, film concept art"
+            args_img_loc: Dict[str, Any] = {
+                "prompt": img_prompt,
+                "width": 1280,
+                "height": 720,
+                "quality_profile": quality_profile,
+            }
+            res_loc = await execute_tool_call({"name": "image.dispatch", "arguments": args_img_loc})
+            if isinstance(res_loc, dict) and isinstance(res_loc.get("result"), dict):
+                rl = res_loc.get("result") or {}
+                arts_l = rl.get("artifacts") if isinstance(rl.get("artifacts"), list) else []
+                if arts_l:
+                    first_l = arts_l[0]
+                    if isinstance(first_l, dict):
+                        path_val_l = first_l.get("path") or first_l.get("view_url") or first_l.get("url")
+                        if isinstance(path_val_l, str) and path_val_l:
+                            entry_loc["images"].append(path_val_l)
+                            _trace_append(
+                                "film2",
+                                {
+                                    "event": "visual_lock_image",
+                                    "entity_type": "location",
+                                    "entity_id": loc_id,
+                                    "prompt": img_prompt,
+                                    "image_path": path_val_l,
+                                    "quality_profile": quality_profile,
+                                },
+                            )
+        loc_locks[loc_id] = entry_loc
+    objects = story.get("objects") if isinstance(story.get("objects"), list) else []
+    for obj in objects:
+        if not isinstance(obj, dict):
+            continue
+        obj_id = obj.get("obj_id")
+        if not isinstance(obj_id, str) or not obj_id:
+            continue
+        entry_obj = obj_locks.get(obj_id)
+        if not isinstance(entry_obj, dict):
+            entry_obj = {
+                "obj_id": obj_id,
+                "name": obj.get("name"),
+                "description": obj.get("description"),
+                "images": [],
+            }
+        if not isinstance(entry_obj.get("images"), list):
+            entry_obj["images"] = []
+        if not entry_obj["images"]:
+            img_prompt = f"{obj.get('description') or 'object'} cinematic product shot, film prop concept art"
+            args_img_obj: Dict[str, Any] = {
+                "prompt": img_prompt,
+                "width": 768,
+                "height": 768,
+                "quality_profile": quality_profile,
+            }
+            res_obj = await execute_tool_call({"name": "image.dispatch", "arguments": args_img_obj})
+            if isinstance(res_obj, dict) and isinstance(res_obj.get("result"), dict):
+                ro = res_obj.get("result") or {}
+                arts_o = ro.get("artifacts") if isinstance(ro.get("artifacts"), list) else []
+                if arts_o:
+                    first_o = arts_o[0]
+                    if isinstance(first_o, dict):
+                        path_val_o = first_o.get("path") or first_o.get("view_url") or first_o.get("url")
+                        if isinstance(path_val_o, str) and path_val_o:
+                            entry_obj["images"].append(path_val_o)
+                            _trace_append(
+                                "film2",
+                                {
+                                    "event": "visual_lock_image",
+                                    "entity_type": "object",
+                                    "entity_id": obj_id,
+                                    "prompt": img_prompt,
+                                    "image_path": path_val_o,
+                                    "quality_profile": quality_profile,
+                                },
+                            )
+        obj_locks[obj_id] = entry_obj
+    return updated_locks
+
+
+async def _ensure_tts_locks_and_dialogue_audio(
+    story: Dict[str, Any],
+    locks_arg: Dict[str, Any],
+    profile_name: str,
+    trace_id: Optional[str],
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """
+    Ensure basic TTS lock entries and pre-generate dialogue audio for lines in the story.
+
+    Returns an updated lock bundle and a dialogue_index mapping line_id -> metadata.
+    """
+    updated_locks = dict(locks_arg) if isinstance(locks_arg, dict) else {}
+    dialogue_index: Dict[str, Any] = {}
+    if not isinstance(story, dict):
+        return updated_locks, dialogue_index
+    acts = story.get("acts") if isinstance(story.get("acts"), list) else []
+    characters = story.get("characters") if isinstance(story.get("characters"), list) else []
+    character_ids = [c.get("char_id") for c in characters if isinstance(c, dict) and isinstance(c.get("char_id"), str)]
+    # Ensure a basic TTS lock branch exists per character
+    tts_branch = updated_locks.get("tts")
+    if not isinstance(tts_branch, dict):
+        tts_branch = {}
+        updated_locks["tts"] = tts_branch
+    char_voice_locks = tts_branch.get("characters")
+    if not isinstance(char_voice_locks, dict):
+        char_voice_locks = {}
+        tts_branch["characters"] = char_voice_locks
+    for c_id in character_ids:
+        if not isinstance(c_id, str) or not c_id:
+            continue
+        if c_id not in char_voice_locks:
+            char_voice_locks[c_id] = {
+                "char_id": c_id,
+                "voice_profile": {
+                    "description": f"Default voice profile for {c_id} based on story context",
+                },
+            }
+    # Collect dialogue lines
+    for act in acts:
+        scenes = act.get("scenes") if isinstance(act.get("scenes"), list) else []
+        for scene in scenes:
+            beats = scene.get("beats") if isinstance(scene.get("beats"), list) else []
+            for beat in beats:
+                lines = beat.get("dialogue") if isinstance(beat.get("dialogue"), list) else []
+                for line in lines:
+                    if not isinstance(line, dict):
+                        continue
+                    line_id = line.get("line_id")
+                    speaker = line.get("speaker")
+                    text = line.get("text")
+                    if not isinstance(line_id, str) or not line_id or not isinstance(text, str) or not text.strip():
+                        continue
+                    if not isinstance(speaker, str) or not speaker:
+                        continue
+                    dialogue_index[line_id] = {
+                        "char_id": speaker,
+                        "text": text,
+                        "audio_path": None,
+                        "duration_s": None,
+                        "error": None,
+                    }
+    if not dialogue_index:
+        return updated_locks, dialogue_index
+    # Pre-generate audio via tts.speak for each unique line
+    for line_id, entry in dialogue_index.items():
+        speaker = entry.get("char_id")
+        text = entry.get("text")
+        if not isinstance(speaker, str) or not isinstance(text, str):
+            continue
+        args_tts: Dict[str, Any] = {
+            "text": text,
+            "cid": trace_id or "",
+            "quality_profile": profile_name,
+        }
+        if isinstance(updated_locks, dict) and updated_locks:
+            args_tts["lock_bundle"] = updated_locks
+        args_tts["character_id"] = speaker
+        res = await execute_tool_call({"name": "tts.speak", "arguments": args_tts})
+        if isinstance(res, dict) and isinstance(res.get("result"), dict):
+            r = res.get("result") or {}
+            meta_audio = r.get("meta") if isinstance(r.get("meta"), dict) else {}
+            ids_audio = r.get("ids") if isinstance(r.get("ids"), dict) else {}
+            audio_id = ids_audio.get("audio_id")
+            url = meta_audio.get("url")
+            if isinstance(audio_id, str) and audio_id:
+                entry["audio_path"] = audio_id
+            elif isinstance(url, str) and url:
+                entry["audio_path"] = url
+            dur = meta_audio.get("full_duration_s")
+            if isinstance(dur, (int, float)):
+                entry["duration_s"] = float(dur)
+            _trace_append(
+                "film2",
+                {
+                    "event": "tts_dialogue_generated",
+                    "line_id": line_id,
+                    "char_id": speaker,
+                    "text": (text[:128] if isinstance(text, str) else ""),
+                    "audio_path": entry.get("audio_path"),
+                    "duration_s": entry.get("duration_s"),
+                    "quality_profile": profile_name,
+                },
+            )
+        elif isinstance(res, dict) and res.get("error") is not None:
+            entry["error"] = str(res.get("error"))
+            _trace_append(
+                "film2",
+                {
+                    "event": "tts_dialogue_failed",
+                    "line_id": line_id,
+                    "char_id": speaker,
+                    "error": str(res.get("error")),
+                },
+            )
+    return updated_locks, dialogue_index
+
+
+async def _generate_scene_storyboards(
+    scenes: List[Dict[str, Any]],
+    locks_arg: Dict[str, Any],
+    profile_name: str,
+    trace_id: Optional[str],
+) -> List[Dict[str, Any]]:
+    """
+    Generate a simple storyboard image per scene using image.dispatch, when possible.
+    """
+    out_scenes: List[Dict[str, Any]] = []
+    for scene in scenes or []:
+        if not isinstance(scene, dict):
+            continue
+        scene_id = scene.get("scene_id")
+        summary = scene.get("summary") or ""
+        prompt = f"Scene {scene_id}: {summary}"
+        args_img: Dict[str, Any] = {
+            "prompt": prompt,
+            "width": 1024,
+            "height": 576,
+            "quality_profile": profile_name,
+        }
+        if isinstance(locks_arg, dict) and locks_arg:
+            args_img["lock_bundle"] = locks_arg
+        storyboard_path: Optional[str] = None
+        res = await execute_tool_call({"name": "image.dispatch", "arguments": args_img})
+        if isinstance(res, dict) and isinstance(res.get("result"), dict):
+            r = res.get("result") or {}
+            arts = r.get("artifacts") if isinstance(r.get("artifacts"), list) else []
+            if arts:
+                first = arts[0]
+                if isinstance(first, dict):
+                    path_val = first.get("path") or first.get("view_url") or first.get("url")
+                    if isinstance(path_val, str) and path_val:
+                        storyboard_path = path_val
+                        _trace_append(
+                            "film2",
+                            {
+                                "event": "scene_storyboard_generated",
+                                "scene_id": scene_id,
+                                "image_path": path_val,
+                                "prompt": prompt,
+                                "quality_profile": profile_name,
+                            },
+                        )
+        scene_out = dict(scene)
+        if storyboard_path:
+            scene_out["storyboard_image"] = storyboard_path
+        out_scenes.append(scene_out)
+    return out_scenes
+
+
+async def _generate_shot_storyboards(
+    shots: List[Dict[str, Any]],
+    locks_arg: Dict[str, Any],
+    profile_name: str,
+    trace_id: Optional[str],
+) -> List[Dict[str, Any]]:
+    """
+    Generate a simple storyboard image per shot using image.dispatch, when possible.
+    """
+    out_shots: List[Dict[str, Any]] = []
+    for shot in shots or []:
+        if not isinstance(shot, dict):
+            continue
+        shot_id = shot.get("shot_id")
+        descr = shot.get("description") or ""
+        # Enrich storyboard prompt with character state hints when available.
+        state_map = shot.get("character_states") if isinstance(shot.get("character_states"), dict) else {}
+        if state_map:
+            state_phrases: List[str] = []
+            for cid, st in state_map.items():
+                if not isinstance(st, dict):
+                    continue
+                if st.get("left_arm") == "missing":
+                    state_phrases.append("a character with a missing left arm")
+                if st.get("left_arm") == "robot":
+                    state_phrases.append("a character with a robotic left arm")
+            if state_phrases:
+                extra = "; ".join(sorted(set(state_phrases)))
+                descr = f"{descr} ({extra})"
+        prompt = f"Shot {shot_id}: {descr}"
+        args_img: Dict[str, Any] = {
+            "prompt": prompt,
+            "width": 1024,
+            "height": 576,
+            "quality_profile": profile_name,
+        }
+        if isinstance(locks_arg, dict) and locks_arg:
+            args_img["lock_bundle"] = locks_arg
+        storyboard_path: Optional[str] = None
+        res = await execute_tool_call({"name": "image.dispatch", "arguments": args_img})
+        if isinstance(res, dict) and isinstance(res.get("result"), dict):
+            r = res.get("result") or {}
+            arts = r.get("artifacts") if isinstance(r.get("artifacts"), list) else []
+            if arts:
+                first = arts[0]
+                if isinstance(first, dict):
+                    path_val = first.get("path") or first.get("view_url") or first.get("url")
+                    if isinstance(path_val, str) and path_val:
+                        storyboard_path = path_val
+                        _trace_append(
+                            "film2",
+                            {
+                                "event": "shot_storyboard_generated",
+                                "shot_id": shot_id,
+                                "image_path": path_val,
+                                "prompt": prompt,
+                                "quality_profile": profile_name,
+                            },
+                        )
+        shot_out = dict(shot)
+        if storyboard_path:
+            shot_out["storyboard_image"] = storyboard_path
+        out_shots.append(shot_out)
+    return out_shots
 
 def _append_jsonl(path: str, obj: dict) -> None:
     append_jsonl_compat(STATE_DIR, path, obj)
@@ -1309,6 +1889,7 @@ FACEID_API_URL = os.getenv("FACEID_API_URL")  # e.g., http://faceid:7000
 MUSIC_API_URL = os.getenv("MUSIC_API_URL")    # e.g., http://musicgen:7860
 VLM_API_URL = os.getenv("VLM_API_URL")        # e.g., http://vlm:8050
 OCR_API_URL = os.getenv("OCR_API_URL")        # e.g., http://ocr:8070
+VISION_REPAIR_API_URL = os.getenv("VISION_REPAIR_API_URL")  # e.g., http://vision_repair:8095
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/workspace/uploads")
 # Ensure UPLOAD_DIR exists; if not creatable (e.g., missing /workspace mount), fall back.
@@ -3156,13 +3737,6 @@ async def postrun_committee_decide(
 async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
     name = call.get("name")
     raw_args = call.get("arguments") or {}
-    # Enforce Film-2 unification: block direct video.* from external plans
-    # Allow only when explicitly invoked by Film-2 internals (flag __film2_internal=true)
-    if isinstance(name, str) and name.startswith("video.") and not bool((raw_args or {}).get("__film2_internal")):
-        return {"name": name, "error": "use film2.run", "traceback": "adapter blocked: use film2.run"}
-    # Hard-disable legacy Film-1 tools to enforce Film-2-only orchestration
-    if name in ("film_create", "film_add_character", "film_add_scene", "film_status", "film_compile", "make_movie"):
-        return {"name": name, "skipped": True, "reason": "film1_disabled"}
     # Generic HTTP API request tool (public APIs only; no internal SSRF)
     if name == "api.request":
         # Backwards-compatible shim: route api.request to http.request implementation.
@@ -3572,6 +4146,314 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 meta_block.setdefault("quality_profile", quality_profile)
                 meta_block["refined_from_segment"] = segment_id
         return {"name": name, "result": env}
+    if name == "image.detect" and VISION_REPAIR_API_URL and ALLOW_TOOL_EXECUTION:
+        src = args.get("src") or args.get("image_path") or ""
+        if not isinstance(src, str) or not src:
+            return {"name": name, "error": "missing_src"}
+        payload: Dict[str, Any] = {"image_path": src}
+        locks = args.get("locks")
+        if isinstance(locks, dict):
+            payload["locks"] = locks
+        try:
+            async with httpx.AsyncClient() as client:
+                r = await client.post(VISION_REPAIR_API_URL.rstrip("/") + "/v1/image/analyze", json=payload)
+            if r.status_code < 200 or r.status_code >= 300:
+                return {"name": name, "error": f"vision_repair_error_status_{r.status_code}"}
+            js = _resp_json(r, {"faces": list, "hands": list, "objects": list, "quality": dict})
+            return {"name": name, "result": js}
+        except Exception as ex:
+            return {"name": name, "error": f"vision_repair_error: {ex}"}
+    if name == "image.repair" and VISION_REPAIR_API_URL and ALLOW_TOOL_EXECUTION:
+        src = args.get("src") or args.get("image_path") or ""
+        if not isinstance(src, str) or not src:
+            return {"name": name, "error": "missing_src"}
+        payload: Dict[str, Any] = {"image_path": src}
+        regions = args.get("regions")
+        if isinstance(regions, list):
+            payload["regions"] = regions
+        locks = args.get("locks")
+        if isinstance(locks, dict):
+            payload["locks"] = locks
+        mode = args.get("mode") or args.get("refine_mode")
+        if isinstance(mode, str) and mode:
+            payload["mode"] = mode
+        try:
+            async with httpx.AsyncClient() as client:
+                r = await client.post(VISION_REPAIR_API_URL.rstrip("/") + "/v1/image/repair", json=payload)
+            if r.status_code < 200 or r.status_code >= 300:
+                return {"name": name, "error": f"vision_repair_error_status_{r.status_code}"}
+            js = _resp_json(r, {"repaired_image_path": str, "regions": list, "mode": (str,)})
+            return {"name": name, "result": js}
+        except Exception as ex:
+            return {"name": name, "error": f"vision_repair_error: {ex}"}
+    if name == "video.refine.clip" and ALLOW_TOOL_EXECUTION:
+        a = args if isinstance(args, dict) else {}
+        segment_id_val = a.get("segment_id")
+        segment_id = str(segment_id_val or "").strip() if segment_id_val is not None else ""
+        if not segment_id:
+            return {
+                "name": name,
+                "error": {
+                    "code": "missing_segment_id",
+                    "message": "video.refine.clip requires a non-empty segment_id",
+                    "status": 422,
+                },
+            }
+        src_val = a.get("src")
+        src = str(src_val or "").strip() if src_val is not None else ""
+        if not src:
+            return {
+                "name": name,
+                "error": {
+                    "code": "missing_src",
+                    "message": "video.refine.clip requires src video path",
+                    "status": 422,
+                },
+            }
+        timecode = a.get("timecode") if isinstance(a.get("timecode"), dict) else {}
+        prompt_val = a.get("prompt")
+        prompt = str(prompt_val or "").strip() if prompt_val is not None else ""
+        locks = a.get("locks") if isinstance(a.get("locks"), dict) else {}
+        refine_mode_val = a.get("refine_mode")
+        refine_mode = str(refine_mode_val or "").strip() if refine_mode_val is not None else ""
+        if not refine_mode:
+            refine_mode = "improve_quality"
+        film_id = a.get("film_id")
+        scene_id = a.get("scene_id")
+        shot_id = a.get("shot_id")
+        _trace_append(
+            "film2",
+            {
+                "event": "clip_refine_start",
+                "segment_id": segment_id,
+                "film_id": film_id,
+                "scene_id": scene_id,
+                "shot_id": shot_id,
+                "src": src,
+                "timecode": timecode,
+                "prompt": prompt,
+                "refine_mode": refine_mode,
+            },
+        )
+        # Derive common parameters from timecode and clip metadata.
+        start_s = float(timecode.get("start_s") or 0.0)
+        end_s = float(timecode.get("end_s") or 0.0)
+        fps_val = int(timecode.get("fps") or 60)
+        duration_s = end_s - start_s
+        if duration_s <= 0.0:
+            duration_s = 2.0
+        seconds_val = max(1, int(round(duration_s)))
+        width_val = int(a.get("width") or 1920)
+        height_val = int(a.get("height") or 1080)
+        # Adjust prompt based on refine_mode to emphasize what needs improvement.
+        prompt_suffix = ""
+        if refine_mode == "fix_faces":
+            prompt_suffix = " | improve facial consistency, correct facial features, match character identity"
+        elif refine_mode == "stabilize_motion":
+            prompt_suffix = " | stabilize motion, reduce jitter and flicker"
+        elif refine_mode == "fix_lipsync":
+            prompt_suffix = " | improve alignment of mouth motion with speech and dialogue"
+        elif refine_mode == "improve_quality":
+            prompt_suffix = " | enhance overall visual quality and temporal stability"
+        hv_prompt = (prompt or "") + prompt_suffix
+        # First attempt: frame-level refinement using image tools and ffmpeg.
+        refined_video_path: Optional[str] = None
+        try:
+            import subprocess, time as _tm
+            from glob import glob as _glob
+            # Extract clip frames for the target window.
+            outdir = os.path.join(UPLOAD_DIR, "artifacts", "video", "refine", segment_id or f"seg-{int(_tm.time())}")
+            frames_dir = os.path.join(outdir, "frames")
+            os.makedirs(frames_dir, exist_ok=True)
+            ff_args = [
+                "ffmpeg",
+                "-y",
+                "-i",
+                src,
+            ]
+            # Limit to the specified time window when available.
+            if start_s > 0.0:
+                ff_args.extend(["-ss", f"{start_s:.3f}"])
+            if end_s > start_s:
+                ff_args.extend(["-to", f"{end_s:.3f}"])
+            ff_args.append(os.path.join(frames_dir, "%06d.png"))
+            subprocess.run(ff_args, check=True)
+            frame_files = sorted(_glob(os.path.join(frames_dir, "*.png")))
+            # Apply lightweight per-frame cleanup using image tools where available.
+            cleaned_frames: List[str] = []
+            for idx, fp in enumerate(frame_files):
+                cleaned_path = fp
+                frame_sharpness_val: Optional[float] = None
+                # First, try vision_repair-based detection + repair when available.
+                if VISION_REPAIR_API_URL:
+                    det_res = await execute_tool_call({"name": "image.detect", "arguments": {"src": fp, "locks": locks}})
+                    det_out = det_res.get("result") if isinstance(det_res, dict) else {}
+                    regions: List[Dict[str, Any]] = []
+                    if isinstance(det_out, dict):
+                        qual = det_out.get("quality") if isinstance(det_out.get("quality"), dict) else {}
+                        sh_val = qual.get("sharpness")
+                        if isinstance(sh_val, (int, float)):
+                            frame_sharpness_val = float(sh_val)
+                        objs = det_out.get("objects") if isinstance(det_out.get("objects"), list) else []
+                        for ob in objs:
+                            if not isinstance(ob, dict):
+                                continue
+                            bbox = ob.get("bbox")
+                            conf = ob.get("conf")
+                            cls_name = ob.get("class_name")
+                            if not isinstance(bbox, list) or not isinstance(conf, (int, float)):
+                                continue
+                            if refine_mode in ("fix_faces", "fix_lipsync"):
+                                # Focus on person/face-like detections.
+                                if isinstance(cls_name, str) and cls_name.lower() == "person" and conf > 0.5:
+                                    regions.append({"type": "face", "bbox": bbox})
+                            elif refine_mode in ("stabilize_motion", "improve_quality"):
+                                # Generic quality/motion fixes: include all high-confidence objects.
+                                if conf > 0.5:
+                                    regions.append({"type": "object", "bbox": bbox})
+                    if regions:
+                        _trace_append(
+                            "film2",
+                            {
+                                "event": "frame_detect",
+                                "segment_id": segment_id,
+                                "film_id": film_id,
+                                "scene_id": scene_id,
+                                "shot_id": shot_id,
+                                "frame_index": idx,
+                                "regions": regions,
+                                "refine_mode": refine_mode,
+                            },
+                        )
+                    if regions:
+                        rep_args: Dict[str, Any] = {"src": fp, "regions": regions, "mode": refine_mode, "locks": locks}
+                        rep_res = await execute_tool_call({"name": "image.repair", "arguments": rep_args})
+                        rep_out = rep_res.get("result") if isinstance(rep_res, dict) else {}
+                        if isinstance(rep_out, dict):
+                            rp = rep_out.get("repaired_image_path")
+                            if isinstance(rp, str) and rp:
+                                cleaned_path = rp
+                # Fallback to generic cleanup if no repair path produced a better frame.
+                if cleaned_path == fp:
+                    im_args: Dict[str, Any] = {"src": fp}
+                    im_res = await execute_tool_call({"name": "image.cleanup", "arguments": im_args})
+                    if isinstance(im_res, dict) and isinstance(im_res.get("result"), dict):
+                        r = im_res.get("result") or {}
+                        p = r.get("path") or r.get("view_url") or r.get("url")
+                        if isinstance(p, str) and p:
+                            cleaned_path = p
+                cleaned_frames.append(cleaned_path)
+                _trace_append(
+                    "film2",
+                    {
+                        "event": "frame_fix",
+                        "segment_id": segment_id,
+                        "film_id": film_id,
+                        "scene_id": scene_id,
+                        "shot_id": shot_id,
+                        "frame_index": idx,
+                        "source_frame": fp,
+                        "cleaned_frame": cleaned_path,
+                        "refine_mode": refine_mode,
+                    },
+                )
+                # Accumulate per-frame sharpness, if available.
+                if frame_sharpness_val is not None:
+                    sharpness_sum += frame_sharpness_val
+                    sharpness_count += 1
+            if cleaned_frames:
+                # Rebuild clip from cleaned frames.
+                rebuilt_path = os.path.join(outdir, "refined.mp4")
+                # Use ffmpeg to assemble frames at the original fps.
+                subprocess.run(
+                    [
+                        "ffmpeg",
+                        "-y",
+                        "-framerate",
+                        str(fps_val),
+                        "-i",
+                        os.path.join(frames_dir, "%06d.png"),
+                        "-c:v",
+                        "libx264",
+                        "-pix_fmt",
+                        "yuv420p",
+                        rebuilt_path,
+                    ],
+                    check=True,
+                )
+                refined_video_path = rebuilt_path
+                _trace_append(
+                    "film2",
+                    {
+                        "event": "clip_rebuild_success",
+                        "segment_id": segment_id,
+                        "film_id": film_id,
+                        "scene_id": scene_id,
+                        "shot_id": shot_id,
+                        "video_path": rebuilt_path,
+                        "refine_mode": refine_mode,
+                    },
+                )
+            if sharpness_count > 0:
+                clip_sharpness = sharpness_sum / float(sharpness_count)
+            else:
+                clip_sharpness = None
+        except Exception:
+            refined_video_path = None
+            clip_sharpness = None
+        video_path: Optional[str] = refined_video_path
+        # Fallback: hv-based refine when frame-level path is unavailable.
+        if video_path is None:
+            hv_args: Dict[str, Any] = {
+                "prompt": hv_prompt,
+                "width": width_val,
+                "height": height_val,
+                "fps": fps_val,
+                "seconds": seconds_val,
+                "locks": locks,
+                "seed": a.get("seed"),
+                "post": {"interpolate": True, "upscale": True, "face_lock": True, "hand_fix": True},
+                "latent_reinit_every": 48,
+                "cid": a.get("cid"),
+            }
+            hv_res = await execute_tool_call({"name": "video.hv.t2v", "arguments": hv_args})
+            if isinstance(hv_res, dict) and hv_res.get("error") is not None:
+                return hv_res
+            hv_result_raw = hv_res.get("result") if isinstance(hv_res, dict) else hv_res
+            hv_result = hv_result_raw if isinstance(hv_result_raw, dict) else {}
+            arts = hv_result.get("artifacts") if isinstance(hv_result.get("artifacts"), list) else []
+            if arts:
+                first = arts[0]
+                if isinstance(first, dict):
+                    path_val = first.get("path") or first.get("view_url") or first.get("url")
+                    if isinstance(path_val, str) and path_val:
+                        video_path = path_val
+        result_meta: Dict[str, Any] = {
+            "timecode": timecode,
+            "locks": locks,
+        }
+        if clip_sharpness is not None:
+            result_meta["sharpness"] = clip_sharpness
+        artifacts: List[Dict[str, Any]] = []
+        if isinstance(video_path, str) and video_path:
+            artifacts.append({"kind": "video", "path": video_path})
+        out = {
+            "meta": result_meta,
+            "artifacts": artifacts,
+        }
+        _trace_append(
+            "film2",
+            {
+                "event": "clip_refine_success",
+                "segment_id": segment_id,
+                "film_id": film_id,
+                "scene_id": scene_id,
+                "shot_id": shot_id,
+                "video_path": video_path,
+                "refine_mode": refine_mode,
+            },
+        )
+        return {"name": name, "result": out}
     if name == "film2.run" and ALLOW_TOOL_EXECUTION:
         # Unified Film-2 shot runner. Executes internal video passes and writes distilled traces/artifacts.
         a = raw_args if isinstance(raw_args, dict) else {}
@@ -3582,13 +4464,195 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         images = a.get("images") if isinstance(a.get("images"), list) else []
         do_interpolate = bool(a.get("interpolate") or False)
         target_scale = a.get("scale")  # optional
+        duration_s = float(a.get("duration_seconds") or a.get("duration_s") or 8.0)
+        fps_val = int(a.get("fps") or 60)
+        width_val = int(a.get("width") or 1920)
+        height_val = int(a.get("height") or 1080)
         result: Dict[str, Any] = {"ids": {}, "meta": {"shots": []}}
-        profile_name = (a.get("quality_profile") or "standard")
+        profile_name = (a.get("quality_profile") or "hero")
         result["meta"]["quality_profile"] = profile_name
         thresholds_lock = _lock_quality_thresholds(profile_name)
         locks_arg = a.get("locks") if isinstance(a.get("locks"), dict) else {}
         if locks_arg:
             result["meta"]["locks"] = locks_arg
+        story_obj: Dict[str, Any] = {}
+        scenes_from_story: List[Dict[str, Any]] = []
+        shots_from_story: List[Dict[str, Any]] = []
+        warnings: List[str] = []
+        if prompt:
+            try:
+                story_obj = _story_draft(prompt, duration_s)
+                _trace_append(
+                    "film2",
+                    {
+                        "event": "story_draft",
+                        "prompt": prompt,
+                        "duration_hint_s": duration_s,
+                    },
+                )
+                max_story_passes = 3
+                last_issues: List[Dict[str, Any]] = []
+                for pass_index in range(max_story_passes):
+                    last_issues = _story_check(story_obj, prompt)
+                    issue_codes = [iss.get("code") for iss in last_issues if isinstance(iss, dict)]
+                    _trace_append(
+                        "film2",
+                        {
+                            "event": "story_consistency_pass",
+                            "pass_index": pass_index,
+                            "issue_codes": issue_codes,
+                        },
+                    )
+                    if not last_issues:
+                        break
+                    story_obj = _story_fix(story_obj, last_issues)
+                if last_issues:
+                    warnings.append("story_consistency_unresolved")
+                    try:
+                        _trace_append(
+                            "film2",
+                            {
+                                "event": "story_consistency_unresolved",
+                                "issues": last_issues,
+                                "prompt": prompt,
+                            },
+                        )
+                    except Exception:
+                        pass
+                scenes_from_story, shots_from_story = _story_derive(story_obj)
+            except Exception as ex:
+                warnings.append("story_phase_failed")
+                try:
+                    _trace_append(
+                        "film2",
+                        {
+                            "event": "story_phase_failed",
+                            "error": str(ex),
+                            "prompt": prompt,
+                        },
+                    )
+                except Exception:
+                    pass
+        if warnings:
+            meta_warnings = result["meta"].setdefault("warnings", [])
+            if isinstance(meta_warnings, list):
+                meta_warnings.extend(warnings)
+        if story_obj:
+            result["meta"]["story"] = story_obj
+        if scenes_from_story:
+            result["meta"]["scenes"] = scenes_from_story
+        if shots_from_story:
+            result["meta"]["shots_from_story"] = shots_from_story
+        # Trace character state changes and per-shot state snapshots for distillation.
+        if story_obj:
+            acts = story_obj.get("acts") if isinstance(story_obj.get("acts"), list) else []
+            for act in acts:
+                act_id = act.get("act_id")
+                scenes = act.get("scenes") if isinstance(act.get("scenes"), list) else []
+                for scene in scenes:
+                    scene_id = scene.get("scene_id")
+                    beats = scene.get("beats") if isinstance(scene.get("beats"), list) else []
+                    for beat in beats:
+                        beat_id = beat.get("beat_id")
+                        events = beat.get("events") if isinstance(beat.get("events"), list) else []
+                        for ev in events:
+                            if not isinstance(ev, dict):
+                                continue
+                            if ev.get("type") != "state_change":
+                                continue
+                            target = ev.get("target")
+                            state_delta = ev.get("state_delta") if isinstance(ev.get("state_delta"), dict) else {}
+                            _trace_append(
+                                "film2",
+                                {
+                                    "event": "character_state_change",
+                                    "char_id": target,
+                                    "event_id": ev.get("event_id"),
+                                    "state_delta": state_delta,
+                                    "act_id": act_id,
+                                    "scene_id": scene_id,
+                                    "beat_id": beat_id,
+                                },
+                            )
+        if shots_from_story:
+            for shot in shots_from_story:
+                if not isinstance(shot, dict):
+                    continue
+                shot_id = shot.get("shot_id")
+                scene_id = shot.get("scene_id")
+                act_id = shot.get("act_id")
+                state_map = shot.get("character_states") if isinstance(shot.get("character_states"), dict) else {}
+                _trace_append(
+                    "film2",
+                    {
+                        "event": "shot_character_state_snapshot",
+                        "shot_id": shot_id,
+                        "scene_id": scene_id,
+                        "act_id": act_id,
+                        "character_states": state_map,
+                    },
+                )
+        # Enrich locks with basic visual/story structure when possible
+        try:
+            if story_obj and isinstance(locks_arg, dict):
+                locks_arg = await _ensure_visual_locks_for_story(story_obj, locks_arg, profile_name, trace_id)
+                result["meta"]["locks"] = locks_arg
+        except Exception as ex:
+            warnings.append("visual_lock_phase_failed")
+            try:
+                _trace_append(
+                    "film2",
+                    {
+                        "event": "visual_lock_phase_failed",
+                        "error": str(ex),
+                        "prompt": prompt,
+                    },
+                )
+            except Exception:
+                pass
+        # Precompute TTS dialogue audio when possible
+        dialogue_index: Dict[str, Any] = {}
+        try:
+            if story_obj:
+                locks_arg, dialogue_index = await _ensure_tts_locks_and_dialogue_audio(story_obj, locks_arg, profile_name, trace_id)
+                if dialogue_index:
+                    result["meta"]["dialogue"] = dialogue_index
+                if locks_arg:
+                    result["meta"]["locks"] = locks_arg
+        except Exception as ex:
+            warnings.append("tts_phase_failed")
+            try:
+                _trace_append(
+                    "film2",
+                    {
+                        "event": "tts_phase_failed",
+                        "error": str(ex),
+                        "prompt": prompt,
+                    },
+                )
+            except Exception:
+                pass
+        # Generate simple scene and shot storyboards before hv video
+        try:
+            if scenes_from_story:
+                scenes_from_story = await _generate_scene_storyboards(scenes_from_story, locks_arg, profile_name, trace_id)
+                result["meta"]["scenes"] = scenes_from_story
+            if shots_from_story:
+                shots_from_story = await _generate_shot_storyboards(shots_from_story, locks_arg, profile_name, trace_id)
+                result["meta"]["shots_from_story"] = shots_from_story
+        except Exception as ex:
+            warnings.append("storyboard_phase_failed")
+            try:
+                _trace_append(
+                    "film2",
+                    {
+                        "event": "storyboard_phase_failed",
+                        "error": str(ex),
+                        "prompt": prompt,
+                    },
+                )
+            except Exception:
+                pass
         character_entries = locks_arg.get("characters") if isinstance(locks_arg.get("characters"), list) else []
         character_ids: List[str] = []
         for entry in character_entries:
@@ -3624,7 +4688,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     segment_log: List[Dict[str, Any]] = []
                     # Cleanup
                     _ev({"event": "film2.pass_cleanup_start", "src": src})
-                    cc = await execute_tool_call({"name": "video.cleanup", "arguments": {"__film2_internal": True, "src": src, "cid": cid, "trace_id": trace_id}})
+                    cc = await execute_tool_call({"name": "video.cleanup", "arguments": {"src": src, "cid": cid, "trace_id": trace_id}})
                     if isinstance(cc, dict):
                         segment_log.append(cc)
                     ccr = (cc.get("result") or {}) if isinstance(cc, dict) else {}
@@ -3637,7 +4701,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     current = clean_path or src
                     if do_interpolate and isinstance(current, str):
                         _ev({"event": "film2.pass_interpolate_start"})
-                        ic = await execute_tool_call({"name": "video.interpolate", "arguments": {"__film2_internal": True, "src": current, "cid": cid, "trace_id": trace_id}})
+                        ic = await execute_tool_call({"name": "video.interpolate", "arguments": {"src": current, "cid": cid, "trace_id": trace_id}})
                         if isinstance(ic, dict):
                             segment_log.append(ic)
                         icr = (ic.get("result") or {}) if isinstance(ic, dict) else {}
@@ -3650,7 +4714,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     # Upscale
                     if isinstance(current, str):
                         _ev({"event": "film2.pass_upscale_start"})
-                        uc_args = {"__film2_internal": True, "src": current, "cid": cid, "trace_id": trace_id}
+                        uc_args = {"src": current, "cid": cid, "trace_id": trace_id}
                         if target_scale:
                             uc_args["scale"] = target_scale
                         uc = await execute_tool_call({"name": "video.upscale", "arguments": uc_args})
@@ -3712,108 +4776,383 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                                             "schema_version": updated_bundle.get("schema_version"),
                                         }
                     result["meta"]["shots"].append(shot_meta)
-            # Image-to-video path via SVD (if images provided)
-            elif images:
-                for i, img in enumerate(images):
-                    _ev({"event": "film2.pass_gen_start", "adapter": "svd.i2v", "image": img})
-                    gv = await execute_tool_call({"name": "video.svd.i2v", "arguments": {"__film2_internal": True, "src": img, "cid": cid, "trace_id": trace_id}})
-                    segment_log: List[Dict[str, Any]] = []
+            # Story-driven Hunyuan generation when no explicit clips are provided.
+            elif shots_from_story:
+                story_shot_index = 0
+                for shot in shots_from_story:
+                    if not isinstance(shot, dict):
+                        continue
+                    shot_id = shot.get("shot_id") or f"shot_{story_shot_index}"
+                    scene_id = shot.get("scene_id")
+                    act_id = shot.get("act_id")
+                    descr = shot.get("description") or prompt
+                    # Enrich prompt with active character state hints when available.
+                    state_map = shot.get("character_states") if isinstance(shot.get("character_states"), dict) else {}
+                    if state_map:
+                        state_phrases: List[str] = []
+                        for cid, st in state_map.items():
+                            if not isinstance(st, dict):
+                                continue
+                            if st.get("left_arm") == "missing":
+                                state_phrases.append("a character with a missing left arm")
+                            if st.get("left_arm") == "robot":
+                                state_phrases.append("a character with a robotic left arm")
+                        if state_phrases:
+                            extra = "; ".join(sorted(set(state_phrases)))
+                            descr = f"{descr} ({extra})"
+                    dur = float(shot.get("duration_s") or duration_s)
+                    seconds_val = int(dur) if dur > 0.0 else int(duration_s)
+                    adapter = "hv.t2v"
+                    hv_name = "video.hv.t2v"
+                    hv_args: Dict[str, Any] = {
+                        "prompt": descr,
+                        "width": width_val,
+                        "height": height_val,
+                        "fps": fps_val,
+                        "seconds": seconds_val,
+                        "locks": locks_arg,
+                        "seed": a.get("seed"),
+                        "post": {"interpolate": True, "upscale": True, "face_lock": True, "hand_fix": True},
+                        "latent_reinit_every": 48,
+                        "cid": cid,
+                    }
+                    storyboard_img = shot.get("storyboard_image")
+                    if isinstance(storyboard_img, str) and storyboard_img:
+                        hv_args["init_image"] = storyboard_img
+                        hv_name = "video.hv.i2v"
+                        adapter = "hv.i2v"
+                    shot_meta = {
+                        "index": story_shot_index,
+                        "shot_id": shot_id,
+                        "scene_id": scene_id,
+                        "act_id": act_id,
+                        "prompt": descr,
+                        "duration_s": dur,
+                    }
+                    segment_log = []
+                    _ev({"event": "film2.pass_gen_start", "adapter": adapter, "shot_id": shot_id})
+                    _trace_append(
+                        "film2",
+                        {
+                            "event": "hv_call_start",
+                            "adapter": hv_name,
+                            "shot_id": shot_id,
+                            "scene_id": scene_id,
+                            "act_id": act_id,
+                            "prompt": descr,
+                            "width": width_val,
+                            "height": height_val,
+                            "fps": fps_val,
+                            "seconds": seconds_val,
+                            "init_image": hv_args.get("init_image"),
+                        },
+                    )
+                    gv = await execute_tool_call({"name": hv_name, "arguments": hv_args})
                     if isinstance(gv, dict):
                         segment_log.append(gv)
                     gvr = (gv.get("result") or {}) if isinstance(gv, dict) else {}
-                    gen_path = gvr.get("path") if isinstance(gvr, dict) else None
-                    shot_meta: Dict[str, Any] = {"index": i, "gen_path": gen_path}
+                    gen_path = None
+                    if isinstance(gvr, dict):
+                        gen_path = gvr.get("path")
+                        if not isinstance(gen_path, str):
+                            video_obj = gvr.get("video") if isinstance(gvr.get("video"), dict) else {}
+                            gen_path = video_obj.get("path") if isinstance(video_obj.get("path"), str) else None
                     if isinstance(gen_path, str):
                         _artifact_video(gen_path)
-                        current = gen_path
-                        # Optional temporal/interpolate
-                        if do_interpolate:
-                            _ev({"event": "film2.pass_interpolate_start"})
-                            ic = await execute_tool_call({"name": "video.interpolate", "arguments": {"__film2_internal": True, "src": current, "cid": cid, "trace_id": trace_id}})
-                            if isinstance(ic, dict):
-                                segment_log.append(ic)
-                            icr = (ic.get("result") or {}) if isinstance(ic, dict) else {}
-                            interp_path = icr.get("path") if isinstance(icr, dict) else None
-                            if isinstance(interp_path, str):
-                                _artifact_video(interp_path)
-                                shot_meta["interp_path"] = interp_path
-                            current = interp_path or current
-                            _ev({"event": "film2.pass_interpolate_finish"})
-                        # Upscale
-                        _ev({"event": "film2.pass_upscale_start"})
-                        uc = await execute_tool_call({"name": "video.upscale", "arguments": {"__film2_internal": True, "src": current, "cid": cid, "trace_id": trace_id}})
-                        if isinstance(uc, dict):
-                            segment_log.append(uc)
-                        up = (uc.get("result") or {}) if isinstance(uc, dict) else {}
-                        up_path = up.get("path") if isinstance(up, dict) else None
-                        if isinstance(up_path, str):
-                            _artifact_video(up_path)
-                            shot_meta["upscaled_path"] = up_path
-                        _ev({"event": "film2.pass_upscale_finish"})
+                        shot_meta["gen_path"] = gen_path
+                        _trace_append(
+                            "film2",
+                            {
+                                "event": "hv_call_success",
+                                "adapter": hv_name,
+                                "shot_id": shot_id,
+                                "scene_id": scene_id,
+                                "act_id": act_id,
+                                "video_path": gen_path,
+                            },
+                        )
                     _ev({"event": "film2.pass_gen_finish"})
                     if segment_log:
                         shot_meta["segment_results"] = segment_log
-                        frames_for_hero = segment_log
-                        hero_pick = choose_hero_frame(frames_for_hero, thresholds_lock)
-                        hero_record = {}
-                        hero_path_value = None
-                        if hero_pick is not None:
-                            hero_frame = hero_pick.get("frame") if isinstance(hero_pick, dict) else None
-                            hero_index = int(hero_pick.get("index")) if isinstance(hero_pick.get("index"), int) else hero_pick.get("index")
-                            hero_meta_payload = _frame_meta_payload(hero_frame) if isinstance(hero_frame, dict) else {}
-                            hero_record = {
-                                "index": int(hero_index) if isinstance(hero_index, int) else hero_pick.get("index"),
-                                "score": hero_pick.get("score"),
-                                "locks": hero_meta_payload.get("locks") if isinstance(hero_meta_payload.get("locks"), dict) else {},
-                            }
-                            hero_path_value = _frame_image_path(hero_frame) if isinstance(hero_frame, dict) else None
-                        elif frames_for_hero:
-                            fallback_frame = frames_for_hero[-1]
-                            fallback_meta = _frame_meta_payload(fallback_frame)
-                            hero_record = {
-                                "index": len(frames_for_hero) - 1,
-                                "score": None,
-                                "locks": fallback_meta.get("locks") if isinstance(fallback_meta.get("locks"), dict) else {},
-                                "fallback": True,
-                            }
-                            hero_path_value = _frame_image_path(fallback_frame)
-                        if hero_record:
-                            if isinstance(hero_path_value, str) and hero_path_value:
-                                if os.path.isabs(hero_path_value):
-                                    hero_abs = hero_path_value
-                                else:
-                                    hero_abs = os.path.join(UPLOAD_DIR, hero_path_value.lstrip("/"))
-                                hero_record["image_path"] = hero_abs
-                            shot_meta["hero_frame"] = hero_record
-                            hero_abs_path = hero_record.get("image_path")
-                            if isinstance(hero_abs_path, str) and hero_abs_path and character_ids:
-                                for character_id in character_ids:
-                                    existing_bundle = current_character_bundles.get(character_id)
-                                    if existing_bundle is not None:
-                                        updated_bundle = await _lock_update_from_hero(
-                                            character_id,
-                                            hero_abs_path,
-                                            existing_bundle,
-                                            locks_root_dir=LOCKS_ROOT_DIR,
-                                        )
-                                        current_character_bundles[character_id] = updated_bundle
-                                        hero_record.setdefault("bundle_versions", {})[character_id] = {
-                                            "schema_version": updated_bundle.get("schema_version"),
-                                        }
-                    result["meta"].setdefault("shots", []).append(shot_meta)
+                    result["meta"]["shots"].append(shot_meta)
+                    story_shot_index += 1
+            # Image-based generation goes through Hunyuan (full-res, max quality) when story shots are unavailable.
+            elif images:
+                for i, img in enumerate(images):
+                    shot_meta = {"index": i, "init_image": img}
+                    segment_log = []
+                    hv_args_img: Dict[str, Any] = {
+                        "init_image": img,
+                        "prompt": prompt or "",
+                        "width": width_val,
+                        "height": height_val,
+                        "fps": fps_val,
+                        "seconds": int(duration_s),
+                        "locks": locks_arg,
+                        "seed": a.get("seed"),
+                        "post": {"interpolate": True, "upscale": True, "face_lock": True, "hand_fix": True},
+                        "latent_reinit_every": 48,
+                        "cid": cid,
+                    }
+                    _ev({"event": "film2.pass_gen_start", "adapter": "hv.i2v", "image": img})
+                    gv = await execute_tool_call({"name": "video.hv.i2v", "arguments": hv_args_img})
+                    if isinstance(gv, dict):
+                        segment_log.append(gv)
+                    gvr = (gv.get("result") or {}) if isinstance(gv, dict) else {}
+                    gen_path = None
+                    if isinstance(gvr, dict):
+                        gen_path = gvr.get("path")
+                        if not isinstance(gen_path, str):
+                            video_obj = gvr.get("video") if isinstance(gvr.get("video"), dict) else {}
+                            gen_path = video_obj.get("path") if isinstance(video_obj.get("path"), str) else None
+                    if isinstance(gen_path, str):
+                        _artifact_video(gen_path)
+                        shot_meta["gen_path"] = gen_path
+                    _ev({"event": "film2.pass_gen_finish"})
+                    if segment_log:
+                        shot_meta["segment_results"] = segment_log
+                    result["meta"]["shots"].append(shot_meta)
             else:
-                # Nothing to do without sources; later we can add HV t2v when proper inputs provided
-                result["meta"]["note"] = "no clips/images supplied; generation adapters are internal only"
+                # Prompt-only Hunyuan generation when no clips/images/story shots are supplied.
+                if prompt:
+                    shot_meta = {"index": 0, "prompt": prompt}
+                    segment_log = []
+                    hv_args_prompt = {
+                        "prompt": prompt,
+                        "width": width_val,
+                        "height": height_val,
+                        "fps": fps_val,
+                        "seconds": int(duration_s),
+                        "locks": locks_arg,
+                        "seed": a.get("seed"),
+                        "post": {"interpolate": True, "upscale": True, "face_lock": True, "hand_fix": True},
+                        "latent_reinit_every": 48,
+                        "cid": cid,
+                    }
+                    _ev({"event": "film2.pass_gen_start", "adapter": "hv.t2v"})
+                    gv = await execute_tool_call({"name": "video.hv.t2v", "arguments": hv_args_prompt})
+                    if isinstance(gv, dict):
+                        segment_log.append(gv)
+                    gvr = (gv.get("result") or {}) if isinstance(gv, dict) else {}
+                    gen_path = None
+                    if isinstance(gvr, dict):
+                        gen_path = gvr.get("path")
+                        if not isinstance(gen_path, str):
+                            video_obj = gvr.get("video") if isinstance(gvr.get("video"), dict) else {}
+                            gen_path = video_obj.get("path") if isinstance(video_obj.get("path"), str) else None
+                    if isinstance(gen_path, str):
+                        _artifact_video(gen_path)
+                        shot_meta["gen_path"] = gen_path
+                    _ev({"event": "film2.pass_gen_finish"})
+                    if segment_log:
+                        shot_meta["segment_results"] = segment_log
+                    result["meta"]["shots"].append(shot_meta)
         except Exception as ex:
             _tb = traceback.format_exc()
             logging.error(_tb)
             return {"name": name, "error": str(ex), "traceback": _tb}
         finally:
             _ev({"event": "film2.shot_finish"})
+        # Build a simple segment hierarchy: film -> scenes -> shots -> clips (one clip per shot for now)
+        try:
+            film_id = cid or f"film2_{str(trace_id or '')}"
+            film_segment: Dict[str, Any] = {
+                "segment_id": film_id,
+                "level": "film",
+                "children": [],
+                "meta": {
+                    "prompt": prompt,
+                    "duration_s": duration_s,
+                },
+            }
+            scene_segments: Dict[str, Dict[str, Any]] = {}
+            shot_segments: Dict[str, Dict[str, Any]] = {}
+            clip_segments: Dict[str, Dict[str, Any]] = {}
+            scenes_meta = result.get("meta", {}).get("scenes")
+            if isinstance(scenes_meta, list):
+                for sc in scenes_meta:
+                    if not isinstance(sc, dict):
+                        continue
+                    sid = sc.get("scene_id")
+                    if not isinstance(sid, str) or not sid:
+                        continue
+                    if sid in scene_segments:
+                        continue
+                    seg_scene: Dict[str, Any] = {
+                        "segment_id": sid,
+                        "level": "scene",
+                        "children": [],
+                        "meta": dict(sc),
+                    }
+                    scene_segments[sid] = seg_scene
+                    film_segment["children"].append(sid)
+            shots_meta = result.get("meta", {}).get("shots")
+            if isinstance(shots_meta, list):
+                # Build a simple dialogue mapping per shot using story-derived shots and dialogue_index when available.
+                meta_block = result.get("meta") if isinstance(result.get("meta"), dict) else {}
+                dialogue_index = meta_block.get("dialogue") if isinstance(meta_block.get("dialogue"), dict) else {}
+                shots_from_story_meta = meta_block.get("shots_from_story") if isinstance(meta_block.get("shots_from_story"), list) else []
+                story_shot_dialogue: Dict[str, List[Dict[str, Any]]] = {}
+                for s in shots_from_story_meta:
+                    if not isinstance(s, dict):
+                        continue
+                    sid = s.get("shot_id")
+                    if not isinstance(sid, str) or not sid:
+                        continue
+                    lines = s.get("dialogue") if isinstance(s.get("dialogue"), list) else []
+                    story_shot_dialogue[sid] = [ln for ln in lines if isinstance(ln, dict)]
+                for sh in shots_meta:
+                    if not isinstance(sh, dict):
+                        continue
+                    shot_id = sh.get("shot_id") or f"shot_{sh.get('index')}"
+                    if not isinstance(shot_id, str) or not shot_id:
+                        continue
+                    scene_id = sh.get("scene_id")
+                    act_id = sh.get("act_id")
+                    dur_s = float(sh.get("duration_s") or duration_s)
+                    gen_path = sh.get("gen_path")
+                    shot_seg: Dict[str, Any] = {
+                        "segment_id": shot_id,
+                        "level": "shot",
+                        "children": [],
+                        "meta": {
+                            "scene_id": scene_id,
+                            "act_id": act_id,
+                            "duration_s": dur_s,
+                            "gen_path": gen_path,
+                        },
+                    }
+                    shot_segments[shot_id] = shot_seg
+                    if isinstance(scene_id, str) and scene_id in scene_segments:
+                        scene_segments[scene_id]["children"].append(shot_id)
+                    # Split each shot into multiple logical clips based on a fixed window size.
+                    clip_window_s = 2.0
+                    if dur_s <= 0.0:
+                        dur_s = duration_s
+                        shot_seg["meta"]["duration_s"] = dur_s
+                    # Align dialogue lines to this shot using a simple equal-partition policy when possible.
+                    shot_lines = story_shot_dialogue.get(shot_id, [])
+                    line_timing: Dict[str, Dict[str, float]] = {}
+                    if shot_lines:
+                        per_line = dur_s / float(len(shot_lines))
+                        current_start = 0.0
+                        for ln in shot_lines:
+                            line_id = ln.get("line_id")
+                            if not isinstance(line_id, str) or not line_id:
+                                continue
+                            start_s = current_start
+                            end_s = min(dur_s, start_s + per_line)
+                            line_timing[line_id] = {"start_s": start_s, "end_s": end_s}
+                            current_start = end_s
+                            entry = dialogue_index.get(line_id) if isinstance(dialogue_index, dict) else None
+                            if isinstance(entry, dict):
+                                entry["shot_id"] = shot_id
+                                entry["start_s"] = start_s
+                                entry["end_s"] = end_s
+                    num_clips = max(1, int(math.ceil(dur_s / clip_window_s)))
+                    for clip_index in range(num_clips):
+                        start_s = clip_index * clip_window_s
+                        end_s = dur_s if clip_index == num_clips - 1 else min(dur_s, (clip_index + 1) * clip_window_s)
+                        clip_id = f"{shot_id}_clip_{clip_index}"
+                        clip_result: Dict[str, Any] = {
+                            "meta": {
+                                "cid": cid,
+                                "film_id": film_id,
+                                "scene_id": scene_id,
+                                "shot_id": shot_id,
+                                "clip_index": clip_index,
+                                "timecode": {"start_s": start_s, "end_s": end_s, "fps": fps_val},
+                                "locks": locks_arg if isinstance(locks_arg, dict) else {},
+                                "prompt": sh.get("prompt"),
+                                "width": width_val,
+                                "height": height_val,
+                            },
+                            "artifacts": [],
+                        }
+                        if isinstance(gen_path, str) and gen_path:
+                            clip_result["artifacts"].append({"kind": "video", "path": gen_path})
+                        # Compute a simple lipsync score based on dialogue durations overlapping this clip window.
+                        clip_lines: List[str] = []
+                        dialogue_total_s = 0.0
+                        if isinstance(dialogue_index, dict) and line_timing:
+                            for ln in shot_lines:
+                                line_id = ln.get("line_id")
+                                if not isinstance(line_id, str) or not line_id:
+                                    continue
+                                timing = line_timing.get(line_id)
+                                if not isinstance(timing, dict):
+                                    continue
+                                line_start = float(timing.get("start_s") or 0.0)
+                                line_end = float(timing.get("end_s") or 0.0)
+                                # Overlap between line window and clip window
+                                if line_end > start_s and line_start < end_s:
+                                    clip_lines.append(line_id)
+                                    entry = dialogue_index.get(line_id)
+                                    dur_val = None
+                                    if isinstance(entry, dict):
+                                        dur_raw = entry.get("duration_s")
+                                        if isinstance(dur_raw, (int, float)):
+                                            dur_val = float(dur_raw)
+                                    if dur_val is None:
+                                        dur_val = max(0.0, line_end - line_start)
+                                    dialogue_total_s += dur_val
+                        clip_length = max(0.0, end_s - start_s)
+                        lipsync_score = 0.0
+                        if clip_length > 0.0:
+                            ratio = dialogue_total_s / clip_length
+                            if ratio < 0.0:
+                                ratio = 0.0
+                            if ratio > 1.0:
+                                ratio = 1.0
+                            lipsync_score = ratio
+                        clip_result["meta"]["dialogue_lines"] = clip_lines
+                        clip_result["meta"]["lipsync_score"] = lipsync_score
+                        clip_seg: Dict[str, Any] = {
+                            "id": clip_id,
+                            "tool": "video.hv.t2v",
+                            "domain": "video",
+                            "name": clip_id,
+                            "index": clip_index,
+                            "parent_cid": cid,
+                            "result": clip_result,
+                            "meta": clip_result["meta"],
+                            "qa": {"scores": {}},
+                            "locks": clip_result["meta"].get("locks"),
+                            "artifacts": clip_result["artifacts"],
+                        }
+                        clip_seg["qa"]["scores"]["lipsync"] = lipsync_score
+                        clip_segments[clip_id] = clip_seg
+                        shot_seg["children"].append(clip_id)
+                        _trace_append(
+                            "film2",
+                            {
+                                "event": "segment_clip_built",
+                                "film_id": film_id,
+                                "scene_id": scene_id,
+                                "shot_id": shot_id,
+                                "clip_id": clip_id,
+                                "clip_index": clip_index,
+                                "start_s": start_s,
+                                "end_s": end_s,
+                                "fps": fps_val,
+                                "video_path": gen_path,
+                                "dialogue_total_s": dialogue_total_s,
+                                "lipsync_score": lipsync_score,
+                            },
+                        )
+            result.setdefault("meta", {})["segments"] = {
+                "film": film_segment,
+                "scenes": list(scene_segments.values()),
+                "shots": list(shot_segments.values()),
+                "clips": list(clip_segments.values()),
+            }
+        except Exception:
+            # Segment hierarchy construction must not break film2.run
+            pass
         # Select a final video output and expose as ids/meta for UI
         final_path = None
         for sh in reversed(result.get("meta", {}).get("shots", [])):
-            for key in ("upscaled_path", "interp_path", "clean_path"):
+            for key in ("upscaled_path", "interp_path", "clean_path", "gen_path"):
                 p = sh.get(key)
                 if isinstance(p, str) and p:
                     final_path = p
@@ -3846,6 +5185,42 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 except Exception:
                     _tb = traceback.format_exc()
                     logging.error(_tb)
+        meta_obj = result.get("meta") if isinstance(result.get("meta"), dict) else {}
+        segments_container = meta_obj.get("segments") if isinstance(meta_obj.get("segments"), dict) else {}
+        clips_meta = segments_container.get("clips") if isinstance(segments_container, dict) else None
+        if isinstance(clips_meta, list):
+            for clip in clips_meta:
+                if not isinstance(clip, dict):
+                    continue
+                cmeta = clip.get("meta") if isinstance(clip.get("meta"), dict) else {}
+                refined_flag = bool(cmeta.get("refined"))
+                ls_val = cmeta.get("lipsync_score")
+                sharp_val = cmeta.get("sharpness")
+                degraded_reasons: List[str] = []
+                if isinstance(ls_val, (int, float)) and ls_val < 0.5 and refined_flag:
+                    degraded_reasons.append("low_lipsync")
+                if isinstance(sharp_val, (int, float)) and sharp_val < 50.0 and refined_flag:
+                    degraded_reasons.append("low_sharpness")
+                if degraded_reasons:
+                    cmeta["degraded"] = True
+                    cmeta["degraded_reasons"] = degraded_reasons
+                    clip["meta"] = cmeta
+                    try:
+                        _trace_append(
+                            "film2",
+                            {
+                                "event": "clip_refine_exhausted",
+                                "segment_id": clip.get("id"),
+                                "film_id": segments_container.get("film", {}).get("segment_id") if isinstance(segments_container.get("film"), dict) else None,
+                                "scene_id": cmeta.get("scene_id"),
+                                "shot_id": cmeta.get("shot_id"),
+                                "refined": refined_flag,
+                                "degraded_reasons": degraded_reasons,
+                            },
+                        )
+                    except Exception:
+                        pass
+    
         return {"name": name, "result": result}
     if name == "icw.pack_context":
         args = raw_args if isinstance(raw_args, dict) else {}
@@ -5869,23 +7244,6 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             return {"name": name, "result": _resp_json(r, {})}
         except Exception as ex:
             return {"name": name, "error": str(ex)}
-    if name == "video.svd.i2v" and ALLOW_TOOL_EXECUTION:
-        if not SVD_API_URL:
-            return {"name": name, "error": "SVD_API_URL not configured"}
-        try:
-            payload = {
-                "init_image": args.get("init_image"),
-                "prompt": args.get("prompt"),
-                "video": {"width": int(args.get("width") or 768), "height": int(args.get("height") or 768), "fps": int(args.get("fps") or 24), "seconds": int(args.get("seconds") or 4)},
-                "seed": args.get("seed"),
-                "quality": "max",
-                "meta": {"trace_level": "full", "stream": True},
-            }
-            async with httpx.AsyncClient() as client:
-                r = await client.post(SVD_API_URL.rstrip("/") + "/v1/video/svd/i2v", json=payload)
-            return {"name": name, "result": _resp_json(r, {})}
-        except Exception as ex:
-            return {"name": name, "error": str(ex)}
     if name == "math.eval":
         expr = args.get("expr") or ""
         task = (args.get("task") or "").strip().lower()
@@ -6811,39 +8169,86 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 extra_results: List[Dict[str, Any]] = []
                 if tname == "film2.run":
                     meta_obj = res.get("meta") if isinstance(res, dict) else {}
-                    shots = meta_obj.get("shots") if isinstance(meta_obj, dict) else None
                     profile_name = meta_obj.get("quality_profile") if isinstance(meta_obj, dict) and isinstance(meta_obj.get("quality_profile"), str) else None
                     preset = LOCK_QUALITY_PRESETS.get((profile_name or "standard").lower(), LOCK_QUALITY_PRESETS["standard"])
                     # Clamp to a single refinement pass for segment-level film QA
                     refine_budget = min(1, int(preset.get("max_refine_passes", 1)))
-                    if isinstance(shots, list):
-                        for shot in shots:
-                            if not isinstance(shot, dict):
+                    segments_obj = meta_obj.get("segments") if isinstance(meta_obj, dict) else {}
+                    clips_for_committee = segments_obj.get("clips") if isinstance(segments_obj, dict) else None
+                    if isinstance(clips_for_committee, list) and clips_for_committee:
+                        seg_results_payload: List[Dict[str, Any]] = []
+                        for seg in clips_for_committee:
+                            if not isinstance(seg, dict):
                                 continue
-                            seg_results = shot.get("segment_results")
-                            if isinstance(seg_results, list) and seg_results:
-                                updated_seg, seg_outcome, seg_patch = await segment_qa_and_committee(
-                                    trace_id=trace_id,
-                                    user_text=last_user_text,
-                                    tool_name="film2.run",
-                                    segment_results=seg_results,
-                                    mode=effective_mode,
-                                    base_url=base_url,
-                                    executor_base_url=executor_endpoint,
-                                    temperature=exec_temperature,
-                                    last_user_text=last_user_text,
-                                    tool_catalog_hash=_cat_hash,
-                                    planner_callable=planner_callable,
-                                    normalize_fn=_normalize_tool_calls,
-                                    absolutize_url=_abs_url,
-                                    quality_profile=profile_name,
-                                    max_refine_passes=refine_budget,
-                                )
-                                shot["segment_results"] = updated_seg
-                                shot["segment_committee"] = seg_outcome
+                            seg_id = seg.get("id")
+                            res_obj = seg.get("result")
+                            if isinstance(seg_id, str) and seg_id and isinstance(res_obj, dict):
+                                seg_results_payload.append({"name": seg_id, "result": res_obj})
+                        if seg_results_payload:
+                            _trace_append(
+                                "film2",
+                                {
+                                    "event": "segment_qa_start",
+                                    "tool": "film2.run",
+                                    "segment_ids": [s.get("name") for s in seg_results_payload if isinstance(s, dict)],
+                                    "quality_profile": profile_name,
+                                },
+                            )
+                            updated_seg, seg_outcome, seg_patch = await segment_qa_and_committee(
+                                trace_id=trace_id,
+                                user_text=last_user_text,
+                                tool_name="film2.run",
+                                segment_results=seg_results_payload,
+                                mode=effective_mode,
+                                base_url=base_url,
+                                executor_base_url=executor_endpoint,
+                                temperature=exec_temperature,
+                                last_user_text=last_user_text,
+                                tool_catalog_hash=_cat_hash,
+                                planner_callable=planner_callable,
+                                normalize_fn=_normalize_tool_calls,
+                                absolutize_url=_abs_url,
+                                quality_profile=profile_name,
+                                max_refine_passes=refine_budget,
+                            )
+                            if isinstance(meta_obj, dict):
+                                meta_obj["segment_committee"] = seg_outcome
                                 if seg_patch:
-                                    shot["segment_patch_results"] = seg_patch
+                                    meta_obj["segment_patch_results"] = seg_patch
                                     extra_results.extend(seg_patch)
+                                    # Mark refined clips in segments metadata.
+                                    segments_container = meta_obj.get("segments")
+                                    if isinstance(segments_container, dict):
+                                        clips_meta = segments_container.get("clips")
+                                        if isinstance(clips_meta, list):
+                                            for pr in seg_patch:
+                                                if not isinstance(pr, dict):
+                                                    continue
+                                                if pr.get("tool") != "video.refine.clip":
+                                                    continue
+                                                if pr.get("error"):
+                                                    continue
+                                                sid = pr.get("segment_id")
+                                                args_used = pr.get("args") if isinstance(pr.get("args"), dict) else {}
+                                                refine_mode_val = args_used.get("refine_mode")
+                                                for clip in clips_meta:
+                                                    if not isinstance(clip, dict):
+                                                        continue
+                                                    if clip.get("id") == sid:
+                                                        clip_meta = clip.setdefault("meta", {})
+                                                        if isinstance(clip_meta, dict):
+                                                            clip_meta["refined"] = True
+                                                            if isinstance(refine_mode_val, str) and refine_mode_val:
+                                                                clip_meta["refine_mode"] = refine_mode_val
+                            _trace_append(
+                                "film2",
+                                {
+                                    "event": "segment_qa_result",
+                                    "tool": "film2.run",
+                                    "segment_ids": [s.get("name") for s in seg_results_payload if isinstance(s, dict)],
+                                    "action": seg_outcome.get("action"),
+                                },
+                            )
                 elif tname in ("music.compose", "music.dispatch", "music.variation", "music.mixdown"):
                     meta_block = res.get("meta") if isinstance(res, dict) else {}
                     profile_name = meta_block.get("quality_profile") if isinstance(meta_block, dict) and isinstance(meta_block.get("quality_profile"), str) else None
