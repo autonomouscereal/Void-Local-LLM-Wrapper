@@ -16,4 +16,12 @@ Pillow>=10.3.0,<11
 imageio>=2.34.0,<3
 numpy<2
 librosa>=0.10.2,<1
+opencv-python-headless>=4.10.0.84,<5
+mediapipe>=0.10.0,<1
+websockets>=12,<13
+sympy>=1.13.0,<2
+soundfile>=0.12.1,<1
+pyloudnorm>=0.1.1,<1
+transformers>=4.44.0,<5
+open_clip_torch>=2.26.1,<3
 
