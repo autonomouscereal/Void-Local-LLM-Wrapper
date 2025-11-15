@@ -728,10 +728,16 @@ services:
       - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-}
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - FILM2_MODELS=/opt/models
+      - FILM2_DATA=/srv/film2
+    # Run on host network so orchestrator and host can reach it at http://127.0.0.1:8090
+    network_mode: host
     expose:
       - "8090"
     volumes:
       - ./:/workspace
+      - film2_models:/opt/models:ro
+      - film2_data:/srv/film2
 
   ablation:
     build:
