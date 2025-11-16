@@ -2143,6 +2143,33 @@ app = FastAPI(title="Void Orchestrator", version="0.1.0")
 from app.routes import toolrun as _toolrun_routes  # type: ignore
 app.include_router(_toolrun_routes.router)
 ToolEnvelope = _toolrun_routes.ToolEnvelope
+
+
+@app.exception_handler(Exception)
+async def _global_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    """
+    Global handler for unhandled exceptions in the orchestrator.
+    Surfaces full traceback in JSON instead of collapsing to generic 'tool failed'.
+    """
+    tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    logging.getLogger("orchestrator.exception").error(
+        "[orchestrator] unhandled exception path=%s exc=%r\n%s",
+        request.url.path,
+        exc,
+        tb,
+    )
+    return JSONResponse(
+        {
+            "ok": False,
+            "error": {
+                "type": type(exc).__name__,
+                "message": str(exc),
+                "traceback": tb,
+            },
+            "path": str(request.url.path),
+        },
+        status_code=500,
+    )
 # Middleware order matters: last added runs first.
 # We want Preflight to run FIRST, so add it LAST.
 from .middleware.ws_permissive import PermissiveWebSocketMiddleware
@@ -4361,53 +4388,42 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 bundle_existing = _lock_migrate_film2(bundle_existing)
                 current_character_bundles[character_id] = bundle_existing
         if prompt:
-            try:
-                story_obj = _story_draft(prompt, duration_s)
+            story_obj = _story_draft(prompt, duration_s)
+            _trace_append(
+                "film2",
+                {
+                    "event": "story_draft",
+                    "prompt": prompt,
+                    "duration_hint_s": duration_s,
+                },
+            )
+            max_story_passes = 3
+            last_issues: List[Dict[str, Any]] = []
+            for pass_index in range(max_story_passes):
+                last_issues = _story_check(story_obj, prompt)
+                issue_codes = [iss.get("code") for iss in last_issues if isinstance(iss, dict)]
                 _trace_append(
                     "film2",
                     {
-                        "event": "story_draft",
-                        "prompt": prompt,
-                        "duration_hint_s": duration_s,
+                        "event": "story_consistency_pass",
+                        "pass_index": pass_index,
+                        "issue_codes": issue_codes,
                     },
                 )
-                max_story_passes = 3
-                last_issues: List[Dict[str, Any]] = []
-                for pass_index in range(max_story_passes):
-                    last_issues = _story_check(story_obj, prompt)
-                    issue_codes = [iss.get("code") for iss in last_issues if isinstance(iss, dict)]
-                    _trace_append(
-                        "film2",
-                        {
-                            "event": "story_consistency_pass",
-                            "pass_index": pass_index,
-                            "issue_codes": issue_codes,
-                        },
-                    )
-                    if not last_issues:
-                        break
-                    story_obj = _story_fix(story_obj, last_issues)
-                if last_issues:
-                    warnings.append("story_consistency_unresolved")
-                    _trace_append(
-                        "film2",
-                        {
-                            "event": "story_consistency_unresolved",
-                            "issues": last_issues,
-                            "prompt": prompt,
-                        },
-                    )
-                scenes_from_story, shots_from_story = _story_derive(story_obj)
-            except Exception as ex:
-                warnings.append("story_phase_failed")
+                if not last_issues:
+                    break
+                story_obj = _story_fix(story_obj, last_issues)
+            if last_issues:
+                warnings.append("story_consistency_unresolved")
                 _trace_append(
                     "film2",
                     {
-                        "event": "story_phase_failed",
-                        "error": str(ex),
+                        "event": "story_consistency_unresolved",
+                        "issues": last_issues,
                         "prompt": prompt,
                     },
                 )
+            scenes_from_story, shots_from_story = _story_derive(story_obj)
         if warnings:
             meta_warnings = result["meta"].setdefault("warnings", [])
             if isinstance(meta_warnings, list):
@@ -4468,59 +4484,40 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     },
                 )
         # Enrich locks with basic visual/story structure when possible
-        try:
-            if story_obj and isinstance(locks_arg, dict):
-                locks_arg = await _ensure_visual_locks_for_story(story_obj, locks_arg, profile_name, trace_id)
-                result["meta"]["locks"] = locks_arg
-        except Exception as ex:
-            warnings.append("visual_lock_phase_failed")
-            _trace_append(
-                "film2",
-                {
-                    "event": "visual_lock_phase_failed",
-                    "error": str(ex),
-                    "prompt": prompt,
-                },
-            )
+        if story_obj and isinstance(locks_arg, dict):
+            locks_arg = await _ensure_visual_locks_for_story(story_obj, locks_arg, profile_name, trace_id)
+            result["meta"]["locks"] = locks_arg
         # Precompute TTS dialogue audio when possible
-    dialogue_index: Dict[str, Any] = {}
-    try:
+        dialogue_index: Dict[str, Any] = {}
         if story_obj:
-            locks_arg, dialogue_index = await _ensure_tts_locks_and_dialogue_audio(story_obj, locks_arg, profile_name, trace_id)
+            locks_arg, dialogue_index = await _ensure_tts_locks_and_dialogue_audio(
+                story_obj,
+                locks_arg,
+                profile_name,
+                trace_id,
+            )
             if dialogue_index:
                 result["meta"]["dialogue"] = dialogue_index
             if locks_arg:
                 result["meta"]["locks"] = locks_arg
-    except Exception as ex:
-        warnings.append("tts_phase_failed")
-        _trace_append(
-            "film2",
-            {
-                "event": "tts_phase_failed",
-                "error": str(ex),
-                "prompt": prompt,
-            },
-        )
-    # Generate simple scene and shot storyboards before hv video
-    try:
+        # Generate simple scene and shot storyboards before hv video
         if scenes_from_story:
-            scenes_from_story = await _generate_scene_storyboards(scenes_from_story, locks_arg, profile_name, trace_id)
+            scenes_from_story = await _generate_scene_storyboards(
+                scenes_from_story,
+                locks_arg,
+                profile_name,
+                trace_id,
+            )
             result["meta"]["scenes"] = scenes_from_story
         if shots_from_story:
-            shots_from_story = await _generate_shot_storyboards(shots_from_story, locks_arg, profile_name, trace_id)
+            shots_from_story = await _generate_shot_storyboards(
+                shots_from_story,
+                locks_arg,
+                profile_name,
+                trace_id,
+            )
             result["meta"]["shots_from_story"] = shots_from_story
-    except Exception as ex:
-        warnings.append("storyboard_phase_failed")
-        _trace_append(
-            "film2",
-            {
-                "event": "storyboard_phase_failed",
-                "error": str(ex),
-                "prompt": prompt,
-            },
-        )
-    # Music planning phase: optionally score the film via music.infinite.windowed.
-    try:
+        # Music planning phase: optionally score the film via music.infinite.windowed.
         music_meta: Dict[str, Any] = {}
         if prompt and duration_s > 0:
             music_args: Dict[str, Any] = {
@@ -4540,191 +4537,180 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             music_call = await http_tool_run("music.infinite.windowed", music_args)
             if isinstance(music_call, dict):
                 music_meta = music_call.get("result") or music_call
-        if music_meta:
-            if isinstance(result.get("meta"), dict):
-                # Tag music windows with scene/shot ids using simple time slicing.
-                meta_obj = music_meta.get("meta") if isinstance(music_meta.get("meta"), dict) else {}
-                win_list = meta_obj.get("windows") if isinstance(meta_obj.get("windows"), list) else []
-                scenes_for_music = result["meta"].get("scenes") if isinstance(result["meta"].get("scenes"), list) else []
-                shots_for_music = result["meta"].get("shots_from_story") if isinstance(result["meta"].get("shots_from_story"), list) else []
-                # Simple heuristic: divide film duration evenly across scenes/shots if no explicit timing.
-                scene_timing: Dict[str, Dict[str, float]] = {}
-                if scenes_for_music:
-                    seg = duration_s / float(len(scenes_for_music) or 1)
-                    t0 = 0.0
-                    for sc in scenes_for_music:
-                        if not isinstance(sc, dict):
-                            continue
-                        sid = sc.get("scene_id")
-                        if not isinstance(sid, str):
-                            continue
-                        scene_timing[sid] = {"t_start": t0, "t_end": t0 + seg}
-                        t0 += seg
-                shot_timing: Dict[str, Dict[str, float]] = {}
-                if shots_for_music:
-                    seg = duration_s / float(len(shots_for_music) or 1)
-                    t0 = 0.0
-                    for sh in shots_for_music:
-                        if not isinstance(sh, dict):
-                            continue
-                        sid = sh.get("shot_id")
-                        if not isinstance(sid, str):
-                            continue
-                        shot_timing[sid] = {"t_start": t0, "t_end": t0 + seg}
-                        t0 += seg
-                for win in win_list or []:
-                    if not isinstance(win, dict):
+        if music_meta and isinstance(result.get("meta"), dict):
+            # Tag music windows with scene/shot ids using simple time slicing.
+            meta_obj = music_meta.get("meta") if isinstance(music_meta.get("meta"), dict) else {}
+            win_list = meta_obj.get("windows") if isinstance(meta_obj.get("windows"), list) else []
+            scenes_for_music = result["meta"].get("scenes") if isinstance(result["meta"].get("scenes"), list) else []
+            shots_for_music = result["meta"].get("shots_from_story") if isinstance(result["meta"].get("shots_from_story"), list) else []
+            # Simple heuristic: divide film duration evenly across scenes/shots if no explicit timing.
+            scene_timing: Dict[str, Dict[str, float]] = {}
+            if scenes_for_music:
+                seg = duration_s / float(len(scenes_for_music) or 1)
+                t0 = 0.0
+                for sc in scenes_for_music:
+                    if not isinstance(sc, dict):
                         continue
-                    t_start = win.get("t_start")
-                    t_end = win.get("t_end")
-                    mid = float(t_start) + (float(t_end) - float(t_start)) / 2.0 if isinstance(t_start, (int, float)) and isinstance(t_end, (int, float)) else None
-                    if mid is not None and scene_timing:
-                        for sid, rng in scene_timing.items():
-                            if rng["t_start"] <= mid <= rng["t_end"]:
-                                win["scene_id"] = sid
-                                break
-                    if mid is not None and shot_timing:
-                        win_shots: List[str] = []
-                        for sid, rng in shot_timing.items():
-                            if rng["t_start"] <= mid <= rng["t_end"]:
-                                win_shots.append(sid)
-                        if win_shots:
-                            win["shot_ids"] = win_shots
-                meta_obj["windows"] = win_list
-                music_meta["meta"] = meta_obj
-                result["meta"]["music"] = music_meta
-                # Trace cross-modal attachment for distillation.
-                music_meta_obj = music_meta.get("meta") if isinstance(music_meta.get("meta"), dict) else {}
-                _trace_append(
-                    "film2",
-                    {
-                        "event": "film2.music.attach",
-                        "film_cid": cid,
-                        "music_cid": music_meta_obj.get("cid"),
-                        "num_scenes": len(scenes_for_music),
-                        "num_shots": len(shots_for_music),
-                        "num_windows": len(win_list),
-                    },
-                )
-    except Exception as ex:
-        warnings.append("music_phase_failed")
-        _trace_append(
-            "film2",
-            {
-                "event": "music_phase_failed",
-                "error": str(ex),
-                "prompt": prompt,
-            },
-        )
+                    sid = sc.get("scene_id")
+                    if not isinstance(sid, str):
+                        continue
+                    scene_timing[sid] = {"t_start": t0, "t_end": t0 + seg}
+                    t0 += seg
+            shot_timing: Dict[str, Dict[str, float]] = {}
+            if shots_for_music:
+                seg = duration_s / float(len(shots_for_music) or 1)
+                t0 = 0.0
+                for sh in shots_for_music:
+                    if not isinstance(sh, dict):
+                        continue
+                    sid = sh.get("shot_id")
+                    if not isinstance(sid, str):
+                        continue
+                    shot_timing[sid] = {"t_start": t0, "t_end": t0 + seg}
+                    t0 += seg
+            for win in win_list or []:
+                if not isinstance(win, dict):
+                    continue
+                t_start = win.get("t_start")
+                t_end = win.get("t_end")
+                mid = float(t_start) + (float(t_end) - float(t_start)) / 2.0 if isinstance(t_start, (int, float)) and isinstance(t_end, (int, float)) else None
+                if mid is not None and scene_timing:
+                    for sid, rng in scene_timing.items():
+                        if rng["t_start"] <= mid <= rng["t_end"]:
+                            win["scene_id"] = sid
+                            break
+                if mid is not None and shot_timing:
+                    win_shots: List[str] = []
+                    for sid, rng in shot_timing.items():
+                        if rng["t_start"] <= mid <= rng["t_end"]:
+                            win_shots.append(sid)
+                    if win_shots:
+                        win["shot_ids"] = win_shots
+            meta_obj["windows"] = win_list
+            music_meta["meta"] = meta_obj
+            result["meta"]["music"] = music_meta
+            # Trace cross-modal attachment for distillation.
+            music_meta_obj = music_meta.get("meta") if isinstance(music_meta.get("meta"), dict) else {}
+            _trace_append(
+                "film2",
+                {
+                    "event": "film2.music.attach",
+                    "film_cid": cid,
+                    "music_cid": music_meta_obj.get("cid"),
+                    "num_scenes": len(scenes_for_music),
+                    "num_shots": len(shots_for_music),
+                    "num_windows": len(win_list),
+                },
+            )
         def _ev(e: Dict[str, Any]) -> None:
-            if trace_id:
-                row = {"t": int(time.time()*1000), **e}
-                checkpoints_append_event(STATE_DIR, trace_id, str(e.get("event") or "event"), row)
+            if not trace_id:
+                return
+            row = {"t": int(time.time() * 1000), **e}
+            checkpoints_append_event(STATE_DIR, trace_id, str(e.get("event") or "event"), row)
         _ev({"event": "film2.shot_start", "prompt": prompt})
-        try:
-            # Helper to append distilled artifact rows when a path is produced
-            def _artifact_video(path: str) -> None:
-                if not (trace_id and isinstance(path, str) and path):
-                    return
-                rel = os.path.relpath(path, UPLOAD_DIR).replace("\\", "/")
-                checkpoints_append_event(STATE_DIR, trace_id, "artifact", {"kind": "video", "path": rel})
-            # Enhance/cleanup path with provided clips
-            if clips:
-                for i, src in enumerate(clips):
-                    shot_meta: Dict[str, Any] = {"index": i, "source": src}
-                    segment_log: List[Dict[str, Any]] = []
-                    # Cleanup
-                    _ev({"event": "film2.pass_cleanup_start", "src": src})
-                    cc = await http_tool_run("video.cleanup", {"src": src, "cid": cid, "trace_id": trace_id})
-                    if isinstance(cc, dict):
-                        segment_log.append(cc)
-                    ccr = (cc.get("result") or {}) if isinstance(cc, dict) else {}
-                    clean_path = ccr.get("path") if isinstance(ccr, dict) else None
-                    if isinstance(clean_path, str):
-                        _artifact_video(clean_path)
-                        shot_meta["clean_path"] = clean_path
-                    _ev({"event": "film2.pass_cleanup_finish"})
-                    # Temporal interpolate (optional)
-                    current = clean_path or src
-                    if do_interpolate and isinstance(current, str):
-                        _ev({"event": "film2.pass_interpolate_start"})
-                        ic = await http_tool_run("video.interpolate", {"src": current, "cid": cid, "trace_id": trace_id})
-                        if isinstance(ic, dict):
-                            segment_log.append(ic)
-                        icr = (ic.get("result") or {}) if isinstance(ic, dict) else {}
-                        interp_path = icr.get("path") if isinstance(icr, dict) else None
-                        if isinstance(interp_path, str):
-                            _artifact_video(interp_path)
-                            shot_meta["interp_path"] = interp_path
-                        current = interp_path or current
-                        _ev({"event": "film2.pass_interpolate_finish"})
-                    # Upscale
-                    if isinstance(current, str):
-                        _ev({"event": "film2.pass_upscale_start"})
-                        uc_args = {"src": current, "cid": cid, "trace_id": trace_id}
-                        if target_scale:
-                            uc_args["scale"] = target_scale
-                        uc = await http_tool_run("video.upscale", uc_args)
-                        if isinstance(uc, dict):
-                            segment_log.append(uc)
-                        up = (uc.get("result") or {}) if isinstance(uc, dict) else {}
-                        up_path = up.get("path") if isinstance(up, dict) else None
-                        if isinstance(up_path, str):
-                            _artifact_video(up_path)
-                            shot_meta["upscaled_path"] = up_path
-                        _ev({"event": "film2.pass_upscale_finish"})
-                    if segment_log:
-                        shot_meta["segment_results"] = segment_log
-                        frames_for_hero = segment_log
-                        hero_pick = choose_hero_frame(frames_for_hero, thresholds_lock)
-                        hero_record: Dict[str, Any] = {}
-                        hero_path_value: Optional[str] = None
-                        if hero_pick is not None:
-                            hero_frame = hero_pick.get("frame") if isinstance(hero_pick, dict) else None
-                            hero_index = int(hero_pick.get("index")) if isinstance(hero_pick.get("index"), int) else hero_pick.get("index")
-                            hero_meta_payload = _frame_meta_payload(hero_frame) if isinstance(hero_frame, dict) else {}
-                            hero_record = {
-                                "index": int(hero_index) if isinstance(hero_index, int) else hero_pick.get("index"),
-                                "score": hero_pick.get("score"),
-                                "locks": hero_meta_payload.get("locks") if isinstance(hero_meta_payload.get("locks"), dict) else {},
-                            }
-                            hero_path_value = _frame_image_path(hero_frame) if isinstance(hero_frame, dict) else None
-                        elif frames_for_hero:
-                            fallback_frame = frames_for_hero[-1]
-                            fallback_meta = _frame_meta_payload(fallback_frame)
-                            hero_record = {
-                                "index": len(frames_for_hero) - 1,
-                                "score": None,
-                                "locks": fallback_meta.get("locks") if isinstance(fallback_meta.get("locks"), dict) else {},
-                                "fallback": True,
-                            }
-                            hero_path_value = _frame_image_path(fallback_frame)
-                        if hero_record:
-                            if isinstance(hero_path_value, str) and hero_path_value:
-                                if os.path.isabs(hero_path_value):
-                                    hero_abs = hero_path_value
-                                else:
-                                    hero_abs = os.path.join(UPLOAD_DIR, hero_path_value.lstrip("/"))
-                                hero_record["image_path"] = hero_abs
-                            shot_meta["hero_frame"] = hero_record
-                            hero_abs_path = hero_record.get("image_path")
-                            if isinstance(hero_abs_path, str) and hero_abs_path and character_ids:
-                                for character_id in character_ids:
-                                    existing_bundle = current_character_bundles.get(character_id)
-                                    if existing_bundle is not None:
-                                        updated_bundle = await _lock_update_from_hero(
-                                            character_id,
-                                            hero_abs_path,
-                                            existing_bundle,
-                                            locks_root_dir=LOCKS_ROOT_DIR,
-                                        )
-                                        current_character_bundles[character_id] = updated_bundle
-                                        hero_record.setdefault("bundle_versions", {})[character_id] = {
-                                            "schema_version": updated_bundle.get("schema_version"),
-                                        }
-                    result["meta"]["shots"].append(shot_meta)
-            # Story-driven Hunyuan generation when no explicit clips are provided.
-            elif shots_from_story:
+        # Helper to append distilled artifact rows when a path is produced
+        def _artifact_video(path: str) -> None:
+            if not (trace_id and isinstance(path, str) and path):
+                return
+            rel = os.path.relpath(path, UPLOAD_DIR).replace("\\", "/")
+            checkpoints_append_event(STATE_DIR, trace_id, "artifact", {"kind": "video", "path": rel})
+        # Enhance/cleanup path with provided clips
+        if clips:
+            for i, src in enumerate(clips):
+                shot_meta: Dict[str, Any] = {"index": i, "source": src}
+                segment_log: List[Dict[str, Any]] = []
+                # Cleanup
+                _ev({"event": "film2.pass_cleanup_start", "src": src})
+                cc = await http_tool_run("video.cleanup", {"src": src, "cid": cid, "trace_id": trace_id})
+                if isinstance(cc, dict):
+                    segment_log.append(cc)
+                ccr = (cc.get("result") or {}) if isinstance(cc, dict) else {}
+                clean_path = ccr.get("path") if isinstance(ccr, dict) else None
+                if isinstance(clean_path, str):
+                    _artifact_video(clean_path)
+                    shot_meta["clean_path"] = clean_path
+                _ev({"event": "film2.pass_cleanup_finish"})
+                # Temporal interpolate (optional)
+                current = clean_path or src
+                if do_interpolate and isinstance(current, str):
+                    _ev({"event": "film2.pass_interpolate_start"})
+                    ic = await http_tool_run("video.interpolate", {"src": current, "cid": cid, "trace_id": trace_id})
+                    if isinstance(ic, dict):
+                        segment_log.append(ic)
+                    icr = (ic.get("result") or {}) if isinstance(ic, dict) else {}
+                    interp_path = icr.get("path") if isinstance(icr, dict) else None
+                    if isinstance(interp_path, str):
+                        _artifact_video(interp_path)
+                        shot_meta["interp_path"] = interp_path
+                    current = interp_path or current
+                    _ev({"event": "film2.pass_interpolate_finish"})
+                # Upscale
+                if isinstance(current, str):
+                    _ev({"event": "film2.pass_upscale_start"})
+                    uc_args = {"src": current, "cid": cid, "trace_id": trace_id}
+                    if target_scale:
+                        uc_args["scale"] = target_scale
+                    uc = await http_tool_run("video.upscale", uc_args)
+                    if isinstance(uc, dict):
+                        segment_log.append(uc)
+                    up = (uc.get("result") or {}) if isinstance(uc, dict) else {}
+                    up_path = up.get("path") if isinstance(up, dict) else None
+                    if isinstance(up_path, str):
+                        _artifact_video(up_path)
+                        shot_meta["upscaled_path"] = up_path
+                    _ev({"event": "film2.pass_upscale_finish"})
+                if segment_log:
+                    shot_meta["segment_results"] = segment_log
+                    frames_for_hero = segment_log
+                    hero_pick = choose_hero_frame(frames_for_hero, thresholds_lock)
+                    hero_record: Dict[str, Any] = {}
+                    hero_path_value: Optional[str] = None
+                    if hero_pick is not None:
+                        hero_frame = hero_pick.get("frame") if isinstance(hero_pick, dict) else None
+                        hero_index = int(hero_pick.get("index")) if isinstance(hero_pick.get("index"), int) else hero_pick.get("index")
+                        hero_meta_payload = _frame_meta_payload(hero_frame) if isinstance(hero_frame, dict) else {}
+                        hero_record = {
+                            "index": int(hero_index) if isinstance(hero_index, int) else hero_pick.get("index"),
+                            "score": hero_pick.get("score"),
+                            "locks": hero_meta_payload.get("locks") if isinstance(hero_meta_payload.get("locks"), dict) else {},
+                        }
+                        hero_path_value = _frame_image_path(hero_frame) if isinstance(hero_frame, dict) else None
+                    elif frames_for_hero:
+                        fallback_frame = frames_for_hero[-1]
+                        fallback_meta = _frame_meta_payload(fallback_frame)
+                        hero_record = {
+                            "index": len(frames_for_hero) - 1,
+                            "score": None,
+                            "locks": fallback_meta.get("locks") if isinstance(fallback_meta.get("locks"), dict) else {},
+                            "fallback": True,
+                        }
+                        hero_path_value = _frame_image_path(fallback_frame)
+                    if hero_record:
+                        if isinstance(hero_path_value, str) and hero_path_value:
+                            if os.path.isabs(hero_path_value):
+                                hero_abs = hero_path_value
+                            else:
+                                hero_abs = os.path.join(UPLOAD_DIR, hero_path_value.lstrip("/"))
+                            hero_record["image_path"] = hero_abs
+                        shot_meta["hero_frame"] = hero_record
+                        hero_abs_path = hero_record.get("image_path")
+                        if isinstance(hero_abs_path, str) and hero_abs_path and character_ids:
+                            for character_id in character_ids:
+                                existing_bundle = current_character_bundles.get(character_id)
+                                if existing_bundle is not None:
+                                    updated_bundle = await _lock_update_from_hero(
+                                        character_id,
+                                        hero_abs_path,
+                                        existing_bundle,
+                                        locks_root_dir=LOCKS_ROOT_DIR,
+                                    )
+                                    current_character_bundles[character_id] = updated_bundle
+                                    hero_record.setdefault("bundle_versions", {})[character_id] = {
+                                        "schema_version": updated_bundle.get("schema_version"),
+                                    }
+                result["meta"]["shots"].append(shot_meta)
+        # Story-driven Hunyuan generation when no explicit clips are provided.
+        elif shots_from_story:
                 story_shot_index = 0
                 for shot in shots_from_story:
                     if not isinstance(shot, dict):
@@ -4823,8 +4809,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                         shot_meta["segment_results"] = segment_log
                     result["meta"]["shots"].append(shot_meta)
                     story_shot_index += 1
-            # Image-based generation goes through Hunyuan (full-res, max quality) when story shots are unavailable.
-            elif images:
+        # Image-based generation goes through Hunyuan (full-res, max quality) when story shots are unavailable.
+        elif images:
                 for i, img in enumerate(images):
                     shot_meta = {"index": i, "init_image": img}
                     segment_log = []
@@ -4859,47 +4845,42 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     if segment_log:
                         shot_meta["segment_results"] = segment_log
                     result["meta"]["shots"].append(shot_meta)
-            else:
-                # Prompt-only Hunyuan generation when no clips/images/story shots are supplied.
-                if prompt:
-                    shot_meta = {"index": 0, "prompt": prompt}
-                    segment_log = []
-                    hv_args_prompt = {
-                        "prompt": prompt,
-                        "width": width_val,
-                        "height": height_val,
-                        "fps": fps_val,
-                        "seconds": int(duration_s),
-                        "locks": locks_arg,
-                        "seed": a.get("seed"),
-                        "post": {"interpolate": True, "upscale": True, "face_lock": True, "hand_fix": True},
-                        "latent_reinit_every": 48,
-                        "cid": cid,
-                    }
-                    _ev({"event": "film2.pass_gen_start", "adapter": "hv.t2v"})
-                    gv = await execute_tool_call({"name": "video.hv.t2v", "arguments": hv_args_prompt})
-                    if isinstance(gv, dict):
-                        segment_log.append(gv)
-                    gvr = (gv.get("result") or {}) if isinstance(gv, dict) else {}
-                    gen_path = None
-                    if isinstance(gvr, dict):
-                        gen_path = gvr.get("path")
-                        if not isinstance(gen_path, str):
-                            video_obj = gvr.get("video") if isinstance(gvr.get("video"), dict) else {}
-                            gen_path = video_obj.get("path") if isinstance(video_obj.get("path"), str) else None
-                    if isinstance(gen_path, str):
-                        _artifact_video(gen_path)
-                        shot_meta["gen_path"] = gen_path
-                    _ev({"event": "film2.pass_gen_finish"})
-                    if segment_log:
-                        shot_meta["segment_results"] = segment_log
-                    result["meta"]["shots"].append(shot_meta)
-        except Exception as ex:
-            _tb = traceback.format_exc()
-            logging.error(_tb)
-            return {"name": name, "error": str(ex), "traceback": _tb}
-        finally:
-            _ev({"event": "film2.shot_finish"})
+        else:
+            # Prompt-only Hunyuan generation when no clips/images/story shots are supplied.
+            if prompt:
+                shot_meta = {"index": 0, "prompt": prompt}
+                segment_log = []
+                hv_args_prompt = {
+                    "prompt": prompt,
+                    "width": width_val,
+                    "height": height_val,
+                    "fps": fps_val,
+                    "seconds": int(duration_s),
+                    "locks": locks_arg,
+                    "seed": a.get("seed"),
+                    "post": {"interpolate": True, "upscale": True, "face_lock": True, "hand_fix": True},
+                    "latent_reinit_every": 48,
+                    "cid": cid,
+                }
+                _ev({"event": "film2.pass_gen_start", "adapter": "hv.t2v"})
+                gv = await execute_tool_call({"name": "video.hv.t2v", "arguments": hv_args_prompt})
+                if isinstance(gv, dict):
+                    segment_log.append(gv)
+                gvr = (gv.get("result") or {}) if isinstance(gv, dict) else {}
+                gen_path = None
+                if isinstance(gvr, dict):
+                    gen_path = gvr.get("path")
+                    if not isinstance(gen_path, str):
+                        video_obj = gvr.get("video") if isinstance(gvr.get("video"), dict) else {}
+                        gen_path = video_obj.get("path") if isinstance(video_obj.get("path"), str) else None
+                if isinstance(gen_path, str):
+                    _artifact_video(gen_path)
+                    shot_meta["gen_path"] = gen_path
+                _ev({"event": "film2.pass_gen_finish"})
+                if segment_log:
+                    shot_meta["segment_results"] = segment_log
+                result["meta"]["shots"].append(shot_meta)
+        _ev({"event": "film2.shot_finish"})
         # Build a simple segment hierarchy: film -> scenes -> shots -> clips (one clip per shot for now)
         film_id = cid or f"film2_{str(trace_id or '')}"
         film_segment: Dict[str, Any] = {

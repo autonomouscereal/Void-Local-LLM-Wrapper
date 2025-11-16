@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 import os, json, uuid, time, asyncio, urllib.request, os.path
-import logging, sys
+import logging, sys, traceback
 from urllib.parse import quote, urlsplit, urlparse
 import base64 as _b64
 from app.state.checkpoints import append_event as checkpoints_append_event
@@ -86,28 +86,22 @@ def _ok_env(ok: bool, **kwargs) -> dict:
 
 async def _post_json(url: str, obj: dict) -> dict:
 	async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
-		try:
-			resp = await client.post(url, json=obj)
-			ct = resp.headers.get("content-type","")
-			data = resp.json() if ("application/json" in ct) else json.loads(resp.text or "{}")
-			if 200 <= resp.status_code < 300:
-				return _ok_env(True, **(data if isinstance(data, dict) else {"data": data}))
-			return _ok_env(False, code="http_error", status=resp.status_code, detail=data)
-		except Exception as ex:
-			return _ok_env(False, code="network_error", message=str(ex))
+		resp = await client.post(url, json=obj)
+		ct = resp.headers.get("content-type", "")
+		data = resp.json() if ("application/json" in ct) else json.loads(resp.text or "{}")
+		if 200 <= resp.status_code < 300:
+			return _ok_env(True, **(data if isinstance(data, dict) else {"data": data}))
+		return _ok_env(False, code="http_error", status=resp.status_code, detail=data)
 
 
 async def _get_json(url: str) -> dict:
 	async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
-		try:
-			resp = await client.get(url, headers={"accept": "application/json"})
-			ct = resp.headers.get("content-type","")
-			data = resp.json() if ("application/json" in ct) else json.loads(resp.text or "{}")
-			if 200 <= resp.status_code < 300:
-				return _ok_env(True, **(data if isinstance(data, dict) else {"data": data}))
-			return _ok_env(False, code="http_error", status=resp.status_code, detail=data)
-		except Exception as ex:
-			return _ok_env(False, code="network_error", message=str(ex))
+		resp = await client.get(url, headers={"accept": "application/json"})
+		ct = resp.headers.get("content-type", "")
+		data = resp.json() if ("application/json" in ct) else json.loads(resp.text or "{}")
+		if 200 <= resp.status_code < 300:
+			return _ok_env(True, **(data if isinstance(data, dict) else {"data": data}))
+		return _ok_env(False, code="http_error", status=resp.status_code, detail=data)
 
 
 def _read_text(path: str) -> str:
@@ -287,13 +281,10 @@ STATE_DIR_LOCAL = os.path.join(os.getenv("UPLOAD_DIR", "/workspace/uploads"), "s
 
 # Runtime guard: force loopback base in host networking even if a container hostname sneaks in
 def _force_loopback(url: str) -> str:
-	try:
-		u = urlsplit(url)
-		host = "127.0.0.1"
-		port = u.port or (8188 if (u.scheme or "http") == "http" else 8188)
-		return f"{u.scheme or 'http'}://{host}:{port}"
-	except Exception:
-		return "http://127.0.0.1:8188"
+	u = urlsplit(url)
+	host = "127.0.0.1"
+	port = u.port or (8188 if (u.scheme or "http") == "http" else 8188)
+	return f"{u.scheme or 'http'}://{host}:{port}"
 _raw_comfy = os.getenv("COMFYUI_API_URL") or "http://127.0.0.1:8188"
 COMFY_BASE = _force_loopback(_raw_comfy)
 
@@ -303,78 +294,47 @@ def _append_jsonl(path: str, obj: dict) -> None:
 		f.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
 
-	prompt = args.get("prompt")
-	if not isinstance(prompt, str) or not prompt.strip():
-		detail = {
-			"tool": name,
-			"missing": ["prompt"],
-			"invalid": [],
-			"schema": {
-				"required": ["prompt"],
-				"notes": "image.dispatch minimal validator",
-			},
-			"args": args,
-		}
-		return ToolEnvelope.failure(
-			"invalid_args",
-			"prompt required for image.dispatch",
-			status=422,
-			request_id=rid,
-			details=detail,
-		)
-	return ToolEnvelope.success(
-		{"name": name, "valid": True, "args": args},
-		request_id=rid,
-	)
-
-
 @router.post("/tool.run")
 async def tool_run(req: Request):
 	rid = "tool.run"
-	try:
-		try:
-			body = await req.json()
-		except Exception as ex:
-			return ToolEnvelope.failure(
-				"invalid_json",
-				f"Body must be valid JSON: {ex}",
-				status=400,
-				request_id=rid,
-			)
-		if not isinstance(body, dict):
-			return ToolEnvelope.failure(
-				"invalid_body_type",
-				"Body must be a JSON object",
-				status=422,
-				request_id=rid,
-			)
-		name = (body.get("name") or "").strip()
-		args = body.get("args") or {}
+	body = await req.json()
+	if not isinstance(body, dict):
+		return ToolEnvelope.failure(
+			"invalid_body_type",
+			"Body must be a JSON object",
+			status=422,
+			request_id=rid,
+		)
+	name = (body.get("name") or "").strip()
+	args = body.get("args") or {}
 
-		# For non-image tools, call the internal orchestrator tool implementation directly
-		# instead of routing back through the executor. This avoids recursion
-		# (executor → /tool.run → executor) and ensures each planned step executes once.
-		if name != "image.dispatch":
-			from app.main import execute_tool_call  # type: ignore
-			call = {"name": name, "arguments": (args if isinstance(args, dict) else {})}
-			res = await execute_tool_call(call)
-			if isinstance(res, dict) and isinstance(res.get("result"), dict):
-				return ToolEnvelope.success(res["result"], request_id=rid)
-			err_obj = res.get("error") if isinstance(res, dict) else None
-			if isinstance(err_obj, dict):
-				code = str(err_obj.get("code") or "tool_error")
-				message = str(err_obj.get("message") or "")
-				status = int(err_obj.get("status") or err_obj.get("_http_status") or 422)
-				return ToolEnvelope.failure(code, message, status=status, request_id=rid, details=err_obj)
-			if isinstance(err_obj, str):
-				return ToolEnvelope.failure("tool_error", err_obj, status=422, request_id=rid, details={})
-			return ToolEnvelope.failure(
-				"tool_error",
-				"tool failed",
-				status=422,
-				request_id=rid,
-				details={},
-			)
+	# For non-image tools, call the internal orchestrator tool implementation directly
+	# instead of routing back through the executor. This avoids recursion
+	# (executor → /tool.run → executor) and ensures each planned step executes once.
+	if name != "image.dispatch":
+		from app.main import execute_tool_call  # type: ignore
+		call = {"name": name, "arguments": (args if isinstance(args, dict) else {})}
+		res = await execute_tool_call(call)
+		if isinstance(res, dict) and isinstance(res.get("result"), dict):
+			return ToolEnvelope.success(res["result"], request_id=rid)
+		err_obj = res.get("error") if isinstance(res, dict) else None
+		if isinstance(err_obj, dict):
+			code = str(err_obj.get("code") or "tool_error")
+			message = str(err_obj.get("message") or "")
+			status = int(err_obj.get("status") or err_obj.get("_http_status") or 422)
+			# Preserve any traceback/details from inner tool handlers so executor logs see real stack lines.
+			return ToolEnvelope.failure(code, message, status=status, request_id=rid, details=err_obj)
+		if isinstance(err_obj, str):
+			return ToolEnvelope.failure("tool_error", err_obj, status=422, request_id=rid, details={})
+		# Fallback: surface the raw response for debugging instead of hiding it behind a generic message.
+		log.error("[toolrun] tool=%s returned non-standard error payload: %r", name, res)
+		return ToolEnvelope.failure(
+			"tool_error",
+			"tool returned non-standard error payload",
+			status=500,
+			request_id=rid,
+			details={"raw": res},
+		)
 
 		# Use the existing Comfy pipeline below for image.dispatch; do not import app.main._image_dispatch_run.
 
@@ -413,35 +373,30 @@ async def tool_run(req: Request):
 
 		# Lightweight auto-bind: if the KSampler lacks positive/negative refs, inject CLIPTextEncode nodes and wire them.
 		if isinstance(prompt_graph, dict):
-			try:
-				ks_id = _first_node_id_by_class(prompt_graph, "KSampler") or _first_node_id_by_class(prompt_graph, "KSamplerAdvanced")
-				if ks_id:
-					ks_in = prompt_graph[str(ks_id)].setdefault("inputs", {})
-					pos_id = _get_ref_node_id(ks_in.get("positive"))
-					neg_id = _get_ref_node_id(ks_in.get("negative"))
-					if not pos_id or not neg_id:
-						ckpt_id = _first_node_id_by_class(prompt_graph, "CheckpointLoaderSimple") or _first_node_id_by_class(prompt_graph, "CheckpointLoaderSimpleSDXL")
-						if ckpt_id:
-							# Find next free integer id(s)
-							def _next_id(g: dict) -> str:
-								max_id = 0
-								for k in g.keys():
-									try:
-										max_id = max(max_id, int(str(k)))
-									except Exception:
-										continue
-								return str(max_id + 1)
-							if not pos_id:
-								new_pos_id = _next_id(prompt_graph)
-								prompt_graph[new_pos_id] = {"class_type": "CLIPTextEncode", "inputs": {"clip": [str(ckpt_id), 1], "text": str(args.get("prompt") or "")}}
-								ks_in["positive"] = [new_pos_id, 0]
-							if not neg_id:
-								new_neg_id = _next_id(prompt_graph)
-								prompt_graph[new_neg_id] = {"class_type": "CLIPTextEncode", "inputs": {"clip": [str(ckpt_id), 1], "text": str(args.get("negative") or "")}}
-								ks_in["negative"] = [new_neg_id, 0]
-			except Exception:
-				# Non-fatal: allow normal validation/binding to report precise errors
-				pass
+			ks_id = _first_node_id_by_class(prompt_graph, "KSampler") or _first_node_id_by_class(prompt_graph, "KSamplerAdvanced")
+			if ks_id:
+				ks_in = prompt_graph[str(ks_id)].setdefault("inputs", {})
+				pos_id = _get_ref_node_id(ks_in.get("positive"))
+				neg_id = _get_ref_node_id(ks_in.get("negative"))
+				if not pos_id or not neg_id:
+					ckpt_id = _first_node_id_by_class(prompt_graph, "CheckpointLoaderSimple") or _first_node_id_by_class(prompt_graph, "CheckpointLoaderSimpleSDXL")
+					if ckpt_id:
+						# Find next free integer id(s)
+						def _next_id(g: dict) -> str:
+							max_id = 0
+							for k in g.keys():
+								s = str(k)
+								if s.isdigit():
+									max_id = max(max_id, int(s))
+							return str(max_id + 1)
+						if not pos_id:
+							new_pos_id = _next_id(prompt_graph)
+							prompt_graph[new_pos_id] = {"class_type": "CLIPTextEncode", "inputs": {"clip": [str(ckpt_id), 1], "text": str(args.get("prompt") or "")}}
+							ks_in["positive"] = [new_pos_id, 0]
+						if not neg_id:
+							new_neg_id = _next_id(prompt_graph)
+							prompt_graph[new_neg_id] = {"class_type": "CLIPTextEncode", "inputs": {"clip": [str(ckpt_id), 1], "text": str(args.get("negative") or "")}}
+							ks_in["negative"] = [new_neg_id, 0]
 
 		if not isinstance(prompt_graph, dict):
 			# Synthesize a valid graph instead of failing
@@ -496,36 +451,9 @@ async def tool_run(req: Request):
 				"6": {"class_type": "VAEDecode", "inputs": {"samples": ["5", 0], "vae": ["3", 2]}},
 				"7": {"class_type": "SaveImage", "inputs": {"images": ["6", 0]}},
 			}
-		# Resolve actual nodes and apply overrides only to those; if binding fails, fall back to a known-good pipeline
-		try:
-			bind = _resolve_bindings(prompt_graph)
-			_apply_overrides(prompt_graph, bind, args)
-		except ValueError:
-			# Build a minimal, valid API graph wiring CLIPTextEncode -> KSampler -> VAEDecode
-			model_ckpt = str(args.get("model") or "sd_xl_base_1.0.safetensors")
-			prompt_text = str(args.get("prompt") or "")
-			neg_text = str(args.get("negative") or "")
-			width = int(args.get("width") or 1024)
-			height = int(args.get("height") or 1024)
-			steps = int(args.get("steps") or 32)
-			cfg = float(args.get("cfg") or 5.5)
-			prompt_graph = {
-				"3": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": model_ckpt}},
-				"4": {"class_type": "EmptyLatentImage", "inputs": {"width": width, "height": height, "batch_size": 1}},
-				"8": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["3", 1], "text": prompt_text}},
-				"9": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["3", 1], "text": neg_text}},
-				"5": {"class_type": "KSampler", "inputs": {
-					"seed": int(args.get("seed") or 123456789),
-					"steps": steps, "cfg": cfg,
-					"sampler_name": str(args.get("sampler") or args.get("sampler_name") or "euler"),
-					"scheduler": str(args.get("scheduler") or "normal"),
-					"denoise": 1.0,
-					"model": ["3", 0], "positive": ["8", 0], "negative": ["9", 0], "latent_image": ["4", 0]
-				}},
-				"6": {"class_type": "VAEDecode", "inputs": {"samples": ["5", 0], "vae": ["3", 2]}},
-				"7": {"class_type": "SaveImage", "inputs": {"images": ["6", 0]}},
-			}
-			# continue with this synthesized graph
+		# Resolve actual nodes and apply overrides only to those. If binding fails, let it raise so we see the real error.
+		bind = _resolve_bindings(prompt_graph)
+		_apply_overrides(prompt_graph, bind, args)
 		# Ensure SaveImage nodes have a filename_prefix (required by newer ComfyUI)
 		_client_id = uuid.uuid4().hex
 		cid = (args.get("cid") or "").strip() if isinstance(args.get("cid"), str) else ""
@@ -714,13 +642,9 @@ async def tool_run(req: Request):
 		if saved_paths:
 			if _qa_analyze_image is not None and _qa_analyze_image_regions is not None:
 				first_image_path = saved_paths[0]
-				try:
-					prompt_str = str(args.get("prompt") or "")
-					global_info = _qa_analyze_image(first_image_path, prompt_str)
-					region_info = _qa_analyze_image_regions(first_image_path, prompt_str, global_info)
-				except Exception:
-					global_info = {}
-					region_info = {}
+				prompt_str = str(args.get("prompt") or "")
+				global_info = _qa_analyze_image(first_image_path, prompt_str)
+				region_info = _qa_analyze_image_regions(first_image_path, prompt_str, global_info)
 				# Attach global scores/semantics into result["qa"]["images"]
 				img_qa = result.setdefault("qa", {}).setdefault("images", {})
 				if isinstance(img_qa, dict) and isinstance(global_info, dict):
@@ -831,14 +755,3 @@ async def tool_run(req: Request):
 					"prompt_id": prompt_id,
 				})
 		return ToolEnvelope.success(result, request_id=rid)
-
-	# Last-resort guardrail: never let unexpected exceptions escape /tool.run
-	# (outer try/except at function level)
-	except Exception as ex:
-		return ToolEnvelope.failure(
-			"toolrun_exception",
-			f"{type(ex).__name__}: {ex}",
-			status=500,
-			request_id=rid,
-			details={},
-		)
