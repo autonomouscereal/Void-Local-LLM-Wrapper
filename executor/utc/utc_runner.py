@@ -1,5 +1,3 @@
-import asyncio
-import json
 import time
 import logging
 import traceback
@@ -7,7 +5,8 @@ from typing import Any, Dict, Optional, List
 
 import os
 import random
-from urllib.error import HTTPError
+
+import requests
 from orchestrator.app.json_parser import JSONParser  # type: ignore
 from .schema_fetcher import fetch as fetch_schema
 from .universal_adapter import repair as repair_args
@@ -15,16 +14,22 @@ from .patch_store import preapply as preapply_patch, persist_success as persist_
 from .db import get_pg_pool
 
 
-
 def _post(url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    import urllib.request
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
-    with urllib.request.urlopen(req) as resp:
-        raw = resp.read().decode("utf-8", errors="replace")
-        parser = JSONParser()
-        # tool.run and logs.append both return dict-like envelopes; use open schema here.
-        return parser.parse(raw, {})
+    """
+    Synchronous HTTP POST helper for executor → orchestrator calls.
+
+    Returns a dict representing the parsed JSON body when possible and
+    injects an `_http_status` field with the HTTP status code. No exceptions
+    are caught here; connection-level failures should surface directly.
+    """
+    r = requests.post(url, json=payload, timeout=None)
+    text = r.text or ""
+    parser = JSONParser()
+    body = parser.parse(text, {})
+    if isinstance(body, dict):
+        body.setdefault("_http_status", r.status_code)
+        return body
+    return {"_http_status": r.status_code, "raw": body}
 
 
 async def _emit_review_event(event: str, trace_id: Optional[str], step_id: Optional[str], notes: Any = None):
@@ -98,31 +103,67 @@ async def utc_run_tool(trace_id: Optional[str], step_id: Optional[str], name: st
     attempt_args.setdefault("autofix_422", True)
     payload = {"name": name, "args": attempt_args, "stream": False, "trace_id": trace_id}
     res = _post(base.rstrip("/") + "/tool.run", payload)
+
+    # If orchestrator returned a non-dict, surface that as a structured error envelope.
+    if not isinstance(res, dict):
+        return {
+            "schema_version": 1,
+            "trace_id": trace_id,
+            "ok": False,
+            "result": None,
+            "error": {
+                "code": "utc_non_dict_response",
+                "message": f"_post returned non-dict for tool {name}",
+                "status": 422,
+                "raw": res,
+                "stack": _stack_str(),
+            },
+        }
+
     # Ensure we always attach a trace_id to the response envelope
-    if isinstance(res, dict) and "trace_id" not in res:
+    if "trace_id" not in res or res.get("trace_id") is None:
         res["trace_id"] = trace_id
-    if isinstance(res, dict) and bool(res.get("ok")):
+
+    # If orchestrator indicates success (ok != False), pass envelope through.
+    if res.get("ok") is not False:
         pool = await get_pg_pool()
         if pool is not None:
             try:
+                import json as _json
                 async with pool.acquire() as c:
-                    await c.execute("insert into tool_call_telemetry(trace_id,step_id,tool_name,version,builder_ok,repair_rounds,retargeted,status_code,error_json,final_args) values ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10::jsonb)",
-                                    trace_id, step_id, name, version, True, 1, False, 200, json.dumps(None), json.dumps(attempt_args))
+                    await c.execute(
+                        "insert into tool_call_telemetry(trace_id,step_id,tool_name,version,builder_ok,repair_rounds,retargeted,status_code,error_json,final_args) "
+                        "values ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10::jsonb)",
+                        trace_id,
+                        step_id,
+                        name,
+                        version,
+                        True,
+                        1,
+                        False,
+                        int(res.get("_http_status") or 200),
+                        _json.dumps(None),
+                        _json.dumps(attempt_args),
+                    )
             except Exception:
                 pass
         return res
 
-    # No retarget per canonical route set
-
-    # final failure telemetry
-    pool = await get_pg_pool()
-    if pool is not None:
-        try:
-            async with pool.acquire() as c:
-                await c.execute("insert into tool_call_telemetry(trace_id,step_id,tool_name,version,builder_ok,repair_rounds,retargeted,status_code,error_json,final_args) values ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10::jsonb)",
-                                trace_id, step_id, name, version, True, 1, False, int(res.get('status') or res.get('_http_status') or 422), json.dumps((res or {}).get("error")), json.dumps(attempt_args))
-        except Exception:
-            pass
-    return res
+    # Non-ok orchestrator response: wrap with a canonical error envelope.
+    status = int(res.get("status") or res.get("_http_status") or 422)
+    err_obj = res.get("error") if isinstance(res.get("error"), dict) else {}
+    return {
+        "schema_version": 1,
+        "trace_id": trace_id,
+        "ok": False,
+        "result": None,
+        "error": {
+            "code": err_obj.get("code") or "tool_error",
+            "message": err_obj.get("message") or "tool failed",
+            "status": status,
+            "raw": res,
+            "stack": _stack_str(),
+        },
+    }
 
 

@@ -85,6 +85,10 @@ def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
                 break
     except Exception:
         inferred_voice = None
+    # Determine language with a hard default to English if unspecified.
+    lang = job.get("language")
+    if not isinstance(lang, str) or not lang.strip():
+        lang = "en"
     args = {
         "text": job.get("text") or "",
         "voice": params.get("voice") or tts_voice_id or inferred_voice,
@@ -97,6 +101,7 @@ def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
         "seed": job.get("seed"),
         "lock_bundle": lock_bundle,
         "quality_profile": quality_profile,
+        "language": lang,
     }
     args = stamp_tool_args("tts.speak", args)
     res = provider.speak(args)

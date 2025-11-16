@@ -5134,37 +5134,85 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         if not XTTS_API_URL:
             return {"name": name, "error": "XTTS_API_URL not configured"}
         class _TTSProvider:
-            async def _xtts(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+            def speak(self, payload: Dict[str, Any]) -> Dict[str, Any]:
                 trace_id = payload.get("trace_id") if isinstance(payload.get("trace_id"), str) else "tt_xtts_unknown"
-                async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
-                    emit_progress({"stage": "request", "target": "xtts"})
-                    r = await client.post(XTTS_API_URL.rstrip("/") + "/tts", json=payload)
+                emit_progress({"stage": "request", "target": "xtts"})
+                import httpx as _hxsync  # use sync client locally to avoid event loop bridging
+                # Ensure language is always set; default to English if absent.
+                lang = payload.get("language")
+                if not isinstance(lang, str) or not lang.strip():
+                    payload["language"] = "en"
+                with _hxsync.Client(timeout=None, trust_env=False) as client:
+                    r = client.post(XTTS_API_URL.rstrip("/") + "/tts", json=payload)
                     status = r.status_code
+                    ct = r.headers.get("content-type", "")
                     if 200 <= status < 300:
-                        # Expected: wav_b64 or url + duration/model metadata
-                        js = _resp_json(r, {"wav_b64": str, "url": str, "duration_s": (float), "model": str})
-                        wav = b""
-                        if isinstance(js.get("wav_b64"), str):
-                            wav = _b.b64decode(js.get("wav_b64"))
-                        elif isinstance(js.get("url"), str):
-                            rr = await client.get(js.get("url"))
-                            if rr.status_code == 200:
-                                wav = rr.content
-                        emit_progress({"stage": "received", "bytes": len(wav)})
+                        # XTTS service returns a canonical envelope: decode audio and adapt to internal shape.
+                        if "application/json" in ct:
+                            env = _resp_json(
+                                r,
+                                {
+                                    "schema_version": int,
+                                    "trace_id": str,
+                                    "ok": bool,
+                                    "result": dict,
+                                    "error": dict,
+                                },
+                            )
+                        else:
+                            env = {
+                                "schema_version": 1,
+                                "trace_id": trace_id,
+                                "ok": False,
+                                "result": None,
+                                "error": {
+                                    "code": "tts_invalid_body",
+                                    "status": status,
+                                    "message": "XTTS /tts returned non-JSON body",
+                                    "raw": r.text,
+                                    "stack": "".join(traceback.format_stack()),
+                                },
+                            }
+                        if isinstance(env, dict) and env.get("ok") is True:
+                            inner = env.get("result") if isinstance(env.get("result"), dict) else {}
+                            b64 = inner.get("audio_wav_base64") or inner.get("wav_b64")
+                            wav = b""
+                            if isinstance(b64, str):
+                                import base64 as _b64local
+                                wav = _b64local.b64decode(b64)
+                            # Adapt to canonical internal envelope expected by run_tts_speak.
+                            return {
+                                "schema_version": 1,
+                                "request_id": trace_id,
+                                "trace_id": trace_id,
+                                "ok": True,
+                                "result": {
+                                    "wav_bytes": wav,
+                                    "duration_s": float(inner.get("duration_s") or 0.0),
+                                    "model": inner.get("model") or "xtts",
+                                },
+                                "error": None,
+                            }
+                        # Any non-ok env from XTTS is wrapped as a tool error.
                         return {
                             "schema_version": 1,
                             "request_id": trace_id,
                             "trace_id": trace_id,
-                            "ok": True,
-                            "result": {
-                                "wav_bytes": wav,
-                                "duration_s": float(js.get("duration_s") or 0.0),
-                                "model": js.get("model") or "xtts",
+                            "ok": False,
+                            "result": None,
+                            "error": {
+                                "code": "tts_invalid_envelope",
+                                "status": status,
+                                "message": "XTTS /tts returned non-ok envelope",
+                                "raw": env,
+                                "stack": "".join(traceback.format_stack()),
                             },
-                            "error": None,
                         }
-                    ct = r.headers.get("content-type", "")
-                    data = r.json() if ("application/json" in ct) else {"body": r.text}
+                    # Non-2xx status: construct error envelope.
+                    raw_body = r.text
+                    data = None
+                    if "application/json" in ct:
+                        data = _resp_json(r, {})
                     return {
                         "schema_version": 1,
                         "request_id": trace_id,
@@ -5175,13 +5223,10 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                             "code": "tts_http_error",
                             "status": status,
                             "message": "XTTS /tts returned non-2xx or invalid body",
-                            "raw": data,
+                            "raw": data if data is not None else {"body": raw_body},
                             "stack": "".join(traceback.format_stack()),
                         },
                     }
-            def speak(self, args: Dict[str, Any]) -> Dict[str, Any]:
-                # Bridge sync to async
-                return _as.get_event_loop().run_until_complete(self._xtts(args))
         provider = _TTSProvider()
         manifest = {"items": []}
         a = args if isinstance(args, dict) else {}
@@ -5486,24 +5531,22 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             }
 
         class _WindowMusicProvider:
-            async def _compose(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-                async with httpx.AsyncClient() as client:
-                    body = {
-                        "prompt": payload.get("prompt"),
-                        # Wire directly to the music service contract: it expects `seconds`.
-                        "seconds": int(payload.get("length_s") or 8),
-                        "music_lock": payload.get("music_lock"),
-                        "seed": payload.get("seed"),
-                        "refs": payload.get("refs") or payload.get("music_refs"),
-                    }
-                    r = await client.post(MUSIC_API_URL.rstrip("/") + "/generate", json=body)
+            def compose(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+                import httpx as _hxsync  # local sync client
+                body = {
+                    "prompt": payload.get("prompt"),
+                    # Wire directly to the music service contract: it expects `seconds`.
+                    "seconds": int(payload.get("length_s") or 8),
+                    "music_lock": payload.get("music_lock"),
+                    "seed": payload.get("seed"),
+                    "refs": payload.get("refs") or payload.get("music_refs"),
+                }
+                with _hxsync.Client(timeout=None, trust_env=False) as client:
+                    r = client.post(MUSIC_API_URL.rstrip("/") + "/generate", json=body)
                     js = _resp_json(r, {"audio_wav_base64": str, "wav_b64": str})
                     b64 = js.get("audio_wav_base64") or js.get("wav_b64")
                     wav = _b.b64decode(b64) if isinstance(b64, str) else b""
                     return {"wav_bytes": wav, "model": f"musicgen:{os.getenv('MUSIC_MODEL_ID','')}"}
-
-            def compose(self, args: Dict[str, Any]) -> Dict[str, Any]:
-                return _as.get_event_loop().run_until_complete(self._compose(args))
 
         provider = _WindowMusicProvider()
         manifest = {"items": []}
@@ -5613,23 +5656,22 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         if not MUSIC_API_URL:
             return {"name": name, "error": "MUSIC_API_URL not configured"}
         class _MusicProvider:
-            async def _compose(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-                async with httpx.AsyncClient() as client:
-                    body = {
-                        "prompt": payload.get("prompt"),
-                        "duration": int(payload.get("length_s") or 8),
-                        # Pass through locks/refs so backends that support them can enforce consistency
-                        "music_lock": payload.get("music_lock") or (payload.get("music_refs") if isinstance(payload, dict) else None),
-                        "seed": payload.get("seed"),
-                        "refs": payload.get("refs") or payload.get("music_refs"),
-                    }
-                    r = await client.post(MUSIC_API_URL.rstrip("/") + "/generate", json=body)
+            def compose(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+                import httpx as _hxsync  # local sync client
+                body = {
+                    "prompt": payload.get("prompt"),
+                    "duration": int(payload.get("length_s") or 8),
+                    # Pass through locks/refs so backends that support them can enforce consistency
+                    "music_lock": payload.get("music_lock") or (payload.get("music_refs") if isinstance(payload, dict) else None),
+                    "seed": payload.get("seed"),
+                    "refs": payload.get("refs") or payload.get("music_refs"),
+                }
+                with _hxsync.Client(timeout=None, trust_env=False) as client:
+                    r = client.post(MUSIC_API_URL.rstrip("/") + "/generate", json=body)
                     js = _resp_json(r, {"audio_wav_base64": str, "wav_b64": str})
                     b64 = js.get("audio_wav_base64") or js.get("wav_b64")
                     wav = _b.b64decode(b64) if isinstance(b64, str) else b""
                     return {"wav_bytes": wav, "model": f"musicgen:{os.getenv('MUSIC_MODEL_ID','')}"}
-            def compose(self, args: Dict[str, Any]) -> Dict[str, Any]:
-                return _as.get_event_loop().run_until_complete(self._compose(args))
         provider = _MusicProvider()
         manifest = {"items": []}
         try:
@@ -5801,23 +5843,21 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         if not MUSIC_API_URL:
             return {"name": name, "error": "MUSIC_API_URL not configured"}
         class _MusicRefineProvider:
-            async def _compose(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-                async with httpx.AsyncClient() as client:
-                    body = {
-                        "prompt": payload.get("prompt"),
-                        "duration": int(payload.get("length_s") or 8),
-                        "music_lock": payload.get("music_lock"),
-                        "seed": payload.get("seed"),
-                        "refs": payload.get("refs") or payload.get("music_refs"),
-                    }
-                    r = await client.post(MUSIC_API_URL.rstrip("/") + "/generate", json=body)
+            def compose(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+                import httpx as _hxsync  # local sync client
+                body = {
+                    "prompt": payload.get("prompt"),
+                    "duration": int(payload.get("length_s") or 8),
+                    "music_lock": payload.get("music_lock"),
+                    "seed": payload.get("seed"),
+                    "refs": payload.get("refs") or payload.get("music_refs"),
+                }
+                with _hxsync.Client(timeout=None, trust_env=False) as client:
+                    r = client.post(MUSIC_API_URL.rstrip("/") + "/generate", json=body)
                     js = _resp_json(r, {"audio_wav_base64": str, "wav_b64": str})
                     b64 = js.get("audio_wav_base64") or js.get("wav_b64")
                     wav = _b.b64decode(b64) if isinstance(b64, str) else b""
                     return {"wav_bytes": wav, "model": f"musicgen:{os.getenv('MUSIC_MODEL_ID','')}"}
-
-            def compose(self, args: Dict[str, Any]) -> Dict[str, Any]:
-                return _as.get_event_loop().run_until_complete(self._compose(args))
 
         provider = _MusicRefineProvider()
         manifest = {"items": []}
@@ -8527,30 +8567,41 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         base = (p.get("base") or "").rstrip("/") or QWEN_BASE_URL
         model = p.get("model") or QWEN_MODEL_ID
         payload = build_ollama_payload(committee_msgs, model, DEFAULT_NUM_CTX, DEFAULT_TEMPERATURE)
-        try:
-            _log("committee.backend.call", trace_id=trace_id, member=member, base=base, model=model)
-            _log("committee.preplan.call", trace_id=trace_id, member=member, base=base, model=model)
-            res = await call_ollama(base, payload)
-            # Treat backend-level errors as hard failures for this committee member.
-            if isinstance(res, dict) and isinstance(res.get("error"), str) and res.get("error"):
-                raise RuntimeError(f"committee backend error for {member}: {res.get('error')}")
-            text = (res.get("response") or "").strip() if isinstance(res, dict) else ""
-            parsed = parser.parse(text or "{}", {"rationale": str, "tools_outline": [str]})
-            rationale = (parsed.get("rationale") or text or "").strip()
-            tools_outline = parsed.get("tools_outline") or []
-        except Exception as ex:
-            # Log and track committee member failures instead of silently degrading.
-            _log("committee.backend.error", trace_id=trace_id, member=member, base=base, model=model, error=str(ex))
+        _log("committee.backend.call", trace_id=trace_id, member=member, base=base, model=model)
+        _log("committee.preplan.call", trace_id=trace_id, member=member, base=base, model=model)
+        res = await call_ollama(base, payload)
+        # Default pessimistic values; overwritten on success.
+        rationale = ""
+        tools_outline: List[str] = []
+        if not isinstance(res, dict):
+            err_msg = f"committee backend returned non-dict for {member}"
+            _log("committee.backend.error", trace_id=trace_id, member=member, base=base, model=model, error=err_msg)
             committee_errors.append(
                 {
                     "member": member,
                     "base": base,
                     "model": model,
-                    "error": str(ex),
+                    "error": err_msg,
                 }
             )
-            rationale = f"(committee error: {ex})"
-            tools_outline = []
+            rationale = f"(committee error: {err_msg})"
+        elif isinstance(res.get("error"), str) and res.get("error"):
+            err_str = res.get("error") or ""
+            _log("committee.backend.error", trace_id=trace_id, member=member, base=base, model=model, error=err_str)
+            committee_errors.append(
+                {
+                    "member": member,
+                    "base": base,
+                    "model": model,
+                    "error": err_str,
+                }
+            )
+            rationale = f"(committee error: {err_str})"
+        else:
+            text = (res.get("response") or "").strip()
+            parsed = parser.parse(text or "{}", {"rationale": str, "tools_outline": [str]})
+            rationale = (parsed.get("rationale") or text or "").strip()
+            tools_outline = parsed.get("tools_outline") or []
         opt_id = f"opt_{member}"
         preplan_options.append(
             {

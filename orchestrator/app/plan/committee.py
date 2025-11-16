@@ -127,10 +127,17 @@ async def _plan_with_retry(system: str, user_text: str, request_id: str, attempt
 async def make_full_plan(user_text: str) -> Dict[str, Any]:
     import uuid as _uuid
     rid = str(_uuid.uuid4())
-    img_t = asyncio.create_task(_plan_with_retry(SYSTEM_IMAGE, user_text, rid))
-    vid_t = asyncio.create_task(_plan_with_retry(SYSTEM_VIDEO, user_text, rid))
-    aud_t = asyncio.create_task(_plan_with_retry(SYSTEM_AUDIO, user_text, rid))
-    parts = await asyncio.gather(img_t, vid_t, aud_t, return_exceptions=True)
+    # Sequential planning: run IMAGE, VIDEO, AUDIO planners one after another for stability.
+    parts: List[Dict[str, Any]] = []
+    img_plan = await _plan_with_retry(SYSTEM_IMAGE, user_text, rid)
+    if isinstance(img_plan, dict):
+        parts.append(img_plan)
+    vid_plan = await _plan_with_retry(SYSTEM_VIDEO, user_text, rid)
+    if isinstance(vid_plan, dict):
+        parts.append(vid_plan)
+    aud_plan = await _plan_with_retry(SYSTEM_AUDIO, user_text, rid)
+    if isinstance(aud_plan, dict):
+        parts.append(aud_plan)
     merged = {"request_id": rid, "plan": []}
     seen = set()
     for p in parts:

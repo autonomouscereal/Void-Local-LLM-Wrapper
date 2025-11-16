@@ -37,19 +37,38 @@ async def healthz():
 
 @app.post("/tts")
 async def tts(body: Dict[str, Any]):
+    trace_id = body.get("trace_id") if isinstance(body.get("trace_id"), str) else "tt_xtts_unknown"
     text = body.get("text") or ""
     speaker = body.get("voice")
+    language = body.get("language") or "en"
     if not text:
-        return JSONResponse(status_code=400, content={"error": "missing text"})
+        return JSONResponse(
+            status_code=400,
+            content={
+                "schema_version": 1,
+                "trace_id": trace_id,
+                "ok": False,
+                "result": None,
+                "error": {"code": "bad_request", "message": "Missing 'text' for TTS."},
+            },
+        )
     tts = get_tts()
-    wav = tts.tts(text=text, speaker=speaker)  # type: ignore[call-arg]
+    wav = tts.tts(text=text, speaker=speaker, language=language)  # type: ignore[call-arg]
     wav = np.array(wav, dtype=np.float32)
     buf = io.BytesIO()
     sf.write(buf, wav, 22050, format="WAV")
     buf.seek(0)
-    # return base64 for simplicity
     import base64
     b64 = base64.b64encode(buf.read()).decode("utf-8")
-    return {"audio_wav_base64": b64, "sample_rate": 22050}
+    return JSONResponse(
+        status_code=200,
+        content={
+            "schema_version": 1,
+            "trace_id": trace_id,
+            "ok": True,
+            "result": {"audio_wav_base64": b64, "sample_rate": 22050, "language": language},
+            "error": None,
+        },
+    )
 
 
