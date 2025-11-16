@@ -17,7 +17,7 @@ sys.path.append("/workspace")
 from orchestrator.app.json_parser import JSONParser  # use the same hardened JSON parser
 
 import psutil
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from executor.utc.utc_runner import utc_run_tool  # moved to top per import policy
 from executor.utc.db import ensure_tables
@@ -42,35 +42,16 @@ logging.basicConfig(
 log = logging.getLogger("executor")
 
 
+def _stack_str() -> str:
+    """Return a best-effort string representation of the current call stack."""
+    return "".join(traceback.format_stack())
+
+
 @app.on_event("startup")
 async def _startup():
     # Let startup failures surface normally; no swallowing.
     await ensure_tables()
     logging.info("[executor] UTC tables ensured")
-
-
-@app.exception_handler(Exception)
-async def _executor_exception_handler(request: Request, exc: Exception):
-    """
-    Global handler for unhandled exceptions in the executor.
-    Surfaces full traceback in the JSON body instead of collapsing to 'tool failed'.
-    """
-    tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-    log.error("[executor] unhandled exception path=%s exc=%r\n%s", request.url.path, exc, tb)
-    return JSONResponse(
-        {
-            "schema_version": 1,
-            "request_id": None,
-            "ok": False,
-            "error": {
-                "type": type(exc).__name__,
-                "message": str(exc),
-                "traceback": tb,
-            },
-            "result": {"produced": []},
-        },
-        status_code=500,
-    )
 
 def within_workspace(path: str) -> str:
     full = os.path.abspath(os.path.join(WORKSPACE_DIR, path))
@@ -442,20 +423,41 @@ async def run_steps(trace_id: str, request_id: str, steps: list[dict]) -> Dict[s
                 raise ValueError(f"missing_tool:{sid}")
             args = merge_inputs(step)
             t0 = time.time()
-            _post_json(ORCHESTRATOR_BASE_URL.rstrip("/") + "/logs/tools.append", {
-                "t": int(time.time()*1000),
-                "event": "exec_step_start",
-                "tool": tool_name,
-                "trace_id": request_id,
-                "cid": request_id,
-                "step_id": sid,
-            }, expected={})
+            _post_json(
+                ORCHESTRATOR_BASE_URL.rstrip("/") + "/logs/tools.append",
+                {
+                    "t": int(time.time() * 1000),
+                    "event": "exec_step_start",
+                    "tool": tool_name,
+                    "trace_id": request_id,
+                    "cid": request_id,
+                    "step_id": sid,
+                },
+                expected={},
+            )
             res = await utc_run_tool(trace_id, sid, tool_name, args)
             ok = False
-            if isinstance(res, dict) and bool(res.get("ok")) is True and res.get("result") is not None:
+            # Guard: utc_run_tool must never return None/non-dict; if it does, wrap in a result block
+            # that matches existing executor result structure (ids/meta/error/status), with a stack.
+            if not isinstance(res, dict):
+                produced[sid] = {
+                    "name": tool_name,
+                    "result": {
+                        "ids": {},
+                        "meta": {},
+                        "error": {
+                            "code": "executor_non_dict_result",
+                            "message": f"utc_run_tool returned {type(res).__name__} for tool {tool_name}",
+                            "stack": _stack_str(),
+                            "trace_id": trace_id or request_id,
+                        },
+                        "status": 422,
+                    },
+                }
+            elif bool(res.get("ok")) is True and res.get("result") is not None:
                 produced[sid] = {"name": tool_name, "result": _canonical_tool_result(res)}
                 ok = True
-            elif isinstance(res, dict) and bool(res.get("ok")) is False:
+            elif bool(res.get("ok")) is False:
                 err_obj = res.get("error") if isinstance(res.get("error"), dict) else {}
                 code_val = err_obj.get("code") if isinstance(err_obj, dict) else None
                 msg_val = err_obj.get("message") if isinstance(err_obj, dict) else None
@@ -466,31 +468,29 @@ async def run_steps(trace_id: str, request_id: str, steps: list[dict]) -> Dict[s
                 if tb:
                     logging.error(tb if isinstance(tb, str) else str(tb))
                 env_fields = {}
-                if isinstance(res, dict):
-                    for k in ("code", "message", "detail", "_http_status", "status"):
-                        if k in res:
-                            env_fields[k] = res[k]
-                    err_code = res.get("code") or (res.get("error") or {}).get("code")
-                    err_msg = res.get("message") or (res.get("error") or {}).get("message")
-                    err_det = res.get("detail") or (res.get("error") or {}).get("detail")
-                    logging.error(
-                        "[executor] step=%s tool=%s FAILED code=%s msg=%s detail=%s env=%s",
-                        sid,
-                        tool_name,
-                        err_code,
-                        err_msg,
-                        err_det,
-                        json.dumps(env_fields, sort_keys=True),
-                    )
-                else:
-                    logging.error("[executor] step=%s tool=%s FAILED %s", sid, tool_name, msg)
+                for k in ("code", "message", "detail", "_http_status", "status"):
+                    if k in res:
+                        env_fields[k] = res[k]
+                err_code = res.get("code") or (res.get("error") or {}).get("code")
+                err_msg = res.get("message") or (res.get("error") or {}).get("message")
+                err_det = res.get("detail") or (res.get("error") or {}).get("detail")
+                logging.error(
+                    "[executor] step=%s tool=%s FAILED code=%s msg=%s detail=%s env=%s",
+                    sid,
+                    tool_name,
+                    err_code,
+                    err_msg,
+                    err_det,
+                    json.dumps(env_fields, sort_keys=True),
+                )
                 produced[sid] = {
                     "name": tool_name,
                     "result": {
                         "ids": {},
                         "meta": {},
-                        "error": (res.get("error") if isinstance(res, dict) else {"message": msg}),
-                        "status": (res.get("status") if isinstance(res, dict) else 422),
+                        "error": (res.get("error") if isinstance(res.get("error"), dict) else {"message": msg}),
+                        "status": (res.get("status") if isinstance(res.get("status"), int) else 422),
+                        "trace_id": (res.get("trace_id") if isinstance(res.get("trace_id"), str) else (trace_id or request_id)),
                     },
                 }
             else:

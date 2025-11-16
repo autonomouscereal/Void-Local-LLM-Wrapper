@@ -8,6 +8,7 @@ from typing import Any, Dict, Optional, List
 import os
 import random
 from urllib.error import HTTPError
+from orchestrator.app.json_parser import JSONParser  # type: ignore
 from .schema_fetcher import fetch as fetch_schema
 from .universal_adapter import repair as repair_args
 from .patch_store import preapply as preapply_patch, persist_success as persist_patch
@@ -19,31 +20,11 @@ def _post(url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     import urllib.request
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
-    try:
-        with urllib.request.urlopen(req) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
-            return json.loads(raw)
-    except HTTPError as e:
-        body = e.read().decode("utf-8", "replace")
-        try:
-            j = json.loads(body)
-        except Exception:
-            j = {}
-        # Flatten FastAPI {"detail": {...}} to top-level envelope
-        if isinstance(j, dict) and "detail" in j and isinstance(j["detail"], dict):
-            j = j["detail"]
-        if not isinstance(j, dict):
-            j = {}
-        j.setdefault("schema_version", 1)
-        j.setdefault("ok", False)
-        # Provide a code if missing
-        if "code" not in j:
-            j["code"] = "http_error"
-        j["_http_status"] = e.code
-        j["status"] = e.code
-        return j
-    except Exception:
-        return {"schema_version": 1, "ok": False, "error": {"code": "network_error", "message": "request_failed"}}
+    with urllib.request.urlopen(req) as resp:
+        raw = resp.read().decode("utf-8", errors="replace")
+        parser = JSONParser()
+        # tool.run and logs.append both return dict-like envelopes; use open schema here.
+        return parser.parse(raw, {})
 
 
 async def _emit_review_event(event: str, trace_id: Optional[str], step_id: Optional[str], notes: Any = None):
@@ -87,6 +68,10 @@ def _is_transient(err: Dict[str, Any]) -> bool:
     return False
 
 
+def _stack_str() -> str:
+    return "".join(traceback.format_stack())
+
+
 async def utc_run_tool(trace_id: Optional[str], step_id: Optional[str], name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     sch = await fetch_schema(name)
     version = sch.get("version") or "1"
@@ -111,8 +96,12 @@ async def utc_run_tool(trace_id: Optional[str], step_id: Optional[str], name: st
     # Directly execute the tool once via /tool.run (no /tool.validate pre-check).
     base = os.getenv("ORCHESTRATOR_BASE_URL", "http://127.0.0.1:8000")
     attempt_args.setdefault("autofix_422", True)
-    res = _post(base.rstrip("/") + "/tool.run", {"name": name, "args": attempt_args, "stream": False})
-    if res.get("ok"):
+    payload = {"name": name, "args": attempt_args, "stream": False, "trace_id": trace_id}
+    res = _post(base.rstrip("/") + "/tool.run", payload)
+    # Ensure we always attach a trace_id to the response envelope
+    if isinstance(res, dict) and "trace_id" not in res:
+        res["trace_id"] = trace_id
+    if isinstance(res, dict) and bool(res.get("ok")):
         pool = await get_pg_pool()
         if pool is not None:
             try:

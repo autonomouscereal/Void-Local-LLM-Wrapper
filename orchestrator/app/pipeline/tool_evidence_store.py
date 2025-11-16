@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 import os
-import json
 from datetime import datetime, timezone
+
+from ..json_parser import JSONParser
 
 
 def _dir(state_dir: str) -> str:
@@ -32,6 +33,7 @@ def append_tool_evidence(state_dir: str, trace_id: str, entry: Dict[str, Any]) -
 		rec["raw"] = {}
 	if not rec.get("raw", {}).get("ts"):
 		rec["raw"]["ts"] = datetime.now(timezone.utc).isoformat()
+	import json
 	with open(_path(state_dir, trace_id), "a", encoding="utf-8") as f:
 		f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
@@ -47,12 +49,13 @@ def load_recent_tool_evidence(state_dir: str, trace_id: str, limit: int = 4) -> 
 	if not os.path.exists(p):
 		return []
 	entries: List[Dict[str, Any]] = []
+	parser = JSONParser()
 	with open(p, "r", encoding="utf-8") as f:
 		for line in f:
 			line = line.strip()
 			if not line:
 				continue
-			obj = json.loads(line)
+			obj = parser.parse(line, {})
 			if isinstance(obj, dict):
 				entries.append(obj)
 	# Return last 'limit' entries in reverse chronological order

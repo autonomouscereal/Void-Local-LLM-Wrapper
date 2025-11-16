@@ -9,6 +9,7 @@ import base64 as _b64
 from app.state.checkpoints import append_event as checkpoints_append_event
 from app.trace_utils import emit_trace as _emit_trace
 from app.analysis.media import analyze_image as _qa_analyze_image, analyze_image_regions as _qa_analyze_image_regions  # type: ignore
+from app.json_parser import JSONParser
 import httpx
 
 
@@ -88,7 +89,11 @@ async def _post_json(url: str, obj: dict) -> dict:
 	async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
 		resp = await client.post(url, json=obj)
 		ct = resp.headers.get("content-type", "")
-		data = resp.json() if ("application/json" in ct) else json.loads(resp.text or "{}")
+		if "application/json" in ct:
+			data = resp.json()
+		else:
+			parser = JSONParser()
+			data = parser.parse(resp.text or "{}", {})
 		if 200 <= resp.status_code < 300:
 			return _ok_env(True, **(data if isinstance(data, dict) else {"data": data}))
 		return _ok_env(False, code="http_error", status=resp.status_code, detail=data)
@@ -98,7 +103,11 @@ async def _get_json(url: str) -> dict:
 	async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
 		resp = await client.get(url, headers={"accept": "application/json"})
 		ct = resp.headers.get("content-type", "")
-		data = resp.json() if ("application/json" in ct) else json.loads(resp.text or "{}")
+		if "application/json" in ct:
+			data = resp.json()
+		else:
+			parser = JSONParser()
+			data = parser.parse(resp.text or "{}", {})
 		if 200 <= resp.status_code < 300:
 			return _ok_env(True, **(data if isinstance(data, dict) else {"data": data}))
 		return _ok_env(False, code="http_error", status=resp.status_code, detail=data)
@@ -296,8 +305,14 @@ def _append_jsonl(path: str, obj: dict) -> None:
 
 @router.post("/tool.run")
 async def tool_run(req: Request):
-	rid = "tool.run"
 	body = await req.json()
+	trace_val = None
+	if isinstance(body, dict):
+		if isinstance(body.get("trace_id"), str) and body.get("trace_id"):
+			trace_val = str(body.get("trace_id"))
+		elif isinstance(body.get("cid"), str) and body.get("cid"):
+			trace_val = str(body.get("cid"))
+	rid = trace_val or "tool.run"
 	if not isinstance(body, dict):
 		return ToolEnvelope.failure(
 			"invalid_body_type",
@@ -313,7 +328,11 @@ async def tool_run(req: Request):
 	# (executor → /tool.run → executor) and ensures each planned step executes once.
 	if name != "image.dispatch":
 		from app.main import execute_tool_call  # type: ignore
-		call = {"name": name, "arguments": (args if isinstance(args, dict) else {})}
+		call = {
+			"name": name,
+			"arguments": (args if isinstance(args, dict) else {}),
+			"trace_id": rid,
+		}
 		res = await execute_tool_call(call)
 		if isinstance(res, dict) and isinstance(res.get("result"), dict):
 			return ToolEnvelope.success(res["result"], request_id=rid)
@@ -349,7 +368,9 @@ async def tool_run(req: Request):
 			           or "/workspace/services/image/workflows/stock_smoke.json")
 			if os.path.exists(wf_path):
 				wf_text = _read_text(wf_path)
-				wf_obj = json.loads(wf_text)
+				parser = JSONParser()
+				# Workflow graphs are open-ended; parse with open schema.
+				wf_obj = parser.parse(wf_text, {})
 			else:
 				# Fallback: proceed without file; we'll synthesize a valid graph below
 				wf_obj = {}

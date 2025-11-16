@@ -8,11 +8,7 @@ import soundfile as sf
 import numpy as np
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
-
-try:
-    from TTS.api import TTS
-except Exception:
-    TTS = None
+from TTS.api import TTS  # type: ignore
 import torch
 
 
@@ -26,19 +22,11 @@ _tts = None
 def get_tts():
     global _tts
     if _tts is None:
-        if TTS is None:
-            raise RuntimeError("coqui-tts not available")
         use_cuda = torch.cuda.is_available()
-        try:
-            _tts = TTS(MODEL_NAME)
-            if use_cuda:
-                # Some TTS models expose .to(); ignore if unsupported
-                try:
-                    _tts.to('cuda')  # type: ignore
-                except Exception:
-                    pass
-        except Exception:
-            _tts = TTS(MODEL_NAME)
+        _tts = TTS(MODEL_NAME)  # may download/initialize; failures should surface loudly
+        if use_cuda:
+            # Some TTS models expose .to(); ignore if unsupported
+            _tts.to("cuda")  # type: ignore[arg-type]
     return _tts
 
 
@@ -54,7 +42,7 @@ async def tts(body: Dict[str, Any]):
     if not text:
         return JSONResponse(status_code=400, content={"error": "missing text"})
     tts = get_tts()
-    wav = tts.tts(text=text, speaker=speaker)  # type: ignore
+    wav = tts.tts(text=text, speaker=speaker)  # type: ignore[call-arg]
     wav = np.array(wav, dtype=np.float32)
     buf = io.BytesIO()
     sf.write(buf, wav, 22050, format="WAV")

@@ -100,9 +100,19 @@ def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
     }
     args = stamp_tool_args("tts.speak", args)
     res = provider.speak(args)
-    wav_bytes = res.get("wav_bytes") or b""
-    dur = float(res.get("duration_s") or 0.0)
-    model = res.get("model", "unknown")
+    # Provider may return either a raw payload or an envelope; handle both safely.
+    if isinstance(res, dict) and "ok" in res:
+        if not bool(res.get("ok")):
+            # Bubble up error envelope unchanged so callers can see failure details.
+            return res
+        inner = res.get("result") if isinstance(res.get("result"), dict) else {}
+        wav_bytes = inner.get("wav_bytes") or b""
+        dur = float(inner.get("duration_s") or 0.0)
+        model = inner.get("model", "unknown")
+    else:
+        wav_bytes = res.get("wav_bytes") or b""
+        dur = float(res.get("duration_s") or 0.0)
+        model = res.get("model", "unknown")
     stem = f"tts_{now_ts()}"
     wav_path = os.path.join(outdir, stem + ".wav")
     with open(wav_path, "wb") as f:

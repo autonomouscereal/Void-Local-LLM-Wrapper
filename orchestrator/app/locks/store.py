@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import json
 import os
 from typing import Any, Dict, Optional
 
 from ..db.pool import get_pg_pool
+from ..json_parser import JSONParser
 
 _LOCK_DIR_ENV = "LOCKS_DIR"
 
@@ -30,6 +30,7 @@ async def upsert_lock_bundle(character_id: str, bundle: Dict[str, Any]) -> None:
     pool = await get_pg_pool()
     if pool is None:
         return
+    import json
     payload = json.dumps(bundle, ensure_ascii=False)
     async with pool.acquire() as conn:
         await conn.execute(
@@ -59,9 +60,8 @@ async def get_lock_bundle(character_id: str) -> Optional[Dict[str, Any]]:
         if isinstance(val, dict):
             return val
         if isinstance(val, str):
-            try:
-                return json.loads(val)
-            except json.JSONDecodeError:
-                return None
+            parser = JSONParser()
+            parsed = parser.parse(val, {})
+            return parsed if isinstance(parsed, dict) else None
         return None
 

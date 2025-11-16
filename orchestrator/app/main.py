@@ -2143,33 +2143,6 @@ app = FastAPI(title="Void Orchestrator", version="0.1.0")
 from app.routes import toolrun as _toolrun_routes  # type: ignore
 app.include_router(_toolrun_routes.router)
 ToolEnvelope = _toolrun_routes.ToolEnvelope
-
-
-@app.exception_handler(Exception)
-async def _global_exception_handler(request: Request, exc: Exception) -> JSONResponse:
-    """
-    Global handler for unhandled exceptions in the orchestrator.
-    Surfaces full traceback in JSON instead of collapsing to generic 'tool failed'.
-    """
-    tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-    logging.getLogger("orchestrator.exception").error(
-        "[orchestrator] unhandled exception path=%s exc=%r\n%s",
-        request.url.path,
-        exc,
-        tb,
-    )
-    return JSONResponse(
-        {
-            "ok": False,
-            "error": {
-                "type": type(exc).__name__,
-                "message": str(exc),
-                "traceback": tb,
-            },
-            "path": str(request.url.path),
-        },
-        status_code=500,
-    )
 # Middleware order matters: last added runs first.
 # We want Preflight to run FIRST, so add it LAST.
 from .middleware.ws_permissive import PermissiveWebSocketMiddleware
@@ -3584,6 +3557,16 @@ async def postrun_committee_decide(
 async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
     name = call.get("name")
     raw_args = call.get("arguments") or {}
+    # Determine trace id for this tool call; always present in envelopes.
+    call_trace_id: str
+    if isinstance(call.get("trace_id"), str) and call.get("trace_id"):
+        call_trace_id = str(call.get("trace_id"))
+    else:
+        meta_val = call.get("meta")
+        if isinstance(meta_val, dict) and isinstance(meta_val.get("trace_id"), str) and meta_val.get("trace_id"):
+            call_trace_id = str(meta_val.get("trace_id"))
+        else:
+            call_trace_id = "tt_unknown"
     # Generic HTTP API request tool (public APIs only; no internal SSRF)
     if name == "api.request":
         # Backwards-compatible shim: route api.request to http.request implementation.
@@ -5152,143 +5135,203 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             return {"name": name, "error": "XTTS_API_URL not configured"}
         class _TTSProvider:
             async def _xtts(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-                async with httpx.AsyncClient() as client:
+                trace_id = payload.get("trace_id") if isinstance(payload.get("trace_id"), str) else "tt_xtts_unknown"
+                async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
                     emit_progress({"stage": "request", "target": "xtts"})
-                    # Pass through voice_lock/voice_id/seed/rate/pitch so backend can lock timbre
                     r = await client.post(XTTS_API_URL.rstrip("/") + "/tts", json=payload)
-                    r.raise_for_status()
-                    js = _resp_json(r, {"wav_b64": str, "url": str, "duration_s": (float), "model": str})
-                    # Expected: wav_b64 or url
-                    wav = b""
-                    if isinstance(js.get("wav_b64"), str):
-                        wav = _b.b64decode(js.get("wav_b64"))
-                    elif isinstance(js.get("url"), str):
-                        rr = await client.get(js.get("url"))
-                        if rr.status_code == 200:
-                            wav = rr.content
-                    emit_progress({"stage": "received", "bytes": len(wav)})
-                    return {"wav_bytes": wav, "duration_s": float(js.get("duration_s") or 0.0), "model": js.get("model") or "xtts"}
+                    status = r.status_code
+                    if 200 <= status < 300:
+                        # Expected: wav_b64 or url + duration/model metadata
+                        js = _resp_json(r, {"wav_b64": str, "url": str, "duration_s": (float), "model": str})
+                        wav = b""
+                        if isinstance(js.get("wav_b64"), str):
+                            wav = _b.b64decode(js.get("wav_b64"))
+                        elif isinstance(js.get("url"), str):
+                            rr = await client.get(js.get("url"))
+                            if rr.status_code == 200:
+                                wav = rr.content
+                        emit_progress({"stage": "received", "bytes": len(wav)})
+                        return {
+                            "schema_version": 1,
+                            "request_id": trace_id,
+                            "trace_id": trace_id,
+                            "ok": True,
+                            "result": {
+                                "wav_bytes": wav,
+                                "duration_s": float(js.get("duration_s") or 0.0),
+                                "model": js.get("model") or "xtts",
+                            },
+                            "error": None,
+                        }
+                    ct = r.headers.get("content-type", "")
+                    data = r.json() if ("application/json" in ct) else {"body": r.text}
+                    return {
+                        "schema_version": 1,
+                        "request_id": trace_id,
+                        "trace_id": trace_id,
+                        "ok": False,
+                        "result": None,
+                        "error": {
+                            "code": "tts_http_error",
+                            "status": status,
+                            "message": "XTTS /tts returned non-2xx or invalid body",
+                            "raw": data,
+                            "stack": "".join(traceback.format_stack()),
+                        },
+                    }
             def speak(self, args: Dict[str, Any]) -> Dict[str, Any]:
                 # Bridge sync to async
                 return _as.get_event_loop().run_until_complete(self._xtts(args))
         provider = _TTSProvider()
         manifest = {"items": []}
-        try:
-            a = args if isinstance(args, dict) else {}
-            quality_profile = (a.get("quality_profile") or "standard")
-            # Derive a stable character/voice identity when possible.
-            char_id = str(a.get("character_id") or a.get("voice_id") or a.get("voice_lock_id") or "").strip()
-            if not char_id:
-                trace_val = a.get("trace_id")
-                if isinstance(trace_val, str) and trace_val.strip():
-                    char_id = f"char_{trace_val.strip()}"
-            if char_id and "character_id" not in a:
-                a["character_id"] = char_id
+        a = args if isinstance(args, dict) else {}
+        quality_profile = (a.get("quality_profile") or "standard")
+        # Derive a stable character/voice identity when possible.
+        char_id = str(a.get("character_id") or a.get("voice_id") or a.get("voice_lock_id") or "").strip()
+        if not char_id:
+            trace_val = a.get("trace_id")
+            if isinstance(trace_val, str) and trace_val.strip():
+                char_id = f"char_{trace_val.strip()}"
+        if char_id and "character_id" not in a:
+            a["character_id"] = char_id
 
-            bundle_arg = a.get("lock_bundle")
-            lock_bundle: Optional[Dict[str, Any]] = None
-            if isinstance(bundle_arg, dict):
-                lock_bundle = bundle_arg
-            elif isinstance(bundle_arg, str) and bundle_arg.strip():
-                loaded = await _lock_load(bundle_arg.strip())
-                if isinstance(loaded, dict):
-                    lock_bundle = loaded
-            if lock_bundle is None and char_id:
-                loaded = await _lock_load(char_id)
-                if isinstance(loaded, dict):
-                    lock_bundle = loaded
-            # Enforce a lock-first invariant for TTS when an identity is known:
-            # if no bundle exists yet, create a minimal skeleton so QA and
-            # refinement can rely on a stable lock container.
-            if lock_bundle is None and char_id:
-                lock_bundle = {
-                    "schema_version": 2,
-                    "character_id": char_id,
-                    "tts": {},
-                    "audio": {},
-                }
-                try:
-                    await _lock_save(char_id, lock_bundle)
-                except Exception:
-                    pass
-            if lock_bundle is not None:
-                lock_bundle = _lock_apply_profile(quality_profile, lock_bundle)
-                lock_bundle = _lock_migrate_tts(lock_bundle)
-                a["lock_bundle"] = lock_bundle
-            a["quality_profile"] = quality_profile
-            env = run_tts_speak(a, provider, manifest)
-            # Persist audio artifact to memory + RAG; distilled artifact row
-            wav = env.get("wav_bytes") if isinstance(env, dict) else None
-            if isinstance(wav, (bytes, bytearray)) and len(wav) > 0:
-                cid = "aud-" + str(_now_ts())
-                outdir = os.path.join(UPLOAD_DIR, "artifacts", "audio", "tts", cid)
-                _ensure_dir(outdir)
-                stem = "tts_00_00"
-                wav_path = os.path.join(outdir, stem + ".wav")
-                with open(wav_path, "wb") as _wf:
-                    _wf.write(wav)
-                # Sidecar metadata (minimal)
-                _sidecar(wav_path, {
+        bundle_arg = a.get("lock_bundle")
+        lock_bundle: Optional[Dict[str, Any]] = None
+        if isinstance(bundle_arg, dict):
+            lock_bundle = bundle_arg
+        elif isinstance(bundle_arg, str) and bundle_arg.strip():
+            loaded = await _lock_load(bundle_arg.strip())
+            if isinstance(loaded, dict):
+                lock_bundle = loaded
+        if lock_bundle is None and char_id:
+            loaded = await _lock_load(char_id)
+            if isinstance(loaded, dict):
+                lock_bundle = loaded
+        # Enforce a lock-first invariant for TTS when an identity is known:
+        # if no bundle exists yet, create a minimal skeleton so QA and
+        # refinement can rely on a stable lock container.
+        if lock_bundle is None and char_id:
+            lock_bundle = {
+                "schema_version": 2,
+                "character_id": char_id,
+                "tts": {},
+                "audio": {},
+            }
+            try:
+                await _lock_save(char_id, lock_bundle)
+            except Exception:
+                pass
+        if lock_bundle is not None:
+            lock_bundle = _lock_apply_profile(quality_profile, lock_bundle)
+            lock_bundle = _lock_migrate_tts(lock_bundle)
+            a["lock_bundle"] = lock_bundle
+        a["quality_profile"] = quality_profile
+
+        env = run_tts_speak(a, provider, manifest)
+        # If run_tts_speak surfaced an error envelope from provider, forward it as a tool error.
+        if isinstance(env, dict) and "ok" in env and not bool(env.get("ok")):
+            return {"name": name, "error": env.get("error") or env}
+
+        # Persist audio artifact to memory + RAG; distilled artifact row
+        wav = env.get("wav_bytes") if isinstance(env, dict) else None
+        if isinstance(wav, (bytes, bytearray)) and len(wav) > 0:
+            cid = "aud-" + str(_now_ts())
+            outdir = os.path.join(UPLOAD_DIR, "artifacts", "audio", "tts", cid)
+            _ensure_dir(outdir)
+            stem = "tts_00_00"
+            wav_path = os.path.join(outdir, stem + ".wav")
+            with open(wav_path, "wb") as _wf:
+                _wf.write(wav)
+            # Sidecar metadata (minimal)
+            _sidecar(
+                wav_path,
+                {
                     "tool": "tts.speak",
                     "text": a.get("text"),
                     "duration_s": float(env.get("duration_s") or 0.0),
                     "model": env.get("model") or "xtts",
-                })
-                # Add to multimodal memory
-                _ctx_add(cid, "audio", wav_path, _uri_from_upload_path(wav_path), None, [], {"text": a.get("text"), "duration_s": float(env.get("duration_s") or 0.0)})
-                # Distilled artifact
-                tr = (a.get("trace_id") if isinstance(a.get("trace_id"), str) else None)
-                if tr:
-                    try:
-                        rel = os.path.relpath(wav_path, UPLOAD_DIR).replace("\\", "/")
-                        checkpoints_append_event(STATE_DIR, tr, "artifact", {"kind": "audio", "path": rel, "bytes": int(len(wav)), "duration_s": float(env.get("duration_s") or 0.0)})
-                    except Exception:
-                        pass
-                # Optional: embed transcript text into RAG
-                pool = await get_pg_pool()
-                txt = a.get("text") if isinstance(a.get("text"), str) else None
-                if pool is not None and txt and txt.strip():
-                    emb = get_embedder()
-                    vec = emb.encode([txt])[0]
-                    async with pool.acquire() as conn:
-                        rel = os.path.relpath(wav_path, UPLOAD_DIR).replace("\\", "/")
-                        await conn.execute("INSERT INTO rag_docs (path, chunk, embedding) VALUES ($1, $2, $3)", rel, txt, list(vec))
-            # Shape result with ids/meta when file persisted
-            out_res = dict(env or {})
-            if isinstance(wav, (bytes, bytearray)) and len(wav) > 0:
-                rel = os.path.relpath(wav_path, UPLOAD_DIR).replace("\\", "/")
-                out_res.setdefault("ids", {})["audio_id"] = rel
-                out_res.setdefault("meta", {})["url"] = f"/{rel}"
-                out_res["meta"]["mime"] = "audio/wav"
-                # Build ~12s mono 22.05kHz preview data_url
-                r = wave.open(BytesIO(wav))
-                nch = r.getnchannels(); sw = r.getsampwidth(); fr = r.getframerate()
-                frames = r.readframes(r.getnframes()); r.close()
-                if nch > 1:
-                    frames = audioop.tomono(frames, sw, 0.5, 0.5)
-                if fr != 22050:
-                    frames, _ = audioop.ratecv(frames, sw, 1, fr, 22050, None)
-                    fr = 22050
-                max_frames = 12 * fr
-                frames = frames[:max_frames * sw]
-                b2 = BytesIO()
-                w2 = wave.open(b2, "wb")
-                w2.setnchannels(1); w2.setsampwidth(sw); w2.setframerate(fr)
-                w2.writeframes(frames); w2.close()
-                out_res["meta"]["data_url"] = "data:audio/wav;base64," + _b64.b64encode(b2.getvalue()).decode("ascii")
-                out_res["meta"]["preview_duration_s"] = float(len(frames) / (sw * fr))
-                # expose preview and full durations distinctly
-                out_res["meta"]["preview_duration_s"] = float(len(frames) / (sw * fr))
-                if env.get("duration_s") is not None:
-                    out_res["meta"]["full_duration_s"] = float(env.get("duration_s"))
-                locks_block = out_res.setdefault("meta", {}).setdefault("locks", {})
-                if isinstance(locks_block, dict) and quality_profile:
-                    locks_block.setdefault("quality_profile", quality_profile)
-            return {"name": name, "result": out_res}
-        except Exception as ex:
-            _tb = traceback.format_exc()
-            logging.error(_tb)
-            return {"name": name, "error": str(ex), "traceback": _tb}
+                },
+            )
+            # Add to multimodal memory
+            _ctx_add(
+                cid,
+                "audio",
+                wav_path,
+                _uri_from_upload_path(wav_path),
+                None,
+                [],
+                {"text": a.get("text"), "duration_s": float(env.get("duration_s") or 0.0)},
+            )
+            # Distilled artifact
+            tr = (a.get("trace_id") if isinstance(a.get("trace_id"), str) else None)
+            if tr:
+                try:
+                    rel = os.path.relpath(wav_path, UPLOAD_DIR).replace("\\", "/")
+                    checkpoints_append_event(
+                        STATE_DIR,
+                        tr,
+                        "artifact",
+                        {
+                            "kind": "audio",
+                            "path": rel,
+                            "bytes": int(len(wav)),
+                            "duration_s": float(env.get("duration_s") or 0.0),
+                        },
+                    )
+                except Exception:
+                    pass
+            # Optional: embed transcript text into RAG
+            pool = await get_pg_pool()
+            txt = a.get("text") if isinstance(a.get("text"), str) else None
+            if pool is not None and txt and txt.strip():
+                emb = get_embedder()
+                vec = emb.encode([txt])[0]
+                async with pool.acquire() as conn:
+                    rel = os.path.relpath(wav_path, UPLOAD_DIR).replace("\\", "/")
+                    await conn.execute(
+                        "INSERT INTO rag_docs (path, chunk, embedding) VALUES ($1, $2, $3)",
+                        rel,
+                        txt,
+                        list(vec),
+                    )
+        # Shape result with ids/meta when file persisted
+        out_res = dict(env or {})
+        if isinstance(wav, (bytes, bytearray)) and len(wav) > 0:
+            rel = os.path.relpath(wav_path, UPLOAD_DIR).replace("\\", "/")
+            out_res.setdefault("ids", {})["audio_id"] = rel
+            out_res.setdefault("meta", {})["url"] = f"/{rel}"
+            out_res["meta"]["mime"] = "audio/wav"
+            # Build ~12s mono 22.05kHz preview data_url
+            r = wave.open(BytesIO(wav))
+            nch = r.getnchannels()
+            sw = r.getsampwidth()
+            fr = r.getframerate()
+            frames = r.readframes(r.getnframes())
+            r.close()
+            if nch > 1:
+                frames = audioop.tomono(frames, sw, 0.5, 0.5)
+            if fr != 22050:
+                frames, _ = audioop.ratecv(frames, sw, 1, fr, 22050, None)
+                fr = 22050
+            max_frames = 12 * fr
+            frames = frames[: max_frames * sw]
+            b2 = BytesIO()
+            w2 = wave.open(b2, "wb")
+            w2.setnchannels(1)
+            w2.setsampwidth(sw)
+            w2.setframerate(fr)
+            w2.writeframes(frames)
+            w2.close()
+            out_res["meta"]["data_url"] = "data:audio/wav;base64," + _b64.b64encode(b2.getvalue()).decode("ascii")
+            out_res["meta"]["preview_duration_s"] = float(len(frames) / (sw * fr))
+            # expose preview and full durations distinctly
+            out_res["meta"]["preview_duration_s"] = float(len(frames) / (sw * fr))
+            if env.get("duration_s") is not None:
+                out_res["meta"]["full_duration_s"] = float(env.get("duration_s"))
+            locks_block = out_res.setdefault("meta", {}).setdefault("locks", {})
+            if isinstance(locks_block, dict) and quality_profile:
+                locks_block.setdefault("quality_profile", quality_profile)
+        return {"name": name, "result": out_res}
     if name == "audio.sfx.compose" and ALLOW_TOOL_EXECUTION:
         manifest = {"items": []}
         try:
@@ -8105,13 +8148,20 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
     # --- Multimodal external services (optional; enable via env URLs) ---
     if name == "tts_speak" and XTTS_API_URL and ALLOW_TOOL_EXECUTION:
         payload = {"text": args.get("text", ""), "voice": args.get("voice")}
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
             r = await client.post(XTTS_API_URL.rstrip("/") + "/tts", json=payload)
-            try:
-                r.raise_for_status()
+            status = r.status_code
+            if 200 <= status < 300:
                 return {"name": name, "result": _resp_json(r, {})}
-            except Exception:
-                return {"name": name, "error": r.text}
+            # Non-2xx: surface a structured error rather than raising
+            return {
+                "name": name,
+                "error": {
+                    "code": "tts_http_error",
+                    "status": status,
+                    "message": r.text,
+                },
+            }
     if name == "asr_transcribe" and WHISPER_API_URL and ALLOW_TOOL_EXECUTION:
         async with httpx.AsyncClient() as client:
             r = await client.post(WHISPER_API_URL.rstrip("/") + "/transcribe", json={"audio_url": args.get("audio_url"), "language": args.get("language")})
