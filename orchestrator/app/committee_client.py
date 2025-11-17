@@ -85,16 +85,7 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str) -> 
         )
         ppayload = dict(payload)
         resp = await client.post(f"{base_url}/api/generate", json=ppayload)
-        # Log raw response text before parsing so we can see exactly what Ollama returned.
         raw_text = resp.text or ""
-        log.info(
-            "[committee] ollama.raw_response base=%s model=%s trace_id=%s status=%s body=%s",
-            base_url,
-            payload.get("model"),
-            trace_key,
-            getattr(resp, "status_code", None),
-            raw_text,
-        )
         # Extract only the fields we care about from the Ollama JSON, without
         # relying on a full JSONParser round-trip. When the upstream JSON is
         # malformed, this extractor still tries to recover the 'response' text
@@ -168,14 +159,15 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str) -> 
             }
             usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
             data["_usage"] = usage
-        # Log the parsed response envelope (no truncation) for debugging.
+        # Log only the model response text and basic usage, not the full upstream JSON.
         log.info(
-            "[committee] ollama.parsed_response base=%s model=%s trace_id=%s status=%s data=%s",
+            "[committee] ollama.response base=%s model=%s trace_id=%s status=%s response=%s usage=%s",
             base_url,
             payload.get("model"),
             trace_key,
             getattr(resp, "status_code", None),
-            data,
+            response_str,
+            usage,
         )
         emit_trace(
             STATE_DIR,
