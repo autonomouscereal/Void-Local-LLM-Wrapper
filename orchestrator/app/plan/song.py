@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional
 from ..json_parser import JSONParser
 from ..pipeline.compression_orchestrator import co_pack, frames_to_string
 from ..datasets.trace import append_sample as _trace_append
-from ..committee_client import CommitteeClient, committee_jsonify
+from ..committee_client import CommitteeClient, committee_jsonify, _schema_to_template
 
 
 # Expected Song Graph shape for coercion. This is intentionally minimal and
@@ -137,7 +137,7 @@ async def plan_song_graph(
         + "\n\n"
         + "You are MusicOps Song Planner. Plan a complete song structure before any audio is generated.\n"
         + "Return ONLY JSON matching this schema exactly:\n"
-        + json.dumps(schema_wrapper, ensure_ascii=False)
+        + json.dumps(_schema_to_template(schema_wrapper), ensure_ascii=False)
         + "\n\n"
         + "User request (music): "
         + text

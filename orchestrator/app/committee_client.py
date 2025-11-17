@@ -267,10 +267,11 @@ async def committee_ai_text(
                 for other_id, ans in answers.items():
                     if other_id == member or not isinstance(ans, str) or not ans.strip():
                         continue
-                    ctx_lines.append(f"Answer from {other_id}:\n{ans.strip()[:800]}")
+                    # Share full peer answers between committee members; do not truncate.
+                    ctx_lines.append(f"Answer from {other_id}:\n{ans.strip()}")
                 prior = answers.get(member)
                 if isinstance(prior, str) and prior.strip():
-                    ctx_lines.append(f"Your previous answer was:\n{prior.strip()[:800]}")
+                    ctx_lines.append(f"Your previous answer was:\n{prior.strip()}")
                 ctx_lines.append(
                     "Compare all answers, keep what is correct, fix what is wrong, "
                     "and produce your best updated answer. Respond with ONLY your full answer."
