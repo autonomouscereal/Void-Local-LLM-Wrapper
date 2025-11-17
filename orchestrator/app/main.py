@@ -411,32 +411,6 @@ def _log(event: str, **fields: Any) -> None:
         checkpoints_append_event(STATE_DIR, tr, str(row.get("event") or "event"), row)
 
 
-def _infer_effective_mode(user_text: str) -> str:
-    text = (user_text or "").lower()
-    asset_triggers = [
-        "draw me an image",
-        "generate an image",
-        "make an image",
-        "make a picture",
-        "make a song",
-        "compose music",
-        "generate music",
-        "make a video",
-        "render video",
-        "film this",
-        "use comfy",
-        "image of",
-    ]
-    stop_triggers = [
-        "stop running tools",
-        "do not call any tools",
-        "just explain",
-        "just respond in text",
-    ]
-    wants_asset = any(trig in text for trig in asset_triggers) and not any(st in text for st in stop_triggers)
-    return "job" if wants_asset else "chat"
-
-
 def _inject_execution_context(tool_calls: List[Dict[str, Any]], trace_id: str, effective_mode: str) -> None:
     for tc in tool_calls or []:
         if not isinstance(tc, dict):
@@ -3350,43 +3324,35 @@ async def planner_produce_plan(messages: List[Dict[str, Any]], tools: Optional[L
             nm_clean = nm.strip()
             if nm_clean and (nm_clean in PLANNER_VISIBLE_TOOLS):
                 tool_names.append(nm_clean)
-    # Determine the latest user message for mode inference and subject canon
-    last_user = ""
-    for m in reversed(messages or []):
-        if isinstance(m, dict) and m.get("role") == "user" and isinstance(m.get("content"), str) and m.get("content").strip():
-            last_user = m.get("content").strip()
-            break
-    mode_local = _infer_effective_mode(last_user)
-    effective_mode = mode_local
+    # Effective mode is provided by the caller (chat_completions / router). Do
+    # not infer from keywords here; semantic routing is done in the prompts.
+    effective_mode = mode or "job"
     # Normalize planner tool names; no mode-based filtering (fixed tool surface).
     tool_names_mode: List[str] = _filter_tool_names_by_mode(tool_names, effective_mode)
     # Allowed tool names for planner use (fixed front-door surface).
     _allowed_for_mode = _allowed_tools_for_mode(effective_mode)
     # Detect repair intent from messages
     _is_repair = any(isinstance(m, dict) and isinstance(m.get("content"), str) and "repair mode" in m.get("content", "").lower() for m in (messages or []))
-    # Curate RAW schema blocks (TSL) for likely-selected tools
+    # Curate RAW schema blocks (TSL) for planner-visible tools using the canonical
+    # tool schemas. This is the primary way the committee sees the exact JSON
+    # args/contracts for image.dispatch, music.infinite.windowed, film2.run, tts.speak.
     tsl_blocks: List[Dict[str, Any]] = []
-    if "image.dispatch" in tool_names_mode:
-        tsl_blocks.append({
-            "name": "image.dispatch",
-            "raw": {
-                "name": "image.dispatch",
-                "args": {
-                    "required": ["prompt","width","height","steps","cfg","negative"],
-                    "properties": {
-                        "prompt": {"type":"string","notes":"literal subject + identity tokens"},
-                        "negative": {"type":"string"},
-                        "width": {"type":"integer","multipleOf":8,"min":256,"max":2048},
-                        "height": {"type":"integer","multipleOf":8,"min":256,"max":2048},
-                        "steps": {"type":"integer","min":1,"max":150,"default":32},
-                        "cfg": {"type":"number","min":1,"max":20,"default":5.5},
-                        "seed": {"type":"integer","optional":True}
-                    }
+    for name in _allowed_for_mode:
+        meta = _TOOL_SCHEMAS.get(name, {})
+        schema = meta.get("schema")
+        if not isinstance(schema, dict):
+            continue
+        tsl_blocks.append(
+            {
+                "name": name,
+                "raw": {
+                    "name": name,
+                    "schema": schema,
+                    "schema_ref": f"{name}@builtin",
+                    "notes": meta.get("notes") or "",
                 },
-                "returns": {"result":{"meta":{},"artifacts":["// omitted"]}},
-                "schema_ref": "image.dispatch@builtin"
             }
-        })
+        )
     # Evidence blocks (TEL): recent runs — filter to planner-visible and allowed-for-mode tools
     tel_blocks: List[Dict[str, Any]] = []
     # CO envelope
@@ -3457,10 +3423,29 @@ async def planner_produce_plan(messages: List[Dict[str, Any]], tools: Optional[L
         "### [COMMITTEE REVIEW / SYSTEM]\n"
         "If plan conflicts with RoE/subject, apply a one-pass prompt revision (minimal) then proceed."
     )
+    # Explicit tool catalog description for the committee: show each front-door
+    # tool with its core JSON schema so the planner can map semantics→tools.
+    catalog_lines: List[str] = [
+        "### [TOOL CATALOG / SYSTEM]",
+        "You must plan using ONLY these front-door tools. For each, the JSON args must follow the given schema.",
+    ]
+    for name in _allowed_for_mode:
+        meta = _TOOL_SCHEMAS.get(name, {})
+        notes = meta.get("notes") or ""
+        schema = meta.get("schema") or {}
+        catalog_lines.append(f"- tool: {name}")
+        if notes:
+            catalog_lines.append(f"  notes: {notes}")
+        catalog_lines.append(
+            "  json_schema: " + json.dumps(schema, ensure_ascii=False, sort_keys=True)
+        )
+    tool_catalog_frame = {"role": "system", "content": "\n".join(catalog_lines)}
+
     contract_return = (
         "Return ONLY strict JSON: {\"steps\":[{\"tool\":\"<name>\",\"args\":{...}}]} — no extra keys or commentary."
     )
     plan_messages = frames_msgs + [
+        tool_catalog_frame,
         {"role": "system", "content": _mode_palette},
         {"role": "system", "content": planner_meta},
         {"role": "system", "content": committee_review},
@@ -8686,9 +8671,8 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     normalized_msgs = shaped.get("normalized_msgs") or []
     attachments = shaped.get("attachments") or []
     last_user_text = shaped.get("last_user_text") or ""
-    effective_mode = _infer_effective_mode(last_user_text)
     conv_cid = shaped.get("conv_cid")
-    mode = shaped.get("mode") or "general"
+    mode = shaped.get("mode") or "job"
     master_seed = int(shaped.get("master_seed") or 0)
     trace_id = shaped.get("trace_id") or "tt_unknown"
     # Body invalid → build a non-fatal envelope; do not return early
@@ -9001,19 +8985,9 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         nm = fn.get("name")
         if nm:
             allowed_tools.add(str(nm))
-    # Derive effective mode for this routing pass based on latest user text (align with planner inference)
-    _latest_lower_route = (last_user_text or "").lower()
-    _asset_triggers_route = [
-        "draw me an image","generate an image","make an image","make a picture",
-        "make a song","compose music","generate music",
-        "make a video","render video","film this","use comfy","image of",
-    ]
-    _stop_triggers_route = [
-        "stop running tools","do not call any tools","just explain","just respond in text",
-    ]
-    _wants_asset_route = any((tr in _latest_lower_route) for tr in _asset_triggers_route) and not any((st in _latest_lower_route) for st in _stop_triggers_route)
-    effective_mode = "job" if _wants_asset_route else "chat"
-    # Restrict to planner-visible tools first
+    # Restrict to planner-visible tools first; semantic mapping of intent→tools
+    # is handled entirely inside the planner/committee prompts, not via keyword
+    # triggers here.
     allowed_tools = {n for n in allowed_tools if n in PLANNER_VISIBLE_TOOLS}
     # Intersect with mode-allowed palette for this planning pass
     allowed_by_mode = set(_allowed_tools_for_mode(effective_mode))
@@ -11036,6 +11010,27 @@ _TOOL_SCHEMAS: Dict[str, Dict[str, Any]] = {
             "additionalProperties": True,
         },
         "notes": "Unified Film-2; public entrypoint; internal adapters only. Returns ids.video_id and meta.view_url.",
+    },
+    "music.infinite.windowed": {
+        "name": "music.infinite.windowed",
+        "version": "1",
+        "kind": "audio",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "prompt": {"type": "string"},
+                "length_s": {"type": ["integer", "number"]},
+                "bpm": {"type": ["integer", "number", "null"]},
+                "key": {"type": ["string", "null"]},
+                "seed": {"type": ["integer", "null"]},
+                "cid": {"type": "string"},
+                "trace_id": {"type": "string"},
+                "instrumental_only": {"type": "boolean"},
+            },
+            "required": ["prompt", "length_s"],
+            "additionalProperties": True,
+        },
+        "notes": "Windowed music composition front door. Returns meta with song_graph, windows, and final mixed track artifact.",
     },
     "tts.speak": {
         "name": "tts.speak",
