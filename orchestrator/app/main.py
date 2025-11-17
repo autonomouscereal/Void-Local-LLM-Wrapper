@@ -3038,84 +3038,18 @@ def meta_prompt(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         )},
         {"role": "system", "content": (
             "### [CYRIL — GLOBAL PYTHON & ENGINEERING RULES / SYSTEM]\n"
-            "These rules apply to ALL Python code and architecture across ALL projects and repos. They are HARD REQUIREMENTS.\n"
-            "Do NOT weaken, ignore, or interpret them.\n\n"
-            "==================================================\n"
-            "1) INDENTATION & FORMATTING\n"
-            "==================================================\n"
-            "- All Python code MUST use exactly 4 spaces per indentation level.\n"
-            "- Tabs (\\t) are FORBIDDEN in Python code. Never emit tab characters.\n"
-            "- Do NOT mix tabs and spaces under any circumstance.\n"
-            "- When touching existing code that has tabs, normalize it to 4-space indentation.\n\n"
-            "==================================================\n"
-            "2) IMPORTS POLICY\n"
-            "==================================================\n"
-            "- All imports MUST be at the top of the file at MODULE level.\n"
-            "- NO function-level, method-level, class-level, or conditional imports. EVER.\n"
-            "- NO dynamic imports or importlib hacks.\n"
-            "- NO import-time I/O or side effects except minimal logger setup in a single entrypoint.\n"
-            "- Whenever you introduce a new import, also update dependency manifests (requirements.txt, Docker layer, etc.) with sensible version pins.\n\n"
-            "==================================================\n"
-            "3) TIMEOUTS & RETRIES (GLOBAL)\n"
-            "==================================================\n"
-            "- Default: NO client-side timeouts anywhere (HTTP, WS, DB, subprocess, etc.).\n"
-            "- If a library/API REQUIRES a timeout: prefer timeout=None; otherwise maximum safe cap.\n"
-            "- NEVER add retries for timeouts.\n"
-            "- Retries ONLY for non-timeout transient failures (429, 503, network reset/refused) with bounded jitter, and only when explicitly requested.\n"
-            "- Do NOT hide timeouts/retries inside helpers/wrappers.\n\n"
-            "==================================================\n"
-            "4) ERROR HANDLING / NO SILENT FAILS\n"
-            "==================================================\n"
-            "- In executor/orchestrator hot paths, NO try/except at all.\n"
-            "- Elsewhere, avoid try/except unless strictly necessary.\n"
-            "- If used, catch specific exceptions, log structured error events, and re-raise or surface clearly; NEVER swallow.\n"
-            "- Failures must be explicit; never convert to empty success, fake booleans, or vague messages.\n\n"
-            "==================================================\n"
-            "5) DEPENDENCIES, ORMs, AND DATABASES\n"
-            "==================================================\n"
-            "- FORBIDDEN: Pydantic, SQLAlchemy, ANY ORM (Django ORM, Tortoise, GINO, etc.), SQLite for app data.\n"
-            "- DATABASE: Only PostgreSQL via asyncpg. Use raw SQL + asyncpg (no ORMs/query builders that hide SQL).\n\n"
-            "==================================================\n"
-            "6) JSON & API CONTRACTS\n"
-            "==================================================\n"
-            "- Public APIs use JSON-only envelopes; no magic schema layers.\n"
-            "- /v1/chat/completions: always HTTP 200 with OpenAI-compatible JSON; choices[0].message.content must be present and non-empty on success.\n"
-            "- On failure: return structured JSON error explaining what failed and why.\n"
-            "- Tool/executor args MUST be JSON objects at execution time; if planning emits strings, include explicit json.parse before execution; executors assume proper objects.\n\n"
-            "==================================================\n"
-            "7) TOOL / EXECUTOR / ORCHESTRATOR PATH INVARIANTS\n"
-            "==================================================\n"
-            "- Public routes MUST NOT call /tool.run directly. Valid flow: Planner → Executor (/execute) → Orchestrator /tool.run.\n"
-            "- No separate validator stage; failures surface as ok=false envelopes for committee/planner handling.\n"
-            "- Do not clobber provided args; add defaults only if missing. Do not delete/overwrite user keys arbitrarily.\n"
-            "- Executor runs the provided steps once; traces MUST include exec.payload, tool.run.start, etc.\n\n"
-            "==================================================\n"
-            "8) TRACING & LOGGING\n"
-            "==================================================\n"
-            "- Every run produces deterministic traces: requests.jsonl, events.jsonl, tools.jsonl, artifacts.jsonl, responses.jsonl; errors.jsonl for verbose details.\n"
-            "- Include breadcrumbs: chat.start, planner.*, committee.*, exec.payload (pre & patched), validate.*, repair.*, tool.run.start, Comfy submit/poll, chat.finish.\n"
-            "- Errors are explicit, never logged-and-forgotten.\n\n"
-            "==================================================\n"
-            "9) MISC GLOBAL ENGINEERING RULES\n"
-            "==================================================\n"
-            "- No in-method imports or hidden side effects.\n"
-            "- No background ops layers or preflight gates unless explicitly requested.\n"
-            "- Prefer deterministic behavior; where randomness is needed, expose and log seeds.\n"
-            "- Do not introduce new frameworks/large deps without clear justification.\n\n"
-            "==================================================\n"
-            "10) FUNCTION STRUCTURE (NO NESTED FUNCTIONS)\n"
-            "==================================================\n"
-            "- Sub-functions / nested functions are FORBIDDEN.\n"
-            "  - Do NOT define functions inside other functions.\n"
-            "  - Do NOT define lambdas or callbacks that contain inner `def` blocks.\n"
-            "- All functions must be:\n"
-            "  - Top-level module functions, or\n"
-            "  - Methods on a class.\n"
-            "- If you think you \"need\" a helper function inside another:\n"
-            "  - Promote it to a top-level function (or a method), and call it from there instead.\n"
-            "- No closures that depend on outer function locals via inner `def` blocks.\n"
-            "  - Use explicit parameters and return values instead of capturing outer scope.\n\n"
-            "SUMMARY: 4 spaces; no tabs; no function-level imports; no default timeouts; no retries on timeouts; no try/except in hot paths; no silent failures; no Pydantic/SQLAlchemy/ORMs/SQLite; Postgres+asyncpg only; strict JSON envelopes; Planner→Executor→Orchestrator flow; clear errors and full traceability."
+            "Hard, global rules for ALL Python and orchestration logic. Do NOT weaken, ignore, or reinterpret them.\n\n"
+            "- INDENTATION: 4 spaces only; tabs are forbidden; never mix tabs and spaces.\n"
+            "- IMPORTS: All imports at module top; no function/method/conditional imports; no import-time I/O except main logger setup.\n"
+            "- TIMEOUTS/RETRIES: No client timeouts by default; only when absolutely required and never with hidden retries; never retry on timeouts.\n"
+            "- ERROR HANDLING: In hot paths (planner/executor/orchestrator), avoid try/except; elsewhere, catch specific errors, log structured events, and surface them; never swallow failures.\n"
+            "- DEPENDENCIES/DB: Pydantic/SQLAlchemy/ANY ORM/SQLite are forbidden; use PostgreSQL via asyncpg + raw SQL only.\n"
+            "- JSON & CONTRACTS: Public APIs use JSON envelopes; /v1/chat/completions must always return OpenAI-compatible JSON; tool args MUST be JSON objects at execution time.\n"
+            "- TOOL FLOW: Public routes never call /tool.run directly; valid path is Planner → Executor (/execute) → Orchestrator /tool.run; no separate validator that hides failures.\n"
+            "- TRACING/LOGGING: Always emit deterministic traces (chat.start, planner.*, committee.*, exec.payload, tool.run.start, chat.finish); errors are explicit, never logged-and-forgotten.\n"
+            "- ARCHITECTURE: No in-method imports, no hidden side effects, no background gateways/proxies unless explicitly requested; prefer deterministic behavior and expose seeds when using randomness.\n"
+            "- FUNCTIONS: No nested functions; all helpers are top-level or class methods; no closures that depend on outer locals—use explicit params/returns instead.\n"
+            "Summary: 4 spaces; no tabs; no function-level imports; no default timeouts; no retries on timeouts; no silent fails; no ORMs/Pydantic/SQLite; Postgres+asyncpg only; strict JSON envelopes; Planner→Executor→Orchestrator tool flow; full traceability."
         )},
         {"role": "system", "content": (
             "When generating videos, reasonable defaults are: duration<=10s, resolution=1920x1080, 24fps, language=en, neutral voice, audio ON, subtitles OFF. "
@@ -8882,76 +8816,9 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     # Pre-review checkpoint
     checkpoints_append_event(STATE_DIR, trace_id, "committee.review.pre", {"evidence": _ev, "risks": _risks})
 
-    # Run a lightweight two-model committee to propose planning strategies.
-    preplan_options: List[Dict[str, Any]] = []
-    # Compact summary of the current conversation for committee members
-    committee_user_text = (last_user_text or "").strip()
-    committee_msgs = [
-        {"role": "system", "content": "You are a planning committee. Propose a high-level tool strategy as JSON: {\"rationale\": str, \"tools_outline\": [str]}."},
-        {"role": "user", "content": committee_user_text or "No user text available."},
-    ]
-    # Log full preplan prompt so we can see exactly what guidance the committee saw.
-    _log(
-        "committee.preplan.messages",
-        trace_id=trace_id,
-        messages=committee_msgs,
-    )
-    env_preplan = await committee_ai_text(
-        committee_msgs,
-        trace_id=str(trace_id or "committee_preplan"),
-        temperature=DEFAULT_TEMPERATURE,
-    )
-    committee_errors: List[Dict[str, Any]] = []
-    preplan_options: List[Dict[str, Any]] = []
-    # Log the raw preplan envelope from the committee for debugging.
-    _log(
-        "committee.preplan.env",
-        trace_id=trace_id,
-        env=env_preplan,
-    )
-    if isinstance(env_preplan, dict) and env_preplan.get("ok"):
-        res_pre = env_preplan.get("result") or {}
-        text_pre = res_pre.get("text") or ""
-        schema_pre = {"rationale": str, "tools_outline": [str]}
-        parsed = await committee_jsonify(
-            text_pre or "{}",
-            expected_schema=schema_pre,
-            trace_id=str(trace_id or "committee_preplan"),
-            temperature=0.0,
-        )
-        rationale = (parsed.get("rationale") or text_pre or "").strip()
-        tools_outline = parsed.get("tools_outline") or []
-        opt_id = "opt_committee"
-        preplan_options.append(
-            {
-                "id": opt_id,
-                "author": "committee",
-                "rationale": rationale,
-                "tools_outline": tools_outline,
-            }
-        )
-    _log("committee.proposals", trace_id=trace_id, options=preplan_options)
-    # Simple heuristic vote: prefer any option that explicitly mentions typed args/json.parse, otherwise first option wins.
-    winner_id = None
-    for opt in preplan_options:
-        outline = " ".join(opt.get("tools_outline") or [])
-        rat = (opt.get("rationale") or "").lower()
-        if "json.parse" in outline or "typed" in rat:
-            winner_id = opt.get("id")
-            break
-    if not winner_id and preplan_options:
-        winner_id = preplan_options[0].get("id")
-    votes = [{"member": opt.get("author") or "member", "option_id": winner_id or opt.get("id"), "reasons": [opt.get("rationale") or ""]} for opt in preplan_options]
-    vote_env = {"votes": votes, "quorum": bool(preplan_options)}
-    _log("committee.vote", trace_id=trace_id, votes=vote_env.get("votes"), quorum=bool(vote_env.get("quorum")))
-    checkpoints_append_event(STATE_DIR, trace_id, "committee.decision.pre", {"votes": vote_env.get("votes"), "quorum": bool(vote_env.get("quorum"))})
-    if not bool(vote_env.get("quorum")):
-        _log("committee.quorum.fail", trace_id=trace_id)
-    _winner = winner_id or (preplan_options[0].get("id") if preplan_options else "opt_qwen")
-    _proposal_ids = [p.get("id") for p in (preplan_options or [])]
-    if _winner not in _proposal_ids:
-        _log("committee.selection.warn", trace_id=trace_id, reason="chosen_option_not_in_proposals")
-    _log("planner.finalize", trace_id=trace_id, chosen_option_id=_winner, deltas_from_option=[], justification="Chosen by two-model committee")
+    # Direct planner call: preplan removed. Planner prompt already includes tool
+    # catalog, mode, RoE, and routing rules; a single planner_produce_plan call
+    # governs tool selection.
     _log("planner.call", trace_id=trace_id)
     plan_text, tool_calls = await planner_produce_plan(messages, body.get("tools"), body.get("temperature") or DEFAULT_TEMPERATURE, trace_id=trace_id, mode=mode)
     _log("planner.done", trace_id=trace_id, tool_count=len(tool_calls or []))
