@@ -50,7 +50,8 @@ async def comfy_submit(graph: Dict[str, Any], client_id: Optional[str] = None, w
                     except Exception:
                         pass
                 return err
-            return JSONParser().parse(text, {})
+            parser = JSONParser()
+            return parser.parse(text, {"prompt_id": str, "uuid": str, "id": str})
 
 
 async def comfy_history(prompt_id: str) -> Dict[str, Any]:
@@ -68,7 +69,8 @@ async def comfy_history(prompt_id: str) -> Dict[str, Any]:
                         "details": {"body": text[:500]},
                     },
                 }
-            return JSONParser().parse(text, {})
+            parser = JSONParser()
+            return parser.parse(text, {"history": dict})
 
 
 async def comfy_upload_image(name_hint: str, b64_png: str) -> str:
@@ -82,8 +84,9 @@ async def comfy_upload_image(name_hint: str, b64_png: str) -> str:
             if r.status != 200:
                 # Return best-effort fallback name so callers can proceed.
                 return filename
-            obj = JSONParser().parse(text, {})
-            stored = obj.get("name") or filename
+            parser = JSONParser()
+            obj = parser.parse(text, {"name": str})
+            stored = obj.get("name") or filename if isinstance(obj, dict) else filename
             return stored
 
 
@@ -98,8 +101,9 @@ async def comfy_upload_mask(name_hint: str, b64_png: str) -> str:
             if r.status != 200:
                 # Return best-effort fallback name so callers can proceed.
                 return filename
-            obj = JSONParser().parse(text, {})
-            return obj.get("name") or filename
+            parser = JSONParser()
+            obj = parser.parse(text, {"name": str})
+            return obj.get("name") or filename if isinstance(obj, dict) else filename
 
 
 async def comfy_view(filename: str) -> Tuple[bytes, str]:
@@ -118,10 +122,9 @@ async def comfy_object_info(session: aiohttp.ClientSession, node_class: str) -> 
         text = await r.text()
         if r.status != 200:
             return {}
-        try:
-            return JSONParser().parse(text, {})
-        except Exception:
-            return {}
+        parser = JSONParser()
+        obj = parser.parse(text, {"inputs": dict})
+        return obj if isinstance(obj, dict) else {}
 
 
 def _norm(name: str) -> str:

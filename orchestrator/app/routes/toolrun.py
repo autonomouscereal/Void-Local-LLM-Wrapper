@@ -88,28 +88,20 @@ def _ok_env(ok: bool, **kwargs) -> dict:
 async def _post_json(url: str, obj: dict) -> dict:
 	async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
 		resp = await client.post(url, json=obj)
-		ct = resp.headers.get("content-type", "")
-		if "application/json" in ct:
-			data = resp.json()
-		else:
-			parser = JSONParser()
-			data = parser.parse(resp.text or "{}", {})
-		if 200 <= resp.status_code < 300:
-			return _ok_env(True, **(data if isinstance(data, dict) else {"data": data}))
+		parser = JSONParser()
+		data = parser.parse(resp.text or "{}", {})
+		if 200 <= resp.status_code < 300 and isinstance(data, dict):
+			return _ok_env(True, **data)
 		return _ok_env(False, code="http_error", status=resp.status_code, detail=data)
 
 
 async def _get_json(url: str) -> dict:
 	async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
 		resp = await client.get(url, headers={"accept": "application/json"})
-		ct = resp.headers.get("content-type", "")
-		if "application/json" in ct:
-			data = resp.json()
-		else:
-			parser = JSONParser()
-			data = parser.parse(resp.text or "{}", {})
-		if 200 <= resp.status_code < 300:
-			return _ok_env(True, **(data if isinstance(data, dict) else {"data": data}))
+		parser = JSONParser()
+		data = parser.parse(resp.text or "{}", {})
+		if 200 <= resp.status_code < 300 and isinstance(data, dict):
+			return _ok_env(True, **data)
 		return _ok_env(False, code="http_error", status=resp.status_code, detail=data)
 
 
@@ -142,10 +134,12 @@ def _ensure_api_prompt_graph(wf: dict) -> dict:
     if isinstance(wf, dict) and "prompt" in wf and isinstance(wf["prompt"], dict):
         return wf["prompt"]
     if isinstance(wf, dict) and "nodes" in wf:
-        raise ValueError("workflow_ui_format_not_supported")
+        # UI-exported workflows are not supported here; return empty mapping so caller can surface an error.
+        return {}
     if isinstance(wf, dict):
         return wf
-    raise ValueError("workflow_shape_invalid")
+    # Invalid shape; return empty mapping so caller can surface an error envelope.
+    return {}
 
 
 def _get_ref_node_id(ref) -> str | None:
@@ -167,12 +161,14 @@ def _resolve_bindings(graph: dict) -> dict:
     ks_id = (_first_node_id_by_class(graph, "KSampler")
              or _first_node_id_by_class(graph, "KSamplerAdvanced"))
     if not ks_id:
-        raise ValueError("missing_ksampler")
+        return {}
     ks_in = graph[ks_id].get("inputs", {})
     pos_id = _get_ref_node_id(ks_in.get("positive"))
     neg_id = _get_ref_node_id(ks_in.get("negative"))
     if not pos_id or not neg_id:
-        raise ValueError("ksampler_missing_positive_or_negative_refs")
+        # Missing positive/negative refs: return empty bindings so callers can
+        # surface structured errors instead of raising.
+        return {}
     latent_id = (_first_node_id_by_class(graph, "EmptyLatentImage")
                  or _first_node_id_by_class(graph, "LatentImage"))
     ckpt_id = (_first_node_id_by_class(graph, "CheckpointLoaderSimple")
@@ -305,7 +301,9 @@ def _append_jsonl(path: str, obj: dict) -> None:
 
 @router.post("/tool.run")
 async def tool_run(req: Request):
-	body = await req.json()
+	raw = await req.body()
+	parser = JSONParser()
+	body = parser.parse(raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw or ""), {"name": str, "args": dict, "trace_id": str, "cid": str})
 	trace_val = None
 	if isinstance(body, dict):
 		if isinstance(body.get("trace_id"), str) and body.get("trace_id"):

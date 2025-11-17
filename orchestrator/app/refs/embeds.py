@@ -35,9 +35,11 @@ def compute_music_embedding(ref_id: str, track_path: str | None, stem_paths: lis
 def maybe_load(ref_id: str, name: str) -> dict | None:
     p = _path(ref_id, name)
     try:
+        from ..json_parser import JSONParser
         with open(p, "r", encoding="utf-8") as f:
-            from ..jsonio.helpers import parse_json_text as _parse_json_text
-            return _parse_json_text(f.read(), {})
+            parser = JSONParser()
+            data = parser.parse(f.read(), {})
+            return data if isinstance(data, dict) else None
     except FileNotFoundError:
         return None
 

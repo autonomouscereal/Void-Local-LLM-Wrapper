@@ -46,9 +46,11 @@ def save_manifest(ref_id: str, manifest: dict) -> None:
 def load_manifest(ref_id: str) -> dict | None:
     p = os.path.join(ref_dir(ref_id), "manifest.json")
     try:
+        from ..json_parser import JSONParser
         with open(p, "r", encoding="utf-8") as f:
-            from ..jsonio.helpers import parse_json_text as _parse_json_text
-            return _parse_json_text(f.read(), {})
+            parser = JSONParser()
+            data = parser.parse(f.read(), {})
+            return data if isinstance(data, dict) else None
     except FileNotFoundError:
         return None
 

@@ -113,13 +113,12 @@ def _run_ocr(path: str) -> Dict[str, Any]:
             data = f.read()
         b64 = base64.b64encode(data).decode("ascii")
         r = requests.post(OCR_API_URL.rstrip("/") + "/ocr", json={"b64": b64, "ext": ext})
-        if 200 <= r.status_code < 300:
-            js = r.json()
-            txt = (js.get("text") or "").strip()
-            out["ocr_text"] = txt
-            out["has_text"] = bool(txt)
-        else:
-            out["error"] = f"ocr_http_{r.status_code}"
+        from app.json_parser import JSONParser  # local import to avoid cycles at module import time
+        parser = JSONParser()
+        js = parser.parse(r.text or "{}", {"text": str})
+        txt = (js.get("text") or "").strip() if isinstance(js, dict) else ""
+        out["ocr_text"] = txt
+        out["has_text"] = bool(txt)
     except Exception as ex:
         out["error"] = f"ocr_error:{ex}"
     return out
@@ -146,11 +145,10 @@ def _run_yolo(path: str) -> Dict[str, Any]:
             json={"image_path": path},
             timeout=10,
         )
-        if not (200 <= r.status_code < 300):
-            res["error"] = f"vision_repair_http_{r.status_code}"
-            return res
-        js = r.json()
-        objects = js.get("objects") or []
+        from app.json_parser import JSONParser  # local import to avoid cycles at module import time
+        parser = JSONParser()
+        js = parser.parse(r.text or "{}", {"objects": list, "faces": list})
+        objects = js.get("objects") or [] if isinstance(js, dict) else []
         yolo_list: List[Dict[str, Any]] = []
         entity_tags: List[str] = []
         if isinstance(objects, list):
@@ -253,11 +251,10 @@ def _qwen_vl_analyze(path: str, prompt: Optional[str]) -> Dict[str, Any]:
             json={"image_url": image_url, "prompt": base_instr},
             timeout=60,
         )
-        if not (200 <= r.status_code < 300):
-            res["error"] = f"vlm_http_{r.status_code}"
-            return res
-        js = r.json()
-        text = (js.get("text") or "").strip()
+        from app.json_parser import JSONParser  # local import to avoid cycles at module import time
+        parser = JSONParser()
+        js = parser.parse(r.text or "{}", {"text": str})
+        text = (js.get("text") or "").strip() if isinstance(js, dict) else ""
         if not text:
             res["error"] = "vlm_empty_text"
             return res

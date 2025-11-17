@@ -5,7 +5,7 @@ import os
 from typing import Any, Dict, List
 import time
 from .ids import step_id
-from ..jsonio.helpers import parse_json_text as _parse_json_text
+from ..json_parser import JSONParser
 
 
 def _append_atomic(path: str, text: str) -> None:
@@ -29,19 +29,16 @@ def read_tail(path: str, n: int = 10) -> List[Dict[str, Any]]:
     if not os.path.exists(path):
         return []
     out: List[Dict[str, Any]] = []
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            lines = f.readlines()[-max(1, int(n)) :]
-        for ln in lines:
-            ln = ln.strip()
-            if not ln:
-                continue
-            try:
-                out.append(_parse_json_text(ln, {}))
-            except Exception:
-                continue
-    except Exception:
-        return []
+    parser = JSONParser()
+    with open(path, "r", encoding="utf-8") as f:
+        lines = f.readlines()[-max(1, int(n)) :]
+    for ln in lines:
+        ln = ln.strip()
+        if not ln:
+            continue
+        obj = parser.parse(ln, {})
+        if isinstance(obj, dict):
+            out.append(obj)
     return out
 
 
@@ -71,11 +68,20 @@ def append_event(root: str, key: str, kind: str, data: Dict[str, Any]) -> None:
 
 
 def read_all(root: str, key: str) -> List[Dict[str, Any]]:
-    try:
-        with open(_path(root, key), "r", encoding="utf-8") as f:
-            return [_parse_json_text(line, {}) for line in f if line.strip()]
-    except FileNotFoundError:
+    path = _path(root, key)
+    if not os.path.exists(path):
         return []
+    parser = JSONParser()
+    out: List[Dict[str, Any]] = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            ln = line.strip()
+            if not ln:
+                continue
+            obj = parser.parse(ln, {})
+            if isinstance(obj, dict):
+                out.append(obj)
+    return out
 
 
 def last_event(root: str, key: str, kind: str | None = None) -> Dict[str, Any] | None:

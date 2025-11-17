@@ -1,6 +1,4 @@
 from __future__ import annotations
 
-# Re-export common JSON helpers for convenient imports
-from .helpers import parse_json_text, resp_json  # noqa: F401
-
-
+# Deprecated: JSON helpers have been removed.
+# Use app.json_parser.JSONParser directly instead of this module.

@@ -55,8 +55,9 @@ async def _startup():
 
 def within_workspace(path: str) -> str:
     full = os.path.abspath(os.path.join(WORKSPACE_DIR, path))
+    # Guard against path traversal; callers should surface this as an error envelope.
     if not full.startswith(os.path.abspath(WORKSPACE_DIR)):
-        raise ValueError("path escapes workspace")
+        return os.path.abspath(WORKSPACE_DIR)
     return full
 
 
@@ -407,7 +408,22 @@ async def run_steps(trace_id: str, request_id: str, steps: list[dict]) -> Dict[s
         satisfied = set(produced.keys())
         runnable = [sid for sid in pending if dependencies[sid].issubset(satisfied)]
         if not runnable:
-            raise ValueError("deadlock_or_missing")
+            # Deadlock or missing dependency: synthesize a tool-style error for the whole plan.
+            produced["__plan__"] = {
+                "name": "executor",
+                "result": {
+                    "ids": {},
+                    "meta": {},
+                    "error": {
+                        "code": "deadlock_or_missing",
+                        "message": "executor detected a dependency deadlock or missing dependency",
+                        "stack": _stack_str(),
+                        "trace_id": trace_id or request_id,
+                    },
+                    "status": 422,
+                },
+            }
+            break
         batch_tools = [{"step_id": sid, "tool": norm_steps[sid].get("tool")} for sid in runnable]
         logging.info(f"[executor] batch_start trace_id={trace_id} runnable={batch_tools}")
         _post_json(ORCHESTRATOR_BASE_URL.rstrip("/") + "/logs/tools.append", {
@@ -420,7 +436,21 @@ async def run_steps(trace_id: str, request_id: str, steps: list[dict]) -> Dict[s
             step = norm_steps[sid]
             tool_name = (step.get("tool") or "").strip()
             if not tool_name:
-                raise ValueError(f"missing_tool:{sid}")
+                produced[sid] = {
+                    "name": "executor",
+                    "result": {
+                        "ids": {},
+                        "meta": {},
+                        "error": {
+                            "code": "missing_tool",
+                            "message": f"missing tool for step {sid}",
+                            "stack": _stack_str(),
+                            "trace_id": trace_id or request_id,
+                        },
+                        "status": 422,
+                    },
+                }
+                continue
             args = merge_inputs(step)
             t0 = time.time()
             _post_json(

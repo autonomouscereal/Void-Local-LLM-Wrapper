@@ -90,7 +90,7 @@ from .json_parser import JSONParser
 from .determinism import seed_router as det_seed_router, seed_tool as det_seed_tool, round6 as det_round6
 from .icw.windowed_solver import solve as windowed_solve
 from .jsonio.normalize import normalize_to_envelope
-from .jsonio.helpers import parse_json_text as _parse_json_text, resp_json as _resp_json
+from .json_parser import JSONParser
 from .search.meta import rrf_fuse as _rrf_fuse
 from .tools.progress import emit_progress, set_progress_queue, get_progress_queue
 from .tools.mcp_bridge import call_mcp_tool as _call_mcp_tool
@@ -322,7 +322,16 @@ async def _run_patch_call(
     Execute a single patch tool call via the executor path (validator disabled).
     """
     if not isinstance(call, dict):
-        raise ValueError("invalid patch tool call")
+        # Surface invalid patch calls as a structured error instead of raising.
+        return {
+            "ok": False,
+            "error": {
+                "code": "invalid_patch_call",
+                "message": "patch tool call must be a dict",
+                "trace_id": trace_id,
+            },
+            "result": {},
+        }
     patch_calls: List[Dict[str, Any]] = [call]
     _inject_execution_context(patch_calls, trace_id, mode)
     # Validator disabled: execute patch calls directly without pre-validation.
@@ -1270,19 +1279,6 @@ def _comfy_is_completed(detail: Dict[str, Any]) -> bool:
     return False
 from .db.pool import get_pg_pool
 from .db.tracing import db_insert_run as _db_insert_run, db_update_run_response as _db_update_run_response, db_insert_icw_log as _db_insert_icw_log, db_insert_tool_call as _db_insert_tool_call
-## db helpers moved to .db.tracing
-def _normalize_dict_body(body: Any, expected_schema: Dict[str, Any]) -> Dict[str, Any]:
-    """Accept either a dict or a JSON string and return a dict shaped by expected_schema.
-    Never raise on bad input; return {} as a safe default.
-    """
-    if isinstance(body, dict):
-        return body
-    if isinstance(body, str):
-        try:
-            return JSONParser().parse(body, expected_schema or {})
-        except Exception:
-            return {}
-    return {}
 
 
 def _merge_lock_bundles(existing: Dict[str, Any], update: Dict[str, Any]) -> Dict[str, Any]:
@@ -2117,10 +2113,11 @@ def _load_wrapper_config() -> None:
             with open(WRAPPER_CONFIG_PATH, "rb") as f:
                 data = f.read()
             WRAPPER_CONFIG_HASH = f"sha256:{_sha256_bytes(data)}"
-            try:
-                WRAPPER_CONFIG = JSONParser().parse(data.decode("utf-8"), {})
-            except Exception:
-                WRAPPER_CONFIG = {}
+            parser = JSONParser()
+            # Wrapper config is expected to be a dict; treat it as open, but
+            # still coerce into a mapping shape.
+            cfg = parser.parse(data.decode("utf-8"), {"profiles": list, "defaults": dict})
+            WRAPPER_CONFIG = cfg if isinstance(cfg, dict) else {}
         else:
             WRAPPER_CONFIG = {}
             WRAPPER_CONFIG_HASH = None
@@ -2499,15 +2496,8 @@ _films_mem: Dict[str, Dict[str, Any]] = {}
 @app.post("/v1/image/dispatch")
 async def post_image_dispatch(request: Request):
     rid = _uuid.uuid4().hex
-    try:
-        body = await request.json()
-    except Exception as ex:
-        return ToolEnvelope.failure(
-            "invalid_json",
-            f"Body must be valid JSON: {ex}",
-            status=400,
-            request_id=rid,
-        )
+    raw = await request.body()
+    body_text = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw or "")
     parser = JSONParser()
     expected = {
         "prompt": (str),
@@ -2522,7 +2512,7 @@ async def post_image_dispatch(request: Request):
         "steps": (int),
         "cfg": (float),
     }
-    obj = parser.parse(body, expected) if isinstance(body, (str, bytes)) else parser.parse(json.dumps(body or {}), expected)
+    obj = parser.parse(body_text, expected)
     # core fields
     prompt = obj.get("prompt")
     negative = obj.get("negative")
@@ -2859,7 +2849,8 @@ async def call_ollama(base_url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
             # Some Ollama versions reject the keep_alive option in the request body; rely on server env instead
             resp = await client.post(f"{base_url}/api/generate", json=ppayload)
             # Expected minimal Ollama generate response
-            data = _resp_json(resp, {"response": str, "prompt_eval_count": int, "eval_count": int})
+            parser = JSONParser()
+            data = parser.parse(resp.text or "", {"response": str, "prompt_eval_count": int, "eval_count": int})
             if isinstance(data, dict) and ("prompt_eval_count" in data or "eval_count" in data):
                 usage = {
                     "prompt_tokens": int(data.get("prompt_eval_count", 0) or 0),
@@ -4034,7 +4025,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 r = await client.post(VISION_REPAIR_API_URL.rstrip("/") + "/v1/image/analyze", json=payload)
             if r.status_code < 200 or r.status_code >= 300:
                 return {"name": name, "error": f"vision_repair_error_status_{r.status_code}"}
-            js = _resp_json(r, {"faces": list, "hands": list, "objects": list, "quality": dict})
+            parser = JSONParser()
+            js = parser.parse(r.text or "", {"faces": list, "hands": list, "objects": list, "quality": dict})
             return {"name": name, "result": js}
         except Exception as ex:
             return {"name": name, "error": f"vision_repair_error: {ex}"}
@@ -4057,7 +4049,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 r = await client.post(VISION_REPAIR_API_URL.rstrip("/") + "/v1/image/repair", json=payload)
             if r.status_code < 200 or r.status_code >= 300:
                 return {"name": name, "error": f"vision_repair_error_status_{r.status_code}"}
-            js = _resp_json(r, {"repaired_image_path": str, "regions": list, "mode": (str,)})
+            parser = JSONParser()
+            js = parser.parse(r.text or "", {"repaired_image_path": str, "regions": list, "mode": (str,)})
             return {"name": name, "result": js}
         except Exception as ex:
             return {"name": name, "error": f"vision_repair_error: {ex}"}
@@ -5149,8 +5142,9 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     if 200 <= status < 300:
                         # XTTS service returns a canonical envelope: decode audio and adapt to internal shape.
                         if "application/json" in ct:
-                            env = _resp_json(
-                                r,
+                            parser = JSONParser()
+                            env = parser.parse(
+                                r.text or "",
                                 {
                                     "schema_version": int,
                                     "trace_id": str,
@@ -5212,7 +5206,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     raw_body = r.text
                     data = None
                     if "application/json" in ct:
-                        data = _resp_json(r, {})
+                        parser = JSONParser()
+                        data = parser.parse(raw_body or "", {})
                     return {
                         "schema_version": 1,
                         "request_id": trace_id,
@@ -5471,13 +5466,12 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 return {"name": name, "error": f"path_error: {str(ex)}"}
         else:
             return {"name": name, "error": "missing b64|url|path"}
-        try:
-            async with httpx.AsyncClient() as client:
-                r = await client.post(OCR_API_URL.rstrip("/") + "/ocr", json={"b64": b64, "ext": ext})
-                js = _resp_json(r, {"text": str})
-                return {"name": name, "result": {"text": js.get("text") or "", "ext": ext}}
-        except Exception as ex:
-            return {"name": name, "error": str(ex)}
+        async with httpx.AsyncClient() as client:
+            r = await client.post(OCR_API_URL.rstrip("/") + "/ocr", json={"b64": b64, "ext": ext})
+            parser = JSONParser()
+            js = parser.parse(r.text or "", {"text": str})
+            text_val = js.get("text") or "" if isinstance(js, dict) else ""
+            return {"name": name, "result": {"text": text_val, "ext": ext}}
     if name == "vlm.analyze" and ALLOW_TOOL_EXECUTION:
         if not VLM_API_URL:
             return {"name": name, "error": "VLM_API_URL not configured"}
@@ -5511,13 +5505,11 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 return {"name": name, "error": f"path_error: {str(ex)}"}
         else:
             return {"name": name, "error": "missing b64|url|path"}
-        try:
-            async with httpx.AsyncClient() as client:
-                r = await client.post(VLM_API_URL.rstrip("/") + "/analyze", json={"b64": b64, "ext": ext})
-                js = _resp_json(r, {})
-                return {"name": name, "result": js}
-        except Exception as ex:
-            return {"name": name, "error": str(ex)}
+        async with httpx.AsyncClient() as client:
+            r = await client.post(VLM_API_URL.rstrip("/") + "/analyze", json={"b64": b64, "ext": ext})
+            parser = JSONParser()
+            js = parser.parse(r.text or "", {})
+            return {"name": name, "result": js if isinstance(js, dict) else {}}
     if name == "music.infinite.windowed" and ALLOW_TOOL_EXECUTION:
         if not MUSIC_API_URL:
             # Fail fast with a clear, structured error instead of burying the root cause.
@@ -5543,8 +5535,9 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 }
                 with _hxsync.Client(timeout=None, trust_env=False) as client:
                     r = client.post(MUSIC_API_URL.rstrip("/") + "/generate", json=body)
-                    js = _resp_json(r, {"audio_wav_base64": str, "wav_b64": str})
-                    b64 = js.get("audio_wav_base64") or js.get("wav_b64")
+                    parser = JSONParser()
+                    js = parser.parse(r.text or "", {"audio_wav_base64": str, "wav_b64": str})
+                    b64 = js.get("audio_wav_base64") or js.get("wav_b64") if isinstance(js, dict) else None
                     wav = _b.b64decode(b64) if isinstance(b64, str) else b""
                     return {"wav_bytes": wav, "model": f"musicgen:{os.getenv('MUSIC_MODEL_ID','')}"}
 
@@ -5668,8 +5661,9 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 }
                 with _hxsync.Client(timeout=None, trust_env=False) as client:
                     r = client.post(MUSIC_API_URL.rstrip("/") + "/generate", json=body)
-                    js = _resp_json(r, {"audio_wav_base64": str, "wav_b64": str})
-                    b64 = js.get("audio_wav_base64") or js.get("wav_b64")
+                    parser = JSONParser()
+                    js = parser.parse(r.text or "", {"audio_wav_base64": str, "wav_b64": str})
+                    b64 = js.get("audio_wav_base64") or js.get("wav_b64") if isinstance(js, dict) else None
                     wav = _b.b64decode(b64) if isinstance(b64, str) else b""
                     return {"wav_bytes": wav, "model": f"musicgen:{os.getenv('MUSIC_MODEL_ID','')}"}
         provider = _MusicProvider()
@@ -5854,9 +5848,10 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 }
                 with _hxsync.Client(timeout=None, trust_env=False) as client:
                     r = client.post(MUSIC_API_URL.rstrip("/") + "/generate", json=body)
-                    js = _resp_json(r, {"audio_wav_base64": str, "wav_b64": str})
-                    b64 = js.get("audio_wav_base64") or js.get("wav_b64")
-                    wav = _b.b64decode(b64) if isinstance(b64, str) else b""
+                    parser = JSONParser()
+                    js = parser.parse(r.text or "", {"audio_wav_base64": str, "wav_b64": str})
+                    b64 = js.get("audio_wav_base64") or js.get("wav_b64") if isinstance(js, dict) else None
+                    wav = _b64.b64decode(b64) if isinstance(b64, str) else b""
                     return {"wav_bytes": wav, "model": f"musicgen:{os.getenv('MUSIC_MODEL_ID','')}"}
 
         provider = _MusicRefineProvider()
@@ -6329,62 +6324,56 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
     if name in ("music.song.primary", "music.song.yue") and ALLOW_TOOL_EXECUTION:
         if not PRIMARY_MUSIC_API_URL:
             return {"name": name, "error": "PRIMARY_MUSIC_API_URL not configured"}
-        try:
-            async with httpx.AsyncClient() as client:
-                body = {
-                    "lyrics": args.get("lyrics"),
-                    "style_tags": args.get("style_tags") or [],
-                    "bpm": args.get("bpm"),
-                    "key": args.get("key"),
-                    "seed": args.get("seed"),
-                    "reference_song": args.get("reference_song"),
-                    "quality": "max",
-                    "infinite": True,
-                }
-                r = await client.post(PRIMARY_MUSIC_API_URL.rstrip("/") + "/v1/music/song", json=body)
-                r.raise_for_status()
-                return {"name": name, "result": _resp_json(r, {})}
-        except Exception as ex:
-            return {"name": name, "error": str(ex)}
+        async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
+            body = {
+                "lyrics": args.get("lyrics"),
+                "style_tags": args.get("style_tags") or [],
+                "bpm": args.get("bpm"),
+                "key": args.get("key"),
+                "seed": args.get("seed"),
+                "reference_song": args.get("reference_song"),
+                "quality": "max",
+                "infinite": True,
+            }
+            r = await client.post(PRIMARY_MUSIC_API_URL.rstrip("/") + "/v1/music/song", json=body)
+            parser = JSONParser()
+            js = parser.parse(r.text or "", {})
+            return {"name": name, "result": js if isinstance(js, dict) else {}}
     if name == "music.melody.musicgen" and ALLOW_TOOL_EXECUTION:
         if not MUSIC_API_URL:
             return {"name": name, "error": "MUSIC_API_URL not configured"}
-        try:
-            async with httpx.AsyncClient() as client:
-                payload = {
-                    "text": args.get("text"),
-                    "melody_wav": args.get("melody_wav"),
-                    "bpm": args.get("bpm"),
-                    "key": args.get("key"),
-                    "seed": args.get("seed"),
-                    "style_tags": args.get("style_tags") or [],
-                    "length_s": args.get("length_s"),
-                    "quality": "max",
-                    "infinite": True,
-                }
-                r = await client.post(MUSIC_API_URL.rstrip("/") + "/generate", json=payload)
-                r.raise_for_status()
-                return {"name": name, "result": _resp_json(r, {})}
-        except Exception as ex:
-            return {"name": name, "error": str(ex)}
+        async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
+            payload = {
+                "text": args.get("text"),
+                "melody_wav": args.get("melody_wav"),
+                "bpm": args.get("bpm"),
+                "key": args.get("key"),
+                "seed": args.get("seed"),
+                "style_tags": args.get("style_tags") or [],
+                "length_s": args.get("length_s"),
+                "quality": "max",
+                "infinite": True,
+            }
+            r = await client.post(MUSIC_API_URL.rstrip("/") + "/generate", json=payload)
+            parser = JSONParser()
+            js = parser.parse(r.text or "", {})
+            return {"name": name, "result": js if isinstance(js, dict) else {}}
     if name == "music.timed.sao" and ALLOW_TOOL_EXECUTION:
         if not SAO_API_URL:
             return {"name": name, "error": "SAO_API_URL not configured"}
-        try:
-            async with httpx.AsyncClient() as client:
-                payload = {
-                    "text": args.get("text"),
-                    "seconds": int(args.get("seconds") or args.get("duration_sec") or 8),
-                    "bpm": args.get("bpm"),
-                    "seed": args.get("seed"),
-                    "genre_tags": args.get("genre_tags") or [],
-                    "quality": "max",
-                }
-                r = await client.post(SAO_API_URL.rstrip("/") + "/v1/music/timed", json=payload)
-                r.raise_for_status()
-                return {"name": name, "result": _resp_json(r, {})}
-        except Exception as ex:
-            return {"name": name, "error": str(ex)}
+        async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
+            payload = {
+                "text": args.get("text"),
+                "seconds": int(args.get("seconds") or args.get("duration_sec") or 8),
+                "bpm": args.get("bpm"),
+                "seed": args.get("seed"),
+                "genre_tags": args.get("genre_tags") or [],
+                "quality": "max",
+            }
+            r = await client.post(SAO_API_URL.rstrip("/") + "/v1/music/timed", json=payload)
+            parser = JSONParser()
+            js = parser.parse(r.text or "", {})
+            return {"name": name, "result": js if isinstance(js, dict) else {}}
     if name == "audio.stems.demucs" and ALLOW_TOOL_EXECUTION:
         if not DEMUCS_API_URL:
             return {"name": name, "error": "DEMUCS_API_URL not configured"}
@@ -6392,8 +6381,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             async with httpx.AsyncClient() as client:
                 payload = {"mix_wav": args.get("mix_wav") or args.get("src"), "stems": args.get("stems") or ["vocals","drums","bass","other"]}
                 r = await client.post(DEMUCS_API_URL.rstrip("/") + "/v1/audio/stems", json=payload)
-                r.raise_for_status()
-                js = _resp_json(r, {})
+                parser = JSONParser()
+                js = parser.parse(r.text or "", {})
                 # Persist stems if present
                 stems_obj = js.get("stems") if isinstance(js, dict) else None
                 if isinstance(stems_obj, dict):
@@ -6574,23 +6563,22 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                         payload["pitch_shift_semitones"] = float(pitch_shift)
                     async with httpx.AsyncClient() as client:
                         r = await client.post(VOCAL_FIXER_API_URL.rstrip("/") + "/vocal_fix_path", json=payload)
-                        js = _resp_json(r, {})
-                        new_path = js.get("path")
+                        parser = JSONParser()
+                        js = parser.parse(r.text or "", {})
+                        new_path = js.get("path") if isinstance(js, dict) else None
                         if isinstance(new_path, str) and new_path.strip():
                             transformed_vocals = new_path
             except Exception:
                 transformed_vocals = vocals_path
             # 3) Optional voice conversion via RVC
-            try:
-                if RVC_API_URL and isinstance(voice_lock_id, str) and voice_lock_id.strip():
-                    async with httpx.AsyncClient() as client:
-                        r = await client.post(RVC_API_URL.rstrip("/") + "/convert_path", json={"wav_path": transformed_vocals, "voice_lock_id": voice_lock_id})
-                        js = _resp_json(r, {})
-                        new_path = js.get("path")
-                        if isinstance(new_path, str) and new_path.strip():
-                            transformed_vocals = new_path
-            except Exception:
-                pass
+            if RVC_API_URL and isinstance(voice_lock_id, str) and voice_lock_id.strip():
+                async with httpx.AsyncClient() as client:
+                    r = await client.post(RVC_API_URL.rstrip("/") + "/convert_path", json={"wav_path": transformed_vocals, "voice_lock_id": voice_lock_id})
+                    parser = JSONParser()
+                    js = parser.parse(r.text or "", {"path": str})
+                    new_path = js.get("path") if isinstance(js, dict) else None
+                    if isinstance(new_path, str) and new_path.strip():
+                        transformed_vocals = new_path
             # 4) Re-mix vocals with backing
             stems_for_mix = [{"path": transformed_vocals, "gain_db": 0.0}] + backing_stems
             mix_args = {
@@ -6658,34 +6646,30 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
     if name == "audio.vc.rvc" and ALLOW_TOOL_EXECUTION:
         if not RVC_API_URL:
             return {"name": name, "error": "RVC_API_URL not configured"}
-        try:
-            async with httpx.AsyncClient() as client:
-                payload = {
-                    "source_vocal_wav": args.get("source_vocal_wav") or args.get("src"),
-                    "target_voice_ref": args.get("target_voice_ref") or args.get("voice_ref"),
-                }
-                r = await client.post(RVC_API_URL.rstrip("/") + "/v1/audio/convert", json=payload)
-                r.raise_for_status()
-                return {"name": name, "result": _resp_json(r, {})}
-        except Exception as ex:
-            return {"name": name, "error": str(ex)}
+        async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
+            payload = {
+                "source_vocal_wav": args.get("source_vocal_wav") or args.get("src"),
+                "target_voice_ref": args.get("target_voice_ref") or args.get("voice_ref"),
+            }
+            r = await client.post(RVC_API_URL.rstrip("/") + "/v1/audio/convert", json=payload)
+            parser = JSONParser()
+            js = parser.parse(r.text or "", {})
+            return {"name": name, "result": js if isinstance(js, dict) else {}}
     if name == "voice.sing.diffsinger.rvc" and ALLOW_TOOL_EXECUTION:
         if not DIFFSINGER_RVC_API_URL:
             return {"name": name, "error": "DIFFSINGER_RVC_API_URL not configured"}
-        try:
-            async with httpx.AsyncClient() as client:
-                payload = {
-                    "lyrics": args.get("lyrics"),
-                    "notes_midi": args.get("notes_midi"),
-                    "melody_wav": args.get("melody_wav"),
-                    "target_voice_ref": args.get("target_voice_ref") or args.get("voice_ref"),
-                    "seed": args.get("seed"),
-                }
-                r = await client.post(DIFFSINGER_RVC_API_URL.rstrip("/") + "/v1/voice/sing", json=payload)
-                r.raise_for_status()
-                return {"name": name, "result": _resp_json(r, {})}
-        except Exception as ex:
-            return {"name": name, "error": str(ex)}
+        async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
+            payload = {
+                "lyrics": args.get("lyrics"),
+                "notes_midi": args.get("notes_midi"),
+                "melody_wav": args.get("melody_wav"),
+                "target_voice_ref": args.get("target_voice_ref") or args.get("voice_ref"),
+                "seed": args.get("seed"),
+            }
+            r = await client.post(DIFFSINGER_RVC_API_URL.rstrip("/") + "/v1/voice/sing", json=payload)
+            parser = JSONParser()
+            js = parser.parse(r.text or "", {})
+            return {"name": name, "result": js if isinstance(js, dict) else {}}
     if name == "refs.music.build_profile" and ALLOW_TOOL_EXECUTION:
         try:
             body = args if isinstance(args, dict) else {}
@@ -7065,18 +7049,16 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
     if name == "audio.foley.hunyuan" and ALLOW_TOOL_EXECUTION:
         if not HUNYUAN_FOLEY_API_URL:
             return {"name": name, "error": "HUNYUAN_FOLEY_API_URL not configured"}
-        try:
-            async with httpx.AsyncClient() as client:
-                payload = {
-                    "video_ref": args.get("video_ref") or args.get("src"),
-                    "cue_regions": args.get("cue_regions") or [],
-                    "style_tags": args.get("style_tags") or [],
-                }
-                r = await client.post(HUNYUAN_FOLEY_API_URL.rstrip("/") + "/v1/audio/foley", json=payload)
-                r.raise_for_status()
-                return {"name": name, "result": _resp_json(r, {})}
-        except Exception as ex:
-            return {"name": name, "error": str(ex)}
+        async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
+            payload = {
+                "video_ref": args.get("video_ref") or args.get("src"),
+                "cue_regions": args.get("cue_regions") or [],
+                "style_tags": args.get("style_tags") or [],
+            }
+            r = await client.post(HUNYUAN_FOLEY_API_URL.rstrip("/") + "/v1/audio/foley", json=payload)
+            parser = JSONParser()
+            js = parser.parse(r.text or "", {})
+            return {"name": name, "result": js if isinstance(js, dict) else {}}
     if name in ("image.edit", "image.upscale") and ALLOW_TOOL_EXECUTION:
         return {"name": name, "error": "disabled: use image.dispatch with full graph (no fallbacks)"}
     if name == "image.super_gen" and ALLOW_TOOL_EXECUTION:
@@ -7240,13 +7222,11 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             base = (DRT_API_URL or "").rstrip("/")
             if not base:
                 return {"name": name, "error": str(ex)}
-            try:
-                async with httpx.AsyncClient() as client:
-                    r = await client.post(base + "/research/run", json=args)
-                    r.raise_for_status()
-                    return {"name": name, "result": _resp_json(r, {})}
-            except Exception as ex2:
-                return {"name": name, "error": str(ex2)}
+            async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
+                r = await client.post(base + "/research/run", json=args)
+                parser = JSONParser()
+                js = parser.parse(r.text or "", {})
+                return {"name": name, "result": js if isinstance(js, dict) else {}}
     if name == "code.super_loop" and ALLOW_TOOL_EXECUTION:
         # Build a local provider wrapper on top of Qwen
         class _LocalProvider:
@@ -7261,13 +7241,11 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 opts["num_predict"] = max(1, int(max_tokens or 900))
                 payload["options"] = opts
                 # reuse async call_ollama via blocking run
-                try:
-                    r = _rq.post(self.base_url.rstrip("/") + "/api/generate", json=payload)
-                    r.raise_for_status()
-                    js = _resp_json(r, {"response": str})
-                    return SimpleNamespace(text=str(js.get("response", "")), model_name=self.model_name)
-                except Exception:
-                    return SimpleNamespace(text="{}", model_name=self.model_name)
+                r = _rq.post(self.base_url.rstrip("/") + "/api/generate", json=payload)
+                parser = JSONParser()
+                js = parser.parse(r.text or "", {"response": str})
+                resp_text = js.get("response") if isinstance(js, dict) and isinstance(js.get("response"), str) else ""
+                return SimpleNamespace(text=str(resp_text), model_name=self.model_name)
         repo_root = os.getenv("REPO_ROOT", "/workspace")
         step_tokens = int(os.getenv("CODE_LOOP_STEP_TOKENS", "900") or 900)
         prov = _LocalProvider(QWEN_BASE_URL, QWEN_MODEL_ID, DEFAULT_NUM_CTX, DEFAULT_TEMPERATURE)
@@ -7323,17 +7301,14 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         base = (DRT_API_URL or "").rstrip("/")
         if not base:
             return {"name": name, "error": "drt_unavailable"}
-        try:
-            async with httpx.AsyncClient() as client:
-                payload = {"url": url, "modes": (args.get("modes") or {})}
-                if isinstance(args.get("headers"), dict):
-                    payload["headers"] = args.get("headers")
-                r = await client.post(base + "/web/smart_get", json=payload)
-                r.raise_for_status()
-                js = _resp_json(r, {})
-                return {"name": name, "result": js}
-        except Exception as ex:
-            return {"name": name, "error": str(ex)}
+        async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
+            payload = {"url": url, "modes": (args.get("modes") or {})}
+            if isinstance(args.get("headers"), dict):
+                payload["headers"] = args.get("headers")
+            r = await client.post(base + "/web/smart_get", json=payload)
+            parser = JSONParser()
+            js = parser.parse(r.text or "", {})
+            return {"name": name, "result": js if isinstance(js, dict) else {}}
     if name == "source_fetch" and ALLOW_TOOL_EXECUTION:
         url = args.get("url") or ""
         if not url:
@@ -7746,7 +7721,10 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                         er = _c.post(FACEID_API_URL.rstrip("/") + "/embed", json={"image_url": face_url})
                         emb = None
                         if er.status_code == 200:
-                            ej = _resp_json(er, {"embedding": list, "vec": list}); emb = ej.get("embedding") or ej.get("vec")
+                            parser = JSONParser()
+                            ej = parser.parse(er.text or "", {"embedding": list, "vec": list})
+                            if isinstance(ej, dict):
+                                emb = ej.get("embedding") or ej.get("vec")
                     # 3) Per-frame InstantID apply with low denoise
                     if emb and isinstance(emb, list):
                         frame_files = sorted(_glob(os.path.join(frames_dir, "*.png")))
@@ -7769,13 +7747,15 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                                 with _hx.Client() as _c2:
                                     pr = _c2.post(COMFYUI_API_URL.rstrip("/") + "/prompt", json={"prompt": g, "client_id": "wrapper-001"})
                                     if pr.status_code == 200:
-                                        pj = _resp_json(pr, {"prompt_id": str, "uuid": str, "id": str})
-                                        pid = (pj.get("prompt_id") or pj.get("uuid") or pj.get("id"))
+                                        parser = JSONParser()
+                                        pj = parser.parse(pr.text or "", {"prompt_id": str, "uuid": str, "id": str})
+                                        pid = (pj.get("prompt_id") or pj.get("uuid") or pj.get("id")) if isinstance(pj, dict) else None
                                         # poll for completion
                                         while True:
                                             hr = _c2.get(COMFYUI_API_URL.rstrip("/") + f"/history/{pid}")
                                             if hr.status_code == 200:
-                                                hj = _resp_json(hr, {})
+                                                parser = JSONParser()
+                                                hj = parser.parse(hr.text or "", {})
                                                 hist = hj.get("history") if isinstance(hj, dict) else {}
                                                 if not isinstance(hist, dict):
                                                     hist = hj if isinstance(hj, dict) else {}
@@ -7949,7 +7929,10 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                         er = _c.post(FACEID_API_URL.rstrip("/") + "/embed", json={"image_url": face_url})
                         emb = None
                         if er.status_code == 200:
-                            ej = _resp_json(er, {"embedding": list, "vec": list}); emb = ej.get("embedding") or ej.get("vec")
+                            parser = JSONParser()
+                            ej = parser.parse(er.text or "", {"embedding": list, "vec": list})
+                            if isinstance(ej, dict):
+                                emb = ej.get("embedding") or ej.get("vec")
                     if emb and isinstance(emb, list):
                         frame_files = sorted(_glob(os.path.join(frames_dir, "*.png")))
                         for fp in frame_files:
@@ -7969,13 +7952,15 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                                 with _hx.Client() as _c2:
                                     pr = _c2.post(COMFYUI_API_URL.rstrip("/") + "/prompt", json={"prompt": g, "client_id": "wrapper-001"})
                                     if pr.status_code == 200:
-                                        pj = _resp_json(pr, {"prompt_id": str, "uuid": str, "id": str})
-                                        pid = (pj.get("prompt_id") or pj.get("uuid") or pj.get("id"))
+                                        parser = JSONParser()
+                                        pj = parser.parse(pr.text or "", {"prompt_id": str, "uuid": str, "id": str})
+                                        pid = (pj.get("prompt_id") or pj.get("uuid") or pj.get("id")) if isinstance(pj, dict) else None
                                         while True:
                                             hr = _c2.get(COMFYUI_API_URL.rstrip("/") + f"/history/{pid}")
                                             if hr.status_code == 200:
-                                                hj = _resp_json(hr, {"history": dict})
-                                                h = (hj.get("history") or {}).get(pid)
+                                                parser = JSONParser()
+                                                hj = parser.parse(hr.text or "", {"history": dict})
+                                                h = (hj.get("history") or {}).get(pid) if isinstance(hj, dict) else None
                                                 if h and _comfy_is_completed(h):
                                                     outs = (h.get("outputs") or {})
                                                     got = False
@@ -8084,7 +8069,9 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             }
             async with httpx.AsyncClient() as client:
                 r = await client.post(HUNYUAN_VIDEO_API_URL.rstrip("/") + "/v1/video/hv/t2v", json=payload)
-            return {"name": name, "result": _resp_json(r, {})}
+            parser = JSONParser()
+            js = parser.parse(r.text or "", {})
+            return {"name": name, "result": js if isinstance(js, dict) else {}}
         except Exception as ex:
             return {"name": name, "error": str(ex)}
     if name == "video.hv.i2v" and ALLOW_TOOL_EXECUTION:
@@ -8106,7 +8093,9 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             }
             async with httpx.AsyncClient() as client:
                 r = await client.post(HUNYUAN_VIDEO_API_URL.rstrip("/") + "/v1/video/hv/i2v", json=payload)
-            return {"name": name, "result": _resp_json(r, {})}
+            parser = JSONParser()
+            js = parser.parse(r.text or "", {})
+            return {"name": name, "result": js if isinstance(js, dict) else {}}
         except Exception as ex:
             return {"name": name, "error": str(ex)}
     if name == "math.eval":
@@ -8191,8 +8180,10 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
             r = await client.post(XTTS_API_URL.rstrip("/") + "/tts", json=payload)
             status = r.status_code
+            parser = JSONParser()
+            js = parser.parse(r.text or "", {})
             if 200 <= status < 300:
-                return {"name": name, "result": _resp_json(r, {})}
+                return {"name": name, "result": js if isinstance(js, dict) else {}}
             # Non-2xx: surface a structured error rather than raising
             return {
                 "name": name,
@@ -8203,83 +8194,83 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 },
             }
     if name == "asr_transcribe" and WHISPER_API_URL and ALLOW_TOOL_EXECUTION:
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
             r = await client.post(WHISPER_API_URL.rstrip("/") + "/transcribe", json={"audio_url": args.get("audio_url"), "language": args.get("language")})
-            try:
-                r.raise_for_status()
-                return {"name": name, "result": _resp_json(r, {})}
-            except Exception:
-                return {"name": name, "error": r.text}
+            parser = JSONParser()
+            js = parser.parse(r.text or "", {})
+            if 200 <= r.status_code < 300:
+                return {"name": name, "result": js if isinstance(js, dict) else {}}
+            return {"name": name, "error": r.text}
     if name == "image_generate" and COMFYUI_API_URL and ALLOW_TOOL_EXECUTION:
         # expects a ComfyUI workflow graph or minimal prompt params passed through
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
             wf_payload = args.get("workflow") or args
             if isinstance(wf_payload, dict) and "prompt" not in wf_payload:
                 wf_payload = {"prompt": wf_payload}
             wf_payload = {**(wf_payload or {}), "client_id": "wrapper-001"}
             r = await client.post(COMFYUI_API_URL.rstrip("/") + "/prompt", json=wf_payload)
-            try:
-                r.raise_for_status()
-                return {"name": name, "result": _resp_json(r, {})}
-            except Exception:
-                return {"name": name, "error": r.text}
+            parser = JSONParser()
+            js = parser.parse(r.text or "", {})
+            if 200 <= r.status_code < 300:
+                return {"name": name, "result": js if isinstance(js, dict) else {}}
+            return {"name": name, "error": r.text}
     if name == "controlnet" and COMFYUI_API_URL and ALLOW_TOOL_EXECUTION:
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
             wf_payload = args.get("workflow") or args
             if isinstance(wf_payload, dict) and "prompt" not in wf_payload:
                 wf_payload = {"prompt": wf_payload}
             wf_payload = {**(wf_payload or {}), "client_id": "wrapper-001"}
             r = await client.post(COMFYUI_API_URL.rstrip("/") + "/prompt", json=wf_payload)
-            try:
-                r.raise_for_status()
-                return {"name": name, "result": _resp_json(r, {})}
-            except Exception:
-                return {"name": name, "error": r.text}
+            parser = JSONParser()
+            js = parser.parse(r.text or "", {})
+            if 200 <= r.status_code < 300:
+                return {"name": name, "result": js if isinstance(js, dict) else {}}
+            return {"name": name, "error": r.text}
     if name == "video_generate" and COMFYUI_API_URL and ALLOW_TOOL_EXECUTION:
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
             wf_payload = args.get("workflow") or args
             if isinstance(wf_payload, dict) and "prompt" not in wf_payload:
                 wf_payload = {"prompt": wf_payload}
             wf_payload = {**(wf_payload or {}), "client_id": "wrapper-001"}
             r = await client.post(COMFYUI_API_URL.rstrip("/") + "/prompt", json=wf_payload)
-            try:
-                r.raise_for_status()
-                return {"name": name, "result": _resp_json(r, {})}
-            except Exception:
-                return {"name": name, "error": r.text}
+            parser = JSONParser()
+            js = parser.parse(r.text or "", {})
+            if 200 <= r.status_code < 300:
+                return {"name": name, "result": js if isinstance(js, dict) else {}}
+            return {"name": name, "error": r.text}
     if name == "face_embed" and FACEID_API_URL and ALLOW_TOOL_EXECUTION:
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
             r = await client.post(FACEID_API_URL.rstrip("/") + "/embed", json={"image_url": args.get("image_url")})
-            try:
-                r.raise_for_status()
-                return {"name": name, "result": _resp_json(r, {})}
-            except Exception:
-                return {"name": name, "error": r.text}
+            parser = JSONParser()
+            js = parser.parse(r.text or "", {})
+            if 200 <= r.status_code < 300:
+                return {"name": name, "result": js if isinstance(js, dict) else {}}
+            return {"name": name, "error": r.text}
     if name == "music_generate" and MUSIC_API_URL and ALLOW_TOOL_EXECUTION:
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
             r = await client.post(MUSIC_API_URL.rstrip("/") + "/generate", json=args)
-            try:
-                r.raise_for_status()
-                return {"name": name, "result": _resp_json(r, {})}
-            except Exception:
-                return {"name": name, "error": r.text}
+            parser = JSONParser()
+            js = parser.parse(r.text or "", {})
+            if 200 <= r.status_code < 300:
+                return {"name": name, "result": js if isinstance(js, dict) else {}}
+            return {"name": name, "error": r.text}
     if name == "vlm_analyze" and VLM_API_URL and ALLOW_TOOL_EXECUTION:
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
             r = await client.post(VLM_API_URL.rstrip("/") + "/analyze", json={"image_url": args.get("image_url"), "prompt": args.get("prompt")})
-            try:
-                r.raise_for_status()
-                return {"name": name, "result": _resp_json(r, {})}
-            except Exception:
-                return {"name": name, "error": r.text}
+            parser = JSONParser()
+            js = parser.parse(r.text or "", {})
+            if 200 <= r.status_code < 300:
+                return {"name": name, "result": js if isinstance(js, dict) else {}}
+            return {"name": name, "error": r.text}
     # --- Film tools (LLM-driven, simple UI) ---
     if name == "run_python" and EXECUTOR_BASE_URL and ALLOW_TOOL_EXECUTION:
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
             r = await client.post(EXECUTOR_BASE_URL.rstrip("/") + "/run_python", json={"code": args.get("code", "")})
-            try:
-                r.raise_for_status()
-                return {"name": name, "result": _resp_json(r, {})}
-            except Exception:
-                return {"name": name, "error": r.text}
+            parser = JSONParser()
+            js = parser.parse(r.text or "", {})
+            if 200 <= r.status_code < 300:
+                return {"name": name, "result": js if isinstance(js, dict) else {}}
+            return {"name": name, "error": r.text}
     if name == "write_file" and EXECUTOR_BASE_URL and ALLOW_TOOL_EXECUTION:
         # Guard: forbid writing banned libraries into requirements/pyproject
         p = (args.get("path") or "").lower()
@@ -8288,21 +8279,21 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             banned = ("pydantic", "sqlalchemy", "pandas", "pyarrow", "fastparquet", "polars")
             if any(b in content_val.lower() for b in banned):
                 return {"name": name, "error": "forbidden_library", "detail": "banned library in dependency file"}
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
             r = await client.post(EXECUTOR_BASE_URL.rstrip("/") + "/write_file", json={"path": args.get("path"), "content": content_val})
-            try:
-                r.raise_for_status()
-                return {"name": name, "result": _resp_json(r, {})}
-            except Exception:
-                return {"name": name, "error": r.text}
+            parser = JSONParser()
+            js = parser.parse(r.text or "", {})
+            if 200 <= r.status_code < 300:
+                return {"name": name, "result": js if isinstance(js, dict) else {}}
+            return {"name": name, "error": r.text}
     if name == "read_file" and EXECUTOR_BASE_URL and ALLOW_TOOL_EXECUTION:
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
             r = await client.post(EXECUTOR_BASE_URL.rstrip("/") + "/read_file", json={"path": args.get("path")})
-            try:
-                r.raise_for_status()
-                return {"name": name, "result": _resp_json(r, {})}
-            except Exception:
-                return {"name": name, "error": r.text}
+            parser = JSONParser()
+            js = parser.parse(r.text or "", {})
+            if 200 <= r.status_code < 300:
+                return {"name": name, "result": js if isinstance(js, dict) else {}}
+            return {"name": name, "error": r.text}
     # MCP tool forwarding (HTTP bridge)
     if name and (name.startswith("mcp:") or args.get("mcpTool") is True) and ALLOW_TOOL_EXECUTION:
         res = await _call_mcp_tool(MCP_HTTP_BRIDGE_URL, name.replace("mcp:", "", 1), args)
@@ -8344,23 +8335,9 @@ async def execute_tools(tool_calls: List[Dict[str, Any]], trace_id: str | None =
         steps_count=len(steps),
     )
     async with _hx.AsyncClient(timeout=None) as client:
-        try:
-            r = await client.post(EXECUTOR_BASE_URL.rstrip("/") + "/execute", json=payload)
-            env = _resp_json(r, {})
-        except Exception as ex:
-            env = {"ok": False, "error": {"code": "executor_connect_error", "message": str(ex)}, "result": {"produced": {}}}
-            if trace_id:
-                _trace_log_error(
-                    STATE_DIR,
-                    str(trace_id),
-                    {
-                        "context": "executor",
-                        "code": "executor_connect_error",
-                        "message": str(ex),
-                        "status": 0,
-                        "details": {},
-                    },
-                )
+        r = await client.post(EXECUTOR_BASE_URL.rstrip("/") + "/execute", json=payload)
+        parser = JSONParser()
+        env = parser.parse(r.text or "", {})
     results: List[Dict[str, Any]] = []
     if isinstance(env, dict) and env.get("ok") and isinstance((env.get("result") or {}).get("produced"), dict):
         for sid, step in (env.get("result") or {}).get("produced", {}).items():
@@ -8408,7 +8385,15 @@ async def execute_tools(tool_calls: List[Dict[str, Any]], trace_id: str | None =
                 "meta": {"retry_index": 0},
             },
         )
-    return [{"name": "executor", "error": (err.get("message") or "executor_failed")}]
+    # Surface full executor error; never truncate to a generic 'executor_failed'.
+    return [{
+        "name": "executor",
+        "error": {
+            "code": err.get("code") or "executor_error",
+            "message": err.get("message") or "executor_error",
+            "stack": err.get("stack") or "".join(traceback.format_stack()),
+        },
+    }]
 
 
 @app.post("/v1/chat/completions")
@@ -10544,11 +10529,30 @@ async def http_tool_run(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     base = (PUBLIC_BASE_URL or "http://127.0.0.1:8000").rstrip("/")
     async with _hx.AsyncClient(trust_env=False, timeout=None) as client:
         r = await client.post(base + "/tool.run", json={"name": name, "args": args})
-        env = _resp_json(r, {})
-        # Canonical consumer: interpret ok/error from envelope
+        parser = JSONParser()
+        env = parser.parse(r.text or "", {})
+        # Canonical consumer: interpret ok/error from envelope; propagate full error object.
         if isinstance(env, dict) and env.get("ok") and isinstance(env.get("result"), dict):
             return {"name": name, "result": env["result"]}
-        return {"name": name, "error": (env.get("error") or {}).get("message") if isinstance(env, dict) else "tool_failed"}
+        if isinstance(env, dict) and isinstance(env.get("error"), dict):
+            err = env.get("error") or {}
+            return {
+                "name": name,
+                "error": {
+                    "code": err.get("code") or "tool_error",
+                    "message": err.get("message") or "tool_error",
+                    "stack": err.get("stack") or "".join(traceback.format_stack()),
+                },
+            }
+        # Fallback: unknown error shape; include stack.
+        return {
+            "name": name,
+            "error": {
+                "code": "tool_error",
+                "message": str(env),
+                "stack": "".join(traceback.format_stack()),
+            },
+        }
 from fastapi import Request  # type: ignore
 from fastapi import Response  # type: ignore
 
@@ -11038,7 +11042,8 @@ async def logs_trace_tail(id: str, kind: str = "responses", limit: int = 200):
 @app.post("/v1/icw/pack")
 async def v1_icw_pack(body: Dict[str, Any]):
     expected = {"job_id": str, "modality": str, "window_idx": int}
-    payload = _normalize_dict_body(body, expected)
+    parser = JSONParser()
+    payload = parser.parse(json.dumps(body or {}), expected)
     job_id = (payload.get("job_id") or "").strip()
     modality = (payload.get("modality") or "").strip().lower()
     if not job_id or modality not in ("text","image","audio","music","video"):
@@ -11072,7 +11077,8 @@ async def v1_icw_pack(body: Dict[str, Any]):
 @app.post("/v1/icw/advance")
 async def v1_icw_advance(body: Dict[str, Any]):
     expected = {"job_id": str, "window_capsule": dict}
-    payload = _normalize_dict_body(body, expected)
+    parser = JSONParser()
+    payload = parser.parse(json.dumps(body or {}), expected)
     job_id = (payload.get("job_id") or "").strip()
     cap = payload.get("window_capsule") or {}
     if not job_id or not isinstance(cap, dict):
@@ -11107,7 +11113,8 @@ async def v1_state_project(job_id: str):
 @app.post("/v1/review/score")
 async def v1_review_score(body: Dict[str, Any]):
     expected = {"kind": str, "path": str, "prompt": str}
-    payload = _normalize_dict_body(body, expected)
+    parser = JSONParser()
+    payload = parser.parse(json.dumps(body or {}), expected)
     kind = (payload.get("kind") or "").strip().lower()
     path = payload.get("path") or ""
     prompt = (payload.get("prompt") or "").strip()
@@ -11133,14 +11140,16 @@ async def v1_review_score(body: Dict[str, Any]):
 
 @app.post("/v1/review/plan")
 async def v1_review_plan(body: Dict[str, Any]):
-    payload = _normalize_dict_body(body, {"scores": dict})
+    parser = JSONParser()
+    payload = parser.parse(json.dumps(body or {}), {"scores": dict})
     plan = _build_delta_plan(payload.get("scores") or {})
     return {"ok": True, "plan": plan}
 
 @app.post("/v1/review/loop")
 async def v1_review_loop(body: Dict[str, Any]):
     expected = {"artifacts": list, "prompt": str}
-    payload = _normalize_dict_body(body, expected)
+    parser = JSONParser()
+    payload = parser.parse(json.dumps(body or {}), expected)
     arts = payload.get("artifacts") or []
     prompt = (payload.get("prompt") or "").strip()
     loop_idx = 0
@@ -11230,7 +11239,8 @@ async def v1_video_generate(body: Dict[str, Any]):
             request_id=rid,
         )
     expected = {"prompt": str, "refs": dict, "locks": dict, "duration_s": int, "fps": int, "size": list, "seed": int, "icw": dict}
-    payload = _normalize_dict_body(body, expected)
+    parser = JSONParser()
+    payload = parser.parse(json.dumps(body or {}), expected)
     prompt = (payload.get("prompt") or "").strip()
     if not prompt:
         return ToolEnvelope.failure(
@@ -11281,7 +11291,8 @@ async def v1_video_edit(body: Dict[str, Any]):
             request_id=rid,
         )
     expected = {"image_url": str, "instruction": str, "locks": dict, "fps": int, "size": list, "seconds": int, "seed": int}
-    payload = _normalize_dict_body(body, expected)
+    parser = JSONParser()
+    payload = parser.parse(json.dumps(body or {}), expected)
     init_image = payload.get("image_url")
     if not init_image:
         return ToolEnvelope.failure(
@@ -11329,7 +11340,8 @@ async def v1_video_edit(body: Dict[str, Any]):
 async def v1_audio_lyrics_to_song(body: Dict[str, Any]):
     rid = _uuid.uuid4().hex
     expected = {"lyrics": str, "style_prompt": str, "ref_audio_ids": list, "lock_ids": list, "duration_s": int, "seed": int, "bpm": int, "key": str}
-    payload = _normalize_dict_body(body, expected)
+    parser = JSONParser()
+    payload = parser.parse(json.dumps(body or {}), expected)
     lyrics = (payload.get("lyrics") or "").strip()
     style = (payload.get("style_prompt") or "").strip()
     duration_s = int(payload.get("duration_s") or 30)
@@ -11362,7 +11374,8 @@ async def v1_audio_lyrics_to_song(body: Dict[str, Any]):
 async def v1_audio_edit(body: Dict[str, Any]):
     rid = _uuid.uuid4().hex
     expected = {"audio_url": str, "ops": list}
-    payload = _normalize_dict_body(body, expected)
+    parser = JSONParser()
+    payload = parser.parse(json.dumps(body or {}), expected)
     audio_url = payload.get("audio_url")
     ops = payload.get("ops") or []
     if not audio_url:
@@ -11388,7 +11401,8 @@ async def v1_audio_edit(body: Dict[str, Any]):
 async def v1_audio_tts_sing(body: Dict[str, Any]):
     rid = _uuid.uuid4().hex
     expected = {"script": list, "style_lock_id": str, "structure": dict}
-    payload = _normalize_dict_body(body, expected)
+    parser = JSONParser()
+    payload = parser.parse(json.dumps(body or {}), expected)
     script = payload.get("script") or []
     if not isinstance(script, list) or not script:
         return ToolEnvelope.failure(
@@ -11428,7 +11442,8 @@ async def v1_audio_tts_sing(body: Dict[str, Any]):
 async def v1_audio_score_video(body: Dict[str, Any]):
     rid = _uuid.uuid4().hex
     expected = {"video_url": str, "markers": list, "style_prompt": str, "voice_lock_id": str, "accept_edits": bool}
-    payload = _normalize_dict_body(body, expected)
+    parser = JSONParser()
+    payload = parser.parse(json.dumps(body or {}), expected)
     video_url = payload.get("video_url")
     markers = payload.get("markers") or []
     style_prompt = payload.get("style_prompt") or ""
@@ -11464,7 +11479,8 @@ async def v1_audio_score_video(body: Dict[str, Any]):
 async def v1_locks_create(body: Dict[str, Any]):
     rid = _uuid.uuid4().hex
     expected = {"type": str, "refs": list, "tags": list}
-    payload = _normalize_dict_body(body, expected)
+    parser = JSONParser()
+    payload = parser.parse(json.dumps(body or {}), expected)
     lk_type = (payload.get("type") or "").strip().lower()
     refs = payload.get("refs") or []
     tags = payload.get("tags") or []
@@ -11490,7 +11506,8 @@ async def v1_locks_create(body: Dict[str, Any]):
 @app.post("/v1/audio/lyrics-to-song")
 async def v1_audio_lyrics_to_song(body: Dict[str, Any]):
     expected = {"lyrics": str, "style_prompt": str, "ref_audio_ids": list, "lock_ids": list, "duration_s": int, "seed": int, "bpm": int, "key": str}
-    payload = _normalize_dict_body(body, expected)
+    parser = JSONParser()
+    payload = parser.parse(json.dumps(body or {}), expected)
     lyrics = (payload.get("lyrics") or "").strip()
     style = (payload.get("style_prompt") or "").strip()
     duration_s = int(payload.get("duration_s") or 30)
@@ -11511,7 +11528,8 @@ async def v1_audio_lyrics_to_song(body: Dict[str, Any]):
 async def v1_tts(body: Dict[str, Any]):
     rid = _uuid.uuid4().hex
     expected = {"text": str, "voice_ref_url": str, "voice_id": str, "lang": str, "prosody": dict, "seed": int}
-    payload = _normalize_dict_body(body, expected)
+    parser = JSONParser()
+    payload = parser.parse(json.dumps(body or {}), expected)
     text = (payload.get("text") or "").strip()
     if not text:
         return ToolEnvelope.failure(
@@ -11528,7 +11546,8 @@ async def v1_tts(body: Dict[str, Any]):
 async def v1_audio_sfx(body: Dict[str, Any]):
     rid = _uuid.uuid4().hex
     expected = {"type": str, "length_s": float, "pitch": float, "seed": int}
-    payload = _normalize_dict_body(body, expected)
+    parser = JSONParser()
+    payload = parser.parse(json.dumps(body or {}), expected)
     args = {"type": payload.get("type"), "length_s": payload.get("length_s"), "pitch": payload.get("pitch"), "seed": payload.get("seed")}
     manifest = {"items": []}
     env = run_sfx_compose(args, manifest)
@@ -11738,28 +11757,29 @@ async def completions_legacy(body: Dict[str, Any]):
                             if data_str == "[DONE]":
                                 yield "data: [DONE]\n\n"
                                 break
-                            try:
-                                obj = _parse_json_text(data_str, {})
-                                # Extract assistant text (final-only chunk in our impl)
-                                txt = ""
+                            parser = JSONParser()
+                            obj = parser.parse(data_str, {"id": str, "model": str, "choices": [{"delta": {"content": str}, "message": {"content": str}}]})
+                            # Extract assistant text (final-only chunk in our impl)
+                            txt = ""
+                            if isinstance(obj, dict):
                                 try:
-                                    txt = (((obj.get("choices") or [{}])[0].get("delta") or {}).get("content") or "")
-                                    if not txt:
-                                        txt = (((obj.get("choices") or [{}])[0].get("message") or {}).get("content") or "")
+                                    choices = obj.get("choices") or [{}]
+                                    if isinstance(choices, list) and choices:
+                                        first = choices[0] if isinstance(choices[0], dict) else {}
+                                        delta = first.get("delta") or {}
+                                        msg = first.get("message") or {}
+                                        txt = (delta.get("content") or msg.get("content") or "") if isinstance(delta, dict) and isinstance(msg, dict) else ""
                                 except Exception:
                                     txt = ""
-                                chunk = {
-                                    "id": obj.get("id") or "orc-1",
-                                    "object": "text_completion.chunk",
-                                    "model": obj.get("model") or QWEN_MODEL_ID,
-                                    "choices": [
-                                        {"index": 0, "delta": {"text": txt}, "finish_reason": None}
-                                    ],
-                                }
-                                yield f"data: {json.dumps(chunk)}\n\n"
-                            except Exception:
-                                # pass through unknown data
-                                yield line + "\n"
+                            chunk = {
+                                "id": obj.get("id") or "orc-1" if isinstance(obj, dict) else "orc-1",
+                                "object": "text_completion.chunk",
+                                "model": obj.get("model") or QWEN_MODEL_ID if isinstance(obj, dict) else QWEN_MODEL_ID,
+                                "choices": [
+                                    {"index": 0, "delta": {"text": txt}, "finish_reason": None}
+                                ],
+                            }
+                            yield f"data: {json.dumps(chunk)}\n\n"
         return StreamingResponse(_gen(), media_type="text/event-stream")
 
     # Non-streaming: call locally and map envelope
@@ -11777,7 +11797,8 @@ async def completions_legacy(body: Dict[str, Any]):
             "created": int(time.time()),
         }
         return JSONResponse(content=out)
-    obj = _resp_json(rr, {"choices": [{"message": {"content": str}}], "usage": dict, "created": int, "system_fingerprint": str, "model": str, "id": str})
+    parser = JSONParser()
+    obj = parser.parse(rr.text or "", {"choices": [{"message": {"content": str}}], "usage": dict, "created": int, "system_fingerprint": str, "model": str, "id": str})
     content_txt = (((obj.get("choices") or [{}])[0].get("message") or {}).get("content") or obj.get("text") or "")
     out = {
         "id": obj.get("id") or "orc-1",
@@ -11958,9 +11979,9 @@ async def _comfy_submit_workflow(workflow: Dict[str, Any]) -> Dict[str, Any]:
                         payload = {**payload, "client_id": "wrapper-001"}
                         r = await client.post(base.rstrip("/") + "/prompt", json=payload)
                     try:
-                        r.raise_for_status()
-                        res = _resp_json(r, {"prompt_id": str, "uuid": str, "id": str})
-                        pid = res.get("prompt_id") or res.get("uuid") or res.get("id")
+                        parser = JSONParser()
+                        res = parser.parse(r.text or "", {"prompt_id": str, "uuid": str, "id": str})
+                        pid = res.get("prompt_id") or res.get("uuid") or res.get("id") if isinstance(res, dict) else None
                         if isinstance(pid, str):
                             _job_endpoint[pid] = base
                             # Wait for execution via WS
@@ -11974,7 +11995,7 @@ async def _comfy_submit_workflow(workflow: Dict[str, Any]) -> Dict[str, Any]:
                                         d = jd.get("data") or {}
                                         if d.get("prompt_id") == pid:
                                             break
-                            return res
+                            return res if isinstance(res, dict) else {}
                     except Exception:
                         last_err = r.text
             except Exception as ex:
@@ -11994,13 +12015,13 @@ async def _comfy_history(prompt_id: str) -> Dict[str, Any]:
     base = _job_endpoint.get(prompt_id) or (await _pick_comfy_base())
     if not base:
         return {"error": "COMFYUI_API_URL(S) not configured"}
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
         r = await client.get(base.rstrip("/") + f"/history/{prompt_id}")
-        try:
-            r.raise_for_status()
-            return _resp_json(r, {})
-        except Exception:
-            return {"error": r.text}
+        parser = JSONParser()
+        js = parser.parse(r.text or "", {})
+        if 200 <= r.status_code < 300:
+            return js if isinstance(js, dict) else {}
+        return {"error": r.text}
 
 
 async def get_film_characters(film_id: str) -> List[Dict[str, Any]]:
@@ -12022,8 +12043,9 @@ async def get_film_preferences(film_id: str) -> Dict[str, Any]:
     if isinstance(meta, dict):
         return dict(meta)
     if isinstance(meta, str):
-        # Expect a preferences dict (open schema)
-        parsed = JSONParser().parse(meta, {})
+        # Expect a preferences dict; coerce into mapping with open schema.
+        parser = JSONParser()
+        parsed = parser.parse(meta, {"preferences": dict})
         return parsed if isinstance(parsed, dict) else {}
     return {}
 
@@ -12554,10 +12576,9 @@ async def _update_scene_from_job(job_id: str, detail: Dict[str, Any] | str, fail
                             if crow:
                                 rd = crow.get("reference_data")
                                 if isinstance(rd, str):
-                                    try:
-                                        rd = JSONParser().parse(rd, {})
-                                    except Exception:
-                                        rd = {}
+                                    parser = JSONParser()
+                                    rd_parsed = parser.parse(rd, {"locks": dict, "style": dict, "qa": dict})
+                                    rd = rd_parsed if isinstance(rd_parsed, dict) else {}
                                 if isinstance(rd, dict):
                                     v2 = rd.get("voice")
                                     if v2:
@@ -12579,15 +12600,17 @@ async def _update_scene_from_job(job_id: str, detail: Dict[str, Any] | str, fail
             except Exception:
                 pass
             if XTTS_API_URL and ALLOW_TOOL_EXECUTION and scene_text and audio_enabled:
-                async with httpx.AsyncClient() as client:
+                async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
                     tr = await client.post(XTTS_API_URL.rstrip("/") + "/tts", json={"text": scene_text, "voice": voice, "language": language})
                     if tr.status_code == 200:
-                        scene_tts = JSONParser().parse(tr.text, {})
+                        parser = JSONParser()
+                        scene_tts = parser.parse(tr.text or "", {"audio_wav_base64": str, "sample_rate": int, "language": str})
             if MUSIC_API_URL and ALLOW_TOOL_EXECUTION and audio_enabled:
-                async with httpx.AsyncClient() as client:
+                async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
                     mr = await client.post(MUSIC_API_URL.rstrip("/") + "/generate", json={"prompt": "cinematic background score", "duration": duration})
                     if mr.status_code == 200:
-                        scene_music = JSONParser().parse(mr.text, {})
+                        parser = JSONParser()
+                        scene_music = parser.parse(mr.text or "", {"audio_wav_base64": str, "duration": float})
             # simple SRT creation from scene_text if enabled
             if scene_text and subs_enabled:
                 srt = _text_to_simple_srt(scene_text, duration)
@@ -12665,18 +12688,18 @@ async def _maybe_compile_film(film_id: str) -> None:
     # Prefer local assembler if available
     if ASSEMBLER_API_URL:
         try:
-            async with httpx.AsyncClient() as client:
+            async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
                 r = await client.post(ASSEMBLER_API_URL.rstrip("/") + "/assemble", json=payload)
-                r.raise_for_status()
-                assembly_result = _resp_json(r, {})
+                parser = JSONParser()
+                assembly_result = parser.parse(r.text or "", {})
         except Exception:
             assembly_result = {"error": True}
     elif N8N_WEBHOOK_URL and ENABLE_N8N:
         try:
-            async with httpx.AsyncClient() as client:
+            async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
                 r = await client.post(N8N_WEBHOOK_URL, json=payload)
-                r.raise_for_status()
-                assembly_result = _resp_json(r, {})
+                parser = JSONParser()
+                assembly_result = parser.parse(r.text or "", {})
         except Exception:
             assembly_result = {"error": True}
     # Always write a manifest to uploads for convenience

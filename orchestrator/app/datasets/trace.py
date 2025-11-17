@@ -50,24 +50,20 @@ def append_sample(kind: str, row: Dict[str, Any]) -> str:
     except Exception:
         pass
     # Maintain a tiny index of file sizes for convenience
-    try:
-        idx_path = os.path.join(root, "index.json")
-        idx = {}
-        if os.path.exists(idx_path):
-            try:
-                with open(idx_path, "r", encoding="utf-8") as f:
-                    from ..jsonio.helpers import parse_json_text as _parse_json_text
-                    idx = _parse_json_text(f.read(), {})
-            except Exception:
-                idx = {}
-        sz = os.path.getsize(path) if os.path.exists(path) else 0
-        idx[kind] = {"path": _public_url(path.replace(UPLOAD_DIR, "/uploads")), "size_bytes": int(sz)}
-        tmp = idx_path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(json.dumps(idx, ensure_ascii=False))
-        os.replace(tmp, idx_path)
-    except Exception:
-        pass
+    idx_path = os.path.join(root, "index.json")
+    idx: Dict[str, Any] = {}
+    if os.path.exists(idx_path):
+        from ..json_parser import JSONParser
+        with open(idx_path, "r", encoding="utf-8") as f:
+            parser = JSONParser()
+            parsed = parser.parse(f.read(), {})
+            idx = parsed if isinstance(parsed, dict) else {}
+    sz = os.path.getsize(path) if os.path.exists(path) else 0
+    idx[kind] = {"path": _public_url(path.replace(UPLOAD_DIR, "/uploads")), "size_bytes": int(sz)}
+    tmp = idx_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(json.dumps(idx, ensure_ascii=False))
+    os.replace(tmp, idx_path)
     return path
 
 

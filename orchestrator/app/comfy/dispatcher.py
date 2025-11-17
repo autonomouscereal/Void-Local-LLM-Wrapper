@@ -19,7 +19,7 @@ WF_PATH    = os.getenv("COMFY_WORKFLOW_PATH", "/workspace/services/image/workflo
 
 def load_workflow() -> Dict[str, Any]:
     text = Path(WF_PATH).read_text(encoding="utf-8")
-    return JSONParser().parse(text, {})
+    return JSONParser().parse(text, {"nodes": list})
 
 
 def _patch_text_prompts(graph: Dict[str, Any], positive: Optional[str], negative: Optional[str]) -> None:
@@ -127,7 +127,9 @@ async def submit(graph: Dict[str, Any]) -> Dict[str, Any]:
         print(f"[comfy.history] GET {hurl}")
         hr = await client.get(hurl)
         if hr.status_code == 200:
-            return {"prompt_id": pid, "history": JSONParser().parse(hr.text, {})}
+            parser = JSONParser()
+            hist = parser.parse(hr.text or "", {"history": dict})
+            return {"prompt_id": pid, "history": hist if isinstance(hist, dict) else {}}
         return {"prompt_id": pid, "history_error": hr.text}
 
 

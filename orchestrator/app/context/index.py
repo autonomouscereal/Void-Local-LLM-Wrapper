@@ -216,14 +216,13 @@ def resolve_global(text: str, kind_hint: Optional[str] = None, search_limit: int
         best = None
         best_score = -1.0
         qvec = _embed_text(txt)
+        parser = JSONParser()
         for ln in reversed(lines):
             ln = ln.strip()
             if not ln:
                 continue
-            try:
-                from ..jsonio.helpers import parse_json_text as _parse_json_text
-                obj = _parse_json_text(ln, {})
-            except Exception:
+            obj = parser.parse(ln, {})
+            if not isinstance(obj, dict):
                 continue
             if kind_hint and not str(obj.get("kind", "")).startswith(kind_hint):
                 continue

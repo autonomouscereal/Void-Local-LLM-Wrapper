@@ -159,7 +159,7 @@ async def utc_run_tool(trace_id: Optional[str], step_id: Optional[str], name: st
         "result": None,
         "error": {
             "code": err_obj.get("code") or "tool_error",
-            "message": err_obj.get("message") or "tool failed",
+            "message": err_obj.get("message") or f"tool {name} failed",
             "status": status,
             "raw": res,
             "stack": _stack_str(),

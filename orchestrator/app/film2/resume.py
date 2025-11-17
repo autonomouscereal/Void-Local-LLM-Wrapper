@@ -34,10 +34,11 @@ def _cp_path(cid: str) -> str:
 
 def load_checkpoint(cid: str) -> Checkpoint:
     try:
+        from ..json_parser import JSONParser
         with open(_cp_path(cid), "r", encoding="utf-8") as f:
-            from ..jsonio.helpers import parse_json_text as _parse_json_text
-            js = _parse_json_text(f.read(), {})
-            return Checkpoint(cid=cid, phase=int(js.get("phase", 0)), extra=js.get("extra"))
+            parser = JSONParser()
+            js = parser.parse(f.read(), {"phase": int, "extra": dict})
+            return Checkpoint(cid=cid, phase=int(js.get("phase", 0)), extra=js.get("extra") if isinstance(js, dict) else None)
     except Exception:
         return Checkpoint(cid=cid, phase=0, extra=None)
 
@@ -64,9 +65,11 @@ def mark_shot_done(cid: str, shot_id: str) -> None:
         p = _shots_done_path(cid)
         done = []
         if os.path.exists(p):
+            from ..json_parser import JSONParser
             with open(p, "r", encoding="utf-8") as f:
-                from ..jsonio.helpers import parse_json_text as _parse_json_text
-                done = _parse_json_text(f.read(), [])
+                parser = JSONParser()
+                parsed = parser.parse(f.read(), [])
+                done = parsed if isinstance(parsed, list) else []
         if shot_id not in done:
             done.append(shot_id)
         tmp = p + ".tmp"
@@ -82,9 +85,11 @@ def is_shot_done(cid: str, shot_id: str) -> bool:
         p = _shots_done_path(cid)
         if not os.path.exists(p):
             return False
+        from ..json_parser import JSONParser
         with open(p, "r", encoding="utf-8") as f:
-            from ..jsonio.helpers import parse_json_text as _parse_json_text
-            done = _parse_json_text(f.read(), [])
+            parser = JSONParser()
+            parsed = parser.parse(f.read(), [])
+            done = parsed if isinstance(parsed, list) else []
         return shot_id in (done or [])
     except Exception:
         return False

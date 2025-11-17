@@ -22,9 +22,11 @@ def save_shot_snapshot(cid: str, shot_id: str, payload: Dict[str, Any]) -> None:
 def load_shot_snapshot(cid: str, shot_id: str) -> Optional[Dict[str, Any]]:
     p = os.path.join(_dir(cid), f"{shot_id}.json")
     try:
+        from ..json_parser import JSONParser
         with open(p, "r", encoding="utf-8") as f:
-            from ..jsonio.helpers import parse_json_text as _parse_json_text
-            return _parse_json_text(f.read(), {})
+            parser = JSONParser()
+            data = parser.parse(f.read(), {})
+            return data if isinstance(data, dict) else None
     except FileNotFoundError:
         return None
 

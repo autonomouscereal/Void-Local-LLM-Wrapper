@@ -4,6 +4,8 @@ from typing import Any, Dict, List, Optional
 
 import httpx as _hx  # type: ignore
 import uuid as _uuid
+import traceback
+from ..json_parser import JSONParser
 
 
 async def execute(tool_calls: List[Dict[str, Any]], trace_id: Optional[str], executor_base_url: str) -> List[Dict[str, Any]]:
@@ -14,25 +16,36 @@ async def execute(tool_calls: List[Dict[str, Any]], trace_id: Optional[str], exe
 	"""
 	steps: List[Dict[str, Any]] = []
 	for call in (tool_calls or [])[:5]:
-		name = (call or {}).get("name")
-		args = (call or {}).get("arguments") or {}
-		if not isinstance(args, dict):
-			args = {}
-		steps.append({"tool": str(name or ""), "args": args})
+		call_dict = call if isinstance(call, dict) else {}
+		name_val = call_dict.get("name") if isinstance(call_dict.get("name"), str) else ""
+		args_val = call_dict.get("arguments") if isinstance(call_dict.get("arguments"), dict) else {}
+		steps.append({"tool": str(name_val or ""), "args": args_val})
 	rid = str(trace_id or _uuid.uuid4().hex)
 	payload = {"schema_version": 1, "request_id": rid, "trace_id": rid, "steps": steps}
 	base = (executor_base_url or "").rstrip("/")
 	if not base:
-		return [{"name": "executor", "error": "executor_base_url_missing"}]
+		return [{
+			"name": "executor",
+			"error": {
+				"code": "executor_base_url_missing",
+				"message": "executor_base_url is not configured",
+				"stack": "".join(traceback.format_stack()),
+			},
+		}]
 	async with _hx.AsyncClient(timeout=None, trust_env=False) as client:
-		try:
-			r = await client.post(base + "/execute", json=payload)
-			try:
-				env = r.json()
-			except Exception:
-				env = {"ok": False, "error": {"code": "executor_bad_json", "message": r.text}, "result": {"produced": {}}}
-		except Exception as ex:
-			env = {"ok": False, "error": {"code": "executor_connect_error", "message": str(ex)}, "result": {"produced": {}}}
+		r = await client.post(base + "/execute", json=payload)
+		parser = JSONParser()
+		env = parser.parse(r.text or "{}", {"ok": bool, "result": dict, "error": dict})
+		if not isinstance(env, dict):
+			env = {
+				"ok": False,
+				"error": {
+					"code": "executor_bad_json",
+					"message": r.text or "",
+					"stack": "".join(traceback.format_stack()),
+				},
+				"result": {"produced": {}},
+			}
 	results: List[Dict[str, Any]] = []
 	if isinstance(env, dict) and env.get("ok") and isinstance((env.get("result") or {}).get("produced"), dict):
 		for _, step in (env.get("result") or {}).get("produced", {}).items():
@@ -41,6 +54,14 @@ async def execute(tool_calls: List[Dict[str, Any]], trace_id: Optional[str], exe
 				results.append({"name": (res.get("name") or "tool") if isinstance(res, dict) else "tool", "result": res})
 		return results
 	err = (env or {}).get("error") or (env.get("result") or {}).get("error") or {}
-	return [{"name": "executor", "error": (err.get("message") or "executor_failed")}]
+	# Surface full structured error; never truncate to a generic 'executor_failed'.
+	return [{
+		"name": "executor",
+		"error": {
+			"code": err.get("code") or "executor_error",
+			"message": err.get("message") or "executor_error",
+			"stack": err.get("stack") or "".join(traceback.format_stack()),
+		},
+	}]
 
 

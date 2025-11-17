@@ -5,7 +5,7 @@ import json
 import time
 import hashlib
 from typing import Dict, Any, List
-from ..jsonio.helpers import parse_json_text as _parse_json_text
+from ..json_parser import JSONParser
 
 
 ROOT = os.getenv("PROMPTS_ROOT", os.path.join("/workspace", "uploads", "artifacts", "prompts"))
@@ -36,7 +36,10 @@ def list_prompts() -> List[Dict[str, Any]]:
         if f.endswith(".json"):
             try:
                 with open(os.path.join(ROOT, f), "r", encoding="utf-8") as fh:
-                    out.append(_parse_json_text(fh.read(), {}))
+                    parser = JSONParser()
+                    data = parser.parse(fh.read(), {})
+                    if isinstance(data, dict):
+                        out.append(data)
             except Exception:
                 continue
     return sorted(out, key=lambda x: x.get("created_at", 0), reverse=True)
