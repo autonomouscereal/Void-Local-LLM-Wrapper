@@ -8673,6 +8673,8 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     last_user_text = shaped.get("last_user_text") or ""
     conv_cid = shaped.get("conv_cid")
     mode = shaped.get("mode") or "job"
+    # Effective mode: no keyword heuristics; whatever the router/shape_request decided.
+    effective_mode = mode
     master_seed = int(shaped.get("master_seed") or 0)
     trace_id = shaped.get("trace_id") or "tt_unknown"
     # Body invalid → build a non-fatal envelope; do not return early
