@@ -6,16 +6,10 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 
-logger = logging.getLogger(__name__)
-if not logger.handlers:
-    handler = logging.FileHandler("json_parser.log")
-    handler.setLevel(logging.INFO)
-    formatter = logging.Formatter(
-        "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-    )
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
-logger.setLevel(logging.INFO)
+# Use the process-wide logging configuration only; no per-module handlers or
+# import-time I/O. This logger will inherit handlers/levels from the main
+# orchestrator entrypoint (configured in app.main).
+logger = logging.getLogger("orchestrator.json_parser")
 
 
 class JSONParser:
@@ -483,5 +477,8 @@ class JSONParser:
     def _err(self, msg: str) -> None:
         self.last_error = msg
         self.errors.append(msg)
+        # Surface parser diagnostics through the shared logger so they land
+        # in the central orchestrator logs instead of a private file.
+        logger.debug(f"JSONParser error: {msg}")
 
 
