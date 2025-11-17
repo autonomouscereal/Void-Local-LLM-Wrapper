@@ -9756,7 +9756,24 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         rounds=3,
         temperature=body.get("temperature") or DEFAULT_TEMPERATURE,
     )
-    # If backends errored but we have tool results (e.g., image job still running/finishing), degrade gracefully
+    # Synthesize per-backend result views from the unified committee envelope for legacy fallback logic.
+    qwen_result: Dict[str, Any] = {}
+    glm_result: Dict[str, Any] = {}
+    deepseek_result: Dict[str, Any] = {}
+    if isinstance(llm_env, dict):
+        err = llm_env.get("error")
+        res = llm_env.get("result") or {}
+        txt = res.get("text")
+        base_payload = {
+            "error": err,
+            "response": txt,
+            "_base_url": "committee",
+        }
+        qwen_result = dict(base_payload)
+        glm_result = dict(base_payload)
+        deepseek_result = dict(base_payload)
+
+    # If backends errored but we have tool results (e.g., image job still running/finishing), degrade gracefully.
     if qwen_result.get("error") or glm_result.get("error") or deepseek_result.get("error"):
         if tool_results:
             # Build a minimal assets block so the UI can render generated media even if models errored
