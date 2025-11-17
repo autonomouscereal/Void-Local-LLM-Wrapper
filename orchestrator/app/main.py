@@ -3013,7 +3013,6 @@ async def propose_search_queries(messages: List[Dict[str, Any]]) -> List[str]:
     env = await committee_ai_text(
         prompt_messages,
         trace_id="search_suggest",
-        rounds=2,
         temperature=DEFAULT_TEMPERATURE,
     )
     if not isinstance(env, dict) or not env.get("ok"):
@@ -3472,7 +3471,6 @@ async def planner_produce_plan(messages: List[Dict[str, Any]], tools: Optional[L
     env = await committee_ai_text(
         plan_messages,
         trace_id=str(trace_id or "planner"),
-        rounds=3,
         temperature=temperature,
     )
     if not isinstance(env, dict) or not env.get("ok"):
@@ -3484,7 +3482,6 @@ async def planner_produce_plan(messages: List[Dict[str, Any]], tools: Optional[L
         text or "{}",
         expected_schema=schema_steps,
         trace_id=str(trace_id or "planner"),
-        rounds=2,
         temperature=0.0,
     )
     steps = parsed_steps.get("steps") or []
@@ -3558,7 +3555,6 @@ async def postrun_committee_decide(
     env_decide = await committee_ai_text(
         msgs,
         trace_id=str(trace_id or "committee_postrun"),
-        rounds=3,
         temperature=0.0,
     )
     if isinstance(env_decide, dict) and env_decide.get("ok"):
@@ -3569,7 +3565,6 @@ async def postrun_committee_decide(
             txt_decide or "{}",
             expected_schema=schema_decide,
             trace_id=str(trace_id or "committee_postrun"),
-            rounds=2,
             temperature=0.0,
         )
         action = (obj.get("action") or "").strip().lower() or "go"
@@ -7508,7 +7503,6 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     committee_ai_text(
                         [{"role": "user", "content": prompt}],
                         trace_id="code_super_loop",
-                        rounds=3,
                         temperature=DEFAULT_TEMPERATURE,
                     )
                 )
@@ -8825,7 +8819,6 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     env_preplan = await committee_ai_text(
         committee_msgs,
         trace_id=str(trace_id or "committee_preplan"),
-        rounds=3,
         temperature=DEFAULT_TEMPERATURE,
     )
     committee_errors: List[Dict[str, Any]] = []
@@ -8838,7 +8831,6 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             text_pre or "{}",
             expected_schema=schema_pre,
             trace_id=str(trace_id or "committee_preplan"),
-            rounds=2,
             temperature=0.0,
         )
         rationale = (parsed.get("rationale") or text_pre or "").strip()
@@ -9775,7 +9767,6 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     llm_env = await committee_ai_text(
         exec_messages,
         trace_id=str(trace_id or "executor_summary"),
-        rounds=3,
         temperature=body.get("temperature") or DEFAULT_TEMPERATURE,
     )
     # Synthesize per-backend result views from the unified committee envelope for legacy fallback logic.
@@ -10007,19 +9998,16 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         qcrit_env = await committee_ai_text(
             qwen_critique_msg,
             trace_id=str(trace_id or "code_crit_qwen"),
-            rounds=2,
             temperature=body.get("temperature") or DEFAULT_TEMPERATURE,
         )
         gcrit_env = await committee_ai_text(
             glm_critique_msg,
             trace_id=str(trace_id or "code_crit_glm"),
-            rounds=2,
             temperature=body.get("temperature") or DEFAULT_TEMPERATURE,
         )
         dcrit_env = await committee_ai_text(
             deepseek_critique_msg,
             trace_id=str(trace_id or "code_crit_deepseek"),
-            rounds=2,
             temperature=body.get("temperature") or DEFAULT_TEMPERATURE,
         )
         def _env_text(env: Dict[str, Any]) -> str:
@@ -10119,7 +10107,6 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     synth_env = await committee_ai_text(
         final_request,
         trace_id=str(trace_id or "compose_final"),
-        rounds=3,
         temperature=body.get("temperature") or DEFAULT_TEMPERATURE,
     )
     final_text = ""
@@ -11932,7 +11919,6 @@ async def debug():
     env = await committee_ai_text(
         [{"role": "user", "content": "ping"}],
         trace_id="debug_ping",
-        rounds=1,
         temperature=0.0,
     )
     ok = bool(isinstance(env, dict) and env.get("ok"))

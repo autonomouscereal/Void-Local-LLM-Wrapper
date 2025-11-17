@@ -59,7 +59,6 @@ async def _call_llm_json(prompt: str, trace_id: str) -> Dict[str, Any]:
             {"role": "user", "content": prompt},
         ],
         trace_id=trace_id,
-        rounds=3,
     )
     if not isinstance(env, dict) or not env.get("ok"):
         return {"request_id": "", "plan": []}
@@ -71,7 +70,6 @@ async def _call_llm_json(prompt: str, trace_id: str) -> Dict[str, Any]:
         text or "{}",
         expected_schema=PLAN_SCHEMA,
         trace_id=trace_id,
-        rounds=2,
         temperature=0.0,
     )
     return parsed if isinstance(parsed, dict) else {"request_id": "", "plan": []}

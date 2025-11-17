@@ -21,6 +21,7 @@ DEEPSEEK_CODER_OLLAMA_BASE_URL = os.getenv("DEEPSEEK_CODER_OLLAMA_BASE_URL", "ht
 DEEPSEEK_CODER_MODEL_ID = os.getenv("DEEPSEEK_CODER_MODEL_ID", "deepseek-coder-v2:lite")
 DEFAULT_NUM_CTX = int(os.getenv("DEFAULT_NUM_CTX", "8192"))
 COMMITTEE_MODEL_ID = os.getenv("COMMITTEE_MODEL_ID") or f"committee:{QWEN_MODEL_ID}+{GLM_MODEL_ID}+{DEEPSEEK_CODER_MODEL_ID}"
+DEFAULT_COMMITTEE_ROUNDS = max(1, int(os.getenv("COMMITTEE_ROUNDS", "1") or "1"))
 
 PARTICIPANT_MODELS: Dict[str, Dict[str, str]] = {
     "qwen": {
@@ -136,7 +137,7 @@ def build_ollama_payload(messages: List[Dict[str, Any]], model: str, num_ctx: in
 async def committee_ai_text(
     messages: List[Dict[str, Any]],
     trace_id: str,
-    rounds: int = 3,
+    rounds: int | None = None,
     temperature: float = 0.3,
 ) -> Dict[str, Any]:
     """
@@ -152,6 +153,7 @@ async def committee_ai_text(
     - result.synth: the envelope corresponding to the member whose
       answer was selected as `result.text` (or a minimal fallback).
     """
+    effective_rounds = max(1, int(rounds if rounds is not None else DEFAULT_COMMITTEE_ROUNDS))
     answers: Dict[str, str] = {}
     # Full per-member envelopes as returned from call_ollama
     member_results: Dict[str, Dict[str, Any]] = {}
@@ -161,13 +163,13 @@ async def committee_ai_text(
         "committee.start",
         {
             "trace_id": str(trace_id or "committee"),
-            "rounds": int(rounds),
+        "rounds": int(effective_rounds),
             "temperature": float(temperature),
             "participants": [p.get("id") or "member" for p in COMMITTEE_PARTICIPANTS],
             "messages": messages or [],
         },
     )
-    for r in range(max(1, int(rounds))):
+    for r in range(effective_rounds):
         for p in COMMITTEE_PARTICIPANTS:
             member = p.get("id") or "member"
             base = (p.get("base") or "").rstrip("/") or QWEN_BASE_URL
@@ -278,7 +280,7 @@ async def committee_jsonify(
     expected_schema: Any,
     *,
     trace_id: str,
-    rounds: int = 2,
+    rounds: int | None = None,
     temperature: float = 0.0,
 ) -> Dict[str, Any]:
     """
@@ -395,7 +397,7 @@ class CommitteeClient:
         self,
         messages: List[Dict[str, Any]],
         trace_id: str,
-        rounds: int = 3,
+        rounds: int | None = None,
         temperature: float = 0.3,
     ) -> Dict[str, Any]:
         return await committee_ai_text(

@@ -297,7 +297,7 @@ def _call_music_eval_committee(summary: str) -> Dict[str, Any]:
         from ..committee_client import CommitteeClient  # type: ignore
 
         client = CommitteeClient()
-        env = await client.run(messages, trace_id="music_eval", rounds=3)
+        env = await client.run(messages, trace_id="music_eval")
         if not isinstance(env, dict) or not env.get("ok"):
             raise RuntimeError("music_eval committee did not return ok")
         result = env.get("result") or {}
@@ -307,7 +307,6 @@ def _call_music_eval_committee(summary: str) -> Dict[str, Any]:
             txt or "{}",
             expected_schema=schema,
             trace_id="music_eval",
-            rounds=2,
             temperature=0.0,
         )
         return parsed if isinstance(parsed, dict) else {}

@@ -158,7 +158,6 @@ async def plan_song_graph(
             {"role": "user", "content": prompt},
         ],
         trace_id=trace_id or "song_plan",
-        rounds=3,
     )
     if not isinstance(env, dict) or not env.get("ok"):
         return {}
@@ -170,7 +169,6 @@ async def plan_song_graph(
         txt or "{}",
         expected_schema=schema_wrapper,
         trace_id=trace_id or "song_plan",
-        rounds=2,
         temperature=0.0,
     )
     song = parsed.get("song")
