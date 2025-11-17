@@ -45,7 +45,7 @@ SYSTEM_AUDIO = (
 )
 
 
-async def _call_llm_json(prompt: str) -> Dict[str, Any]:
+async def _call_llm_json(prompt: str, trace_id: str) -> Dict[str, Any]:
     """
     Legacy planner helper now routed through the central committee path.
     The committee debate produces free-form text; we then parse that text
@@ -55,7 +55,7 @@ async def _call_llm_json(prompt: str) -> Dict[str, Any]:
     env = await client.run(
         [{"role": "system", "content": "You are a multimodal planner. Output ONLY JSON per the schema."},
          {"role": "user", "content": prompt}],
-        trace_id="planner_legacy",
+        trace_id=trace_id,
         rounds=3,
     )
     if not isinstance(env, dict) or not env.get("ok"):
@@ -113,7 +113,7 @@ async def _plan_with_role(system: str, user_text: str, request_id: str) -> Dict[
         + "### [FINALITY / SYSTEM]\n"
         + "Do not output assistant content until committee consensus; one final answer only."
     )
-    out = await _call_llm_json(prompt)
+    out = await _call_llm_json(prompt, trace_id=request_id)
     out["request_id"] = request_id
     return out
 

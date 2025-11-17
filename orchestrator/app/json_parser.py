@@ -9,13 +9,13 @@ from typing import Any, Dict, List, Optional, Tuple
 logger = logging.getLogger(__name__)
 if not logger.handlers:
     handler = logging.FileHandler("json_parser.log")
-    handler.setLevel(logging.ERROR)
+    handler.setLevel(logging.DEBUG)
     formatter = logging.Formatter(
         "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     )
     handler.setFormatter(formatter)
     logger.addHandler(handler)
-logger.setLevel(logging.ERROR)
+logger.setLevel(logging.DEBUG)
 
 
 class JSONParser:
@@ -40,18 +40,18 @@ class JSONParser:
         Best-effort parsing with repairs, followed by coercion into expected_structure.
         Never raises; always returns something matching the expected shape.
         """
-        logger.debug("Starting JSON parsing process")
+        # logger.debug("Starting JSON parsing process")
         if not isinstance(json_string, str):
             json_string = "" if json_string is None else str(json_string)
-        logger.debug("Original JSON string: %s", json_string)
+        # logger.debug("Original JSON string: %s", json_string)
 
         # Step 1: normalize wrapper noise (markdown fences, BOM, whitespace)
         json_string = self.strip_markdown(json_string)
-        logger.debug("After strip_markdown: %s", json_string)
+        # logger.debug("After strip_markdown: %s", json_string)
 
         # Step 2: quick repair pass for very common issues
         json_string = self.attempt_repair(json_string)
-        logger.debug("After attempt_repair: %s", json_string)
+        # logger.debug("After attempt_repair: %s", json_string)
 
         # Step 3: apply a sequence of parsing strategies, keeping the "best" result
         methods = [
@@ -69,7 +69,7 @@ class JSONParser:
         for method in methods:
             try:
                 parsed_json = method(json_string)
-                logger.debug("Method %s produced: %r", method.__name__, parsed_json)
+                # logger.debug("Method %s produced: %r", method.__name__, parsed_json)
                 best_result = self.select_best_result(
                     best_result, parsed_json, expected_structure
                 )
@@ -80,7 +80,7 @@ class JSONParser:
 
         # Final fallback: if nothing succeeded, synthesise structure from schema alone
         if best_result is None:
-            logger.debug("No parsing strategy succeeded; synthesising from schema")
+            # logger.debug("No parsing strategy succeeded; synthesising from schema")
             if isinstance(expected_structure, list):
                 best_result = self.ensure_structure([], expected_structure)
             else:
@@ -89,7 +89,7 @@ class JSONParser:
             # Ensure the final result conforms exactly to the expected schema.
             best_result = self.ensure_structure(best_result, expected_structure)
 
-        logger.debug("Final coerced result: %r", best_result)
+        # logger.debug("Final coerced result: %r", best_result)
         return best_result
 
     # Backwards-compatible alias
@@ -148,17 +148,17 @@ class JSONParser:
 
     def strip_markdown(self, response: str) -> str:
         """Remove common ```json fences and surrounding whitespace."""
-        logger.debug("Stripping markdown from response")
+        # logger.debug("Stripping markdown from response")
         if not isinstance(response, str):
             response = "" if response is None else str(response)
         response = response.replace("```json", "").replace("```", "").strip()
-        logger.debug("Response after stripping markdown: %s", response)
+        # logger.debug("Response after stripping markdown: %s", response)
         # Also strip BOM / stray whitespace
         response = response.replace("\ufeff", "").strip()
         return response
 
     def correct_common_errors(self, text: str) -> str:
-        logger.debug("Correcting common JSON format errors")
+        # logger.debug("Correcting common JSON format errors")
         corrections = [
             ('\\"', '"'),
             ("\\'", "'"),
@@ -172,14 +172,14 @@ class JSONParser:
         for old, new in corrections:
             if old in text:
                 text = text.replace(old, new)
-                logger.debug("Replaced %r with %r -> %s", old, new, text)
+                # logger.debug("Replaced %r with %r -> %s", old, new, text)
         return text
 
     def extract_json_segment(
         self, text: str, start_delim: str = "{", end_delim: str = "}"
     ) -> List[str]:
         """Return all balanced {...} segments from text (last one is usually the answer)."""
-        logger.debug("Extracting JSON segments from text")
+        # logger.debug("Extracting JSON segments from text")
         stack: List[str] = []
         json_segments: List[str] = []
         start_index = -1
@@ -193,20 +193,20 @@ class JSONParser:
                 if not stack and start_index != -1:
                     segment = text[start_index : i + 1]
                     json_segments.append(segment)
-                    logger.debug("Extracted JSON segment: %s", segment)
+                    # logger.debug("Extracted JSON segment: %s", segment)
         return json_segments
 
     def fix_missing_commas(self, json_string: str) -> str:
-        logger.debug("Fixing missing commas in JSON string")
+        #logger.debug("Fixing missing commas in JSON string")
         json_string = json_string.replace("}{", "},{")
-        logger.debug("JSON string after fixing missing commas: %s", json_string)
+        # logger.debug("JSON string after fixing missing commas: %s", json_string)
         return json_string
 
     def attempt_repair(self, json_string: str) -> str:
-        logger.debug("Attempting to repair JSON string")
+        # logger.debug("Attempting to repair JSON string")
         json_string = self.correct_common_errors(json_string)
         json_string = self.fix_missing_commas(json_string)
-        logger.debug("JSON string after repair: %s", json_string)
+        # logger.debug("JSON string after repair: %s", json_string)
         return json_string
 
     def regex_parse(self, json_string: str) -> Any:
@@ -215,7 +215,7 @@ class JSONParser:
         unquoted keys. This is intentionally permissive and only used after
         simpler strategies fail.
         """
-        logger.debug("Attempting regex-based JSON parsing")
+        # logger.debug("Attempting regex-based JSON parsing")
         try:
             return json.loads(json_string)
         except Exception:
@@ -226,7 +226,7 @@ class JSONParser:
             r'"\1":',
             json_string,
         )
-        logger.debug("JSON string after regex-based fixes: %s", json_string)
+        # logger.debug("JSON string after regex-based fixes: %s", json_string)
         return json.loads(json_string)
 
     # ---------- method variants, each using json.loads ----------
@@ -355,7 +355,7 @@ class JSONParser:
                 if not isinstance(value, expected_type):
                     value = self.default_value(expected_type)
                 result[key] = value
-                logger.debug("Ensured key %r with value: %r", key, result[key])
+                # logger.debug("Ensured key %r with value: %r", key, result[key])
             result_list.append(result)
         return result_list
 

@@ -46,18 +46,33 @@ STATE_DIR = os.path.join(UPLOAD_DIR, "state")
 os.makedirs(STATE_DIR, exist_ok=True)
 
 
-async def call_ollama(base_url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str) -> Dict[str, Any]:
     """
     Low-level Ollama generate call used by committee debate.
 
     This function is owned by the committee layer so that all committee-related
     backend calls are centralized here.
     """
+    trace_key = str(trace_id or "committee")
     async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
+        # Trace request (without full prompt content to avoid huge payloads).
+        emit_trace(
+            STATE_DIR,
+            trace_key,
+            "committee.ollama.request",
+            {
+                "trace_id": trace_key,
+                "base_url": base_url,
+                "model": payload.get("model"),
+                "num_ctx": payload.get("num_ctx"),
+                "temperature": payload.get("temperature"),
+            },
+        )
         ppayload = dict(payload)
         resp = await client.post(f"{base_url}/api/generate", json=ppayload)
         parser = JSONParser()
         data = parser.parse(resp.text or "", {"response": str, "prompt_eval_count": int, "eval_count": int})
+        usage: Dict[str, int] | None = None
         if isinstance(data, dict) and ("prompt_eval_count" in data or "eval_count" in data):
             usage = {
                 "prompt_tokens": int(data.get("prompt_eval_count", 0) or 0),
@@ -65,6 +80,24 @@ async def call_ollama(base_url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
             }
             usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
             data["_usage"] = usage
+        # Prepare a short preview of the model response for logging/tracing.
+        resp_text = ""
+        if isinstance(data, dict):
+            raw_resp = data.get("response")
+            if isinstance(raw_resp, str):
+                resp_text = raw_resp.strip()
+        preview = resp_text[:512] if resp_text else ""
+        emit_trace(
+            STATE_DIR,
+            trace_key,
+            "committee.ollama.response",
+            {
+                "trace_id": trace_key,
+                "status_code": int(getattr(resp, "status_code", 0) or 0),
+                "usage": usage or {},
+                "response_preview": preview,
+            },
+        )
         return data
 
 
@@ -164,7 +197,7 @@ async def committee_ai_text(
                 },
             )
             payload = build_ollama_payload(member_msgs, model, DEFAULT_NUM_CTX, temperature)
-            res = await call_ollama(base, payload)
+            res = await call_ollama(base, payload, trace_id=trace_id)
             txt = (
                 (res.get("response") or "").strip()
                 if isinstance(res, dict)
