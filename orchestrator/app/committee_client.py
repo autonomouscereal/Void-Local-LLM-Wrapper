@@ -329,7 +329,7 @@ async def committee_jsonify(
             "raw_len": len(raw_text or ""),
         },
     )
-    log.debug(
+    log.info(
         "[committee.jsonify] start trace_id=%s schema_len=%d raw_len=%d",
         trace_base,
         len(schema_desc),
@@ -370,7 +370,7 @@ async def committee_jsonify(
             "main_text_preview": txt_main_preview,
         },
     )
-    log.debug(
+    log.info(
         "[committee.jsonify] committee_result trace_id=%s ok=%s main_preview=%s",
         trace_base,
         ok_env,
@@ -403,7 +403,7 @@ async def committee_jsonify(
             "first_preview": (candidates[0][:400] if candidates else ""),
         },
     )
-    log.debug(
+    log.info(
         "[committee.jsonify] candidates trace_id=%s count=%d",
         trace_base,
         len(candidates),
@@ -470,7 +470,7 @@ async def committee_jsonify(
             "merged_keys": sorted(list(merged.keys())) if isinstance(merged, dict) else [],
         },
     )
-    log.debug(
+    log.info(
         "[committee.jsonify] merge trace_id=%s candidates=%d parsed=%d keys=%s",
         trace_base,
         len(candidates),
