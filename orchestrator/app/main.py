@@ -3400,7 +3400,7 @@ async def planner_produce_plan(messages: List[Dict[str, Any]], tools: Optional[L
     _mode_palette = (
         "### [PLANNER MODE / SYSTEM]\n"
         f"Mode:\n"
-        f"- mode: {mode_local}\n"
+        f"- mode: {effective_mode}\n"
         "Tool surface (fixed):\n"
         "- The planner can ONLY call these tools: "
         + (", ".join(_allowed_for_mode) if _allowed_for_mode else "(none)")
