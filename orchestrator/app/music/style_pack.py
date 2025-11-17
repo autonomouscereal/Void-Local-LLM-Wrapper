@@ -101,7 +101,7 @@ def build_style_pack(ref_paths: List[str]) -> Dict[str, Any]:
     tempos = []
     keys = []
     genres = []
-        emotions = []
+    emotions = []
     for r in refs:
         m = r.get("metrics") or {}
         t = m.get("tempo_bpm")
