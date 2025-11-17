@@ -3324,6 +3324,18 @@ async def planner_produce_plan(messages: List[Dict[str, Any]], tools: Optional[L
             nm_clean = nm.strip()
             if nm_clean and (nm_clean in PLANNER_VISIBLE_TOOLS):
                 tool_names.append(nm_clean)
+    # Determine latest user message for subject_canon / CO, but do NOT use this
+    # for keyword-based tool routing; that is handled semantically in prompts.
+    last_user = ""
+    for m in reversed(messages or []):
+        if (
+            isinstance(m, dict)
+            and m.get("role") == "user"
+            and isinstance(m.get("content"), str)
+            and m.get("content").strip()
+        ):
+            last_user = m.get("content").strip()
+            break
     # Effective mode is provided by the caller (chat_completions / router). Do
     # not infer from keywords here; semantic routing is done in the prompts.
     effective_mode = mode or "job"

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from typing import Dict, Any
+from typing import Dict, Any, List
 
 from ..json_parser import JSONParser
 from ..pipeline.compression_orchestrator import co_pack, frames_to_string
