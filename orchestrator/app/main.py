@@ -8951,15 +8951,6 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 "tools_outline": tools_outline,
             }
         )
-        opt_id = f"opt_{member}"
-        preplan_options.append(
-            {
-                "id": opt_id,
-                "author": member,
-                "rationale": rationale,
-                "tools_outline": tools_outline,
-            }
-        )
     _log("committee.proposals", trace_id=trace_id, options=preplan_options)
     # Simple heuristic vote: prefer any option that explicitly mentions typed args/json.parse, otherwise first option wins.
     winner_id = None
