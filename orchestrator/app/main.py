@@ -513,6 +513,9 @@ async def segment_qa_and_committee(
     current_results = list(segment_results or [])
     cumulative_patch_results: List[Dict[str, Any]] = []
     committee_outcome: Dict[str, Any] = {"action": "go", "patch_plan": [], "rationale": ""}
+    # Track per-tool failure counts across attempts so we can detect and break
+    # out of potential self-looping patch plans (same tool failing repeatedly).
+    failure_counts: Dict[str, int] = {}
     while attempt <= max(0, int(max_refine_passes)):
         # Build per-segment structures and standalone QA scores for committee input
         segments_summary: List[Dict[str, Any]] = []
@@ -738,6 +741,25 @@ async def segment_qa_and_committee(
         committee_outcome["patch_plan"] = filtered_patch_plan
         if not filtered_patch_plan:
             break
+        # Loop guard: if any tool in the filtered patch plan has already failed
+        # multiple times in this segment-committee loop, stop revising and fail
+        # instead of attempting the same broken tool over and over.
+        loop_guard_tools: List[str] = []
+        for step in filtered_patch_plan:
+            st_name = (step.get("tool") or "").strip()
+            if st_name and failure_counts.get(st_name, 0) >= 2:
+                loop_guard_tools.append(st_name)
+        if loop_guard_tools:
+            _log(
+                "committee.loop_guard",
+                trace_id=trace_id,
+                tool=tool_name,
+                attempt=attempt,
+                tools=loop_guard_tools,
+            )
+            committee_outcome["action"] = "fail"
+            committee_outcome.setdefault("loop_guard", {"tools": loop_guard_tools})
+            break
         # Enrich image/video/music refine steps with per-segment context before execution.
         enriched_patch_plan = enrich_patch_plan_for_image_segments(
             filtered_patch_plan,
@@ -766,7 +788,7 @@ async def segment_qa_and_committee(
             trace_id,
             tool_name,
         )
-        # Log patch execution results for telemetry/debugging.
+        # Log patch execution results for telemetry/debugging and update failure counts.
         for pr in patch_results or []:
             tname = str((pr or {}).get("name") or "tool")
             result_obj = (pr or {}).get("result") if isinstance((pr or {}).get("result"), dict) else {}
@@ -776,6 +798,8 @@ async def segment_qa_and_committee(
                 status = (err_obj.get("status") if isinstance(err_obj, dict) else None)
                 message = (err_obj.get("message") if isinstance(err_obj, dict) else "")
                 _log("tool.run.error", trace_id=trace_id, tool=tname, code=(code or ""), status=status, message=(message or ""), attempt=attempt)
+                # Increment failure counter for this tool to detect repeated failures.
+                failure_counts[tname] = int(failure_counts.get(tname, 0)) + 1
                 _tel_append(STATE_DIR, trace_id, {
                     "name": tname,
                     "ok": False,
@@ -3506,6 +3530,20 @@ async def postrun_committee_decide(
     )
     allowed_list = ", ".join(allowed_for_mode or [])
     mode_note = f"mode={mode}"
+    # Compute per-tool failure counts so the committee can avoid proposing
+    # the same failing tools indefinitely.
+    fail_counts: Dict[str, int] = {}
+    for tr in (tool_results or []):
+        if not isinstance(tr, dict):
+            continue
+        err = tr.get("error")
+        if not err:
+            res_tr = tr.get("result") if isinstance(tr.get("result"), dict) else {}
+            err = res_tr.get("error")
+        if isinstance(err, (dict, str)):
+            nm = str((tr.get("name") or tr.get("tool") or "")).strip()
+            if nm:
+                fail_counts[nm] = int(fail_counts.get(nm, 0)) + 1
     user_blob = {
         "user_text": (user_text or ""),
         "qa_metrics": (qa_metrics or {}),
@@ -3513,10 +3551,17 @@ async def postrun_committee_decide(
         "artifact_urls": artifact_urls[:8],
         "allowed_tools_for_mode": allowed_for_mode,
         "mode": mode,
+        "tool_failures": fail_counts,
     }
     parser = JSONParser()
     msgs = [
-        {"role": "system", "content": sys_hdr + f"Allowed tools: {allowed_list}\nCurrent {mode_note}."},
+        {
+            "role": "system",
+            "content": sys_hdr
+            + f"Allowed tools: {allowed_list}\nCurrent {mode_note}.\n"
+            + "If a tool has already failed multiple times in this trace (see tool_failures), you MUST NOT propose running it again; "
+              "prefer either a different tool or action=\"fail\" instead of looping.",
+        },
         {"role": "user", "content": json.dumps(user_blob, ensure_ascii=False)},
         {"role": "system", "content": "Return ONLY a single JSON object with keys: action, rationale, patch_plan."},
     ]
@@ -5738,13 +5783,16 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             except Exception:
                 music_profile = None
 
+        # Propagate the tool-level trace_id into Song Graph planning and tracing.
+        trace_val = a.get("trace_id") if isinstance(a.get("trace_id"), str) else None
+
         if needs_song_graph:
             song_graph = await plan_song_graph(
                 user_text=prompt_text,
                 length_s=length_s,
                 bpm=bpm_int,
                 key=key_txt,
-                trace_id=str(trace_id or ""),
+                trace_id=str(trace_val or ""),
                 music_profile=music_profile,
             )
             if isinstance(song_graph, dict) and song_graph:
@@ -5759,7 +5807,6 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         if lock_bundle:
             a["lock_bundle"] = lock_bundle
         # Trace: standalone music.infinite.windowed start
-        trace_val = a.get("trace_id") if isinstance(a.get("trace_id"), str) else None
         if trace_val:
             trace_append("music.infinite.windowed.start", {
                 "trace_id": trace_val,
