@@ -5449,10 +5449,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 "tts": {},
                 "audio": {},
             }
-            try:
-                await _lock_save(char_id, lock_bundle)
-            except Exception:
-                pass
+            await _lock_save(char_id, lock_bundle)
         if lock_bundle is not None:
             lock_bundle = _lock_apply_profile(quality_profile, lock_bundle)
             lock_bundle = _lock_migrate_tts(lock_bundle)
@@ -5497,21 +5494,18 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             # Distilled artifact
             tr = (a.get("trace_id") if isinstance(a.get("trace_id"), str) else None)
             if tr:
-                try:
-                    rel = os.path.relpath(wav_path, UPLOAD_DIR).replace("\\", "/")
-                    checkpoints_append_event(
-                        STATE_DIR,
-                        tr,
-                        "artifact",
-                        {
-                            "kind": "audio",
-                            "path": rel,
-                            "bytes": int(len(wav)),
-                            "duration_s": float(env.get("duration_s") or 0.0),
-                        },
-                    )
-                except Exception:
-                    pass
+                rel = os.path.relpath(wav_path, UPLOAD_DIR).replace("\\", "/")
+                checkpoints_append_event(
+                    STATE_DIR,
+                    tr,
+                    "artifact",
+                    {
+                        "kind": "audio",
+                        "path": rel,
+                        "bytes": int(len(wav)),
+                        "duration_s": float(env.get("duration_s") or 0.0),
+                    },
+                )
             # Optional: embed transcript text into RAG
             pool = await get_pg_pool()
             txt = a.get("text") if isinstance(a.get("text"), str) else None
@@ -5593,11 +5587,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 _ctx_add(cid, "audio", wav_path, _uri_from_upload_path(wav_path), None, [], {})
                 tr = (a.get("trace_id") if isinstance(a.get("trace_id"), str) else None)
                 if tr:
-                    try:
-                        rel = os.path.relpath(wav_path, UPLOAD_DIR).replace("\\", "/")
-                        checkpoints_append_event(STATE_DIR, tr, "artifact", {"kind": "audio", "path": rel, "bytes": int(len(wav))})
-                    except Exception:
-                        pass
+                    rel = os.path.relpath(wav_path, UPLOAD_DIR).replace("\\", "/")
+                    checkpoints_append_event(STATE_DIR, tr, "artifact", {"kind": "audio", "path": rel, "bytes": int(len(wav))})
             # Shape result with ids/meta when file persisted
             out_res = dict(env or {})
             if isinstance(wav, (bytes, bytearray)) and len(wav) > 0:
@@ -5847,12 +5838,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         env = run_music_infinite_windowed(a, provider, manifest)
 
         # Persist updated lock bundle (including song graph and windows) when character_id present.
-        try:
-            if char_id and lock_bundle:
-                await _lock_save(char_id, lock_bundle)
-        except Exception:
-            # Persistence failures should not hide the main music result.
-            pass
+        if char_id and lock_bundle:
+            await _lock_save(char_id, lock_bundle)
 
         # Trace: standalone music.infinite.windowed finish
         if trace_val:
@@ -5939,8 +5926,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                                 locks_meta["tempo_detected"] = tempo_detected
                                 locks_meta["tempo_score"] = tempo_score
                                 locks_meta["tempo_lock_mode"] = tempo_mode
-                        except Exception:
-                            pass
+                        except Exception as ex:
+                            _log("music.lock.tempo_score.fail", error=str(ex), path=wav_path)
                     key_target = audio_section.get("key")
                     key_mode = audio_section.get("key_lock_mode", "off")
                     if isinstance(key_target, str) and key_mode != "off":
@@ -5982,11 +5969,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 _ctx_add(cid, "audio", wav_path, _uri_from_upload_path(wav_path), None, [], {"prompt": a.get("prompt")})
                 tr = (a.get("trace_id") if isinstance(a.get("trace_id"), str) else None)
                 if tr:
-                    try:
-                        rel = os.path.relpath(wav_path, UPLOAD_DIR).replace("\\", "/")
-                        checkpoints_append_event(STATE_DIR, tr, "artifact", {"kind": "audio", "path": rel, "bytes": int(len(wav))})
-                    except Exception:
-                        pass
+                    rel = os.path.relpath(wav_path, UPLOAD_DIR).replace("\\", "/")
+                    checkpoints_append_event(STATE_DIR, tr, "artifact", {"kind": "audio", "path": rel, "bytes": int(len(wav))})
                 # RAG: embed prompt
                 pool = await get_pg_pool()
                 txt = a.get("prompt") if isinstance(a.get("prompt"), str) else None
@@ -6039,11 +6023,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 _ctx_add(cid, "audio", wav_path, _uri_from_upload_path(wav_path), None, [], {})
                 tr = (a.get("trace_id") if isinstance(a.get("trace_id"), str) else None)
                 if tr:
-                    try:
-                        rel = os.path.relpath(wav_path, UPLOAD_DIR).replace("\\", "/")
-                        checkpoints_append_event(STATE_DIR, tr, "artifact", {"kind": "audio", "path": rel, "bytes": int(len(wav))})
-                    except Exception:
-                        pass
+                    rel = os.path.relpath(wav_path, UPLOAD_DIR).replace("\\", "/")
+                    checkpoints_append_event(STATE_DIR, tr, "artifact", {"kind": "audio", "path": rel, "bytes": int(len(wav))})
                 if isinstance(env, dict):
                     meta_env = env.setdefault("meta", {})
                     if isinstance(meta_env, dict):
@@ -6275,8 +6256,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                                 locks_meta["tempo_detected"] = tempo_detected
                                 locks_meta["tempo_score"] = tempo_score
                                 locks_meta["tempo_lock_mode"] = tempo_mode
-                        except Exception:
-                            pass
+                        except Exception as ex:
+                            _log("music.lock.tempo_score.fail", error=str(ex), path=wav_path)
                     key_target = audio_section.get("key")
                     key_mode = audio_section.get("key_lock_mode", "off")
                     if isinstance(key_target, str) and key_mode != "off":
@@ -6304,11 +6285,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 _ctx_add(cid, "audio", wav_path, _uri_from_upload_path(wav_path), None, [], {})
                 tr = (a.get("trace_id") if isinstance(a.get("trace_id"), str) else None)
                 if tr:
-                    try:
-                        rel = os.path.relpath(wav_path, UPLOAD_DIR).replace("\\", "/")
-                        checkpoints_append_event(STATE_DIR, tr, "artifact", {"kind": "audio", "path": rel, "bytes": int(len(wav))})
-                    except Exception:
-                        pass
+                    rel = os.path.relpath(wav_path, UPLOAD_DIR).replace("\\", "/")
+                    checkpoints_append_event(STATE_DIR, tr, "artifact", {"kind": "audio", "path": rel, "bytes": int(len(wav))})
                 if isinstance(env, dict):
                     meta_env = env.setdefault("meta", {})
                     if isinstance(meta_env, dict) and quality_profile:
@@ -9181,6 +9159,27 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     validation_failures: List[Dict[str, Any]] = []
     tool_results: List[Dict[str, Any]] = []
     tool_exec_meta: List[Dict[str, Any]] = []
+    # In film mode, an empty tool plan is never acceptable: treat as a planner error
+    # instead of silently continuing with no tool calls. Surface a full error envelope
+    # with stack trace so the failure is explicit to callers.
+    if not tool_calls and effective_mode == "film":
+        _tb = "".join(traceback.format_stack())
+        err_env = {
+            "schema_version": 1,
+            "request_id": _uuid.uuid4().hex,
+            "ok": False,
+            "error": {
+                "code": "planner_no_tools",
+                "message": "Planner did not schedule any tools for film mode.",
+                "details": {},
+                "status": 0,
+                "traceback": _tb,
+            },
+        }
+        validation_failures.append(
+            {"name": "planner", "arguments": {}, "status": 0, "envelope": err_env}
+        )
+        _log("planner.error.no_tools_film", trace_id=trace_id, error=err_env["error"])
     _ledger_shard = None
     _ledger_root = os.path.join(UPLOAD_DIR, "artifacts", "runs", trace_id)
     _ledger_name = "ledger"

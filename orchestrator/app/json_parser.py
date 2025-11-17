@@ -377,6 +377,19 @@ class JSONParser:
         if isinstance(new_result, dict):
             for key, expected_type in expected_structure.items():
                 new_val = new_result.get(key)
+                # Nested list/dict schemas are handled via full structure coercion
+                # instead of direct isinstance checks, to avoid treating schema
+                # templates (e.g. [{"tool": str, "args": dict}]) as type objects.
+                if isinstance(expected_type, (list, dict)):
+                    if new_val is not None:
+                        current_best[key] = self._ensure_structure_internal(
+                            new_val,
+                            expected_type,
+                        )
+                    elif key not in current_best:
+                        current_best[key] = self.default_value(expected_type)
+                    continue
+                # Scalar leaf types (str, int, float, etc.)
                 if isinstance(new_val, expected_type):
                     current_best[key] = new_val
                 elif key not in current_best:
