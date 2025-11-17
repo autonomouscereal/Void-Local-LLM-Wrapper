@@ -9040,8 +9040,14 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             tc = {**tc, "arguments": args}
             enriched.append(tc)
         tool_calls = enriched
-    # Inject minimal defaults for image.dispatch without overwriting provided args; also emit args snapshot
+    # Before filling defaults, ensure any string/\"_raw\" arguments are parsed into objects
     if tool_calls:
+        def _parse_json_for_args(text: str, expected: Any) -> Any:
+            parser = JSONParser()
+            # expected is currently unused by callers ({}), but we honor it for flexibility.
+            return parser.parse(text or "", expected or {})
+        tool_calls = args_ensure_object_args(tool_calls, _parse_json_for_args)
+        # Inject minimal defaults for image.dispatch without overwriting provided args; also emit args snapshot
         tool_calls = args_fill_min_defaults(tool_calls, last_user_text, log_fn=_log, trace_id=trace_id)
     # Planner must fully fill args per contract; no auto-insertion of tools beyond minimal defaults above
     # If planner returned no tools or unnamed tools, run a strict re-plan to force valid names from the catalog
@@ -9069,8 +9075,9 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     allowed_tools = allowed_tools & allowed_by_mode
     no_steps = (len(tool_calls or []) == 0)
     names_missing = any(not str((tc or {}).get("name") or "").strip() for tc in (tool_calls or []))
-    # In chat/analysis mode: accept zero steps; in job mode: retry if zero or names missing
-    if (no_steps and (effective_mode == "job")) or (not no_steps and names_missing):
+    # Tool-first invariant: any request that reaches the planner is expected to use tools.
+    # If the planner returns zero steps or unnamed tools, force a constrained re-plan.
+    if no_steps or (not no_steps and names_missing):
         allowed_sorted = sorted(list(allowed_tools))
         constraint = (
             "Your previous output omitted tool names. You MUST choose only from the allowed tool catalog:\n- "
