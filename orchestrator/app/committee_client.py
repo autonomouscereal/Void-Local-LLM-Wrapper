@@ -85,22 +85,86 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str) -> 
         )
         ppayload = dict(payload)
         resp = await client.post(f"{base_url}/api/generate", json=ppayload)
-        parser = JSONParser()
         # Log raw response text before parsing so we can see exactly what Ollama returned.
+        raw_text = resp.text or ""
         log.info(
             "[committee] ollama.raw_response base=%s model=%s trace_id=%s status=%s body=%s",
             base_url,
             payload.get("model"),
             trace_key,
             getattr(resp, "status_code", None),
-            resp.text,
+            raw_text,
         )
-        data = parser.parse(resp.text or "", {"response": str, "prompt_eval_count": int, "eval_count": int})
+        # Extract only the fields we care about from the Ollama JSON, without
+        # relying on a full JSONParser round-trip. When the upstream JSON is
+        # malformed, this extractor still tries to recover the 'response' text
+        # and token counts, instead of dropping to an empty string.
+        response_str = ""
+        prompt_eval = 0
+        eval_count = 0
+        # Naive string scans; avoid regex overkill and json.loads here.
+        # 1) response (assume a simple `"response":"...json string..."` field)
+        marker = '"response":'
+        idx = raw_text.find(marker)
+        if idx != -1:
+            # Find the first quote after the marker and read until the matching quote.
+            start = raw_text.find('"', idx + len(marker))
+            if start != -1:
+                start += 1
+                end = start
+                # Scan until the next unescaped quote.
+                while end < len(raw_text):
+                    ch = raw_text[end]
+                    if ch == '\\':
+                        end += 2
+                        continue
+                    if ch == '"':
+                        break
+                    end += 1
+                raw_resp = raw_text[start:end]
+                # Unescape common JSON string escapes.
+                try:
+                    response_str = bytes(raw_resp, "utf-8").decode("unicode_escape")
+                except Exception:
+                    response_str = raw_resp
+        # 2) prompt_eval_count
+        marker_pe = '"prompt_eval_count":'
+        idx_pe = raw_text.find(marker_pe)
+        if idx_pe != -1:
+            j = idx_pe + len(marker_pe)
+            num = []
+            while j < len(raw_text) and raw_text[j].isdigit():
+                num.append(raw_text[j])
+                j += 1
+            if num:
+                try:
+                    prompt_eval = int("".join(num))
+                except Exception:
+                    prompt_eval = 0
+        # 3) eval_count
+        marker_ec = '"eval_count":'
+        idx_ec = raw_text.find(marker_ec)
+        if idx_ec != -1:
+            j = idx_ec + len(marker_ec)
+            num = []
+            while j < len(raw_text) and raw_text[j].isdigit():
+                num.append(raw_text[j])
+                j += 1
+            if num:
+                try:
+                    eval_count = int("".join(num))
+                except Exception:
+                    eval_count = 0
+        data: Dict[str, Any] = {
+            "response": response_str,
+            "prompt_eval_count": prompt_eval,
+            "eval_count": eval_count,
+        }
         usage: Dict[str, int] | None = None
-        if isinstance(data, dict) and ("prompt_eval_count" in data or "eval_count" in data):
+        if prompt_eval or eval_count:
             usage = {
-                "prompt_tokens": int(data.get("prompt_eval_count", 0) or 0),
-                "completion_tokens": int(data.get("eval_count", 0) or 0),
+                "prompt_tokens": int(prompt_eval),
+                "completion_tokens": int(eval_count),
             }
             usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
             data["_usage"] = usage
@@ -335,12 +399,23 @@ async def committee_jsonify(
     )
     # Log full raw_text and schema for debugging (no truncation).
     log.info("[committee.jsonify] start trace_id=%s schema=%s raw_text=%s", trace_base, schema_desc, raw_text)
+    # Hard JSON contract: show the exact skeleton and forbid any deviation.
     sys_msg = (
-        "You are JSONFixer. You receive messy AI output and MUST respond ONLY with strict JSON "
-        "that matches this schema:\n"
-        f"{schema_desc}\n"
-        "Do not add any explanations, comments, or extra keys. If fields are missing, fill them "
-        "with sensible defaults of the correct type. Your entire reply must be a single JSON object."
+        "You are JSONFixer. You receive messy AI output and MUST respond with exactly ONE JSON object.\n"
+        "NO markdown, NO code fences, NO prose, NO comments.\n\n"
+        "The JSON MUST match this exact structure (keys and nesting):\n\n"
+        f"{schema_desc}\n\n"
+        "Rules:\n"
+        "- You MUST preserve all keys and their nesting exactly as shown.\n"
+        "- You MUST NOT add any extra keys at any level.\n"
+        "- You MUST NOT remove or rename any keys.\n"
+        "- Values MUST be of the correct JSON type implied by the structure (number, string, object, array, null).\n"
+        "- The output MUST be valid JSON:\n"
+        "  - All keys and string values in double quotes.\n"
+        "  - No trailing commas.\n"
+        "  - No unescaped quotes inside strings.\n"
+        "- You MUST NOT output any text before or after the JSON object.\n\n"
+        "Fill in this JSON object according to the provided text. Respond ONLY with the JSON object."
     )
     messages: List[Dict[str, Any]] = [
         {"role": "system", "content": sys_msg},
