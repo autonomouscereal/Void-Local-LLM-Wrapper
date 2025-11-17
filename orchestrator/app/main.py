@@ -465,16 +465,21 @@ async def _run_patch_call(
                 "args": args_snapshot,
             }
         )
+    # Execute patch calls directly via the local tool front doors instead of
+    # delegating to the external executor. This guarantees that image/music/film
+    # services are actually called, and errors are surfaced via the canonical
+    # tool envelopes.
     exec_results: List[Dict[str, Any]] = []
     exec_batch = patch_validated or patch_calls
     if exec_batch:
-        _log("tool.run.start", trace_id=trace_id, executor="void", count=len(exec_batch or []), attempt=0)
+        _log("tool.run.start", trace_id=trace_id, executor="local", count=len(exec_batch or []), attempt=0)
         for c in exec_batch:
             tn = (c.get("name") or "tool")
             args_call = c.get("arguments") if isinstance(c.get("arguments"), dict) else {}
             _log("tool.run.before", trace_id=trace_id, tool=str(tn), args_keys=list((args_call or {}).keys()), attempt=0)
-        exec_results = await gateway_execute(exec_batch, trace_id, executor_base_url or "http://127.0.0.1:8081")
-    # Prefer executor results; if none, return first failure snapshot
+            res = await execute_tool_call(c)
+            exec_results.append(res)
+    # Prefer direct results; if none, return first failure snapshot
     if exec_results:
         return exec_results[0]
     if patch_failure_results:
@@ -5705,10 +5710,37 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 }
                 with _hxsync.Client(timeout=None, trust_env=False) as client:
                     r = client.post(MUSIC_API_URL.rstrip("/") + "/generate", json=body)
+                    # If the backend fails or returns non‑JSON, surface a structured error
+                    # instead of handing garbage to JSONParser.
+                    if r.status_code < 200 or r.status_code >= 300:
+                        return {
+                            "error": {
+                                "code": "music_backend_http_error",
+                                "message": f"music backend returned HTTP {r.status_code}",
+                                "status": int(r.status_code),
+                                "body": r.text or "",
+                            }
+                        }
                     parser = JSONParser()
                     js = parser.parse(r.text or "", {"audio_wav_base64": str, "wav_b64": str})
-                    b64 = js.get("audio_wav_base64") or js.get("wav_b64") if isinstance(js, dict) else None
-                    wav = _b.b64decode(b64) if isinstance(b64, str) else b""
+                    if not isinstance(js, dict):
+                        return {
+                            "error": {
+                                "code": "music_backend_bad_json",
+                                "message": r.text or "",
+                                "status": int(r.status_code),
+                            }
+                        }
+                    b64 = js.get("audio_wav_base64") or js.get("wav_b64")
+                    if not isinstance(b64, str) or not b64:
+                        return {
+                            "error": {
+                                "code": "music_backend_missing_audio",
+                                "message": "music backend response did not contain audio_wav_base64 or wav_b64",
+                                "status": int(r.status_code),
+                            }
+                        }
+                    wav = _b.b64decode(b64)
                     return {"wav_bytes": wav, "model": f"musicgen:{os.getenv('MUSIC_MODEL_ID','')}"}
 
         provider = _WindowMusicProvider()
@@ -5847,10 +5879,35 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 }
                 with _hxsync.Client(timeout=None, trust_env=False) as client:
                     r = client.post(MUSIC_API_URL.rstrip("/") + "/generate", json=body)
+                    if r.status_code < 200 or r.status_code >= 300:
+                        return {
+                            "error": {
+                                "code": "music_backend_http_error",
+                                "message": f"music backend returned HTTP {r.status_code}",
+                                "status": int(r.status_code),
+                                "body": r.text or "",
+                            }
+                        }
                     parser = JSONParser()
                     js = parser.parse(r.text or "", {"audio_wav_base64": str, "wav_b64": str})
-                    b64 = js.get("audio_wav_base64") or js.get("wav_b64") if isinstance(js, dict) else None
-                    wav = _b.b64decode(b64) if isinstance(b64, str) else b""
+                    if not isinstance(js, dict):
+                        return {
+                            "error": {
+                                "code": "music_backend_bad_json",
+                                "message": r.text or "",
+                                "status": int(r.status_code),
+                            }
+                        }
+                    b64 = js.get("audio_wav_base64") or js.get("wav_b64")
+                    if not isinstance(b64, str) or not b64:
+                        return {
+                            "error": {
+                                "code": "music_backend_missing_audio",
+                                "message": "music backend response did not contain audio_wav_base64 or wav_b64",
+                                "status": int(r.status_code),
+                            }
+                        }
+                    wav = _b.b64decode(b64)
                     return {"wav_bytes": wav, "model": f"musicgen:{os.getenv('MUSIC_MODEL_ID','')}"}
         provider = _MusicProvider()
         manifest = {"items": []}
@@ -9191,63 +9248,84 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         for tc in tool_calls:
             tn = (tc.get("name") or "tool")
             ta = tc.get("arguments") if isinstance(tc.get("arguments"), dict) else {}
-            _log("tool.run.before", trace_id=trace_id, tool=str(tn), args_keys=list((ta or {}).keys()))
-            exec_batch = await gateway_execute([tc], trace_id, executor_endpoint)
-            for tr in exec_batch or []:
-                tname = str((tr or {}).get("name") or "tool")
-                res = (tr or {}).get("result") if isinstance((tr or {}).get("result"), dict) else {}
-                err_obj = (tr or {}).get("error")
-                if not err_obj and isinstance(res, dict):
-                    err_obj = res.get("error")
-                if isinstance(err_obj, (str, dict)):
-                    code = (err_obj.get("code") if isinstance(err_obj, dict) else str(err_obj))
-                    status = (err_obj.get("status") if isinstance(err_obj, dict) else None)
-                    message = (err_obj.get("message") if isinstance(err_obj, dict) else "")
-                    _log("tool.run.error", trace_id=trace_id, tool=tname, code=(code or ""), status=status, message=(message or ""))
-                    _tel_append(
-                        STATE_DIR,
-                        trace_id,
-                        {
-                            "name": tname,
-                            "ok": False,
-                            "label": "failure",
-                            "raw": {
-                                "ts": None,
-                                "ok": False,
-                                "args": (tr.get("args") if isinstance(tr.get("args"), dict) else {}),
-                                "error": (err_obj if isinstance(err_obj, dict) else {"code": "error", "message": str(err_obj)}),
-                            },
-                        },
-                    )
+            # For film2.run, never rely on planner-fabricated clip/image URLs. Instead,
+            # automatically wire in real image artifacts from any prior image.dispatch
+            # (or other image-producing) tool results in this trace. If no real images
+            # exist yet, drop any planner-provided images/clips so film2 falls back to
+            # prompt/story-driven generation instead of referencing non-existent assets.
+            if tn == "film2.run":
+                args_film = ta if isinstance(ta, dict) else {}
+                urls_all = assets_collect_urls(tool_results or [], _abs_url)
+                img_urls = [u for u in (urls_all or []) if isinstance(u, str) and "/artifacts/image/" in u]
+                if img_urls:
+                    args_film["images"] = img_urls
+                    # Ensure we do not carry over any stale clip references from the planner.
+                    args_film.pop("clips", None)
                 else:
-                    arts_summary: List[Dict[str, Any]] = []
-                    arts = res.get("artifacts") if isinstance(res, dict) else None
-                    if isinstance(arts, list):
-                        for a in arts:
-                            if isinstance(a, dict):
-                                aid = a.get("id")
-                                kind = a.get("kind")
-                                if isinstance(aid, str) and isinstance(kind, str):
-                                    arts_summary.append({"id": aid, "kind": kind})
-                    urls_this = assets_collect_urls([tr], _abs_url)
-                    _log("tool.run.after", trace_id=trace_id, tool=tname, artifacts=arts_summary, urls_count=len(urls_this or []))
-                    meta = res.get("meta") if isinstance(res, dict) else {}
-                    first_url = urls_this[0] if isinstance(urls_this, list) and urls_this else None
-                    _tel_append(
-                        STATE_DIR,
-                        trace_id,
-                        {
-                            "name": tname,
-                            "ok": True,
-                            "label": "success",
-                            "raw": {
-                                "ts": None,
-                                "ok": True,
-                                "args": (tr.get("args") if isinstance(tr.get("args"), dict) else {}),
-                                "result": {"meta": (meta if isinstance(meta, dict) else {}), "artifact_url": first_url},
-                            },
+                    # No real images available yet; strip any fabricated paths.
+                    args_film.pop("images", None)
+                    args_film.pop("clips", None)
+                tc["arguments"] = args_film
+                ta = args_film
+            _log("tool.run.before", trace_id=trace_id, tool=str(tn), args_keys=list((ta or {}).keys()))
+            # Execute tools directly via local tool front doors instead of routing
+            # through the external executor. This guarantees that image/music/film
+            # services are actually invoked and their errors are surfaced.
+            tr = await execute_tool_call(tc)
+            tname = str((tr or {}).get("name") or "tool")
+            res = (tr or {}).get("result") if isinstance((tr or {}).get("result"), dict) else {}
+            err_obj = (tr or {}).get("error")
+            if not err_obj and isinstance(res, dict):
+                err_obj = res.get("error")
+            if isinstance(err_obj, (str, dict)):
+                code = (err_obj.get("code") if isinstance(err_obj, dict) else str(err_obj))
+                status = (err_obj.get("status") if isinstance(err_obj, dict) else None)
+                message = (err_obj.get("message") if isinstance(err_obj, dict) else "")
+                _log("tool.run.error", trace_id=trace_id, tool=tname, code=(code or ""), status=status, message=(message or ""))
+                _tel_append(
+                    STATE_DIR,
+                    trace_id,
+                    {
+                        "name": tname,
+                        "ok": False,
+                        "label": "failure",
+                        "raw": {
+                            "ts": None,
+                            "ok": False,
+                            "args": (tr.get("args") if isinstance(tr.get("args"), dict) else {}),
+                            "error": (err_obj if isinstance(err_obj, dict) else {"code": "error", "message": str(err_obj)}),
                         },
-                    )
+                    },
+                )
+            else:
+                arts_summary: List[Dict[str, Any]] = []
+                arts = res.get("artifacts") if isinstance(res, dict) else None
+                if isinstance(arts, list):
+                    for a in arts:
+                        if isinstance(a, dict):
+                            aid = a.get("id")
+                            kind = a.get("kind")
+                            if isinstance(aid, str) and isinstance(kind, str):
+                                arts_summary.append({"id": aid, "kind": kind})
+                urls_this = assets_collect_urls([tr], _abs_url)
+                _log("tool.run.after", trace_id=trace_id, tool=tname, artifacts=arts_summary, urls_count=len(urls_this or []))
+                meta = res.get("meta") if isinstance(res, dict) else {}
+                first_url = urls_this[0] if isinstance(urls_this, list) and urls_this else None
+                _tel_append(
+                    STATE_DIR,
+                    trace_id,
+                    {
+                        "name": tname,
+                        "ok": True,
+                        "label": "success",
+                        "raw": {
+                            "ts": None,
+                            "ok": True,
+                            "args": (tr.get("args") if isinstance(tr.get("args"), dict) else {}),
+                            "result": {"meta": (meta if isinstance(meta, dict) else {}), "artifact_url": first_url},
+                        },
+                    },
+                )
                 extra_results: List[Dict[str, Any]] = []
                 if tname == "film2.run":
                     meta_obj = res.get("meta") if isinstance(res, dict) else {}
@@ -9542,15 +9620,17 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                     )
                 exec_results: List[Dict[str, Any]] = []
                 # Advisory-only: always execute the patch plan once, with any arg
-                # adjustments from validator when present.
+                # adjustments from validator when present. Execute tools directly
+                # via local front doors so downstream services are actually hit.
                 exec_batch = patch_validated or patch_calls
                 if exec_batch:
-                    _log("tool.run.start", trace_id=trace_id, executor="void", count=len(exec_batch or []))
+                    _log("tool.run.start", trace_id=trace_id, executor="local", count=len(exec_batch or []))
                     for tc in exec_batch:
                         tn = (tc.get("name") or "tool")
                         ta = tc.get("arguments") if isinstance(tc.get("arguments"), dict) else {}
                         _log("tool.run.before", trace_id=trace_id, tool=str(tn), args_keys=list((ta or {}).keys()))
-                    exec_results = await gateway_execute(exec_batch, trace_id, EXECUTOR_BASE_URL or "http://127.0.0.1:8081")
+                        res_tc = await execute_tool_call(tc)
+                        exec_results.append(res_tc)
                 patch_results = list(patch_failure_results) + list(exec_results or [])
                 tool_results = (tool_results or []) + patch_results
                 _log("committee.revision.executed", trace_id=trace_id, steps=len(patch_validated or []), failures=len(patch_failures or []))
@@ -10702,27 +10782,32 @@ async def http_tool_run(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     base = (PUBLIC_BASE_URL or "http://127.0.0.1:8000").rstrip("/")
     async with _hx.AsyncClient(trust_env=False, timeout=None) as client:
         r = await client.post(base + "/tool.run", json={"name": name, "args": args})
+        raw_body = r.text or ""
         parser = JSONParser()
-        env = parser.parse(r.text or "", {})
+        env = parser.parse(raw_body or "", {})
         # Canonical consumer: interpret ok/error from envelope; propagate full error object.
         if isinstance(env, dict) and env.get("ok") and isinstance(env.get("result"), dict):
             return {"name": name, "result": env["result"]}
         if isinstance(env, dict) and isinstance(env.get("error"), dict):
-            err = env.get("error") or {}
+            # Preserve the entire error payload from /tool.run, including status/details,
+            # and add a local stack + raw body for additional debugging context.
+            err_obj = env.get("error") or {}
+            error_out: Dict[str, Any] = dict(err_obj)
+            error_out.setdefault("status", int(err_obj.get("status") or 0))
+            error_out.setdefault("body", raw_body)
+            error_out.setdefault("stack_local", "".join(traceback.format_stack()))
             return {
                 "name": name,
-                "error": {
-                    "code": err.get("code") or "tool_error",
-                    "message": err.get("message") or "tool_error",
-                    "stack": err.get("stack") or "".join(traceback.format_stack()),
-                },
+                "error": error_out,
             }
-        # Fallback: unknown error shape; include stack.
+        # Fallback: unknown error shape; include raw body and local stack so nothing is masked.
         return {
             "name": name,
             "error": {
                 "code": "tool_error",
                 "message": str(env),
+                "status": int(r.status_code),
+                "body": raw_body,
                 "stack": "".join(traceback.format_stack()),
             },
         }
@@ -10904,7 +10989,13 @@ _TOOL_SCHEMAS: Dict[str, Dict[str, Any]] = {
             "required": [],
             "additionalProperties": True,
         },
-        "notes": "Unified Film-2; public entrypoint; internal adapters only. Returns ids.video_id and meta.view_url.",
+        "notes": (
+            "Unified Film-2 front door for Void. Planner MUST treat this as the final assembly step in a film pipeline. "
+            "Do NOT fabricate or hard-code clip/image URLs in args; the orchestrator automatically wires real image "
+            "artifacts from prior image.dispatch (and related) tool results into args.images at execution time. "
+            "If no images exist yet for this trace, film2.run will operate in prompt/story-driven mode only. "
+            "Returns ids.video_id and meta.view_url."
+        ),
     },
     "music.infinite.windowed": {
         "name": "music.infinite.windowed",

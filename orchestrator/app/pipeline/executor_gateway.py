@@ -35,13 +35,20 @@ async def execute(tool_calls: List[Dict[str, Any]], trace_id: Optional[str], exe
 	async with _hx.AsyncClient(timeout=None, trust_env=False) as client:
 		r = await client.post(base + "/execute", json=payload)
 		parser = JSONParser()
-		env = parser.parse(r.text or "{}", {"ok": bool, "result": dict, "error": dict})
+		raw_body = r.text or ""
+		# The executor is expected to return a JSON envelope of the form
+		# {"ok": bool, "result": {"produced": {...}}, "error": {...}}. When the
+		# body is not valid JSON, or the shape drifts, we still want to surface
+		# the raw response text and HTTP status instead of collapsing to a
+		# generic executor_error.
+		env = parser.parse(raw_body or "{}", {"ok": bool, "result": dict, "error": dict})
 		if not isinstance(env, dict):
 			env = {
 				"ok": False,
 				"error": {
 					"code": "executor_bad_json",
-					"message": r.text or "",
+					"message": raw_body,
+					"status": int(r.status_code),
 					"stack": "".join(traceback.format_stack()),
 				},
 				"result": {"produced": {}},
@@ -55,12 +62,17 @@ async def execute(tool_calls: List[Dict[str, Any]], trace_id: Optional[str], exe
 		return results
 	err = (env or {}).get("error") or (env.get("result") or {}).get("error") or {}
 	# Surface full structured error; never truncate to a generic 'executor_failed'.
+	# Include HTTP status and the raw executor body when available so callers
+	# can see exactly what the executor returned.
 	return [{
 		"name": "executor",
 		"error": {
 			"code": err.get("code") or "executor_error",
 			"message": err.get("message") or "executor_error",
+			"status": err.get("status") or err.get("_http_status") or int(r.status_code),
 			"stack": err.get("stack") or "".join(traceback.format_stack()),
+			"env": env,
+			"body": raw_body,
 		},
 	}]
 
