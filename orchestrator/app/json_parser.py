@@ -7,9 +7,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 
 # Use the process-wide logging configuration only; no per-module handlers or
-# import-time I/O. This logger will inherit handlers/levels from the main
-# orchestrator entrypoint (configured in app.main).
-logger = logging.getLogger("orchestrator.json_parser")
+# import-time I/O. This logger is the root orchestrator logger configured in
+# app.main via logging.basicConfig, so all parser diagnostics go to the same
+# sinks as the rest of Void Orchestrator.
+logger = logging.getLogger()
 
 
 class JSONParser:
