@@ -367,22 +367,36 @@ def _schema_to_template(expected: Any) -> Any:
     This is ONLY for prompting the JSONFixer model; the original expected_schema
     (with type objects) is still used for JSONParser coercion/validation.
     """
+    # Structured containers: recurse into dicts/lists
     if isinstance(expected, dict):
         return {k: _schema_to_template(v) for k, v in expected.items()}
     if isinstance(expected, list):
+        # For list schemas, use the first element as the prototype when present.
         if not expected:
             return []
         return [_schema_to_template(expected[0])]
-    if expected is str:
-        return ""
-    if expected is int:
-        return 0
-    if expected is float:
-        return 0.0
-    if expected is list:
-        return []
-    if expected is dict:
-        return {}
+    # Type objects: map Python types to concrete JSON-compatible sample values.
+    # This is the core path that prevents 'type' objects from leaking into
+    # json.dumps calls when we render schema skeletons into prompts.
+    if isinstance(expected, type):
+        # Booleans first (bool is a subclass of int)
+        if issubclass(expected, bool):
+            return False
+        if issubclass(expected, int):
+            return 0
+        if issubclass(expected, float):
+            return 0.0
+        if issubclass(expected, str):
+            return ""
+        if issubclass(expected, (list, tuple, set)):
+            return []
+        if issubclass(expected, dict):
+            return {}
+        # Unknown type object: fall back to null in JSON
+        return None
+    # Primitive instances or anything else that is already JSON-serializable
+    # are returned as-is; non-serializable objects will be caught by json.dumps
+    # at call sites if they appear here.
     return expected
 
 
