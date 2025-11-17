@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import os
 import logging
+import sys
 from types import SimpleNamespace
 from io import BytesIO
 import base64 as _b64
@@ -395,6 +396,8 @@ logging.basicConfig(
     level=_level,
     format="%(asctime)s.%(msecs)03d %(levelname)s %(process)d/%(threadName)s %(name)s %(pathname)s:%(funcName)s:%(lineno)d - %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[logging.StreamHandler(sys.stdout)],
+    force=True,
 )
 
 def _log(event: str, **fields: Any) -> None:
