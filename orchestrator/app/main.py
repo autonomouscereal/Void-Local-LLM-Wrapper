@@ -3360,7 +3360,7 @@ async def planner_produce_plan(messages: List[Dict[str, Any]], tools: Optional[L
         tsl_blocks.append(
             {
                 "name": name,
-                "raw": {
+            "raw": {
                     "name": name,
                     "schema": schema,
                     "schema_ref": f"{name}@builtin",
@@ -3432,7 +3432,8 @@ async def planner_produce_plan(messages: List[Dict[str, Any]], tools: Optional[L
         "- When editing, include the input image via attachments (preferred) or set args.images to an array of objects containing absolute /uploads/... URLs.\n"
         "- For denoise/inpaint style edits, include a strength field (0.0–1.0) when applicable; keep the prompt aligned with the edit intent.\n"
         "- You MAY produce multiple steps in one plan in the 'steps' array; preserve the intended order. When the user requests media, choose one or more of the front-door tools (image.dispatch, music.infinite.windowed, film2.run, tts.speak) and do not reference any other tools.\n"
-        "- For purely textual questions with no media intent, you MAY return an empty 'steps' list. Do NOT propose internal tools such as locks.*, rag_search, research.run, web.smart_get, or http.request."
+        "- Returning an empty 'steps' list is ONLY allowed for purely textual questions with no media intent at all. If the user asks for any images, video/film, music, audio, or TTS, you MUST include at least one tool step.\n"
+        "- Do NOT propose internal tools such as locks.*, rag_search, research.run, web.smart_get, or http.request."
     )
     committee_review = (
         "### [COMMITTEE REVIEW / SYSTEM]\n"
@@ -9073,34 +9074,6 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     # Intersect with mode-allowed palette for this planning pass
     allowed_by_mode = set(_allowed_tools_for_mode(effective_mode))
     allowed_tools = allowed_tools & allowed_by_mode
-    no_steps = (len(tool_calls or []) == 0)
-    names_missing = any(not str((tc or {}).get("name") or "").strip() for tc in (tool_calls or []))
-    # Tool-first invariant: any request that reaches the planner is expected to use tools.
-    # If the planner returns zero steps or unnamed tools, force a constrained re-plan.
-    if no_steps or (not no_steps and names_missing):
-        allowed_sorted = sorted(list(allowed_tools))
-        constraint = (
-            "Your previous output omitted tool names. You MUST choose only from the allowed tool catalog:\n- "
-            + "\n- ".join(allowed_sorted)
-            + "\nReturn strict JSON ONLY: {\"steps\":[{\"tool\":\"<name>\",\"args\":{...}}]} or {\"steps\":[]}. "
-            "If the user requested an image, select image.dispatch and provide args."
-        )
-        replan_messages = messages + [{"role": "system", "content": constraint}]
-        _log("replan.start", trace_id=trace_id, reason="empty_or_unnamed_tools", allowed=allowed_sorted)
-        plan2, calls2 = await planner_produce_plan(replan_messages, body.get("tools"), body.get("temperature") or DEFAULT_TEMPERATURE, trace_id=trace_id, mode=effective_mode)
-        calls2_norm = _normalize_tool_calls(calls2)
-        # Filter out any unknown tools
-        filtered = []
-        for tc in (calls2_norm or []):
-            nm = str((tc or {}).get("name") or "").strip()
-            if nm and (nm in allowed_tools):
-                filtered.append(tc)
-        _log("replan.done", trace_id=trace_id, count=len(filtered or []))
-        tool_calls = filtered
-
-    # If no tool_calls were proposed but tools are available, nudge Planner by ensuring tools context is always present
-    # (No keyword heuristics; semantic mapping is handled by the Planner instructions above.)
-
     # If tool semantics are client-driven, return tool_calls instead of executing
     if False:
         tool_calls_openai = to_openai_tool_calls(tool_calls)
@@ -9848,7 +9821,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             "error": err,
             "response": txt,
             "_base_url": "committee",
-        }
+            }
         if not qwen_result:
             qwen_result = dict(base_payload)
         if not glm_result:

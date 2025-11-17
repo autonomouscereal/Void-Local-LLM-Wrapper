@@ -306,11 +306,35 @@ async def committee_jsonify(
     """
     Use the committee to coerce a messy text blob into strict JSON matching expected_schema.
 
-    This helper is intended for planner-style function calling where we require a JSON object
-    with a known shape (e.g., steps[], action/rationale/patch_plan). It routes the raw text
-    through a dedicated JSON-fixer prompt and then parses the result with JSONParser.
+    Fully traced so we can debug planner behavior:
+      - committee.jsonify.start
+      - committee.jsonify.committee_result
+      - committee.jsonify.candidates
+      - committee.jsonify.merge
     """
+    trace_base = str(trace_id or "committee")
+    trace_full = f"{trace_base}.jsonify"
     schema_desc = json.dumps(expected_schema, default=str, ensure_ascii=False)
+    raw_preview = (raw_text or "")[:600] if isinstance(raw_text, str) else ""
+    emit_trace(
+        STATE_DIR,
+        trace_base,
+        "committee.jsonify.start",
+        {
+            "trace_id": trace_base,
+            "trace_id_full": trace_full,
+            "schema_preview": schema_desc[:600],
+            "schema_len": len(schema_desc),
+            "raw_preview": raw_preview,
+            "raw_len": len(raw_text or ""),
+        },
+    )
+    log.debug(
+        "[committee.jsonify] start trace_id=%s schema_len=%d raw_len=%d",
+        trace_base,
+        len(schema_desc),
+        len(raw_text or ""),
+    )
     sys_msg = (
         "You are JSONFixer. You receive messy AI output and MUST respond ONLY with strict JSON "
         "that matches this schema:\n"
@@ -324,11 +348,34 @@ async def committee_jsonify(
     ]
     env = await committee_ai_text(
         messages,
-        trace_id=f"{trace_id or 'committee'}.jsonify",
+        trace_id=trace_full,
         rounds=rounds,
         temperature=temperature,
     )
     result_block = env.get("result") if isinstance(env, dict) else {}
+    ok_env = bool(env.get("ok")) if isinstance(env, dict) else False
+    txt_main_preview = ""
+    if isinstance(result_block, dict):
+        _txt = result_block.get("text")
+        if isinstance(_txt, str):
+            txt_main_preview = _txt[:600]
+    emit_trace(
+        STATE_DIR,
+        trace_base,
+        "committee.jsonify.committee_result",
+        {
+            "trace_id": trace_base,
+            "trace_id_full": trace_full,
+            "ok": ok_env,
+            "main_text_preview": txt_main_preview,
+        },
+    )
+    log.debug(
+        "[committee.jsonify] committee_result trace_id=%s ok=%s main_preview=%s",
+        trace_base,
+        ok_env,
+        txt_main_preview,
+    )
 
     # Collect up to four candidate JSON texts: the merged text plus per-backend responses.
     candidates: List[str] = []
@@ -345,6 +392,22 @@ async def committee_jsonify(
     # Always include the original raw_text as a last-resort candidate.
     if isinstance(raw_text, str) and raw_text.strip():
         candidates.append(raw_text)
+
+    emit_trace(
+        STATE_DIR,
+        trace_base,
+        "committee.jsonify.candidates",
+        {
+            "trace_id": trace_base,
+            "count": len(candidates),
+            "first_preview": (candidates[0][:400] if candidates else ""),
+        },
+    )
+    log.debug(
+        "[committee.jsonify] candidates trace_id=%s count=%d",
+        trace_base,
+        len(candidates),
+    )
 
     parser = JSONParser()
     parsed_candidates: List[Dict[str, Any]] = []
@@ -397,13 +460,22 @@ async def committee_jsonify(
 
     emit_trace(
         STATE_DIR,
-        str(trace_id or "committee"),
+        trace_base,
         "committee.jsonify.merge",
         {
-            "trace_id": str(trace_id or "committee"),
+            "trace_id": trace_base,
+            "trace_id_full": trace_full,
             "candidates": len(candidates),
             "parsed_candidates": len(parsed_candidates),
+            "merged_keys": sorted(list(merged.keys())) if isinstance(merged, dict) else [],
         },
+    )
+    log.debug(
+        "[committee.jsonify] merge trace_id=%s candidates=%d parsed=%d keys=%s",
+        trace_base,
+        len(candidates),
+        len(parsed_candidates),
+        ",".join(sorted(list(merged.keys()))) if isinstance(merged, dict) else "",
     )
     return merged
 
