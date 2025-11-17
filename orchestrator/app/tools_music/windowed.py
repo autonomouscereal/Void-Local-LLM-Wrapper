@@ -7,11 +7,390 @@ from typing import Any, Dict, List, Tuple, Optional
 
 from .common import now_ts, ensure_dir, sidecar, stamp_env, music_edge_defaults
 from ..analysis.media import analyze_audio
+from ..music.style_pack import style_score_for_track  # type: ignore
+from ..music.eval import compute_music_eval  # type: ignore
 from ..artifacts.manifest import add_manifest_row
 from ..context.index import add_artifact as _ctx_add
 from ..datasets.trace import append_sample as _trace_append
 from ..jsonio.normalize import normalize_to_envelope
 from ..jsonio.versioning import bump_envelope, assert_envelope
+
+
+# Regeneration thresholds and limits for MusicEval-driven windowed composition.
+QUALITY_THRESHOLD_TRACK = 0.7
+FIT_THRESHOLD_TRACK = 0.7
+WINDOW_QUALITY_THRESHOLD = 0.6
+WINDOW_FIT_THRESHOLD = 0.6
+MAX_REGEN_PASSES = 2
+
+
+def _eval_window_clip(
+    win: Dict[str, Any],
+    clip_path: str,
+    cid: str,
+    music_branch: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Evaluate a single window clip using MusicEval 2.0 and attach results to the window.
+    """
+    global_block = music_branch.get("global") if isinstance(music_branch.get("global"), dict) else {}
+    sections = music_branch.get("sections") if isinstance(music_branch.get("sections"), list) else []
+    sec_obj = None
+    if isinstance(win.get("section_id"), str):
+        for sec in sections:
+            if isinstance(sec, dict) and sec.get("section_id") == win.get("section_id"):
+                sec_obj = sec
+                break
+    local_song_graph: Dict[str, Any] = {
+        "global": global_block,
+        "sections": [sec_obj] if isinstance(sec_obj, dict) else [],
+        "lyrics": {},
+        "voices": music_branch.get("voices") or [],
+        "instruments": music_branch.get("instruments") or [],
+        "motifs": music_branch.get("motifs") or [],
+    }
+    style_pack = music_branch.get("style_pack") if isinstance(music_branch.get("style_pack"), dict) else None
+    film_context: Dict[str, Any] = {}
+    eval_out = compute_music_eval(
+        track_path=clip_path,
+        song_graph=local_song_graph,
+        style_pack=style_pack,
+        film_context=film_context,
+    )
+    overall = eval_out.get("overall") if isinstance(eval_out.get("overall"), dict) else {}
+    win["eval"] = eval_out
+    win["quality_score"] = overall.get("overall_quality_score")
+    win["fit_score"] = overall.get("fit_score")
+    _trace_append(
+        "music",
+        {
+            "event": "music.window.eval",
+            "cid": cid,
+            "tool": "music.infinite.windowed",
+            "window_id": win.get("window_id"),
+            "section_id": win.get("section_id"),
+            "eval": eval_out,
+            "path": clip_path,
+        },
+    )
+    return eval_out
+
+
+def _eval_full_track(full_path: str, music_branch: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Evaluate the stitched full track for multi-axis MusicEval.
+    """
+    style_pack = music_branch.get("style_pack") if isinstance(music_branch.get("style_pack"), dict) else None
+    track_eval = compute_music_eval(
+        track_path=full_path,
+        song_graph=music_branch,
+        style_pack=style_pack,
+        film_context={},
+    )
+    return track_eval
+
+
+def _find_bad_windows(windows: List[Dict[str, Any]]) -> List[str]:
+    """
+    Return a list of window_ids that fall below per-window eval thresholds.
+    """
+    ids: List[str] = []
+    for win in windows:
+        if not isinstance(win, dict):
+            continue
+        q = win.get("quality_score")
+        f = win.get("fit_score")
+        if isinstance(q, (int, float)) and isinstance(f, (int, float)):
+            if float(q) < WINDOW_QUALITY_THRESHOLD or float(f) < WINDOW_FIT_THRESHOLD:
+                wid = win.get("window_id")
+                if isinstance(wid, str) and wid:
+                    ids.append(wid)
+    return ids
+
+
+def _recompose_single_window(
+    job: Dict[str, Any],
+    provider,
+    manifest: Dict[str, Any],
+    cid: str,
+    win: Dict[str, Any],
+    music_branch: Dict[str, Any],
+    global_block: Dict[str, Any],
+    bpm: int,
+    params: Dict[str, Any],
+) -> Tuple[bytes, int, int]:
+    """
+    Regenerate audio and metrics for a single window, returning raw PCM + sr + ch.
+    """
+    sections = music_branch.get("sections") if isinstance(music_branch.get("sections"), list) else []
+    section_index: Dict[str, Dict[str, Any]] = {}
+    for sec in sections:
+        if isinstance(sec, dict) and isinstance(sec.get("section_id"), str):
+            section_index[str(sec.get("section_id"))] = sec
+    sr_local = int(params.get("sample_rate") or 44100)
+    ch_local = int(params.get("channels") or 2)
+    window_id = str(win.get("window_id") or "")
+    if not window_id:
+        return b"", sr_local, ch_local
+    sec_obj = section_index.get(win.get("section_id")) if isinstance(win.get("section_id"), str) else None
+    prompt = job.get("prompt") or ""
+    base_prompt = prompt or ""
+    prompt_parts: List[str] = []
+    if base_prompt:
+        prompt_parts.append(base_prompt)
+    sec_type = str(sec_obj.get("type") or "").lower() if isinstance(sec_obj, dict) else ""
+    if sec_type:
+        prompt_parts.append(f"{sec_type} section of the song")
+    target_energy = sec_obj.get("target_energy") if isinstance(sec_obj, dict) else None
+    if isinstance(target_energy, (int, float)):
+        if target_energy <= 0.33:
+            prompt_parts.append("low energy, more relaxed feel")
+        elif target_energy >= 0.66:
+            prompt_parts.append("high energy, more intense feel")
+        else:
+            prompt_parts.append("medium energy")
+    target_emotion = sec_obj.get("target_emotion") if isinstance(sec_obj, dict) else None
+    if isinstance(target_emotion, str) and target_emotion.strip():
+        prompt_parts.append(f"emotion: {target_emotion.strip()}")
+    style_tags: List[str] = []
+    global_styles = global_block.get("style_tags")
+    if isinstance(global_styles, list):
+        style_tags = [s for s in global_styles if isinstance(s, str) and s.strip()]
+    elif isinstance(global_block.get("genre_tags"), list):
+        style_tags = [s for s in global_block.get("genre_tags") if isinstance(s, str) and s.strip()]
+    if style_tags:
+        prompt_parts.append("style: " + ", ".join(style_tags))
+    if isinstance(sec_obj, dict):
+        v_ids = sec_obj.get("voice_ids")
+        if isinstance(v_ids, list):
+            roles = []
+            voices_list = music_branch.get("voices") or []
+            if isinstance(voices_list, list):
+                vid_to_role: Dict[str, str] = {}
+                for v in voices_list:
+                    if not isinstance(v, dict):
+                        continue
+                    vid = v.get("voice_id")
+                    role = v.get("role")
+                    if isinstance(vid, str) and vid and isinstance(role, str) and role.strip():
+                        vid_to_role[vid] = role.strip()
+                for vid in v_ids:
+                    if isinstance(vid, str) and vid:
+                        r = vid_to_role.get(vid)
+                        roles.append(r or vid)
+            if roles:
+                prompt_parts.append("featured voices: " + ", ".join(roles))
+            win["voice_ids"] = [str(vid) for vid in v_ids if isinstance(vid, str) and vid]
+    if bool(job.get("instrumental_only")):
+        prompt_parts.append("instrumental only, no vocals")
+    if sec_type == "chorus":
+        prompt_parts.append("strong memorable hook, repeat the main motif")
+    elif sec_type == "intro":
+        prompt_parts.append("atmospheric build-up, introduce main motif softly")
+    elif sec_type == "bridge":
+        prompt_parts.append("contrast section, increase tension before final chorus")
+    win_prompt = ". ".join([p for p in prompt_parts if p]).strip() or (prompt or "song section")
+    compose_args = {
+        "prompt": win_prompt,
+        "bpm": global_block.get("tempo_bpm") or bpm,
+        "length_s": int(
+            max(
+                1,
+                int(
+                    round(
+                        float(
+                            (win.get("t_end") or 0.0)
+                            - (win.get("t_start") or 0.0)
+                        )
+                    )
+                ),
+            )
+        ),
+        "sample_rate": params.get("sample_rate"),
+        "channels": params.get("channels"),
+        "music_lock": music_branch,
+        "seed": job.get("seed"),
+    }
+    res = provider.compose(compose_args)
+    wav_bytes = res.get("wav_bytes") or b""
+    clip_stem = f"{window_id}_{now_ts()}"
+    outdir = os.path.join("/workspace", "uploads", "artifacts", "music", cid)
+    ensure_dir(outdir)
+    clip_path = os.path.join(outdir, f"{clip_stem}.wav")
+    with wave.open(clip_path, "wb") as wf:
+        wf.setnchannels(ch_local)
+        wf.setsampwidth(2)
+        wf.setframerate(sr_local)
+        wf.writeframes(wav_bytes)
+    add_manifest_row(manifest, clip_path, step_id="music.infinite.windowed")
+    ainfo = analyze_audio(clip_path)
+    tempo_detected = ainfo.get("tempo_bpm")
+    tempo_target = None
+    if isinstance(sec_obj, dict) and isinstance(sec_obj.get("tempo_bpm"), (int, float)):
+        tempo_target = float(sec_obj.get("tempo_bpm"))
+    elif isinstance(global_block.get("tempo_bpm"), (int, float)):
+        tempo_target = float(global_block.get("tempo_bpm"))
+    tempo_lock = None
+    if isinstance(tempo_detected, (int, float)) and tempo_target and tempo_target > 0.0:
+        tempo_lock = 1.0 - (abs(float(tempo_detected) - tempo_target) / tempo_target)
+        if tempo_lock < 0.0:
+            tempo_lock = 0.0
+        if tempo_lock > 1.0:
+            tempo_lock = 1.0
+    key_detected = ainfo.get("key")
+    key_target = None
+    if isinstance(sec_obj, dict) and isinstance(sec_obj.get("key"), str):
+        key_target = sec_obj.get("key")
+    elif isinstance(global_block.get("key"), str):
+        key_target = global_block.get("key")
+    key_lock = None
+    if (
+        isinstance(key_target, str)
+        and key_target.strip()
+        and isinstance(key_detected, str)
+        and key_detected
+    ):
+        key_lock = 1.0 if key_target.strip().lower() == key_detected.strip().lower() else 0.0
+    lyrics_lock = None
+    motif_lock = None
+    if isinstance(tempo_lock, (int, float)) and isinstance(key_lock, (int, float)):
+        motif_lock = min(float(tempo_lock), float(key_lock))
+    ainfo["tempo_lock"] = tempo_lock
+    ainfo["key_lock"] = key_lock
+    ainfo["lyrics_lock"] = lyrics_lock
+    ainfo["motif_lock"] = motif_lock
+    win["artifact_path"] = clip_path
+    win["metrics"] = ainfo
+    _eval_window_clip(win, clip_path, cid, music_branch)
+    return wav_bytes, sr_local, ch_local
+
+
+def _stitch_from_windows(
+    windows: List[Dict[str, Any]],
+    crossfade_frames: int,
+) -> Tuple[bytes, int, int]:
+    """
+    Helper to rebuild PCM from existing windows on disk using timing order.
+    """
+    clips: List[Tuple[bytes, int, int]] = []
+    sortable: List[Tuple[float, Dict[str, Any]]] = []
+    for win in windows:
+        if not isinstance(win, dict):
+            continue
+        t_start = win.get("t_start")
+        try:
+            t_val = float(t_start) if isinstance(t_start, (int, float)) else 0.0
+        except Exception:
+            t_val = 0.0
+        sortable.append((t_val, win))
+    sortable.sort(key=lambda x: x[0])
+    base_sr: Optional[int] = None
+    base_ch: Optional[int] = None
+    for _, win in sortable:
+        clip_path = win.get("artifact_path")
+        if not (isinstance(clip_path, str) and clip_path and os.path.exists(clip_path)):
+            continue
+        try:
+            with wave.open(clip_path, "rb") as wf:
+                sr = wf.getframerate()
+                ch = wf.getnchannels()
+                frames = wf.readframes(wf.getnframes())
+        except Exception:
+            continue
+        if base_sr is None:
+            base_sr = sr
+        if base_ch is None:
+            base_ch = ch
+        if sr != base_sr or ch != base_ch:
+            continue
+        clips.append((frames, sr, ch))
+    if not clips:
+        return b"", 44100, 2
+    stitched_pcm, stitched_sr, stitched_ch = _stitch_windows_pcm(clips, crossfade_frames)
+    return stitched_pcm, stitched_sr, stitched_ch
+
+
+def _regenerate_bad_windows_only(
+    job: Dict[str, Any],
+    provider,
+    manifest: Dict[str, Any],
+    cid: str,
+    windows: List[Dict[str, Any]],
+    bad_window_ids: List[str],
+    music_branch: Dict[str, Any],
+    global_block: Dict[str, Any],
+    bpm: int,
+    params: Dict[str, Any],
+    crossfade_frames: int,
+) -> Tuple[List[Dict[str, Any]], str]:
+    """
+    Recompose only windows listed in bad_window_ids, re-evaluate them, and stitch a new full track.
+    """
+    bad_set = {wid for wid in bad_window_ids if isinstance(wid, str) and wid}
+    for win in windows:
+        wid = win.get("window_id")
+        if isinstance(wid, str) and wid in bad_set:
+            _recompose_single_window(job, provider, manifest, cid, win, music_branch, global_block, bpm, params)
+    stitched_pcm, stitched_sr, stitched_ch = _stitch_from_windows(windows, crossfade_frames)
+    outdir = os.path.join("/workspace", "uploads", "artifacts", "music", cid)
+    ensure_dir(outdir)
+    stem = f"windowed_regen_{now_ts()}"
+    full_path = os.path.join(outdir, f"{stem}.wav")
+    with wave.open(full_path, "wb") as wf_full:
+        wf_full.setnchannels(stitched_ch)
+        wf_full.setsampwidth(2)
+        wf_full.setframerate(stitched_sr)
+        wf_full.writeframes(stitched_pcm)
+    add_manifest_row(manifest, full_path, step_id="music.infinite.windowed.full")
+    return windows, full_path
+
+
+def _regenerate_full_music(
+    job: Dict[str, Any],
+    provider,
+    manifest: Dict[str, Any],
+    cid: str,
+    windows: List[Dict[str, Any]],
+    music_branch: Dict[str, Any],
+    global_block: Dict[str, Any],
+    bpm: int,
+    params: Dict[str, Any],
+    crossfade_frames: int,
+) -> Tuple[List[Dict[str, Any]], str]:
+    """
+    Rebuild all windows with provider.compose, re-evaluate, and stitch into a fresh full track.
+    """
+    new_clips: List[Tuple[bytes, int, int, Dict[str, Any]]] = []
+    for win in windows:
+        if not isinstance(win, dict):
+            continue
+        wav_bytes, sr_local, ch_local = _recompose_single_window(
+            job,
+            provider,
+            manifest,
+            cid,
+            win,
+            music_branch,
+            global_block,
+            bpm,
+            params,
+        )
+        new_clips.append((wav_bytes, sr_local, ch_local, win))
+    clip_pcm_list: List[Tuple[bytes, int, int]] = []
+    for pcm, sr, ch, _ in new_clips:
+        clip_pcm_list.append((pcm, sr, ch))
+    stitched_pcm, stitched_sr, stitched_ch = _stitch_windows_pcm(clip_pcm_list, crossfade_frames)
+    outdir = os.path.join("/workspace", "uploads", "artifacts", "music", cid)
+    ensure_dir(outdir)
+    stem = f"windowed_regen_full_{now_ts()}"
+    full_path = os.path.join(outdir, f"{stem}.wav")
+    with wave.open(full_path, "wb") as wf_full:
+        wf_full.setnchannels(stitched_ch)
+        wf_full.setsampwidth(2)
+        wf_full.setframerate(stitched_sr)
+        wf_full.writeframes(stitched_pcm)
+    add_manifest_row(manifest, full_path, step_id="music.infinite.windowed.full")
+    return windows, full_path
 
 
 def _song_global_defaults(prompt: str, length_s: int, bpm: int) -> Dict[str, Any]:
@@ -318,6 +697,7 @@ def run_music_infinite_windowed(job: Dict[str, Any], provider, manifest: Dict[st
     for sec in sections:
         if isinstance(sec, dict) and isinstance(sec.get("section_id"), str):
             section_index[str(sec.get("section_id"))] = sec
+    instrumental_only = bool(job.get("instrumental_only"))
     for win in windows:
         if not isinstance(win, dict):
             continue
@@ -368,6 +748,33 @@ def run_music_infinite_windowed(job: Dict[str, Any], provider, manifest: Dict[st
             style_tags = [s for s in global_block.get("genre_tags") if isinstance(s, str) and s.strip()]
         if style_tags:
             prompt_parts.append("style: " + ", ".join(style_tags))
+        # Optional multi-voice hint and instrumental-only toggle.
+        if isinstance(sec_obj, dict):
+            v_ids = sec_obj.get("voice_ids")
+            if isinstance(v_ids, list):
+                roles = []
+                voices_list = music_branch.get("voices") or []
+                if isinstance(voices_list, list):
+                    # Build a quick index voice_id -> role for richer prompts.
+                    vid_to_role = {}
+                    for v in voices_list:
+                        if not isinstance(v, dict):
+                            continue
+                        vid = v.get("voice_id")
+                        role = v.get("role")
+                        if isinstance(vid, str) and vid and isinstance(role, str) and role.strip():
+                            vid_to_role[vid] = role.strip()
+                    for vid in v_ids:
+                        if isinstance(vid, str) and vid:
+                            r = vid_to_role.get(vid)
+                            roles.append(r or vid)
+                if roles:
+                    prompt_parts.append("featured voices: " + ", ".join(roles))
+                # Also record which logical voices this window expects, so downstream
+                # vocal pipelines can render stems per voice_lock_id.
+                win["voice_ids"] = [str(vid) for vid in v_ids if isinstance(vid, str) and vid]
+        if instrumental_only:
+            prompt_parts.append("instrumental only, no vocals")
         # Section-type specific hints.
         if sec_type == "chorus":
             prompt_parts.append("strong memorable hook, repeat the main motif")
@@ -435,6 +842,8 @@ def run_music_infinite_windowed(job: Dict[str, Any], provider, manifest: Dict[st
         ainfo["motif_lock"] = motif_lock
         win["artifact_path"] = clip_path
         win["metrics"] = ainfo
+        # Per-window multi-axis evaluation (MusicEval 2.0).
+        _eval_window_clip(win, clip_path, cid, music_branch)
         window_clips.append((wav_bytes, sr_local, ch_local, win))
     # For canonical windows we have PCM in memory; for reuse windows we read
     # their audio from disk before stitching.
@@ -447,9 +856,10 @@ def run_music_infinite_windowed(job: Dict[str, Any], provider, manifest: Dict[st
                 with open(clip_path, "rb") as fh:
                     data = fh.read()
         clip_pcm_list.append((data, sr, ch))
+    crossfade_frames = int(job.get("crossfade_frames") or 2048)
     stitched_pcm, stitched_sr, stitched_ch = _stitch_windows_pcm(
         clip_pcm_list,
-        int(job.get("crossfade_frames") or 2048),
+        crossfade_frames,
     )
     stem = f"windowed_{now_ts()}"
     full_path = os.path.join(outdir, f"{stem}.wav")
@@ -533,6 +943,62 @@ def run_music_infinite_windowed(job: Dict[str, Any], provider, manifest: Dict[st
         "instruments_count": len(music_branch.get("instruments") or []),
         "motifs_count": len(music_branch.get("motifs") or []),
     }
+    # Track-level multi-axis evaluation (MusicEval 2.0) on the initial full track.
+    track_eval = _eval_full_track(full_path, music_branch)
+    overall_block = track_eval.get("overall") if isinstance(track_eval.get("overall"), dict) else {}
+    track_quality = overall_block.get("overall_quality_score")
+    track_fit = overall_block.get("fit_score")
+
+    # Identify windows that are weak according to per-window eval.
+    bad_window_ids = _find_bad_windows(windows)
+
+    # Regen loop: fix weak windows and optionally the whole track.
+    regen_pass = 0
+    while regen_pass < MAX_REGEN_PASSES:
+        quality_ok = isinstance(track_quality, (int, float)) and float(track_quality) >= QUALITY_THRESHOLD_TRACK
+        fit_ok = isinstance(track_fit, (int, float)) and float(track_fit) >= FIT_THRESHOLD_TRACK
+        if quality_ok and fit_ok and not bad_window_ids:
+            break
+        if bad_window_ids:
+            windows, full_path = _regenerate_bad_windows_only(
+                job,
+                provider,
+                manifest,
+                cid,
+                windows,
+                bad_window_ids,
+                music_branch,
+                global_block,
+                bpm,
+                params,
+                crossfade_frames,
+            )
+        else:
+            windows, full_path = _regenerate_full_music(
+                job,
+                provider,
+                manifest,
+                cid,
+                windows,
+                music_branch,
+                global_block,
+                bpm,
+                params,
+                crossfade_frames,
+            )
+        track_eval = _eval_full_track(full_path, music_branch)
+        overall_block = track_eval.get("overall") if isinstance(track_eval.get("overall"), dict) else {}
+        track_quality = overall_block.get("overall_quality_score")
+        track_fit = overall_block.get("fit_score")
+        bad_window_ids = _find_bad_windows(windows)
+        regen_pass += 1
+
+    # Style score against a style pack if attached to the music branch, computed on the final track.
+    style_score = None
+    sp = music_branch.get("style_pack") if isinstance(music_branch.get("style_pack"), dict) else None
+    if sp is not None and isinstance(full_path, str) and full_path:
+        style_score = style_score_for_track(full_path, sp)
+
     _trace_append(
         "music",
         {
@@ -550,6 +1016,9 @@ def run_music_infinite_windowed(job: Dict[str, Any], provider, manifest: Dict[st
             "lock_score_music": locks_meta.get("lock_score_music"),
             "song_graph_summary": song_summary,
             "music_profile_used": bool((global_block.get("style_tags") or [])),
+            "style_score": style_score,
+            "music_eval_track": track_eval,
+            "bad_window_ids": bad_window_ids,
             "path": full_path,
         },
     )

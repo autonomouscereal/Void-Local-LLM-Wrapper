@@ -30,8 +30,6 @@ def write_status() -> None:
         json.dump(STATUS, f, indent=2)
 
 
-YUE_REPO = os.environ.get("YUE_REPO", "").strip()
-
 HF_MODELS = [
     ("tencent/HunyuanVideo",                  "hunyuan",        None),
     ("Lightricks/LTX-Video",                  "ltx_video",      None),
@@ -49,9 +47,12 @@ HF_MODELS = [
     ("facebook/musicgen-melody",               "musicgen-melody", None),
     ("facebook/audiogen-medium",               "audiogen-medium", None),
     ("cvssp/audioldm2-large",                  "audioldm2-large", None),
+    # RVC voice conversion base model (TITAN) – downloaded into MODELS_DIR/rvc_titan
+    ("blaise-tk/TITAN",                        "rvc_titan",      None),
 ]
 
-# Never append YuE dynamically in bootstrap; YuE is handled as a local artifact if used.
+# Never append external/custom music engines dynamically in bootstrap; when used
+# they are handled as local artifacts outside this manifest.
 
 
 GIT_REPOS = [
@@ -78,8 +79,9 @@ MANDATORY_DIRS = [
     "clap",
     "blip2",
     "whisper",
+    "rvc_titan",
 ]
-# Do not require 'yue' as mandatory; removed from bootstrap scope
+# Do not require external/custom music engines as mandatory; removed from bootstrap scope
 
 
 def ensure_aesthetic_head() -> None:

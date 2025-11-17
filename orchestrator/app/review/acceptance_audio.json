@@ -2,7 +2,9 @@
   "music": {
     "clap_min": 0.35,
     "fad_max": 1.5,
-    "bpm_drift_pct_max": 0.8
+    "bpm_drift_pct_max": 0.8,
+    "overall_quality_min": 0.7,
+    "fit_score_min": 0.7
   },
   "singing": {
     "cer_max": 0.06,

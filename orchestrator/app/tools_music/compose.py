@@ -15,6 +15,7 @@ from ..context.index import add_artifact as _ctx_add
 import wave
 import struct
 from ..analysis.media import analyze_audio, normalize_lufs
+from ..music.style_pack import style_score_for_track  # type: ignore
 from ..datasets.trace import append_sample as _trace_append
 
 
@@ -156,6 +157,13 @@ def run_music_compose(job: dict, provider, manifest: dict) -> dict:
             with open(sp, "wb") as f:
                 f.write(s.get("wav_bytes") or b"")
             stems_meta.append({"name": s.get("name"), "path": sp})
+    # Optional style pack scoring if present in the lock.
+    style_score = None
+    if isinstance(lock, dict):
+        sp = lock.get("style_pack")
+        if isinstance(sp, dict):
+            style_score = style_score_for_track(track_path, sp)
+            qa["style_score"] = style_score
     sidecar(track_path, {"tool": "music.compose", **args, "model": model, "stems": stems_meta, "committee": qa})
     try:
         if job.get("music_id"):
@@ -169,18 +177,22 @@ def run_music_compose(job: dict, provider, manifest: dict) -> dict:
     except Exception:
         pass
     try:
-        append_music_sample(outdir, {
-            "prompt": job.get("prompt"),
-            "bpm": args.get("bpm"),
-            "length_s": args.get("length_s"),
-            "structure": args.get("structure"),
-            "seed": int(args.get("seed") or 0),
-            "music_lock": bool(lock),
-            "track_ref": track_path,
-            "stems": [s.get("path") for s in stems_meta],
-            "model": model,
-            "created_at": now_ts(),
-        })
+        append_music_sample(
+            outdir,
+            {
+                "prompt": job.get("prompt"),
+                "bpm": args.get("bpm"),
+                "length_s": args.get("length_s"),
+                "structure": args.get("structure"),
+                "seed": int(args.get("seed") or 0),
+                "music_lock": bool(lock),
+                "track_ref": track_path,
+                "stems": [s.get("path") for s in stems_meta],
+                "model": model,
+                "style_score": style_score,
+                "created_at": now_ts(),
+            },
+        )
     except Exception:
         pass
     add_manifest_row(manifest, track_path, step_id="music.compose")
@@ -197,21 +209,25 @@ def run_music_compose(job: dict, provider, manifest: dict) -> dict:
     # Trace row for distillation
     try:
         ainfo3 = analyze_audio(track_path)
-        _trace_append("music", {
-            "cid": cid,
-            "tool": "music.compose",
-            "prompt": job.get("prompt"),
-            "bpm": args.get("bpm"),
-            "length_s": args.get("length_s"),
-            "seed": int(args.get("seed") or 0),
-            "music_lock": lock,
-            "model": model,
-            "path": track_path,
-            "lufs": ainfo3.get("lufs") if isinstance(ainfo3, dict) else None,
-            "tempo_bpm": ainfo3.get("tempo_bpm") if isinstance(ainfo3, dict) else None,
-            "key": ainfo3.get("key") if isinstance(ainfo3, dict) else None,
-            "genre": ainfo3.get("genre") if isinstance(ainfo3, dict) else None,
-        })
+        _trace_append(
+            "music",
+            {
+                "cid": cid,
+                "tool": "music.compose",
+                "prompt": job.get("prompt"),
+                "bpm": args.get("bpm"),
+                "length_s": args.get("length_s"),
+                "seed": int(args.get("seed") or 0),
+                "music_lock": lock,
+                "model": model,
+                "path": track_path,
+                "lufs": ainfo3.get("lufs") if isinstance(ainfo3, dict) else None,
+                "tempo_bpm": ainfo3.get("tempo_bpm") if isinstance(ainfo3, dict) else None,
+                "key": ainfo3.get("key") if isinstance(ainfo3, dict) else None,
+                "genre": ainfo3.get("genre") if isinstance(ainfo3, dict) else None,
+                "style_score": style_score,
+            },
+        )
     except Exception:
         pass
     return env

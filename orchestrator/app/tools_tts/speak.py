@@ -19,6 +19,7 @@ import struct
 import math
 from ..analysis.media import analyze_audio, normalize_lufs
 from ..datasets.trace import append_sample as _trace_append
+import httpx  # type: ignore
 
 
 def _cosine_similarity(vec_a, vec_b):
@@ -118,6 +119,127 @@ def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
         wav_bytes = res.get("wav_bytes") or b""
         dur = float(res.get("duration_s") or 0.0)
         model = res.get("model", "unknown")
+    # Optional RVC voice conversion when a voice_lock_id is present.
+    voice_lock_id = job.get("voice_lock_id") or job.get("voice_id")
+    rvc_url = os.getenv("RVC_API_URL")
+    if isinstance(voice_lock_id, str) and voice_lock_id.strip() and isinstance(rvc_url, str) and rvc_url.strip():
+        try:
+            import base64 as _b64_rvc
+            payload_rvc = {
+                "source_wav_base64": _b64_rvc.b64encode(wav_bytes or b"").decode("ascii"),
+                "voice_lock_id": voice_lock_id.strip(),
+            }
+            with httpx.Client(timeout=None, trust_env=False) as client:
+                r_rvc = client.post(rvc_url.rstrip("/") + "/v1/audio/convert", json=payload_rvc)
+            try:
+                from ..json_parser import JSONParser  # type: ignore
+                parser = JSONParser()
+                js_rvc = parser.parse(r_rvc.text or "", {"ok": bool, "audio_wav_base64": str, "sample_rate": int})
+            except Exception:
+                js_rvc = {}
+            if not isinstance(js_rvc, dict) or not bool(js_rvc.get("ok")):
+                return {
+                    "ok": False,
+                    "error": {
+                        "code": "rvc_error",
+                        "status": int(getattr(r_rvc, "status_code", 500) or 500),
+                        "message": "RVC /v1/audio/convert failed for tts.speak",
+                        "raw": js_rvc,
+                    },
+                }
+            b64_rvc = js_rvc.get("audio_wav_base64") if isinstance(js_rvc.get("audio_wav_base64"), str) else None
+            if not b64_rvc:
+                return {
+                    "ok": False,
+                    "error": {
+                        "code": "rvc_missing_audio",
+                        "status": 500,
+                        "message": "RVC /v1/audio/convert returned no audio_wav_base64",
+                    },
+                }
+            wav_bytes = _b64_rvc.b64decode(b64_rvc)
+        except Exception as ex:
+            return {
+                "ok": False,
+                "error": {
+                    "code": "rvc_exception",
+                    "status": 500,
+                    "message": str(ex),
+                },
+            }
+    # Mandatory VocalFix quality stage for all TTS audio.
+    vf_url = os.getenv("VOCAL_FIXER_API_URL")
+    if not isinstance(vf_url, str) or not vf_url.strip():
+        return {
+            "ok": False,
+            "error": {
+                "code": "vocalfix_unconfigured",
+                "status": 500,
+                "message": "VOCAL_FIXER_API_URL must be configured for tts.speak",
+            },
+        }
+    try:
+        import base64 as _b64_vf
+        payload_vf = {
+            "audio_wav_base64": _b64_vf.b64encode(wav_bytes or b"").decode("ascii"),
+            "sample_rate": int(params.get("sample_rate") or 22050),
+            "ops": ["pitch", "align", "deess"],
+        }
+        with httpx.Client(timeout=None, trust_env=False) as client:
+            r_vf = client.post(vf_url.rstrip("/") + "/v1/vocal/fix", json=payload_vf)
+        try:
+            from ..json_parser import JSONParser  # type: ignore
+            parser = JSONParser()
+            js_vf = parser.parse(
+                r_vf.text or "",
+                {
+                    "ok": bool,
+                    "audio_wav_base64": str,
+                    "sample_rate": int,
+                    "metrics_before": dict,
+                    "metrics_after": dict,
+                },
+            )
+        except Exception:
+            js_vf = {}
+        if not isinstance(js_vf, dict) or not bool(js_vf.get("ok")):
+            return {
+                "ok": False,
+                "error": {
+                    "code": "vocalfix_error",
+                    "status": int(getattr(r_vf, "status_code", 500) or 500),
+                    "message": "VocalFix /v1/vocal/fix failed for tts.speak",
+                    "raw": js_vf,
+                },
+            }
+        b64_vf = js_vf.get("audio_wav_base64") if isinstance(js_vf.get("audio_wav_base64"), str) else None
+        if not b64_vf:
+            return {
+                "ok": False,
+                "error": {
+                    "code": "vocalfix_missing_audio",
+                    "status": 500,
+                    "message": "VocalFix /v1/vocal/fix returned no audio_wav_base64",
+                },
+            }
+        wav_bytes = _b64_vf.b64decode(b64_vf)
+        # Attach VocalFix metrics to manifest for teacher/distillation.
+        manifest.setdefault("items", []).append(
+            {
+                "kind": "tts.vocalfix",
+                "metrics_before": js_vf.get("metrics_before") if isinstance(js_vf.get("metrics_before"), dict) else {},
+                "metrics_after": js_vf.get("metrics_after") if isinstance(js_vf.get("metrics_after"), dict) else {},
+            }
+        )
+    except Exception as ex:
+        return {
+            "ok": False,
+            "error": {
+                "code": "vocalfix_exception",
+                "status": 500,
+                "message": str(ex),
+            },
+        }
     stem = f"tts_{now_ts()}"
     wav_path = os.path.join(outdir, stem + ".wav")
     with open(wav_path, "wb") as f:

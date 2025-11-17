@@ -1,14 +1,11 @@
 from __future__ import annotations
 
-import os
-import asyncio
 import json
 from typing import Dict, Any
 
-import httpx  # type: ignore
-
 from ..json_parser import JSONParser
 from ..pipeline.compression_orchestrator import co_pack, frames_to_string
+from ..main import committee_ai_text
 
 
 PLAN_SCHEMA: Dict[str, Any] = {
@@ -49,19 +46,24 @@ SYSTEM_AUDIO = (
 
 
 async def _call_llm_json(prompt: str) -> Dict[str, Any]:
-    base = os.getenv("QWEN_BASE_URL", "http://ollama_qwen:11435").rstrip("/")
-    model = os.getenv("QWEN_MODEL_ID", "qwen2.5:14b").strip() or "qwen2.5:14b"
-    payload = {"model": model, "prompt": prompt, "stream": False}
-    async with httpx.AsyncClient() as client:
-        r = await client.post(base + "/api/generate", json=payload)
-        # Do not raise on HTTP errors; return an empty plan instead so callers can continue.
-        if r.status_code < 200 or r.status_code >= 300:
-            return {"request_id": "", "plan": []}
-        txt = (JSONParser().parse(r.text, {"response": str}) or {}).get("response") or "{}"
-        try:
-            return JSONParser().parse(txt, PLAN_SCHEMA)
-        except Exception:
-            return {"request_id": "", "plan": []}
+    """
+    Legacy planner helper now routed through the central committee path.
+    The committee debate produces free-form text; we then parse that text
+    into PLAN_SCHEMA via JSONParser. No direct calls to Ollama here.
+    """
+    env = await committee_ai_text(
+        [{"role": "system", "content": "You are a multimodal planner. Output ONLY JSON per the schema."},
+         {"role": "user", "content": prompt}],
+        trace_id="planner_legacy",
+        rounds=3,
+    )
+    if not isinstance(env, dict) or not env.get("ok"):
+        return {"request_id": "", "plan": []}
+    res = env.get("result") or {}
+    text = res.get("text") or ""
+    parser = JSONParser()
+    parsed = parser.parse(text or "{}", PLAN_SCHEMA)
+    return parsed if isinstance(parsed, dict) else {"request_id": "", "plan": []}
 
 
 async def _plan_with_role(system: str, user_text: str, request_id: str) -> Dict[str, Any]:

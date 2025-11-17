@@ -13,9 +13,9 @@ from transformers import AutoProcessor, MusicgenForConditionalGeneration  # type
 import torch
 
 
-MODEL_ID = os.getenv("YUE_MODEL_ID", os.getenv("MUSIC_MODEL_ID", "facebook/musicgen-medium"))
+MODEL_ID = os.getenv("MUSIC_MODEL_ID", "facebook/musicgen-medium")
 
-app = FastAPI(title="YuE (local) - Lyrics to Song", version="0.1.0")
+app = FastAPI(title="MusicGen (local) - Lyrics to Song", version="0.1.0")
 
 _model = None
 _proc = None
@@ -69,6 +69,6 @@ async def song(body: Dict[str, Any]):
     b64 = base64.b64encode(buf.read()).decode("utf-8")
     # Minimal structure stub
     structure = {"sections": [{"name": "full", "start": 0.0, "end": float(length_s)}], "bpm": body.get("bpm"), "key": body.get("key")}
-    return {"audio_wav_base64": b64, "sample_rate": sr, "structure": structure, "model": f"yue:{MODEL_ID}"}
+    return {"audio_wav_base64": b64, "sample_rate": sr, "structure": structure, "model": f"musicgen:{MODEL_ID}"}
 
 

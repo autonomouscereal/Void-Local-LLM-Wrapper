@@ -9,13 +9,13 @@ from typing import Any, Dict, List, Optional, Tuple
 logger = logging.getLogger(__name__)
 if not logger.handlers:
     handler = logging.FileHandler("json_parser.log")
-    handler.setLevel(logging.DEBUG)
+    handler.setLevel(logging.ERROR)
     formatter = logging.Formatter(
         "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     )
     handler.setFormatter(formatter)
     logger.addHandler(handler)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.ERROR)
 
 
 class JSONParser:

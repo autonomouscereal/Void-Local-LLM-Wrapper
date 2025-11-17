@@ -14,7 +14,7 @@ from PIL import Image  # type: ignore
 import soundfile as sf  # type: ignore
 import pyloudnorm as pyln  # type: ignore
 import librosa  # type: ignore
-from app.json_parser import JSONParser
+from ..json_parser import JSONParser
 
 
 VLM_API_URL = os.getenv("VLM_API_URL")  # e.g., http://vlm:8050
@@ -113,7 +113,7 @@ def _run_ocr(path: str) -> Dict[str, Any]:
             data = f.read()
         b64 = base64.b64encode(data).decode("ascii")
         r = requests.post(OCR_API_URL.rstrip("/") + "/ocr", json={"b64": b64, "ext": ext})
-        from app.json_parser import JSONParser  # local import to avoid cycles at module import time
+        from ..json_parser import JSONParser  # local import to avoid cycles at module import time
         parser = JSONParser()
         js = parser.parse(r.text or "{}", {"text": str})
         txt = (js.get("text") or "").strip() if isinstance(js, dict) else ""
@@ -145,7 +145,7 @@ def _run_yolo(path: str) -> Dict[str, Any]:
             json={"image_path": path},
             timeout=10,
         )
-        from app.json_parser import JSONParser  # local import to avoid cycles at module import time
+        from ..json_parser import JSONParser  # local import to avoid cycles at module import time
         parser = JSONParser()
         js = parser.parse(r.text or "{}", {"objects": list, "faces": list})
         objects = js.get("objects") or [] if isinstance(js, dict) else []
@@ -251,34 +251,17 @@ def _qwen_vl_analyze(path: str, prompt: Optional[str]) -> Dict[str, Any]:
             json={"image_url": image_url, "prompt": base_instr},
             timeout=60,
         )
-        from app.json_parser import JSONParser  # local import to avoid cycles at module import time
+        from ..json_parser import JSONParser  # local import to avoid cycles at module import time
         parser = JSONParser()
         js = parser.parse(r.text or "{}", {"text": str})
         text = (js.get("text") or "").strip() if isinstance(js, dict) else ""
         if not text:
             res["error"] = "vlm_empty_text"
             return res
-        try:
-            from app.json_parser import JSONParser  # local import to avoid cycles at module import time
-            parser = JSONParser()
-            # VLM JSON is free-form but expected to contain at least caption/keywords/tags.
-            parsed = parser.parse(text, {"caption": str, "keywords": list, "tags": list})
-        except Exception:
-            # Fallback: treat the entire response as caption and derive naive tags.
-            res["caption"] = text
-            toks = [
-                t.strip(" ,.;:()[]{}\"'")
-                for t in text.split()
-                if len(t.strip(" ,.;:()[]{}\"'")) >= 3
-            ]
-            dedup: List[str] = []
-            seen = set()
-            for t in toks:
-                if t and t not in seen:
-                    seen.add(t)
-                    dedup.append(t)
-            res["tags"] = dedup[:20]
-            return res
+        from ..json_parser import JSONParser  # local import to avoid cycles at module import time
+        parser = JSONParser()
+        # VLM JSON is free-form but expected to contain at least caption/keywords/tags.
+        parsed = parser.parse(text, {"caption": str, "keywords": list, "tags": list})
         caption = parsed.get("caption")
         if isinstance(caption, str):
             res["caption"] = caption.strip()

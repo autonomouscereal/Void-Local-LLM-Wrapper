@@ -136,6 +136,7 @@ from .tools_tts.sfx import run_sfx_compose
 from .tools_music.compose import run_music_compose
 from .tools_music.variation import run_music_variation
 from .tools_music.mixdown import run_music_mixdown
+from .tools_music.vocals import render_vocal_stems_for_track
 from .context.index import add_artifact as _ctx_add
 from .artifacts.shard import open_shard as _art_open_shard, append_jsonl as _art_append_jsonl, _finalize_shard as _art_finalize
 from .artifacts.shard import newest_part as _art_newest_part, list_parts as _art_list_parts
@@ -206,9 +207,145 @@ from .qa.segments import (
 )
 from .plan.song import plan_song_graph
 from .tools_music.windowed import run_music_infinite_windowed, restitch_music_from_windows
+from .music.eval import compute_music_eval
 from functools import partial
 from .context.index import add_artifact as _ctx_add
 from .story import draft_story_graph as _story_draft, check_story_consistency as _story_check, fix_story as _story_fix, derive_scenes_and_shots as _story_derive
+
+
+MUSIC_HERO_QUALITY_MIN = 0.85
+MUSIC_HERO_FIT_MIN = 0.85
+_MUSIC_ACCEPT_THRESHOLDS: Dict[str, float] | None = None
+
+
+def _get_music_acceptance_thresholds() -> Dict[str, float]:
+    """
+    Load music acceptance thresholds from review/acceptance_audio.json.
+
+    This helper enforces that the config must exist and be well-formed; any
+    failure here will surface as an exception instead of silently falling back.
+    """
+    global _MUSIC_ACCEPT_THRESHOLDS
+    if _MUSIC_ACCEPT_THRESHOLDS is not None:
+        return _MUSIC_ACCEPT_THRESHOLDS
+    cfg_path = os.path.join(os.path.dirname(__file__), "review", "acceptance_audio.json")
+    with open(cfg_path, "r", encoding="utf-8") as f:
+        txt = f.read()
+    parser = JSONParser()
+    cfg = parser.parse(txt or "{}", {"music": dict})
+    music_cfg = cfg.get("music") if isinstance(cfg.get("music"), dict) else {}
+    overall_min = float(music_cfg.get("overall_quality_min"))
+    fit_min = float(music_cfg.get("fit_score_min"))
+    _MUSIC_ACCEPT_THRESHOLDS = {
+        "overall_quality_min": overall_min,
+        "fit_score_min": fit_min,
+    }
+    return _MUSIC_ACCEPT_THRESHOLDS
+
+
+class _TTSProvider:
+    """
+    Shared XTTS provider used by tts.speak and Film2 vocal rendering.
+    Adapts the external XTTS /tts response into the canonical envelope that
+    run_tts_speak expects.
+    """
+
+    def speak(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        trace_id = payload.get("trace_id") if isinstance(payload.get("trace_id"), str) else "tt_xtts_unknown"
+        emit_progress({"stage": "request", "target": "xtts"})
+        import httpx as _hxsync  # type: ignore
+        # Ensure language is always set; default to English if absent.
+        lang = payload.get("language")
+        if not isinstance(lang, str) or not lang.strip():
+            payload["language"] = "en"
+        with _hxsync.Client(timeout=None, trust_env=False) as client:
+            r = client.post(XTTS_API_URL.rstrip("/") + "/tts", json=payload)
+            status = r.status_code
+            ct = r.headers.get("content-type", "")
+            if 200 <= status < 300:
+                # XTTS service returns a canonical envelope: decode audio and adapt to internal shape.
+                if "application/json" in ct:
+                    parser = JSONParser()
+                    env = parser.parse(
+                        r.text or "",
+                        {
+                            "schema_version": int,
+                            "trace_id": str,
+                            "ok": bool,
+                            "result": dict,
+                            "error": dict,
+                        },
+                    )
+                else:
+                    env = {
+                        "schema_version": 1,
+                        "trace_id": trace_id,
+                        "ok": False,
+                        "result": None,
+                        "error": {
+                            "code": "tts_invalid_body",
+                            "status": status,
+                            "message": "XTTS /tts returned non-JSON body",
+                            "raw": r.text,
+                            "stack": "".join(traceback.format_stack()),
+                        },
+                    }
+                if isinstance(env, dict) and env.get("ok") is True:
+                    inner = env.get("result") if isinstance(env.get("result"), dict) else {}
+                    b64 = inner.get("audio_wav_base64") or inner.get("wav_b64")
+                    wav = b""
+                    if isinstance(b64, str):
+                        import base64 as _b64local
+                        wav = _b64local.b64decode(b64)
+                    # Adapt to canonical internal envelope expected by run_tts_speak.
+                    return {
+                        "schema_version": 1,
+                        "request_id": trace_id,
+                        "trace_id": trace_id,
+                        "ok": True,
+                        "result": {
+                            "wav_bytes": wav,
+                            "duration_s": float(inner.get("duration_s") or 0.0),
+                            "model": inner.get("model") or "xtts",
+                        },
+                        "error": None,
+                    }
+                # Any non-ok env from XTTS is wrapped as a tool error.
+                return {
+                    "schema_version": 1,
+                    "request_id": trace_id,
+                    "trace_id": trace_id,
+                    "ok": False,
+                    "result": None,
+                    "error": {
+                        "code": "tts_invalid_envelope",
+                        "status": status,
+                        "message": "XTTS /tts returned non-ok envelope",
+                        "raw": env,
+                        "stack": "".join(traceback.format_stack()),
+                    },
+                }
+            # Non-2xx status: construct error envelope.
+            raw_body = r.text
+            data = None
+            if "application/json" in ct:
+                parser = JSONParser()
+                data = parser.parse(raw_body or "", {})
+            return {
+                "schema_version": 1,
+                "request_id": trace_id,
+                "trace_id": trace_id,
+                "ok": False,
+                "result": None,
+                "error": {
+                    "code": "tts_http_error",
+                    "status": status,
+                    "message": "XTTS /tts returned non-2xx or invalid body",
+                    "raw": data if data is not None else {"body": raw_body},
+                    "stack": "".join(traceback.format_stack()),
+                },
+            }
+
 
 from .pipeline.subject_resolver import resolve_subject_canon as _resolve_subject_canon  # type: ignore
 from .pipeline.roe_store import load_roe_digest as _roe_load, save_roe_digest as _roe_save  # type: ignore
@@ -1877,7 +2014,8 @@ POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD")
 EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "BAAI/bge-large-en-v1.5")
 RAG_CACHE_TTL_SEC = int(os.getenv("RAG_CACHE_TTL_SEC", "300"))
 
-# Optional external tool services (set URLs to enable)
+# Optional external tool services (set URLs to enable) —
+# except where explicitly required (XTTS, Whisper, Music, VocalFix, RVC, OCR, VLM, MFA, VisionRepair).
 COMFYUI_API_URL = os.getenv("COMFYUI_API_URL")  # e.g., http://comfyui:8188
 COMFYUI_API_URLS = [u.strip() for u in os.getenv("COMFYUI_API_URLS", "").split(",") if u.strip()]
 COMFYUI_REPLICAS = int(os.getenv("COMFYUI_REPLICAS", "1"))
@@ -1894,6 +2032,7 @@ VLM_API_URL = os.getenv("VLM_API_URL")        # e.g., http://vlm:8050
 OCR_API_URL = os.getenv("OCR_API_URL")        # e.g., http://ocr:8070
 VISION_REPAIR_API_URL = os.getenv("VISION_REPAIR_API_URL")  # e.g., http://vision_repair:8095
 MFA_API_URL = os.getenv("MFA_API_URL")        # e.g., http://mfa:7867
+VOCAL_FIXER_API_URL = os.getenv("VOCAL_FIXER_API_URL")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/workspace/uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -1921,25 +2060,38 @@ ARTIFACT_SHARD_BYTES = int(os.getenv("ARTIFACT_SHARD_BYTES", "200000"))
 ARTIFACT_LATEST_ONLY = os.getenv("ARTIFACT_LATEST_ONLY", "true").lower() == "true"
 
 # Music/Audio extended services (spec Step 18/Instruction Set)
-# Primary full-song engine (historically YuE). We treat this as the generic
-# "primary music engine" and keep the YUE env for backwards compatibility.
-YUE_API_URL = os.getenv("YUE_API_URL")                  # e.g., http://yue:9001
-SAO_API_URL = os.getenv("SAO_API_URL")                  # e.g., http://sao:9002
-DEMUCS_API_URL = os.getenv("DEMUCS_API_URL")            # e.g., http://demucs:9003
-RVC_API_URL = os.getenv("RVC_API_URL")                  # e.g., http://rvc:9004
+SAO_API_URL = os.getenv("SAO_API_URL")                    # e.g., http://sao:9002
+DEMUCS_API_URL = os.getenv("DEMUCS_API_URL")              # e.g., http://demucs:9003
+RVC_API_URL = os.getenv("RVC_API_URL")                    # e.g., http://rvc:9004
 DIFFSINGER_RVC_API_URL = os.getenv("DIFFSINGER_RVC_API_URL")  # e.g., http://dsrvc:9005
 
 # Generic primary music engine base URL. Prefer an explicit MUSIC_FULL_API_URL
-# when provided; fall back to the legacy YuE URL, then to the generic
-# MUSIC_API_URL used for shorter musicgen-style generations.
+# when provided; then MUSIC_API_URL.
 PRIMARY_MUSIC_API_URL = (
     os.getenv("MUSIC_FULL_API_URL")
-    or YUE_API_URL
     or os.getenv("MUSIC_API_URL")
 )
 HUNYUAN_FOLEY_API_URL = os.getenv("HUNYUAN_FOLEY_API_URL")    # http://foley:9006
 HUNYUAN_VIDEO_API_URL = os.getenv("HUNYUAN_VIDEO_API_URL")    # http://hunyuan:9007
 SVD_API_URL = os.getenv("SVD_API_URL")                        # http://svd:9008
+
+# Mandatory audio/vocal services: fail fast if configuration is missing.
+_missing_audio_env: list[str] = []
+for _name, _val in (
+    ("XTTS_API_URL", XTTS_API_URL),
+    ("WHISPER_API_URL", WHISPER_API_URL),
+    ("MUSIC_API_URL", MUSIC_API_URL),
+    ("VOCAL_FIXER_API_URL", VOCAL_FIXER_API_URL),
+    ("RVC_API_URL", RVC_API_URL),
+    ("OCR_API_URL", OCR_API_URL),
+    ("VLM_API_URL", VLM_API_URL),
+    ("MFA_API_URL", MFA_API_URL),
+    ("VISION_REPAIR_API_URL", VISION_REPAIR_API_URL),
+):
+    if not isinstance(_val, str) or not _val.strip():
+        _missing_audio_env.append(_name)
+if _missing_audio_env:
+    raise RuntimeError(f"Missing required audio/vocal service env vars: {', '.join(sorted(_missing_audio_env))}")
 
 
 def _sha256_bytes(b: bytes) -> str:
@@ -2841,6 +2993,127 @@ from .rag.core import rag_search  # re-exported for backwards-compat
 from .pipeline.compression_orchestrator import co_pack as _co_pack, frames_to_messages as _co_frames_to_msgs
 
 
+async def committee_ai_text(
+    messages: List[Dict[str, Any]],
+    trace_id: str,
+    rounds: int = 3,
+    temperature: float = DEFAULT_TEMPERATURE,
+) -> Dict[str, Any]:
+    """
+    Core committee primitive: all participants see the same base messages,
+    then iteratively see each other's answers and refine their own. Returns
+    a single merged text answer wrapped in our canonical envelope.
+    """
+    # Last answer per member id
+    answers: Dict[str, str] = {}
+    # Trace committee invocation for distillation/analysis.
+    emit_trace(
+        STATE_DIR,
+        str(trace_id or "committee"),
+        "committee.start",
+        {
+            "trace_id": str(trace_id or "committee"),
+            "rounds": int(rounds),
+            "temperature": float(temperature),
+            "participants": [p.get("id") or "member" for p in COMMITTEE_PARTICIPANTS],
+            "messages": messages or [],
+        },
+    )
+    # Sequential debate: no concurrency, no gather.
+    for r in range(max(1, int(rounds))):
+        for p in COMMITTEE_PARTICIPANTS:
+            member = p.get("id") or "member"
+            base = (p.get("base") or "").rstrip("/") or QWEN_BASE_URL
+            model = p.get("model") or QWEN_MODEL_ID
+            # Build per-member messages: base conversation + debate context.
+            member_msgs: List[Dict[str, Any]] = list(messages or [])
+            ctx_lines: List[str] = []
+            if r == 0 and not answers:
+                ctx_lines.append(
+                    f"You are committee member {member}. Provide your best answer to the user."
+                )
+            else:
+                ctx_lines.append(
+                    f"You are committee member {member}. This is debate round {r+1}."
+                )
+                # Show other members' latest answers.
+                for other_id, ans in answers.items():
+                    if other_id == member or not isinstance(ans, str) or not ans.strip():
+                        continue
+                    ctx_lines.append(
+                        f"Answer from {other_id}:\n{ans.strip()[:800]}"
+                    )
+                # Show this member's prior answer so they can revise it.
+                prior = answers.get(member)
+                if isinstance(prior, str) and prior.strip():
+                    ctx_lines.append(
+                        f"Your previous answer was:\n{prior.strip()[:800]}"
+                    )
+                ctx_lines.append(
+                    "Compare all answers, keep what is correct, fix what is wrong, "
+                    "and produce your best updated answer. Respond with ONLY your full answer."
+                )
+            member_msgs.append(
+                {"role": "system", "content": "\n\n".join(ctx_lines)}
+            )
+            # Per-round, per-member trace (inputs only; outputs recorded below).
+            emit_trace(
+                STATE_DIR,
+                str(trace_id or "committee"),
+                "committee.member_round",
+                {
+                    "trace_id": str(trace_id or "committee"),
+                    "round": int(r + 1),
+                    "member": member,
+                    "model": model,
+                    "base": base,
+                    "messages": member_msgs,
+                },
+            )
+            payload = build_ollama_payload(member_msgs, model, DEFAULT_NUM_CTX, temperature)
+            # Do not set format=json here; allow free-form text debate.
+            res = await call_ollama(base, payload)
+            txt = (
+                (res.get("response") or "").strip()
+                if isinstance(res, dict)
+                else ""
+            )
+            answers[member] = txt
+    # Choose a final answer: prefer the first non-empty in COMMITTEE_PARTICIPANTS order.
+    final_text = ""
+    member_summaries: List[Dict[str, Any]] = []
+    for p in COMMITTEE_PARTICIPANTS:
+        mid = p.get("id") or "member"
+        ans = answers.get(mid) or ""
+        if not final_text and isinstance(ans, str) and ans.strip():
+            final_text = ans.strip()
+        member_summaries.append({"member": mid, "answer": ans})
+    ok = bool(final_text)
+    # Final committee trace including merged answer and per-member outputs.
+    emit_trace(
+        STATE_DIR,
+        str(trace_id or "committee"),
+        "committee.finish",
+        {
+            "trace_id": str(trace_id or "committee"),
+            "ok": ok,
+            "final_text": final_text,
+            "members": member_summaries,
+        },
+    )
+    return {
+        "schema_version": 1,
+        "trace_id": trace_id or "committee",
+        "ok": ok,
+        "result": {"text": final_text, "members": member_summaries} if ok else None,
+        "error": None if ok else {
+            "code": "committee_no_answer",
+            "message": "Committee did not produce a non-empty answer",
+            "stack": "".join(traceback.format_stack()),
+        },
+    }
+
+
 async def call_ollama(base_url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
         try:
@@ -2896,11 +3169,17 @@ async def propose_search_queries(messages: List[Dict[str, Any]]) -> List[str]:
         "Return each query on its own line with no extra text."
     )
     prompt_messages = messages + [{"role": "user", "content": guidance}]
-    payload = build_ollama_payload(prompt_messages, QWEN_MODEL_ID, DEFAULT_NUM_CTX, DEFAULT_TEMPERATURE)
-    result = await call_ollama(QWEN_BASE_URL, payload)
-    text = result.get("response", "") if isinstance(result, dict) else ""
+    env = await committee_ai_text(
+        prompt_messages,
+        trace_id="search_suggest",
+        rounds=2,
+        temperature=DEFAULT_TEMPERATURE,
+    )
+    if not isinstance(env, dict) or not env.get("ok"):
+        return []
+    res_env = env.get("result") or {}
+    text = res_env.get("text") or ""
     lines = [ln.strip("- ") for ln in text.splitlines() if ln.strip()]
-    # take up to 3 non-empty queries
     return lines[:3]
 
 
@@ -3347,80 +3626,29 @@ async def planner_produce_plan(messages: List[Dict[str, Any]], tools: Optional[L
         {"role": "system", "content": committee_review},
         {"role": "system", "content": contract_return},
     ]
-    payload = build_ollama_payload(plan_messages, planner_id, DEFAULT_NUM_CTX, temperature)
-    _log("planner.backend.call", trace_id=trace_id, base=planner_base, model=planner_id)
-    result = await call_ollama(planner_base, payload)
-    _log("planner.backend.ok", trace_id=trace_id, base=planner_base, have_response=bool(result and result.get("response")))
-    if isinstance(result.get("error"), str) and result.get("error"):
-        _log("planner.backend.error", trace_id=None, base=planner_base, error=result.get("error"))
+    # Route planner through the central committee debate; models may respond in free text,
+    # and we coerce into the strict JSON planner schema via JSONParser.
+    env = await committee_ai_text(
+        plan_messages,
+        trace_id=str(trace_id or "planner"),
+        rounds=3,
+        temperature=temperature,
+    )
+    if not isinstance(env, dict) or not env.get("ok"):
         return "", []
-    text = result.get("response", "").strip()
-    # Use custom parser to normalise the planner JSON
+    res_env = env.get("result") or {}
+    text = res_env.get("text") or ""
     parser = JSONParser()
-    # Prefer strict steps format; fallback to legacy 'tool_calls'
-    parsed_steps: Dict[str, Any] = {}
-    # 1) Direct parse
-    parsed_steps = parser.parse(text, {"steps": [{"tool": str, "args": dict}]})
-    # 2) If direct parse fails to produce steps, attempt to extract a JSON block (e.g., from a fenced code block)
+    parsed_steps = parser.parse(text or "{}", {"steps": [{"tool": str, "args": dict}]})
     steps = parsed_steps.get("steps") or []
     if not steps:
-        def _extract_json_candidate(s: str) -> str:
-            s = s.strip()
-            if "```" in s:
-                parts = s.split("```")
-                for i in range(0, len(parts) - 1, 2):
-                    fence_lang = parts[i+0].split()[-1] if i == 0 else ""
-                    block = parts[i+1]
-                    if block is None:
-                        continue
-                    b = block.strip()
-                    if b:
-                        return b
-            start = s.find("{")
-            if start == -1:
-                return s
-            depth = 0
-            for j in range(start, len(s)):
-                ch = s[j]
-                if ch == "{":
-                    depth += 1
-                elif ch == "}":
-                    depth -= 1
-                    if depth == 0:
-                        return s[start:j+1]
-            return s
-        candidate = _extract_json_candidate(text)
-        if candidate and candidate != text:
-            parsed_steps = parser.parse(candidate, {"steps": [{"tool": str, "args": dict}]})
-    steps = parsed_steps.get("steps") or []
-    if steps:
-        _log("planner.steps", trace_id=trace_id, steps=steps)
-        for st in steps:
-            if isinstance(st, dict) and st.get("tool") == "image.dispatch":
-                _log("planner.image.dispatch.args", trace_id=trace_id, args=st.get("args") or {})
-        tool_calls = [{"name": s.get("tool"), "arguments": (s.get("args") or {})} for s in steps if isinstance(s, dict)]
-        return "", tool_calls
-    # Legacy path
-    parsed = parser.parse(text, {"plan": str, "tool_calls": [{"name": str, "arguments": dict}]})
-    plan = parsed.get("plan", "")
-    tcs = parsed.get("tool_calls", []) or []
-    _log("planner.steps.legacy", trace_id=trace_id, tool_calls=tcs)
-    if tcs:
-        return plan, tcs
-    # Final hardening: one more pass forcing JSON mode at the backend with zero temperature
-    plan_messages_retry = plan_messages + [{"role": "system", "content": "Return ONLY a single minified JSON object matching the schema {\"steps\":[{\"tool\":\"<name>\",\"args\":{...}}]}. NO code fences. NO prose."}]
-    payload2 = build_ollama_payload(plan_messages_retry, planner_id, DEFAULT_NUM_CTX, 0.0)
-    payload2["format"] = "json"
-    _log("planner.retry", trace_id=trace_id, reason="no_steps_first_pass")
-    result2 = await call_ollama(planner_base, payload2)
-    text2 = result2.get("response", "").strip()
-    parsed2 = parser.parse(text2, {"steps": [{"tool": str, "args": dict}]})
-    steps2 = parsed2.get("steps") or []
-    if steps2:
-        _log("planner.steps", trace_id=trace_id, steps=steps2)
-        tool_calls2 = [{"name": s.get("tool"), "arguments": (s.get("args") or {})} for s in steps2 if isinstance(s, dict)]
-        return "", tool_calls2
-    return "", []
+        return "", []
+    _log("planner.steps", trace_id=trace_id, steps=steps)
+    for st in steps:
+        if isinstance(st, dict) and st.get("tool") == "image.dispatch":
+            _log("planner.image.dispatch.args", trace_id=trace_id, args=st.get("args") or {})
+    tool_calls = [{"name": s.get("tool"), "arguments": (s.get("args") or {})} for s in steps if isinstance(s, dict)]
+    return "", tool_calls
 
 
 async def postrun_committee_decide(
@@ -3478,32 +3706,34 @@ async def postrun_committee_decide(
         {"role": "system", "content": "Return ONLY a single JSON object with keys: action, rationale, patch_plan."},
     ]
     # Two-model postrun committee: gather decisions from all participants and merge.
+    # Post-run decision is now derived from a single committee debate call.
     decisions: List[Dict[str, Any]] = []
-    for p in COMMITTEE_PARTICIPANTS:
-        member = p.get("id") or "member"
-        base = (p.get("base") or "").rstrip("/") or QWEN_BASE_URL
-        model = p.get("model") or QWEN_MODEL_ID
-        payload = build_ollama_payload(msgs, model, DEFAULT_NUM_CTX, 0.0)
-        _log("committee.backend.call", trace_id=trace_id, member=member, base=base, model=model)
-        _log("committee.postrun.call", trace_id=trace_id, base=base, model=model, member=member)
-        try:
-            res = await call_ollama(base, payload)
-            text = (res.get("response") or "").strip() if isinstance(res, dict) else ""
-            obj = parser.parse(text, {"action": str, "rationale": str, "patch_plan": [{"tool": str, "args": dict}]})
-            action = (obj.get("action") or "").strip().lower() or "go"
-            rationale = (obj.get("rationale") or "") if isinstance(obj.get("rationale"), str) else ""
-            steps = obj.get("patch_plan") or []
-            decisions.append(
-                {
-                    "member": member,
-                    "action": action,
-                    "rationale": rationale,
-                    "patch_plan": steps if isinstance(steps, list) else [],
-                }
-            )
-            _log("committee.postrun.member", trace_id=trace_id, member=member, action=action)
-        except Exception as ex:
-            _log("committee.postrun.member.error", trace_id=trace_id, member=member, message=str(ex))
+    env_decide = await committee_ai_text(
+        msgs,
+        trace_id=str(trace_id or "committee_postrun"),
+        rounds=3,
+        temperature=0.0,
+    )
+    if isinstance(env_decide, dict) and env_decide.get("ok"):
+        res_decide = env_decide.get("result") or {}
+        txt_decide = res_decide.get("text") or ""
+        parser = JSONParser()
+        obj = parser.parse(
+            txt_decide or "{}",
+            {"action": str, "rationale": str, "patch_plan": [{"tool": str, "args": dict}]},
+        )
+        action = (obj.get("action") or "").strip().lower() or "go"
+        rationale = (obj.get("rationale") or "") if isinstance(obj.get("rationale"), str) else ""
+        steps = obj.get("patch_plan") or []
+        decisions.append(
+            {
+                "member": "committee",
+                "action": action,
+                "rationale": rationale,
+                "patch_plan": steps if isinstance(steps, list) else [],
+            }
+        )
+        _log("committee.postrun.member", trace_id=trace_id, member="committee", action=action)
 
     if not decisions:
         out = {"action": "go", "rationale": "committee_unavailable", "patch_plan": []}
@@ -4322,6 +4552,14 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         return {"name": name, "result": out}
     if name == "film2.run" and ALLOW_TOOL_EXECUTION:
         # Unified Film-2 shot runner. Executes internal video passes and writes distilled traces/artifacts.
+        if not XTTS_API_URL:
+            return {
+                "name": name,
+                "error": {
+                    "code": "xtts_unconfigured",
+                    "message": "XTTS_API_URL is required for film2.run music vocals",
+                },
+            }
         a = raw_args if isinstance(raw_args, dict) else {}
         prompt = (a.get("prompt") or "").strip()
         trace_id = a.get("trace_id") if isinstance(a.get("trace_id"), str) else None
@@ -4506,6 +4744,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 "mode": "start",
                 "lock_bundle": locks_arg if isinstance(locks_arg, dict) else {},
                 "cid": cid,
+                "instrumental_only": True,
             }
             if character_ids:
                 music_args["character_id"] = character_ids[0]
@@ -4513,6 +4752,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             music_call = await http_tool_run("music.infinite.windowed", music_args)
             if isinstance(music_call, dict):
                 music_meta = music_call.get("result") or music_call
+        final_music_mix_path: str | None = None
+        final_music_eval: Dict[str, Any] | None = None
         if music_meta and isinstance(result.get("meta"), dict):
             # Tag music windows with scene/shot ids using simple time slicing.
             meta_obj = music_meta.get("meta") if isinstance(music_meta.get("meta"), dict) else {}
@@ -4565,8 +4806,155 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             meta_obj["windows"] = win_list
             music_meta["meta"] = meta_obj
             result["meta"]["music"] = music_meta
-            # Trace cross-modal attachment for distillation.
+            # Trace cross-modal attachment for distillation and perform backing+vocals mix.
             music_meta_obj = music_meta.get("meta") if isinstance(music_meta.get("meta"), dict) else {}
+            # Locate the backing audio path from the music envelope artifacts.
+            backing_full_path: str | None = None
+            artifacts_music = music_meta.get("artifacts") if isinstance(music_meta.get("artifacts"), list) else []
+            for art in artifacts_music:
+                if not isinstance(art, dict):
+                    continue
+                if art.get("kind") == "audio-ref":
+                    art_id = art.get("id")
+                    if isinstance(art_id, str) and art_id:
+                        backing_full_path = os.path.join(
+                            "/workspace",
+                            "uploads",
+                            "artifacts",
+                            "music",
+                            music_meta_obj.get("cid") or cid,
+                            art_id,
+                        )
+                        break
+            if not backing_full_path:
+                backing_full_path = music_meta.get("path") if isinstance(music_meta.get("path"), str) else None
+            # When backing is available, render multi-voice vocals and mix.
+            if isinstance(backing_full_path, str) and backing_full_path:
+                # Derive Song Graph for vocals from the current locks bundle.
+                music_branch = locks_arg.get("music") if isinstance(locks_arg.get("music"), dict) else {}
+                win_list_for_vocals = meta_obj.get("windows") if isinstance(meta_obj.get("windows"), list) else []
+                tts_manifest: Dict[str, Any] = {"items": []}
+                stems_result = render_vocal_stems_for_track(
+                    job={"seed": a.get("seed")},
+                    song_graph=music_branch,
+                    windows=win_list_for_vocals,
+                    lock_bundle=locks_arg if isinstance(locks_arg, dict) else {},
+                    backing_path=backing_full_path,
+                    cid=cid,
+                    manifest=tts_manifest,
+                    tts_provider=_TTSProvider(),
+                )
+                if isinstance(stems_result, dict) and stems_result.get("error"):
+                    _trace_append(
+                        "film2",
+                        {
+                            "event": "film2.music.vocal_stems_error",
+                            "film_cid": cid,
+                            "error": stems_result.get("error"),
+                        },
+                    )
+                    result["meta"].setdefault("music", {})["error"] = stems_result.get("error")
+                    final_music_mix_path = backing_full_path
+                else:
+                    stems = stems_result.get("stems") if isinstance(stems_result, dict) else []
+                    stems_arg: List[Dict[str, Any]] = []
+                    stems_arg.append(
+                        {
+                            "path": backing_full_path,
+                            "gain_db": 0.0,
+                            "pan": 0.0,
+                            "start_s": 0.0,
+                        }
+                    )
+                    for stem in stems:
+                        stem_path = stem.get("path")
+                        if not isinstance(stem_path, str) or not stem_path:
+                            continue
+                        stems_arg.append(
+                            {
+                                "path": stem_path,
+                                "gain_db": 0.0,
+                                "pan": 0.0,
+                                "start_s": float(stem.get("start_s") or 0.0),
+                            }
+                        )
+                    mix_job = {
+                        "cid": cid,
+                        "stems": stems_arg,
+                        "sample_rate": 32000,
+                        "channels": 2,
+                        "seed": a.get("seed"),
+                    }
+                    mix_env = run_music_mixdown(mix_job, {})
+                    mix_artifacts = mix_env.get("artifacts") if isinstance(mix_env.get("artifacts"), list) else []
+                    mix_path: str | None = None
+                    for art in mix_artifacts:
+                        if not isinstance(art, dict):
+                            continue
+                        if art.get("kind") == "audio-ref":
+                            art_id = art.get("id")
+                            if isinstance(art_id, str) and art_id:
+                                mix_path = os.path.join(
+                                    "/workspace",
+                                    "uploads",
+                                    "artifacts",
+                                    "music",
+                                    cid,
+                                    art_id,
+                                )
+                                break
+                    final_music_mix_path = mix_path or backing_full_path
+                    if isinstance(final_music_mix_path, str) and final_music_mix_path:
+                        final_music_eval = compute_music_eval(
+                            track_path=final_music_mix_path,
+                            song_graph=music_branch,
+                            style_pack=music_branch.get("style_pack") if isinstance(music_branch.get("style_pack"), dict) else None,
+                            film_context={
+                                "duration_s": duration_s,
+                                "fps": fps_val,
+                                "width": width_val,
+                                "height": height_val,
+                            },
+                        )
+                        overall_block = final_music_eval.get("overall") if isinstance(final_music_eval.get("overall"), dict) else {}
+                        oq = float(overall_block.get("overall_quality_score") or 0.0)
+                        fs = float(overall_block.get("fit_score") or 0.0)
+                        th_music = _get_music_acceptance_thresholds()
+                        # Acceptance thresholds loaded from review/acceptance_audio.json
+                        accepted = (oq >= th_music.get("overall_quality_min", 0.0) and fs >= th_music.get("fit_score_min", 0.0))
+                        # Hero thresholds: stricter than acceptance
+                        hero = (oq >= MUSIC_HERO_QUALITY_MIN and fs >= MUSIC_HERO_FIT_MIN)
+                        _trace_append(
+                            "film2",
+                            {
+                                "event": "film2.music.final_eval",
+                                "film_cid": cid,
+                                "music_path": final_music_mix_path,
+                                "music_eval": final_music_eval,
+                                "tts_manifest_items": tts_manifest.get("items", []),
+                                "accepted": accepted,
+                                "hero": hero,
+                            },
+                        )
+                        _trace_append(
+                            "film2",
+                            {
+                                "event": "film2.music.acceptance",
+                                "film_cid": cid,
+                                "music_path": final_music_mix_path,
+                                "overall_quality_score": oq,
+                                "fit_score": fs,
+                                "accepted": accepted,
+                                "hero": hero,
+                                "reject_reason": None if accepted else "music_eval_below_threshold",
+                            },
+                        )
+                        meta_music_block = result["meta"].setdefault("music", {})
+                        if isinstance(meta_music_block, dict):
+                            meta_music_block["final_mix_path"] = final_music_mix_path
+                            meta_music_block["final_eval"] = final_music_eval
+                            meta_music_block["accepted"] = accepted
+                            meta_music_block["hero"] = hero
             _trace_append(
                 "film2",
                 {
@@ -5126,102 +5514,6 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
     if name == "tts.speak" and ALLOW_TOOL_EXECUTION:
         if not XTTS_API_URL:
             return {"name": name, "error": "XTTS_API_URL not configured"}
-        class _TTSProvider:
-            def speak(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-                trace_id = payload.get("trace_id") if isinstance(payload.get("trace_id"), str) else "tt_xtts_unknown"
-                emit_progress({"stage": "request", "target": "xtts"})
-                import httpx as _hxsync  # use sync client locally to avoid event loop bridging
-                # Ensure language is always set; default to English if absent.
-                lang = payload.get("language")
-                if not isinstance(lang, str) or not lang.strip():
-                    payload["language"] = "en"
-                with _hxsync.Client(timeout=None, trust_env=False) as client:
-                    r = client.post(XTTS_API_URL.rstrip("/") + "/tts", json=payload)
-                    status = r.status_code
-                    ct = r.headers.get("content-type", "")
-                    if 200 <= status < 300:
-                        # XTTS service returns a canonical envelope: decode audio and adapt to internal shape.
-                        if "application/json" in ct:
-                            parser = JSONParser()
-                            env = parser.parse(
-                                r.text or "",
-                                {
-                                    "schema_version": int,
-                                    "trace_id": str,
-                                    "ok": bool,
-                                    "result": dict,
-                                    "error": dict,
-                                },
-                            )
-                        else:
-                            env = {
-                                "schema_version": 1,
-                                "trace_id": trace_id,
-                                "ok": False,
-                                "result": None,
-                                "error": {
-                                    "code": "tts_invalid_body",
-                                    "status": status,
-                                    "message": "XTTS /tts returned non-JSON body",
-                                    "raw": r.text,
-                                    "stack": "".join(traceback.format_stack()),
-                                },
-                            }
-                        if isinstance(env, dict) and env.get("ok") is True:
-                            inner = env.get("result") if isinstance(env.get("result"), dict) else {}
-                            b64 = inner.get("audio_wav_base64") or inner.get("wav_b64")
-                            wav = b""
-                            if isinstance(b64, str):
-                                import base64 as _b64local
-                                wav = _b64local.b64decode(b64)
-                            # Adapt to canonical internal envelope expected by run_tts_speak.
-                            return {
-                                "schema_version": 1,
-                                "request_id": trace_id,
-                                "trace_id": trace_id,
-                                "ok": True,
-                                "result": {
-                                    "wav_bytes": wav,
-                                    "duration_s": float(inner.get("duration_s") or 0.0),
-                                    "model": inner.get("model") or "xtts",
-                                },
-                                "error": None,
-                            }
-                        # Any non-ok env from XTTS is wrapped as a tool error.
-                        return {
-                            "schema_version": 1,
-                            "request_id": trace_id,
-                            "trace_id": trace_id,
-                            "ok": False,
-                            "result": None,
-                            "error": {
-                                "code": "tts_invalid_envelope",
-                                "status": status,
-                                "message": "XTTS /tts returned non-ok envelope",
-                                "raw": env,
-                                "stack": "".join(traceback.format_stack()),
-                            },
-                        }
-                    # Non-2xx status: construct error envelope.
-                    raw_body = r.text
-                    data = None
-                    if "application/json" in ct:
-                        parser = JSONParser()
-                        data = parser.parse(raw_body or "", {})
-                    return {
-                        "schema_version": 1,
-                        "request_id": trace_id,
-                        "trace_id": trace_id,
-                        "ok": False,
-                        "result": None,
-                        "error": {
-                            "code": "tts_http_error",
-                            "status": status,
-                            "message": "XTTS /tts returned non-2xx or invalid body",
-                            "raw": data if data is not None else {"body": raw_body},
-                            "stack": "".join(traceback.format_stack()),
-                        },
-                    }
         provider = _TTSProvider()
         manifest = {"items": []}
         a = args if isinstance(args, dict) else {}
@@ -6321,7 +6613,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         # Hook is already integrated in image.super_gen; this returns an explicit OK
         return {"name": name, "result": {"ok": True}}
     # --- Extended Music/Audio tools ---
-    if name in ("music.song.primary", "music.song.yue") and ALLOW_TOOL_EXECUTION:
+    if name in ("music.song.primary", "music.song.legacy") and ALLOW_TOOL_EXECUTION:
         if not PRIMARY_MUSIC_API_URL:
             return {"name": name, "error": "PRIMARY_MUSIC_API_URL not configured"}
         async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
@@ -6554,31 +6846,133 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     backing_stems.append({"path": stem_path, "gain_db": 0.0})
             if not vocals_path:
                 return {"name": name, "error": "vocals_stem_missing"}
-            # 2) Apply VocalFix (pitch correction/shift) if configured
+            # 2) Optional voice conversion via RVC (identity lock), required when voice_lock_id is provided.
             transformed_vocals = vocals_path
-            try:
-                if VOCAL_FIXER_API_URL:
-                    payload = {"wav_path": vocals_path}
-                    if isinstance(pitch_shift, (int, float)):
-                        payload["pitch_shift_semitones"] = float(pitch_shift)
-                    async with httpx.AsyncClient() as client:
-                        r = await client.post(VOCAL_FIXER_API_URL.rstrip("/") + "/vocal_fix_path", json=payload)
-                        parser = JSONParser()
-                        js = parser.parse(r.text or "", {})
-                        new_path = js.get("path") if isinstance(js, dict) else None
-                        if isinstance(new_path, str) and new_path.strip():
-                            transformed_vocals = new_path
-            except Exception:
-                transformed_vocals = vocals_path
-            # 3) Optional voice conversion via RVC
-            if RVC_API_URL and isinstance(voice_lock_id, str) and voice_lock_id.strip():
-                async with httpx.AsyncClient() as client:
-                    r = await client.post(RVC_API_URL.rstrip("/") + "/convert_path", json={"wav_path": transformed_vocals, "voice_lock_id": voice_lock_id})
+            if isinstance(voice_lock_id, str) and voice_lock_id.strip():
+                try:
+                    # Read source vocals and send as base64 to RVC.
+                    with open(transformed_vocals, "rb") as _f:
+                        src_bytes = _f.read()
+                    import base64 as _b64local
+                    payload_rvc = {
+                        "source_wav_b64": _b64local.b64encode(src_bytes).decode("ascii"),
+                        "voice_lock_id": voice_lock_id.strip(),
+                    }
+                    async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
+                        r_rvc = await client.post(RVC_API_URL.rstrip("/") + "/v1/audio/convert", json=payload_rvc)
                     parser = JSONParser()
-                    js = parser.parse(r.text or "", {"path": str})
-                    new_path = js.get("path") if isinstance(js, dict) else None
-                    if isinstance(new_path, str) and new_path.strip():
-                        transformed_vocals = new_path
+                    js_rvc = parser.parse(r_rvc.text or "", {"ok": bool, "audio_wav_base64": str, "sample_rate": int})
+                    if not isinstance(js_rvc, dict) or not bool(js_rvc.get("ok")):
+                        return {
+                            "name": name,
+                            "error": {
+                                "code": "rvc_error",
+                                "status": int(getattr(r_rvc, "status_code", 500) or 500),
+                                "message": "RVC /v1/audio/convert failed for vocals stem",
+                                "raw": js_rvc,
+                            },
+                        }
+                    b64_rvc = js_rvc.get("audio_wav_base64") if isinstance(js_rvc.get("audio_wav_base64"), str) else None
+                    if not b64_rvc:
+                        return {
+                            "name": name,
+                            "error": {
+                                "code": "rvc_missing_audio",
+                                "status": 500,
+                                "message": "RVC /v1/audio/convert returned no audio_wav_base64",
+                            },
+                        }
+                    out_bytes = _b64local.b64decode(b64_rvc)
+                    # Write converted vocals next to original.
+                    v_dir, v_name = os.path.dirname(vocals_path), os.path.basename(vocals_path)
+                    v_base, v_ext = os.path.splitext(v_name)
+                    rvc_path = os.path.join(v_dir, f"{v_base}.rvc{v_ext or '.wav'}")
+                    with open(rvc_path, "wb") as _rf:
+                        _rf.write(out_bytes)
+                    transformed_vocals = rvc_path
+                except Exception as ex:
+                    return {
+                        "name": name,
+                        "error": {
+                            "code": "rvc_exception",
+                            "status": 500,
+                            "message": str(ex),
+                        },
+                    }
+            # 3) Apply VocalFix (pitch correction/shift) as a mandatory quality stage.
+            try:
+                import base64 as _b64local2
+                with open(transformed_vocals, "rb") as _f2:
+                    vf_src = _f2.read()
+                payload_vf = {
+                    "audio_wav_base64": _b64local2.b64encode(vf_src).decode("ascii"),
+                    "sample_rate": int(args.get("sample_rate") or 44100),
+                    "ops": ["pitch", "align", "deess"],
+                }
+                if isinstance(pitch_shift, (int, float)):
+                    payload_vf.setdefault("score_json", {})
+                    payload_vf["score_json"]["pitch_shift_semitones"] = float(pitch_shift)
+                async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
+                    r_vf = await client.post(VOCAL_FIXER_API_URL.rstrip("/") + "/v1/vocal/fix", json=payload_vf)
+                parser = JSONParser()
+                js_vf = parser.parse(
+                    r_vf.text or "",
+                    {
+                        "ok": bool,
+                        "audio_wav_base64": str,
+                        "sample_rate": int,
+                        "metrics_before": dict,
+                        "metrics_after": dict,
+                    },
+                )
+                if not isinstance(js_vf, dict) or not bool(js_vf.get("ok")):
+                    return {
+                        "name": name,
+                        "error": {
+                            "code": "vocalfix_error",
+                            "status": int(getattr(r_vf, "status_code", 500) or 500),
+                            "message": "VocalFix /v1/vocal/fix failed for vocals stem",
+                            "raw": js_vf,
+                        },
+                    }
+                b64_vf = js_vf.get("audio_wav_base64") if isinstance(js_vf.get("audio_wav_base64"), str) else None
+                if not b64_vf:
+                    return {
+                        "name": name,
+                        "error": {
+                            "code": "vocalfix_missing_audio",
+                            "status": 500,
+                            "message": "VocalFix /v1/vocal/fix returned no audio_wav_base64",
+                        },
+                    }
+                out_vf = _b64local2.b64decode(b64_vf)
+                v_dir2, v_name2 = os.path.dirname(transformed_vocals), os.path.basename(transformed_vocals)
+                v_base2, v_ext2 = os.path.splitext(v_name2)
+                vf_path = os.path.join(v_dir2, f"{v_base2}.vf{v_ext2 or '.wav'}")
+                with open(vf_path, "wb") as _wf2:
+                    _wf2.write(out_vf)
+                transformed_vocals = vf_path
+                # Attach VocalFix metrics to trace for distillation.
+                _trace_append(
+                    "music",
+                    {
+                        "event": "audio.vocals.vocalfix",
+                        "mix_path": mix_path,
+                        "vocals_path": vocals_path,
+                        "transformed_path": transformed_vocals,
+                        "metrics_before": js_vf.get("metrics_before") if isinstance(js_vf.get("metrics_before"), dict) else {},
+                        "metrics_after": js_vf.get("metrics_after") if isinstance(js_vf.get("metrics_after"), dict) else {},
+                    },
+                )
+            except Exception as ex:
+                return {
+                    "name": name,
+                    "error": {
+                        "code": "vocalfix_exception",
+                        "status": 500,
+                        "message": str(ex),
+                    },
+                }
             # 4) Re-mix vocals with backing
             stems_for_mix = [{"path": transformed_vocals, "gain_db": 0.0}] + backing_stems
             mix_args = {
@@ -6644,17 +7038,38 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         except Exception as ex:
             return {"name": name, "error": str(ex)}
     if name == "audio.vc.rvc" and ALLOW_TOOL_EXECUTION:
-        if not RVC_API_URL:
-            return {"name": name, "error": "RVC_API_URL not configured"}
+        # Generic voice conversion tool using the RVC microservice.
+        src_path = args.get("source_vocal_wav") or args.get("src")
+        voice_lock_id = args.get("voice_lock_id") or args.get("target_voice_ref") or args.get("voice_ref")
+        if not isinstance(src_path, str) or not src_path.strip():
+            return {"name": name, "error": {"code": "missing_src", "message": "source_vocal_wav/src is required"}}
+        if not isinstance(voice_lock_id, str) or not voice_lock_id.strip():
+            return {"name": name, "error": {"code": "missing_voice_lock_id", "message": "voice_lock_id/target_voice_ref/voice_ref is required"}}
+        try:
+            with open(src_path, "rb") as _f:
+                src_bytes = _f.read()
+        except Exception as ex:
+            return {"name": name, "error": {"code": "src_read_error", "message": str(ex)}}
+        import base64 as _b64local
+        payload = {
+            "source_wav_base64": _b64local.b64encode(src_bytes).decode("ascii"),
+            "voice_lock_id": voice_lock_id.strip(),
+        }
         async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
-            payload = {
-                "source_vocal_wav": args.get("source_vocal_wav") or args.get("src"),
-                "target_voice_ref": args.get("target_voice_ref") or args.get("voice_ref"),
-            }
             r = await client.post(RVC_API_URL.rstrip("/") + "/v1/audio/convert", json=payload)
-            parser = JSONParser()
-            js = parser.parse(r.text or "", {})
-            return {"name": name, "result": js if isinstance(js, dict) else {}}
+        parser = JSONParser()
+        js = parser.parse(r.text or "", {"ok": bool, "audio_wav_base64": str, "sample_rate": int})
+        if not isinstance(js, dict) or not bool(js.get("ok")):
+            return {
+                "name": name,
+                "error": {
+                    "code": "rvc_error",
+                    "status": int(getattr(r, "status_code", 500) or 500),
+                    "message": "RVC /v1/audio/convert failed",
+                    "raw": js,
+                },
+            }
+        return {"name": name, "result": js}
     if name == "voice.sing.diffsinger.rvc" and ALLOW_TOOL_EXECUTION:
         if not DIFFSINGER_RVC_API_URL:
             return {"name": name, "error": "DIFFSINGER_RVC_API_URL not configured"}
@@ -7228,27 +7643,33 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 js = parser.parse(r.text or "", {})
                 return {"name": name, "result": js if isinstance(js, dict) else {}}
     if name == "code.super_loop" and ALLOW_TOOL_EXECUTION:
-        # Build a local provider wrapper on top of Qwen
-        class _LocalProvider:
-            def __init__(self, base_url: str, model_id: str, num_ctx: int, temperature: float):
-                self.base_url = base_url
-                self.model_name = model_id
-                self.num_ctx = num_ctx
-                self.temperature = temperature
-            def chat(self, prompt: str, max_tokens: int):
-                payload = build_ollama_payload([{"role": "user", "content": prompt}], self.model_name, self.num_ctx, self.temperature)
-                opts = dict(payload.get("options") or {})
-                opts["num_predict"] = max(1, int(max_tokens or 900))
-                payload["options"] = opts
-                # reuse async call_ollama via blocking run
-                r = _rq.post(self.base_url.rstrip("/") + "/api/generate", json=payload)
-                parser = JSONParser()
-                js = parser.parse(r.text or "", {"response": str})
-                resp_text = js.get("response") if isinstance(js, dict) and isinstance(js.get("response"), str) else ""
-                return SimpleNamespace(text=str(resp_text), model_name=self.model_name)
+        # Back code.super_loop with the central committee AI path only.
+        from types import SimpleNamespace
         repo_root = os.getenv("REPO_ROOT", "/workspace")
         step_tokens = int(os.getenv("CODE_LOOP_STEP_TOKENS", "900") or 900)
-        prov = _LocalProvider(QWEN_BASE_URL, QWEN_MODEL_ID, DEFAULT_NUM_CTX, DEFAULT_TEMPERATURE)
+
+        class _CommitteeProvider:
+            def chat(self, prompt: str, max_tokens: int):
+                # NOTE: run_super_loop expects a sync chat; we adapt by running
+                # committee_ai_text synchronously on the current event loop.
+                import asyncio as _asyncio
+                loop = _asyncio.get_event_loop()
+                env = loop.run_until_complete(
+                    committee_ai_text(
+                        [{"role": "user", "content": prompt}],
+                        trace_id="code_super_loop",
+                        rounds=3,
+                        temperature=DEFAULT_TEMPERATURE,
+                    )
+                )
+                txt = ""
+                if isinstance(env, dict) and env.get("ok"):
+                    res = env.get("result") or {}
+                    if isinstance(res, dict) and isinstance(res.get("text"), str):
+                        txt = res.get("text") or ""
+                return SimpleNamespace(text=str(txt), model_name="committee")
+
+        prov = _CommitteeProvider()
         task = args.get("task") or ""
         env = run_super_loop(task=task, repo_root=repo_root, model=prov, step_tokens=step_tokens)
         return {"name": name, "result": env}
@@ -8543,50 +8964,32 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     # Compact summary of the current conversation for committee members
     committee_user_text = (last_user_text or "").strip()
     committee_msgs = [
-        {"role": "system", "content": "You are a planning committee member. Propose a high-level tool strategy as JSON: {\"rationale\": str, \"tools_outline\": [str]}."},
+        {"role": "system", "content": "You are a planning committee. Propose a high-level tool strategy as JSON: {\"rationale\": str, \"tools_outline\": [str]}."},
         {"role": "user", "content": committee_user_text or "No user text available."},
     ]
+    env_preplan = await committee_ai_text(
+        committee_msgs,
+        trace_id=str(trace_id or "committee_preplan"),
+        rounds=3,
+        temperature=DEFAULT_TEMPERATURE,
+    )
     committee_errors: List[Dict[str, Any]] = []
-    for p in COMMITTEE_PARTICIPANTS:
-        member = p.get("id") or "member"
-        base = (p.get("base") or "").rstrip("/") or QWEN_BASE_URL
-        model = p.get("model") or QWEN_MODEL_ID
-        payload = build_ollama_payload(committee_msgs, model, DEFAULT_NUM_CTX, DEFAULT_TEMPERATURE)
-        _log("committee.backend.call", trace_id=trace_id, member=member, base=base, model=model)
-        _log("committee.preplan.call", trace_id=trace_id, member=member, base=base, model=model)
-        res = await call_ollama(base, payload)
-        # Default pessimistic values; overwritten on success.
-        rationale = ""
-        tools_outline: List[str] = []
-        if not isinstance(res, dict):
-            err_msg = f"committee backend returned non-dict for {member}"
-            _log("committee.backend.error", trace_id=trace_id, member=member, base=base, model=model, error=err_msg)
-            committee_errors.append(
-                {
-                    "member": member,
-                    "base": base,
-                    "model": model,
-                    "error": err_msg,
-                }
-            )
-            rationale = f"(committee error: {err_msg})"
-        elif isinstance(res.get("error"), str) and res.get("error"):
-            err_str = res.get("error") or ""
-            _log("committee.backend.error", trace_id=trace_id, member=member, base=base, model=model, error=err_str)
-            committee_errors.append(
-                {
-                    "member": member,
-                    "base": base,
-                    "model": model,
-                    "error": err_str,
-                }
-            )
-            rationale = f"(committee error: {err_str})"
-        else:
-            text = (res.get("response") or "").strip()
-            parsed = parser.parse(text or "{}", {"rationale": str, "tools_outline": [str]})
-            rationale = (parsed.get("rationale") or text or "").strip()
-            tools_outline = parsed.get("tools_outline") or []
+    preplan_options: List[Dict[str, Any]] = []
+    if isinstance(env_preplan, dict) and env_preplan.get("ok"):
+        res_pre = env_preplan.get("result") or {}
+        text_pre = res_pre.get("text") or ""
+        parsed = parser.parse(text_pre or "{}", {"rationale": str, "tools_outline": [str]})
+        rationale = (parsed.get("rationale") or text_pre or "").strip()
+        tools_outline = parsed.get("tools_outline") or []
+        opt_id = "opt_committee"
+        preplan_options.append(
+            {
+                "id": opt_id,
+                "author": "committee",
+                "rationale": rationale,
+                "tools_outline": tools_outline,
+            }
+        )
         opt_id = f"opt_{member}"
         preplan_options.append(
             {
@@ -8596,8 +8999,6 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 "tools_outline": tools_outline,
             }
         )
-    if committee_errors:
-        _log("committee.preplan.errors", trace_id=trace_id, errors=committee_errors)
     _log("committee.proposals", trace_id=trace_id, options=preplan_options)
     # Simple heuristic vote: prefer any option that explicitly mentions typed args/json.parse, otherwise first option wins.
     winner_id = None
@@ -9508,20 +9909,13 @@ async def chat_completions(body: Dict[str, Any], request: Request):
 
     # Idempotency fast-path disabled to prevent early returns; defer any cached reuse to finalization if desired
 
-    qwen_payload = build_ollama_payload(
-        messages=exec_messages, model=QWEN_MODEL_ID, num_ctx=DEFAULT_NUM_CTX, temperature=body.get("temperature") or DEFAULT_TEMPERATURE
+    # Use the central committee path to derive a single merged LLM view over exec_messages.
+    llm_env = await committee_ai_text(
+        exec_messages,
+        trace_id=str(trace_id or "executor_summary"),
+        rounds=3,
+        temperature=body.get("temperature") or DEFAULT_TEMPERATURE,
     )
-    glm_payload = build_ollama_payload(
-        messages=exec_messages, model=GLM_MODEL_ID, num_ctx=DEFAULT_NUM_CTX, temperature=body.get("temperature") or DEFAULT_TEMPERATURE
-    )
-    deepseek_payload = build_ollama_payload(
-        messages=exec_messages, model=DEEPSEEK_CODER_MODEL_ID, num_ctx=DEFAULT_NUM_CTX, temperature=body.get("temperature") or DEFAULT_TEMPERATURE
-    )
-
-    qwen_task = _as.create_task(call_ollama(QWEN_BASE_URL, qwen_payload))
-    glm_task = _as.create_task(call_ollama(GLM_OLLAMA_BASE_URL, glm_payload))
-    deepseek_task = _as.create_task(call_ollama(DEEPSEEK_CODER_OLLAMA_BASE_URL, deepseek_payload))
-    qwen_result, glm_result, deepseek_result = await _as.gather(qwen_task, glm_task, deepseek_task)
     # If backends errored but we have tool results (e.g., image job still running/finishing), degrade gracefully
     if qwen_result.get("error") or glm_result.get("error") or deepseek_result.get("error"):
         if tool_results:
@@ -9713,32 +10107,35 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             {"role": "user", "content": critique_prompt + "\n\nOther answers:\n" + other_for_deepseek}
         ]
 
-        qwen_crit_payload = build_ollama_payload(
+        # Route cross-critique through the committee path as well.
+        qcrit_env = await committee_ai_text(
             qwen_critique_msg,
-            QWEN_MODEL_ID,
-            DEFAULT_NUM_CTX,
-            body.get("temperature") or DEFAULT_TEMPERATURE,
+            trace_id=str(trace_id or "code_crit_qwen"),
+            rounds=2,
+            temperature=body.get("temperature") or DEFAULT_TEMPERATURE,
         )
-        glm_crit_payload = build_ollama_payload(
+        gcrit_env = await committee_ai_text(
             glm_critique_msg,
-            GLM_MODEL_ID,
-            DEFAULT_NUM_CTX,
-            body.get("temperature") or DEFAULT_TEMPERATURE,
+            trace_id=str(trace_id or "code_crit_glm"),
+            rounds=2,
+            temperature=body.get("temperature") or DEFAULT_TEMPERATURE,
         )
-        deepseek_crit_payload = build_ollama_payload(
+        dcrit_env = await committee_ai_text(
             deepseek_critique_msg,
-            DEEPSEEK_CODER_MODEL_ID,
-            DEFAULT_NUM_CTX,
-            body.get("temperature") or DEFAULT_TEMPERATURE,
+            trace_id=str(trace_id or "code_crit_deepseek"),
+            rounds=2,
+            temperature=body.get("temperature") or DEFAULT_TEMPERATURE,
         )
-
-        qcrit_task = _as.create_task(call_ollama(QWEN_BASE_URL, qwen_crit_payload))
-        gcrit_task = _as.create_task(call_ollama(GLM_OLLAMA_BASE_URL, glm_crit_payload))
-        dcrit_task = _as.create_task(call_ollama(DEEPSEEK_CODER_OLLAMA_BASE_URL, deepseek_crit_payload))
-        qcrit_res, gcrit_res, dcrit_res = await _as.gather(qcrit_task, gcrit_task, dcrit_task)
-        qcrit_text = qcrit_res.get("response", "")
-        gcrit_text = gcrit_res.get("response", "")
-        dcrit_text = dcrit_res.get("response", "")
+        def _env_text(env: Dict[str, Any]) -> str:
+            if not isinstance(env, dict) or not env.get("ok"):
+                return ""
+            res = env.get("result") or {}
+            if isinstance(res, dict) and isinstance(res.get("text"), str):
+                return res.get("text") or ""
+            return ""
+        qcrit_text = _env_text(qcrit_env)
+        gcrit_text = _env_text(gcrit_env)
+        dcrit_text = _env_text(dcrit_env)
         exec_messages = exec_messages + [
             {"role": "system", "content": "Cross-critique from Qwen:\n" + qcrit_text},
             {"role": "system", "content": "Cross-critique from GLM4-9B:\n" + gcrit_text},
@@ -9822,11 +10219,20 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     else:
         final_request = [_finality, _light_qa, _compose, committee_frame, {"role": "user", "content": _compose_instruction}]
 
-    planner_id = QWEN_MODEL_ID if PLANNER_MODEL.lower() == "qwen" else GLM_MODEL_ID
-    planner_base = QWEN_BASE_URL if PLANNER_MODEL.lower() == "qwen" else GLM_OLLAMA_BASE_URL
-    synth_payload = build_ollama_payload(final_request, planner_id, DEFAULT_NUM_CTX, (body.get("temperature") or DEFAULT_TEMPERATURE))
-    synth_result = await call_ollama(planner_base, synth_payload)
-    final_text = synth_result.get("response", "") or qwen_text or glm_text or deepseek_text
+    # Final synthesis also goes through the committee path.
+    synth_env = await committee_ai_text(
+        final_request,
+        trace_id=str(trace_id or "compose_final"),
+        rounds=3,
+        temperature=body.get("temperature") or DEFAULT_TEMPERATURE,
+    )
+    final_text = ""
+    if isinstance(synth_env, dict) and synth_env.get("ok"):
+        res_syn = synth_env.get("result") or {}
+        if isinstance(res_syn, dict) and isinstance(res_syn.get("text"), str):
+            final_text = res_syn.get("text") or ""
+    if not final_text:
+        final_text = qwen_text or glm_text or deepseek_text or ""
     # Append discovered asset URLs from tool results so users see concrete outputs inline
     asset_urls = assets_collect_urls(tool_results, _abs_url)
     # Fallback: if no URLs surfaced from tool results (e.g. async image jobs that finished out-of-band),
@@ -11516,8 +11922,8 @@ async def v1_audio_lyrics_to_song(body: Dict[str, Any]):
     seed = payload.get("seed")
     if not lyrics:
         return JSONResponse(status_code=400, content={"error": "missing lyrics"})
-    if YUE_API_URL:
-        call = {"name": "music.song.yue", "arguments": {"lyrics": lyrics, "style_tags": ([style] if style else []), "bpm": bpm, "key": key, "seed": seed}}
+    if PRIMARY_MUSIC_API_URL:
+        call = {"name": "music.song.primary", "arguments": {"lyrics": lyrics, "style_tags": ([style] if style else []), "bpm": bpm, "key": key, "seed": seed}}
     else:
         prompt = ((style + ": ") if style else "") + lyrics
         call = {"name": "music.compose", "arguments": {"prompt": prompt, "length_s": duration_s, "bpm": bpm, "seed": seed}}
@@ -11611,21 +12017,15 @@ async def orcjob_stream(job_id: str, interval_ms: Optional[int] = None):
 
 @app.get("/debug")
 async def debug():
-    # sanity checks to all three backends
-    try:
-        qr = await call_ollama(QWEN_BASE_URL, {"model": QWEN_MODEL_ID, "prompt": "ping", "stream": False})
-        gr = await call_ollama(GLM_OLLAMA_BASE_URL, {"model": GLM_MODEL_ID, "prompt": "ping", "stream": False})
-        dr = await call_ollama(DEEPSEEK_CODER_OLLAMA_BASE_URL, {"model": DEEPSEEK_CODER_MODEL_ID, "prompt": "ping", "stream": False})
-        return {
-            "qwen_ok": "response" in qr and not qr.get("error"),
-            "glm_ok": "response" in gr and not gr.get("error"),
-            "deepseek_ok": "response" in dr and not dr.get("error"),
-            "qwen_detail": qr.get("error"),
-            "glm_detail": gr.get("error"),
-            "deepseek_detail": dr.get("error"),
-        }
-    except Exception as ex:
-        return JSONResponse(status_code=500, content={"error": str(ex)})
+    # Committee-backed sanity check: single ping via committee path.
+    env = await committee_ai_text(
+        [{"role": "user", "content": "ping"}],
+        trace_id="debug_ping",
+        rounds=1,
+        temperature=0.0,
+    )
+    ok = bool(isinstance(env, dict) and env.get("ok"))
+    return {"committee_ok": ok, "envelope": env}
 
 
 @app.get("/v1/models")

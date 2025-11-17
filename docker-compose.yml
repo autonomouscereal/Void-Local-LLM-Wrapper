@@ -16,8 +16,8 @@ services:
       - HF_HUB_ENABLE_XET=0
       - HF_MAX_WORKERS=4
       - SKIP_SVD=1
-      - YUE_REPO=${YUE_REPO:-}
-      - YUE_TARBALL_URL=${YUE_TARBALL_URL:-}
+      - MUSIC_ENGINE_REPO=${MUSIC_ENGINE_REPO:-}
+      - MUSIC_ENGINE_TARBALL_URL=${MUSIC_ENGINE_TARBALL_URL:-}
       - HUGGINGFACE_TOKEN=${HUGGINGFACE_TOKEN:-}
     volumes:
       - film2_models:/opt/models
@@ -73,9 +73,14 @@ services:
     environment:
       - NVIDIA_VISIBLE_DEVICES=${MUSIC_GPU:-all}
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      # RVC uses the shared model volume populated by bootstrap (rvc_titan under /opt/models).
+      - RVC_MODEL_ROOT=/opt/models/rvc_titan
     network_mode: host
     expose:
       - "7863"
+    volumes:
+      # Shared FILM2 model volume; bootstrap deposits blaise-tk/TITAN under /opt/models/rvc_titan
+      - film2_models:/opt/models:ro
     
 
   vocalfix:
@@ -327,6 +332,9 @@ services:
       - SERPAPI_API_KEY
       - EXECUTOR_BASE_URL=http://127.0.0.1:8081
       - PLANNER_MODEL=${PLANNER_MODEL:-qwen3}
+      # Audio/vocal services are required parts of the pipeline; these must be set.
+      - RVC_API_URL=${RVC_API_URL:-http://127.0.0.1:7863}
+      - VOCAL_FIXER_API_URL=${VOCAL_FIXER_API_URL:-http://127.0.0.1:7864}
       - MCP_HTTP_BRIDGE_URL
       - N8N_WEBHOOK_URL=${N8N_WEBHOOK_URL:-}
       - ASSEMBLER_API_URL=http://127.0.0.1:9095

@@ -6,8 +6,7 @@ for s in "${REQS[@]:-}"; do
   [ -n "${s:-}" ] || continue
   echo "[gate] waiting for $s health..."
   case "$s" in
-    music)    URL="${MUSIC_API_URL:-http://127.0.0.1:7860}/healthz" ;;
-    yue)      URL="${YUE_API_URL:-http://yue:9001}/healthz" ;;
+    music)    URL="${MUSIC_API_URL:-${MUSIC_FULL_API_URL:-http://127.0.0.1:7860}}/healthz" ;;
     xtts)     URL="${XTTS_API_URL:-http://127.0.0.1:8020}/healthz" ;;
     demucs)   URL="${DEMUCS_API_URL:-http://127.0.0.1:9101}/healthz" ;;
     film2)    URL="${FILM2_API_URL:-http://127.0.0.1:8090}/healthz" ;;

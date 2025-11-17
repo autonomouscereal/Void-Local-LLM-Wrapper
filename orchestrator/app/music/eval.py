@@ -1,0 +1,362 @@
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional
+
+from ..analysis.media import analyze_audio, _load_audio  # type: ignore
+from ..json_parser import JSONParser
+from .style_pack import _embed_music_clap, _cos_sim
+
+
+def _map_technical_to_score(metrics: Dict[str, Any]) -> float:
+    """
+    Map low-level audio metrics into a coarse technical quality score in [0,1].
+    """
+    lufs = metrics.get("lufs")
+    tempo = metrics.get("tempo_bpm")
+    key = metrics.get("key")
+
+    score_components: List[float] = []
+
+    if isinstance(lufs, (int, float)):
+        lufs_val = float(lufs)
+        # Target window around -14 LUFS with soft tolerance.
+        if -18.0 <= lufs_val <= -10.0:
+            score_components.append(1.0)
+        elif -24.0 <= lufs_val <= -6.0:
+            score_components.append(0.7)
+        else:
+            score_components.append(0.3)
+
+    if isinstance(tempo, (int, float)) and float(tempo) > 0.0:
+        score_components.append(1.0)
+
+    if isinstance(key, str) and key:
+        score_components.append(1.0)
+
+    if not score_components:
+        return 0.0
+    return float(sum(score_components) / float(len(score_components)))
+
+
+def _compute_extra_technical(path: str) -> Dict[str, Any]:
+    """
+    Cheap RMS-based technical extras (crest factor, dynamic range proxy).
+    """
+    y, sr = _load_audio(path)
+    if not y or not sr:
+        return {
+            "crest_factor": None,
+            "rms": None,
+            "dynamic_range": None,
+        }
+    vals = [float(v) for v in y]
+    rms = (sum(v * v for v in vals) / float(len(vals))) ** 0.5
+    peak = max(abs(v) for v in vals)
+    crest = float(peak / rms) if rms > 0.0 else None
+    # Dynamic range proxy: fixed placeholder until a fuller implementation is added.
+    dyn = None
+    return {
+        "crest_factor": crest,
+        "rms": rms,
+        "dynamic_range": dyn,
+    }
+
+
+def eval_technical(track_path: str) -> Dict[str, Any]:
+    base = analyze_audio(track_path)
+    extra = _compute_extra_technical(track_path)
+    out: Dict[str, Any] = {}
+    out.update(base)
+    out.update(extra)
+    out["technical_quality_score"] = _map_technical_to_score(out)
+    return out
+
+
+def eval_style(track_path: str, style_pack: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if style_pack is None:
+        embed = _embed_music_clap(track_path)
+        return {
+            "style_score": 0.0,
+            "track_embed": embed,
+            "per_ref_scores": {},
+        }
+
+    style_embed = style_pack.get("style_embed")
+    if not isinstance(style_embed, list) or not style_embed:
+        raise ValueError("eval_style: style_pack is missing a valid style_embed")
+
+    track_embed = _embed_music_clap(track_path)
+    raw_sim = _cos_sim(style_embed, track_embed)
+    style_score = 0.5 * (raw_sim + 1.0)
+
+    per_ref_scores: Dict[str, float] = {}
+    refs = style_pack.get("refs") or []
+    if isinstance(refs, list):
+        for ref in refs:
+            if not isinstance(ref, dict):
+                continue
+            ref_path = ref.get("path")
+            ref_embed = ref.get("embed")
+            if not isinstance(ref_path, str) or not isinstance(ref_embed, list):
+                continue
+            sim = _cos_sim(ref_embed, track_embed)
+            per_ref_scores[ref_path] = 0.5 * (sim + 1.0)
+
+    return {
+        "style_score": style_score,
+        "track_embed": track_embed,
+        "per_ref_scores": per_ref_scores,
+    }
+
+
+def _eval_structure_from_song_graph(track_path: str, song_graph: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Lightweight structure evaluation based on Song Graph sections and
+    approximate per-section energy.
+    """
+    sections = song_graph.get("sections") if isinstance(song_graph.get("sections"), list) else []
+    if not sections:
+        return {
+            "energy_alignment_score": 0.0,
+            "repetition_score": 0.0,
+            "transition_score": 0.0,
+        }
+
+    y, sr = _load_audio(track_path)
+    if not y or not sr:
+        return {
+            "energy_alignment_score": 0.0,
+            "repetition_score": 0.0,
+            "transition_score": 0.0,
+        }
+
+    vals = [float(v) for v in y]
+    n = len(vals)
+    if n <= 0:
+        return {
+            "energy_alignment_score": 0.0,
+            "repetition_score": 0.0,
+            "transition_score": 0.0,
+        }
+
+    sec_energies: List[float] = []
+    targets: List[float] = []
+
+    for sec in sections:
+        if not isinstance(sec, dict):
+            continue
+        t_start = sec.get("t_start")
+        t_end = sec.get("t_end")
+        if not isinstance(t_start, (int, float)) or not isinstance(t_end, (int, float)):
+            continue
+        if t_end <= t_start:
+            continue
+        s_idx = int(max(0, min(int(t_start * sr), n - 1)))
+        e_idx = int(max(s_idx + 1, min(int(t_end * sr), n)))
+        slice_vals = vals[s_idx:e_idx]
+        if not slice_vals:
+            continue
+        rms = (sum(v * v for v in slice_vals) / float(len(slice_vals))) ** 0.5
+        sec_energies.append(rms)
+        tgt = sec.get("target_energy")
+        if isinstance(tgt, (int, float)):
+            targets.append(float(tgt))
+        else:
+            targets.append(0.5)
+
+    if not sec_energies:
+        return {
+            "energy_alignment_score": 0.0,
+            "repetition_score": 0.0,
+            "transition_score": 0.0,
+        }
+
+    max_energy = max(sec_energies)
+    norm_energies = [e / max_energy for e in sec_energies] if max_energy > 0.0 else [0.0] * len(sec_energies)
+
+    # Energy alignment: how close per-section energy is to target_energy.
+    diffs = [abs(ne - tgt) for ne, tgt in zip(norm_energies, targets)]
+    mean_diff = sum(diffs) / float(len(diffs))
+    energy_alignment_score = 1.0 - mean_diff
+    if energy_alignment_score < 0.0:
+        energy_alignment_score = 0.0
+    if energy_alignment_score > 1.0:
+        energy_alignment_score = 1.0
+
+    # Repetition: prefer some variation but not chaos.
+    mean_energy = sum(norm_energies) / float(len(norm_energies))
+    var = sum((e - mean_energy) ** 2 for e in norm_energies) / float(len(norm_energies))
+    # Map variance into [0,1] with a soft range.
+    if var < 0.01:
+        repetition_score = 0.3
+    elif var > 0.25:
+        repetition_score = 0.6
+    else:
+        repetition_score = 1.0
+
+    # Transition score: how smooth section energies are between neighbors.
+    if len(norm_energies) > 1:
+        jumps = [abs(norm_energies[i + 1] - norm_energies[i]) for i in range(len(norm_energies) - 1)]
+        mean_jump = sum(jumps) / float(len(jumps))
+        transition_score = 1.0 - mean_jump
+        if transition_score < 0.0:
+            transition_score = 0.0
+        if transition_score > 1.0:
+            transition_score = 1.0
+    else:
+        transition_score = 1.0
+
+    return {
+        "energy_alignment_score": energy_alignment_score,
+        "repetition_score": repetition_score,
+        "transition_score": transition_score,
+    }
+
+
+def eval_structure(track_path: str, song_graph: Dict[str, Any]) -> Dict[str, Any]:
+    return _eval_structure_from_song_graph(track_path, song_graph or {})
+
+
+def eval_emotion(track_path: str) -> Dict[str, Any]:
+    base = analyze_audio(track_path)
+    emotion = base.get("emotion")
+    tempo = base.get("tempo_bpm")
+
+    valence = 0.5
+    arousal = 0.5
+
+    if isinstance(tempo, (int, float)):
+        t = float(tempo)
+        if t > 150:
+            arousal = 0.9
+        elif t < 80:
+            arousal = 0.3
+        else:
+            arousal = 0.6
+
+    if isinstance(emotion, str):
+        e = emotion.strip().lower()
+        if e == "excited":
+            valence = 0.8
+        elif e == "calm":
+            valence = 0.7
+        elif e == "neutral":
+            valence = 0.5
+        else:
+            valence = 0.5
+
+    return {
+        "emotion_guess": emotion,
+        "tempo_bpm": tempo,
+        "valence": valence,
+        "arousal": arousal,
+    }
+
+
+def _build_music_eval_summary(all_axes: Dict[str, Any], film_context: Optional[Dict[str, Any]]) -> str:
+    payload: Dict[str, Any] = {
+        "axes": all_axes,
+        "film_context": film_context or {},
+    }
+    return JSONParser().dumps(payload)
+
+
+def _call_music_eval_committee(summary: str) -> Dict[str, Any]:
+    """
+    Use the existing committee infrastructure to obtain aesthetic judgements.
+    """
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are MusicEval. You receive JSON with technical/style/structure/emotion metrics "
+                "for a music segment or track, plus optional film context. "
+                "Respond ONLY with JSON containing keys: "
+                '{"overall_quality_score": float, "fit_score": float, "originality_score": float, '
+                '"cohesion_score": float, "issues": [str]}.'
+            ),
+        },
+        {
+            "role": "user",
+            "content": summary,
+        },
+    ]
+    # Local import to avoid circular dependency between main.py and music.eval.
+    from ..main import committee_ai_text  # type: ignore
+
+    env = committee_ai_text(messages, trace_id="music_eval", rounds=3)
+    if not isinstance(env, dict) or not env.get("ok"):
+        raise RuntimeError("music_eval committee did not return ok")
+    result = env.get("result") or {}
+    txt = result.get("text") or ""
+    parser = JSONParser()
+    schema = {
+        "overall_quality_score": float,
+        "fit_score": float,
+        "originality_score": float,
+        "cohesion_score": float,
+        "issues": [str],
+    }
+    parsed = parser.parse(txt or "{}", schema)
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def eval_aesthetic(all_axes: Dict[str, Any], film_context: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    summary = _build_music_eval_summary(all_axes, film_context)
+    judge = _call_music_eval_committee(summary)
+    return judge
+
+
+def compute_music_eval(
+    track_path: str,
+    song_graph: Dict[str, Any],
+    style_pack: Optional[Dict[str, Any]],
+    film_context: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    Multi-axis evaluation entrypoint for music clips and full tracks.
+
+    Returns:
+      {
+        "technical": {...},
+        "style": {...},
+        "structure": {...},
+        "emotion": {...},
+        "aesthetic": {...},
+        "overall": {
+          "overall_quality_score": float,
+          "fit_score": float,
+        },
+      }
+    """
+    technical = eval_technical(track_path)
+    style = eval_style(track_path, style_pack)
+    structure = eval_structure(track_path, song_graph)
+    emotion = eval_emotion(track_path)
+
+    all_axes = {
+        "technical": technical,
+        "style": style,
+        "structure": structure,
+        "emotion": emotion,
+    }
+    aesthetic = eval_aesthetic(all_axes, film_context)
+
+    overall_quality = float(aesthetic.get("overall_quality_score") or 0.0)
+    fit_score = float(aesthetic.get("fit_score") or 0.0)
+
+    overall = {
+        "overall_quality_score": overall_quality,
+        "fit_score": fit_score,
+    }
+
+    return {
+        "technical": technical,
+        "style": style,
+        "structure": structure,
+        "emotion": emotion,
+        "aesthetic": aesthetic,
+        "overall": overall,
+    }
+
+

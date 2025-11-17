@@ -90,6 +90,22 @@ async def healthz():
     return {"status": "ok"}
 
 
+def _process_vocal(y: np.ndarray, sr: int, key: str, ops: list[str], score_json: dict | None) -> dict:
+    before = {"lufs": lufs(y, sr)}
+    if "pitch" in ops:
+        y = pitch_correct(y, sr, key=key, strength=0.6)
+    if "align" in ops and isinstance(score_json, dict):
+        y = time_align(y, sr, score_json.get("notes", []))
+    if "deess" in ops:
+        y = de_ess(y, sr, float(os.getenv("AUDIO_SIBILANCE_DB_MAX", "-16")))
+    buf = io.BytesIO()
+    sf.write(buf, y, sr, format="WAV")
+    import base64
+    b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+    after = {"lufs": lufs(y, sr)}
+    return {"ok": True, "audio_wav_base64": b64, "sample_rate": sr, "metrics_before": before, "metrics_after": after}
+
+
 @app.post("/vocal_fix")
 async def vocal_fix(body: dict):
     global _device
@@ -101,20 +117,49 @@ async def vocal_fix(body: dict):
         key = body.get("key") or os.getenv("AUDIO_KEY", "E minor")
         ops = body.get("ops") or ["pitch", "align", "deess"]
         y, sr = _read_wav_payload(wav_url, wav_bytes)
-        before = {"lufs": lufs(y, sr)}
-        if "pitch" in ops:
-            y = pitch_correct(y, sr, key=key, strength=0.6)
-        if "align" in ops and isinstance(score_json, dict):
-            y = time_align(y, sr, score_json.get("notes", []))
-        if "deess" in ops:
-            y = de_ess(y, sr, float(os.getenv("AUDIO_SIBILANCE_DB_MAX", "-16")))
-        buf = io.BytesIO()
-        sf.write(buf, y, sr, format="WAV")
-        import base64
-        b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-        after = {"lufs": lufs(y, sr)}
-        return {"ok": True, "audio_wav_base64": b64, "metrics_before": before, "metrics_after": after}
+        result = _process_vocal(y, sr, key, ops, score_json)
+        return result
     except Exception as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
+
+
+@app.post("/v1/vocal/fix")
+async def vocal_fix_v1(body: dict):
+    """
+    Canonical API for orchestrator: audio_wav_base64 + sample_rate + optional mode/metadata.
+    """
+    global _device
+    _device = _device or DEVICE
+    audio_b64 = body.get("audio_wav_base64")
+    sr = body.get("sample_rate")
+    if not isinstance(audio_b64, str) or not audio_b64.strip():
+        return JSONResponse(
+            status_code=400,
+            content={"ok": False, "error_code": "missing_audio_wav_base64", "error_message": "audio_wav_base64 is required"},
+        )
+    if not isinstance(sr, int) or sr <= 0:
+        return JSONResponse(
+            status_code=400,
+            content={"ok": False, "error_code": "missing_sample_rate", "error_message": "sample_rate must be a positive integer"},
+        )
+    try:
+        import base64
+        data = base64.b64decode(audio_b64)
+        y, sr2 = sf.read(io.BytesIO(data), always_2d=False)
+        if y.ndim > 1:
+            y = y.mean(axis=1)
+        y = y.astype(np.float32)
+        sr_eff = int(sr2 or sr)
+    except Exception as e:
+        return JSONResponse(
+            status_code=400,
+            content={"ok": False, "error_code": "decode_error", "error_message": str(e)},
+        )
+    key = body.get("key") or os.getenv("AUDIO_KEY", "E minor")
+    ops = body.get("ops") or ["pitch", "align", "deess"]
+    score_json = body.get("score_json") or {}
+    result = _process_vocal(y, sr_eff, key, ops, score_json if isinstance(score_json, dict) else {})
+    # Preserve the canonical contract: ok + audio_wav_base64 + sample_rate + metrics.
+    return result
 
 

@@ -22,7 +22,7 @@ What’s Included (always ON)
 - WindowedSolver: sliding window + CAC; CONT/HALT; checkpoints; seed registry; no inline caps.
 - Deterministic routing: Film (`film.run`), Images (`image.dispatch`), TTS (`tts.speak`), Music (song/instrumental/infinite composer), RAG, Research, Code Super‑Loop.
 - Images: super‑gen, edit, upscale; face/pose/style locks; hands/artifact fixes; inline assets.
-- Music/TTS: full songs (YuE) + instrumentals (MusicGen) + duration‑locked (SAO); infinite composer with bar‑aligned seams, seam QA/auto‑repair, mastering; XTTS voice‑lock; stems; manifests.
+- Music/TTS: full songs (primary music engine) + instrumentals (MusicGen) + duration-locked (SAO); infinite composer with bar-aligned seams, seam QA/auto-repair, mastering; XTTS voice-lock; stems; manifests.
 - Film‑2: clarifications → storyboard/animatic/final; shot‑level locks; QA/re‑render; upscale/interp; EDL/export.
 - Research/RAG: keyless multi‑engine `metasearch.fuse`, RAG TTL/dedup/newest‑first; evidence binding.
 - Ablation: facts extraction + `facts.jsonl` export; attached to envelopes.

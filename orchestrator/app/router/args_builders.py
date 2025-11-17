@@ -36,7 +36,7 @@ def build_music_args(req_text: str) -> Dict[str, Any]:
     return {"prompt": req_text, "bpm": 120, "length_s": 30, "structure": ["intro", "verse", "outro"], "seed": None}
 
 
-def build_yue_args(req_text: str) -> Dict[str, Any]:
+def build_music_song_args(req_text: str) -> Dict[str, Any]:
     # Treat the incoming text as lyrics; style_tags empty by default
     return {"lyrics": req_text, "style_tags": [], "bpm": None, "key": None, "seed": None, "reference_song": None}
 

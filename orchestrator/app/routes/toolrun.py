@@ -9,7 +9,7 @@ import base64 as _b64
 from app.state.checkpoints import append_event as checkpoints_append_event
 from app.trace_utils import emit_trace as _emit_trace
 from app.analysis.media import analyze_image as _qa_analyze_image, analyze_image_regions as _qa_analyze_image_regions  # type: ignore
-from app.json_parser import JSONParser
+from .json_parser import JSONParser
 import httpx
 
 

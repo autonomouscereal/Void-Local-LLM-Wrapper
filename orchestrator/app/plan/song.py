@@ -4,11 +4,10 @@ import os
 import json
 from typing import Any, Dict, List, Optional
 
-import httpx  # type: ignore
-
 from ..json_parser import JSONParser
 from ..pipeline.compression_orchestrator import co_pack, frames_to_string
 from ..datasets.trace import append_sample as _trace_append
+from ..main import committee_ai_text
 
 
 # Expected Song Graph shape for coercion. This is intentionally minimal and
@@ -36,6 +35,10 @@ SONG_GRAPH_SCHEMA: Dict[str, Any] = {
             "target_emotion": str,
             "is_chorus": bool,
             "reuse_from_section_id": str,
+            # Optional multi-voice assignment for this section. Entries must
+            # reference voice_id values from the top-level voices array, which
+            # in turn map to concrete voice_lock_id entries.
+            "voice_ids": [str],
         }
     ],
     "lyrics": {
@@ -147,19 +150,20 @@ async def plan_song_graph(
         + "Use section_ids and motif_ids that are stable and reusable.\n"
     )
 
-    base = os.getenv("QWEN_BASE_URL", "http://ollama_qwen:11435").rstrip("/")
-    model = os.getenv("QWEN_MODEL_ID", "qwen2.5:14b").strip() or "qwen2.5:14b"
-    payload = {"model": model, "prompt": prompt, "stream": False}
-    try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(base + "/api/generate", json=payload)
-    except Exception:
+    # Route song planner exclusively through the central committee debate.
+    env = await committee_ai_text(
+        [
+            {"role": "system", "content": "You are SongOps. Output ONLY JSON per the song schema."},
+            {"role": "user", "content": prompt},
+        ],
+        trace_id=trace_id or "song_plan",
+        rounds=3,
+    )
+    if not isinstance(env, dict) or not env.get("ok"):
         return {}
-    if resp.status_code < 200 or resp.status_code >= 300:
-        return {}
-
-    txt = (JSONParser().parse(resp.text, {"response": str}) or {}).get("response") or "{}"
-    parsed = JSONParser().parse(txt, schema_wrapper)
+    res_env = env.get("result") or {}
+    txt = res_env.get("text") or ""
+    parsed = JSONParser().parse(txt or "{}", schema_wrapper)
     song = parsed.get("song")
     if isinstance(song, dict):
         sections = song.get("sections") if isinstance(song.get("sections"), list) else []
