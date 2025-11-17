@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import json
 import base64
 from typing import Dict, Any, Tuple
@@ -9,7 +10,6 @@ import numpy as np  # type: ignore
 import soundfile as sf  # type: ignore
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
-from hf_rvc import RVCFeatureExtractor, RVCModel  # type: ignore
 
 
 app = FastAPI(title="RVC Voice Conversion Service", version="1.0.0")
@@ -22,12 +22,28 @@ RVC_MODEL_ROOT = os.getenv("RVC_MODEL_ROOT", "/opt/models/rvc_titan")
 if not (os.path.isdir(RVC_MODEL_ROOT) and os.listdir(RVC_MODEL_ROOT)):
     raise RuntimeError(f"RVC model directory missing or empty: {RVC_MODEL_ROOT}")
 
+# Titan HF model id for metadata/logging.
 RVC_MODEL_NAME = "blaise-tk/TITAN"
 
-# Load hf-rvc feature extractor and model once at import time. Any failure here should
+# Load the Titan RVC implementation directly from the bootstrapped snapshot.
+# We do NOT rely on any external 'hf-rvc' wheel from PyPI; instead, we import
+# the hf_rvc package from the local RVC_MODEL_ROOT where bootstrap downloaded
+# the blaise-tk/TITAN repository.
+if RVC_MODEL_ROOT not in sys.path:
+    sys.path.insert(0, RVC_MODEL_ROOT)
+try:
+    from hf_rvc import RVCFeatureExtractor, RVCModel  # type: ignore
+except ImportError as ex:  # pragma: no cover - hard startup failure
+    raise RuntimeError(
+        "hf_rvc package not found under RVC_MODEL_ROOT; ensure blaise-tk/TITAN "
+        "has been bootstrapped into /opt/models/rvc_titan and that the repo "
+        "contains the hf_rvc package."
+    ) from ex
+
+# Load feature extractor and model once at import time. Any failure here should
 # cause the container to fail fast so orchestrator startup will also fail.
-FEATURE_EXTRACTOR = RVCFeatureExtractor.from_pretrained(RVC_MODEL_NAME)
-RVC_MODEL = RVCModel.from_pretrained(RVC_MODEL_NAME)
+FEATURE_EXTRACTOR = RVCFeatureExtractor.from_pretrained(RVC_MODEL_ROOT)
+RVC_MODEL = RVCModel.from_pretrained(RVC_MODEL_ROOT)
 FEATURE_EXTRACTOR.set_f0_method("rmvpe")
 RVC_MODEL.eval()
 

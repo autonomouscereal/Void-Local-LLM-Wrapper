@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /
 RUN pip install --no-cache-dir --upgrade pip \
  && pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cu118 \
     "torch==2.7.1+cu118" "torchaudio==2.7.1+cu118" "torchvision==0.22.1+cu118" \
- && pip install --no-cache-dir fastapi uvicorn soundfile numpy huggingface_hub hf-rvc
+ && pip install --no-cache-dir fastapi uvicorn soundfile numpy huggingface_hub
 
 WORKDIR /app
 COPY app /app/app
