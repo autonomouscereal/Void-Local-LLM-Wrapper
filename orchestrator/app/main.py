@@ -3437,6 +3437,7 @@ async def planner_produce_plan(messages: List[Dict[str, Any]], tools: Optional[L
     )
     planner_meta = (
         "### [PLANNER / SYSTEM]\n"
+        "All planner reasoning and any generated text MUST be in English only. Other languages are not allowed.\n"
         "Honor CO ratios/RoE. Prefer tools over text when media is requested. Construct strict JSON steps with all required args; snap sizes to /8.\n"
         "- Image edits: do NOT use image.edit. Always use image.dispatch for both generation and editing.\n"
         "- When editing, include the input image via attachments (preferred) or set args.images to an array of objects containing absolute /uploads/... URLs.\n"
@@ -9149,30 +9150,9 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     _allowed_mode_set = set(_allowed_tools_for_mode(effective_mode))
     _, unknown = catalog_validate(tool_calls or [], allowed_tools)
     if unknown:
-        # Attempt a single re-plan constrained to allowed tool names
-        if _allowed_mode_set:
-            allowed_sorted = sorted([n for n in list(allowed_tools) if n in _allowed_mode_set])
-        else:
-            allowed_sorted = sorted(list(allowed_tools))
-        constraint = (
-            "Tool selection invalid. You must choose only from the allowed tool catalog:\n- "
-            + "\n- ".join(allowed_sorted)
-            + "\nReturn strict JSON: {\"steps\":[{\"tool\":\"<name>\",\"args\":{...}}]} or {\"steps\":[]}."
-        )
-        replan_messages = messages + [{"role": "system", "content": constraint}]
-        _log("replan.start", trace_id=trace_id, reason="unknown_tool", unknown=unknown, allowed=allowed_sorted)
-        plan2, tool_calls2 = await planner_produce_plan(replan_messages, body.get("tools"), body.get("temperature") or DEFAULT_TEMPERATURE, trace_id=trace_id, mode=effective_mode)
-        # Normalize and filter
-        tool_calls2 = _normalize_tool_calls(tool_calls2)
-        # Re-check against allowed
-        _, still_unknown = catalog_validate(tool_calls2 or [], allowed_tools)
-        if still_unknown:
-            _log("tools.unknown.filtered", trace_id=trace_id, unknown=still_unknown, allowed=allowed_sorted)
-            # Drop unknown tools and continue
-            tool_calls2 = [tc for tc in (tool_calls2 or []) if str((tc or {}).get("name") or "") not in still_unknown]
-        # Adopt re-planned tool calls
-        _log("replan.done", trace_id=trace_id, count=len(tool_calls2 or []))
-        tool_calls = tool_calls2
+        # No replans: log and drop unknown tools; execution will continue with valid ones only.
+        _log("tools.unknown.filtered", trace_id=trace_id, unknown=unknown)
+        tool_calls = [tc for tc in (tool_calls or []) if str((tc or {}).get("name") or "") not in unknown]
 
     def _compute_tools_hash() -> str:
         names = set()
@@ -9807,7 +9787,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     )})
     evidence_blocks.append({"role": "system", "content": (
         "### [COMPOSE / SYSTEM]\n"
-        "Return a single assistant message. Include Assets: with only absolute /uploads/artifacts/... URLs. "
+        "Produce the final assistant message in English only. Do NOT output JSON, logs, traces, or an Assets: block; the system will append asset URLs automatically when available. "
         "If minor issues: add Warnings:. Append Applied RoE: with 1–3 short items actually followed. Keep output concise and useful."
     )})
     evidence_blocks.append({"role": "system", "content": (
@@ -10024,7 +10004,10 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     frames_final = _co_frames_to_msgs(co_out_final.get("frames") or [])
     _rtf = co_out_final.get("ratio_telemetry") or {}
     _log("co.pack", trace_id=trace_id, call_kind="compose", alloc=_rtf.get("alloc"), used_pct=_rtf.get("used_pct"), free_pct=_rtf.get("free_pct"))
-    _finality = {"role": "system", "content": "### [FINALITY / SYSTEM]\nReturn exactly one final assistant message only."}
+    _finality = {"role": "system", "content": (
+        "### [FINALITY / SYSTEM]\n"
+        "Return exactly one final assistant message only, written in English. No other languages are allowed."
+    )}
     _light_qa = {"role": "system", "content": (
         "### [LIGHT QA / SYSTEM]\n"
         "After artifacts, briefly self-check: subject fidelity (≥60% tokens present?), RoE hygiene (URLs only /uploads/artifacts/...; no local links). "
@@ -10032,7 +10015,8 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     )}
     _compose = {"role": "system", "content": (
         "### [COMPOSE / SYSTEM]\n"
-        "Return a single assistant message. Include Assets: with only absolute /uploads/artifacts/... URLs. "
+        "Produce the final, corrected answer in English only. Do NOT output JSON, logs, or traces (no chat.start, exec.payload.pre, Comfy.submit, Comfy.poll, or similar). "
+        "Do NOT invent or include any Assets: block or /uploads/artifacts/... URLs; the system will append asset URLs automatically when available. "
         "If minor issues: add Warnings: lines; keep the answer helpful. Append Applied RoE: with 1–3 short items actually followed."
     )}
     committee_summary_parts: List[str] = []

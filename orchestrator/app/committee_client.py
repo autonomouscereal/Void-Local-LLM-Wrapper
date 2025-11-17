@@ -283,6 +283,9 @@ async def committee_ai_text(
                     "Compare all answers, keep what is correct, fix what is wrong, "
                     "and produce your best updated answer. Respond with ONLY your full answer."
                 )
+            ctx_lines.append(
+                "All content must be written in English only. Do NOT respond in any other language."
+            )
             member_msgs.append({"role": "system", "content": "\n\n".join(ctx_lines)})
             emit_trace(
                 STATE_DIR,
@@ -363,6 +366,33 @@ async def committee_ai_text(
     }
 
 
+def _schema_to_template(expected: Any) -> Any:
+    """
+    Build a literal JSON skeleton from an expected_schema that may contain
+    Python type objects (str, int, float, dict, list) as leaves.
+
+    This is ONLY for prompting the JSONFixer model; the original expected_schema
+    (with type objects) is still used for JSONParser coercion/validation.
+    """
+    if isinstance(expected, dict):
+        return {k: _schema_to_template(v) for k, v in expected.items()}
+    if isinstance(expected, list):
+        if not expected:
+            return []
+        return [_schema_to_template(expected[0])]
+    if expected is str:
+        return ""
+    if expected is int:
+        return 0
+    if expected is float:
+        return 0.0
+    if expected is list:
+        return []
+    if expected is dict:
+        return {}
+    return expected
+
+
 async def committee_jsonify(
     raw_text: str,
     expected_schema: Any,
@@ -382,7 +412,8 @@ async def committee_jsonify(
     """
     trace_base = str(trace_id or "committee")
     trace_full = f"{trace_base}.jsonify"
-    schema_desc = json.dumps(expected_schema, default=str, ensure_ascii=False)
+    schema_template = _schema_to_template(expected_schema)
+    schema_desc = json.dumps(schema_template, ensure_ascii=False)
     raw_preview = (raw_text or "")[:600] if isinstance(raw_text, str) else ""
     emit_trace(
         STATE_DIR,
@@ -402,6 +433,7 @@ async def committee_jsonify(
     # Hard JSON contract: show the exact skeleton and forbid any deviation.
     sys_msg = (
         "You are JSONFixer. You receive messy AI output and MUST respond with exactly ONE JSON object.\n"
+        "Respond ONLY in English. NO other languages are allowed.\n"
         "NO markdown, NO code fences, NO prose, NO comments.\n\n"
         "The JSON MUST match this exact structure (keys and nesting):\n\n"
         f"{schema_desc}\n\n"
