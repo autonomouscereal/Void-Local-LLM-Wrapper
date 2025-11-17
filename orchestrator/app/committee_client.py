@@ -62,12 +62,13 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str) -> 
     """
     trace_key = str(trace_id or "committee")
     async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
-        # Log a lightweight request summary (no full prompt content).
+        # Log full prompt and model for complete visibility.
         log.info(
-            "[committee] ollama.request base=%s model=%s trace_id=%s",
+            "[committee] ollama.request base=%s model=%s trace_id=%s prompt=%s",
             base_url,
             payload.get("model"),
             trace_key,
+            payload.get("prompt"),
         )
         # Trace request (without full prompt content to avoid huge payloads).
         emit_trace(
@@ -85,6 +86,15 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str) -> 
         ppayload = dict(payload)
         resp = await client.post(f"{base_url}/api/generate", json=ppayload)
         parser = JSONParser()
+        # Log raw response text before parsing so we can see exactly what Ollama returned.
+        log.info(
+            "[committee] ollama.raw_response base=%s model=%s trace_id=%s status=%s body=%s",
+            base_url,
+            payload.get("model"),
+            trace_key,
+            getattr(resp, "status_code", None),
+            resp.text,
+        )
         data = parser.parse(resp.text or "", {"response": str, "prompt_eval_count": int, "eval_count": int})
         usage: Dict[str, int] | None = None
         if isinstance(data, dict) and ("prompt_eval_count" in data or "eval_count" in data):
@@ -94,20 +104,14 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str) -> 
             }
             usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
             data["_usage"] = usage
-        # Prepare a short preview of the model response for logging/tracing.
-        resp_text = ""
-        if isinstance(data, dict):
-            raw_resp = data.get("response")
-            if isinstance(raw_resp, str):
-                resp_text = raw_resp.strip()
-        preview = resp_text[:512] if resp_text else ""
-        log.debug(
-            "[committee] ollama.response base=%s model=%s trace_id=%s status=%s preview=%s",
+        # Log the parsed response envelope (no truncation) for debugging.
+        log.info(
+            "[committee] ollama.parsed_response base=%s model=%s trace_id=%s status=%s data=%s",
             base_url,
             payload.get("model"),
             trace_key,
             getattr(resp, "status_code", None),
-            preview,
+            data,
         )
         emit_trace(
             STATE_DIR,
@@ -117,7 +121,7 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str) -> 
                 "trace_id": trace_key,
                 "status_code": int(getattr(resp, "status_code", 0) or 0),
                 "usage": usage or {},
-                "response_preview": preview,
+                "response": data,
             },
         )
         return data
@@ -329,12 +333,8 @@ async def committee_jsonify(
             "raw_len": len(raw_text or ""),
         },
     )
-    log.info(
-        "[committee.jsonify] start trace_id=%s schema_len=%d raw_len=%d",
-        trace_base,
-        len(schema_desc),
-        len(raw_text or ""),
-    )
+    # Log full raw_text and schema for debugging (no truncation).
+    log.info("[committee.jsonify] start trace_id=%s schema=%s raw_text=%s", trace_base, schema_desc, raw_text)
     sys_msg = (
         "You are JSONFixer. You receive messy AI output and MUST respond ONLY with strict JSON "
         "that matches this schema:\n"
@@ -370,11 +370,13 @@ async def committee_jsonify(
             "main_text_preview": txt_main_preview,
         },
     )
+    # Log full committee result text and envelope (no truncation).
     log.info(
-        "[committee.jsonify] committee_result trace_id=%s ok=%s main_preview=%s",
+        "[committee.jsonify] committee_result trace_id=%s ok=%s text=%s env=%s",
         trace_base,
         ok_env,
-        txt_main_preview,
+        result_block.get("text") if isinstance(result_block, dict) else None,
+        result_block,
     )
 
     # Collect up to four candidate JSON texts: the merged text plus per-backend responses.
@@ -403,16 +405,30 @@ async def committee_jsonify(
             "first_preview": (candidates[0][:400] if candidates else ""),
         },
     )
+    # Log all candidate texts for JSON parsing.
     log.info(
-        "[committee.jsonify] candidates trace_id=%s count=%d",
+        "[committee.jsonify] candidates trace_id=%s count=%d candidates=%s",
         trace_base,
         len(candidates),
+        candidates,
     )
 
     parser = JSONParser()
     parsed_candidates: List[Dict[str, Any]] = []
-    for txt in candidates:
+    for idx, txt in enumerate(candidates):
+        log.info(
+            "[committee.jsonify] parse_candidate trace_id=%s index=%d text=%s",
+            trace_base,
+            idx,
+            txt,
+        )
         obj = parser.parse(txt or "{}", expected_schema)
+        log.info(
+            "[committee.jsonify] parsed_candidate trace_id=%s index=%d obj=%s",
+            trace_base,
+            idx,
+            obj,
+        )
         if isinstance(obj, dict):
             parsed_candidates.append(obj)
 

@@ -3346,6 +3346,14 @@ async def planner_produce_plan(messages: List[Dict[str, Any]], tools: Optional[L
     tool_names_mode: List[str] = _filter_tool_names_by_mode(tool_names, effective_mode)
     # Allowed tool names for planner use (fixed front-door surface).
     _allowed_for_mode = _allowed_tools_for_mode(effective_mode)
+    # Log tool palette and mode so we can see exactly what planner can choose from.
+    _log(
+        "planner.tools.palette",
+        trace_id=trace_id,
+        mode=effective_mode,
+        tool_names=tool_names_mode,
+        allowed_for_mode=_allowed_for_mode,
+    )
     # Detect repair intent from messages
     _is_repair = any(isinstance(m, dict) and isinstance(m.get("content"), str) and "repair mode" in m.get("content", "").lower() for m in (messages or []))
     # Curate RAW schema blocks (TSL) for planner-visible tools using the canonical
@@ -3408,6 +3416,8 @@ async def planner_produce_plan(messages: List[Dict[str, Any]], tools: Optional[L
         "tsl_blocks": tsl_blocks,
         "tel_blocks": (_tel_recent or tel_blocks),
     }
+    # Log full CO envelope before compression so we can see the exact planner context.
+    _log("planner.co_env", trace_id=trace_id, co_env=co_env)
     co_out = _co_pack(co_env)
     frames_msgs = _co_frames_to_msgs(co_out.get("frames") or [])
     # Minimal planner/committee frames
@@ -3469,6 +3479,12 @@ async def planner_produce_plan(messages: List[Dict[str, Any]], tools: Optional[L
     ]
     # Route planner through the central committee debate; models may respond in free text,
     # and we coerce into the strict JSON planner schema via JSONParser.
+    # Log the full planner prompt (all messages) before sending to committee.
+    _log(
+        "planner.prompt.messages",
+        trace_id=trace_id,
+        messages=plan_messages,
+    )
     env = await committee_ai_text(
         plan_messages,
         trace_id=str(trace_id or "planner"),
@@ -3478,6 +3494,13 @@ async def planner_produce_plan(messages: List[Dict[str, Any]], tools: Optional[L
         return "", []
     res_env = env.get("result") or {}
     text = res_env.get("text") or ""
+    # Log the raw planner text response from the committee, before JSON fixing.
+    _log(
+        "planner.raw_text",
+        trace_id=trace_id,
+        text=text,
+        result=res_env,
+    )
     schema_steps = {"steps": [{"tool": str, "args": dict}]}
     parsed_steps = await committee_jsonify(
         text or "{}",
@@ -3485,7 +3508,19 @@ async def planner_produce_plan(messages: List[Dict[str, Any]], tools: Optional[L
         trace_id=str(trace_id or "planner"),
         temperature=0.0,
     )
+    # Log raw planner steps before any normalization/cleanup so we can debug
+    # JSONFixer / parser behavior end-to-end.
+    _log(
+        "planner.steps.pre_normalize",
+        trace_id=trace_id,
+        steps=parsed_steps.get("steps"),
+    )
     steps = parsed_steps.get("steps") or []
+    _log(
+        "planner.steps.post_normalize",
+        trace_id=trace_id,
+        steps=steps,
+    )
     if not steps:
         return "", []
     _log("planner.steps", trace_id=trace_id, steps=steps)
@@ -8876,6 +8911,12 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         {"role": "system", "content": "You are a planning committee. Propose a high-level tool strategy as JSON: {\"rationale\": str, \"tools_outline\": [str]}."},
         {"role": "user", "content": committee_user_text or "No user text available."},
     ]
+    # Log full preplan prompt so we can see exactly what guidance the committee saw.
+    _log(
+        "committee.preplan.messages",
+        trace_id=trace_id,
+        messages=committee_msgs,
+    )
     env_preplan = await committee_ai_text(
         committee_msgs,
         trace_id=str(trace_id or "committee_preplan"),
@@ -8883,6 +8924,12 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     )
     committee_errors: List[Dict[str, Any]] = []
     preplan_options: List[Dict[str, Any]] = []
+    # Log the raw preplan envelope from the committee for debugging.
+    _log(
+        "committee.preplan.env",
+        trace_id=trace_id,
+        env=env_preplan,
+    )
     if isinstance(env_preplan, dict) and env_preplan.get("ok"):
         res_pre = env_preplan.get("result") or {}
         text_pre = res_pre.get("text") or ""
@@ -10534,32 +10581,23 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         final_env=None,  # will be attached below after bump/assert/stamp
     )
     if isinstance(final_env, dict) and final_env:
-        try:
-            final_env = _env_bump(final_env); _env_assert(final_env)
-            final_env = _env_stamp(final_env, tool=None, model=COMMITTEE_MODEL_ID)
-        except Exception:
-            logging.debug("final_env bump/assert/stamp failed:\n%s", traceback.format_exc())
+        final_env = _env_bump(final_env); _env_assert(final_env)
+        final_env = _env_stamp(final_env, tool=None, model=COMMITTEE_MODEL_ID)
         # Optional ablation: extract grounded facts and export
-        try:
-            do_ablate = True
-            do_export = True
-            scope = "auto"
-            if do_ablate:
-                abl = ablate_env(final_env, scope_hint=(scope if scope != "auto" else "chat"))
-                final_env["ablated"] = abl
-                if do_export:
-                    try:
-                        outdir = os.path.join(UPLOAD_DIR, "ablation", trace_id)
-                        facts_path = ablate_write_facts(abl, trace_id, outdir)
-                        # attach a reference to the exported dataset
-                        response.setdefault("artifacts", {})
-                        if isinstance(response["artifacts"], dict):
-                            uri = _uri_from_upload_path(facts_path)
-                            response["artifacts"]["ablation_facts"] = {"uri": uri}
-                    except Exception:
-                        logging.debug("ablation facts export failed:\n%s", traceback.format_exc())
-        except Exception:
-            logging.debug("ablation phase failed:\n%s", traceback.format_exc())
+        do_ablate = True
+        do_export = True
+        scope = "auto"
+        if do_ablate:
+            abl = ablate_env(final_env, scope_hint=(scope if scope != "auto" else "chat"))
+            final_env["ablated"] = abl
+            if do_export:
+                outdir = os.path.join(UPLOAD_DIR, "ablation", trace_id)
+                facts_path = ablate_write_facts(abl, trace_id, outdir)
+                # attach a reference to the exported dataset
+                response.setdefault("artifacts", {})
+                if isinstance(response["artifacts"], dict):
+                    uri = _uri_from_upload_path(facts_path)
+                    response["artifacts"]["ablation_facts"] = {"uri": uri}
         response["envelope"] = final_env
     # Finalize artifacts shard and write a tiny manifest reference
     if _ledger_shard is not None:
@@ -10585,6 +10623,26 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     # Mirror planner routing decision from planner_produce_plan for trace metadata.
     _use_qwen2 = str(PLANNER_MODEL or "qwen").lower().startswith("qwen")
     planner_id = QWEN_MODEL_ID if _use_qwen2 else GLM_MODEL_ID
+    # Prefer the last assistant message from the final envelope's result.messages
+    # (excludes RoE/system tails) when available; otherwise fall back to the
+    # composed display_content used for the OpenAI response.
+    response_text_for_teacher = display_content or ""
+    if isinstance(final_env, dict):
+        res_block = final_env.get("result")
+        msgs_block = res_block.get("messages") if isinstance(res_block, dict) else None
+        if isinstance(msgs_block, list):
+            last_assistant: str | None = None
+            for m in msgs_block:
+                if not isinstance(m, dict):
+                    continue
+                if m.get("role") != "assistant":
+                    continue
+                content = m.get("content")
+                if isinstance(content, str) and content.strip():
+                    last_assistant = content
+            if isinstance(last_assistant, str) and last_assistant.strip():
+                response_text_for_teacher = last_assistant
+
     trace_payload = {
         "label": label_cfg or "exp_default",
         "seed": master_seed,
@@ -10592,7 +10650,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         "context": ({"pack_hash": pack_hash} if pack_hash else {}),
         "routing": {"planner_model": planner_id, "executors": [QWEN_MODEL_ID, GLM_MODEL_ID, DEEPSEEK_CODER_MODEL_ID], "seed_router": det_seed_router(trace_id, master_seed)},
         "tool_calls": _tc2,
-        "response": {"text": (display_content or "")[:4000]},
+        "response": {"text": (response_text_for_teacher or "")[:4000]},
         "metrics": usage,
         "env": {"public_base_url": PUBLIC_BASE_URL, "config_hash": WRAPPER_CONFIG_HASH},
         "privacy": {"vault_refs": 0, "secrets_in": 0, "secrets_out": 0},
@@ -10680,35 +10738,32 @@ async def refs_resolve(body: Dict[str, Any]):
 def _build_locks_from_context(cid: str) -> Dict[str, Any]:
     locks: Dict[str, Any] = {"characters": []}
     # Pick recent artifacts
-    try:
-        last_img = _ctx_resolve(cid, "last image", "image")
-        last_voice = _ctx_resolve(cid, "last voice", "audio")
-        last_music = _ctx_resolve(cid, "last music", "audio")
-        char: Dict[str, Any] = {"id": "C_A"}
-        # Save temporary refs for each kind and wire ref_ids
-        if last_img and isinstance(last_img.get("path"), str):
-            ref = _refs_save({"kind": "image", "title": f"ctx:{cid}:image", "files": {"images": [last_img.get("path")]}, "compute_embeds": False})
-            if isinstance(ref, dict) and isinstance(ref.get("ref"), dict):
-                char["image_ref_id"] = ref["ref"].get("ref_id")
-        if last_voice and isinstance(last_voice.get("path"), str):
-            ref = _refs_save({"kind": "voice", "title": f"ctx:{cid}:voice", "files": {"voice_samples": [last_voice.get("path")]}, "compute_embeds": False})
-            if isinstance(ref, dict) and isinstance(ref.get("ref"), dict):
-                char["voice_ref_id"] = ref["ref"].get("ref_id")
-        if last_music and isinstance(last_music.get("path"), str):
-            # Collect any stems tagged in recent context
-            stems: List[str] = []
-            for it in reversed(_ctx_list(cid, limit=20, kind_hint="audio")):
-                tags = it.get("tags") or []
-                if any(str(t).startswith("stem:") for t in tags):
-                    pth = it.get("path")
-                    if isinstance(pth, str): stems.append(pth)
-            ref = _refs_save({"kind": "music", "title": f"ctx:{cid}:music", "files": {"track": last_music.get("path"), "stems": stems}, "compute_embeds": False})
-            if isinstance(ref, dict) and isinstance(ref.get("ref"), dict):
-                char["music_ref_id"] = ref["ref"].get("ref_id")
-        if len(char) > 1:
-            locks["characters"].append(char)
-    except Exception:
-        logging.debug("locks build from context failed:\n%s", traceback.format_exc())
+    last_img = _ctx_resolve(cid, "last image", "image")
+    last_voice = _ctx_resolve(cid, "last voice", "audio")
+    last_music = _ctx_resolve(cid, "last music", "audio")
+    char: Dict[str, Any] = {"id": "C_A"}
+    # Save temporary refs for each kind and wire ref_ids
+    if last_img and isinstance(last_img.get("path"), str):
+        ref = _refs_save({"kind": "image", "title": f"ctx:{cid}:image", "files": {"images": [last_img.get("path")]}, "compute_embeds": False})
+        if isinstance(ref, dict) and isinstance(ref.get("ref"), dict):
+            char["image_ref_id"] = ref["ref"].get("ref_id")
+    if last_voice and isinstance(last_voice.get("path"), str):
+        ref = _refs_save({"kind": "voice", "title": f"ctx:{cid}:voice", "files": {"voice_samples": [last_voice.get("path")]}, "compute_embeds": False})
+        if isinstance(ref, dict) and isinstance(ref.get("ref"), dict):
+            char["voice_ref_id"] = ref["ref"].get("ref_id")
+    if last_music and isinstance(last_music.get("path"), str):
+        # Collect any stems tagged in recent context
+        stems: List[str] = []
+        for it in reversed(_ctx_list(cid, limit=20, kind_hint="audio")):
+            tags = it.get("tags") or []
+            if any(str(t).startswith("stem:") for t in tags):
+                pth = it.get("path")
+                if isinstance(pth, str): stems.append(pth)
+        ref = _refs_save({"kind": "music", "title": f"ctx:{cid}:music", "files": {"track": last_music.get("path"), "stems": stems}, "compute_embeds": False})
+        if isinstance(ref, dict) and isinstance(ref.get("ref"), dict):
+            char["music_ref_id"] = ref["ref"].get("ref_id")
+    if len(char) > 1:
+        locks["characters"].append(char)
     return locks
 
 
@@ -10830,7 +10885,7 @@ async def tools_append(body: Dict[str, Any], request: Request):
                     if isinstance(s.get("wav_bytes"), int) and s.get("wav_bytes") > 0:
                         checkpoints_append_event(STATE_DIR, str(trace_id), "artifact_summary", {"kind": "audio", "bytes": int(s.get("wav_bytes"))})
                 except Exception:
-                    logging.debug("artifact summary distillation failed:\n%s", traceback.format_exc())
+                    logging.info("artifact summary distillation failed:\n%s", traceback.format_exc())
             # Forward review WS events to connected client if present
             try:
                 app = request.app
@@ -10840,7 +10895,7 @@ async def tools_append(body: Dict[str, Any], request: Request):
                     payload = {"type": row["event"], "trace_id": str(trace_id), "step_id": row.get("step_id"), "notes": row.get("notes")}
                     await ws.send_json(payload)
             except Exception:
-                logging.debug("websocket forward failed:\n%s", traceback.format_exc())
+                logging.info("websocket forward failed:\n%s", traceback.format_exc())
     except Exception:
         return JSONResponse(status_code=400, content={"error": "append_failed"})
     return {"ok": True}

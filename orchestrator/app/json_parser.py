@@ -480,6 +480,6 @@ class JSONParser:
         self.errors.append(msg)
         # Surface parser diagnostics through the shared logger so they land
         # in the central orchestrator logs instead of a private file.
-        logger.debug(f"JSONParser error: {msg}")
+        logger.info(f"JSONParser error: {msg}")
 
 
