@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional
 from ..json_parser import JSONParser
 from ..pipeline.compression_orchestrator import co_pack, frames_to_string
 from ..datasets.trace import append_sample as _trace_append
-from ..main import committee_ai_text
+from ..committee_client import CommitteeClient
 
 
 # Expected Song Graph shape for coercion. This is intentionally minimal and
@@ -151,7 +151,8 @@ async def plan_song_graph(
     )
 
     # Route song planner exclusively through the central committee debate.
-    env = await committee_ai_text(
+    client = CommitteeClient()
+    env = await client.run(
         [
             {"role": "system", "content": "You are SongOps. Output ONLY JSON per the song schema."},
             {"role": "user", "content": prompt},

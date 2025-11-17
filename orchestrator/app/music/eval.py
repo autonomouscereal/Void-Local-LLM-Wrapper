@@ -281,10 +281,11 @@ def _call_music_eval_committee(summary: str) -> Dict[str, Any]:
             "content": summary,
         },
     ]
-    # Local import to avoid circular dependency between main.py and music.eval.
-    from ..main import committee_ai_text  # type: ignore
+    from ..committee_client import CommitteeClient  # type: ignore
+    import asyncio
 
-    env = committee_ai_text(messages, trace_id="music_eval", rounds=3)
+    client = CommitteeClient()
+    env = asyncio.run(client.run(messages, trace_id="music_eval", rounds=3))
     if not isinstance(env, dict) or not env.get("ok"):
         raise RuntimeError("music_eval committee did not return ok")
     result = env.get("result") or {}

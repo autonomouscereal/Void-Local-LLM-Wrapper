@@ -5,7 +5,7 @@ from typing import Dict, Any
 
 from ..json_parser import JSONParser
 from ..pipeline.compression_orchestrator import co_pack, frames_to_string
-from ..main import committee_ai_text
+from ..committee_client import CommitteeClient
 
 
 PLAN_SCHEMA: Dict[str, Any] = {
@@ -51,7 +51,8 @@ async def _call_llm_json(prompt: str) -> Dict[str, Any]:
     The committee debate produces free-form text; we then parse that text
     into PLAN_SCHEMA via JSONParser. No direct calls to Ollama here.
     """
-    env = await committee_ai_text(
+    client = CommitteeClient()
+    env = await client.run(
         [{"role": "system", "content": "You are a multimodal planner. Output ONLY JSON per the schema."},
          {"role": "user", "content": prompt}],
         trace_id="planner_legacy",
