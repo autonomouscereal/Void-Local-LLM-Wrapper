@@ -5,7 +5,7 @@ from typing import Dict, Any
 
 from ..json_parser import JSONParser
 from ..pipeline.compression_orchestrator import co_pack, frames_to_string
-from ..committee_client import CommitteeClient
+from ..committee_client import CommitteeClient, committee_jsonify
 
 
 PLAN_SCHEMA: Dict[str, Any] = {
@@ -51,10 +51,13 @@ async def _call_llm_json(prompt: str, trace_id: str) -> Dict[str, Any]:
     The committee debate produces free-form text; we then parse that text
     into PLAN_SCHEMA via JSONParser. No direct calls to Ollama here.
     """
+    # First, route through the main planner committee to get a rich text answer.
     client = CommitteeClient()
     env = await client.run(
-        [{"role": "system", "content": "You are a multimodal planner. Output ONLY JSON per the schema."},
-         {"role": "user", "content": prompt}],
+        [
+            {"role": "system", "content": "You are a multimodal planner. Output ONLY JSON per the schema."},
+            {"role": "user", "content": prompt},
+        ],
         trace_id=trace_id,
         rounds=3,
     )
@@ -62,8 +65,15 @@ async def _call_llm_json(prompt: str, trace_id: str) -> Dict[str, Any]:
         return {"request_id": "", "plan": []}
     res = env.get("result") or {}
     text = res.get("text") or ""
-    parser = JSONParser()
-    parsed = parser.parse(text or "{}", PLAN_SCHEMA)
+
+    # Then, run the raw planner text through committee.jsonify to enforce PLAN_SCHEMA.
+    parsed = await committee_jsonify(
+        text or "{}",
+        expected_schema=PLAN_SCHEMA,
+        trace_id=trace_id,
+        rounds=2,
+        temperature=0.0,
+    )
     return parsed if isinstance(parsed, dict) else {"request_id": "", "plan": []}
 
 

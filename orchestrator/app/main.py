@@ -2975,6 +2975,7 @@ from .committee_client import (
     COMMITTEE_MODEL_ID,
     COMMITTEE_PARTICIPANTS,
     committee_ai_text,
+    committee_jsonify,
 )
 
 
@@ -3478,8 +3479,14 @@ async def planner_produce_plan(messages: List[Dict[str, Any]], tools: Optional[L
         return "", []
     res_env = env.get("result") or {}
     text = res_env.get("text") or ""
-    parser = JSONParser()
-    parsed_steps = parser.parse(text or "{}", {"steps": [{"tool": str, "args": dict}]})
+    schema_steps = {"steps": [{"tool": str, "args": dict}]}
+    parsed_steps = await committee_jsonify(
+        text or "{}",
+        expected_schema=schema_steps,
+        trace_id=str(trace_id or "planner"),
+        rounds=2,
+        temperature=0.0,
+    )
     steps = parsed_steps.get("steps") or []
     if not steps:
         return "", []
@@ -3557,10 +3564,13 @@ async def postrun_committee_decide(
     if isinstance(env_decide, dict) and env_decide.get("ok"):
         res_decide = env_decide.get("result") or {}
         txt_decide = res_decide.get("text") or ""
-        parser = JSONParser()
-        obj = parser.parse(
+        schema_decide = {"action": str, "rationale": str, "patch_plan": [{"tool": str, "args": dict}]}
+        obj = await committee_jsonify(
             txt_decide or "{}",
-            {"action": str, "rationale": str, "patch_plan": [{"tool": str, "args": dict}]},
+            expected_schema=schema_decide,
+            trace_id=str(trace_id or "committee_postrun"),
+            rounds=2,
+            temperature=0.0,
         )
         action = (obj.get("action") or "").strip().lower() or "go"
         rationale = (obj.get("rationale") or "") if isinstance(obj.get("rationale"), str) else ""
@@ -8663,6 +8673,12 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     t0 = time.time()
     # Single-exit accumulator for prebuilt final responses (avoid early returns)
     response_prebuilt = None
+    # Initialize per-backend envelopes upfront so they are always defined,
+    # even if upstream committee calls fail early.
+    qwen_result: Dict[str, Any] = {}
+    glm_result: Dict[str, Any] = {}
+    deepseek_result: Dict[str, Any] = {}
+    synth_result: Dict[str, Any] = {}
     # Request shaping (pure; no network)
     shaped = shape_request(
         body or {},
@@ -8800,7 +8816,6 @@ async def chat_completions(body: Dict[str, Any], request: Request):
 
     # Run a lightweight two-model committee to propose planning strategies.
     preplan_options: List[Dict[str, Any]] = []
-    parser = JSONParser()
     # Compact summary of the current conversation for committee members
     committee_user_text = (last_user_text or "").strip()
     committee_msgs = [
@@ -8818,7 +8833,14 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     if isinstance(env_preplan, dict) and env_preplan.get("ok"):
         res_pre = env_preplan.get("result") or {}
         text_pre = res_pre.get("text") or ""
-        parsed = parser.parse(text_pre or "{}", {"rationale": str, "tools_outline": [str]})
+        schema_pre = {"rationale": str, "tools_outline": [str]}
+        parsed = await committee_jsonify(
+            text_pre or "{}",
+            expected_schema=schema_pre,
+            trace_id=str(trace_id or "committee_preplan"),
+            rounds=2,
+            temperature=0.0,
+        )
         rationale = (parsed.get("rationale") or text_pre or "").strip()
         tools_outline = parsed.get("tools_outline") or []
         opt_id = "opt_committee"
@@ -9757,21 +9779,37 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         temperature=body.get("temperature") or DEFAULT_TEMPERATURE,
     )
     # Synthesize per-backend result views from the unified committee envelope for legacy fallback logic.
-    qwen_result: Dict[str, Any] = {}
-    glm_result: Dict[str, Any] = {}
-    deepseek_result: Dict[str, Any] = {}
     if isinstance(llm_env, dict):
         err = llm_env.get("error")
         res = llm_env.get("result") or {}
         txt = res.get("text")
+        # Prefer structured per-backend envelopes surfaced by the committee when available.
+        qwen_env = res.get("qwen") if isinstance(res, dict) else None
+        glm_env = res.get("glm") if isinstance(res, dict) else None
+        deepseek_env = res.get("deepseek") if isinstance(res, dict) else None
+        synth_env_struct = res.get("synth") if isinstance(res, dict) else None
+        if isinstance(qwen_env, dict):
+            qwen_result = dict(qwen_env)
+        if isinstance(glm_env, dict):
+            glm_result = dict(glm_env)
+        if isinstance(deepseek_env, dict):
+            deepseek_result = dict(deepseek_env)
+        if isinstance(synth_env_struct, dict):
+            synth_result = dict(synth_env_struct)
+        # Backward-compatible fallback when committee did not expose per-backend structs.
         base_payload = {
             "error": err,
             "response": txt,
             "_base_url": "committee",
         }
-        qwen_result = dict(base_payload)
-        glm_result = dict(base_payload)
-        deepseek_result = dict(base_payload)
+        if not qwen_result:
+            qwen_result = dict(base_payload)
+        if not glm_result:
+            glm_result = dict(base_payload)
+        if not deepseek_result:
+            deepseek_result = dict(base_payload)
+        if not synth_result:
+            synth_result = dict(base_payload)
 
     # If backends errored but we have tool results (e.g., image job still running/finishing), degrade gracefully.
     if qwen_result.get("error") or glm_result.get("error") or deepseek_result.get("error"):
@@ -9876,9 +9914,10 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         response_prebuilt = response
         # Do not return; finalize at the unified tail
 
-    qwen_text = qwen_result.get("response", "")
-    glm_text = glm_result.get("response", "")
-    deepseek_text = deepseek_result.get("response", "")
+    # Normalize per-backend responses to always be strings for downstream logic.
+    qwen_text = (qwen_result.get("response") or "")
+    glm_text = (glm_result.get("response") or "")
+    deepseek_text = (deepseek_result.get("response") or "")
     # Preserve the first-pass model outputs for robust fallback in final composition
     orig_qwen_text = qwen_text
     orig_glm_text = glm_text
@@ -10084,10 +10123,19 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         temperature=body.get("temperature") or DEFAULT_TEMPERATURE,
     )
     final_text = ""
+    # Prefer the structured synth result when available.
     if isinstance(synth_env, dict) and synth_env.get("ok"):
         res_syn = synth_env.get("result") or {}
-        if isinstance(res_syn, dict) and isinstance(res_syn.get("text"), str):
-            final_text = res_syn.get("text") or ""
+        if isinstance(res_syn, dict):
+            synth_struct = res_syn.get("synth")
+            if isinstance(synth_struct, dict):
+                # Keep the full synth envelope (including usage) for downstream accounting.
+                synth_result = dict(synth_struct)
+                text_candidate = synth_result.get("response") or res_syn.get("text")
+            else:
+                text_candidate = res_syn.get("text")
+            if isinstance(text_candidate, str):
+                final_text = text_candidate or ""
     if not final_text:
         final_text = qwen_text or glm_text or deepseek_text or ""
     # Append discovered asset URLs from tool results so users see concrete outputs inline

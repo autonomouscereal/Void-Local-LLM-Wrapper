@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional
 
 from ..analysis.media import analyze_audio, _load_audio  # type: ignore
 from ..json_parser import JSONParser
+from ..committee_client import committee_jsonify  # type: ignore
 from .style_pack import _embed_music_clap, _cos_sim
 
 
@@ -281,16 +282,8 @@ def _call_music_eval_committee(summary: str) -> Dict[str, Any]:
             "content": summary,
         },
     ]
-    from ..committee_client import CommitteeClient  # type: ignore
     import asyncio
 
-    client = CommitteeClient()
-    env = asyncio.run(client.run(messages, trace_id="music_eval", rounds=3))
-    if not isinstance(env, dict) or not env.get("ok"):
-        raise RuntimeError("music_eval committee did not return ok")
-    result = env.get("result") or {}
-    txt = result.get("text") or ""
-    parser = JSONParser()
     schema = {
         "overall_quality_score": float,
         "fit_score": float,
@@ -298,8 +291,28 @@ def _call_music_eval_committee(summary: str) -> Dict[str, Any]:
         "cohesion_score": float,
         "issues": [str],
     }
-    parsed = parser.parse(txt or "{}", schema)
-    return parsed if isinstance(parsed, dict) else {}
+
+    async def _run() -> Dict[str, Any]:
+        # First, obtain the raw MusicEval text via the main committee path.
+        from ..committee_client import CommitteeClient  # type: ignore
+
+        client = CommitteeClient()
+        env = await client.run(messages, trace_id="music_eval", rounds=3)
+        if not isinstance(env, dict) or not env.get("ok"):
+            raise RuntimeError("music_eval committee did not return ok")
+        result = env.get("result") or {}
+        txt = result.get("text") or ""
+        # Then, pass the raw text through committee_jsonify to enforce the schema.
+        parsed = await committee_jsonify(
+            txt or "{}",
+            expected_schema=schema,
+            trace_id="music_eval",
+            rounds=2,
+            temperature=0.0,
+        )
+        return parsed if isinstance(parsed, dict) else {}
+
+    return asyncio.run(_run())
 
 
 def eval_aesthetic(all_axes: Dict[str, Any], film_context: Optional[Dict[str, Any]]) -> Dict[str, Any]:

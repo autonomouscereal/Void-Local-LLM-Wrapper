@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional
 from ..json_parser import JSONParser
 from ..pipeline.compression_orchestrator import co_pack, frames_to_string
 from ..datasets.trace import append_sample as _trace_append
-from ..committee_client import CommitteeClient
+from ..committee_client import CommitteeClient, committee_jsonify
 
 
 # Expected Song Graph shape for coercion. This is intentionally minimal and
@@ -150,7 +150,7 @@ async def plan_song_graph(
         + "Use section_ids and motif_ids that are stable and reusable.\n"
     )
 
-    # Route song planner exclusively through the central committee debate.
+    # First, route song planner through the main committee to produce a Song Graph text.
     client = CommitteeClient()
     env = await client.run(
         [
@@ -164,7 +164,15 @@ async def plan_song_graph(
         return {}
     res_env = env.get("result") or {}
     txt = res_env.get("text") or ""
-    parsed = JSONParser().parse(txt or "{}", schema_wrapper)
+
+    # Then, run the Song Graph text through committee.jsonify to enforce strict JSON.
+    parsed = await committee_jsonify(
+        txt or "{}",
+        expected_schema=schema_wrapper,
+        trace_id=trace_id or "song_plan",
+        rounds=2,
+        temperature=0.0,
+    )
     song = parsed.get("song")
     if isinstance(song, dict):
         sections = song.get("sections") if isinstance(song.get("sections"), list) else []
