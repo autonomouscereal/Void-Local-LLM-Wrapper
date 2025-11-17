@@ -10192,6 +10192,9 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         provided_seed3 = int(body.get("seed")) if isinstance(body.get("seed"), (int, float)) else None
         master_seed = provided_seed3 if provided_seed3 is not None else _derive_seed("chat", msgs_for_seed)
         seed_router = det_seed_router(trace_id, master_seed)
+        # Mirror planner routing decision from planner_produce_plan for trace metadata.
+        _use_qwen = str(PLANNER_MODEL or "qwen").lower().startswith("qwen")
+        planner_id = QWEN_MODEL_ID if _use_qwen else GLM_MODEL_ID
         label_cfg = (WRAPPER_CONFIG.get("teacher") or {}).get("default_label")
         # Normalize tool_calls shape for teacher (use args, not arguments)
         _tc = tool_exec_meta or []
@@ -10666,6 +10669,9 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     label_cfg = (WRAPPER_CONFIG.get("teacher") or {}).get("default_label")
     # Normalize tool_calls shape for teacher (use args, not arguments)
     _tc2 = tool_exec_meta or []
+    # Mirror planner routing decision from planner_produce_plan for trace metadata.
+    _use_qwen2 = str(PLANNER_MODEL or "qwen").lower().startswith("qwen")
+    planner_id = QWEN_MODEL_ID if _use_qwen2 else GLM_MODEL_ID
     trace_payload = {
         "label": label_cfg or "exp_default",
         "seed": master_seed,
