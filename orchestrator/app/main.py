@@ -4101,7 +4101,9 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             js = parser.parse(r.text or "", {"faces": list, "hands": list, "objects": list, "quality": dict})
             return {"name": name, "result": js}
         except Exception as ex:
-            return {"name": name, "error": f"vision_repair_error: {ex}"}
+            _tb = traceback.format_exc()
+            logging.error(_tb)
+            return {"name": name, "error": f"vision_repair_error: {ex}", "traceback": _tb}
     if name == "image.repair" and VISION_REPAIR_API_URL and ALLOW_TOOL_EXECUTION:
         src = args.get("src") or args.get("image_path") or ""
         if not isinstance(src, str) or not src:
@@ -4125,7 +4127,9 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             js = parser.parse(r.text or "", {"repaired_image_path": str, "regions": list, "mode": (str,)})
             return {"name": name, "result": js}
         except Exception as ex:
-            return {"name": name, "error": f"vision_repair_error: {ex}"}
+            _tb = traceback.format_exc()
+            logging.error(_tb)
+            return {"name": name, "error": f"vision_repair_error: {ex}", "traceback": _tb}
     if name == "video.refine.clip" and ALLOW_TOOL_EXECUTION:
         a = args if isinstance(args, dict) else {}
         segment_id_val = a.get("segment_id")
@@ -4590,6 +4594,13 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             }
             if character_ids:
                 music_args["character_id"] = character_ids[0]
+            # Trace: Film2 → music front-door call start
+            if trace_id:
+                trace_append("film2.music.start", {
+                    "trace_id": trace_id,
+                    "tool": "music.infinite.windowed",
+                    "args": {k: v for k, v in music_args.items() if k not in ("lock_bundle",)},
+                })
             # Avoid recursion into execute_tool_call; call the canonical /tool.run bridge instead.
             music_call = await http_tool_run("music.infinite.windowed", music_args)
             if isinstance(music_call, dict):
@@ -4597,6 +4608,13 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         final_music_mix_path: str | None = None
         final_music_eval: Dict[str, Any] | None = None
         if music_meta and isinstance(result.get("meta"), dict):
+            # Trace: Film2 → music completion summary
+            if trace_id:
+                trace_append("film2.music.finish", {
+                    "trace_id": trace_id,
+                    "tool": "music.infinite.windowed",
+                    "meta": music_meta.get("meta") if isinstance(music_meta.get("meta"), dict) else {},
+                })
             # Tag music windows with scene/shot ids using simple time slicing.
             meta_obj = music_meta.get("meta") if isinstance(music_meta.get("meta"), dict) else {}
             win_list = meta_obj.get("windows") if isinstance(meta_obj.get("windows"), list) else []
@@ -5584,7 +5602,9 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                         if "." in p:
                             ext = "." + p.split(".")[-1].lower()
             except Exception as ex:
-                return {"name": name, "error": f"fetch_error: {str(ex)}"}
+                _tb = traceback.format_exc()
+                logging.error(_tb)
+                return {"name": name, "error": f"fetch_error: {str(ex)}", "traceback": _tb}
         elif isinstance(args.get("path"), str) and args.get("path").strip():
             try:
                 rel = args.get("path").strip()
@@ -5597,7 +5617,9 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 if not ext and "." in rel:
                     ext = "." + rel.split(".")[-1].lower()
             except Exception as ex:
-                return {"name": name, "error": f"path_error: {str(ex)}"}
+                _tb = traceback.format_exc()
+                logging.error(_tb)
+                return {"name": name, "error": f"path_error: {str(ex)}", "traceback": _tb}
         else:
             return {"name": name, "error": "missing b64|url|path"}
         async with httpx.AsyncClient() as client:
@@ -5623,7 +5645,9 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                         if "." in p:
                             ext = "." + p.split(".")[-1].lower()
             except Exception as ex:
-                return {"name": name, "error": f"fetch_error: {str(ex)}"}
+                _tb = traceback.format_exc()
+                logging.error(_tb)
+                return {"name": name, "error": f"fetch_error: {str(ex)}", "traceback": _tb}
         elif isinstance(args.get("path"), str) and args.get("path").strip():
             try:
                 rel = args.get("path").strip()
@@ -5636,7 +5660,9 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 if not ext and "." in rel:
                     ext = "." + rel.split(".")[-1].lower()
             except Exception as ex:
-                return {"name": name, "error": f"path_error: {str(ex)}"}
+                _tb = traceback.format_exc()
+                logging.error(_tb)
+                return {"name": name, "error": f"path_error: {str(ex)}", "traceback": _tb}
         else:
             return {"name": name, "error": "missing b64|url|path"}
         async with httpx.AsyncClient() as client:
@@ -5767,7 +5793,17 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             lock_bundle["music"] = music_branch
         if lock_bundle:
             a["lock_bundle"] = lock_bundle
-
+        # Trace: standalone music.infinite.windowed start
+        trace_val = a.get("trace_id") if isinstance(a.get("trace_id"), str) else None
+        if trace_val:
+            trace_append("music.infinite.windowed.start", {
+                "trace_id": trace_val,
+                "tool": "music.infinite.windowed",
+                "prompt": prompt_text,
+                "length_s": length_s,
+                "bpm": bpm_int,
+                "key": key_txt,
+            })
         env = run_music_infinite_windowed(a, provider, manifest)
 
         # Persist updated lock bundle (including song graph and windows) when character_id present.
@@ -5778,6 +5814,14 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             # Persistence failures should not hide the main music result.
             pass
 
+        # Trace: standalone music.infinite.windowed finish
+        if trace_val:
+            meta_env = env.get("meta") if isinstance(env, dict) else {}
+            trace_append("music.infinite.windowed.finish", {
+                "trace_id": trace_val,
+                "tool": "music.infinite.windowed",
+                "meta": meta_env if isinstance(meta_env, dict) else {},
+            })
         return {"name": name, "result": env}
     if name == "music.compose" and ALLOW_TOOL_EXECUTION:
         if not MUSIC_API_URL:
@@ -5924,7 +5968,9 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     meta_block["locks"] = locks_meta
             return {"name": name, "result": env}
         except Exception as ex:
-            return {"name": name, "error": str(ex)}
+            _tb = traceback.format_exc()
+            logging.error(_tb)
+            return {"name": name, "error": str(ex), "traceback": _tb}
     if name == "music.variation" and ALLOW_TOOL_EXECUTION:
         manifest = {"items": []}
         try:
@@ -5966,7 +6012,9 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                             meta_env.setdefault("locks", {"bundle": lock_bundle})
             return {"name": name, "result": env}
         except Exception as ex:
-            return {"name": name, "error": str(ex)}
+            _tb = traceback.format_exc()
+            logging.error(_tb)
+            return {"name": name, "error": str(ex), "traceback": _tb}
     if name == "music.refine.window" and ALLOW_TOOL_EXECUTION:
         if not MUSIC_API_URL:
             return {"name": name, "error": "MUSIC_API_URL not configured"}
@@ -6133,7 +6181,9 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             )
             return {"name": name, "result": env}
         except Exception as ex:
-            return {"name": name, "error": str(ex)}
+            _tb = traceback.format_exc()
+            logging.error(_tb)
+            return {"name": name, "error": str(ex), "traceback": _tb}
     if name == "music.mixdown" and ALLOW_TOOL_EXECUTION:
         manifest = {"items": []}
         try:
@@ -6225,7 +6275,9 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                         meta_env.setdefault("quality_profile", quality_profile)
             return {"name": name, "result": env}
         except Exception as ex:
-            return {"name": name, "error": str(ex)}
+            _tb = traceback.format_exc()
+            logging.error(_tb)
+            return {"name": name, "error": str(ex), "traceback": _tb}
     # --- Creative helpers ---
     if name == "creative.alt_takes" and ALLOW_TOOL_EXECUTION:
         # Run N variants with orthogonal seeds, score via committee, pick best, return all URLs
@@ -6354,7 +6406,9 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             uri = path.replace("/workspace", "") if path.startswith("/workspace/") else path
             return {"name": name, "result": {"dna": dna, "uri": uri}}
         except Exception as ex:
-            return {"name": name, "error": str(ex)}
+            _tb = traceback.format_exc()
+            logging.error(_tb)
+            return {"name": name, "error": str(ex), "traceback": _tb}
     if name == "refs.auto_hunt" and ALLOW_TOOL_EXECUTION:
         try:
             q = args.get("query") or ""
@@ -6368,7 +6422,9 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     links.append(u)
             return {"name": name, "result": {"refs": links}}
         except Exception as ex:
-            return {"name": name, "error": str(ex)}
+            _tb = traceback.format_exc()
+            logging.error(_tb)
+            return {"name": name, "error": str(ex), "traceback": _tb}
     if name == "director.mode" and ALLOW_TOOL_EXECUTION:
         t = (args.get("prompt") or "").lower()
         qs = []
@@ -6407,7 +6463,9 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             global_info = _analyze_image(src, prompt)
             region_info = _analyze_image_regions(src, prompt, global_info)
         except Exception as ex:
-            return {"name": name, "error": f"image_qa_error:{ex}"}
+            _tb = traceback.format_exc()
+            logging.error(_tb)
+            return {"name": name, "error": f"image_qa_error:{ex}", "traceback": _tb}
         # Attach a QA-shaped summary so compute_domain_qa can consume it if needed
         qa_block: Dict[str, Any] = {}
         if isinstance(global_info, dict):
@@ -9789,109 +9847,6 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             deepseek_result = dict(base_payload)
         if not synth_result:
             synth_result = dict(base_payload)
-
-    # If backends errored but we have tool results (e.g., image job still running/finishing), degrade gracefully.
-    if qwen_result.get("error") or glm_result.get("error") or deepseek_result.get("error"):
-        if tool_results:
-            # Build a minimal assets block so the UI can render generated media even if models errored
-            def _asset_urls_from_tools(results: List[Dict[str, Any]]) -> List[str]:
-                urls: List[str] = []
-                for tr in results or []:
-                    try:
-                        res = (tr or {}).get("result") or {}
-                        if isinstance(res, dict):
-                            # envelope-based tools
-                            meta = res.get("meta")
-                            arts = res.get("artifacts")
-                            if isinstance(meta, dict) and isinstance(arts, list):
-                                cid = meta.get("cid")
-                                for a in arts:
-                                    aid = (a or {}).get("id")
-                                    kind = (a or {}).get("kind") or ""
-                                    if cid and aid:
-                                        if kind.startswith("image"):
-                                            urls.append(f"/uploads/artifacts/image/{cid}/{aid}")
-                                        elif kind.startswith("audio"):
-                                            # allow both tts and music paths
-                                            urls.append(f"/uploads/artifacts/audio/tts/{cid}/{aid}")
-                                            urls.append(f"/uploads/artifacts/music/{cid}/{aid}")
-                            # generic path scraping
-                            exts = (".mp4", ".webm", ".mov", ".mkv", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".wav", ".mp3", ".m4a", ".ogg", ".flac", ".opus", ".srt")
-                            def _walk(v):
-                                if isinstance(v, str):
-                                    s = v.strip().lower()
-                                    if not s:
-                                        return
-                                    if s.startswith("http://") or s.startswith("https://"):
-                                        urls.append(v)
-                                        return
-                                    if "/workspace/uploads/" in v:
-                                        try:
-                                            tail = v.split("/workspace", 1)[1]
-                                            urls.append(tail)
-                                        except Exception:
-                                            pass
-                                        return
-                                    if v.startswith("/uploads/"):
-                                        urls.append(v)
-                                        return
-                                    if any(s.endswith(ext) for ext in exts) and ("/uploads/" in s or "/workspace/uploads/" in s):
-                                        if "/workspace/uploads/" in v:
-                                            try:
-                                                tail = v.split("/workspace", 1)[1]
-                                                urls.append(tail)
-                                            except Exception:
-                                                pass
-                                        else:
-                                            urls.append(v)
-                                elif isinstance(v, list):
-                                    for it in v:
-                                        _walk(it)
-                                elif isinstance(v, dict):
-                                    for it in v.values():
-                                        _walk(it)
-                            _walk(res)
-                    except Exception:
-                        continue
-                return list(dict.fromkeys(urls))
-            asset_urls = _asset_urls_from_tools(tool_results)
-            final_text = "\n".join(["Assets:"] + [f"- {u}" for u in asset_urls]) if asset_urls else ""
-            usage = estimate_usage(messages, final_text)
-            response = {
-                "id": "orc-1",
-                "object": "chat.completion",
-                "model": COMMITTEE_MODEL_ID,
-                "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": final_text}}],
-                "usage": usage,
-                "seed": master_seed,
-            }
-            if _lock_token:
-                _release_lock(STATE_DIR, trace_id)
-            _trace_response(trace_id, response)
-            response_prebuilt = response
-            # Do not return early; finalize at unified tail
-        detail = {
-            "qwen": {k: v for k, v in qwen_result.items() if k in ("error", "_base_url")},
-            "glm": {k: v for k, v in glm_result.items() if k in ("error", "_base_url")},
-            "deepseek": {k: v for k, v in deepseek_result.items() if k in ("error", "_base_url")},
-        }
-        if _lock_token:
-            trace_release_lock(STATE_DIR, trace_id)
-        # Always return an OpenAI-compatible JSON envelope (200) with a short assistant message
-        msg = "Upstream backends failed; please retry. If this persists, check model backends."
-        usage = estimate_usage(messages, msg)
-        response = _build_openai_envelope(
-            ok=False,
-            text=msg,
-            error={"code": "backend_failed", "message": "one or more backends failed", "detail": detail},
-            usage=usage,
-            model=COMMITTEE_MODEL_ID,
-            seed=master_seed,
-            id_="orc-1",
-        )
-        _trace_response(trace_id, response)
-        response_prebuilt = response
-        # Do not return; finalize at the unified tail
 
     # Normalize per-backend responses to always be strings for downstream logic.
     qwen_text = (qwen_result.get("response") or "")

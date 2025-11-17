@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any, Dict, List
+import logging
 
 import os
 import json
@@ -47,6 +48,10 @@ UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/workspace/uploads")
 STATE_DIR = os.path.join(UPLOAD_DIR, "state")
 os.makedirs(STATE_DIR, exist_ok=True)
 
+# Use orchestrator-wide logging; no per-module basicConfig. All committee logs
+# go through the same handlers configured in app.main.
+log = logging.getLogger("orchestrator.committee")
+
 
 async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str) -> Dict[str, Any]:
     """
@@ -57,6 +62,13 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str) -> 
     """
     trace_key = str(trace_id or "committee")
     async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
+        # Log a lightweight request summary (no full prompt content).
+        log.info(
+            "[committee] ollama.request base=%s model=%s trace_id=%s",
+            base_url,
+            payload.get("model"),
+            trace_key,
+        )
         # Trace request (without full prompt content to avoid huge payloads).
         emit_trace(
             STATE_DIR,
@@ -89,6 +101,14 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str) -> 
             if isinstance(raw_resp, str):
                 resp_text = raw_resp.strip()
         preview = resp_text[:512] if resp_text else ""
+        log.debug(
+            "[committee] ollama.response base=%s model=%s trace_id=%s status=%s preview=%s",
+            base_url,
+            payload.get("model"),
+            trace_key,
+            getattr(resp, "status_code", None),
+            preview,
+        )
         emit_trace(
             STATE_DIR,
             trace_key,
