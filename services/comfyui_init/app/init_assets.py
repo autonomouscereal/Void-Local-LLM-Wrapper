@@ -137,17 +137,45 @@ def main() -> None:
                   f"{MODELS_ROOT}/ipadapter", "ip-adapter-plus-face_sdxl_vit-h.safetensors", token)
     dl("h94/IP-Adapter", "models/image_encoder/model.safetensors", f"{MODELS_ROOT}/ipadapter", "ip-adapter-image-encoder.safetensors", token)
 
-    # InstantID (ControlNet + adapter + insightface)
-    # InstantID (optional; some paths require license/cookies). Try, but do not block init if 404.
+    # InstantID (ControlNet + adapter) + antelopev2 InsightFace pack.
+    # InstantID weights are optional (some paths require license/cookies). Try, but do not block init if 404.
     try:
-        dl_candidates("InstantX/InstantID",
-                      ["models/ControlNetModel/diffusion_pytorch_model.safetensors"],
-                      f"{MODELS_ROOT}/controlnet", "controlnet-instantid.safetensors", token)
-        dl("InstantX/InstantID", "models/ip-adapter/instantid.safetensors", f"{MODELS_ROOT}/ipadapter", "instantid.safetensors", token)
-        dl("InstantX/InstantID", "models/insightface/models/antelopev2/m2.0.onnx", f"{MODELS_ROOT}/insightface", "m2.0.onnx", token)
-        dl("InstantX/InstantID", "models/insightface/models/antelopev2/genderage.onnx", f"{MODELS_ROOT}/insightface", "genderage.onnx", token)
+        dl_candidates(
+            "InstantX/InstantID",
+            ["models/ControlNetModel/diffusion_pytorch_model.safetensors"],
+            f"{MODELS_ROOT}/controlnet",
+            "controlnet-instantid.safetensors",
+            token,
+        )
+        dl(
+            "InstantX/InstantID",
+            "models/ip-adapter/instantid.safetensors",
+            f"{MODELS_ROOT}/ipadapter",
+            "instantid.safetensors",
+            token,
+        )
     except Exception as ex:
-        print("InstantID assets optional, continuing:", ex)
+        print("InstantID assets (controlnet/ip-adapter) optional, continuing:", ex)
+
+    # Canonical InsightFace antelopev2 ONNX pack for InstantID / FaceID.
+    # Use LPDoctor/insightface, which exposes the full antelopev2 directory.
+    try:
+        antel_dir = f"{MODELS_ROOT}/insightface/models/antelopev2"
+        ensure_dir(antel_dir)
+        antel_base = "https://huggingface.co/LPDoctor/insightface/resolve/main/models/antelopev2"
+        antel_files = [
+            "1k3d68.onnx",
+            "2d106det.onnx",
+            "genderage.onnx",
+            "glintr100.onnx",
+            "scrfd_10g_bnkps.onnx",
+        ]
+        for name in antel_files:
+            url = f"{antel_base}/{name}"
+            download_url(url, antel_dir, name)
+    except Exception as ex:
+        # Antelopev2 is strongly recommended for InstantID; log loudly but do not abort container init.
+        print("Failed to fetch antelopev2 ONNX pack:", ex)
 
     # AnimateDiff motion modules (public stabilized alternatives)
     try:

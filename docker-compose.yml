@@ -460,6 +460,9 @@ services:
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     expose:
       - "7000"
+    volumes:
+      # Share the same antelopev2 ONNX pack used by ComfyUI/InstantID.
+      - comfyui_models:/opt/models
 
   vision_repair:
     build:

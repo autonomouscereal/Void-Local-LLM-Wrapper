@@ -9,6 +9,8 @@ from pathlib import Path
 
 MODELS_DIR = os.environ.get("FILM2_MODELS", "/opt/models")
 HF_HOME = os.environ.get("HF_HOME", os.path.join(MODELS_DIR, ".hf"))
+# Optional Hugging Face token (forwarded from docker-compose as HUGGINGFACE_TOKEN).
+HF_TOKEN = os.environ.get("HUGGINGFACE_TOKEN", "").strip() or None
 
 os.makedirs(MODELS_DIR, exist_ok=True)
 os.makedirs(HF_HOME, exist_ok=True)
@@ -192,6 +194,10 @@ def snapshot(repo_id: str, local_key: str, allow_patterns: list[str] | None = No
         )
         if allow_patterns:
             kw["allow_patterns"] = allow_patterns
+        # Forward the compose-level token when available so private/gated models
+        # can be accessed without relying on global env defaults.
+        if HF_TOKEN:
+            kw["token"] = HF_TOKEN
         try:
             snapshot_download(**kw)
         except RuntimeError as e:
@@ -223,6 +229,53 @@ def git_clone(url: str, local_key: str) -> None:
     log("DONE-GIT", url, "->", tgt)
 
 
+def ensure_rvc_titan() -> None:
+    """
+    Ensure the Titan RVC pretrained weights are present under MODELS_DIR/rvc_titan.
+
+    We rely primarily on snapshot() to clone the full blaise-tk/TITAN repo, but
+    this helper guarantees that the 48k Medium D/G checkpoints are materialized
+    inside /opt/models/rvc_titan so the rvc_service startup check never sees an
+    empty directory.
+    """
+    from huggingface_hub import hf_hub_download
+
+    target_dir = os.path.join(MODELS_DIR, "rvc_titan")
+    os.makedirs(target_dir, exist_ok=True)
+    d_name = "D-f048k-TITAN-Medium.pth"
+    g_name = "G-f048k-TITAN-Medium.pth"
+    d_path = os.path.join(target_dir, d_name)
+    g_path = os.path.join(target_dir, g_name)
+
+    # If both files already exist and are non-empty, nothing to do.
+    if os.path.isfile(d_path) and os.path.getsize(d_path) > 0 and os.path.isfile(g_path) and os.path.getsize(g_path) > 0:
+        log("exists", "rvc_titan.DG48k", "->", target_dir)
+        return
+
+    log("START-RVC-TITAN-DG48k", "blaise-tk/TITAN", "->", target_dir)
+    # Use the explicit 48k Medium pretrained paths for D and G.
+    d_remote = "models/medium/48k/pretrained/" + d_name
+    g_remote = "models/medium/48k/pretrained/" + g_name
+
+    # Download D
+    d_local = hf_hub_download(
+        repo_id="blaise-tk/TITAN",
+        filename=d_remote,
+        local_dir=target_dir,
+        local_dir_use_symlinks=False,
+        token=HF_TOKEN,
+    )
+    # Download G
+    g_local = hf_hub_download(
+        repo_id="blaise-tk/TITAN",
+        filename=g_remote,
+        local_dir=target_dir,
+        local_dir_use_symlinks=False,
+        token=HF_TOKEN,
+    )
+    log("DONE-RVC-TITAN-DG48k", d_local, g_local, "->", target_dir)
+
+
 def main() -> None:
     ensure_pkg()
     # Early exit if done marker exists
@@ -234,7 +287,9 @@ def main() -> None:
             snapshot(rid, key, allow)
         for url, key in GIT_REPOS:
             git_clone(url, key)
-        # Optional: aesthetic head weights for orchestrator image scoring
+        # Ensure Titan's 48k Medium D/G checkpoints are present for rvc_service,
+        # then optional aesthetic head weights for orchestrator image scoring.
+        ensure_rvc_titan()
         ensure_aesthetic_head()
     manifest = {
         "hf": {rid: key for rid, key, _ in HF_MODELS},
