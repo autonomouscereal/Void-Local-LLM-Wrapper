@@ -353,150 +353,150 @@ async def tool_run(req: Request):
 			details={"raw": res},
 		)
 
-		# Use the existing Comfy pipeline below for image.dispatch; do not import app.main._image_dispatch_run.
+	# For image.dispatch, use the existing Comfy pipeline below.
 
-		# Inline graph or path
-		inline = args.get("workflow_graph")
-		if inline is not None:
-			wf_obj = inline
-			wf_path = "(inline)"
+	# Inline graph or path
+	inline = args.get("workflow_graph")
+	if inline is not None:
+		wf_obj = inline
+		wf_path = "(inline)"
+	else:
+		wf_path = (args.get("workflow_path")
+		           or os.getenv("COMFY_WORKFLOW_PATH")
+		           or "/workspace/services/image/workflows/stock_smoke.json")
+		if os.path.exists(wf_path):
+			wf_text = _read_text(wf_path)
+			parser = JSONParser()
+			# Workflow graphs are open-ended; parse with open schema.
+			wf_obj = parser.parse(wf_text, {})
 		else:
-			wf_path = (args.get("workflow_path")
-			           or os.getenv("COMFY_WORKFLOW_PATH")
-			           or "/workspace/services/image/workflows/stock_smoke.json")
-			if os.path.exists(wf_path):
-				wf_text = _read_text(wf_path)
-				parser = JSONParser()
-				# Workflow graphs are open-ended; parse with open schema.
-				wf_obj = parser.parse(wf_text, {})
-			else:
-				# Fallback: proceed without file; we'll synthesize a valid graph below
-				wf_obj = {}
+			# Fallback: proceed without file; we'll synthesize a valid graph below
+			wf_obj = {}
 
-		# Try to ensure API prompt mapping, with optional coercion/subset
-		prompt_graph = None
-		if isinstance(wf_obj, dict) and "prompt" in wf_obj and isinstance(wf_obj["prompt"], dict):
-			prompt_graph = wf_obj["prompt"]
-		elif isinstance(wf_obj, dict) and "nodes" not in wf_obj:
-			prompt_graph = wf_obj
+	# Try to ensure API prompt mapping, with optional coercion/subset
+	prompt_graph = None
+	if isinstance(wf_obj, dict) and "prompt" in wf_obj and isinstance(wf_obj["prompt"], dict):
+		prompt_graph = wf_obj["prompt"]
+	elif isinstance(wf_obj, dict) and "nodes" not in wf_obj:
+		prompt_graph = wf_obj
 
-		if not isinstance(prompt_graph, dict) and bool(args.get("autofix_422", False)):
-			log.info("[comfy] attempting UI→API coercion for workflow shape")
-			coerced = _coerce_ui_export_to_api_graph(wf_obj)
-			if isinstance(coerced, dict):
-				prompt_graph = coerced
-			if not isinstance(prompt_graph, dict) and isinstance(coerced, dict):
-				subset = _extract_node_subset(coerced)
-				if subset:
-					prompt_graph = subset
+	if not isinstance(prompt_graph, dict) and bool(args.get("autofix_422", False)):
+		log.info("[comfy] attempting UI→API coercion for workflow shape")
+		coerced = _coerce_ui_export_to_api_graph(wf_obj)
+		if isinstance(coerced, dict):
+			prompt_graph = coerced
+		if not isinstance(prompt_graph, dict) and isinstance(coerced, dict):
+			subset = _extract_node_subset(coerced)
+			if subset:
+				prompt_graph = subset
 
-		# Lightweight auto-bind: if the KSampler lacks positive/negative refs, inject CLIPTextEncode nodes and wire them.
-		if isinstance(prompt_graph, dict):
-			ks_id = _first_node_id_by_class(prompt_graph, "KSampler") or _first_node_id_by_class(prompt_graph, "KSamplerAdvanced")
-			if ks_id:
-				ks_in = prompt_graph[str(ks_id)].setdefault("inputs", {})
-				pos_id = _get_ref_node_id(ks_in.get("positive"))
-				neg_id = _get_ref_node_id(ks_in.get("negative"))
-				if not pos_id or not neg_id:
-					ckpt_id = _first_node_id_by_class(prompt_graph, "CheckpointLoaderSimple") or _first_node_id_by_class(prompt_graph, "CheckpointLoaderSimpleSDXL")
-					if ckpt_id:
-						# Find next free integer id(s)
-						def _next_id(g: dict) -> str:
-							max_id = 0
-							for k in g.keys():
-								s = str(k)
-								if s.isdigit():
-									max_id = max(max_id, int(s))
-							return str(max_id + 1)
-						if not pos_id:
-							new_pos_id = _next_id(prompt_graph)
-							prompt_graph[new_pos_id] = {"class_type": "CLIPTextEncode", "inputs": {"clip": [str(ckpt_id), 1], "text": str(args.get("prompt") or "")}}
-							ks_in["positive"] = [new_pos_id, 0]
-						if not neg_id:
-							new_neg_id = _next_id(prompt_graph)
-							prompt_graph[new_neg_id] = {"class_type": "CLIPTextEncode", "inputs": {"clip": [str(ckpt_id), 1], "text": str(args.get("negative") or "")}}
-							ks_in["negative"] = [new_neg_id, 0]
+	# Lightweight auto-bind: if the KSampler lacks positive/negative refs, inject CLIPTextEncode nodes and wire them.
+	if isinstance(prompt_graph, dict):
+		ks_id = _first_node_id_by_class(prompt_graph, "KSampler") or _first_node_id_by_class(prompt_graph, "KSamplerAdvanced")
+		if ks_id:
+			ks_in = prompt_graph[str(ks_id)].setdefault("inputs", {})
+			pos_id = _get_ref_node_id(ks_in.get("positive"))
+			neg_id = _get_ref_node_id(ks_in.get("negative"))
+			if not pos_id or not neg_id:
+				ckpt_id = _first_node_id_by_class(prompt_graph, "CheckpointLoaderSimple") or _first_node_id_by_class(prompt_graph, "CheckpointLoaderSimpleSDXL")
+				if ckpt_id:
+					# Find next free integer id(s)
+					def _next_id(g: dict) -> str:
+						max_id = 0
+						for k in g.keys():
+							s = str(k)
+							if s.isdigit():
+								max_id = max(max_id, int(s))
+						return str(max_id + 1)
+					if not pos_id:
+						new_pos_id = _next_id(prompt_graph)
+						prompt_graph[new_pos_id] = {"class_type": "CLIPTextEncode", "inputs": {"clip": [str(ckpt_id), 1], "text": str(args.get("prompt") or "")}}
+						ks_in["positive"] = [new_pos_id, 0]
+					if not neg_id:
+						new_neg_id = _next_id(prompt_graph)
+						prompt_graph[new_neg_id] = {"class_type": "CLIPTextEncode", "inputs": {"clip": [str(ckpt_id), 1], "text": str(args.get("negative") or "")}}
+						ks_in["negative"] = [new_neg_id, 0]
 
-		if not isinstance(prompt_graph, dict):
-			# Synthesize a valid graph instead of failing
-			model_ckpt = str(args.get("model") or "sd_xl_base_1.0.safetensors")
-			prompt_text = str(args.get("prompt") or "")
-			neg_text = str(args.get("negative") or "")
-			width = int(args.get("width") or 1024)
-			height = int(args.get("height") or 1024)
-			steps = int(args.get("steps") or 32)
-			cfg = float(args.get("cfg") or 5.5)
-			prompt_graph = {
-				"3": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": model_ckpt}},
-				"4": {"class_type": "EmptyLatentImage", "inputs": {"width": width, "height": height, "batch_size": 1}},
-				"8": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["3", 1], "text": prompt_text}},
-				"9": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["3", 1], "text": neg_text}},
-				"5": {"class_type": "KSampler", "inputs": {
-					"seed": int(args.get("seed") or 123456789),
-					"steps": steps, "cfg": cfg,
-					"sampler_name": str(args.get("sampler") or args.get("sampler_name") or "euler"),
-					"scheduler": str(args.get("scheduler") or "normal"),
-					"denoise": 1.0,
-					"model": ["3", 0], "positive": ["8", 0], "negative": ["9", 0], "latent_image": ["4", 0]
-				}},
-				"6": {"class_type": "VAEDecode", "inputs": {"samples": ["5", 0], "vae": ["3", 2]}},
-				"7": {"class_type": "SaveImage", "inputs": {"images": ["6", 0]}},
-			}
+	if not isinstance(prompt_graph, dict):
+		# Synthesize a valid graph instead of failing
+		model_ckpt = str(args.get("model") or "sd_xl_base_1.0.safetensors")
+		prompt_text = str(args.get("prompt") or "")
+		neg_text = str(args.get("negative") or "")
+		width = int(args.get("width") or 1024)
+		height = int(args.get("height") or 1024)
+		steps = int(args.get("steps") or 32)
+		cfg = float(args.get("cfg") or 5.5)
+		prompt_graph = {
+			"3": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": model_ckpt}},
+			"4": {"class_type": "EmptyLatentImage", "inputs": {"width": width, "height": height, "batch_size": 1}},
+			"8": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["3", 1], "text": prompt_text}},
+			"9": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["3", 1], "text": neg_text}},
+			"5": {"class_type": "KSampler", "inputs": {
+				"seed": int(args.get("seed") or 123456789),
+				"steps": steps, "cfg": cfg,
+				"sampler_name": str(args.get("sampler") or args.get("sampler_name") or "euler"),
+				"scheduler": str(args.get("scheduler") or "normal"),
+				"denoise": 1.0,
+				"model": ["3", 0], "positive": ["8", 0], "negative": ["9", 0], "latent_image": ["4", 0]
+			}},
+			"6": {"class_type": "VAEDecode", "inputs": {"samples": ["5", 0], "vae": ["3", 2]}},
+			"7": {"class_type": "SaveImage", "inputs": {"images": ["6", 0]}},
+		}
 
-		# Validate and bind
-		problems = _validate_api_graph(prompt_graph)
-		if problems:
-			# Replace with synthesized valid graph instead of failing
-			model_ckpt = str(args.get("model") or "sd_xl_base_1.0.safetensors")
-			prompt_text = str(args.get("prompt") or "")
-			neg_text = str(args.get("negative") or "")
-			width = int(args.get("width") or 1024)
-			height = int(args.get("height") or 1024)
-			steps = int(args.get("steps") or 32)
-			cfg = float(args.get("cfg") or 5.5)
-			prompt_graph = {
-				"3": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": model_ckpt}},
-				"4": {"class_type": "EmptyLatentImage", "inputs": {"width": width, "height": height, "batch_size": 1}},
-				"8": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["3", 1], "text": prompt_text}},
-				"9": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["3", 1], "text": neg_text}},
-				"5": {"class_type": "KSampler", "inputs": {
-					"seed": int(args.get("seed") or 123456789),
-					"steps": steps, "cfg": cfg,
-					"sampler_name": str(args.get("sampler") or args.get("sampler_name") or "euler"),
-					"scheduler": str(args.get("scheduler") or "normal"),
-					"denoise": 1.0,
-					"model": ["3", 0], "positive": ["8", 0], "negative": ["9", 0], "latent_image": ["4", 0]
-				}},
-				"6": {"class_type": "VAEDecode", "inputs": {"samples": ["5", 0], "vae": ["3", 2]}},
-				"7": {"class_type": "SaveImage", "inputs": {"images": ["6", 0]}},
-			}
-		# Resolve actual nodes and apply overrides only to those. If binding fails, let it raise so we see the real error.
-		bind = _resolve_bindings(prompt_graph)
-		_apply_overrides(prompt_graph, bind, args)
-		# Ensure SaveImage nodes have a filename_prefix (required by newer ComfyUI)
-		_client_id = uuid.uuid4().hex
-		cid = (args.get("cid") or "").strip() if isinstance(args.get("cid"), str) else ""
-		trace = (args.get("trace_id") or "").strip() if isinstance(args.get("trace_id"), str) else ""
-		step_id = (args.get("step_id") or "").strip() if isinstance(args.get("step_id"), str) else ""
-		for nid, node in (prompt_graph or {}).items():
-			if isinstance(node, dict) and (node.get("class_type") or "") == "SaveImage":
-				ins = node.setdefault("inputs", {})
-				if not isinstance(ins.get("filename_prefix"), str) or not (ins.get("filename_prefix") or "").strip():
-					prefix = f"{cid}_{trace}_{step_id}" if (cid or trace or step_id) else f"void_{_client_id}"
-					ins["filename_prefix"] = prefix
+	# Validate and bind
+	problems = _validate_api_graph(prompt_graph)
+	if problems:
+		# Replace with synthesized valid graph instead of failing
+		model_ckpt = str(args.get("model") or "sd_xl_base_1.0.safetensors")
+		prompt_text = str(args.get("prompt") or "")
+		neg_text = str(args.get("negative") or "")
+		width = int(args.get("width") or 1024)
+		height = int(args.get("height") or 1024)
+		steps = int(args.get("steps") or 32)
+		cfg = float(args.get("cfg") or 5.5)
+		prompt_graph = {
+			"3": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": model_ckpt}},
+			"4": {"class_type": "EmptyLatentImage", "inputs": {"width": width, "height": height, "batch_size": 1}},
+			"8": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["3", 1], "text": prompt_text}},
+			"9": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["3", 1], "text": neg_text}},
+			"5": {"class_type": "KSampler", "inputs": {
+				"seed": int(args.get("seed") or 123456789),
+				"steps": steps, "cfg": cfg,
+				"sampler_name": str(args.get("sampler") or args.get("sampler_name") or "euler"),
+				"scheduler": str(args.get("scheduler") or "normal"),
+				"denoise": 1.0,
+				"model": ["3", 0], "positive": ["8", 0], "negative": ["9", 0], "latent_image": ["4", 0]
+			}},
+			"6": {"class_type": "VAEDecode", "inputs": {"samples": ["5", 0], "vae": ["3", 2]}},
+			"7": {"class_type": "SaveImage", "inputs": {"images": ["6", 0]}},
+		}
+	# Resolve actual nodes and apply overrides only to those. If binding fails, let it raise so we see the real error.
+	bind = _resolve_bindings(prompt_graph)
+	_apply_overrides(prompt_graph, bind, args)
+	# Ensure SaveImage nodes have a filename_prefix (required by newer ComfyUI)
+	_client_id = uuid.uuid4().hex
+	cid = (args.get("cid") or "").strip() if isinstance(args.get("cid"), str) else ""
+	trace = (args.get("trace_id") or "").strip() if isinstance(args.get("trace_id"), str) else ""
+	step_id = (args.get("step_id") or "").strip() if isinstance(args.get("step_id"), str) else ""
+	for nid, node in (prompt_graph or {}).items():
+		if isinstance(node, dict) and (node.get("class_type") or "") == "SaveImage":
+			ins = node.setdefault("inputs", {})
+			if not isinstance(ins.get("filename_prefix"), str) or not (ins.get("filename_prefix") or "").strip():
+				prefix = f"{cid}_{trace}_{step_id}" if (cid or trace or step_id) else f"void_{_client_id}"
+				ins["filename_prefix"] = prefix
 
-		client_id = _client_id
-		_emit_trace(STATE_DIR_LOCAL, "global", "comfyui.submit", {"t": int(time.time()*1000), "base": COMFY_BASE, "workflow_path": wf_path})
-		log.info("[comfy] POST /prompt url=%s", COMFY_BASE.rstrip("/") + "/prompt")
-		submit_res = await _post_json(COMFY_BASE.rstrip("/") + "/prompt", {"prompt": prompt_graph, "client_id": client_id})
-		if not bool(submit_res.get("ok")):
-			return ToolEnvelope.failure(
-				"http_error",
-				"comfy submit failed",
-				status=502,
-				request_id=rid,
-				details=submit_res,
-			)
+	client_id = _client_id
+	_emit_trace(STATE_DIR_LOCAL, "global", "comfyui.submit", {"t": int(time.time()*1000), "base": COMFY_BASE, "workflow_path": wf_path})
+	log.info("[comfy] POST /prompt url=%s", COMFY_BASE.rstrip("/") + "/prompt")
+	submit_res = await _post_json(COMFY_BASE.rstrip("/") + "/prompt", {"prompt": prompt_graph, "client_id": client_id})
+	if not bool(submit_res.get("ok")):
+		return ToolEnvelope.failure(
+			"http_error",
+			"comfy submit failed",
+			status=502,
+			request_id=rid,
+			details=submit_res,
+		)
 		prompt_id = submit_res.get("prompt_id") or submit_res.get("promptId") or ""
 		log.info("[comfy] prompt_id=%s client_id=%s", prompt_id, client_id)
 

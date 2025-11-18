@@ -9130,27 +9130,6 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     validation_failures: List[Dict[str, Any]] = []
     tool_results: List[Dict[str, Any]] = []
     tool_exec_meta: List[Dict[str, Any]] = []
-    # In film mode, an empty tool plan is never acceptable: treat as a planner error
-    # instead of silently continuing with no tool calls. Surface a full error envelope
-    # with stack trace so the failure is explicit to callers.
-    if not tool_calls and effective_mode == "film":
-        _tb = "".join(traceback.format_stack())
-        err_env = {
-            "schema_version": 1,
-            "request_id": _uuid.uuid4().hex,
-            "ok": False,
-            "error": {
-                "code": "planner_no_tools",
-                "message": "Planner did not schedule any tools for film mode.",
-                "details": {},
-                "status": 0,
-                "traceback": _tb,
-            },
-        }
-        validation_failures.append(
-            {"name": "planner", "arguments": {}, "status": 0, "envelope": err_env}
-        )
-        _log("planner.error.no_tools_film", trace_id=trace_id, error=err_env["error"])
     _ledger_shard = None
     _ledger_root = os.path.join(UPLOAD_DIR, "artifacts", "runs", trace_id)
     _ledger_name = "ledger"
@@ -9268,10 +9247,11 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 tc["arguments"] = args_film
                 ta = args_film
             _log("tool.run.before", trace_id=trace_id, tool=str(tn), args_keys=list((ta or {}).keys()))
-            # Execute tools directly via local tool front doors instead of routing
-            # through the external executor. This guarantees that image/music/film
-            # services are actually invoked and their errors are surfaced.
-            tr = await execute_tool_call(tc)
+            # Execute tools via the external executor so all heavy/remote work
+            # happens in the executor container instead of the orchestrator.
+            exec_batch = [tc]
+            exec_res = await gateway_execute(exec_batch, trace_id, executor_endpoint)
+            tr = exec_res[0] if isinstance(exec_res, list) and exec_res else {}
             tname = str((tr or {}).get("name") or "tool")
             res = (tr or {}).get("result") if isinstance((tr or {}).get("result"), dict) else {}
             err_obj = (tr or {}).get("error")
