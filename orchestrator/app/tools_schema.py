@@ -94,23 +94,7 @@ def get_builtin_tools_schema() -> List[Dict[str, Any]]:
 				"parameters": {"type": "object", "properties": {"tool": {"type": "string"}, "args": {"type": "object"}, "artifact_path": {"type": "string"}, "cid": {"type": "string"}}, "required": ["tool", "args"]}
 			}
 		},
-		{
-			"type": "function",
-			"function": {
-				"name": "music.song.primary",
-				"parameters": {"type": "object", "properties": {"lyrics": {"type": "string"}, "style_tags": {"type": "array", "items": {"type": "string"}}, "bpm": {"type": "integer"}, "key": {"type": "string"}, "seed": {"type": "integer"}, "reference_song": {"type": "string"}, "infinite": {"type": "boolean"}}, "required": ["lyrics"]}
-			}
-		},
-		{
-			# Backwards-compatible alias for older plans/specs that still
-			# reference the legacy song tool name. Internally this is routed
-			# through the same primary music engine as music.song.primary.
-			"type": "function",
-			"function": {
-				"name": "music.song.legacy",
-				"parameters": {"type": "object", "properties": {"lyrics": {"type": "string"}, "style_tags": {"type": "array", "items": {"type": "string"}}, "bpm": {"type": "integer"}, "key": {"type": "string"}, "seed": {"type": "integer"}, "reference_song": {"type": "string"}, "infinite": {"type": "boolean"}}, "required": ["lyrics"]}
-			}
-		},
+		,
 		{
 			"type": "function",
 			"function": {

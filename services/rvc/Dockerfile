@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+FROM python:3.10-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
@@ -9,7 +9,8 @@ RUN pip install --no-cache-dir --upgrade pip
 
 WORKDIR /app
 COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cu118 -r /app/requirements.txt
+RUN pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cu118 -r /app/requirements.txt && \
+    pip install --no-cache-dir git+https://github.com/esnya/hf-rvc.git#egg=hf-rvc
 
 COPY app /app/app
 

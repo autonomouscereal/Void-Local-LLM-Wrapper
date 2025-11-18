@@ -6592,24 +6592,6 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         # Hook is already integrated in image.super_gen; this returns an explicit OK
         return {"name": name, "result": {"ok": True}}
     # --- Extended Music/Audio tools ---
-    if name in ("music.song.primary", "music.song.legacy") and ALLOW_TOOL_EXECUTION:
-        if not PRIMARY_MUSIC_API_URL:
-            return {"name": name, "error": "PRIMARY_MUSIC_API_URL not configured"}
-        async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
-            body = {
-                "lyrics": args.get("lyrics"),
-                "style_tags": args.get("style_tags") or [],
-                "bpm": args.get("bpm"),
-                "key": args.get("key"),
-                "seed": args.get("seed"),
-                "reference_song": args.get("reference_song"),
-                "quality": "max",
-                "infinite": True,
-            }
-            r = await client.post(PRIMARY_MUSIC_API_URL.rstrip("/") + "/v1/music/song", json=body)
-            parser = JSONParser()
-            js = parser.parse(r.text or "", {})
-            return {"name": name, "result": js if isinstance(js, dict) else {}}
     if name == "music.melody.musicgen" and ALLOW_TOOL_EXECUTION:
         if not MUSIC_API_URL:
             return {"name": name, "error": "MUSIC_API_URL not configured"}
@@ -11724,18 +11706,12 @@ async def v1_audio_lyrics_to_song(body: Dict[str, Any]):
             status=400,
             request_id=rid,
         )
-    if PRIMARY_MUSIC_API_URL:
-        call = {
-            "name": "music.song.primary",
-            "arguments": {"lyrics": lyrics, "style_tags": ([style] if style else []), "bpm": bpm, "key": key, "seed": seed},
-        }
-    else:
-        # Route lyrics-to-song through the windowed music path instead of music.compose.
-        prompt = ((style + ": ") if style else "") + lyrics
-        call = {
-            "name": "music.infinite.windowed",
-            "arguments": {"prompt": prompt, "length_s": duration_s, "bpm": bpm, "key": key, "seed": seed},
-        }
+    # Route lyrics-to-song through the infinite/windowed music path.
+    prompt = ((style + ": ") if style else "") + lyrics
+    call = {
+        "name": "music.infinite.windowed",
+        "arguments": {"prompt": prompt, "length_s": duration_s, "bpm": bpm, "key": key, "seed": seed},
+    }
     res = await execute_tool_call(call)
     return ToolEnvelope.success({"result": res}, request_id=rid)
 
@@ -11789,17 +11765,11 @@ async def v1_audio_tts_sing(body: Dict[str, Any]):
             outputs.append({"type": "tts", "result": res})
         elif kind == "sing":
             lyrics = (item.get("lyrics") or "")
-            if PRIMARY_MUSIC_API_URL:
-                call = {
-                    "name": "music.song.primary",
-                    "arguments": {"lyrics": lyrics, "style_tags": [], "seed": item.get("seed")},
-                }
-            else:
-                prompt = lyrics
-                call = {
-                    "name": "music.infinite.windowed",
-                    "arguments": {"prompt": prompt, "length_s": 30, "seed": item.get("seed")},
-                }
+            prompt = lyrics
+            call = {
+                "name": "music.infinite.windowed",
+                "arguments": {"prompt": prompt, "length_s": 30, "seed": item.get("seed")},
+            }
             res = await execute_tool_call(call)
             outputs.append({"type": "sing", "result": res})
     return ToolEnvelope.success(
@@ -11885,11 +11855,9 @@ async def v1_audio_lyrics_to_song(body: Dict[str, Any]):
     seed = payload.get("seed")
     if not lyrics:
         return JSONResponse(status_code=400, content={"error": "missing lyrics"})
-    if PRIMARY_MUSIC_API_URL:
-        call = {"name": "music.song.primary", "arguments": {"lyrics": lyrics, "style_tags": ([style] if style else []), "bpm": bpm, "key": key, "seed": seed}}
-    else:
-        prompt = ((style + ": ") if style else "") + lyrics
-        call = {"name": "music.compose", "arguments": {"prompt": prompt, "length_s": duration_s, "bpm": bpm, "seed": seed}}
+    # Always route lyrics-to-song via music.infinite.windowed now that music.song.* is removed.
+    prompt = ((style + ": ") if style else "") + lyrics
+    call = {"name": "music.infinite.windowed", "arguments": {"prompt": prompt, "length_s": duration_s, "bpm": bpm, "seed": seed}}
     res = await execute_tool_call(call)
     return {"ok": True, "result": res}
 

@@ -36,11 +36,6 @@ def build_music_args(req_text: str) -> Dict[str, Any]:
     return {"prompt": req_text, "bpm": 120, "length_s": 30, "structure": ["intro", "verse", "outro"], "seed": None}
 
 
-def build_music_song_args(req_text: str) -> Dict[str, Any]:
-    # Treat the incoming text as lyrics; style_tags empty by default
-    return {"lyrics": req_text, "style_tags": [], "bpm": None, "key": None, "seed": None, "reference_song": None}
-
-
 def build_musicgen_args(req_text: str) -> Dict[str, Any]:
     # Instrumental by default; melody lock can be attached by tools later
     return {"text": req_text, "melody_wav": None, "bpm": None, "key": None, "seed": None, "style_tags": [], "length_s": 30}
