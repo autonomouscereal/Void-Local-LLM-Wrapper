@@ -67,9 +67,18 @@ def generate_music(
     """
     if not prompt:
         raise ValueError("prompt is required for generate_music")
-    # Unwrap (model, processor) tuples defensively if a legacy caller passes them.
-    if isinstance(model, (tuple, list)):
-        model = model[0]
+    # Resolve the effective engine: prefer the global _MODEL if initialized,
+    # otherwise fall back to the passed-in model. In all cases, unwrap tuples
+    # so we never call .generate on (model, processor) or similar.
+    global _MODEL
+    engine = _MODEL if _MODEL is not None else model
+    if isinstance(engine, (tuple, list)):
+        try:
+            engine = engine[0]
+        except Exception:
+            raise RuntimeError(f"generate_music: unexpected tuple engine type {type(engine)}")
+    if not hasattr(engine, "generate"):
+        raise RuntimeError(f"generate_music: music engine has no .generate attribute (type={type(engine)})")
     proc = _PROC
     if proc is None:
         raise RuntimeError("Music processor not initialized")
@@ -87,14 +96,14 @@ def generate_music(
     with torch.inference_mode():
         if device.startswith("cuda"):
             with torch.cuda.amp.autocast():
-                audio_values = model.generate(
+                audio_values = engine.generate(
                     **inputs,
                     do_sample=True,
                     guidance_scale=3.0,
                     max_new_tokens=max_new_tokens,
                 )
         else:
-            audio_values = model.generate(
+            audio_values = engine.generate(
                 **inputs,
                 do_sample=True,
                 guidance_scale=3.0,

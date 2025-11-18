@@ -5864,6 +5864,16 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             })
         return {"name": name, "result": env}
     if name == "music.compose" and ALLOW_TOOL_EXECUTION:
+        # Route all compose requests through music.infinite.windowed so the infinite
+        # windowed music path is the only caller of the music backend.
+        a = args if isinstance(args, dict) else {}
+        a.setdefault("length_s", int(a.get("length_s") or 30))
+        a.setdefault("bpm", None)
+        a.setdefault("key", None)
+        a.setdefault("instrumental_only", False)
+        a["prompt"] = str(a.get("prompt") or "").strip()
+        a["length_s"] = int(a.get("length_s") or 30)
+        return await http_tool_run("music.infinite.windowed", a)
         if not MUSIC_API_URL:
             return {"name": name, "error": "MUSIC_API_URL not configured"}
         class _MusicProvider:
@@ -6082,7 +6092,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 import httpx as _hxsync  # local sync client
                 body = {
                     "prompt": payload.get("prompt"),
-                    "duration": int(payload.get("length_s") or 8),
+                    # Match the music service contract: it expects `seconds`, not `duration`.
+                    "seconds": int(payload.get("length_s") or 8),
                     "music_lock": payload.get("music_lock"),
                     "seed": payload.get("seed"),
                     "refs": payload.get("refs") or payload.get("music_refs"),
