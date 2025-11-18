@@ -1,5 +1,5 @@
 import os
-from typing import Optional, List, Tuple
+from typing import Optional, List
 
 import torch  # type: ignore
 import numpy as np  # type: ignore
@@ -25,7 +25,7 @@ def _resolve_model_path(model_dir: str, model_id_env: str) -> str:
     return model_id or model_id_env
 
 
-def load_music_engine(model_dir: str, device: str = "cpu") -> Tuple[MusicgenForConditionalGeneration, AutoProcessor]:
+def load_music_engine(model_dir: str, device: str = "cpu") -> MusicgenForConditionalGeneration:
     """
     Load the primary music generation engine (MusicGen or compatible) from a
     local directory populated by bootstrap, falling back to HF repo id if
@@ -33,7 +33,7 @@ def load_music_engine(model_dir: str, device: str = "cpu") -> Tuple[MusicgenForC
     """
     global _MODEL, _PROC, _DEVICE
     if _MODEL is not None and _PROC is not None:
-        return _MODEL, _PROC
+        return _MODEL
     _DEVICE = device or _DEVICE
     # Resolve either a local snapshot path or a HF repo id.
     model_path = _resolve_model_path(model_dir, os.getenv("MUSIC_MODEL_ID", "facebook/musicgen-large"))
@@ -43,7 +43,7 @@ def load_music_engine(model_dir: str, device: str = "cpu") -> Tuple[MusicgenForC
     _MODEL = MusicgenForConditionalGeneration.from_pretrained(model_path, torch_dtype=dtype)
     _MODEL = _MODEL.to(_DEVICE)
     _PROC = AutoProcessor.from_pretrained(model_path)
-    return _MODEL, _PROC
+    return _MODEL
 
 
 def generate_music(
@@ -57,10 +57,19 @@ def generate_music(
     """
     Generate music audio using the loaded MusicGen-compatible model.
 
+    The engine is a transformers MusicgenForConditionalGeneration loaded from
+    facebook/musicgen-* (or equivalent). Some callers historically passed the
+    (model, processor) tuple returned by load_music_engine; to be robust we
+    defensively unwrap that here and always operate on the underlying model
+    instance that exposes .generate(...).
+
     Returns WAV bytes at 32 kHz.
     """
     if not prompt:
         raise ValueError("prompt is required for generate_music")
+    # Unwrap (model, processor) tuples defensively if a legacy caller passes them.
+    if isinstance(model, (tuple, list)):
+        model = model[0]
     proc = _PROC
     if proc is None:
         raise RuntimeError("Music processor not initialized")

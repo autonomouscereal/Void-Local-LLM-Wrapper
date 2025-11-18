@@ -9029,13 +9029,94 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             tc = {**tc, "arguments": args}
             enriched.append(tc)
         tool_calls = enriched
-    # Before filling defaults, ensure any string/\"_raw\" arguments are parsed into objects
+    # Before filling defaults, ensure any string/\"_raw\" arguments are parsed into objects.
+    # For planner/committee outputs, run them through committee_jsonify with a compact
+    # schema derived from the tool's JSON schema so we are never feeding markdown/prose
+    # directly into JSONParser.
     if tool_calls:
-        def _parse_json_for_args(text: str, expected: Any) -> Any:
-            parser = JSONParser()
-            # expected is currently unused by callers ({}), but we honor it for flexibility.
-            return parser.parse(text or "", expected or {})
-        tool_calls = args_ensure_object_args(tool_calls, _parse_json_for_args)
+        def _tool_expected_from_jsonschema(js_schema: Any) -> Dict[str, Any]:
+            """
+            Convert the JSON Schema we expose via _TOOL_SCHEMAS into the simpler
+            expected_schema format that committee_jsonify uses (field->python_type).
+            """
+            expected: Dict[str, Any] = {}
+            if not isinstance(js_schema, dict):
+                return expected
+            props = js_schema.get("properties") or {}
+            if not isinstance(props, dict):
+                return expected
+            for key, spec in props.items():
+                t = spec.get("type") if isinstance(spec, dict) else None
+                # Normalize union types like ["integer","null"] to a single primary type.
+                if isinstance(t, list):
+                    # Prefer non-null, non-array/object/string if present.
+                    if "integer" in t:
+                        t = "integer"
+                    elif "number" in t:
+                        t = "number"
+                    elif "string" in t:
+                        t = "string"
+                    elif "boolean" in t:
+                        t = "boolean"
+                    elif "object" in t:
+                        t = "object"
+                    elif "array" in t:
+                        t = "array"
+                    else:
+                        t = t[0] if t else None
+                if t == "integer":
+                    expected[key] = int
+                elif t == "number":
+                    expected[key] = float
+                elif t == "boolean":
+                    expected[key] = bool
+                elif t == "object":
+                    expected[key] = dict
+                elif t == "array":
+                    expected[key] = list
+                else:
+                    # Default to string for unknown/nullable types.
+                    expected[key] = str
+            return expected
+        parser = JSONParser()
+        normalized_calls: List[Dict[str, Any]] = []
+        for tc in tool_calls:
+            if not isinstance(tc, dict):
+                normalized_calls.append(tc)
+                continue
+            name = (tc.get("name") or "").strip()
+            args_obj = tc.get("arguments")
+            raw_text: Optional[str] = None
+            if isinstance(args_obj, dict) and isinstance(args_obj.get("_raw"), str):
+                raw_text = args_obj.get("_raw")  # type: ignore[assignment]
+            elif isinstance(args_obj, str):
+                raw_text = args_obj
+            # If we have a raw string from the planner/committee, normalize it.
+            if isinstance(raw_text, str) and raw_text.strip():
+                meta = _TOOL_SCHEMAS.get(name, {})
+                js_schema = meta.get("schema") or {}
+                expected_schema = _tool_expected_from_jsonschema(js_schema)
+                # When we have a known schema (planner-visible tools), use committee_jsonify
+                # to coerce the messy text into strict JSON. Fallback to JSONParser when
+                # schema is unknown.
+                if expected_schema:
+                    fixed = await committee_jsonify(
+                        raw_text,
+                        expected_schema=expected_schema,
+                        trace_id=str(trace_id or f"{name or 'tool'}.args"),
+                        temperature=0.0,
+                    )
+                    if isinstance(fixed, dict):
+                        args_obj = fixed
+                    else:
+                        args_obj = {}
+                else:
+                    # Best-effort direct parse for tools without a registered schema.
+                    args_obj = parser.parse(raw_text or "", {})
+            if not isinstance(args_obj, dict):
+                args_obj = {}  # ensure downstream sees an object
+            normalized_calls.append({**tc, "arguments": args_obj})
+        tool_calls = normalized_calls
         # Inject minimal defaults for image.dispatch without overwriting provided args; also emit args snapshot
         tool_calls = args_fill_min_defaults(tool_calls, last_user_text, log_fn=_log, trace_id=trace_id)
     # Planner must fully fill args per contract; no auto-insertion of tools beyond minimal defaults above

@@ -41,9 +41,8 @@ def get_model():
     global _model, _device
     if _model is None:
         _device = DEVICE
-        # load_music_engine returns (model, processor); we only cache the model here.
-        model, _proc = load_music_engine(MUSIC_MODEL_DIR, device=_device)
-        _model = model
+        # load_music_engine initializes the global processor and returns the model.
+        _model = load_music_engine(MUSIC_MODEL_DIR, device=_device)
     return _model, _device
 
 
