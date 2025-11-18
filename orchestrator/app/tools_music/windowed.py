@@ -23,6 +23,10 @@ WINDOW_QUALITY_THRESHOLD = 0.6
 WINDOW_FIT_THRESHOLD = 0.6
 MAX_REGEN_PASSES = 2
 
+# Hard cap for per-window generation length passed to the backend music engine.
+# The infinite/windowed tool is responsible for stitching longer tracks.
+MAX_WINDOW_SECONDS = 20
+
 
 def _eval_window_clip(
     win: Dict[str, Any],
@@ -190,22 +194,14 @@ def _recompose_single_window(
     elif sec_type == "bridge":
         prompt_parts.append("contrast section, increase tension before final chorus")
     win_prompt = ". ".join([p for p in prompt_parts if p]).strip() or (prompt or "song section")
+    raw_seconds = float((win.get("t_end") or 0.0) - (win.get("t_start") or 0.0))
+    win_seconds = int(max(1, int(round(raw_seconds))))
+    if win_seconds > MAX_WINDOW_SECONDS:
+        win_seconds = MAX_WINDOW_SECONDS
     compose_args = {
         "prompt": win_prompt,
         "bpm": global_block.get("tempo_bpm") or bpm,
-        "length_s": int(
-            max(
-                1,
-                int(
-                    round(
-                        float(
-                            (win.get("t_end") or 0.0)
-                            - (win.get("t_start") or 0.0)
-                        )
-                    )
-                ),
-            )
-        ),
+        "length_s": win_seconds,
         "sample_rate": params.get("sample_rate"),
         "channels": params.get("channels"),
         "music_lock": music_branch,
@@ -783,10 +779,16 @@ def run_music_infinite_windowed(job: Dict[str, Any], provider, manifest: Dict[st
         elif sec_type == "bridge":
             prompt_parts.append("contrast section, increase tension before final chorus")
         win_prompt = ". ".join([p for p in prompt_parts if p]).strip() or (prompt or "song section")
+        # Per-window duration passed to the backend is strictly capped; longer
+        # tracks are achieved by stitching windows, not by a single huge call.
+        raw_seconds = float((win.get("t_end") or 0.0) - (win.get("t_start") or 0.0))
+        win_seconds = int(max(1, int(round(raw_seconds))))
+        if win_seconds > MAX_WINDOW_SECONDS:
+            win_seconds = MAX_WINDOW_SECONDS
         compose_args = {
             "prompt": win_prompt,
             "bpm": global_block.get("tempo_bpm") or bpm,
-            "length_s": int(max(1, int(round(float(win.get("t_end") - win.get("t_start") or 0.0))))),
+            "length_s": win_seconds,
             "sample_rate": params.get("sample_rate"),
             "channels": params.get("channels"),
             "music_lock": music_branch,

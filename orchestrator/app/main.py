@@ -5881,7 +5881,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 import httpx as _hxsync  # local sync client
                 body = {
                     "prompt": payload.get("prompt"),
-                    "duration": int(payload.get("length_s") or 8),
+                    # Match the music service contract: it expects `seconds`.
+                    "seconds": int(payload.get("length_s") or 8),
                     # Pass through locks/refs so backends that support them can enforce consistency
                     "music_lock": payload.get("music_lock") or (payload.get("music_refs") if isinstance(payload, dict) else None),
                     "seed": payload.get("seed"),

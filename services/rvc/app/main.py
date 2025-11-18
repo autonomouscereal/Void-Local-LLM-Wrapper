@@ -4,16 +4,16 @@ import os
 import json
 import base64
 import glob
+import io
 from typing import Dict, Any, Tuple
 
 import numpy as np  # type: ignore
 import soundfile as sf  # type: ignore
-import torch  # type: ignore
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
 
-app = FastAPI(title="RVC Voice Conversion Service", version="1.0.2")
+app = FastAPI(title="RVC Voice Conversion Service", version="1.1.0")
 
 REGISTRY_PATH = os.getenv("RVC_REGISTRY_PATH", "/rvc/assets/registry.json")
 os.makedirs(os.path.dirname(REGISTRY_PATH), exist_ok=True)
@@ -23,23 +23,34 @@ RVC_MODEL_ROOT = os.getenv("RVC_MODEL_ROOT", "/opt/models/rvc_titan")
 if not (os.path.isdir(RVC_MODEL_ROOT) and os.listdir(RVC_MODEL_ROOT)):
     raise RuntimeError(f"RVC model directory missing or empty: {RVC_MODEL_ROOT}")
 
-# Titan HF model id for metadata/logging only.
-RVC_MODEL_NAME = "blaise-tk/TITAN"
+# Titan HF model id for metadata/logging only; model weights live under RVC_MODEL_ROOT.
+RVC_MODEL_NAME = os.getenv("RVC_MODEL_ID", "blaise-tk/TITAN")
 
-# Eagerly load at least one Titan checkpoint so we fail fast if bootstrap did not
-# populate the expected weights. We do NOT import any external hf_rvc package here;
-# we simply load the .pth state dict so Titan is guaranteed to be present.
-_TITAN_STATE: Dict[str, Any] | None = None
-_titan_paths = glob.glob(os.path.join(RVC_MODEL_ROOT, "**", "G-f0*48k-TITAN-*.pth"), recursive=True)
-if not _titan_paths:
-    # Fall back to any G-*.pth under the root as a safety net.
-    _titan_paths = glob.glob(os.path.join(RVC_MODEL_ROOT, "**", "G-*.pth"), recursive=True)
-if not _titan_paths:
-    raise RuntimeError(f"TITAN checkpoints not found under {RVC_MODEL_ROOT}")
+# hf-rvc is a Python package installed into the rvc_service image. If it is
+# missing, this is an image/build problem, not a Titan bootstrap problem.
 try:
-    _TITAN_STATE = torch.load(_titan_paths[0], map_location="cpu")
+    from hf_rvc import RVCFeatureExtractor, RVCModel  # type: ignore
+except ModuleNotFoundError as e:  # pragma: no cover - hard startup failure
+    raise RuntimeError(
+        "hf_rvc Python package is not installed in the rvc_service container. "
+        "Ensure the rvc_service image includes:\n"
+        "    pip install git+https://github.com/esnya/hf-rvc.git#egg=hf-rvc"
+    ) from e
+
+# Prefer loading Titan from the local snapshot under RVC_MODEL_ROOT so we do not
+# depend on network access at runtime. Fall back to the HF model id if needed.
+_model_target = RVC_MODEL_ROOT if os.path.isdir(RVC_MODEL_ROOT) else RVC_MODEL_NAME
+try:
+    FEATURE_EXTRACTOR = RVCFeatureExtractor.from_pretrained(_model_target)
+    RVC_MODEL = RVCModel.from_pretrained(_model_target)
+    FEATURE_EXTRACTOR.set_f0_method("rmvpe")
+    RVC_MODEL.eval()
 except Exception as ex:  # pragma: no cover - hard startup failure
-    raise RuntimeError(f"Failed to load TITAN checkpoint at {_titan_paths[0]}: {ex}") from ex
+    raise RuntimeError(
+        f"Failed to load RVC Titan model from '{_model_target}'. "
+        f"Check that Titan has been bootstrapped into {RVC_MODEL_ROOT} and that hf_rvc is compatible. "
+        f"Underlying error: {ex}"
+    ) from ex
 
 
 def _load_registry() -> Dict[str, Any]:
@@ -124,7 +135,7 @@ def _decode_wav_to_mono_float32(data: bytes) -> Tuple[np.ndarray, int]:
     """
     Decode WAV bytes into mono float32 PCM and return (audio, sample_rate).
     """
-    audio, sr = sf.read(io.BytesIO(data), always_2d=False)  # type: ignore[name-defined]
+    audio, sr = sf.read(io.BytesIO(data), always_2d=False)
     if getattr(audio, "ndim", 1) > 1:
         audio = audio.mean(axis=1)
     audio = np.asarray(audio, dtype=np.float32)
@@ -135,25 +146,38 @@ def _encode_mono_float32_to_wav_bytes(y: np.ndarray, sr: int) -> bytes:
     """
     Encode mono float32 PCM into WAV bytes.
     """
-    buf = io.BytesIO()  # type: ignore[name-defined]
+    buf = io.BytesIO()
     sf.write(buf, y, int(sr), format="WAV")
     return buf.getvalue()
 
 
-def _simple_rvc_convert(src_y: np.ndarray, src_sr: int, ref_y: np.ndarray, ref_sr: int, cfg: Dict[str, Any]) -> np.ndarray:
+def _run_rvc_convert(src_y: np.ndarray, src_sr: int, ref_y: np.ndarray, ref_sr: int, cfg: Dict[str, Any]) -> np.ndarray:
     """
-    Temporary, lightweight RVC "conversion" that keeps the pipeline working
-    without depending on an external hf_rvc package.
+    Titan-backed RVC conversion using hf_rvc's feature extractor and model.
 
-    This currently acts as a passthrough with optional gain/transpose hooks
-    reserved for a future Titan-backed engine. The critical behavior is that
-    it never raises on missing hf_rvc and always returns a valid waveform.
+    This loads content features for both source and reference and calls the
+    generic convert() interface on the Titan RVC model.
     """
-    # For now, just return the source audio as-is. This keeps the service
-    # functional while avoiding hard dependency on extras.
     if not isinstance(src_y, np.ndarray) or src_y.size == 0:
-        return np.zeros(1, dtype=np.float32)
-    return np.asarray(src_y, dtype=np.float32)
+        raise ValueError("rvc_convert: empty source audio")
+    if not isinstance(ref_y, np.ndarray) or ref_y.size == 0:
+        raise ValueError("rvc_convert: empty reference audio")
+    # Build features for source and reference using Titan's feature extractor.
+    src_feats = FEATURE_EXTRACTOR(audio=src_y, sampling_rate=src_sr, return_tensors="pt")
+    ref_feats = FEATURE_EXTRACTOR(audio=ref_y, sampling_rate=ref_sr, return_tensors="pt")
+    # Apply optional transpose/f0_method from registry if present.
+    transpose = int(cfg.get("transpose") or 0) if isinstance(cfg, dict) else 0
+    f0_method = cfg.get("f0_method") if isinstance(cfg, dict) else "rmvpe"
+    converted = RVC_MODEL.convert(
+        source_features=src_feats,
+        reference_features=ref_feats,
+        transpose=transpose,
+        f0_method=f0_method or "rmvpe",
+    )
+    # converted is expected to be a 1D float tensor; convert to numpy.
+    if hasattr(converted, "detach"):
+        return converted.detach().cpu().numpy().astype("float32")
+    return np.asarray(converted, dtype=np.float32)
 
 
 @app.post("/v1/audio/convert")
@@ -223,11 +247,8 @@ async def convert_v1(body: Dict[str, Any]):
     else:
         # Fallback: use source as its own reference when no explicit reference path is set.
         ref_y, ref_sr = src_y, src_sr
-    # Titan-backed RVC engine placeholder: we currently apply a simple passthrough
-    # conversion to keep the service functional without relying on an external
-    # hf_rvc package. Future work can replace this with a full RVC implementation.
     try:
-        converted_np = _simple_rvc_convert(src_y, src_sr, ref_y, ref_sr, ref_cfg if isinstance(ref_cfg, dict) else {})
+        converted_np = _run_rvc_convert(src_y, src_sr, ref_y, ref_sr, ref_cfg if isinstance(ref_cfg, dict) else {})
     except Exception as ex:
         return JSONResponse(
             status_code=500,
