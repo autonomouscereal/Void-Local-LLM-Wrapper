@@ -56,6 +56,8 @@ def plan_vocal_segments(song_graph: Dict[str, Any], windows: List[Dict[str, Any]
 
     Each segment:
       {
+        "segment_id": str,
+        "voice_id": str,
         "voice_lock_id": str,
         "window_id": str,
         "start_s": float,
@@ -102,8 +104,11 @@ def plan_vocal_segments(song_graph: Dict[str, Any], windows: List[Dict[str, Any]
             for idx, text in enumerate(phrases):
                 seg_start = float(t_start) + idx * seg_duration
                 seg_end = seg_start + seg_duration
+                segment_id = f"seg_{section_id}_{voice_id}_{idx:03d}"
                 segments.append(
                     {
+                        "segment_id": segment_id,
+                        "voice_id": voice_id,
                         "voice_lock_id": voice_lock_id,
                         "window_id": win.get("window_id"),
                         "start_s": seg_start,
@@ -155,6 +160,8 @@ def render_vocal_stems_for_track(
         tts_job: Dict[str, Any] = {
             "text": text,
             "voice_lock_id": voice_lock_id,
+            "voice_id": seg.get("voice_id"),
+            "segment_id": seg.get("segment_id"),
             "sample_rate": int(job.get("tts_sample_rate") or 22050),
             "max_seconds": max_seconds,
             "seed": job.get("seed"),
@@ -224,6 +231,8 @@ def render_vocal_stems_for_track(
             {
                 "path": stem_out,
                 "voice_lock_id": voice_lock_id,
+                "voice_id": seg.get("voice_id"),
+                "segment_id": seg.get("segment_id"),
                 "start_s": start_s,
                 "end_s": end_s,
             }

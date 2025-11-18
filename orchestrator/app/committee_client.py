@@ -84,7 +84,27 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str) -> 
             },
         )
         ppayload = dict(payload)
-        resp = await client.post(f"{base_url}/api/generate", json=ppayload)
+        try:
+            resp = await client.post(f"{base_url.rstrip('/')}/api/generate", json=ppayload)
+        except httpx.ConnectError as exc:
+            # Surface a clear, structured connection failure instead of a raw httpcore traceback.
+            log.info(
+                "[committee] ollama.connect_error base=%s trace_id=%s error=%s",
+                base_url,
+                trace_key,
+                str(exc),
+            )
+            emit_trace(
+                STATE_DIR,
+                trace_key,
+                "committee.ollama.connect_error",
+                {
+                    "trace_id": trace_key,
+                    "base_url": base_url,
+                    "error": str(exc),
+                },
+            )
+            raise RuntimeError(f"ollama connection failed to {base_url}: {exc}") from exc
         raw_text = resp.text or ""
         # Extract only the fields we care about from the Ollama JSON, without
         # relying on a full JSONParser round-trip. When the upstream JSON is

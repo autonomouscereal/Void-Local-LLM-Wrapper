@@ -19,7 +19,10 @@ def tts_edge_defaults(params: dict, edge: bool) -> dict:
         "sample_rate": 22050 if edge else int(params.get("sample_rate") or 24000),
         "channels": 1,
         "max_seconds": min(int(params.get("max_seconds") or 20), 30),
-        "voice": params.get("voice") or "narrator",
+        # Do not inject a hard-coded logical voice; let callers supply an explicit
+        # voice_id/voice so XTTS speaker mapping and RVC locks stay under orchestration
+        # control.
+        "voice": params.get("voice"),
     }
     for k, v in (params or {}).items():
         if k not in out and v is not None:

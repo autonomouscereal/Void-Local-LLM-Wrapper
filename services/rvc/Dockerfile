@@ -5,12 +5,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir --upgrade pip \
- && pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cu118 \
-    "torch==2.7.1+cu118" "torchaudio==2.7.1+cu118" "torchvision==0.22.1+cu118" \
- && pip install --no-cache-dir fastapi uvicorn soundfile numpy huggingface_hub
+RUN pip install --no-cache-dir --upgrade pip
 
 WORKDIR /app
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cu118 -r /app/requirements.txt
+
 COPY app /app/app
 
 EXPOSE 7863

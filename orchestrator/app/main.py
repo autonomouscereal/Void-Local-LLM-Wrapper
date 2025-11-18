@@ -299,6 +299,11 @@ class _TTSProvider:
                         import base64 as _b64local
                         wav = _b64local.b64decode(b64)
                     # Adapt to canonical internal envelope expected by run_tts_speak.
+                    sample_rate = int(inner.get("sample_rate") or payload.get("sample_rate") or 22050)
+                    language = inner.get("language") or payload.get("language") or "en"
+                    voice_id = inner.get("voice_id") or payload.get("voice_id") or payload.get("voice")
+                    xtts_speaker = inner.get("xtts_speaker")
+                    segment_id = inner.get("segment_id") or payload.get("segment_id")
                     return {
                         "schema_version": 1,
                         "request_id": trace_id,
@@ -308,6 +313,12 @@ class _TTSProvider:
                             "wav_bytes": wav,
                             "duration_s": float(inner.get("duration_s") or 0.0),
                             "model": inner.get("model") or "xtts",
+                            "sample_rate": sample_rate,
+                            "language": language,
+                            "voice_id": voice_id,
+                            "voice": payload.get("voice"),
+                            "xtts_speaker": xtts_speaker,
+                            "segment_id": segment_id,
                         },
                         "error": None,
                     }

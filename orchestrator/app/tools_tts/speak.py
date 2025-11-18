@@ -90,9 +90,20 @@ def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
     lang = job.get("language")
     if not isinstance(lang, str) or not lang.strip():
         lang = "en"
+    # Logical voice identifier used for XTTS base-speaker mapping and RVC locks.
+    logical_voice_id = job.get("voice_id") or params.get("voice") or tts_voice_id or inferred_voice
+    # Ensure each call is associated with a stable segment identifier for downstream
+    # RVC conversion and Film2/audio mixing.
+    seg_raw = job.get("segment_id")
+    if isinstance(seg_raw, str) and seg_raw.strip():
+        segment_id = seg_raw.strip()
+    else:
+        segment_id = f"seg_{cid}"
     args = {
         "text": job.get("text") or "",
-        "voice": params.get("voice") or tts_voice_id or inferred_voice,
+        "voice": logical_voice_id,
+        "voice_id": logical_voice_id,
+        "segment_id": segment_id,
         "rate": float(job.get("rate") or tts_global.get("default_speaking_rate") or 1.0),
         "pitch": float(job.get("pitch") or tts_global.get("default_pitch_shift_semitones") or 0.0),
         "sample_rate": int(params.get("sample_rate") or 22050),
@@ -103,6 +114,7 @@ def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
         "lock_bundle": lock_bundle,
         "quality_profile": quality_profile,
         "language": lang,
+        "trace_id": cid,
     }
     args = stamp_tool_args("tts.speak", args)
     res = provider.speak(args)
@@ -119,54 +131,60 @@ def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
         wav_bytes = res.get("wav_bytes") or b""
         dur = float(res.get("duration_s") or 0.0)
         model = res.get("model", "unknown")
-    # Optional RVC voice conversion when a voice_lock_id is present.
-    voice_lock_id = job.get("voice_lock_id") or job.get("voice_id")
+    # Mandatory RVC voice conversion for all vocal segments; configuration and
+    # reference locks must be present or this tool returns an error.
+    voice_lock_id = job.get("voice_lock_id") or job.get("voice_id") or logical_voice_id
     rvc_url = os.getenv("RVC_API_URL")
-    if isinstance(voice_lock_id, str) and voice_lock_id.strip() and isinstance(rvc_url, str) and rvc_url.strip():
-        try:
-            import base64 as _b64_rvc
-            payload_rvc = {
-                "source_wav_base64": _b64_rvc.b64encode(wav_bytes or b"").decode("ascii"),
-                "voice_lock_id": voice_lock_id.strip(),
-            }
-            with httpx.Client(timeout=None, trust_env=False) as client:
-                r_rvc = client.post(rvc_url.rstrip("/") + "/v1/audio/convert", json=payload_rvc)
-            try:
-                from ..json_parser import JSONParser  # type: ignore
-                parser = JSONParser()
-                js_rvc = parser.parse(r_rvc.text or "", {"ok": bool, "audio_wav_base64": str, "sample_rate": int})
-            except Exception:
-                js_rvc = {}
-            if not isinstance(js_rvc, dict) or not bool(js_rvc.get("ok")):
-                return {
-                    "ok": False,
-                    "error": {
-                        "code": "rvc_error",
-                        "status": int(getattr(r_rvc, "status_code", 500) or 500),
-                        "message": "RVC /v1/audio/convert failed for tts.speak",
-                        "raw": js_rvc,
-                    },
-                }
-            b64_rvc = js_rvc.get("audio_wav_base64") if isinstance(js_rvc.get("audio_wav_base64"), str) else None
-            if not b64_rvc:
-                return {
-                    "ok": False,
-                    "error": {
-                        "code": "rvc_missing_audio",
-                        "status": 500,
-                        "message": "RVC /v1/audio/convert returned no audio_wav_base64",
-                    },
-                }
-            wav_bytes = _b64_rvc.b64decode(b64_rvc)
-        except Exception as ex:
-            return {
-                "ok": False,
-                "error": {
-                    "code": "rvc_exception",
-                    "status": 500,
-                    "message": str(ex),
-                },
-            }
+    if not isinstance(rvc_url, str) or not rvc_url.strip():
+        return {
+            "ok": False,
+            "error": {
+                "code": "rvc_not_configured",
+                "status": 500,
+                "message": "RVC_API_URL is not set; RVC is mandatory for tts.speak.",
+            },
+        }
+    if not isinstance(voice_lock_id, str) or not voice_lock_id.strip():
+        return {
+            "ok": False,
+            "error": {
+                "code": "rvc_reference_missing",
+                "status": 500,
+                "message": f"No voice_lock_id / reference configured for voice_id '{logical_voice_id}'.",
+            },
+        }
+    import base64 as _b64_rvc
+    payload_rvc = {
+        "source_wav_base64": _b64_rvc.b64encode(wav_bytes or b"").decode("ascii"),
+        "voice_lock_id": voice_lock_id.strip(),
+    }
+    with httpx.Client(timeout=None, trust_env=False) as client:
+        r_rvc = client.post(rvc_url.rstrip("/") + "/v1/audio/convert", json=payload_rvc)
+    from ..json_parser import JSONParser  # type: ignore
+
+    parser = JSONParser()
+    js_rvc = parser.parse(r_rvc.text or "", {"ok": bool, "audio_wav_base64": str, "sample_rate": int})
+    if not isinstance(js_rvc, dict) or not bool(js_rvc.get("ok")):
+        return {
+            "ok": False,
+            "error": {
+                "code": "rvc_error",
+                "status": int(getattr(r_rvc, "status_code", 500) or 500),
+                "message": "RVC /v1/audio/convert failed for tts.speak",
+                "raw": js_rvc,
+            },
+        }
+    b64_rvc = js_rvc.get("audio_wav_base64") if isinstance(js_rvc.get("audio_wav_base64"), str) else None
+    if not b64_rvc:
+        return {
+            "ok": False,
+            "error": {
+                "code": "rvc_missing_audio",
+                "status": 500,
+                "message": "RVC /v1/audio/convert returned no audio_wav_base64",
+            },
+        }
+    wav_bytes = _b64_rvc.b64decode(b64_rvc)
     # Mandatory VocalFix quality stage for all TTS audio.
     vf_url = os.getenv("VOCAL_FIXER_API_URL")
     if not isinstance(vf_url, str) or not vf_url.strip():
@@ -511,6 +529,11 @@ def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
             "step": 0,
             "state": "halt",
             "cont": {"present": False, "state_hash": None, "reason": None},
+            # Expose segment/voice identifiers at the envelope level so downstream
+            # planners and mixers can stitch multi-singer timelines.
+            "segment_id": segment_id,
+            "voice_id": logical_voice_id,
+            "voice_lock_id": voice_lock_id,
         },
         "reasoning": {"goal": "tts", "constraints": ["json-only", "edge-safe"], "decisions": ["tts.speak done"]},
         "evidence": [],

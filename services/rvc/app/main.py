@@ -5,6 +5,7 @@ import json
 import base64
 import glob
 import io
+import logging
 from typing import Dict, Any, Tuple
 
 import numpy as np  # type: ignore
@@ -20,8 +21,22 @@ os.makedirs(os.path.dirname(REGISTRY_PATH), exist_ok=True)
 
 # Model root populated by bootstrap (blaise-tk/TITAN under /opt/models/rvc_titan)
 RVC_MODEL_ROOT = os.getenv("RVC_MODEL_ROOT", "/opt/models/rvc_titan")
-if not (os.path.isdir(RVC_MODEL_ROOT) and os.listdir(RVC_MODEL_ROOT)):
-    raise RuntimeError(f"RVC model directory missing or empty: {RVC_MODEL_ROOT}")
+
+
+def ensure_rvc_weights_present() -> None:
+    """
+    Verify that Titan RVC weights exist under RVC_MODEL_ROOT.
+
+    This is independent of the hf_rvc Python package; failures here indicate a
+    bootstrap/volume problem, not a missing library.
+    """
+    if not os.path.isdir(RVC_MODEL_ROOT):
+        raise RuntimeError(f"RVC_MODEL_ROOT does not exist: {RVC_MODEL_ROOT}")
+    entries = os.listdir(RVC_MODEL_ROOT)
+    if not entries:
+        raise RuntimeError(f"RVC model directory is empty: {RVC_MODEL_ROOT}")
+    logging.info("RVC weights present in %s: %s", RVC_MODEL_ROOT, entries)
+
 
 # Titan HF model id for metadata/logging only; model weights live under RVC_MODEL_ROOT.
 RVC_MODEL_NAME = os.getenv("RVC_MODEL_ID", "blaise-tk/TITAN")
@@ -36,6 +51,9 @@ except ModuleNotFoundError as e:  # pragma: no cover - hard startup failure
         "Ensure the rvc_service image includes:\n"
         "    pip install git+https://github.com/esnya/hf-rvc.git#egg=hf-rvc"
     ) from e
+
+# Ensure Titan weights are present before attempting to load the engine.
+ensure_rvc_weights_present()
 
 # Prefer loading Titan from the local snapshot under RVC_MODEL_ROOT so we do not
 # depend on network access at runtime. Fall back to the HF model id if needed.
