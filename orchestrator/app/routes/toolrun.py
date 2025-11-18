@@ -331,7 +331,20 @@ async def tool_run(req: Request):
 			"arguments": (args if isinstance(args, dict) else {}),
 			"trace_id": rid,
 		}
-		res = await execute_tool_call(call)
+		try:
+			res = await execute_tool_call(call)
+		except Exception as ex:
+			_tb = traceback.format_exc()
+			log.error("[toolrun] tool=%s raised exception: %s", name, _tb)
+			# Surface a structured envelope instead of letting the exception bubble
+			# to FastAPI (which would produce a bare 500/CORS error at the client).
+			return ToolEnvelope.failure(
+				"tool_exception",
+				str(ex),
+				status=500,
+				request_id=rid,
+				details={"traceback": _tb},
+			)
 		if isinstance(res, dict) and isinstance(res.get("result"), dict):
 			return ToolEnvelope.success(res["result"], request_id=rid)
 		err_obj = res.get("error") if isinstance(res, dict) else None

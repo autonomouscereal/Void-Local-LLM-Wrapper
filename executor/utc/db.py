@@ -1,6 +1,8 @@
 import os
 import asyncio
 from typing import Optional, Any, Dict, List
+import logging
+import traceback
 
 _pool = None
 
@@ -14,12 +16,14 @@ async def get_pg_pool():
         return None
     try:
         import asyncpg  # type: ignore
-    except Exception:
+    except Exception as e:
+        logging.error("asyncpg import failed for PG_DSN=%s: %s\n%s", dsn, e, traceback.format_exc())
         return None
     try:
         _pool = await asyncpg.create_pool(dsn=dsn, min_size=1, max_size=4)
         return _pool
-    except Exception:
+    except Exception as e:
+        logging.error("asyncpg.create_pool failed for PG_DSN=%s: %s\n%s", dsn, e, traceback.format_exc())
         return None
 
 

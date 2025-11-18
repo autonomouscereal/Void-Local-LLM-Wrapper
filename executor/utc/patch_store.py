@@ -1,5 +1,7 @@
 import json
 from typing import Any, Dict, List, Optional
+import logging
+import traceback
 from .db import get_pg_pool
 from .pathutil import get_in, set_in, pop_in
 
@@ -53,7 +55,15 @@ async def preapply(tool_name: str, version: str, from_hash: str, args: Dict[str,
                 "select patch_json from tool_patches where tool_name=$1 and version=$2 and from_hash=$3 order by patch_id asc",
                 tool_name, version, from_hash,
             )
-        except Exception:
+        except Exception as e:
+            logging.error(
+                "patch_store.preapply failed for tool=%s version=%s from_hash=%s: %s\n%s",
+                tool_name,
+                version,
+                from_hash,
+                e,
+                traceback.format_exc(),
+            )
             return args
     out = dict(args)
     for r in rows or []:
@@ -75,7 +85,16 @@ async def persist_success(tool_name: str, version: str, from_hash: str, to_hash:
                 tool_name, version, from_hash, to_hash, json.dumps({"ops": ops or []}),
             )
             return int(row["patch_id"]) if row and "patch_id" in row else None
-        except Exception:
+        except Exception as e:
+            logging.error(
+                "patch_store.persist_success failed for tool=%s version=%s from_hash=%s to_hash=%s: %s\n%s",
+                tool_name,
+                version,
+                from_hash,
+                to_hash,
+                e,
+                traceback.format_exc(),
+            )
             return None
 
 

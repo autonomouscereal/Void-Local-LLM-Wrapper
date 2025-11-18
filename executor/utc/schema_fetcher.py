@@ -3,6 +3,8 @@ import hashlib
 import json
 from typing import Any, Dict, Optional
 import time
+import logging
+import traceback
 
 from .db import get_pg_pool
 
@@ -19,7 +21,8 @@ def _get(url: str) -> Dict[str, Any]:
         raw = resp.read().decode("utf-8", errors="replace")
     try:
         return json.loads(raw)
-    except Exception:
+    except Exception as e:
+        logging.error("schema_fetcher._get failed for url=%s: %s\n%s", url, e, traceback.format_exc())
         return {}
 
 
@@ -40,8 +43,8 @@ async def fetch(name: str) -> Dict[str, Any]:
                     "insert into tool_schemas (tool_name, version, schema_hash, schema_json) values ($1,$2,$3,$4) on conflict do nothing",
                     name, version, schema_hash, json.dumps(schema),
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logging.error("schema_fetcher.fetch failed to cache schema for tool=%s: %s\n%s", name, e, traceback.format_exc())
     return {"name": name, "version": version, "schema": (schema or {}), "schema_hash": schema_hash}
 
 

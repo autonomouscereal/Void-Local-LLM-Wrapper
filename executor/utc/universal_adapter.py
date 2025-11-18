@@ -1,5 +1,7 @@
 import re
 from typing import Any, Dict, List, Tuple
+import logging
+import traceback
 
 
 def _camel_to_snake(s: str) -> str:
@@ -70,7 +72,15 @@ def _cast(args: Dict[str, Any], schema: Dict[str, Any], errors: List[Dict[str, A
                 out[path] = (val.strip().lower() == "true"); ops.append({"op": "cast", "path": path, "to": "boolean"})
             elif exp == "string" and not isinstance(val, str):
                 out[path] = str(val); ops.append({"op": "cast", "path": path, "to": "string"})
-        except Exception:
+        except Exception as e:
+            logging.error(
+                "universal_adapter._cast failed for path=%s expected=%s value=%r: %s\n%s",
+                path,
+                exp,
+                val,
+                e,
+                traceback.format_exc(),
+            )
             continue
     return out, ops
 

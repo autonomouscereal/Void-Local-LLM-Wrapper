@@ -145,8 +145,8 @@ async def utc_run_tool(trace_id: Optional[str], step_id: Optional[str], name: st
                         _json.dumps(None),
                         _json.dumps(attempt_args),
                     )
-            except Exception:
-                pass
+            except Exception as e:
+                logging.error("tool_call_telemetry insert failed: %s", e, exc_info=True)
         return res
 
     # Non-ok orchestrator response: wrap with a canonical error envelope.
