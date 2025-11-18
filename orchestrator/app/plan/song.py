@@ -81,6 +81,41 @@ SONG_GRAPH_SCHEMA: Dict[str, Any] = {
 }
 
 
+def _fix_mojibake(s: str) -> str:
+    """
+    Lightweight normalization for common UTF-8 mojibake artifacts that leak
+    through some LLM backends (e.g., â\x80\x99 for right single quote).
+
+    This keeps semantics intact while cleaning up text for downstream TTS/lyrics.
+    """
+    if not isinstance(s, str) or not s:
+        return s
+    replacements = {
+        "â\x80\x99": "'",   # smart apostrophe → straight quote
+        "â\x80¦": "...",    # ellipsis
+        "â\x80\x9c": "\"",  # left double quote
+        "â\x80\x9d": "\"",  # right double quote
+    }
+    out = s
+    for bad, good in replacements.items():
+        if bad in out:
+            out = out.replace(bad, good)
+    return out
+
+
+def _normalize_text_fields(obj: Any) -> Any:
+    """
+    Recursively normalize all string fields in a Song Graph object.
+    """
+    if isinstance(obj, dict):
+        return {k: _normalize_text_fields(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_normalize_text_fields(v) for v in obj]
+    if isinstance(obj, str):
+        return _fix_mojibake(obj)
+    return obj
+
+
 async def plan_song_graph(
     user_text: str,
     length_s: int,
@@ -173,6 +208,9 @@ async def plan_song_graph(
     )
     song = parsed.get("song")
     if isinstance(song, dict):
+        # Normalize textual fields (lyrics, section names, motif descriptions, etc.)
+        # to clean up common UTF-8 mojibake before downstream tools consume them.
+        song = _normalize_text_fields(song)
         sections = song.get("sections") if isinstance(song.get("sections"), list) else []
         lyrics_obj = song.get("lyrics") if isinstance(song.get("lyrics"), dict) else {}
         lyrics_sections = lyrics_obj.get("sections") if isinstance(lyrics_obj.get("sections"), list) else []

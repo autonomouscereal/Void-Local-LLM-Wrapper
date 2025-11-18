@@ -6,7 +6,7 @@ from typing import List, Dict, Any
 
 import torch  # type: ignore
 
-from ..analysis.media import analyze_audio
+from ..analysis.media import analyze_audio, _load_audio
 
 
 def _cos_sim(a: List[float], b: List[float]) -> float:
@@ -38,6 +38,18 @@ if not (os.path.isdir(CLAP_MODEL_DIR) and os.listdir(CLAP_MODEL_DIR)):
 
 import laion_clap  # type: ignore
 
+
+class MusicEvalError(Exception):
+    """
+    Non-fatal error for music evaluation paths (e.g., CLAP failures).
+
+    Tool code (music.infinite.windowed, MusicEval 2.0) should treat this as
+    "style eval unavailable for this track/clip" and degrade gracefully,
+    rather than letting it crash the entire tool call.
+    """
+    pass
+
+
 _CLAP_MODEL = laion_clap.CLAP_Module(enable_fusion=False, amodel="HTSAT-base")
 _CLAP_STATE_PATH = os.path.join(CLAP_MODEL_DIR, "CLAP_HTSAT_base.pt")
 if os.path.exists(_CLAP_STATE_PATH) and os.path.getsize(_CLAP_STATE_PATH) > 0:
@@ -51,18 +63,30 @@ def _embed_music_clap(path: str) -> List[float]:
     CLAP-based music embedding helper.
 
     Returns a dense float32 embedding for the given audio file path. CLAP
-    presence and weights are treated as mandatory; failures will surface as
-    exceptions instead of returning None.
+    presence and weights are treated as mandatory for style eval, but callers
+    should catch MusicEvalError and degrade gracefully instead of crashing the
+    entire music tool.
     """
     if not isinstance(path, str) or not path:
-        raise ValueError("embed_music_clap: invalid path")
-    with torch.no_grad():
-        emb = _CLAP_MODEL.get_audio_embedding_from_filelist([path])
+        raise MusicEvalError("embed_music_clap: invalid path")
+    if (not os.path.isfile(path)) or os.path.getsize(path) <= 0:
+        raise MusicEvalError(f"embed_music_clap: audio file missing or empty: {path}")
+    y, sr = _load_audio(path)
+    if not y or not sr:
+        raise MusicEvalError(f"embed_music_clap: zero-length or unreadable audio: {path}")
+    try:
+        with torch.no_grad():
+            emb = _CLAP_MODEL.get_audio_embedding_from_filelist([path])
+    except ZeroDivisionError as e:
+        # Known laion_clap bug when audio_data is empty; surface as MusicEvalError.
+        raise MusicEvalError(f"embed_music_clap: clap_zero_division for {path}") from e
+    except Exception as e:
+        raise MusicEvalError(f"embed_music_clap: clap_internal_error for {path}: {e}") from e
     if emb is None or len(emb) == 0:
-        raise RuntimeError("embed_music_clap: CLAP returned no embedding")
+        raise MusicEvalError("embed_music_clap: CLAP returned no embedding")
     v = emb[0].detach().cpu().numpy().astype("float32").tolist()
     if not v:
-        raise RuntimeError("embed_music_clap: empty embedding vector")
+        raise MusicEvalError("embed_music_clap: empty embedding vector")
     return v
 
 

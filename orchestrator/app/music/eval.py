@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional
 from ..analysis.media import analyze_audio, _load_audio  # type: ignore
 from ..json_parser import JSONParser
 from ..committee_client import committee_jsonify  # type: ignore
-from .style_pack import _embed_music_clap, _cos_sim
+from .style_pack import _embed_music_clap, _cos_sim, MusicEvalError
 
 
 def _map_technical_to_score(metrics: Dict[str, Any]) -> float:
@@ -74,40 +74,59 @@ def eval_technical(track_path: str) -> Dict[str, Any]:
 
 
 def eval_style(track_path: str, style_pack: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    if style_pack is None:
-        embed = _embed_music_clap(track_path)
+    """
+    Style-axis evaluation using CLAP embeddings.
+
+    CLAP failures (e.g., zero-length audio, laion_clap internal ZeroDivisionError)
+    are treated as non-fatal for the overall music tool: we surface them via
+    style_eval_ok=False and a reason string instead of raising to FastAPI.
+    """
+    try:
+        if style_pack is None:
+            embed = _embed_music_clap(track_path)
+            return {
+                "style_score": 0.0,
+                "track_embed": embed,
+                "per_ref_scores": {},
+                "style_eval_ok": True,
+            }
+
+        style_embed = style_pack.get("style_embed")
+        if not isinstance(style_embed, list) or not style_embed:
+            raise ValueError("eval_style: style_pack is missing a valid style_embed")
+
+        track_embed = _embed_music_clap(track_path)
+        raw_sim = _cos_sim(style_embed, track_embed)
+        style_score = 0.5 * (raw_sim + 1.0)
+
+        per_ref_scores: Dict[str, float] = {}
+        refs = style_pack.get("refs") or []
+        if isinstance(refs, list):
+            for ref in refs:
+                if not isinstance(ref, dict):
+                    continue
+                ref_path = ref.get("path")
+                ref_embed = ref.get("embed")
+                if not isinstance(ref_path, str) or not isinstance(ref_embed, list):
+                    continue
+                sim = _cos_sim(ref_embed, track_embed)
+                per_ref_scores[ref_path] = 0.5 * (sim + 1.0)
+
+        return {
+            "style_score": style_score,
+            "track_embed": track_embed,
+            "per_ref_scores": per_ref_scores,
+            "style_eval_ok": True,
+        }
+    except MusicEvalError as e:
+        # CLAP failed for this track; surface as non-fatal style-axis failure.
         return {
             "style_score": 0.0,
-            "track_embed": embed,
+            "track_embed": None,
             "per_ref_scores": {},
+            "style_eval_ok": False,
+            "reason": str(e),
         }
-
-    style_embed = style_pack.get("style_embed")
-    if not isinstance(style_embed, list) or not style_embed:
-        raise ValueError("eval_style: style_pack is missing a valid style_embed")
-
-    track_embed = _embed_music_clap(track_path)
-    raw_sim = _cos_sim(style_embed, track_embed)
-    style_score = 0.5 * (raw_sim + 1.0)
-
-    per_ref_scores: Dict[str, float] = {}
-    refs = style_pack.get("refs") or []
-    if isinstance(refs, list):
-        for ref in refs:
-            if not isinstance(ref, dict):
-                continue
-            ref_path = ref.get("path")
-            ref_embed = ref.get("embed")
-            if not isinstance(ref_path, str) or not isinstance(ref_embed, list):
-                continue
-            sim = _cos_sim(ref_embed, track_embed)
-            per_ref_scores[ref_path] = 0.5 * (sim + 1.0)
-
-    return {
-        "style_score": style_score,
-        "track_embed": track_embed,
-        "per_ref_scores": per_ref_scores,
-    }
 
 
 def _eval_structure_from_song_graph(track_path: str, song_graph: Dict[str, Any]) -> Dict[str, Any]:

@@ -43,6 +43,14 @@ def get_model():
         _device = DEVICE
         # load_music_engine initializes the global processor and returns the model.
         _model = load_music_engine(MUSIC_MODEL_DIR, device=_device)
+    # Absolute guardrail: never let a tuple propagate as the model; unwrap here.
+    if isinstance(_model, (tuple, list)):
+        logging.info("music.get_model: unwrapping tuple model %s", type(_model))
+        try:
+            _model = _model[0]
+        except Exception:
+            # If this ever happens, surface via the generate() error envelope.
+            pass
     return _model, _device
 
 

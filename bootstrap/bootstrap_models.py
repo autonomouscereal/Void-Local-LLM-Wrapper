@@ -49,8 +49,6 @@ HF_MODELS = [
     ("facebook/musicgen-melody",               "musicgen-melody", None),
     ("facebook/audiogen-medium",               "audiogen-medium", None),
     ("cvssp/audioldm2-large",                  "audioldm2-large", None),
-    # RVC voice conversion base model (TITAN) – downloaded into MODELS_DIR/rvc_titan
-    ("blaise-tk/TITAN",                        "rvc_titan",      None),
 ]
 
 # Never append external/custom music engines dynamically in bootstrap; when used
@@ -278,19 +276,23 @@ def ensure_rvc_titan() -> None:
 
 def main() -> None:
     ensure_pkg()
-    # Early exit if done marker exists
     done_marker = os.path.join(MODELS_DIR, "manifests", ".bootstrap_done")
     if os.path.exists(done_marker):
-        log("marker-present", done_marker, "— skipping downloads")
+        # Marker means "bootstrap completed at least once", NOT "skip all work".
+        # We still re-verify all mandatory models on every run so newly-added
+        # directories like rvc_titan are populated even after the initial bootstrap.
+        log("marker-present", done_marker, "— will still verify all mandatory models")
     else:
-        for rid, key, allow in HF_MODELS:
-            snapshot(rid, key, allow)
-        for url, key in GIT_REPOS:
-            git_clone(url, key)
-        # Ensure Titan's 48k Medium D/G checkpoints are present for rvc_service,
-        # then optional aesthetic head weights for orchestrator image scoring.
-        ensure_rvc_titan()
-        ensure_aesthetic_head()
+        log("marker-missing", done_marker, "— full bootstrap will run")
+    # Idempotent per-model downloads; snapshot/git_clone short-circuit when targets exist.
+    for rid, key, allow in HF_MODELS:
+        snapshot(rid, key, allow)
+    for url, key in GIT_REPOS:
+        git_clone(url, key)
+    # Ensure Titan's 48k Medium D/G checkpoints are present for rvc_service,
+    # then optional aesthetic head weights for orchestrator image scoring.
+    ensure_rvc_titan()
+    ensure_aesthetic_head()
     manifest = {
         "hf": {rid: key for rid, key, _ in HF_MODELS},
         "git": {url: key for url, key in GIT_REPOS},
@@ -299,14 +301,12 @@ def main() -> None:
     os.makedirs(mpath, exist_ok=True)
     with open(os.path.join(mpath, "model_manifest.json"), "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
-    # Summary
+    # Summary for HF/git sources (best effort; STATUS only tracks fresh downloads).
     pending = {k: v for k, v in STATUS.get("hf", {}).items() if v.get("state") != "done"}
     pending.update({f"git:{k}": v for k, v in STATUS.get("git", {}).items() if v.get("state") != "done"})
     if pending:
         log("SUMMARY: PENDING/MISSING", sorted(pending.keys()))
-    else:
-        log("SUMMARY: ALL MODELS DOWNLOADED")
-    # Hard fail if any mandatory directory is missing or empty
+    # Hard fail if any mandatory directory is missing or empty (authoritative check).
     missing = [
         k for k in MANDATORY_DIRS
         if not (os.path.isdir(os.path.join(MODELS_DIR, k)) and os.listdir(os.path.join(MODELS_DIR, k)))
