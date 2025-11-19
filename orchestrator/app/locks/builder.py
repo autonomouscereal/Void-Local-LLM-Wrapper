@@ -167,7 +167,6 @@ async def build_image_bundle(
     palette_hex = [_hex_from_rgb(rgb) for rgb in palette]
     palette_tags = _palette_tags(palette)
     stored_path = _save_image_bytes(locks_root_dir, character_id, raw, "ref")
-    embedding = await _compute_face_embedding(stored_path)
     pose_block: Dict[str, Any] = {}
     if bool(opts.get("detect_pose")):
         pose_block = {"skeleton": None, "strength": 0.7}
@@ -181,12 +180,63 @@ async def build_image_bundle(
                 "all": palette_hex,
             },
         }
+    # Primary reference embedding from the main image.
+    primary_emb = await _compute_face_embedding(stored_path)
+    # Optional: additional reference images for the same character. These are
+    # stored as extra_image_paths on the legacy face block so migrate_visual_bundle
+    # can expose them as visual.faces[0].refs without changing callers.
+    extra_paths: List[str] = []
+    extra_urls = opts.get("extra_image_urls")
+    if isinstance(extra_urls, list):
+        for idx, u in enumerate(extra_urls):
+            if not isinstance(u, str) or not u.strip():
+                continue
+            try:
+                extra_raw = await _download_bytes(u.strip())
+                if not extra_raw:
+                    continue
+                p = _save_image_bytes(locks_root_dir, character_id, extra_raw, f"ref_extra_{idx}")
+                extra_paths.append(p)
+            except Exception:
+                continue
+    # Aggregate all available embeddings into a single mean id_embedding so that
+    # multi-view locks are more stable than a single-shot embedding.
+    embs: List[List[float]] = []
+    if isinstance(primary_emb, list):
+        embs.append(primary_emb)
+    for p in extra_paths:
+        try:
+            e = await _compute_face_embedding(p)
+        except Exception:
+            e = None
+        if isinstance(e, list):
+            embs.append(e)
+    mean_emb: Optional[List[float]] = None
+    if embs:
+        # Compute elementwise mean across all embedding vectors, assuming they
+        # have consistent dimensionality.
+        dim = len(embs[0])
+        acc = [0.0] * dim
+        count = 0
+        for vec in embs:
+            if not isinstance(vec, list) or len(vec) != dim:
+                continue
+            for i, v in enumerate(vec):
+                try:
+                    acc[i] += float(v)
+                except Exception:
+                    acc[i] += 0.0
+            count += 1
+        if count > 0:
+            mean_emb = [v / float(count) for v in acc]
     face_block: Dict[str, Any] = {
-        "embedding": embedding,
+        "embedding": mean_emb if mean_emb is not None else primary_emb,
         "mask": None,
         "image_path": stored_path,
         "strength": opts.get("face_strength", 0.75),
     }
+    if extra_paths:
+        face_block["extra_image_paths"] = extra_paths
     image_np = np.asarray(image)
     background_embedding = None
     if image_np.size > 0:

@@ -59,6 +59,64 @@ services:
       - "7862"
     
 
+  rvc_python:
+    build:
+      context: ./services/rvc_python
+      dockerfile: Dockerfile
+    container_name: rvc_python
+    restart: unless-stopped
+    runtime: nvidia
+    devices:
+      - "nvidia.com/gpu=all"
+    depends_on:
+      - nvidia_init
+      - film2_bootstrap
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - PYTHONUNBUFFERED=1
+    volumes:
+      # RVC models live here; one subdir per model (trained voice models)
+      - rvc_models:/srv/rvc_models
+      # Access to Titan pretrained weights from bootstrap (read-only)
+      - film2_models:/opt/models:ro
+    network_mode: host
+    expose:
+      - "5050"
+
+  rvc_trainer:
+    build:
+      context: ./services/rvc_trainer
+      dockerfile: Dockerfile
+    container_name: rvc_trainer
+    restart: unless-stopped
+    runtime: nvidia
+    devices:
+      - "nvidia.com/gpu=all"
+    depends_on:
+      - nvidia_init
+      - film2_bootstrap
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - PYTHONUNBUFFERED=1
+      - RVC_TRAIN_DATA_ROOT=/srv/data
+      - RVC_MODELS_ROOT=/srv/rvc_models
+      - RVC_WEBUI_ROOT=/srv/rvc_webui
+      - RVC_DEFAULT_MALE_VOICE_ID=${RVC_DEFAULT_MALE_VOICE_ID:-default_male}
+      - RVC_DEFAULT_FEMALE_VOICE_ID=${RVC_DEFAULT_FEMALE_VOICE_ID:-default_female}
+    volumes:
+      # Titan pretrain is already on the server; mount it read-only
+      - film2_models:/opt/models:ro
+      # Shared RVC models (same volume as rvc_python uses)
+      - rvc_models:/srv/rvc_models
+      # Training data + logs
+      - rvc_train_data:/srv/data
+      - rvc_logs:/srv/logs
+    network_mode: host
+    expose:
+      - "7070"
+
   rvc:
     build:
       context: ./services/rvc
@@ -70,17 +128,37 @@ services:
       - "nvidia.com/gpu=all"
     depends_on:
       - nvidia_init
+      - rvc_python
+      - rvc_trainer
     environment:
       - NVIDIA_VISIBLE_DEVICES=${MUSIC_GPU:-all}
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - PYTHONUNBUFFERED=1
       # RVC uses the shared model volume populated by bootstrap (rvc_titan under /opt/models).
       - RVC_MODEL_ROOT=/opt/models/rvc_titan
+      - RVC_REGISTRY_PATH=/rvc/assets/registry.json
+      - RVC_VOICES_ROOT=/rvc/assets/voices
+      - RVC_ENGINE_BASE=http://127.0.0.1:5050
+      - RVC_TRAINER_BASE=http://127.0.0.1:7070
+      - RVC_MODELS_ROOT=/srv/rvc_models
+      - RVC_DEFAULT_MALE_VOICE_ID=${RVC_DEFAULT_MALE_VOICE_ID:-default_male}
+      - RVC_DEFAULT_FEMALE_VOICE_ID=${RVC_DEFAULT_FEMALE_VOICE_ID:-default_female}
+      # Service URLs for mining
+      - DEMUCS_API_URL=http://127.0.0.1:9101
+      - WHISPER_API_URL=http://127.0.0.1:7861
+      - VOCALFIX_API_URL=http://127.0.0.1:7866
     network_mode: host
     expose:
       - "7863"
     volumes:
       # Shared FILM2 model volume; bootstrap deposits blaise-tk/TITAN under /opt/models/rvc_titan
       - film2_models:/opt/models:ro
+      # Persist RVC registry and voices
+      - rvc_assets:/rvc/assets
+      # Shared RVC models (same volume as rvc_python and rvc_trainer use)
+      - rvc_models:/srv/rvc_models
+      # Training data access
+      - rvc_train_data:/srv/data
     
 
   vocalfix:
@@ -365,6 +443,7 @@ services:
       - AESTHETIC_HEAD_PATH=/opt/models/aesthetic/laion_v2_linear_L14.pt
       - MFA_API_URL=${MFA_API_URL:-http://127.0.0.1:7867}
       - VISION_REPAIR_API_URL=${VISION_REPAIR_API_URL:-http://127.0.0.1:8095}
+      - INSIGHTFACE_HOME=/models/insightface
     # Run the canonical orchestrator application
     command: ["uvicorn","app.main:app","--host","0.0.0.0","--port","8000","--log-level","info","--access-log","--use-colors"]
     volumes:
@@ -373,6 +452,7 @@ services:
       - film2_models:/opt/models
       - film2_data:/srv/film2
       - ./assets/comfyui/input:/comfyui/input
+      - ./assets/insightface:/models/insightface
 
   music:
     build:
@@ -814,5 +894,9 @@ volumes:
   film2_data: {}
   comfyui_input: {}
   uploads_data: {}
+  rvc_models: {}
+  rvc_assets: {}
+  rvc_train_data: {}
+  rvc_logs: {}
 
 

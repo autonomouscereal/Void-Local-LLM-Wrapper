@@ -2,16 +2,90 @@ import os
 from typing import Optional, List
 
 import io
+import logging
+
 import torch  # type: ignore
 import numpy as np  # type: ignore
 import soundfile as sf  # type: ignore
 from transformers import AutoProcessor, MusicgenForConditionalGeneration  # type: ignore
 
 
+logger = logging.getLogger(__name__)
+
 _MUSIC_MODEL: Optional[MusicgenForConditionalGeneration] = None
 _MUSIC_PROCESSOR = None
 _MUSIC_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 _ENGINE_LOADED = False
+
+
+def _log_music_generate_state(
+    prompt: str,
+    seconds: int,
+    seed: Optional[int],
+    model: MusicgenForConditionalGeneration,
+    device: str,
+    inputs: dict,
+    max_new_tokens: int,
+) -> None:
+    """
+    Log detailed information about the MusicGen generation call without dumping
+    full tensor contents. Intended for debugging around model.generate().
+    """
+    try:
+        logger.info("========== [MUSICGEN DEBUG] ==========")
+        logger.info("prompt=%r", prompt)
+        logger.info("seconds=%s seed=%s", seconds, seed)
+        logger.info("device=%s", device)
+
+        logger.info("model type=%s", type(model))
+        model_id = getattr(getattr(model, "config", None), "name_or_path", None)
+        logger.info("model id=%r", model_id)
+
+        generate_attr = getattr(model, "generate", None)
+        logger.info("model.generate attr=%r", generate_attr)
+        logger.info("model.generate type=%s", type(generate_attr))
+        logger.info("model.generate callable=%s", callable(generate_attr))
+
+        gen_cfg = getattr(model, "generation_config", None)
+        if gen_cfg is not None:
+            logger.info(
+                "generation_config.return_dict_in_generate=%r",
+                getattr(gen_cfg, "return_dict_in_generate", None),
+            )
+            logger.info(
+                "generation_config.max_new_tokens=%r",
+                getattr(gen_cfg, "max_new_tokens", None),
+            )
+            logger.info(
+                "generation_config.do_sample=%r",
+                getattr(gen_cfg, "do_sample", None),
+            )
+            logger.info(
+                "generation_config.guidance_scale=%r",
+                getattr(gen_cfg, "guidance_scale", None),
+            )
+
+        input_keys = list(inputs.keys()) if isinstance(inputs, dict) else []
+        logger.info("inputs keys=%r", input_keys)
+        if isinstance(inputs, dict):
+            for key, value in inputs.items():
+                value_type = type(value)
+                shape = getattr(value, "shape", None)
+                tensor_device = getattr(value, "device", None)
+                logger.info(
+                    "  - %s type=%s shape=%r device=%r",
+                    key,
+                    value_type,
+                    shape,
+                    tensor_device,
+                )
+
+        logger.info("extra kwargs: max_new_tokens=%s do_sample=%s guidance_scale=%s",
+                    max_new_tokens, True, 3.0)
+        logger.info("========== [END MUSICGEN DEBUG] ==========")
+    except Exception:
+        # This should never break generation; log and continue.
+        logger.exception("Failed to log MusicGen generate state")
 
 
 def _resolve_model_path(model_dir: str, model_id_env: str) -> str:
@@ -81,6 +155,18 @@ def generate_music(
     inputs = {k: (v.to(device) if hasattr(v, "to") else v) for k, v in inputs.items()}
     # Crude mapping: ~50 tokens/s for small/medium configs
     max_new_tokens = max(50, int(seconds) * 50)
+
+    # Detailed debug logging around the model.generate call.
+    _log_music_generate_state(
+        prompt=prompt,
+        seconds=seconds,
+        seed=seed,
+        model=model,
+        device=device,
+        inputs=inputs,
+        max_new_tokens=max_new_tokens,
+    )
+
     with torch.inference_mode():
         if device.startswith("cuda"):
             with torch.cuda.amp.autocast():

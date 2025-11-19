@@ -36,7 +36,24 @@ async def transcribe(body: Dict[str, Any]):
         return JSONResponse(status_code=400, content={"error": "missing audio_url"})
     model = get_model()
     segments, info = model.transcribe(audio_url, beam_size=1, language=language)
-    text = " ".join([seg.text for seg in segments])
-    return {"text": text, "language": info.language}
+    
+    # Convert generator to list and build response segments
+    seg_list = []
+    text_parts = []
+    for seg in segments:
+        text_parts.append(seg.text)
+        seg_list.append({
+            "start": seg.start,
+            "end": seg.end,
+            "text": seg.text,
+            "speaker_label": "SPEAKER_00" # Placeholder until diarization model is integrated
+        })
+    
+    text = " ".join(text_parts)
+    return {
+        "text": text,
+        "language": info.language,
+        "segments": seg_list
+    }
 
 

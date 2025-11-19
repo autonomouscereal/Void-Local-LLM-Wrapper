@@ -4,6 +4,7 @@ import math
 from typing import Any, Dict, List, Optional
 
 from ....analysis.media import analyze_image
+from ....locks.builder import _compute_face_embedding
 
 
 def _cosine_similarity(vec_a: List[float], vec_b: List[float]) -> Optional[float]:
@@ -50,28 +51,23 @@ def _extract_embedding(ref: Any) -> Optional[List[float]]:
 
 async def compute_face_lock_score(image_path: str, ref_embedding: List[float]) -> Optional[float]:
     """
-    Compute a best-effort face lock score between an image and a reference embedding.
+    Compute a face lock score between an image and a reference embedding using
+    the same InsightFace/ArcFace space that lock bundles are built with.
 
-    Uses the clip embedding from analyze_image (if available) and cosine similarity against ref_embedding.
     Returns a score in [0,1] or None if unavailable.
     """
+    # Best-effort coercion of whatever is stored in the bundle into a flat float vector.
     ref_vec = _extract_embedding(ref_embedding)
     if ref_vec is None:
         return None
-    info = analyze_image(image_path)
-    if not isinstance(info, dict):
+
+    # Reuse the lock builder's InsightFace helper so creation and QA live in the
+    # same embedding space.
+    img_vec = await _compute_face_embedding(image_path)
+    if not isinstance(img_vec, list):
         return None
-    sem = info.get("semantics") or {}
-    emb = sem.get("clip_emb")
-    if not isinstance(emb, list):
-        return None
-    img_vec: List[float] = []
-    for x in emb:
-        if isinstance(x, (int, float)):
-            img_vec.append(float(x))
-        else:
-            return None
-    sim = _cosine_similarity(img_vec, ref_vec)
+
+    sim = _cosine_similarity(ref_vec, img_vec)  # type: ignore[arg-type]
     return _normalize_similarity(sim)
 
 

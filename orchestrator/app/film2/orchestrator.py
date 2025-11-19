@@ -1,24 +1,39 @@
 from __future__ import annotations
 
-from typing import Dict, Any
+import os
+from typing import Any, Dict
+
+from .artifacts import add_artifact, new_manifest, save_manifest
+from .bible import merge_answers_into_bibles, write_character_bible, write_story_bible
 from .clarifications import collect_one_shot
-from .bible import write_story_bible, write_character_bible, merge_answers_into_bibles
 from .planner import build_scenes, build_shots
+from .qa import apply_autofix, qa_animatic, qa_storyboards
 from .refs import extract_refs_from_storyboards, inject_refs_into_final
-from .qa import qa_storyboards, qa_animatic, apply_autofix
 from .renderers import (
-    render_thumbnails,
-    render_storyboards,
+    assemble_final,
     render_animatic,
     render_final_shots,
-    assemble_final,
+    render_storyboards,
+    render_thumbnails,
 )
-from .timeline import build_timeline, export_srt, export_edl
-from .resume import Phase, load_checkpoint, save_checkpoint, mark_shot_done, is_shot_done
-from .artifacts import add_artifact, new_manifest, save_manifest
+from .resume import Phase, is_shot_done, load_checkpoint, mark_shot_done, save_checkpoint
+from .timeline import build_timeline, export_edl, export_srt
 
 
-def run_film(job: Dict[str, Any]) -> Dict[str, Any]:
+def _autofix_enabled() -> bool:
+    """
+    Gate Film2 autofix behavior behind an environment variable so it can be
+    enabled/disabled without code changes.
+
+    FILM2_AUTOFIX:
+      - "1", "true", "yes", "on" (case-insensitive) => enabled
+      - anything else or unset => disabled
+    """
+    val = os.getenv("FILM2_AUTOFIX", "").strip().lower()
+    return val in {"1", "true", "yes", "on"}
+
+
+async def run_film(job: Dict[str, Any]) -> Dict[str, Any]:
     """
     job: {"prompt": str, "answers": Optional[dict], "preset": {...}, "cid": str}
     Deterministic, resumable state machine. Returns phase + artifacts list.
@@ -61,17 +76,20 @@ def run_film(job: Dict[str, Any]) -> Dict[str, Any]:
         scenes = build_scenes(story_bible)
         shots = build_shots(scenes, char_bible, coverage=job.get("preset", {}).get("coverage", "basic"))
 
-    # Phase 3: Storyboards (with QA)
+    # Phase 3: Storyboards (with QA + single-pass autofix)
     if cp.phase < Phase.STORYBOARDS:
         thumbs = render_thumbnails(shots)
         sboards = render_storyboards(shots, thumbs)
         add_artifact(manifest, "thumbnails/", thumbs, dir=True)
         add_artifact(manifest, "storyboards/", sboards, dir=True)
         qa1 = qa_storyboards(sboards, char_bible)
-        if getattr(qa1, "fail_rate", 0.0) > 0.15:
-            sboards = apply_autofix(sboards, qa1)
+        qa1_dict = qa1.to_dict()
+        fail_rate = float(getattr(qa1, "fail_rate", 0.0) or qa1_dict.get("fail_rate") or 0.0)
+        # Single hero-style redraw pass for weak storyboards, gated by FILM2_AUTOFIX.
+        if _autofix_enabled() and fail_rate > 0.15:
+            sboards = await apply_autofix(sboards, qa1_dict)
             add_artifact(manifest, "storyboards/", sboards, dir=True, overwrite=True)
-        save_checkpoint(cid, Phase.STORYBOARDS, extra={"qa_storyboards": qa1.to_dict()})
+        save_checkpoint(cid, Phase.STORYBOARDS, extra={"qa_storyboards": qa1_dict})
     else:
         sboards = render_storyboards(shots, render_thumbnails(shots))
 
@@ -80,9 +98,6 @@ def run_film(job: Dict[str, Any]) -> Dict[str, Any]:
         animatic = render_animatic(shots, sboards)
         add_artifact(manifest, "animatic.mp4", animatic)
         qa2 = qa_animatic(animatic, shots, char_bible)
-        if getattr(qa2, "fail_rate", 0.0) > 0.10:
-            animatic = apply_autofix(animatic, qa2)
-            add_artifact(manifest, "animatic.mp4", animatic, overwrite=True)
         save_checkpoint(cid, Phase.ANIMATIC, extra={"qa_animatic": qa2.to_dict()})
     else:
         animatic = render_animatic(shots, sboards)

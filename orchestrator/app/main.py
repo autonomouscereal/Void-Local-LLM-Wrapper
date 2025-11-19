@@ -167,6 +167,7 @@ from .locks.builder import (
     apply_audio_mode_updates as _apply_audio_mode_updates,
     voice_embedding_from_path as _lock_voice_embedding_from_path,
 )
+from .locks.video_builder import build_video_bundle as _build_video_lock_bundle
 from .locks.runtime import (
     apply_quality_profile as _lock_apply_profile,
     bundle_to_image_locks as _lock_to_assets,
@@ -3818,6 +3819,27 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         _summarize_all_locks_for_context(character_id, merged)
         await _lock_save(character_id, merged)
         return {"name": name, "result": {"lock_bundle": merged}}
+    if name == "locks.build_video_bundle":
+        a = args if isinstance(args, dict) else {}
+        character_id = str(a.get("character_id") or "").strip()
+        video_path = str(a.get("video_path") or "").strip()
+        max_frames_val = a.get("max_frames")
+        max_frames = int(max_frames_val) if isinstance(max_frames_val, int) and max_frames_val > 0 else 16
+        if not character_id:
+            return {"name": name, "error": "missing_character_id"}
+        if not video_path:
+            return {"name": name, "error": "missing_video_path"}
+        bundle = await _build_video_lock_bundle(character_id, video_path, locks_root_dir=LOCKS_ROOT_DIR, max_frames=max_frames)
+        existing = await _lock_load(character_id) or {}
+        existing = _lock_migrate_visual(existing)
+        existing = _lock_migrate_music(existing)
+        existing = _lock_migrate_tts(existing)
+        existing = _lock_migrate_sfx(existing)
+        existing = _lock_migrate_film2(existing)
+        merged = _merge_lock_bundles(existing, bundle)
+        _summarize_all_locks_for_context(character_id, merged)
+        await _lock_save(character_id, merged)
+        return {"name": name, "result": {"lock_bundle": merged}}
     if name == "locks.build_audio_bundle":
         a = args if isinstance(args, dict) else {}
         character_id = str(a.get("character_id") or "").strip()
@@ -4258,6 +4280,25 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             frame_files = sorted(_glob(os.path.join(frames_dir, "*.png")))
             # Apply lightweight per-frame cleanup using image tools where available.
             cleaned_frames: List[str] = []
+            # Optional: per-frame identity scores when a face embedding is available
+            clip_identity_scores: List[float] = []
+            face_ref: Optional[list] = None
+            try:
+                lock_bundle = locks.get("bundle") if isinstance(locks.get("bundle"), dict) else None
+                if isinstance(lock_bundle, dict):
+                    vis = lock_bundle.get("visual")
+                    if isinstance(vis, dict):
+                        faces = vis.get("faces")
+                        if isinstance(faces, list) and faces:
+                            emb_block = faces[0].get("embeddings") or {}
+                            if isinstance(emb_block, dict) and isinstance(emb_block.get("id_embedding"), list):
+                                face_ref = emb_block.get("id_embedding")  # type: ignore[assignment]
+                    if face_ref is None:
+                        legacy_face = lock_bundle.get("face")
+                        if isinstance(legacy_face, dict) and isinstance(legacy_face.get("embedding"), list):
+                            face_ref = legacy_face.get("embedding")  # type: ignore[assignment]
+            except Exception:
+                face_ref = None
             for idx, fp in enumerate(frame_files):
                 cleaned_path = fp
                 frame_sharpness_val: Optional[float] = None
@@ -4320,6 +4361,14 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                         if isinstance(p, str) and p:
                             cleaned_path = p
                 cleaned_frames.append(cleaned_path)
+                # Per-frame identity score (best-effort; does not affect control flow).
+                try:
+                    if face_ref is not None:
+                        score = await _compute_face_lock_score(cleaned_path, face_ref)
+                        if isinstance(score, (int, float)):
+                            clip_identity_scores.append(float(score))
+                except Exception:
+                    pass
                 _trace_append(
                     "film2",
                     {
@@ -4375,6 +4424,26 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 clip_sharpness = sharpness_sum / float(sharpness_count)
             else:
                 clip_sharpness = None
+            # Emit a clip-level identity QA summary when we have scores.
+            if clip_identity_scores:
+                try:
+                    id_min = min(clip_identity_scores)
+                    id_mean = sum(clip_identity_scores) / float(len(clip_identity_scores))
+                    _trace_append(
+                        "film2",
+                        {
+                            "event": "clip_identity_qa",
+                            "segment_id": segment_id,
+                            "film_id": film_id,
+                            "scene_id": scene_id,
+                            "shot_id": shot_id,
+                            "scores": clip_identity_scores,
+                            "min": id_min,
+                            "mean": id_mean,
+                        },
+                    )
+                except Exception:
+                    pass
         except Exception:
             refined_video_path = None
             clip_sharpness = None
@@ -4414,10 +4483,38 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         artifacts: List[Dict[str, Any]] = []
         if isinstance(video_path, str) and video_path:
             artifacts.append({"kind": "video", "path": video_path})
-        out = {
+        # Optional clip-level identity QA summary for downstream controllers.
+        qa_video: Dict[str, Any] = {}
+        if clip_identity_scores:
+            try:
+                id_min = min(clip_identity_scores)
+                id_mean = sum(clip_identity_scores) / float(len(clip_identity_scores))
+                # Classify identity health using hero-mode face_min threshold.
+                try:
+                    preset_hero = LOCK_QUALITY_PRESETS.get("hero", LOCK_QUALITY_PRESETS["standard"])
+                    face_min = float(preset_hero.get("face_min", 0.9))
+                except Exception:
+                    face_min = 0.9
+                weak_margin = 0.1 * face_min
+                if id_min >= face_min and id_mean >= face_min:
+                    identity_status = "ok"
+                elif id_min >= max(0.0, face_min - weak_margin) and id_mean >= max(0.0, face_min - weak_margin):
+                    identity_status = "weak"
+                else:
+                    identity_status = "fail"
+                qa_video = {
+                    "identity_min": id_min,
+                    "identity_mean": id_mean,
+                    "identity_status": identity_status,
+                }
+            except Exception:
+                qa_video = {}
+        out: Dict[str, Any] = {
             "meta": result_meta,
             "artifacts": artifacts,
         }
+        if qa_video:
+            out["qa"] = {"video": qa_video}
         _trace_append(
             "film2",
             {
@@ -11333,7 +11430,38 @@ async def film2_qa(body: Dict[str, Any]):
                 args = {"name": "music.timed.sao", "args": {"text": cue.get("prompt") or "", "seconds": 8}}
                 _ = await http_tool_run(args.get("name") or "music.timed.sao", args.get("args") or {})
                 issues.append({"cue": cid2, "type": "music", "score": score})
-        return {"cid": cid, "issues": issues, "thresholds": {"face": T_FACE, "voice": T_VOICE, "music": T_MUSIC}}
+        # Best-effort integration of per-shot image QA from image.dispatch when present.
+        # This does not replace the existing Film2 QA heuristics; it augments them with
+        # face_lock and entity_lock_score from the lock-aware image pipeline.
+        try:
+            preset = LOCK_QUALITY_PRESETS.get("hero", LOCK_QUALITY_PRESETS["standard"])
+            face_min_lock = float(preset.get("face_min", T_FACE))
+        except Exception:
+            face_min_lock = T_FACE
+        for shot in shots:
+            sid = shot.get("id") or shot.get("shot_id")
+            if not sid:
+                continue
+            qa_block = (shot.get("qa") or {}).get("images") if isinstance(shot.get("qa"), dict) else {}
+            locks_meta = (shot.get("meta") or {}).get("locks") if isinstance(shot.get("meta"), dict) else {}
+            face_lock_val = None
+            ent_lock_val = None
+            if isinstance(qa_block, dict):
+                fl = qa_block.get("face_lock")
+                if isinstance(fl, (int, float)):
+                    face_lock_val = float(fl)
+            if isinstance(locks_meta, dict):
+                el = locks_meta.get("entity_lock_score")
+                if isinstance(el, (int, float)):
+                    ent_lock_val = float(el)
+            shot_issues = []
+            if face_lock_val is not None and face_lock_val < face_min_lock:
+                shot_issues.append({"type": "identity_lock", "face_lock": face_lock_val})
+            if ent_lock_val is not None and ent_lock_val < 0.8:
+                shot_issues.append({"type": "entity_lock", "entity_lock_score": ent_lock_val})
+            if shot_issues:
+                issues.append({"shot": sid, "type": "image_lock", "details": shot_issues})
+        return {"cid": cid, "issues": issues, "thresholds": {"face": T_FACE, "voice": T_VOICE, "music": T_MUSIC, "face_lock": face_min_lock}}
     except Exception as ex:
         return JSONResponse(status_code=400, content={"error": str(ex)})
 
@@ -11707,11 +11835,11 @@ async def v1_audio_lyrics_to_song(body: Dict[str, Any]):
             request_id=rid,
         )
     # Route lyrics-to-song through the infinite/windowed music path.
-    prompt = ((style + ": ") if style else "") + lyrics
-    call = {
-        "name": "music.infinite.windowed",
-        "arguments": {"prompt": prompt, "length_s": duration_s, "bpm": bpm, "key": key, "seed": seed},
-    }
+        prompt = ((style + ": ") if style else "") + lyrics
+        call = {
+            "name": "music.infinite.windowed",
+            "arguments": {"prompt": prompt, "length_s": duration_s, "bpm": bpm, "key": key, "seed": seed},
+        }
     res = await execute_tool_call(call)
     return ToolEnvelope.success({"result": res}, request_id=rid)
 
@@ -11856,7 +11984,7 @@ async def v1_audio_lyrics_to_song(body: Dict[str, Any]):
     if not lyrics:
         return JSONResponse(status_code=400, content={"error": "missing lyrics"})
     # Always route lyrics-to-song via music.infinite.windowed now that music.song.* is removed.
-    prompt = ((style + ": ") if style else "") + lyrics
+        prompt = ((style + ": ") if style else "") + lyrics
     call = {"name": "music.infinite.windowed", "arguments": {"prompt": prompt, "length_s": duration_s, "bpm": bpm, "seed": seed}}
     res = await execute_tool_call(call)
     return {"ok": True, "result": res}

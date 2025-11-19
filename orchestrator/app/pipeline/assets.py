@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, Optional
+
+from app.locks.runtime import QUALITY_PRESETS as LOCK_QUALITY_PRESETS
+from app.locks.runtime import quality_thresholds as _lock_quality_thresholds
 
 
 def collect_urls(tool_results: List[Dict[str, Any]], absolutize_url: Callable[[str], str]) -> List[str]:
@@ -151,6 +154,8 @@ def compute_domain_qa(tool_results: List[Dict[str, Any]]) -> Dict[str, Any]:
 	image_entity_clip_vals: List[float] = []
 	image_entity_texture_vals: List[float] = []
 	image_entity_shape_vals: List[float] = []
+	image_entity_lock_vals: List[float] = []
+	image_quality_profile: Optional[str] = None
 
 	video_seam_ratio_vals: List[float] = []
 	video_seam_true = 0.0
@@ -316,6 +321,15 @@ def compute_domain_qa(tool_results: List[Dict[str, Any]]) -> Dict[str, Any]:
 						image_entity_texture_vals.append(float(tv))
 					if isinstance(sv, (int, float)):
 						image_entity_shape_vals.append(float(sv))
+			# Optional aggregate entity_lock_score from locks/QA metadata
+			entity_lock_scores = _collect_key_values(root_candidates, ["entity_lock_score"])
+			for val in entity_lock_scores:
+				if isinstance(val, (int, float)):
+					image_entity_lock_vals.append(float(val))
+			# Best-effort detection of the active image quality profile
+			qp = meta.get("quality_profile")
+			if isinstance(qp, str) and qp.strip() and image_quality_profile is None:
+				image_quality_profile = qp.strip().lower()
 
 		if name.startswith("video.") or name == "film2.run":
 			seam_dicts = _collect_key_values(root_candidates, ["seam", "seams"])
@@ -519,6 +533,7 @@ def compute_domain_qa(tool_results: List[Dict[str, Any]]) -> Dict[str, Any]:
 	entity_clip_avg = sum(image_entity_clip_vals) / len(image_entity_clip_vals) if image_entity_clip_vals else None
 	entity_texture_avg = sum(image_entity_texture_vals) / len(image_entity_texture_vals) if image_entity_texture_vals else None
 	entity_shape_avg = sum(image_entity_shape_vals) / len(image_entity_shape_vals) if image_entity_shape_vals else None
+	entity_lock_score_avg = sum(image_entity_lock_vals) / len(image_entity_lock_vals) if image_entity_lock_vals else None
 
 	video_seam_ratio = None
 	if video_seam_ratio_vals:
@@ -576,6 +591,33 @@ def compute_domain_qa(tool_results: List[Dict[str, Any]]) -> Dict[str, Any]:
 	if _image_lock_components:
 		image_lock_overall = min(_image_lock_components)
 
+	# Derive a simple categorical lock_status for images ("ok" / "weak" / "fail")
+	lock_status: Optional[str] = None
+	if isinstance(image_face_avg, (int, float)):
+		profile_name = (image_quality_profile or "standard").lower()
+		try:
+			thresholds = _lock_quality_thresholds(profile_name)
+			face_min = float(thresholds.get("face_min", 0.8))
+		except Exception:
+			try:
+				preset = LOCK_QUALITY_PRESETS.get(profile_name, LOCK_QUALITY_PRESETS["standard"])
+				face_min = float(preset.get("face_min", 0.8))
+			except Exception:
+				face_min = 0.8
+		weak_margin = 0.1 * face_min
+		if image_face_avg >= face_min:
+			lock_status = "ok"
+		elif image_face_avg >= max(0.0, face_min - weak_margin):
+			lock_status = "weak"
+		else:
+			lock_status = "fail"
+		# Optionally downgrade based on aggregate entity lock quality
+		if isinstance(entity_lock_score_avg, (int, float)):
+			if entity_lock_score_avg < 0.6 and lock_status == "ok":
+				lock_status = "weak"
+			if entity_lock_score_avg < 0.4:
+				lock_status = "fail"
+
 	video_lock_overall = None
 	_video_lock_components: list[float] = []
 	for v in (video_seam_ratio, video_art_ratio, video_fvmd_avg, video_flow_consistency_avg, video_color_consistency_avg):
@@ -629,7 +671,9 @@ def compute_domain_qa(tool_results: List[Dict[str, Any]]) -> Dict[str, Any]:
 			"entity_clip_lock_mean": entity_clip_avg,
 			"entity_texture_lock_mean": entity_texture_avg,
 			"entity_shape_lock_mean": entity_shape_avg,
+			"entity_lock_score": entity_lock_score_avg,
 			"lock_overall": image_lock_overall,
+			"lock_status": lock_status,
 		},
 		"videos": {
 			"seam_ok_ratio": video_seam_ratio,

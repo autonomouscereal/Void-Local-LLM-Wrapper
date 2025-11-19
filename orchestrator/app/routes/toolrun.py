@@ -620,7 +620,7 @@ async def tool_run(req: Request):
 		# Persist artifacts under orchestrator /uploads and return absolute URLs for UI
 		from app.main import UPLOAD_DIR as _UPLOAD_DIR, PUBLIC_BASE_URL as _PUBLIC_BASE_URL  # type: ignore
 		from app.locks.runtime import bundle_to_image_locks as _lock_to_assets  # type: ignore
-		from app.services.image.analysis.locks import compute_region_scores as _qa_region_scores  # type: ignore
+		from app.services.image.analysis.locks import compute_region_scores as _qa_region_scores, compute_face_lock_score as _qa_face_lock  # type: ignore
 		import os as _os
 		# Use prompt_id as the canonical image cid for artifact paths
 		_cid = prompt_id or client_id
@@ -725,7 +725,9 @@ async def tool_run(req: Request):
 							"aggregates": agg if isinstance(region_info, dict) else {},
 						})
 
-		# Populate basic per-entity QA metrics when a lock bundle is present.
+		# Populate basic per-entity QA metrics when a lock bundle is present, and
+		# attach a global face/identity lock score using the same embedding space
+		# used for lock construction.
 		lock_bundle = args.get("lock_bundle") if isinstance(args.get("lock_bundle"), dict) else None
 		if lock_bundle and saved_paths:
 			locks = _lock_to_assets(lock_bundle)
@@ -776,6 +778,32 @@ async def tool_run(req: Request):
 				meta_block = result.setdefault("meta", {})
 				if isinstance(meta_block, dict):
 					meta_block["locks"] = locks_meta
+			# Global face/identity lock score derived from the lock bundle's
+			# face embedding and the generated image.
+			try:
+				face_ref: Optional[list] = None
+				vis = lock_bundle.get("visual")
+				if isinstance(vis, dict):
+					faces = vis.get("faces")
+					if isinstance(faces, list) and faces:
+						emb_block = faces[0].get("embeddings") or {}
+						if isinstance(emb_block, dict) and isinstance(emb_block.get("id_embedding"), list):
+							face_ref = emb_block.get("id_embedding")  # type: ignore[assignment]
+				if face_ref is None:
+					legacy_face = lock_bundle.get("face")
+					if isinstance(legacy_face, dict) and isinstance(legacy_face.get("embedding"), list):
+						face_ref = legacy_face.get("embedding")  # type: ignore[assignment]
+				if isinstance(face_ref, list):
+					face_score = await _qa_face_lock(first_image_path, face_ref)
+					if isinstance(face_score, (int, float)):
+						img_qa = result.setdefault("qa", {}).setdefault("images", {})
+						if isinstance(img_qa, dict):
+							# Use keys that compute_domain_qa already understands.
+							img_qa["face_lock"] = float(face_score)
+							img_qa["id_lock"] = float(face_score)
+			except Exception:
+				# Identity scoring is best-effort and should never break the tool.
+				pass
 			# Trace for distillation: emit chat.append with media parts for this trace
 			trc = args.get("trace_id") or args.get("cid")
 			if isinstance(trc, str) and trc.strip():

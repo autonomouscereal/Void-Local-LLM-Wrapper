@@ -210,6 +210,13 @@ def migrate_visual_bundle(bundle: Dict[str, Any]) -> Dict[str, Any]:
     if (not isinstance(vis_faces, list) or not vis_faces) and isinstance(bundle.get("face"), dict):
         legacy_face = bundle.get("face") or {}
         img_path = legacy_face.get("image_path") if isinstance(legacy_face.get("image_path"), str) else None
+        extra_paths = legacy_face.get("extra_image_paths") if isinstance(legacy_face.get("extra_image_paths"), list) else []
+        refs: List[Dict[str, Any]] = []
+        if img_path:
+            refs.append({"image_path": img_path})
+        for p in extra_paths:
+            if isinstance(p, str) and p:
+                refs.append({"image_path": p})
         visual["faces"] = [
             {
                 "entity_id": "face_0",
@@ -234,7 +241,7 @@ def migrate_visual_bundle(bundle: Dict[str, Any]) -> Dict[str, Any]:
                     "allow_scale_delta": 0.0,
                     "strength": legacy_face.get("strength", 0.75),
                 },
-                "refs": [{"image_path": img_path}] if img_path else [],
+                "refs": refs,
             }
         ]
     # Pose

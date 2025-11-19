@@ -530,6 +530,22 @@ def get_builtin_tools_schema() -> List[Dict[str, Any]]:
 		{
 			"type": "function",
 			"function": {
+				"name": "locks.build_video_bundle",
+				"description": "Build an identity lock bundle from a reference video by sampling frames and aggregating face embeddings.",
+				"parameters": {
+					"type": "object",
+					"properties": {
+						"character_id": {"type": "string"},
+						"video_path": {"type": "string"},
+						"max_frames": {"type": "integer"}
+					},
+					"required": ["character_id", "video_path"]
+				}
+			}
+		},
+		{
+			"type": "function",
+			"function": {
 				"name": "locks.build_audio_bundle",
 				"description": "Build a voice lock bundle from a reference audio clip.",
 				"parameters": {

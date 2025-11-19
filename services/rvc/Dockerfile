@@ -9,8 +9,7 @@ RUN pip install --no-cache-dir --upgrade pip
 
 WORKDIR /app
 COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cu118 -r /app/requirements.txt && \
-    pip install --no-cache-dir git+https://github.com/esnya/hf-rvc.git#egg=hf-rvc
+RUN pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cu118 -r /app/requirements.txt
 
 COPY app /app/app
 
