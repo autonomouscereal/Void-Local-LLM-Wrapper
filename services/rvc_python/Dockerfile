@@ -16,12 +16,13 @@ RUN apt-get update && \
         python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
-# Python deps: rvc-python + PyTorch (GPU build)
-RUN python3 -m pip install --no-cache-dir --upgrade pip && \
+# Python deps: pin pip to a version compatible with rvc-python's fairseq/omegaconf
+# stack, then install rvc-python and the canonical Torch stack (cu118).
+RUN python3 -m pip install --no-cache-dir "pip<24.1" && \
     python3 -m pip install --no-cache-dir rvc-python==0.1.5 && \
     python3 -m pip install --no-cache-dir \
-        "torch==2.1.1+cu118" \
-        "torchaudio==2.1.1+cu118" \
+        "torch==2.7.1+cu118" \
+        "torchaudio==2.7.1+cu118" \
         --index-url https://download.pytorch.org/whl/cu118
 
 # Models directory; mount a volume here
