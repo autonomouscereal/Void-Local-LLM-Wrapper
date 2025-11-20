@@ -25,8 +25,13 @@ WORKDIR /srv/rvc_webui
 # Optional: pin to a specific commit for reproducibility
 # RUN git checkout <COMMIT_HASH>
 
-# Install WebUI requirements
-RUN python3 -m pip install --no-cache-dir --upgrade pip && \
+# Install WebUI requirements with a pip version compatible with fairseq/omegaconf
+# and the canonical Torch cu118 stack used across the project.
+RUN python3 -m pip install --no-cache-dir "pip<24.1" && \
+    python3 -m pip install --no-cache-dir \
+        "torch==2.7.1+cu118" \
+        "torchaudio==2.7.1+cu118" \
+        --index-url https://download.pytorch.org/whl/cu118 && \
     python3 -m pip install --no-cache-dir -r requirements.txt && \
     python3 -m pip install --no-cache-dir "speechbrain==0.5.16"
 
