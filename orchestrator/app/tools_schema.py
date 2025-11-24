@@ -94,7 +94,6 @@ def get_builtin_tools_schema() -> List[Dict[str, Any]]:
 				"parameters": {"type": "object", "properties": {"tool": {"type": "string"}, "args": {"type": "object"}, "artifact_path": {"type": "string"}, "cid": {"type": "string"}}, "required": ["tool", "args"]}
 			}
 		},
-		,
 		{
 			"type": "function",
 			"function": {
