@@ -12,6 +12,10 @@ COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cu118 -r /app/requirements.txt
 
 COPY app /app/app
+# Provide a local shim for the legacy `hf_rvc` imports, so old code paths
+# that still do `from hf_rvc import ...` won't crash on import. The shim
+# itself is a no-op and will raise if actually called.
+COPY hf_rvc /app/hf_rvc
 
 EXPOSE 7863
 CMD ["uvicorn","app.main:app","--host","0.0.0.0","--port","7863"]
