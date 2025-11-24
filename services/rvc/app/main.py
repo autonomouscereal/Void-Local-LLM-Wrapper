@@ -46,8 +46,8 @@ def ensure_rvc_weights_present() -> None:
     """
     Verify that Titan RVC weights exist under RVC_MODEL_ROOT.
 
-    This is independent of the hf_rvc Python package; failures here indicate a
-    bootstrap/volume problem, not a missing library.
+    Failures here indicate a bootstrap/volume problem (missing Titan weights),
+    not a missing Python library.
     """
     if not os.path.isdir(RVC_MODEL_ROOT):
         raise RuntimeError(f"RVC_MODEL_ROOT does not exist: {RVC_MODEL_ROOT}")
@@ -55,6 +55,21 @@ def ensure_rvc_weights_present() -> None:
     if not entries:
         raise RuntimeError(f"RVC model directory is empty: {RVC_MODEL_ROOT}")
     logging.info("RVC weights present in %s: %s", RVC_MODEL_ROOT, entries)
+
+
+@app.on_event("startup")
+async def _check_rvc_weights_on_startup() -> None:
+    """
+    On service startup, verify that Titan RVC weights are present under RVC_MODEL_ROOT.
+    This guarantees that any failure is clearly attributed to a missing/incorrect
+    model volume, not to a missing or misconfigured model package.
+    """
+    try:
+        ensure_rvc_weights_present()
+    except Exception as ex:
+        logging.error("RVC weights check failed: %s", ex)
+        # Re-raise so the process fails fast with a clear error
+        raise
 
 
 def ensure_rvc_engine_loaded(cfg: Dict[str, Any]) -> None:
