@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+# Import marker: if you don't see this in container logs, you're not running this file.
+print("RVC_SERVICE_MARKER: workspace main.py 2025-11-24-b")
+
 import os
 import json
 import base64
