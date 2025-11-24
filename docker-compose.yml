@@ -345,7 +345,7 @@ services:
       - glm_ollama
     environment:
       - GLM_MODEL_ID=${GLM_MODEL_ID:-glm4:9b}
-    command: ["sh","-lc","until curl -s http://127.0.0.1:11433/api/tags >/dev/null; do sleep 2; done; echo Pulling $GLM_MODEL_ID; curl -s -X POST http://127.0.0.1:11433/api/pull -H 'Content-Type: application/json' -d '{\"name\":\"${GLM_MODEL_ID}\"}'; echo Pulled $GLM_MODEL_ID"]
+    command: ["sh","-lc","until curl -s http://127.0.0.1:11433/api/tags >/dev/null; do sleep 2; done; echo Pulling $GLM_MODEL_ID; curl -s -X POST http://127.0.0.1:11433/api/pull -H 'Content-Type: application/json' -d '{\"name\":\"${GLM_MODEL_ID:-glm4:9b}\"}'; echo Pulled $GLM_MODEL_ID"]
 
 
   init_deepseek:
@@ -356,7 +356,7 @@ services:
       - deepseek_ollama
     environment:
       - DEEPSEEK_CODER_MODEL_ID=${DEEPSEEK_CODER_MODEL_ID:-deepseek-coder-v2:lite}
-    command: ["sh","-lc","until curl -s http://127.0.0.1:11436/api/tags >/dev/null; do sleep 2; done; echo Pulling $DEEPSEEK_CODER_MODEL_ID; curl -s -X POST http://127.0.0.1:11436/api/pull -H 'Content-Type: application/json' -d '{\"name\":\"${DEEPSEEK_CODER_MODEL_ID}\"}'; echo Pulled $DEEPSEEK_CODER_MODEL_ID"]
+    command: ["sh","-lc","until curl -s http://127.0.0.1:11436/api/tags >/dev/null; do sleep 2; done; echo Pulling $DEEPSEEK_CODER_MODEL_ID; curl -s -X POST http://127.0.0.1:11436/api/pull -H 'Content-Type: application/json' -d '{\"name\":\"${DEEPSEEK_CODER_MODEL_ID:-deepseek-coder-v2:lite}\"}'; echo Pulled $DEEPSEEK_CODER_MODEL_ID"]
 
   init_qwen_vl:
     image: curlimages/curl:8.7.1
@@ -366,7 +366,7 @@ services:
       - ollama_qwen
     environment:
       - QWEN_VL_MODEL_ID=${QWEN_VL_MODEL_ID:-qwen3-vl:8b}
-    command: ["sh","-lc","until curl -sf http://127.0.0.1:11435/api/tags >/dev/null; do sleep 2; done; echo Pulling $QWEN_VL_MODEL_ID; curl -sf -X POST http://127.0.0.1:11435/api/pull -H 'Content-Type: application/json' -d '{\"name\":\"${QWEN_VL_MODEL_ID}\"}'; echo Pulled $QWEN_VL_MODEL_ID"]
+    command: ["sh","-lc","until curl -sf http://127.0.0.1:11435/api/tags >/dev/null; do sleep 2; done; echo Pulling $QWEN_VL_MODEL_ID; curl -sf -X POST http://127.0.0.1:11435/api/pull -H 'Content-Type: application/json' -d '{\"name\":\"${QWEN_VL_MODEL_ID:-qwen3-vl:8b}\"}'; echo Pulled $QWEN_VL_MODEL_ID"]
 
   orchestrator:
     build:

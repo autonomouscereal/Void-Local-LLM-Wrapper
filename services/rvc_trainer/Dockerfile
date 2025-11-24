@@ -6,7 +6,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 WORKDIR /srv
 
-# System deps
+# System deps (include build tools and Python headers for fairseq/pyworld, etc.)
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         git \
@@ -15,6 +15,8 @@ RUN apt-get update && \
         python3 \
         python3-venv \
         python3-pip \
+        build-essential \
+        python3-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Clone RVC WebUI repo at build time (server has internet)
