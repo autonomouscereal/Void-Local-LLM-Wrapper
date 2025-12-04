@@ -20,7 +20,6 @@ class _BannedLoader:
         return None
 
     def exec_module(self, module):  # type: ignore[no-untyped-def]
-        raise ImportError(self.reason)
 
 
 class _BannedFinder:

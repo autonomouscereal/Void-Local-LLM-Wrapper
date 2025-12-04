@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 from typing import Any, Callable, Dict, List, Optional
+import logging
 
 from .assets import collect_urls as assets_collect_urls
 from ..traces.writer import log_artifact as _trace_log_artifact
+
+
+log = logging.getLogger(__name__)
 
 
 def finalize_tool_phase(
@@ -157,10 +161,12 @@ def finalize_tool_phase(
         id_="orc-1",
     )
     if warnings:
+        # Attaching warnings should not fail silently; log any issues while still
+        # returning the core response.
         try:
             response["_meta"] = {"errors": warnings}
-        except Exception:
-            pass
+        except Exception as ex:
+            log.error("finalize_tool_phase: failed to attach warnings to response: %s", ex, exc_info=True)
     # Artifact trace logging (distillation-friendly)
     try:
         for u in asset_urls or []:
@@ -179,9 +185,15 @@ def finalize_tool_phase(
                     },
                 },
             )
-    except Exception:
-        # Tracing must not affect user-visible responses
-        pass
+    except Exception as ex:
+        # Tracing must not affect user-visible responses, but we still want to
+        # see failures in logs instead of swallowing them.
+        log.error(
+            "finalize_tool_phase: artifact trace logging failed for trace_id=%s: %s",
+            trace_id,
+            ex,
+            exc_info=True,
+        )
     return response
 
 
@@ -196,13 +208,14 @@ def compose_openai_response(
     prebuilt: Optional[Dict[str, Any]] = None,
     artifacts: Optional[Dict[str, Any]] = None,
     final_env: Optional[Dict[str, Any]] = None,
+    ok: bool = True,
 ) -> Dict[str, Any]:
     """
     Compose the final OpenAI-compatible response envelope with optional artifacts and embedded final_env.
     Does not perform I/O. Returns the response dict.
     """
     response = envelope_builder(
-        ok=True,
+        ok=bool(ok),
         text=text,
         error=None,
         usage=usage,

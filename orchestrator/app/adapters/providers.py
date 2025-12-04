@@ -63,13 +63,11 @@ def model_chat_with_retry(provider, prompt: str, max_tokens: int, timeout_s: int
             perr = classify_exc(e)
             last_err = perr
             if (perr.kind != "retryable") or (attempt == retries):
-                raise perr
             # deterministic backoff
             delay = backoff[min(attempt + 1, len(backoff) - 1)] if backoff else 0
             if delay > 0:
                 time.sleep(delay)
             continue
-    raise last_err if last_err else ProviderError("permanent", None, "unknown")
 
 
 def ask_model_json(provider, prompt: str, max_tokens: int) -> dict:

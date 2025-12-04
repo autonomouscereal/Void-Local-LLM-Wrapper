@@ -33,7 +33,6 @@ async def comfy_submit(graph: Dict[str, Any], client_id: Optional[str] = None, w
         async with s.post(f"{BASE}/prompt", data=body_bytes, headers={"Content-Type": "application/json"}) as r:
             text = await r.text()
             if r.status != 200:
-                # Do not raise; return a structured error envelope for callers to surface.
                 err = {
                     "ok": False,
                     "error": {

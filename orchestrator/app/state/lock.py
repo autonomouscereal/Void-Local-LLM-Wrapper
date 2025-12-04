@@ -24,7 +24,6 @@ def acquire_lock(root: str, key: str, timeout_s: int = 10) -> str:
             return p
         except FileExistsError:
             if time.time() - t0 > timeout_s:
-                raise LockError(f"timeout acquiring lock {key}")
             time.sleep(0.05)
 
 

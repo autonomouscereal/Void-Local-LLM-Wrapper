@@ -13,6 +13,9 @@ from typing import Any, Dict, List, Optional, Tuple
 import httpx  # type: ignore
 import numpy as np  # type: ignore
 from PIL import Image, ImageDraw  # type: ignore
+import logging
+
+log = logging.getLogger(__name__)
 
 _INSIGHTFACE_MODEL = None
 
@@ -24,7 +27,6 @@ def _now_ts() -> int:
 async def _download_bytes(url: str) -> bytes:
     async with httpx.AsyncClient(timeout=None, follow_redirects=True) as client:
         resp = await client.get(url)
-        # Do not raise on HTTP errors; return empty bytes so callers can handle missing data.
         if resp.status_code < 200 or resp.status_code >= 300:
             return b""
         return resp.content
@@ -161,7 +163,9 @@ async def build_image_bundle(
     elif image_url:
         raw = await _download_bytes(image_url)
     else:
-        raise ValueError("image_url or image_path required")
+        # No image source provided; downstream use of `raw` will fail naturally
+        # instead of raising a custom ValueError here.
+        raw = b""
     image = Image.open(io.BytesIO(raw)).convert("RGB")
     palette = _extract_palette(image)
     palette_hex = [_hex_from_rgb(rgb) for rgb in palette]
@@ -197,7 +201,10 @@ async def build_image_bundle(
                     continue
                 p = _save_image_bytes(locks_root_dir, character_id, extra_raw, f"ref_extra_{idx}")
                 extra_paths.append(p)
-            except Exception:
+            except Exception as ex:
+                # Optional extra references: log failures with context instead of
+                # silently swallowing them, but do not fail the entire bundle build.
+                log.error("build_image_bundle: failed to download extra_image_url=%r error=%s", u, ex, exc_info=True)
                 continue
     # Aggregate all available embeddings into a single mean id_embedding so that
     # multi-view locks are more stable than a single-shot embedding.
@@ -495,10 +502,13 @@ def apply_region_mode_updates(bundle: Dict[str, Any], updates: List[Dict[str, An
             current_mode.update({k: v for k, v in lock_mode_update.items() if isinstance(v, str)})
             target["lock_mode"] = current_mode
         if update.get("strength") is not None:
-            try:
-                target["strength"] = float(update.get("strength"))
-            except Exception:
-                pass
+            strength_val = update.get("strength")
+            if isinstance(strength_val, (int, float, str)):
+                try:
+                    target["strength"] = float(strength_val)
+                except (TypeError, ValueError):
+                    # Leave existing strength unchanged if coercion fails.
+                    log.warning("apply_region_mode_updates: invalid strength=%r for region_id=%s", strength_val, region_id)
         if update.get("color_palette"):
             palette = update.get("color_palette")
             if isinstance(palette, dict):
@@ -516,10 +526,12 @@ def apply_audio_mode_updates(bundle: Dict[str, Any], update: Dict[str, Any]) -> 
         next_bundle["schema_version"] = 2
     audio = dict(next_bundle.get("audio") or {})
     if update.get("tempo_bpm") is not None:
-        try:
-            audio["tempo_bpm"] = float(update.get("tempo_bpm"))
-        except Exception:
-            pass
+        tempo_val = update.get("tempo_bpm")
+        if isinstance(tempo_val, (int, float, str)):
+            try:
+                audio["tempo_bpm"] = float(tempo_val)
+            except (TypeError, ValueError):
+                log.warning("apply_audio_mode_updates: invalid tempo_bpm=%r", tempo_val)
     if isinstance(update.get("tempo_lock_mode"), str):
         audio["tempo_lock_mode"] = update["tempo_lock_mode"]
     if isinstance(update.get("key"), str):

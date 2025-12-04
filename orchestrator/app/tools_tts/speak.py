@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import json
 from typing import Any, Dict
+import logging
 from .common import now_ts, ensure_dir, tts_edge_defaults, sidecar, stamp_env
 from ..locks import voice_embedding_from_path, tts_get_global, tts_get_voices
 from ..determinism.seeds import stamp_tool_args
@@ -22,6 +23,7 @@ from ..datasets.trace import append_sample as _trace_append
 import httpx  # type: ignore
 
 
+log = logging.getLogger(__name__)
 def _cosine_similarity(vec_a, vec_b):
     if not vec_a or not vec_b or len(vec_a) != len(vec_b):
         return None
@@ -84,7 +86,10 @@ def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
                     break
             if inferred_voice:
                 break
-    except Exception:
+    except Exception as ex:
+        # Context lookup for inferred_voice is best-effort; log failures so they
+        # are visible in traces instead of silently ignoring them.
+        log.warning("tts.speak: failed to infer voice from context for cid=%s: %s", cid, ex, exc_info=True)
         inferred_voice = None
     # Determine language with a hard default to English if unspecified.
     lang = job.get("language")

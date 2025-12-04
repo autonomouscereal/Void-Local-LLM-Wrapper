@@ -14,7 +14,6 @@ def _hex_to_rgb(hex_code: str) -> Tuple[int, int, int]:
     s = hex_code.strip().lstrip("#")
     if len(s) == 6:
         return int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16)
-    raise ValueError("invalid hex color")
 
 
 def _cosine(a: Iterable[float], b: Iterable[float]) -> float:

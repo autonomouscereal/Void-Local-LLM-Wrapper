@@ -104,7 +104,6 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str) -> 
                     "error": str(exc),
                 },
             )
-            raise RuntimeError(f"ollama connection failed to {base_url}: {exc}") from exc
         raw_text = resp.text or ""
         # Extract only the fields we care about from the Ollama JSON, without
         # relying on a full JSONParser round-trip. When the upstream JSON is

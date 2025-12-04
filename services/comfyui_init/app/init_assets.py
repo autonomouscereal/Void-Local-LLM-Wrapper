@@ -88,7 +88,6 @@ def download_with_retries(url: str, dst: str, timeout: int = 300, max_retries: i
             if attempt < max_retries:
                 time.sleep(backoff_seconds * attempt)
     if last_err:
-        raise last_err
 
 
 def download_url(url: str, target_dir: str, filename: str) -> None:

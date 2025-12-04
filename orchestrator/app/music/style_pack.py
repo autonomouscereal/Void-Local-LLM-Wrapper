@@ -14,7 +14,6 @@ def _cos_sim(a: List[float], b: List[float]) -> float:
     """
     Cosine similarity in [-1,1] between two equal-length vectors.
 
-    This helper assumes non-empty, equal-length inputs and will raise if the
     inputs are malformed. Callers are responsible for ensuring dimensionality
     consistency when building style packs and embeddings.
     """
@@ -78,24 +77,17 @@ def _embed_music_clap(path: str) -> List[float]:
     entire music tool.
     """
     if not isinstance(path, str) or not path:
-        raise MusicEvalError("embed_music_clap: invalid path")
     if CLAP_MODEL_DIR_MISSING or _CLAP_MODEL is None:
-        raise MusicEvalError(f"embed_music_clap: CLAP model dir missing or empty; expected at {CLAP_MODEL_DIR}")
     if (not os.path.isfile(path)) or os.path.getsize(path) <= 0:
-        raise MusicEvalError(f"embed_music_clap: audio file missing or empty: {path}")
     y, sr = _load_audio(path)
     if not y or not sr:
-        raise MusicEvalError(f"embed_music_clap: zero-length or unreadable audio: {path}")
     try:
         with torch.no_grad():
             emb = _CLAP_MODEL.get_audio_embedding_from_filelist([path])
     except ZeroDivisionError as e:
         # Known laion_clap bug when audio_data is empty; surface as MusicEvalError.
-        raise MusicEvalError(f"embed_music_clap: clap_zero_division for {path}") from e
     except Exception as e:
-        raise MusicEvalError(f"embed_music_clap: clap_internal_error for {path}: {e}") from e
     if emb is None or len(emb) == 0:
-        raise MusicEvalError("embed_music_clap: CLAP returned no embedding")
     e0 = emb[0]
     # Support both torch tensors and numpy arrays (and generic list-like) without
     # assuming .detach() is available.
@@ -107,7 +99,6 @@ def _embed_music_clap(path: str) -> List[float]:
         arr = np.asarray(e0, dtype="float32")
     v = arr.tolist()
     if not v:
-        raise MusicEvalError("embed_music_clap: empty embedding vector")
     return v
 
 

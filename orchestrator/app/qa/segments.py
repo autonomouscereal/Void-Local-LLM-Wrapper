@@ -77,9 +77,7 @@ def is_valid_segment_result(obj: Any) -> bool:
 
 
 def assert_valid_segment_result(obj: Any) -> None:
-    """Raise ValueError if the object is not a valid SegmentResult."""
     if not is_valid_segment_result(obj):
-        raise ValueError("invalid SegmentResult structure")
 
 
 def _extract_locks_from_result(result: Dict[str, Any]) -> Optional[Dict[str, Any]]:

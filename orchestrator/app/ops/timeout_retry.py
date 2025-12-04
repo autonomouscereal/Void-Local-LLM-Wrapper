@@ -28,18 +28,14 @@ def run_phase_with_timeout(fn, args: Dict[str, Any], timeout_s: int, retries: in
         except ProviderError as e:
             last_err = e
             if (e.kind not in retry_on) or (attempt == retries):
-                raise
         except Exception as e:
             # unknown exceptions treated as permanent
             last_err = e
-            raise
         # deterministic backoff
         delay = backoff[min(attempt + 1, len(backoff) - 1)] if backoff else 0
         if delay > 0:
             time.sleep(delay)
-        # Timeouts are forbidden: ignore timeout_s and never raise PhaseTimeout based on elapsed time.
     if last_err:
-        raise last_err
     # If we reach here without a result and no error, return None with attempts/elapsed for diagnostics
     return None, retries + 1, time.time() - tstart
 

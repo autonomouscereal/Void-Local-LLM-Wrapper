@@ -9,7 +9,6 @@ History and behavior (summary):
   3) Only then apply repair steps (quote/braces/commas) and retry multiple methods, including segment extraction
      and permissive regex parsing.
 - Structure enforcement:
-  - ensure_structure/select_best_result handle both dict- and list-based schemas and never raise on type mismatches.
   - Unknown or invalid types default to safe values rather than throwing.
 - Logging:
   - File logging disabled; logger uses WARNING level with NullHandler to avoid runtime I/O overheads.

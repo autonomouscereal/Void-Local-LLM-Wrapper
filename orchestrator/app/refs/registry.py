@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import os
 import time
+import logging
 from typing import Dict, Any, List
 from .storage import new_ref_id, save_manifest, load_manifest, ref_dir, _sha_file
 from ..determinism.seeds import SEEDS
 
+
+log = logging.getLogger(__name__)
 
 def create_ref(kind: str, title: str, files: Dict[str, Any], meta: Dict[str, Any] | None = None) -> Dict[str, Any]:
     rid = new_ref_id(kind)
@@ -24,7 +27,10 @@ def create_ref(kind: str, title: str, files: Dict[str, Any], meta: Dict[str, Any
     def fhash(p: str):
         try:
             return {"path": p, "sha256": _sha_file(p)}
-        except Exception:
+        except Exception as ex:
+            # Hashing is best-effort; record the path with a null hash but also
+            # log the failure so it can be investigated.
+            log.warning("refs.create_ref: failed to hash path=%s: %s", p, ex, exc_info=True)
             return {"path": p, "sha256": None}
     if kind == "image":
         m.setdefault("files", {})

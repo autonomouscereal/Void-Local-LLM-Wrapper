@@ -43,7 +43,6 @@ def _read_wav_payload(wav_url: str | None, wav_bytes_b64: str | None) -> tuple[n
         if y.ndim > 1:
             y = y.mean(axis=1)
         return y.astype(np.float32), int(sr)
-    raise ValueError("missing wav_url or wav_bytes")
 
 
 def lufs(y: np.ndarray, sr: int) -> float:

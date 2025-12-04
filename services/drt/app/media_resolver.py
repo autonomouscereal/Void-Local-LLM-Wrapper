@@ -47,7 +47,6 @@ def _yt_dlp_info(url: str) -> Dict[str, Any]:
             pass
     p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if p.returncode != 0:
-        raise RuntimeError(p.stderr.strip() or "yt-dlp failed")
     return json.loads(p.stdout)
 
 
@@ -61,12 +60,10 @@ def _http_get(url: str, max_bytes: int = 32 * 1024 * 1024, timeout: int | None =
             pass
     with httpx.Client(timeout=timeout, follow_redirects=True) as cli:
         with cli.stream("GET", url, headers=headers) as r:
-            # Do not raise for status; read body even on 4xx/5xx to allow callers to parse gate pages
             out = bytearray()
             for chunk in r.iter_bytes():
                 out.extend(chunk)
                 if len(out) > max_bytes:
-                    raise ValueError("download too large")
             return bytes(out)
 
 

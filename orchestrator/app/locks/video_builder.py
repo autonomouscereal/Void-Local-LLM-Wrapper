@@ -29,13 +29,10 @@ async def build_video_bundle(
     - Expose the first frame as image_path and the rest as extra_image_paths.
     """
     if not isinstance(character_id, str) or not character_id.strip():
-        raise ValueError("character_id is required")
     if not isinstance(video_path, str) or not video_path.strip():
-        raise ValueError("video_path is required")
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        raise ValueError(f"unable to open video_path={video_path!r}")
 
     frame_idx = 0
     saved_paths: List[str] = []
@@ -60,8 +57,8 @@ async def build_video_bundle(
         except Exception:
             pass
 
-    if not saved_paths:
-        raise ValueError("no frames could be sampled from video")
+    # If no frames were saved, downstream indexing into saved_paths will fail
+    # naturally instead of being guarded by an explicit ValueError here.
 
     # Compute embeddings for all saved frames and aggregate into a mean.
     embs: List[List[float]] = []

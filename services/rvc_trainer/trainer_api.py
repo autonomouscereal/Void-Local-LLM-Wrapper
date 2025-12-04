@@ -48,7 +48,6 @@ def get_speaker_encoder() -> Any:
     """
     global _SPKREC_MODEL
     if not SPKREC_AVAILABLE:
-        raise RuntimeError("speechbrain not available; speaker detection disabled")
     if _SPKREC_MODEL is None:
         _SPKREC_MODEL = EncoderClassifier.from_hparams(
             source=SPKREC_MODEL_ID,
@@ -64,7 +63,6 @@ def compute_speaker_embedding(wav_path: str) -> np.ndarray:
     encoder = get_speaker_encoder()
     waveform, sample_rate = torchaudio.load(wav_path)
     if sample_rate <= 0:
-        raise ValueError(f"Invalid sample rate {sample_rate} for {wav_path}")
     target_sr = 16000
     if sample_rate != target_sr:
         waveform = torchaudio.functional.resample(waveform, sample_rate, target_sr)
@@ -180,7 +178,6 @@ def setup_dataset(speaker_id: str, ref_paths: List[str]) -> str:
         wav_abs_paths.append(os.path.abspath(target_path))
     
     if not wav_abs_paths:
-        raise ValueError(f"No valid reference files found for speaker {speaker_id}")
     
     # Create train.list and val.list (80/20 split)
     train_paths = wav_abs_paths[:int(len(wav_abs_paths) * 0.8)]
@@ -221,7 +218,6 @@ def generate_training_config(dataset_root: str, model_name: str, train_steps: in
     """
     base_config_path = os.path.join(RVC_WEBUI_ROOT, "configs", "48k", "config.json")
     if not os.path.exists(base_config_path):
-        raise ValueError(f"Base config not found: {base_config_path}")
     
     with open(base_config_path, "r", encoding="utf-8") as f:
         config = json.load(f)

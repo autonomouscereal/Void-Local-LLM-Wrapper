@@ -44,7 +44,6 @@ Do NOT weaken, ignore, or interpret them.
 ==================================================
 - In executor/orchestrator hot paths, NO try/except at all.
 - Elsewhere, avoid try/except unless strictly necessary.
-- If used, catch specific exceptions, log structured error events, and re-raise or surface clearly; NEVER swallow.
 - Failures must be explicit; never convert to empty success, fake booleans, or vague messages.
 
 ==================================================

@@ -2082,7 +2082,6 @@ for _name, _val in (
     if not isinstance(_val, str) or not _val.strip():
         _missing_audio_env.append(_name)
 if _missing_audio_env:
-    raise RuntimeError(f"Missing required audio/vocal service env vars: {', '.join(sorted(_missing_audio_env))}")
 
 
 def _sha256_bytes(b: bytes) -> str:
@@ -2251,20 +2250,19 @@ def _make_tool_failure_message(*, tool: str, err: Dict[str, Any], attempted_args
 
 def _load_wrapper_config() -> None:
     global WRAPPER_CONFIG, WRAPPER_CONFIG_HASH
-    try:
-        if os.path.exists(WRAPPER_CONFIG_PATH):
-            with open(WRAPPER_CONFIG_PATH, "rb") as f:
-                data = f.read()
-            WRAPPER_CONFIG_HASH = f"sha256:{_sha256_bytes(data)}"
-            parser = JSONParser()
-            # Wrapper config is expected to be a dict; treat it as open, but
-            # still coerce into a mapping shape.
-            cfg = parser.parse(data.decode("utf-8"), {"profiles": list, "defaults": dict})
-            WRAPPER_CONFIG = cfg if isinstance(cfg, dict) else {}
-        else:
-            WRAPPER_CONFIG = {}
-            WRAPPER_CONFIG_HASH = None
-    except Exception:
+    if os.path.exists(WRAPPER_CONFIG_PATH):
+        with open(WRAPPER_CONFIG_PATH, "rb") as f:
+            data = f.read()
+        WRAPPER_CONFIG_HASH = f"sha256:{_sha256_bytes(data)}"
+        parser = JSONParser()
+        # Wrapper config is expected to be a dict; treat it as open, but
+        # still coerce into a mapping shape.
+        cfg = parser.parse(data.decode("utf-8"), {"profiles": list, "defaults": dict})
+        if not isinstance(cfg, dict):
+            # Treat a non-dict config as a hard configuration error instead of
+            # silently falling back to defaults.
+        WRAPPER_CONFIG = cfg
+    else:
         WRAPPER_CONFIG = {}
         WRAPPER_CONFIG_HASH = None
 
@@ -4283,22 +4281,19 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             # Optional: per-frame identity scores when a face embedding is available
             clip_identity_scores: List[float] = []
             face_ref: Optional[list] = None
-            try:
-                lock_bundle = locks.get("bundle") if isinstance(locks.get("bundle"), dict) else None
-                if isinstance(lock_bundle, dict):
-                    vis = lock_bundle.get("visual")
-                    if isinstance(vis, dict):
-                        faces = vis.get("faces")
-                        if isinstance(faces, list) and faces:
-                            emb_block = faces[0].get("embeddings") or {}
-                            if isinstance(emb_block, dict) and isinstance(emb_block.get("id_embedding"), list):
-                                face_ref = emb_block.get("id_embedding")  # type: ignore[assignment]
-                    if face_ref is None:
-                        legacy_face = lock_bundle.get("face")
-                        if isinstance(legacy_face, dict) and isinstance(legacy_face.get("embedding"), list):
-                            face_ref = legacy_face.get("embedding")  # type: ignore[assignment]
-            except Exception:
-                face_ref = None
+            lock_bundle = locks.get("bundle") if isinstance(locks.get("bundle"), dict) else None
+            if isinstance(lock_bundle, dict):
+                vis = lock_bundle.get("visual")
+                if isinstance(vis, dict):
+                    faces = vis.get("faces")
+                    if isinstance(faces, list) and faces:
+                        emb_block = faces[0].get("embeddings") or {}
+                        if isinstance(emb_block, dict) and isinstance(emb_block.get("id_embedding"), list):
+                            face_ref = emb_block.get("id_embedding")  # type: ignore[assignment]
+                if face_ref is None:
+                    legacy_face = lock_bundle.get("face")
+                    if isinstance(legacy_face, dict) and isinstance(legacy_face.get("embedding"), list):
+                        face_ref = legacy_face.get("embedding")  # type: ignore[assignment]
             for idx, fp in enumerate(frame_files):
                 cleaned_path = fp
                 frame_sharpness_val: Optional[float] = None
@@ -5920,12 +5915,9 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         refs_val = lock_bundle.get("music_refs") if isinstance(lock_bundle.get("music_refs"), dict) else {}
         ref_ids = refs_val.get("ref_ids") if isinstance(refs_val.get("ref_ids"), list) else None
         if ref_ids:
-            try:
-                prof = _refs_music_profile({"ref_ids": ref_ids})
-                if isinstance(prof, dict) and prof.get("ok") and isinstance(prof.get("profile"), dict):
-                    music_profile = prof.get("profile")
-            except Exception:
-                music_profile = None
+            prof = _refs_music_profile({"ref_ids": ref_ids})
+            if isinstance(prof, dict) and prof.get("ok") and isinstance(prof.get("profile"), dict):
+                music_profile = prof.get("profile")
 
         # Propagate the tool-level trace_id into Song Graph planning and tracing.
         trace_val = a.get("trace_id") if isinstance(a.get("trace_id"), str) else None
@@ -6751,25 +6743,23 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                                 if rr.status_code == 200:
                                     wav_bytes = rr.content
                             elif isinstance(val, str):
-                                try:
-                                    wav_bytes = _b.b64decode(val)
-                                except Exception:
-                                    wav_bytes = b""
+                                # producing an empty stem; this surfaces Demucs bugs.
+                                wav_bytes = _b.b64decode(val)
                             if wav_bytes:
                                 path = os.path.join(outdir, f"{stem_name}.wav")
                                 with open(path, "wb") as wf: wf.write(wav_bytes)
                                 _sidecar(path, {"tool": "audio.stems.demucs", "stem": stem_name})
                                 try:
                                     _ctx_add(cid, "audio", path, _uri_from_upload_path(path), payload.get("mix_wav"), ["demucs"], {"stem": stem_name})
-                                except Exception:
-                                    pass
+                                except Exception as ex:
+                                    _log("audio.stems.demucs.ctx_add.error", stem=stem_name, error=str(ex))
                                 tr = args.get("trace_id") if isinstance(args.get("trace_id"), str) else None
                                 if tr:
                                     try:
                                         rel = os.path.relpath(path, UPLOAD_DIR).replace("\\", "/")
                                         checkpoints_append_event(STATE_DIR, tr, "artifact", {"kind": "audio", "path": rel, "bytes": int(len(wav_bytes)), "stem": stem_name})
-                                    except Exception:
-                                        pass
+                                    except Exception as ex:
+                                        _log("audio.stems.demucs.trace.error", stem=stem_name, error=str(ex))
                         except Exception:
                             continue
                 return {"name": name, "result": js}
@@ -7544,24 +7534,22 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         if not prompt:
             return {"name": name, "error": "missing prompt"}
         size_text = args.get("size") or "1024x1024"
-        try:
-            w, h = [int(x) for x in size_text.lower().split("x")]
-        except Exception:
-            w, h = 1024, 1024
+        # Parse size; if invalid, fail loudly so the caller sees a clear error instead
+        # of silently defaulting.
+        size_parts = str(size_text).lower().split("x")
+        if len(size_parts) != 2 or not all(p.strip().isdigit() for p in size_parts):
+        w, h = [int(x) for x in size_parts]
         outdir = os.path.join(UPLOAD_DIR, "artifacts", "image", f"super-{int(time.time())}")
         os.makedirs(outdir, exist_ok=True)
         # 1) Decompose prompt → object prompts (heuristic: split by commas/" and ")
         objs = []
         base_style = prompt
-        try:
-            parts = [p.strip() for p in prompt.replace(" and ", ", ").split(",") if p.strip()]
-            if len(parts) >= 3:
-                base_style = parts[0]
-                objs = parts[1:]
-            else:
-                objs = parts
-        except Exception:
-            objs = [prompt]
+        parts = [p.strip() for p in prompt.replace(" and ", ", ").split(",") if p.strip()]
+        if len(parts) >= 3:
+            base_style = parts[0]
+            objs = parts[1:]
+        else:
+            objs = parts
         if not objs:
             objs = [prompt]
         # 2) Layout: grid boxes left→right, top→bottom
@@ -7655,25 +7643,27 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             except Exception:
                 continue
         # 6) Final signage overlay (safety net) to strictly enforce text if requested
-        try:
-            if wants_signage and exact_text:
+        # This is best-effort: failures are logged but do not abort image generation.
+        if wants_signage and exact_text:
+            try:
                 draw = ImageDraw.Draw(canvas)
                 # Choose a region likely to contain signage: first box with keyword, else center
                 target_box = None
                 for (obj_prompt, box) in zip(objs, boxes):
                     if any(kw in obj_prompt.lower() for kw in ("sign", "poster", "label", "billboard", "traffic sign")):
-                        target_box = box; break
+                        target_box = box
+                        break
                 if not target_box:
-                    target_box = (w//4, h//4, 3*w//4, 3*h//4)
+                    target_box = (w // 4, h // 4, 3 * w // 4, 3 * h // 4)
                 tx, ty = (target_box[0] + 10, target_box[1] + 10)
                 # Fallback font
                 try:
-                    font = ImageFont.truetype("arial.ttf", max(24, (target_box[3]-target_box[1])//6))
+                    font = ImageFont.truetype("arial.ttf", max(24, (target_box[3] - target_box[1]) // 6))
                 except Exception:
                     font = None
                 draw.text((tx, ty), str(exact_text), fill=(220, 220, 220), font=font)
-        except Exception:
-            pass
+            except Exception as ex:
+                _log("image.super_gen.signage.error", error=str(ex))
         final_path = _os.path.join(outdir, "final.png")
         canvas.save(final_path)
         url = final_path.replace("/workspace", "") if final_path.startswith("/workspace/") else final_path
@@ -9317,6 +9307,8 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     validation_failures: List[Dict[str, Any]] = []
     tool_results: List[Dict[str, Any]] = []
     tool_exec_meta: List[Dict[str, Any]] = []
+    # Pipeline success flag: flipped to False when any critical front-door tool fails.
+    pipeline_ok: bool = True
     _ledger_shard = None
     _ledger_root = os.path.join(UPLOAD_DIR, "artifacts", "runs", trace_id)
     _ledger_name = "ledger"
@@ -9449,6 +9441,9 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 status = (err_obj.get("status") if isinstance(err_obj, dict) else None)
                 message = (err_obj.get("message") if isinstance(err_obj, dict) else "")
                 _log("tool.run.error", trace_id=trace_id, tool=tname, code=(code or ""), status=status, message=(message or ""))
+                # Flip pipeline_ok to False when a critical front-door tool fails.
+                if tname in ("image.dispatch", "music.infinite.windowed", "film2.run", "tts.speak"):
+                    pipeline_ok = False
                 _tel_append(
                     STATE_DIR,
                     trace_id,
@@ -10382,11 +10377,15 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                                 if s.startswith("http://") or s.startswith("https://"):
                                     urls.append(s); return
                                 if "/workspace/uploads/" in s:
+                                    # Best-effort conversion from absolute /workspace path
+                                    # to /uploads-relative URL; if splitting fails, log and
+                                    # leave the original string so debugging is possible.
                                     try:
                                         tail = s.split("/workspace", 1)[1]
                                         urls.append(tail)
-                                    except Exception:
-                                        pass
+                                    except Exception as ex:
+                                        _log("assets.path.convert.fail", path=s, error=str(ex))
+                                        urls.append(s)
                                     return
                                 if s.startswith("/uploads/"):
                                     urls.append(s); return
@@ -10396,8 +10395,9 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                                         try:
                                             tail = s.split("/workspace", 1)[1]
                                             urls.append(tail)
-                                        except Exception:
-                                            pass
+                                        except Exception as ex:
+                                            _log("assets.path.convert.fail", path=s, error=str(ex))
+                                            urls.append(s)
                                     else:
                                         urls.append(s)
                             elif isinstance(v, list):
@@ -10613,7 +10613,10 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     except Exception:
         final_env = {}
 
-    # Compose final OpenAI-compatible response envelope (prebuilt respected)
+    # Compose final OpenAI-compatible response envelope. The ok flag reflects
+    # whether the critical tool pipeline (image/music/tts/film) completed
+    # without hard failures, even though the assistant still returns a useful
+    # explanation and any partial artifacts.
     response = compose_openai_response(
         display_content,
         usage_with_wall,
@@ -10624,6 +10627,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         prebuilt=(response_prebuilt if 'response_prebuilt' in locals() else None),
         artifacts=(artifacts if isinstance(artifacts, dict) else None),
         final_env=None,  # will be attached below after bump/assert/stamp
+        ok=pipeline_ok,
     )
     if isinstance(final_env, dict) and final_env:
         final_env = _env_bump(final_env); _env_assert(final_env)

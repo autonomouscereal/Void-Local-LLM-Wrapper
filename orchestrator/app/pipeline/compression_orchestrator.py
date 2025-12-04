@@ -87,7 +87,6 @@ def _co_frames_baseline() -> Dict[str, str]:
 			"==================================================\n"
 			"- In executor/orchestrator hot paths, NO try/except at all.\n"
 			"- Elsewhere, avoid try/except unless strictly necessary.\n"
-			"- If used, catch specific exceptions, log structured error events, and re-raise or surface clearly; NEVER swallow.\n"
 			"- Failures must be explicit; never convert to empty success, fake booleans, or vague messages.\n\n"
 			"==================================================\n"
 			"5) DEPENDENCIES, ORMs, AND DATABASES\n"

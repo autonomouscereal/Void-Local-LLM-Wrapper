@@ -205,7 +205,6 @@ def snapshot(repo_id: str, local_key: str, allow_patterns: list[str] | None = No
                 kw["max_workers"] = 2
                 snapshot_download(**kw)
             else:
-                raise
     finally:
         beat.stop()
     STATUS["hf"][local_key]["state"] = "done"

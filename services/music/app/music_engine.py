@@ -113,7 +113,6 @@ def ensure_music_engine_loaded() -> None:
     model_dir = os.getenv("MUSIC_MODEL_DIR", "/opt/models/music")
     model_path = _resolve_model_path(model_dir, os.getenv("MUSIC_MODEL_ID", "facebook/musicgen-large"))
     if not model_path:
-        # Do not raise here; log a clear error and let the caller surface a full
         # stack trace at the service layer when generation is attempted.
         logger.error("musicgen.init.error missing MUSIC_MODEL_ID/MUSIC_MODEL_DIR (model_path empty)")
         _ENGINE_LOADED = False

@@ -16,6 +16,9 @@ from ..jsonio.normalize import normalize_to_envelope
 from ..jsonio.versioning import bump_envelope, assert_envelope
 
 
+log = logging.getLogger(__name__)
+
+
 # Regeneration thresholds and limits for MusicEval-driven windowed composition.
 QUALITY_THRESHOLD_TRACK = 0.7
 FIT_THRESHOLD_TRACK = 0.7
@@ -276,7 +279,14 @@ def _stitch_from_windows(
         t_start = win.get("t_start")
         try:
             t_val = float(t_start) if isinstance(t_start, (int, float)) else 0.0
-        except Exception:
+        except Exception as ex:
+            # Keep windows sortable even on bad timestamps, but log the issue.
+            log.warning(
+                "music.windowed: invalid t_start=%r for window_id=%r: %s",
+                t_start,
+                win.get("window_id"),
+                ex,
+            )
             t_val = 0.0
         sortable.append((t_val, win))
     sortable.sort(key=lambda x: x[0])
@@ -291,7 +301,13 @@ def _stitch_from_windows(
                 sr = wf.getframerate()
                 ch = wf.getnchannels()
                 frames = wf.readframes(wf.getnframes())
-        except Exception:
+        except Exception as ex:
+            log.error(
+                "music.windowed: failed to read clip_path=%r for window_id=%r: %s",
+                clip_path,
+                win.get("window_id"),
+                ex,
+            )
             continue
         if base_sr is None:
             base_sr = sr

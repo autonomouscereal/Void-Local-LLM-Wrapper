@@ -43,7 +43,6 @@ class Tx:
 async def with_tx():
     pool = await get_pool()
     if pool is None:
-        raise RuntimeError("DB pool is not configured")
     conn = await pool.acquire()
     return Tx(conn)
 

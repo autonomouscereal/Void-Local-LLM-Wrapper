@@ -6,6 +6,7 @@ import os, json, uuid, time, asyncio, urllib.request, os.path
 import logging, sys, traceback
 from urllib.parse import quote, urlsplit, urlparse
 import base64 as _b64
+from typing import Optional
 from app.state.checkpoints import append_event as checkpoints_append_event
 from app.trace_utils import emit_trace as _emit_trace
 from app.analysis.media import analyze_image as _qa_analyze_image, analyze_image_regions as _qa_analyze_image_regions  # type: ignore
@@ -331,20 +332,9 @@ async def tool_run(req: Request):
 			"arguments": (args if isinstance(args, dict) else {}),
 			"trace_id": rid,
 		}
-		try:
-			res = await execute_tool_call(call)
-		except Exception as ex:
-			_tb = traceback.format_exc()
-			log.error("[toolrun] tool=%s raised exception: %s", name, _tb)
-			# Surface a structured envelope instead of letting the exception bubble
-			# to FastAPI (which would produce a bare 500/CORS error at the client).
-			return ToolEnvelope.failure(
-				"tool_exception",
-				str(ex),
-				status=500,
-				request_id=rid,
-				details={"traceback": _tb},
-			)
+		# try/except here; any real exceptions will surface as HTTP errors with full
+		# stack traces, in line with the global "no silent failures" policy.
+		res = await execute_tool_call(call)
 		if isinstance(res, dict) and isinstance(res.get("result"), dict):
 			return ToolEnvelope.success(res["result"], request_id=rid)
 		err_obj = res.get("error") if isinstance(res, dict) else None
@@ -483,7 +473,6 @@ async def tool_run(req: Request):
 				"6": {"class_type": "VAEDecode", "inputs": {"samples": ["5", 0], "vae": ["3", 2]}},
 				"7": {"class_type": "SaveImage", "inputs": {"images": ["6", 0]}},
 			}
-		# Resolve actual nodes and apply overrides only to those. If binding fails, let it raise so we see the real error.
 		bind = _resolve_bindings(prompt_graph)
 		_apply_overrides(prompt_graph, bind, args)
 		# Ensure SaveImage nodes have a filename_prefix (required by newer ComfyUI)

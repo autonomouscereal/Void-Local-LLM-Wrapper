@@ -4,10 +4,12 @@ import json
 import os
 from typing import Any, Dict, List
 import time
+import logging
 from .ids import step_id
 from ..json_parser import JSONParser
 
 
+log = logging.getLogger(__name__)
 def _append_atomic(path: str, text: str) -> None:
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     tmp = path + ".tmp"
@@ -63,8 +65,10 @@ def append_event(root: str, key: str, kind: str, data: Dict[str, Any]) -> None:
         f.flush()
         try:
             os.fsync(f.fileno())
-        except Exception:
-            pass
+        except Exception as ex:
+            # Fsync failure shouldn't break request handling, but we still want
+            # to see it in logs instead of swallowing it.
+            log.warning("checkpoints.append_event: fsync failed for path=%s: %s", path, ex, exc_info=True)
 
 
 def read_all(root: str, key: str) -> List[Dict[str, Any]]:

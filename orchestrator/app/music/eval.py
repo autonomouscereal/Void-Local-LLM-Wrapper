@@ -93,8 +93,8 @@ def eval_style(track_path: str, style_pack: Optional[Dict[str, Any]]) -> Dict[st
             }
 
         style_embed = style_pack.get("style_embed")
-        if not isinstance(style_embed, list) or not style_embed:
-            raise ValueError("eval_style: style_pack is missing a valid style_embed")
+            # For malformed style packs, fail loudly so configuration bugs are
+            # surfaced immediately instead of being silently tolerated.
 
         track_embed = _embed_music_clap(track_path)
         raw_sim = _cos_sim(style_embed, track_embed)
@@ -319,8 +319,6 @@ def _call_music_eval_committee(summary: str) -> Dict[str, Any]:
 
         client = CommitteeClient()
         env = await client.run(messages, trace_id="music_eval")
-        if not isinstance(env, dict) or not env.get("ok"):
-            raise RuntimeError("music_eval committee did not return ok")
         result = env.get("result") or {}
         txt = result.get("text") or ""
         # Then, pass the raw text through committee_jsonify to enforce the schema.

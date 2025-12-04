@@ -34,7 +34,6 @@ def _write_temp_wav(b64: str | None, url: str | None) -> str:
             with open(path, "wb") as f:
                 f.write(r.content)
         return path
-    raise RuntimeError("no input provided")
 
 
 @app.post("/v1/audio/stems")
