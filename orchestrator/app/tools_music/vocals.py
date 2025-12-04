@@ -171,19 +171,24 @@ def render_vocal_stems_for_track(
         env = run_tts_speak(tts_job, tts_provider, manifest)
         # run_tts_speak returns either an error envelope or a normal envelope.
         if not isinstance(env, dict):
+            import traceback as _tb
             return {
                 "error": {
-                    "code": "tts_env_invalid",
+                    "code": "InternalError",
                     "message": "run_tts_speak did not return a dict envelope",
                     "voice_lock_id": voice_lock_id,
+                    "stack": _tb.format_stack(),
                 }
             }
         if env.get("error"):
+            # Propagate downstream error (with its own stack) and add our call-site stack.
+            import traceback as _tb2
             return {
                 "error": {
-                    "code": "tts_stem_error",
+                    "code": (env.get("error") or {}).get("code") if isinstance(env.get("error"), dict) else "InternalError",
                     "message": f"tts.speak failed for voice_lock_id={voice_lock_id}",
                     "detail": env.get("error"),
+                    "stack": (env.get("error") or {}).get("stack") if isinstance(env.get("error"), dict) else _tb2.format_stack(),
                 }
             }
         meta = env.get("meta") if isinstance(env.get("meta"), dict) else {}
@@ -207,10 +212,12 @@ def render_vocal_stems_for_track(
                 )
                 break
         if not stem_path or not os.path.exists(stem_path):
+            import traceback as _tb3
             return {
                 "error": {
-                    "code": "tts_stem_missing",
+                    "code": "InternalError",
                     "message": f"tts.speak produced no audio-ref artifact for voice_lock_id={voice_lock_id}",
+                    "stack": _tb3.format_stack(),
                 }
             }
         # Copy/normalize stem into the music CID stems directory for mixdown.

@@ -121,7 +121,8 @@ def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
     # Provider may return either a raw payload or an envelope; handle both safely.
     if isinstance(res, dict) and "ok" in res:
         if not bool(res.get("ok")):
-            # Bubble up error envelope unchanged so callers can see failure details.
+            # Bubble up error envelope unchanged so callers can see failure details,
+            # including any stack traces from downstream XTTS/RVC/VocalFix.
             return res
         inner = res.get("result") if isinstance(res.get("result"), dict) else {}
         wav_bytes = inner.get("wav_bytes") or b""
@@ -139,18 +140,20 @@ def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
         return {
             "ok": False,
             "error": {
-                "code": "rvc_not_configured",
+                "code": "ValidationError",
                 "status": 500,
                 "message": "RVC_API_URL is not set; RVC is mandatory for tts.speak.",
+                "stack": "".join(__import__("traceback").format_stack()),
             },
         }
     if not isinstance(voice_lock_id, str) or not voice_lock_id.strip():
         return {
             "ok": False,
             "error": {
-                "code": "rvc_reference_missing",
+                "code": "ValidationError",
                 "status": 500,
                 "message": f"No voice_lock_id / reference configured for voice_id '{logical_voice_id}'.",
+                "stack": "".join(__import__("traceback").format_stack()),
             },
         }
     import base64 as _b64_rvc
@@ -165,23 +168,27 @@ def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
     parser = JSONParser()
     js_rvc = parser.parse(r_rvc.text or "", {"ok": bool, "audio_wav_base64": str, "sample_rate": int})
     if not isinstance(js_rvc, dict) or not bool(js_rvc.get("ok")):
+        import traceback as _tb
         return {
             "ok": False,
             "error": {
-                "code": "rvc_error",
+                "code": js_rvc.get("error", {}).get("code") if isinstance(js_rvc.get("error"), dict) else "InternalError",
                 "status": int(getattr(r_rvc, "status_code", 500) or 500),
                 "message": "RVC /v1/audio/convert failed for tts.speak",
                 "raw": js_rvc,
+                "stack": js_rvc.get("error", {}).get("stack") if isinstance(js_rvc.get("error"), dict) else _tb.format_exc(),
             },
         }
     b64_rvc = js_rvc.get("audio_wav_base64") if isinstance(js_rvc.get("audio_wav_base64"), str) else None
     if not b64_rvc:
+        import traceback as _tb2
         return {
             "ok": False,
             "error": {
-                "code": "rvc_missing_audio",
+                "code": "ValidationError",
                 "status": 500,
                 "message": "RVC /v1/audio/convert returned no audio_wav_base64",
+                "stack": _tb2.format_stack(),
             },
         }
     wav_bytes = _b64_rvc.b64decode(b64_rvc)
@@ -191,9 +198,10 @@ def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
         return {
             "ok": False,
             "error": {
-                "code": "vocalfix_unconfigured",
+                "code": "ValidationError",
                 "status": 500,
                 "message": "VOCAL_FIXER_API_URL must be configured for tts.speak",
+                "stack": "".join(__import__("traceback").format_stack()),
             },
         }
     try:
@@ -221,23 +229,28 @@ def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
         except Exception:
             js_vf = {}
         if not isinstance(js_vf, dict) or not bool(js_vf.get("ok")):
+            import traceback as _tb3
+            inner_err = js_vf.get("error") if isinstance(js_vf, dict) else None
             return {
                 "ok": False,
                 "error": {
-                    "code": "vocalfix_error",
+                    "code": (inner_err or {}).get("code") if isinstance(inner_err, dict) else "InternalError",
                     "status": int(getattr(r_vf, "status_code", 500) or 500),
                     "message": "VocalFix /v1/vocal/fix failed for tts.speak",
                     "raw": js_vf,
+                    "stack": (inner_err or {}).get("stack") if isinstance(inner_err, dict) else _tb3.format_exc(),
                 },
             }
         b64_vf = js_vf.get("audio_wav_base64") if isinstance(js_vf.get("audio_wav_base64"), str) else None
         if not b64_vf:
+            import traceback as _tb4
             return {
                 "ok": False,
                 "error": {
-                    "code": "vocalfix_missing_audio",
+                    "code": "ValidationError",
                     "status": 500,
                     "message": "VocalFix /v1/vocal/fix returned no audio_wav_base64",
+                    "stack": _tb4.format_stack(),
                 },
             }
         wav_bytes = _b64_vf.b64decode(b64_vf)

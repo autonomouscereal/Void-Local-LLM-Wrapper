@@ -5808,6 +5808,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         class _WindowMusicProvider:
             def compose(self, payload: Dict[str, Any]) -> Dict[str, Any]:
                 import httpx as _hxsync  # local sync client
+                import traceback as _tbmod
                 body = {
                     "prompt": payload.get("prompt"),
                     # Wire directly to the music service contract: it expects `seconds`.
@@ -5827,6 +5828,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                                 "message": f"music backend returned HTTP {r.status_code}",
                                 "status": int(r.status_code),
                                 "body": r.text or "",
+                                "stack": _tbmod.format_stack(),
                             }
                         }
                     parser = JSONParser()
@@ -5837,6 +5839,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                                 "code": "music_backend_bad_json",
                                 "message": r.text or "",
                                 "status": int(r.status_code),
+                                "stack": _tbmod.format_stack(),
                             }
                         }
                     b64 = js.get("audio_wav_base64") or js.get("wav_b64")
@@ -5846,6 +5849,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                                 "code": "music_backend_missing_audio",
                                 "message": "music backend response did not contain audio_wav_base64 or wav_b64",
                                 "status": int(r.status_code),
+                                "stack": _tbmod.format_stack(),
                             }
                         }
                     wav = _b.b64decode(b64)
@@ -9805,103 +9809,11 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 domain_qa = assets_compute_domain_qa(tool_results)
                 qa_metrics = {"counts": counts_summary, "domain": domain_qa}
             _log("qa.metrics", trace_id=trace_id, tool="postrun.revise", metrics=qa_metrics)
-        # Pass committee context into finalizer
+        # Make full tool results (including internal error stacks) available to the
+        # final COMPOSE pass so the committee can explain failures and partial
+        # successes directly to the user instead of using a prebuilt summary.
         if tool_results:
             messages = [{"role": "system", "content": "Tool results:\n" + json.dumps(tool_results, indent=2)}] + messages
-            # If tools produced media artifacts, return them immediately (skip waiting on models)
-            asset_urls = assets_collect_urls(tool_results, _abs_url)
-            # Always return a final OpenAI envelope after tools complete (even without assets)
-            # Build a richer assistant message using tool meta (prompt/params) when available
-            prompt_text = ""
-            meta_used: Dict[str, Any] = {}
-            if isinstance(tool_results, list) and tool_results:
-                first = (tool_results[0] or {}).get("result") or {}
-                if isinstance(first.get("meta"), dict):
-                    meta_used = first.get("meta") or {}
-                    pt = meta_used.get("prompt")
-                    if isinstance(pt, str) and pt.strip():
-                        prompt_text = pt.strip()
-            # Detect tool errors and surface them clearly to the user
-            tool_errors: List[Dict[str, Any]] = []
-            for tr in (tool_results or []):
-                if not isinstance(tr, dict):
-                    continue
-                name_t = (tr.get("name") or tr.get("tool") or "tool")
-                err_obj: Any = None
-                if isinstance(tr.get("error"), (str, dict)):
-                    err_obj = tr.get("error")
-                res_t = tr.get("result") if isinstance(tr.get("result"), dict) else {}
-                if isinstance(res_t.get("error"), (str, dict)):
-                    err_obj = res_t.get("error")
-                if err_obj is not None:
-                    code = (err_obj.get("code") if isinstance(err_obj, dict) else str(err_obj))
-                    status = None
-                    if isinstance(err_obj, dict):
-                        status = err_obj.get("status") or err_obj.get("_http_status") or err_obj.get("http_status")
-                    message = (err_obj.get("message") if isinstance(err_obj, dict) else None) or ""
-                    tool_errors.append({"tool": str(name_t), "code": (code or ""), "status": status, "message": message, "error": err_obj})
-            warnings = tool_errors[:] if tool_errors else []
-            summary_lines: List[str] = []
-            if (not asset_urls) and tool_errors:
-                # Compose an explicit failure report
-                summary_lines.append("The image tool failed to run.")
-                for e in tool_errors:
-                    line = f"- {e.get('tool')}: {e.get('code') or 'error'}"
-                    if e.get("status") is not None:
-                        line += f" (status {e.get('status')})"
-                    if e.get("message"):
-                        line += f" — {e.get('message')}"
-                    summary_lines.append(line)
-                if prompt_text:
-                    summary_lines.append(f"Prompt attempted:\n“{prompt_text}”")
-                # Provide effective params when known
-                if isinstance(meta_used, dict) and meta_used:
-                    param_bits = []
-                    for k in ("width","height","steps","cfg","sampler","scheduler","model","seed"):
-                        v = meta_used.get(k)
-                        if v is not None and v != "":
-                            param_bits.append(f"{k}={v}")
-                    if param_bits:
-                        summary_lines.append("Parameters: " + ", ".join(param_bits))
-                summary_lines.append("No assets were produced.")
-            else:
-                if prompt_text:
-                    summary_lines.append(f"Here is your image:\n“{prompt_text}”")
-                else:
-                    summary_lines.append("Here are your generated image(s):")
-                # include effective params when present
-                for k in ("width","height","steps","cfg","sampler","scheduler","model","seed"):
-                    v = meta_used.get(k)
-                    if v is not None and v != "":
-                        summary_lines.append(f"{k}: {v}")
-                if asset_urls:
-                    summary_lines.append("Assets:")
-                    summary_lines.extend([f"- {u}" for u in asset_urls])
-                if warnings:
-                    summary_lines.append("")
-                    summary_lines.append("Warnings:")
-                    for e in warnings[:5]:
-                        code = (e.get("error") or {}).get("code") if isinstance(e.get("error"), dict) else (e.get("code") or "tool_error")
-                        message = (e.get("error") or {}).get("message") if isinstance(e.get("error"), dict) else (e.get("message") or "")
-                        summary_lines.append(f"- {code}: {message}")
-            response = finalize_tool_phase(
-                messages=messages,
-                tool_results=tool_results,
-                master_seed=master_seed,
-                trace_id=trace_id,
-                model_name=COMMITTEE_MODEL_ID,
-                absolutize_url=_abs_url,
-                estimate_usage_fn=estimate_usage,
-                envelope_builder=_build_openai_envelope,
-                state_dir=STATE_DIR,
-                committee_info={"action": committee_action, "rationale": committee_rationale},
-                qa_metrics=qa_metrics,
-            )
-            if _lock_token:
-                trace_release_lock(STATE_DIR, trace_id)
-            _trace_response(trace_id, response)
-            response_prebuilt = response
-            # Do not return; finalize at the unified tail
 
     # 3) Executors respond independently using plan + evidence
     evidence_blocks: List[Dict[str, Any]] = [
@@ -10173,7 +10085,9 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         "### [COMPOSE / SYSTEM]\n"
         "Produce the final, corrected answer in English only. Do NOT output JSON, logs, or traces (no chat.start, exec.payload.pre, Comfy.submit, Comfy.poll, or similar). "
         "Do NOT invent or include any Assets: block or /uploads/artifacts/... URLs; the system will append asset URLs automatically when available. "
-        "If minor issues: add Warnings: lines; keep the answer helpful. Append Applied RoE: with 1–3 short items actually followed."
+        "If any tools in the Tool results block failed (ok:false or with an error object), clearly explain which tool(s) failed, show their error codes and status values, and include a short (possibly truncated) stack-trace snippet when available. "
+        "Also describe any artifacts that did succeed so the user understands partial progress. "
+        "If minor issues only: add Warnings: lines; keep the answer helpful. Append Applied RoE: with 1–3 short items actually followed."
     )}
     committee_summary_parts: List[str] = []
     committee_summary_parts.append("You are the committee synthesizer. Merge the following model answers and critiques into a single best answer.\n")

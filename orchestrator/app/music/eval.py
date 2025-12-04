@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
+import traceback
 
 from ..analysis.media import analyze_audio, _load_audio  # type: ignore
 from ..json_parser import JSONParser
@@ -119,13 +120,14 @@ def eval_style(track_path: str, style_pack: Optional[Dict[str, Any]]) -> Dict[st
             "style_eval_ok": True,
         }
     except MusicEvalError as e:
-        # CLAP failed for this track; surface as non-fatal style-axis failure.
+        # CLAP failed for this track; surface as non-fatal style-axis failure with stack.
         return {
             "style_score": 0.0,
             "track_embed": None,
             "per_ref_scores": {},
             "style_eval_ok": False,
             "reason": str(e),
+            "stack": traceback.format_exc(),
         }
 
 

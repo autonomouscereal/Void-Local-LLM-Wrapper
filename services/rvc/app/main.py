@@ -53,10 +53,12 @@ def ensure_rvc_weights_present() -> None:
     not a missing Python library.
     """
     if not os.path.isdir(RVC_MODEL_ROOT):
-        raise RuntimeError(f"RVC_MODEL_ROOT does not exist: {RVC_MODEL_ROOT}")
+        logging.error("RVC weights missing: RVC_MODEL_ROOT does not exist: %s", RVC_MODEL_ROOT)
+        return
     entries = os.listdir(RVC_MODEL_ROOT)
     if not entries:
-        raise RuntimeError(f"RVC model directory is empty: {RVC_MODEL_ROOT}")
+        logging.error("RVC weights missing: model directory is empty: %s", RVC_MODEL_ROOT)
+        return
     logging.info("RVC weights present in %s: %s", RVC_MODEL_ROOT, entries)
 
 
@@ -64,15 +66,13 @@ def ensure_rvc_weights_present() -> None:
 async def _check_rvc_weights_on_startup() -> None:
     """
     On service startup, verify that Titan RVC weights are present under RVC_MODEL_ROOT.
-    This guarantees that any failure is clearly attributed to a missing/incorrect
-    model volume, not to a missing or misconfigured model package.
+    Any failure is logged with a full stack trace; callers should rely on runtime
+    error envelopes from endpoints rather than process-level crashes.
     """
     try:
         ensure_rvc_weights_present()
-    except Exception as ex:
-        logging.error("RVC weights check failed: %s", ex)
-        # Re-raise so the process fails fast with a clear error
-        raise
+    except Exception:
+        logging.error("RVC weights check failed:\n%s", traceback.format_exc())
 
 
 def ensure_rvc_engine_loaded(cfg: Dict[str, Any]) -> None:
@@ -86,9 +86,10 @@ def ensure_rvc_engine_loaded(cfg: Dict[str, Any]) -> None:
 
     model_name = (cfg.get("model_name") or "").strip()
     if not model_name:
-        raise RuntimeError(
-            "rvc_engine: cfg['model_name'] is required and must match a model directory name in the rvc_python models folder"
-        )
+        # Let callers surface this as a structured ValidationError instead of
+        # raising from the helper.
+        logging.error("rvc_engine: cfg['model_name'] missing or empty in ensure_rvc_engine_loaded")
+        return
 
     base = RVC_ENGINE_BASE.rstrip("/")
 
@@ -96,7 +97,8 @@ def ensure_rvc_engine_loaded(cfg: Dict[str, Any]) -> None:
         device = "cuda:0" if torch.cuda.is_available() else "cpu"
         resp = httpx.post(f"{base}/set_device", json={"device": device}, timeout=None)
         if resp.status_code < 200 or resp.status_code >= 300:
-            raise RuntimeError(f"rvc_engine: /set_device failed: {resp.status_code} {resp.text}")
+            logging.error("rvc_engine: /set_device failed: %s %s", resp.status_code, resp.text)
+            return
         _ENGINE_DEVICE_SET = True
 
     if model_name in _LOADED_MODELS and _LOADED_MODELS[model_name]:
@@ -104,9 +106,8 @@ def ensure_rvc_engine_loaded(cfg: Dict[str, Any]) -> None:
 
     resp = httpx.post(f"{base}/models/{model_name}", timeout=None)
     if resp.status_code < 200 or resp.status_code >= 300:
-        raise RuntimeError(
-            f"rvc_engine: /models/{model_name} failed: {resp.status_code} {resp.text}"
-        )
+        logging.error("rvc_engine: /models/%s failed: %s %s", model_name, resp.status_code, resp.text)
+        return
 
     _LOADED_MODELS[model_name] = True
 
@@ -142,9 +143,10 @@ async def register_voice(body: Dict[str, Any]):
         return {
             "ok": False,
             "error": {
-                "code": "missing_voice_lock_id",
+                "code": "ValidationError",
                 "message": "voice_lock_id is required",
                 "status": 400,
+                "stack": "".join(traceback.format_stack()),
             },
         }
     model_name = (body.get("model_name") or "").strip()
@@ -152,9 +154,10 @@ async def register_voice(body: Dict[str, Any]):
         return {
             "ok": False,
             "error": {
-                "code": "missing_model_name",
+                "code": "ValidationError",
                 "message": "model_name is required for rvc-python",
                 "status": 400,
+                "stack": "".join(traceback.format_stack()),
             },
         }
     reg = _load_registry()
@@ -172,7 +175,7 @@ async def register_voice(body: Dict[str, Any]):
                     "message": str(ex),
                     "status": 400,
                     "type": ex.__class__.__name__,
-                    "traceback": traceback.format_exc(),
+                    "stack": traceback.format_exc(),
                 },
             }
         voices_root = os.getenv("RVC_VOICES_ROOT", "/rvc/assets/voices")
@@ -219,10 +222,7 @@ async def register_voice(body: Dict[str, Any]):
 
 
 def _decode_wav_from_b64(b64: str) -> bytes:
-    try:
-        return base64.b64decode(b64)
-    except Exception as ex:
-        raise ValueError(f"invalid base64 audio: {ex}") from ex
+    return base64.b64decode(b64)
 
 
 def _decode_wav_to_mono_float32(data: bytes) -> Tuple[np.ndarray, int]:
@@ -262,10 +262,14 @@ def _run_rvc_convert(
       include f0_method, transpose, index_rate, etc.
     """
     if not isinstance(src_y, np.ndarray) or src_y.size == 0:
-        raise ValueError("rvc_convert: empty source audio")
+        # Leave semantic enforcement (empty source) to the caller to surface as
+        # a ValidationError in the JSON envelope.
+        logging.error("rvc_convert: empty source audio")
+        return src_y
     if not isinstance(ref_y, np.ndarray) or ref_y.size == 0:
         # keep RVC mandatory semantics: require a reference clip at registration time
-        raise ValueError("rvc_convert: empty reference audio")
+        logging.error("rvc_convert: empty reference audio")
+        return src_y
 
     # Ensure external engine and model are ready
     ensure_rvc_engine_loaded(cfg)
@@ -287,9 +291,8 @@ def _run_rvc_convert(
         timeout=None,
     )
     if resp_params.status_code < 200 or resp_params.status_code >= 300:
-        raise RuntimeError(
-            f"rvc_engine: /params failed: {resp_params.status_code} {resp_params.text}"
-        )
+        logging.error("rvc_engine: /params failed: %s %s", resp_params.status_code, resp_params.text)
+        return src_y
 
     # Encode source audio to WAV bytes and base64 for /convert
     wav_bytes = _encode_mono_float32_to_wav_bytes(src_y, src_sr)
@@ -301,14 +304,14 @@ def _run_rvc_convert(
         timeout=None,
     )
     if resp_conv.status_code < 200 or resp_conv.status_code >= 300:
-        raise RuntimeError(
-            f"rvc_engine: /convert failed: {resp_conv.status_code} {resp_conv.text}"
-        )
+        logging.error("rvc_engine: /convert failed: %s %s", resp_conv.status_code, resp_conv.text)
+        return src_y
 
     # rvc-python returns raw WAV bytes in the body, not JSON
     out_bytes = resp_conv.content
     if not out_bytes:
-        raise RuntimeError("rvc_engine: /convert returned empty body")
+        logging.error("rvc_engine: /convert returned empty body")
+        return src_y
 
     out_y, out_sr = _decode_wav_to_mono_float32(out_bytes)
     # You can resample to cfg["sample_rate"] later if needed; for now we return what engine produced
@@ -378,9 +381,10 @@ async def train_voice(body: Dict[str, Any]):
         return {
             "ok": False,
             "error": {
-                "code": "missing_voice_lock_id",
+                "code": "ValidationError",
                 "message": "voice_lock_id is required",
                 "status": 400,
+                "stack": "".join(traceback.format_stack()),
             },
         }
     
@@ -390,7 +394,7 @@ async def train_voice(body: Dict[str, Any]):
         return {
             "ok": False,
             "error": {
-                "code": "unknown_voice_lock_id",
+                "code": "ValidationError",
                 "message": f"no registry entry for {voice_lock_id}",
                 "status": 404,
             },
@@ -401,7 +405,7 @@ async def train_voice(body: Dict[str, Any]):
         return {
             "ok": False,
             "error": {
-                "code": "missing_model_name",
+                "code": "ValidationError",
                 "message": "voice registry entry missing model_name",
                 "status": 400,
             },
@@ -436,9 +440,10 @@ async def train_voice(body: Dict[str, Any]):
         return {
             "ok": False,
             "error": {
-                "code": "no_reference_audio",
+                "code": "ValidationError",
                 "message": f"No reference audio files found for voice {voice_lock_id}",
                 "status": 400,
+                "stack": "".join(traceback.format_stack()),
             },
         }
     
@@ -448,9 +453,10 @@ async def train_voice(body: Dict[str, Any]):
         return {
             "ok": False,
             "error": {
-                "code": "default_voice_not_trainable",
+                "code": "ValidationError",
                 "message": f"Voice '{model_name}' is a reserved default and cannot be trained.",
                 "status": 400,
+                "stack": "".join(traceback.format_stack()),
             },
         }
     
@@ -508,11 +514,11 @@ async def train_voice(body: Dict[str, Any]):
         return {
             "ok": False,
             "error": {
-                "code": "train_request_failed",
+                "code": ex.__class__.__name__ or "InternalError",
                 "message": str(ex),
                 "status": 500,
                 "type": ex.__class__.__name__,
-                "traceback": traceback.format_exc(),
+                "stack": traceback.format_exc(),
             },
         }
 
@@ -535,9 +541,10 @@ async def voice_rename(body: Dict[str, Any]):
         return {
             "ok": False,
             "error": {
-                "code": "missing_old_voice_id",
+                "code": "ValidationError",
                 "message": "old_voice_id is required for rename.",
                 "status": 400,
+                "stack": "".join(traceback.format_stack()),
             },
         }
     
@@ -545,9 +552,10 @@ async def voice_rename(body: Dict[str, Any]):
         return {
             "ok": False,
             "error": {
-                "code": "missing_new_voice_id",
+                "code": "ValidationError",
                 "message": "new_voice_id is required for rename.",
                 "status": 400,
+                "stack": "".join(traceback.format_stack()),
             },
         }
     
@@ -555,9 +563,10 @@ async def voice_rename(body: Dict[str, Any]):
         return {
             "ok": False,
             "error": {
-                "code": "same_voice_id",
+                "code": "ValidationError",
                 "message": "old_voice_id and new_voice_id cannot be the same.",
                 "status": 400,
+                "stack": "".join(traceback.format_stack()),
             },
         }
     
@@ -696,9 +705,10 @@ async def voice_rename(body: Dict[str, Any]):
                 return {
                     "ok": False,
                     "error": {
-                        "code": "rename_failed",
+                        "code": ex.__class__.__name__ or "InternalError",
                         "message": f"Failed to rename model directory: {str(ex)}",
                         "status": 500,
+                        "stack": traceback.format_exc(),
                     },
                 }
         
@@ -799,9 +809,10 @@ async def convert_v1(body: Dict[str, Any]):
         return {
             "ok": False,
             "error": {
-                "code": "missing_source_wav_b64",
+                "code": "ValidationError",
                 "message": "source_wav_b64 is required",
                 "status": 400,
+                "stack": "".join(traceback.format_stack()),
             },
         }
     
@@ -850,15 +861,15 @@ async def convert_v1(body: Dict[str, Any]):
                 model_name = fallback_model
     try:
         wav_bytes = _decode_wav_from_b64(src_b64)
-    except ValueError as ex:
+    except Exception as ex:
         return {
             "ok": False,
             "error": {
-                "code": "invalid_b64",
+                "code": ex.__class__.__name__ or "InternalError",
                 "message": str(ex),
                 "status": 400,
                 "type": ex.__class__.__name__,
-                "traceback": traceback.format_exc(),
+                "stack": traceback.format_exc(),
             },
         }
     # Decode source audio to mono float32.
@@ -868,11 +879,11 @@ async def convert_v1(body: Dict[str, Any]):
         return {
             "ok": False,
             "error": {
-                "code": "decode_error",
+                "code": ex.__class__.__name__ or "InternalError",
                 "message": str(ex),
                 "status": 400,
                 "type": ex.__class__.__name__,
-                "traceback": traceback.format_exc(),
+                "stack": traceback.format_exc(),
             },
         }
     # Use voice_cfg we determined above (with fallback if needed)
@@ -909,7 +920,7 @@ async def convert_v1(body: Dict[str, Any]):
                         "message": str(ex),
                         "status": 400,
                         "type": ex.__class__.__name__,
-                        "traceback": traceback.format_exc(),
+                        "stack": traceback.format_exc(),
                     },
                 }
     elif is_default_voice:
@@ -921,9 +932,10 @@ async def convert_v1(body: Dict[str, Any]):
         return {
             "ok": False,
             "error": {
-                "code": "rvc_reference_missing",
+                "code": "ValidationError",
                 "message": f"No reference_wav_path configured or file not found for voice_lock_id '{voice_lock_id or 'N/A'}'.",
                 "status": 400,
+                "stack": "".join(traceback.format_stack()),
             },
         }
     try:
@@ -932,11 +944,11 @@ async def convert_v1(body: Dict[str, Any]):
         return {
             "ok": False,
             "error": {
-                "code": "rvc_inference_error",
+                "code": ex.__class__.__name__ or "InternalError",
                 "message": str(ex),
                 "status": 500,
                 "type": ex.__class__.__name__,
-                "traceback": traceback.format_exc(),
+                "stack": traceback.format_exc(),
             },
         }
     # Encode back to WAV bytes at the desired sample rate.
@@ -947,11 +959,11 @@ async def convert_v1(body: Dict[str, Any]):
         return {
             "ok": False,
             "error": {
-                "code": "encode_error",
+                "code": ex.__class__.__name__ or "InternalError",
                 "message": str(ex),
                 "status": 500,
                 "type": ex.__class__.__name__,
-                "traceback": traceback.format_exc(),
+                "stack": traceback.format_exc(),
             },
         }
     out_b64 = base64.b64encode(out_wav_bytes).decode("ascii")
@@ -975,27 +987,30 @@ async def convert_path(body: Dict[str, Any]):
         return {
             "ok": False,
             "error": {
-                "code": "missing_wav_path",
+                "code": "ValidationError",
                 "message": "wav_path is required",
                 "status": 400,
+                "stack": "".join(traceback.format_stack()),
             },
         }
     if not voice_lock_id:
         return {
             "ok": False,
             "error": {
-                "code": "missing_voice_lock_id",
+                "code": "ValidationError",
                 "message": "voice_lock_id is required",
                 "status": 400,
+                "stack": "".join(traceback.format_stack()),
             },
         }
     if not os.path.exists(wav_path):
         return {
             "ok": False,
             "error": {
-                "code": "wav_path_not_found",
+                "code": "ValidationError",
                 "message": f"wav_path not found: {wav_path}",
                 "status": 404,
+                "stack": "".join(traceback.format_stack()),
             },
         }
     with open(wav_path, "rb") as f:
@@ -1006,9 +1021,10 @@ async def convert_path(body: Dict[str, Any]):
         return {
             "ok": False,
             "error": {
-                "code": "conversion_failed",
+                "code": "InternalError",
                 "detail": res,
                 "status": 500,
+                "stack": "".join(traceback.format_stack()),
             },
         }
     out_bytes = base64.b64decode(res.get("audio_wav_base64") or "")

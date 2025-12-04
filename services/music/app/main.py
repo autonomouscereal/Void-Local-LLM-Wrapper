@@ -1,14 +1,14 @@
 from __future__ import annotations
 
+import base64
 import io
 import os
-import base64
-from typing import Dict, Any
+from typing import Any, Dict
 
 import numpy as np
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
-import logging, sys
+import logging, sys, traceback
 
 logging.basicConfig(level=logging.INFO, stream=sys.stdout, format="%(levelname)s:%(name)s:%(message)s")
 
@@ -32,7 +32,18 @@ async def generate(body: Dict[str, Any]):
     prompt = body.get("prompt") or ""
     seconds = int(body.get("seconds", 8))
     if not prompt:
-        return JSONResponse(status_code=400, content={"error": "missing prompt"})
+        # Surface validation errors as structured JSON with a synthetic stack for debugging.
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": {
+                    "code": "ValidationError",
+                    "message": "prompt is required for music generation",
+                    "status": 400,
+                    "stack": "".join(traceback.format_stack()),
+                }
+            },
+        )
     try:
         wav = generate_music(
             prompt=prompt,
@@ -51,16 +62,15 @@ async def generate(body: Dict[str, Any]):
         b64 = base64.b64encode(wav).decode("utf-8")
         return {"audio_wav_base64": b64, "sample_rate": 32000}
     except Exception as ex:  # surface full error as structured JSON
-        import traceback
-
         logging.exception("music.generate error")
         return JSONResponse(
             status_code=500,
             content={
                 "error": {
-                    "code": "music_internal_error",
+                    "code": ex.__class__.__name__ or "InternalError",
                     "message": str(ex),
-                    "traceback": traceback.format_exc(),
+                    "status": 500,
+                    "stack": traceback.format_exc(),
                 }
             },
         )

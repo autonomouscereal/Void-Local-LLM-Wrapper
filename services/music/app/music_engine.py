@@ -1,12 +1,12 @@
-import os
-from typing import Optional, List
-
 import io
 import logging
+import os
+import time
+from typing import List, Optional
 
-import torch  # type: ignore
 import numpy as np  # type: ignore
 import soundfile as sf  # type: ignore
+import torch  # type: ignore
 from transformers import AutoProcessor, MusicgenForConditionalGeneration  # type: ignore
 
 
@@ -113,12 +113,19 @@ def ensure_music_engine_loaded() -> None:
     model_dir = os.getenv("MUSIC_MODEL_DIR", "/opt/models/music")
     model_path = _resolve_model_path(model_dir, os.getenv("MUSIC_MODEL_ID", "facebook/musicgen-large"))
     if not model_path:
-        raise RuntimeError("MUSIC_MODEL_ID or MUSIC_MODEL_DIR must be set for music engine")
+        # Do not raise here; log a clear error and let the caller surface a full
+        # stack trace at the service layer when generation is attempted.
+        logger.error("musicgen.init.error missing MUSIC_MODEL_ID/MUSIC_MODEL_DIR (model_path empty)")
+        _ENGINE_LOADED = False
+        _MUSIC_MODEL = None
+        _MUSIC_PROCESSOR = None
+        return
     dtype = torch.float16 if _MUSIC_DEVICE.startswith("cuda") else torch.float32
     _MUSIC_MODEL = MusicgenForConditionalGeneration.from_pretrained(model_path, torch_dtype=dtype)
     _MUSIC_MODEL = _MUSIC_MODEL.to(_MUSIC_DEVICE)
     _MUSIC_PROCESSOR = AutoProcessor.from_pretrained(model_path)
     _ENGINE_LOADED = True
+    logger.info("musicgen.init model=%s device=%s dtype=%s", model_path, _MUSIC_DEVICE, dtype)
 
 
 def generate_music(
@@ -135,12 +142,10 @@ def generate_music(
 
     Returns WAV bytes at 32 kHz.
     """
-    if not prompt or not prompt.strip():
-        raise ValueError("prompt is required for generate_music")
-    # Ensure engine is initialized.
+    # Caller (/generate) is responsible for validating prompt; avoid raising here.
+    # Ensure engine is initialized; rely on ensure_music_engine_loaded to log any
+    # configuration problems, which will surface as errors at the service layer.
     ensure_music_engine_loaded()
-    if _MUSIC_MODEL is None or _MUSIC_PROCESSOR is None:
-        raise RuntimeError("Music engine not initialized")
     model = _MUSIC_MODEL
     proc = _MUSIC_PROCESSOR
     device = _MUSIC_DEVICE
@@ -156,7 +161,14 @@ def generate_music(
     # Crude mapping: ~50 tokens/s for small/medium configs
     max_new_tokens = max(50, int(seconds) * 50)
 
-    # Detailed debug logging around the model.generate call.
+    # Structured logging around the model.generate call.
+    logger.info(
+        "musicgen.request seconds=%s seed=%s device=%s max_new_tokens=%s",
+        seconds,
+        seed,
+        device,
+        max_new_tokens,
+    )
     _log_music_generate_state(
         prompt=prompt,
         seconds=seconds,
@@ -167,6 +179,7 @@ def generate_music(
         max_new_tokens=max_new_tokens,
     )
 
+    t0 = time.time()
     with torch.inference_mode():
         if device.startswith("cuda"):
             with torch.cuda.amp.autocast():
@@ -183,6 +196,14 @@ def generate_music(
                 guidance_scale=3.0,
                 max_new_tokens=max_new_tokens,
             )
+    elapsed = time.time() - t0
+    logger.info(
+        "musicgen.generate.finished seconds=%s device=%s elapsed_s=%.3f max_new_tokens=%s",
+        seconds,
+        device,
+        elapsed,
+        max_new_tokens,
+    )
     # Expect [batch, channels, samples]
     audio = audio_values[0, 0].cpu().numpy().astype(np.float32)
     sr = 32000

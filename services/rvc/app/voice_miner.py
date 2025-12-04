@@ -144,7 +144,7 @@ def normalize_audio_to_wav(input_path: str, output_path: str, target_sr: int = 4
             capture_output=True,
         )
     except Exception as ex:
-        raise RuntimeError(f"Failed to normalize audio: {ex}")
+        logging.error("Failed to normalize audio %s -> %s: %s", input_path, output_path, ex)
 
 
 def extract_audio_from_video(video_path: str, output_path: str) -> None:
@@ -161,7 +161,7 @@ def extract_audio_from_video(video_path: str, output_path: str) -> None:
             capture_output=True,
         )
     except Exception as ex:
-        raise RuntimeError(f"Failed to extract audio from video: {ex}")
+        logging.error("Failed to extract audio from video %s -> %s: %s", video_path, output_path, ex)
 
 
 def slice_audio_segment(audio_path: str, start: float, end: float, output_path: str) -> None:
@@ -173,17 +173,19 @@ def slice_audio_segment(audio_path: str, start: float, end: float, output_path: 
             frames_to_read = int((end - start) * sr)
             
             if frames_to_read <= 0:
-                raise ValueError(f"Invalid duration for segment {start}-{end}")
+                logging.error("Invalid duration for segment %s-%s (frames_to_read<=0)", start, end)
+                return
                 
             f.seek(start_frame)
             audio = f.read(frames_to_read)
             
             if len(audio) == 0:
-                raise ValueError(f"Empty segment read {start}-{end}")
+                logging.error("Empty segment read %s-%s", start, end)
+                return
                 
             sf.write(output_path, audio, sr)
     except Exception as ex:
-        raise RuntimeError(f"Failed to slice segment {start}-{end}: {ex}")
+        logging.error("Failed to slice segment %s-%s: %s", start, end, ex)
 
 
 def group_by_speaker(segments: List[Dict[str, Any]]) -> List[Tuple[str, List[Dict[str, Any]]]]:
@@ -233,10 +235,12 @@ def isolate_vocals_with_demucs(audio_path: str, project_dir: str) -> Tuple[str, 
             json={"b64": audio_b64, "stems": ["vocals", "other"]},
         )
         if resp.status_code != 200:
-            raise RuntimeError(f"demucs_service failed: {resp.status_code} {resp.text}")
+            logging.error("demucs_service failed: %s %s", resp.status_code, resp.text)
+            return audio_path, audio_path
         data = resp.json()
         if not data.get("ok"):
-            raise RuntimeError(f"demucs_service error: {data.get('error')}")
+            logging.error("demucs_service error: %s", data.get("error"))
+            return audio_path, audio_path
         
         stems = data.get("stems_b64", {})
         vocals_b64 = stems.get("vocals")
@@ -273,7 +277,8 @@ def transcribe_with_whisper(audio_path: str, language: Optional[str] = None) -> 
             json={"audio_url": f"file://{audio_path}", "language": language},
         )
         if resp.status_code != 200:
-            raise RuntimeError(f"whisper_service failed: {resp.status_code} {resp.text}")
+            logging.error("whisper_service failed: %s %s", resp.status_code, resp.text)
+            return []
         data = resp.json()
         
         # If whisper service returns segments (future proofing)
