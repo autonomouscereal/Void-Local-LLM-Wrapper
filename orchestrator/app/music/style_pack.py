@@ -79,8 +79,15 @@ def _embed_music_clap(path: str) -> List[float]:
         return []
     with torch.no_grad():
         emb = _CLAP_MODEL.get_audio_embedding_from_filelist([path])
-    if not emb:
+    # Avoid ambiguous truth-value checks on torch/NumPy arrays.
+    if emb is None:
         return []
+    try:
+        if hasattr(emb, "__len__") and len(emb) == 0:
+            return []
+    except Exception:
+        # If len() is not supported, fall through and let indexing fail loudly.
+        pass
     e0 = emb[0]
     # Support both torch tensors and numpy arrays (and generic list-like) without
     # assuming .detach() is available.
