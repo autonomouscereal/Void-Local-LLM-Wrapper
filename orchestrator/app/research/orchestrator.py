@@ -17,7 +17,6 @@ from .report import make_report
 from ..jobs.state import create_job, set_state, get_job
 from ..jobs.progress import event as progress_event
 from ..jobs.partials import emit_partial
-from ..ops.timeout_retry import run_phase_with_timeout, PhaseTimeout
 from ..datasets.trace import append_sample as _trace_append
 
 
@@ -57,17 +56,8 @@ def run_research(job: Dict[str, Any]) -> Dict[str, Any]:
         except Exception:
             pass
 
-    # Phase: normalize → Evidence Ledger (with timeout)
-    try:
-        ledger_rows, _attempts_norm, _elapsed_norm = run_phase_with_timeout(
-            fn=normalize_sources,
-            args={"sources": sources},
-            timeout_s=int(os.getenv("RESEARCH_NORMALIZE_TIMEOUT", "120")),
-        )
-    except (PhaseTimeout, Exception):
-        if jid:
-            emit_partial(jid, "normalize", {**manifest, "root": root}, lambda ev: _append_job_event(jid, ev))
-        return {"phase": "cancelled", "artifacts": manifest.get("items", []), "cid": cid}
+    # Phase: normalize → Evidence Ledger (no explicit timeout wrapper)
+    ledger_rows = normalize_sources(sources)
     sh = open_shard(root, "ledger", max_bytes=int(os.getenv("ARTIFACT_SHARD_BYTES", "200000")))
     for row in ledger_rows:
         if jid and (get_job(jid) and get_job(jid).cancel_flag):
@@ -85,17 +75,8 @@ def run_research(job: Dict[str, Any]) -> Dict[str, Any]:
         except Exception:
             pass
 
-    # Phase: analyze → Money Map (with timeout)
-    try:
-        edges, _attempts_an, _elapsed_an = run_phase_with_timeout(
-            fn=extract_edges,
-            args={"ledger_rows": ledger_rows, "query": q},
-            timeout_s=int(os.getenv("RESEARCH_ANALYZE_TIMEOUT", "120")),
-        )
-    except (PhaseTimeout, Exception):
-        if jid:
-            emit_partial(jid, "analyze", {**manifest, "root": root}, lambda ev: _append_job_event(jid, ev))
-        return {"phase": "cancelled", "artifacts": manifest.get("items", []), "cid": cid}
+    # Phase: analyze → Money Map (no explicit timeout wrapper)
+    edges = extract_edges(ledger_rows=ledger_rows, query=q)
     money_map = build_money_map(edges)
     _write_json_atomic(os.path.join(root, "money_map.json"), money_map)
     add_manifest_row(manifest, os.path.join(root, "money_map.json"), step_id="analyze")

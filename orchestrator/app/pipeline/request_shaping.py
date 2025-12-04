@@ -1,8 +1,33 @@
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple, Callable
+import unicodedata
 
-from app.ops.unicode import nfc_msgs  # type: ignore
+
+def unicode_normalize_messages(msgs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+	"""
+	Unicode normalizer for chat messages.
+
+	- Applies NFC normalization to any string `content` fields.
+	- Leaves non-string content and unknown fields unchanged.
+	- Does not hide or catch errors: if something truly pathological is in
+	  `content`, it will surface naturally when accessed later.
+	"""
+	out: List[Dict[str, Any]] = []
+	for m in msgs:
+		if not isinstance(m, dict):
+			continue
+		m2 = dict(m)
+		content = m2.get("content")
+		if isinstance(content, str):
+			m2["content"] = unicodedata.normalize("NFC", content)
+		out.append(m2)
+	return out
+
+
+# Back-compat alias used by existing shaping code.
+def nfc_msgs(msgs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+	return unicode_normalize_messages(msgs)
 
 
 def shape_request(

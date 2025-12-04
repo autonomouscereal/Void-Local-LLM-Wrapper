@@ -51,23 +51,9 @@ def _call_provider_chat(provider, prompt: str, max_tokens: int):
 
 
 def model_chat_with_retry(provider, prompt: str, max_tokens: int, timeout_s: int = 30, retries: int = 2, backoff: List[int] | None = None):
-    if backoff is None:
-        backoff = [0, 2, 4]
-    last_err: ProviderError | None = None
-    for attempt in range(retries + 1):
-        try:
-            # Always call without timeout
-            resp = _call_provider_chat(provider, prompt, max_tokens)
-            return resp
-        except Exception as e:
-            perr = classify_exc(e)
-            last_err = perr
-            if (perr.kind != "retryable") or (attempt == retries):
-            # deterministic backoff
-            delay = backoff[min(attempt + 1, len(backoff) - 1)] if backoff else 0
-            if delay > 0:
-                time.sleep(delay)
-            continue
+    # Simplified: delegate directly to the provider without retries or custom
+    # error handling so any failures surface naturally.
+    return _call_provider_chat(provider, prompt, max_tokens)
 
 
 def ask_model_json(provider, prompt: str, max_tokens: int) -> dict:

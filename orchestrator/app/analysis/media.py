@@ -143,7 +143,7 @@ def _run_yolo(path: str) -> Dict[str, Any]:
         r = requests.post(
             VISION_REPAIR_API_URL.rstrip("/") + "/v1/image/analyze",
             json={"image_path": path},
-            timeout=10,
+            timeout=None,
         )
         from ..json_parser import JSONParser  # local import to avoid cycles at module import time
         parser = JSONParser()
@@ -249,7 +249,7 @@ def _qwen_vl_analyze(path: str, prompt: Optional[str]) -> Dict[str, Any]:
         r = requests.post(
             VLM_API_URL.rstrip("/") + "/analyze",
             json={"image_url": image_url, "prompt": base_instr},
-            timeout=60,
+            timeout=None,
         )
         from ..json_parser import JSONParser  # local import to avoid cycles at module import time
         parser = JSONParser()

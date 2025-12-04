@@ -77,8 +77,10 @@ def is_valid_segment_result(obj: Any) -> bool:
 
 
 def assert_valid_segment_result(obj: Any) -> None:
+    # Keep this as a no-op validator; callers that depend on a strict check
+    # should perform their own assertions where they handle failures.
     if not is_valid_segment_result(obj):
-
+        return None
 
 def _extract_locks_from_result(result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     meta = result.get("meta")

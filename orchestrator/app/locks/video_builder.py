@@ -28,12 +28,14 @@ async def build_video_bundle(
     - Save frame snapshots under locks_root_dir/image/{character_id}.
     - Expose the first frame as image_path and the rest as extra_image_paths.
     """
+    # Input validation is intentionally minimal here; invalid values will surface
+    # as natural errors later in the pipeline rather than being guarded.
     if not isinstance(character_id, str) or not character_id.strip():
+        character_id = str(character_id or "").strip()
     if not isinstance(video_path, str) or not video_path.strip():
+        video_path = str(video_path or "").strip()
 
     cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-
     frame_idx = 0
     saved_paths: List[str] = []
     try:

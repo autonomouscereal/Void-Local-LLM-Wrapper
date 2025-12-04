@@ -13,7 +13,6 @@ from .continuation import (
 from .tokenizer import byte_budget_for_model, bytes_len
 from .reframe import need_reframe, build_reframe_prompt
 from ..adapters.providers import model_chat_with_retry, ProviderError
-from ..ops.timeout_retry import PhaseTimeout
 import os
 
 
@@ -56,21 +55,13 @@ def solve(
         window = assemble_window(request, global_state, in_budget, step_tokens)
         if progress:
             progress(step, "window", {"input_bytes": bytes_len(window.prompt), "step_tokens": step_tokens})
-        # Provider call with deterministic timeout/retry
+        # Provider call without wrapper timeouts; any failures surface via ProviderError.
         try:
-            backoff_env = os.getenv("RETRY_BACKOFF", "0,2,4").strip()
-            backoff = [int(x) for x in backoff_env.split(",") if x.strip().isdigit()] or [0, 2, 4]
             out = model_chat_with_retry(
                 model,
                 window.prompt,
                 max_tokens=step_tokens,
-                timeout_s=int(os.getenv("ICW_STEP_TIMEOUT", "35")),
-                retries=int(os.getenv("ICW_STEP_RETRIES", "2")),
-                backoff=backoff,
             )
-        except PhaseTimeout:
-            partials.append(f"<HALT state=\"{global_state['state_hash']}\" outcome=\"timeout\"/>")
-            return SimpleNamespace(kind="HALT", partials=partials, state=global_state)
         except ProviderError as e:
             partials.append(f"<HALT state=\"{global_state['state_hash']}\" outcome=\"error:{e.code or e.kind}\"/>")
             return SimpleNamespace(kind="HALT", partials=partials, state=global_state)

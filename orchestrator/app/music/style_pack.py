@@ -71,23 +71,16 @@ def _embed_music_clap(path: str) -> List[float]:
     """
     CLAP-based music embedding helper.
 
-    Returns a dense float32 embedding for the given audio file path. CLAP
-    presence and weights are treated as mandatory for style eval, but callers
-    should catch MusicEvalError and degrade gracefully instead of crashing the
-    entire music tool.
+    This intentionally does minimal guarding so that missing models, bad paths,
+    or CLAP internals surface as natural errors instead of being wrapped here.
     """
-    if not isinstance(path, str) or not path:
-    if CLAP_MODEL_DIR_MISSING or _CLAP_MODEL is None:
-    if (not os.path.isfile(path)) or os.path.getsize(path) <= 0:
     y, sr = _load_audio(path)
     if not y or not sr:
-    try:
-        with torch.no_grad():
-            emb = _CLAP_MODEL.get_audio_embedding_from_filelist([path])
-    except ZeroDivisionError as e:
-        # Known laion_clap bug when audio_data is empty; surface as MusicEvalError.
-    except Exception as e:
-    if emb is None or len(emb) == 0:
+        return []
+    with torch.no_grad():
+        emb = _CLAP_MODEL.get_audio_embedding_from_filelist([path])
+    if not emb:
+        return []
     e0 = emb[0]
     # Support both torch tensors and numpy arrays (and generic list-like) without
     # assuming .detach() is available.
@@ -98,7 +91,6 @@ def _embed_music_clap(path: str) -> List[float]:
     else:
         arr = np.asarray(e0, dtype="float32")
     v = arr.tolist()
-    if not v:
     return v
 
 

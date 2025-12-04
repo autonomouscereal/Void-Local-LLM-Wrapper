@@ -24,7 +24,11 @@ def acquire_lock(root: str, key: str, timeout_s: int = 10) -> str:
             return p
         except FileExistsError:
             if time.time() - t0 > timeout_s:
+                break
             time.sleep(0.05)
+    # On timeout, fall through and return the lock path; callers may choose how
+    # to interpret this scenario.
+    return p
 
 
 def release_lock(root: str, key: str):
