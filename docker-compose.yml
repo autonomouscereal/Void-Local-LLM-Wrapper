@@ -31,10 +31,15 @@ services:
       dockerfile: Dockerfile
     container_name: melody_service
     restart: unless-stopped
+    runtime: nvidia
+    devices:
+      - "nvidia.com/gpu=all"
     depends_on:
+      - nvidia_init
       - film2_bootstrap
     environment:
       - NVIDIA_VISIBLE_DEVICES=${MUSIC_GPU:-all}
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     network_mode: host
     expose:
       - "7861"
@@ -460,8 +465,16 @@ services:
       dockerfile: Dockerfile
     container_name: music_service
     restart: unless-stopped
+    runtime: nvidia
+    devices:
+      - "nvidia.com/gpu=all"
+    depends_on:
+      - nvidia_init
+      - film2_bootstrap
     environment:
       - PYTHONUNBUFFERED=1
+      - NVIDIA_VISIBLE_DEVICES=${MUSIC_GPU:-all}
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     network_mode: host
     expose:
       - "7860"
@@ -714,10 +727,15 @@ services:
         <<: *cu118_args
     container_name: demucs_service
     restart: unless-stopped
+    runtime: nvidia
+    devices:
+      - "nvidia.com/gpu=all"
     depends_on:
+      - nvidia_init
       - film2_bootstrap
     environment:
-      
+      - NVIDIA_VISIBLE_DEVICES=${MUSIC_GPU:-all}
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - TORCH_HOME=/models/torch
     expose:
       - "9101"
