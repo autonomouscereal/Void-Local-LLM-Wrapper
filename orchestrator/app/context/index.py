@@ -221,7 +221,8 @@ def resolve_global(text: str, kind_hint: Optional[str] = None, search_limit: int
             ln = ln.strip()
             if not ln:
                 continue
-            obj = parser.parse(ln, {})
+            # Global index rows are arbitrary dicts; coerce to generic mapping.
+            obj = parser.parse_superset(ln, dict)["coerced"]
             if not isinstance(obj, dict):
                 continue
             if kind_hint and not str(obj.get("kind", "")).startswith(kind_hint):

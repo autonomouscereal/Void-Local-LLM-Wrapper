@@ -61,7 +61,8 @@ async def get_lock_bundle(character_id: str) -> Optional[Dict[str, Any]]:
             return val
         if isinstance(val, str):
             parser = JSONParser()
-            parsed = parser.parse(val, {})
+            # Lock bundles are arbitrary dicts; coerce to generic mapping.
+            parsed = parser.parse_superset(val, dict)["coerced"]
             return parsed if isinstance(parsed, dict) else None
         return None
 

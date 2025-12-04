@@ -1,3 +1,0 @@
-{"ts":"2025-10-28T22:07:15Z","trace_id":"tt_demo","seed":1337,"workspace":"default","mode":"general","request":{"messages":[{"role":"user","content":"hi"}],"tools_allowed":["web_search"]},"context":{"pack_hash":"sha256:pack"},"routing":{"chosen_model":"teacher","alt_models":["alt1","alt2"]},"tool_calls":[{"name":"web_search","args":{"q":"hi"},"seed":771}],"response":{"text":"hello","artifacts":[]},"metrics":{"tokens_in":3,"tokens_out":1},"seeds":{"master":1337,"router":101,"tools":{"web_search":771}},"env":{},"privacy":{"vault_refs":0,"secrets_in":0,"secrets_out":0}}
-
-

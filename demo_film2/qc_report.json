@@ -1,9 +1,0 @@
-{
-  "character": {"C_A": {"match": 0.92, "notes": "ok"}},
-  "color": {"deltaE_avg": 1.8},
-  "audio_sync": {"ms_offset": 12},
-  "artifacts": {"flicker": ["S1_SH02@t=1.2"], "warps": []},
-  "suggested_fixes": [{"shot_id":"S1_SH02","action":"re-render partial","reason":"flicker","seed_adj":"+3"}]
-}
-
-

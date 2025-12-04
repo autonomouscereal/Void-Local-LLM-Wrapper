@@ -25,7 +25,9 @@ def load_shot_snapshot(cid: str, shot_id: str) -> Optional[Dict[str, Any]]:
         from ..json_parser import JSONParser
         with open(p, "r", encoding="utf-8") as f:
             parser = JSONParser()
-            data = parser.parse(f.read(), {})
+            # Shot snapshots are arbitrary dicts; coerce to generic mapping.
+            sup = parser.parse_superset(f.read(), dict)
+            data = sup["coerced"]
             return data if isinstance(data, dict) else None
     except FileNotFoundError:
         return None

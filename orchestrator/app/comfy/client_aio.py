@@ -50,7 +50,9 @@ async def comfy_submit(graph: Dict[str, Any], client_id: Optional[str] = None, w
                         pass
                 return err
             parser = JSONParser()
-            return parser.parse(text, {"prompt_id": str, "uuid": str, "id": str})
+            schema = {"prompt_id": str, "uuid": str, "id": str}
+            sup = parser.parse_superset(text, schema)
+            return sup["coerced"]
 
 
 async def comfy_history(prompt_id: str) -> Dict[str, Any]:
@@ -69,7 +71,9 @@ async def comfy_history(prompt_id: str) -> Dict[str, Any]:
                     },
                 }
             parser = JSONParser()
-            return parser.parse(text, {"history": dict})
+            schema = {"history": dict}
+            sup = parser.parse_superset(text, schema)
+            return sup["coerced"]
 
 
 async def comfy_upload_image(name_hint: str, b64_png: str) -> str:
@@ -83,8 +87,10 @@ async def comfy_upload_image(name_hint: str, b64_png: str) -> str:
             if r.status != 200:
                 # Return best-effort fallback name so callers can proceed.
                 return filename
-            parser = JSONParser()
-            obj = parser.parse(text, {"name": str})
+        parser = JSONParser()
+        schema = {"name": str}
+        sup = parser.parse_superset(text, schema)
+        obj = sup["coerced"]
             stored = obj.get("name") or filename if isinstance(obj, dict) else filename
             return stored
 
@@ -100,8 +106,10 @@ async def comfy_upload_mask(name_hint: str, b64_png: str) -> str:
             if r.status != 200:
                 # Return best-effort fallback name so callers can proceed.
                 return filename
-            parser = JSONParser()
-            obj = parser.parse(text, {"name": str})
+        parser = JSONParser()
+        schema = {"name": str}
+        sup = parser.parse_superset(text, schema)
+        obj = sup["coerced"]
             return obj.get("name") or filename if isinstance(obj, dict) else filename
 
 
@@ -121,8 +129,10 @@ async def comfy_object_info(session: aiohttp.ClientSession, node_class: str) -> 
         text = await r.text()
         if r.status != 200:
             return {}
-        parser = JSONParser()
-        obj = parser.parse(text, {"inputs": dict})
+    parser = JSONParser()
+    schema = {"inputs": dict}
+    sup = parser.parse_superset(text, schema)
+    obj = sup["coerced"]
         return obj if isinstance(obj, dict) else {}
 
 

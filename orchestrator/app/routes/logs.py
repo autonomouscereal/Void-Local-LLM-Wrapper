@@ -16,7 +16,18 @@ STATE_DIR = os.environ.get("STATE_DIR_LOCAL", "/workspace/state")
 async def tools_append(req: Request):
     raw = await req.body()
     parser = JSONParser()
-    body = parser.parse(raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw or ""), {"trace_id": str, "tid": str, "event": str, "step_id": str, "tool": str, "payload": dict})
+    schema = {
+        "trace_id": str,
+        "tid": str,
+        "event": str,
+        "step_id": str,
+        "tool": str,
+        "payload": dict,
+    }
+    body = parser.parse_superset(
+        raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw or ""),
+        schema,
+    )["coerced"]
     trace_id = str(body.get("trace_id") or body.get("tid") or "unknown") if isinstance(body, dict) else "unknown"
     entry = {
         "t": int(time.time() * 1000),

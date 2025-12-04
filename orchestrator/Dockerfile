@@ -20,10 +20,11 @@ RUN apt-get update && \
 ENV AESTHETIC_HEAD_PATH=/opt/models/aesthetic/laion_v2_linear_L14.pt
 RUN mkdir -p /opt/models/aesthetic
 
-COPY requirements.txt /app/requirements.txt
+COPY orchestrator/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-COPY app /app/app
+COPY orchestrator/app /app/app
+COPY void_json /app/void_json
 
 # IMPORTANT (policy): Module import path is fixed to 'app.*' within /app.
 # Do NOT rely on external workpath or PYTHONPATH overrides from compose.

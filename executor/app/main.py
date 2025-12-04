@@ -174,7 +174,12 @@ def _post_json(url: str, payload: Dict[str, Any], expected: Optional[Dict[str, A
         raw = resp.read().decode("utf-8", errors="replace")
         parser = JSONParser()
         schema = expected if expected is not None else {}
-        return parser.parse(raw, schema)
+        if isinstance(schema, dict):
+            sup = parser.parse_superset(raw, schema)
+            return sup["coerced"]
+        # When schema is not a dict (very rare), fall back to strict parse without coercion.
+        ok, obj = parser.parse_strict(raw)
+        return obj if ok else {}
 
 
 def _distill_summary(result_obj: Any) -> Dict[str, Any]:

@@ -229,7 +229,7 @@ def _get_music_acceptance_thresholds() -> Dict[str, float]:
     with open(cfg_path, "r", encoding="utf-8") as f:
         txt = f.read()
     parser = JSONParser()
-    cfg = parser.parse(txt or "{}", {"music": dict})
+    cfg = parser.parse_superset(txt or "{}", {"music": dict})["coerced"]
     music_cfg = cfg.get("music") if isinstance(cfg.get("music"), dict) else {}
     overall_min = float(music_cfg.get("overall_quality_min"))
     fit_min = float(music_cfg.get("fit_score_min"))
@@ -263,7 +263,7 @@ class _TTSProvider:
                 # XTTS service returns a canonical envelope: decode audio and adapt to internal shape.
                 if "application/json" in ct:
                     parser = JSONParser()
-                    env = parser.parse(
+                    env = parser.parse_superset(
                         r.text or "",
                         {
                             "schema_version": int,
@@ -337,8 +337,10 @@ class _TTSProvider:
             raw_body = r.text
             data = None
             if "application/json" in ct:
+                # Best-effort parse of error bodies from XTTS; we treat the
+                # whole object as an untyped mapping here.
                 parser = JSONParser()
-                data = parser.parse(raw_body or "", {})
+                data = parser.parse_superset(raw_body or "", dict)["coerced"]
             return {
                 "schema_version": 1,
                 "request_id": trace_id,
@@ -1384,10 +1386,16 @@ def _trace_response(trace_id: str, envelope: Dict[str, Any]) -> None:
     content = str(msg.get("content") or "")
     # Heuristic: count asset bullet lines introduced as "- " under "Assets" blocks
     assets_count = content.count("\n- ")
+    # Prefer the explicit envelope["ok"] flag when present; fall back to the
+    # absence of an error object for legacy callers that omit ok.
+    if isinstance(envelope, dict) and "ok" in envelope:
+        ok_flag = bool(envelope.get("ok"))
+    else:
+        ok_flag = not bool(envelope.get("error"))
     out = {
         "t": tms,
         "trace_id": str(trace_id),
-        "ok": bool(envelope is not None),
+        "ok": bool(ok_flag),
         "message_len": len(content),
         "assets_count": int(assets_count),
     }
@@ -1407,7 +1415,13 @@ def _trace_response(trace_id: str, envelope: Dict[str, Any]) -> None:
             },
         },
     )
-    _log("chat.finish", trace_id=str(trace_id), ok=bool(envelope is not None and not bool(envelope.get("error"))), assets_count=int(assets_count), message_len=int(len(content)))
+    _log(
+        "chat.finish",
+        trace_id=str(trace_id),
+        ok=bool(ok_flag),
+        assets_count=int(assets_count),
+        message_len=int(len(content)),
+    )
 # CPU/GPU adaptive mode for ComfyUI graphs
 COMFY_CPU_MODE = (os.getenv("COMFY_CPU_MODE", "").strip().lower() in ("1", "true", "yes", "on"))
 
@@ -2259,7 +2273,7 @@ def _load_wrapper_config() -> None:
         parser = JSONParser()
         # Wrapper config is expected to be a dict; treat it as open, but
         # still coerce into a mapping shape.
-        cfg = parser.parse(data.decode("utf-8"), {"profiles": list, "defaults": dict})
+        cfg = parser.parse_superset(data.decode("utf-8"), {"profiles": list, "defaults": dict})["coerced"]
         if isinstance(cfg, dict):
             WRAPPER_CONFIG = cfg
         else:
@@ -2518,7 +2532,9 @@ async def v1_image_generate(request: Request):
     """
     rid = str(_uuid.uuid4())
     raw = await request.body()
-    body = JSONParser().parse(raw.decode("utf-8", errors="replace"), {})
+    # Accept any JSON object for this front-door image API; shape it manually
+    # into image.dispatch args below.
+    body = JSONParser().parse_superset(raw.decode("utf-8", errors="replace"), dict)["coerced"]
     if not isinstance(body, dict):
         return _jerr(422, rid, "invalid_body_type", "Body must be an object")
     prompt = body.get("prompt") or body.get("text") or ""
@@ -2657,7 +2673,7 @@ async def post_image_dispatch(request: Request):
         "steps": (int),
         "cfg": (float),
     }
-    obj = parser.parse(body_text, expected)
+    obj = parser.parse_superset(body_text, expected)["coerced"]
     # core fields
     prompt = obj.get("prompt")
     negative = obj.get("negative")
@@ -3725,7 +3741,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 "references": dict,
                 "reference_data": dict,
             }
-            parsed = parser.parse(a, expected)
+            parsed = parser.parse_superset(a, expected)["coerced"]
             # If nothing meaningful parsed, treat as synopsis/prompt
             if not any(str(parsed.get(k) or "").strip() for k in ("title","synopsis","prompt")):
                 out = {"synopsis": a}
@@ -4157,7 +4173,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             if r.status_code < 200 or r.status_code >= 300:
                 return {"name": name, "error": f"vision_repair_error_status_{r.status_code}"}
             parser = JSONParser()
-            js = parser.parse(r.text or "", {"faces": list, "hands": list, "objects": list, "quality": dict})
+            js = parser.parse_superset(r.text or "", {"faces": list, "hands": list, "objects": list, "quality": dict})["coerced"]
             return {"name": name, "result": js}
         except Exception as ex:
             _tb = traceback.format_exc()
@@ -4183,7 +4199,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             if r.status_code < 200 or r.status_code >= 300:
                 return {"name": name, "error": f"vision_repair_error_status_{r.status_code}"}
             parser = JSONParser()
-            js = parser.parse(r.text or "", {"repaired_image_path": str, "regions": list, "mode": (str,)})
+            js = parser.parse_superset(r.text or "", {"repaired_image_path": str, "regions": list, "mode": (str,)})["coerced"]
             return {"name": name, "result": js}
         except Exception as ex:
             _tb = traceback.format_exc()
@@ -5747,7 +5763,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         async with httpx.AsyncClient() as client:
             r = await client.post(OCR_API_URL.rstrip("/") + "/ocr", json={"b64": b64, "ext": ext})
             parser = JSONParser()
-            js = parser.parse(r.text or "", {"text": str})
+            js = parser.parse_superset(r.text or "", {"text": str})["coerced"]
             text_val = js.get("text") or "" if isinstance(js, dict) else ""
             return {"name": name, "result": {"text": text_val, "ext": ext}}
     if name == "vlm.analyze" and ALLOW_TOOL_EXECUTION:
@@ -5790,7 +5806,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         async with httpx.AsyncClient() as client:
             r = await client.post(VLM_API_URL.rstrip("/") + "/analyze", json={"b64": b64, "ext": ext})
             parser = JSONParser()
-            js = parser.parse(r.text or "", {})
+            # VLM returns a free-form JSON object; keep it as a generic mapping.
+            js = parser.parse_superset(r.text or "", dict)["coerced"]
             return {"name": name, "result": js if isinstance(js, dict) else {}}
     if name == "music.infinite.windowed" and ALLOW_TOOL_EXECUTION:
         if not MUSIC_API_URL:
@@ -5831,7 +5848,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                             }
                         }
                     parser = JSONParser()
-                    js = parser.parse(r.text or "", {"audio_wav_base64": str, "wav_b64": str})
+                    js = parser.parse_superset(r.text or "", {"audio_wav_base64": str, "wav_b64": str})["coerced"]
                     if not isinstance(js, dict):
                         return {
                             "error": {
@@ -6008,7 +6025,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                             }
                         }
                     parser = JSONParser()
-                    js = parser.parse(r.text or "", {"audio_wav_base64": str, "wav_b64": str})
+                    js = parser.parse_superset(r.text or "", {"audio_wav_base64": str, "wav_b64": str})["coerced"]
                     if not isinstance(js, dict):
                         return {
                             "error": {
@@ -6210,7 +6227,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 with _hxsync.Client(timeout=None, trust_env=False) as client:
                     r = client.post(MUSIC_API_URL.rstrip("/") + "/generate", json=body)
                     parser = JSONParser()
-                    js = parser.parse(r.text or "", {"audio_wav_base64": str, "wav_b64": str})
+                    js = parser.parse_superset(r.text or "", {"audio_wav_base64": str, "wav_b64": str})["coerced"]
                     b64 = js.get("audio_wav_base64") or js.get("wav_b64") if isinstance(js, dict) else None
                     wav = _b64.b64decode(b64) if isinstance(b64, str) else b""
                     return {"wav_bytes": wav, "model": f"musicgen:{os.getenv('MUSIC_MODEL_ID','')}"}
@@ -6706,7 +6723,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             }
             r = await client.post(MUSIC_API_URL.rstrip("/") + "/generate", json=payload)
             parser = JSONParser()
-            js = parser.parse(r.text or "", {})
+            js = parser.parse_superset(r.text or "", dict)["coerced"]
             return {"name": name, "result": js if isinstance(js, dict) else {}}
     if name == "music.timed.sao" and ALLOW_TOOL_EXECUTION:
         if not SAO_API_URL:
@@ -6722,7 +6739,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             }
             r = await client.post(SAO_API_URL.rstrip("/") + "/v1/music/timed", json=payload)
             parser = JSONParser()
-            js = parser.parse(r.text or "", {})
+            js = parser.parse_superset(r.text or "", dict)["coerced"]
             return {"name": name, "result": js if isinstance(js, dict) else {}}
     if name == "audio.stems.demucs" and ALLOW_TOOL_EXECUTION:
         if not DEMUCS_API_URL:
@@ -6732,7 +6749,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 payload = {"mix_wav": args.get("mix_wav") or args.get("src"), "stems": args.get("stems") or ["vocals","drums","bass","other"]}
                 r = await client.post(DEMUCS_API_URL.rstrip("/") + "/v1/audio/stems", json=payload)
                 parser = JSONParser()
-                js = parser.parse(r.text or "", {})
+                js = parser.parse_superset(r.text or "", dict)["coerced"]
                 # Persist stems if present
                 stems_obj = js.get("stems") if isinstance(js, dict) else None
                 if isinstance(stems_obj, dict):
@@ -6917,7 +6934,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
                         r_rvc = await client.post(RVC_API_URL.rstrip("/") + "/v1/audio/convert", json=payload_rvc)
                     parser = JSONParser()
-                    js_rvc = parser.parse(r_rvc.text or "", {"ok": bool, "audio_wav_base64": str, "sample_rate": int})
+                    js_rvc = parser.parse_superset(r_rvc.text or "", {"ok": bool, "audio_wav_base64": str, "sample_rate": int})["coerced"]
                     if not isinstance(js_rvc, dict) or not bool(js_rvc.get("ok")):
                         return {
                             "name": name,
@@ -6971,7 +6988,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
                     r_vf = await client.post(VOCAL_FIXER_API_URL.rstrip("/") + "/v1/vocal/fix", json=payload_vf)
                 parser = JSONParser()
-                js_vf = parser.parse(
+                js_vf = parser.parse_superset(
                     r_vf.text or "",
                     {
                         "ok": bool,
@@ -7114,7 +7131,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
             r = await client.post(RVC_API_URL.rstrip("/") + "/v1/audio/convert", json=payload)
         parser = JSONParser()
-        js = parser.parse(r.text or "", {"ok": bool, "audio_wav_base64": str, "sample_rate": int})
+        js = parser.parse_superset(r.text or "", {"ok": bool, "audio_wav_base64": str, "sample_rate": int})["coerced"]
         if not isinstance(js, dict) or not bool(js.get("ok")):
             return {
                 "name": name,
@@ -7139,7 +7156,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             }
             r = await client.post(DIFFSINGER_RVC_API_URL.rstrip("/") + "/v1/voice/sing", json=payload)
             parser = JSONParser()
-            js = parser.parse(r.text or "", {})
+            js = parser.parse_superset(r.text or "", dict)["coerced"]
             return {"name": name, "result": js if isinstance(js, dict) else {}}
     if name == "refs.music.build_profile" and ALLOW_TOOL_EXECUTION:
         try:
@@ -7267,7 +7284,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                                 MFA_API_URL.rstrip("/") + "/align",
                                 json={"lyrics": section_text, "wav_bytes": wav_b64},
                             )
-                        js = JSONParser().parse(r.text, {"alignment": list}) or {}
+                        js = JSONParser().parse_superset(r.text, {"alignment": list})["coerced"] or {}
                         raw_words = js.get("alignment")
                         if isinstance(raw_words, list):
                             for w in raw_words:
@@ -7287,7 +7304,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                             MFA_API_URL.rstrip("/") + "/align",
                             json={"lyrics": section_text, "wav_bytes": full_b64},
                         )
-                    js = JSONParser().parse(r.text, {"alignment": list}) or {}
+                    js = JSONParser().parse_superset(r.text, {"alignment": list})["coerced"] or {}
                     raw_words = js.get("alignment")
                     if isinstance(raw_words, list):
                         for w in raw_words:
@@ -7528,7 +7545,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             }
             r = await client.post(HUNYUAN_FOLEY_API_URL.rstrip("/") + "/v1/audio/foley", json=payload)
             parser = JSONParser()
-            js = parser.parse(r.text or "", {})
+            js = parser.parse_superset(r.text or "", dict)["coerced"]
             return {"name": name, "result": js if isinstance(js, dict) else {}}
     if name in ("image.edit", "image.upscale") and ALLOW_TOOL_EXECUTION:
         return {"name": name, "error": "disabled: use image.dispatch with full graph (no fallbacks)"}
@@ -7697,7 +7714,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
                 r = await client.post(base + "/research/run", json=args)
                 parser = JSONParser()
-                js = parser.parse(r.text or "", {})
+                js = parser.parse_superset(r.text or "", dict)["coerced"]
                 return {"name": name, "result": js if isinstance(js, dict) else {}}
     if name == "code.super_loop" and ALLOW_TOOL_EXECUTION:
         # Back code.super_loop with the central committee AI path only.
@@ -7784,7 +7801,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 payload["headers"] = args.get("headers")
             r = await client.post(base + "/web/smart_get", json=payload)
             parser = JSONParser()
-            js = parser.parse(r.text or "", {})
+            js = parser.parse_superset(r.text or "", dict)["coerced"]
             return {"name": name, "result": js if isinstance(js, dict) else {}}
     if name == "source_fetch" and ALLOW_TOOL_EXECUTION:
         url = args.get("url") or ""
@@ -8199,7 +8216,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                         emb = None
                         if er.status_code == 200:
                             parser = JSONParser()
-                            ej = parser.parse(er.text or "", {"embedding": list, "vec": list})
+                            ej = parser.parse_superset(er.text or "", {"embedding": list, "vec": list})["coerced"]
                             if isinstance(ej, dict):
                                 emb = ej.get("embedding") or ej.get("vec")
                     # 3) Per-frame InstantID apply with low denoise
@@ -8225,14 +8242,17 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                                     pr = _c2.post(COMFYUI_API_URL.rstrip("/") + "/prompt", json={"prompt": g, "client_id": "wrapper-001"})
                                     if pr.status_code == 200:
                                         parser = JSONParser()
-                                        pj = parser.parse(pr.text or "", {"prompt_id": str, "uuid": str, "id": str})
+                                        pj = parser.parse_superset(pr.text or "", {"prompt_id": str, "uuid": str, "id": str})["coerced"]
                                         pid = (pj.get("prompt_id") or pj.get("uuid") or pj.get("id")) if isinstance(pj, dict) else None
                                         # poll for completion
                                         while True:
                                             hr = _c2.get(COMFYUI_API_URL.rstrip("/") + f"/history/{pid}")
                                             if hr.status_code == 200:
                                                 parser = JSONParser()
-                                                hj = parser.parse(hr.text or "", {})
+                                                # History responses may be either {"history": {...}} or a direct
+                                                # {prompt_id: {...}} mapping; treat the full body as a generic
+                                                # mapping and preserve all keys.
+                                                hj = parser.parse_superset(hr.text or "{}", dict)["coerced"]
                                                 hist = hj.get("history") if isinstance(hj, dict) else {}
                                                 if not isinstance(hist, dict):
                                                     hist = hj if isinstance(hj, dict) else {}
@@ -8407,7 +8427,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                         emb = None
                         if er.status_code == 200:
                             parser = JSONParser()
-                            ej = parser.parse(er.text or "", {"embedding": list, "vec": list})
+                            ej = parser.parse_superset(er.text or "", {"embedding": list, "vec": list})["coerced"]
                             if isinstance(ej, dict):
                                 emb = ej.get("embedding") or ej.get("vec")
                     if emb and isinstance(emb, list):
@@ -8430,13 +8450,13 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                                     pr = _c2.post(COMFYUI_API_URL.rstrip("/") + "/prompt", json={"prompt": g, "client_id": "wrapper-001"})
                                     if pr.status_code == 200:
                                         parser = JSONParser()
-                                        pj = parser.parse(pr.text or "", {"prompt_id": str, "uuid": str, "id": str})
+                                        pj = parser.parse_superset(pr.text or "", {"prompt_id": str, "uuid": str, "id": str})["coerced"]
                                         pid = (pj.get("prompt_id") or pj.get("uuid") or pj.get("id")) if isinstance(pj, dict) else None
                                         while True:
                                             hr = _c2.get(COMFYUI_API_URL.rstrip("/") + f"/history/{pid}")
                                             if hr.status_code == 200:
                                                 parser = JSONParser()
-                                                hj = parser.parse(hr.text or "", {"history": dict})
+                                                hj = parser.parse_superset(hr.text or "", {"history": dict})["coerced"]
                                                 h = (hj.get("history") or {}).get(pid) if isinstance(hj, dict) else None
                                                 if h and _comfy_is_completed(h):
                                                     outs = (h.get("outputs") or {})
@@ -8547,7 +8567,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             async with httpx.AsyncClient() as client:
                 r = await client.post(HUNYUAN_VIDEO_API_URL.rstrip("/") + "/v1/video/hv/t2v", json=payload)
             parser = JSONParser()
-            js = parser.parse(r.text or "", {})
+            # Treat Hunyuan video responses as free-form mapping; callers inspect fields as needed.
+            js = parser.parse_superset(r.text or "{}", dict)["coerced"]
             return {"name": name, "result": js if isinstance(js, dict) else {}}
         except Exception as ex:
             return {"name": name, "error": str(ex)}
@@ -8571,7 +8592,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             async with httpx.AsyncClient() as client:
                 r = await client.post(HUNYUAN_VIDEO_API_URL.rstrip("/") + "/v1/video/hv/i2v", json=payload)
             parser = JSONParser()
-            js = parser.parse(r.text or "", {})
+            js = parser.parse_superset(r.text or "{}", dict)["coerced"]
             return {"name": name, "result": js if isinstance(js, dict) else {}}
         except Exception as ex:
             return {"name": name, "error": str(ex)}
@@ -8658,7 +8679,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             r = await client.post(XTTS_API_URL.rstrip("/") + "/tts", json=payload)
             status = r.status_code
             parser = JSONParser()
-            js = parser.parse(r.text or "", {})
+            js = parser.parse_superset(r.text or "", {})["coerced"]
             if 200 <= status < 300:
                 return {"name": name, "result": js if isinstance(js, dict) else {}}
             # Non-2xx: surface a structured error rather than raising
@@ -8674,7 +8695,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
             r = await client.post(WHISPER_API_URL.rstrip("/") + "/transcribe", json={"audio_url": args.get("audio_url"), "language": args.get("language")})
             parser = JSONParser()
-            js = parser.parse(r.text or "", {})
+            js = parser.parse_superset(r.text or "", {})["coerced"]
             if 200 <= r.status_code < 300:
                 return {"name": name, "result": js if isinstance(js, dict) else {}}
             return {"name": name, "error": r.text}
@@ -8687,7 +8708,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             wf_payload = {**(wf_payload or {}), "client_id": "wrapper-001"}
             r = await client.post(COMFYUI_API_URL.rstrip("/") + "/prompt", json=wf_payload)
             parser = JSONParser()
-            js = parser.parse(r.text or "", {})
+            js = parser.parse_superset(r.text or "", {})["coerced"]
             if 200 <= r.status_code < 300:
                 return {"name": name, "result": js if isinstance(js, dict) else {}}
             return {"name": name, "error": r.text}
@@ -8699,7 +8720,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             wf_payload = {**(wf_payload or {}), "client_id": "wrapper-001"}
             r = await client.post(COMFYUI_API_URL.rstrip("/") + "/prompt", json=wf_payload)
             parser = JSONParser()
-            js = parser.parse(r.text or "", {})
+            js = parser.parse_superset(r.text or "", {})["coerced"]
             if 200 <= r.status_code < 300:
                 return {"name": name, "result": js if isinstance(js, dict) else {}}
             return {"name": name, "error": r.text}
@@ -8711,7 +8732,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             wf_payload = {**(wf_payload or {}), "client_id": "wrapper-001"}
             r = await client.post(COMFYUI_API_URL.rstrip("/") + "/prompt", json=wf_payload)
             parser = JSONParser()
-            js = parser.parse(r.text or "", {})
+            js = parser.parse_superset(r.text or "", {})["coerced"]
             if 200 <= r.status_code < 300:
                 return {"name": name, "result": js if isinstance(js, dict) else {}}
             return {"name": name, "error": r.text}
@@ -8719,7 +8740,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
             r = await client.post(FACEID_API_URL.rstrip("/") + "/embed", json={"image_url": args.get("image_url")})
             parser = JSONParser()
-            js = parser.parse(r.text or "", {})
+            js = parser.parse_superset(r.text or "", {})["coerced"]
             if 200 <= r.status_code < 300:
                 return {"name": name, "result": js if isinstance(js, dict) else {}}
             return {"name": name, "error": r.text}
@@ -8727,7 +8748,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
             r = await client.post(MUSIC_API_URL.rstrip("/") + "/generate", json=args)
             parser = JSONParser()
-            js = parser.parse(r.text or "", {})
+            js = parser.parse_superset(r.text or "", {})["coerced"]
             if 200 <= r.status_code < 300:
                 return {"name": name, "result": js if isinstance(js, dict) else {}}
             return {"name": name, "error": r.text}
@@ -8735,7 +8756,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
             r = await client.post(VLM_API_URL.rstrip("/") + "/analyze", json={"image_url": args.get("image_url"), "prompt": args.get("prompt")})
             parser = JSONParser()
-            js = parser.parse(r.text or "", {})
+            js = parser.parse_superset(r.text or "", {})["coerced"]
             if 200 <= r.status_code < 300:
                 return {"name": name, "result": js if isinstance(js, dict) else {}}
             return {"name": name, "error": r.text}
@@ -8744,7 +8765,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
             r = await client.post(EXECUTOR_BASE_URL.rstrip("/") + "/run_python", json={"code": args.get("code", "")})
             parser = JSONParser()
-            js = parser.parse(r.text or "", {})
+            js = parser.parse_superset(r.text or "", {})["coerced"]
             if 200 <= r.status_code < 300:
                 return {"name": name, "result": js if isinstance(js, dict) else {}}
             return {"name": name, "error": r.text}
@@ -8759,7 +8780,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
             r = await client.post(EXECUTOR_BASE_URL.rstrip("/") + "/write_file", json={"path": args.get("path"), "content": content_val})
             parser = JSONParser()
-            js = parser.parse(r.text or "", {})
+            js = parser.parse_superset(r.text or "", {})["coerced"]
             if 200 <= r.status_code < 300:
                 return {"name": name, "result": js if isinstance(js, dict) else {}}
             return {"name": name, "error": r.text}
@@ -8767,7 +8788,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
             r = await client.post(EXECUTOR_BASE_URL.rstrip("/") + "/read_file", json={"path": args.get("path")})
             parser = JSONParser()
-            js = parser.parse(r.text or "", {})
+            js = parser.parse_superset(r.text or "", {})["coerced"]
             if 200 <= r.status_code < 300:
                 return {"name": name, "result": js if isinstance(js, dict) else {}}
             return {"name": name, "error": r.text}
@@ -8814,7 +8835,8 @@ async def execute_tools(tool_calls: List[Dict[str, Any]], trace_id: str | None =
     async with _hx.AsyncClient(timeout=None) as client:
         r = await client.post(EXECUTOR_BASE_URL.rstrip("/") + "/execute", json=payload)
         parser = JSONParser()
-        env = parser.parse(r.text or "", {})
+        env_schema = {"schema_version": int, "request_id": str, "ok": bool, "result": dict, "error": dict}
+        env = parser.parse_superset(r.text or "{}", env_schema)["coerced"]
     results: List[Dict[str, Any]] = []
     if isinstance(env, dict) and env.get("ok") and isinstance((env.get("result") or {}).get("produced"), dict):
         for sid, step in (env.get("result") or {}).get("produced", {}).items():
@@ -9212,8 +9234,9 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                     else:
                         args_obj = {}
                 else:
-                    # Best-effort direct parse for tools without a registered schema.
-                    args_obj = parser.parse(raw_text or "", {})
+                    # Best-effort direct parse for tools without a registered schema:
+                    # treat arguments as an untyped mapping.
+                    args_obj = parser.parse_superset(raw_text or "{}", dict)["coerced"]
             if not isinstance(args_obj, dict):
                 args_obj = {}  # ensure downstream sees an object
             normalized_calls.append({**tc, "arguments": args_obj})
@@ -10461,7 +10484,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                     res_field = tr.get("result")
                     if isinstance(res_field, str):
                         try:
-                            res_field = JSONParser().parse(res_field, {"film_id": str, "job_id": str, "prompt_id": str, "created": [ {"result": dict, "job_id": str, "prompt_id": str} ]})
+                            res_field = JSONParser().parse_superset(res_field, {"film_id": str, "job_id": str, "prompt_id": str, "created": [ {"result": dict, "job_id": str, "prompt_id": str} ]})["coerced"]
                         except Exception:
                             res_field = {}
                     if not isinstance(res_field, dict):
@@ -10870,7 +10893,8 @@ async def http_tool_run(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         r = await client.post(base + "/tool.run", json={"name": name, "args": args})
         raw_body = r.text or ""
         parser = JSONParser()
-        env = parser.parse(raw_body or "", {})
+        env_schema = {"schema_version": int, "request_id": str, "ok": bool, "result": dict, "error": dict}
+        env = parser.parse_superset(raw_body or "{}", env_schema)["coerced"]
         # Canonical consumer: interpret ok/error from envelope; propagate full error object.
         if isinstance(env, dict) and env.get("ok") and isinstance(env.get("result"), dict):
             return {"name": name, "result": env["result"]}
@@ -11445,7 +11469,7 @@ async def logs_trace_tail(id: str, kind: str = "responses", limit: int = 200):
 async def v1_icw_pack(body: Dict[str, Any]):
     expected = {"job_id": str, "modality": str, "window_idx": int}
     parser = JSONParser()
-    payload = parser.parse(json.dumps(body or {}), expected)
+    payload = parser.parse_superset(json.dumps(body or {}), expected)["coerced"]
     job_id = (payload.get("job_id") or "").strip()
     modality = (payload.get("modality") or "").strip().lower()
     if not job_id or modality not in ("text","image","audio","music","video"):
@@ -11480,7 +11504,7 @@ async def v1_icw_pack(body: Dict[str, Any]):
 async def v1_icw_advance(body: Dict[str, Any]):
     expected = {"job_id": str, "window_capsule": dict}
     parser = JSONParser()
-    payload = parser.parse(json.dumps(body or {}), expected)
+    payload = parser.parse_superset(json.dumps(body or {}), expected)["coerced"]
     job_id = (payload.get("job_id") or "").strip()
     cap = payload.get("window_capsule") or {}
     if not job_id or not isinstance(cap, dict):
@@ -11516,7 +11540,7 @@ async def v1_state_project(job_id: str):
 async def v1_review_score(body: Dict[str, Any]):
     expected = {"kind": str, "path": str, "prompt": str}
     parser = JSONParser()
-    payload = parser.parse(json.dumps(body or {}), expected)
+    payload = parser.parse_superset(json.dumps(body or {}), expected)["coerced"]
     kind = (payload.get("kind") or "").strip().lower()
     path = payload.get("path") or ""
     prompt = (payload.get("prompt") or "").strip()
@@ -11543,7 +11567,7 @@ async def v1_review_score(body: Dict[str, Any]):
 @app.post("/v1/review/plan")
 async def v1_review_plan(body: Dict[str, Any]):
     parser = JSONParser()
-    payload = parser.parse(json.dumps(body or {}), {"scores": dict})
+    payload = parser.parse_superset(json.dumps(body or {}), {"scores": dict})["coerced"]
     plan = _build_delta_plan(payload.get("scores") or {})
     return {"ok": True, "plan": plan}
 
@@ -11551,7 +11575,7 @@ async def v1_review_plan(body: Dict[str, Any]):
 async def v1_review_loop(body: Dict[str, Any]):
     expected = {"artifacts": list, "prompt": str}
     parser = JSONParser()
-    payload = parser.parse(json.dumps(body or {}), expected)
+    payload = parser.parse_superset(json.dumps(body or {}), expected)["coerced"]
     arts = payload.get("artifacts") or []
     prompt = (payload.get("prompt") or "").strip()
     loop_idx = 0
@@ -11642,7 +11666,7 @@ async def v1_video_generate(body: Dict[str, Any]):
         )
     expected = {"prompt": str, "refs": dict, "locks": dict, "duration_s": int, "fps": int, "size": list, "seed": int, "icw": dict}
     parser = JSONParser()
-    payload = parser.parse(json.dumps(body or {}), expected)
+    payload = parser.parse_superset(json.dumps(body or {}), expected)["coerced"]
     prompt = (payload.get("prompt") or "").strip()
     if not prompt:
         return ToolEnvelope.failure(
@@ -11694,7 +11718,7 @@ async def v1_video_edit(body: Dict[str, Any]):
         )
     expected = {"image_url": str, "instruction": str, "locks": dict, "fps": int, "size": list, "seconds": int, "seed": int}
     parser = JSONParser()
-    payload = parser.parse(json.dumps(body or {}), expected)
+    payload = parser.parse_superset(json.dumps(body or {}), expected)["coerced"]
     init_image = payload.get("image_url")
     if not init_image:
         return ToolEnvelope.failure(
@@ -11743,7 +11767,7 @@ async def v1_audio_lyrics_to_song(body: Dict[str, Any]):
     rid = _uuid.uuid4().hex
     expected = {"lyrics": str, "style_prompt": str, "ref_audio_ids": list, "lock_ids": list, "duration_s": int, "seed": int, "bpm": int, "key": str}
     parser = JSONParser()
-    payload = parser.parse(json.dumps(body or {}), expected)
+    payload = parser.parse_superset(json.dumps(body or {}), expected)["coerced"]
     lyrics = (payload.get("lyrics") or "").strip()
     style = (payload.get("style_prompt") or "").strip()
     duration_s = int(payload.get("duration_s") or 30)
@@ -11771,7 +11795,7 @@ async def v1_audio_edit(body: Dict[str, Any]):
     rid = _uuid.uuid4().hex
     expected = {"audio_url": str, "ops": list}
     parser = JSONParser()
-    payload = parser.parse(json.dumps(body or {}), expected)
+    payload = parser.parse_superset(json.dumps(body or {}), expected)["coerced"]
     audio_url = payload.get("audio_url")
     ops = payload.get("ops") or []
     if not audio_url:
@@ -11798,7 +11822,7 @@ async def v1_audio_tts_sing(body: Dict[str, Any]):
     rid = _uuid.uuid4().hex
     expected = {"script": list, "style_lock_id": str, "structure": dict}
     parser = JSONParser()
-    payload = parser.parse(json.dumps(body or {}), expected)
+    payload = parser.parse_superset(json.dumps(body or {}), expected)["coerced"]
     script = payload.get("script") or []
     if not isinstance(script, list) or not script:
         return ToolEnvelope.failure(
@@ -11833,7 +11857,7 @@ async def v1_audio_score_video(body: Dict[str, Any]):
     rid = _uuid.uuid4().hex
     expected = {"video_url": str, "markers": list, "style_prompt": str, "voice_lock_id": str, "accept_edits": bool}
     parser = JSONParser()
-    payload = parser.parse(json.dumps(body or {}), expected)
+    payload = parser.parse_superset(json.dumps(body or {}), expected)["coerced"]
     video_url = payload.get("video_url")
     markers = payload.get("markers") or []
     style_prompt = payload.get("style_prompt") or ""
@@ -11870,7 +11894,7 @@ async def v1_locks_create(body: Dict[str, Any]):
     rid = _uuid.uuid4().hex
     expected = {"type": str, "refs": list, "tags": list}
     parser = JSONParser()
-    payload = parser.parse(json.dumps(body or {}), expected)
+    payload = parser.parse_superset(json.dumps(body or {}), expected)["coerced"]
     lk_type = (payload.get("type") or "").strip().lower()
     refs = payload.get("refs") or []
     tags = payload.get("tags") or []
@@ -11897,7 +11921,7 @@ async def v1_locks_create(body: Dict[str, Any]):
 async def v1_audio_lyrics_to_song(body: Dict[str, Any]):
     expected = {"lyrics": str, "style_prompt": str, "ref_audio_ids": list, "lock_ids": list, "duration_s": int, "seed": int, "bpm": int, "key": str}
     parser = JSONParser()
-    payload = parser.parse(json.dumps(body or {}), expected)
+    payload = parser.parse_superset(json.dumps(body or {}), expected)["coerced"]
     lyrics = (payload.get("lyrics") or "").strip()
     style = (payload.get("style_prompt") or "").strip()
     duration_s = int(payload.get("duration_s") or 30)
@@ -11917,7 +11941,7 @@ async def v1_tts(body: Dict[str, Any]):
     rid = _uuid.uuid4().hex
     expected = {"text": str, "voice_ref_url": str, "voice_id": str, "lang": str, "prosody": dict, "seed": int}
     parser = JSONParser()
-    payload = parser.parse(json.dumps(body or {}), expected)
+    payload = parser.parse_superset(json.dumps(body or {}), expected)["coerced"]
     text = (payload.get("text") or "").strip()
     if not text:
         return ToolEnvelope.failure(
@@ -11935,7 +11959,7 @@ async def v1_audio_sfx(body: Dict[str, Any]):
     rid = _uuid.uuid4().hex
     expected = {"type": str, "length_s": float, "pitch": float, "seed": int}
     parser = JSONParser()
-    payload = parser.parse(json.dumps(body or {}), expected)
+    payload = parser.parse_superset(json.dumps(body or {}), expected)["coerced"]
     args = {"type": payload.get("type"), "length_s": payload.get("length_s"), "pitch": payload.get("pitch"), "seed": payload.get("seed")}
     manifest = {"items": []}
     env = run_sfx_compose(args, manifest)
@@ -12139,7 +12163,7 @@ async def completions_legacy(body: Dict[str, Any]):
                                 yield "data: [DONE]\n\n"
                                 break
                             parser = JSONParser()
-                            obj = parser.parse(data_str, {"id": str, "model": str, "choices": [{"delta": {"content": str}, "message": {"content": str}}]})
+                            obj = parser.parse_superset(data_str, {"id": str, "model": str, "choices": [{"delta": {"content": str}, "message": {"content": str}}]})["coerced"]
                             # Extract assistant text (final-only chunk in our impl)
                             txt = ""
                             if isinstance(obj, dict):
@@ -12179,7 +12203,7 @@ async def completions_legacy(body: Dict[str, Any]):
         }
         return JSONResponse(content=out)
     parser = JSONParser()
-    obj = parser.parse(rr.text or "", {"choices": [{"message": {"content": str}}], "usage": dict, "created": int, "system_fingerprint": str, "model": str, "id": str})
+    obj = parser.parse_superset(rr.text or "", {"choices": [{"message": {"content": str}}], "usage": dict, "created": int, "system_fingerprint": str, "model": str, "id": str})["coerced"]
     content_txt = (((obj.get("choices") or [{}])[0].get("message") or {}).get("content") or obj.get("text") or "")
     out = {
         "id": obj.get("id") or "orc-1",
@@ -12219,7 +12243,7 @@ async def ws_tool(websocket: WebSocket):
     try:
         while True:
             raw = await websocket.receive_text()
-            req = JSONParser().parse(raw, {"name": str, "arguments": dict})
+            req = JSONParser().parse_superset(raw, {"name": str, "arguments": dict})["coerced"]
             name = (req.get("name") or "").strip()
             args = req.get("arguments") or {}
             if not name:
@@ -12361,7 +12385,7 @@ async def _comfy_submit_workflow(workflow: Dict[str, Any]) -> Dict[str, Any]:
                         r = await client.post(base.rstrip("/") + "/prompt", json=payload)
                     try:
                         parser = JSONParser()
-                        res = parser.parse(r.text or "", {"prompt_id": str, "uuid": str, "id": str})
+                        res = parser.parse_superset(r.text or "", {"prompt_id": str, "uuid": str, "id": str})["coerced"]
                         pid = res.get("prompt_id") or res.get("uuid") or res.get("id") if isinstance(res, dict) else None
                         if isinstance(pid, str):
                             _job_endpoint[pid] = base
@@ -12371,7 +12395,7 @@ async def _comfy_submit_workflow(workflow: Dict[str, Any]) -> Dict[str, Any]:
                                 # Drain until executed message for our pid
                                 while True:
                                     msg = await ws.recv()
-                                    jd = JSONParser().parse(msg, {"type": str, "data": dict}) if isinstance(msg, (str, bytes)) else {}
+                                    jd = JSONParser().parse_superset(msg, {"type": str, "data": dict})["coerced"] if isinstance(msg, (str, bytes)) else {}
                                     if isinstance(jd, dict) and jd.get("type") == "executed":
                                         d = jd.get("data") or {}
                                         if d.get("prompt_id") == pid:
@@ -12399,7 +12423,7 @@ async def _comfy_history(prompt_id: str) -> Dict[str, Any]:
     async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
         r = await client.get(base.rstrip("/") + f"/history/{prompt_id}")
         parser = JSONParser()
-        js = parser.parse(r.text or "", {})
+        js = parser.parse_superset(r.text or "", {})["coerced"]
         if 200 <= r.status_code < 300:
             return js if isinstance(js, dict) else {}
         return {"error": r.text}
@@ -12426,7 +12450,7 @@ async def get_film_preferences(film_id: str) -> Dict[str, Any]:
     if isinstance(meta, str):
         # Expect a preferences dict; coerce into mapping with open schema.
         parser = JSONParser()
-        parsed = parser.parse(meta, {"preferences": dict})
+        parsed = parser.parse_superset(meta, {"preferences": dict})["coerced"]
         return parsed if isinstance(parsed, dict) else {}
     return {}
 
@@ -12733,7 +12757,7 @@ async def stream_job(job_id: str, interval_ms: Optional[int] = None):
                 yield f"data: {snapshot}\n\n"
                 last_snapshot = snapshot
             # Parse current job status safely via JSONParser. Never use json.loads.
-            parsed = JSONParser().parse(snapshot or "", {"status": str})
+            parsed = JSONParser().parse_superset(snapshot or "", {"status": str})["coerced"]
             state = parsed.get("status") if isinstance(parsed, dict) else None
             if state in ("succeeded", "failed", "cancelled"):
                 yield "data: [DONE]\n\n"
@@ -12859,7 +12883,7 @@ async def _index_job_into_rag(job_id: str) -> None:
 def _extract_comfy_asset_urls(detail: Dict[str, Any] | str, base_override: Optional[str] = None) -> List[Dict[str, Any]]:
     if isinstance(detail, str):
         try:
-            detail = JSONParser().parse(detail, {"outputs": dict, "status": dict})
+            detail = JSONParser().parse_superset(detail, {"outputs": dict, "status": dict})["coerced"]
         except Exception:
             detail = {}
     outputs = (detail or {}).get("outputs", {}) or {}
@@ -12900,7 +12924,7 @@ async def _update_scene_from_job(job_id: str, detail: Dict[str, Any] | str, fail
         base = None
     if isinstance(detail, str):
         try:
-            detail = JSONParser().parse(detail, {"outputs": dict, "status": dict})
+            detail = JSONParser().parse_superset(detail, {"outputs": dict, "status": dict})["coerced"]
         except Exception:
             detail = {}
     assets = {"outputs": (detail or {}).get("outputs", {}), "status": (detail or {}).get("status"), "urls": _extract_comfy_asset_urls(detail, base)}
@@ -12958,7 +12982,7 @@ async def _update_scene_from_job(job_id: str, detail: Dict[str, Any] | str, fail
                                 rd = crow.get("reference_data")
                                 if isinstance(rd, str):
                                     parser = JSONParser()
-                                    rd_parsed = parser.parse(rd, {"locks": dict, "style": dict, "qa": dict})
+                                    rd_parsed = parser.parse_superset(rd, {"locks": dict, "style": dict, "qa": dict})["coerced"]
                                     rd = rd_parsed if isinstance(rd_parsed, dict) else {}
                                 if isinstance(rd, dict):
                                     v2 = rd.get("voice")
@@ -12985,13 +13009,13 @@ async def _update_scene_from_job(job_id: str, detail: Dict[str, Any] | str, fail
                     tr = await client.post(XTTS_API_URL.rstrip("/") + "/tts", json={"text": scene_text, "voice": voice, "language": language})
                     if tr.status_code == 200:
                         parser = JSONParser()
-                        scene_tts = parser.parse(tr.text or "", {"audio_wav_base64": str, "sample_rate": int, "language": str})
+                        scene_tts = parser.parse_superset(tr.text or "", {"audio_wav_base64": str, "sample_rate": int, "language": str})["coerced"]
             if MUSIC_API_URL and ALLOW_TOOL_EXECUTION and audio_enabled:
                 async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
                     mr = await client.post(MUSIC_API_URL.rstrip("/") + "/generate", json={"prompt": "cinematic background score", "duration": duration})
                     if mr.status_code == 200:
                         parser = JSONParser()
-                        scene_music = parser.parse(mr.text or "", {"audio_wav_base64": str, "duration": float})
+                        scene_music = parser.parse_superset(mr.text or "", {"audio_wav_base64": str, "duration": float})["coerced"]
             # simple SRT creation from scene_text if enabled
             if scene_text and subs_enabled:
                 srt = _text_to_simple_srt(scene_text, duration)
@@ -13072,7 +13096,7 @@ async def _maybe_compile_film(film_id: str) -> None:
             async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
                 r = await client.post(ASSEMBLER_API_URL.rstrip("/") + "/assemble", json=payload)
                 parser = JSONParser()
-                assembly_result = parser.parse(r.text or "", {})
+                assembly_result = parser.parse_superset(r.text or "", {})["coerced"]
         except Exception:
             assembly_result = {"error": True}
     elif N8N_WEBHOOK_URL and ENABLE_N8N:
@@ -13080,7 +13104,7 @@ async def _maybe_compile_film(film_id: str) -> None:
             async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
                 r = await client.post(N8N_WEBHOOK_URL, json=payload)
                 parser = JSONParser()
-                assembly_result = parser.parse(r.text or "", {})
+                assembly_result = parser.parse_superset(r.text or "", {})["coerced"]
         except Exception:
             assembly_result = {"error": True}
     # Always write a manifest to uploads for convenience

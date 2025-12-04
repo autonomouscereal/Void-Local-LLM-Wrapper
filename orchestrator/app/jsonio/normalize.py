@@ -4,22 +4,27 @@ import time
 from typing import Any, Dict
 from ..json_parser import JSONParser
 from .coerce import coerce_to_envelope
-from .limits import enforce_field_limits
+# High-level envelope shape for JSONParser to coerce into. This matches the
+# canonical sections used throughout the orchestrator and keeps the parser
+# schema-driven instead of treating everything as an untyped dict.
+EXPECTED_ENVELOPE_SHAPE: Dict[str, Any] = {
+    "meta": dict,
+    "reasoning": dict,
+    "evidence": list,
+    "message": dict,
+    "tool_calls": list,
+    "artifacts": list,
+    "telemetry": dict,
+}
 
 
 def normalize_envelope(obj: Dict[str, Any]) -> Dict[str, Any]:
     # Fill defaults for the envelope structure described by the user
-    expected = {
-        "meta": dict,
-        "reasoning": dict,
-        "evidence": list,
-        "message": dict,
-        "tool_calls": list,
-        "artifacts": list,
-        "telemetry": dict,
-    }
     parser = JSONParser()
-    base = parser.ensure_structure(obj if isinstance(obj, dict) else {}, expected)
+    base = parser.ensure_structure(
+        obj if isinstance(obj, dict) else {},
+        EXPECTED_ENVELOPE_SHAPE,
+    )
     meta = base.get("meta", {}) or {}
     meta.setdefault("schema_version", 1)
     meta.setdefault("model", "")
@@ -43,26 +48,13 @@ def normalize_envelope(obj: Dict[str, Any]) -> Dict[str, Any]:
     return base
 
 
-def to_envelope(raw_text: str, model_name: str, cid: str, step: int) -> Dict[str, Any]:
-    # Parse arbitrary text as JSON (using hardened parser), then ensure envelope defaults
-    parser = JSONParser()
-    try:
-        obj = parser.parse(raw_text or "{}", {})
-    except Exception:
-        obj = {}
-    env = normalize_envelope(obj)
-    env["meta"]["model"] = model_name or env["meta"].get("model")
-    env["meta"]["cid"] = cid or env["meta"].get("cid")
-    env["meta"]["step"] = int(step)
-    return env
-
-
 def _parse_json(text: str) -> Dict[str, Any]:
     parser = JSONParser()
-    try:
-        return parser.parse(text or "{}", {})
-    except Exception:
-        return {}
+    # Parse provider/tool output into the high-level envelope shape. Fields not
+    # represented in EXPECTED_ENVELOPE_SHAPE are ignored at this layer;
+    # downstream helpers (coerce_to_envelope, limits) operate on the coerced envelope.
+    return parser.parse_superset(text or "{}", EXPECTED_ENVELOPE_SHAPE)["coerced"]
+
 
 
 def normalize_to_envelope(raw_text: str) -> Dict[str, Any]:
@@ -72,7 +64,6 @@ def normalize_to_envelope(raw_text: str) -> Dict[str, Any]:
     """
     obj = _parse_json(raw_text)
     env = coerce_to_envelope(obj)
-    env = enforce_field_limits(env)
     return env
 
 

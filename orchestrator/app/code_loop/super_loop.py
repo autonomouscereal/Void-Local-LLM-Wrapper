@@ -13,7 +13,10 @@ from ..json_parser import JSONParser
 
 def _parse_json(text: str) -> dict:
     parser = JSONParser()
-    return parser.parse(text or "{}", {})
+    # Architect/implementer/reviewer JSON is loosely structured; coerce to mapping.
+    sup = parser.parse_superset(text or "{}", dict)
+    obj = sup["coerced"]
+    return obj if isinstance(obj, dict) else {}
 
 
 def run_super_loop(task: str, repo_root: str, model, step_tokens: int = 900) -> dict:

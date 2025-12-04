@@ -96,7 +96,7 @@ async def assemble(body: Dict[str, Any]):
                 try:
                     parser = JSONParser()
                     expected = {"urls": list, "outputs": dict, "status": dict}
-                    assets = parser.parse(assets, expected)
+                    assets = parser.parse_superset(assets, expected)["coerced"]
                 except Exception:
                     assets = {}
             urls = assets.get("urls") or []
@@ -127,7 +127,7 @@ async def assemble(body: Dict[str, Any]):
                 try:
                     parser = JSONParser()
                     expected = {"tts": dict, "music": dict, "urls": list}
-                    assets = parser.parse(assets, expected)
+                    assets = parser.parse_superset(assets, expected)["coerced"]
                 except Exception:
                     assets = {}
             tts = assets.get("tts") or {}
@@ -150,7 +150,7 @@ async def assemble(body: Dict[str, Any]):
                 try:
                     parser = JSONParser()
                     expected = {"subtitles_srt": str, "urls": list}
-                    assets = parser.parse(assets, expected)
+                    assets = parser.parse_superset(assets, expected)["coerced"]
                 except Exception:
                     assets = {}
             srt = assets.get("subtitles_srt")

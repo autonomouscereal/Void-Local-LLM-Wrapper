@@ -41,7 +41,8 @@ async def execute(tool_calls: List[Dict[str, Any]], trace_id: Optional[str], exe
 		# body is not valid JSON, or the shape drifts, we still want to surface
 		# the raw response text and HTTP status instead of collapsing to a
 		# generic executor_error.
-		env = parser.parse(raw_body or "{}", {"ok": bool, "result": dict, "error": dict})
+		schema = {"ok": bool, "result": dict, "error": dict}
+		env = parser.parse_superset(raw_body or "{}", schema)["coerced"]
 		if not isinstance(env, dict):
 			env = {
 				"ok": False,

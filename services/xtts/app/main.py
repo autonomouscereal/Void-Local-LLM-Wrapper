@@ -146,6 +146,24 @@ async def tts(body: Dict[str, Any]):
     # Logical voice identifier from upstream (voice_id preferred, voice as fallback).
     raw_voice_id = body.get("voice_id") or body.get("voice") or ""
     voice_id = raw_voice_id.strip() if isinstance(raw_voice_id, str) else ""
+    if not voice_id:
+        # Enforce explicit voice selection so upstream callers wire a concrete
+        # speaker profile; this avoids opaque RuntimeError messages like
+        # "Neither `speaker_wav` nor `speaker_id` was specified".
+        return JSONResponse(
+            status_code=200,
+            content={
+                "schema_version": 1,
+                "trace_id": trace_id,
+                "ok": False,
+                "result": None,
+                "error": {
+                    "code": "xtts_missing_voice",
+                    "message": "No voice_id/voice provided for XTTS request.",
+                    "stack": "".join(traceback.format_stack()),
+                },
+            },
+        )
     if not text:
         # Always return a canonical envelope; do not rely on HTTP status codes or
         # raised exceptions for control flow. Include a synthetic stack trace so
@@ -183,9 +201,11 @@ async def tts(body: Dict[str, Any]):
             torch.manual_seed(seed)
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(seed)
-        # XTTS API supports language + (optionally) speaker selection; prosody controls
-        # like rate/pitch are handled upstream by locks and RVC.
-        wav = engine.tts(text=text, language=language)  # type: ignore[call-arg]
+        # XTTS API supports language + speaker selection; interpret the logical
+        # voice_id as a speaker_id so multi-voice setups can route to distinct
+        # embeddings or base voices. Any mismatch or missing speaker mapping
+        # will be surfaced via the structured error envelope below.
+        wav = engine.tts(text=text, speaker_id=voice_id, language=language)  # type: ignore[call-arg]
         wav_arr = np.array(wav, dtype=np.float32)
         buf = io.BytesIO()
         sample_rate = 22050

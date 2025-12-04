@@ -1,3 +1,0 @@
-{"prompt_hash":"sha256:demo","chosen":{"text":"hello","tool_seq":["web_search"]},"rejected":{"text":"","tool_seq":[]},"meta":{"mode":"general","seed":1337,"trace_ids":["tt_prev","tt_demo"]}}
-
-

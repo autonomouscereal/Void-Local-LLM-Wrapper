@@ -55,7 +55,8 @@ def ingest_file(path: str, vlm_url: str | None = None, whisper_url: str | None =
                 with httpx.Client() as client:
                     r = client.post(ocr_url.rstrip("/") + "/ocr", json={"b64": b64, "ext": ext})
                     parser = JSONParser()
-                    js = parser.parse(r.text or "", {"text": str})
+                    sup = parser.parse_superset(r.text or "", {"text": str})
+                    js = sup["coerced"]
                     txt = (js.get("text") or "").strip() if isinstance(js, dict) else ""
                     if txt:
                         texts.append(txt)
@@ -76,7 +77,8 @@ def ingest_file(path: str, vlm_url: str | None = None, whisper_url: str | None =
                 with httpx.Client() as client:
                     r = client.post(vlm_url.rstrip("/") + "/analyze", json={"b64": b64})
                     parser = JSONParser()
-                    js = parser.parse(r.text or "", {"caption": str, "text": str})
+                    sup = parser.parse_superset(r.text or "", {"caption": str, "text": str})
+                    js = sup["coerced"]
                     cap = (js.get("caption") or js.get("text") or "").strip() if isinstance(js, dict) else ""
                     if cap:
                         texts.append(f"[image] {os.path.basename(path)}\n{cap}")
@@ -90,7 +92,8 @@ def ingest_file(path: str, vlm_url: str | None = None, whisper_url: str | None =
                 with httpx.Client() as client:
                     r = client.post(ocr_url.rstrip("/") + "/ocr", json={"b64": b64, "ext": ext})
                     parser = JSONParser()
-                    js = parser.parse(r.text or "", {"text": str})
+                    sup = parser.parse_superset(r.text or "", {"text": str})
+                    js = sup["coerced"]
                     tx = (js.get("text") or "").strip() if isinstance(js, dict) else ""
                     if tx:
                         texts.append(f"[ocr] {tx}")
@@ -107,7 +110,8 @@ def ingest_file(path: str, vlm_url: str | None = None, whisper_url: str | None =
                 with httpx.Client() as client:
                     r = client.post(whisper_url.rstrip("/") + "/transcribe", json={"b64": b64})
                     parser = JSONParser()
-                    js = parser.parse(r.text or "", {"text": str, "transcript": str})
+                    sup = parser.parse_superset(r.text or "", {"text": str, "transcript": str})
+                    js = sup["coerced"]
                     tx = (js.get("text") or js.get("transcript") or "").strip() if isinstance(js, dict) else ""
                     if tx:
                         texts.append(f"[audio] {os.path.basename(path)}\n{tx}")

@@ -32,7 +32,8 @@ def _post_json(url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         raw = resp.read().decode("utf-8", errors="replace")
         # Strict parse with expected structure only (no std json.loads fallback)
         expected = {"produced": dict, "error": str, "detail": str, "traceback": str}
-        return JSONParser().parse(raw, expected)
+        sup = JSONParser().parse_superset(raw, expected)
+        return sup["coerced"]
 
 
 

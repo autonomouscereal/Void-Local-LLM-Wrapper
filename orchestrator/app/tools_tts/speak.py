@@ -171,7 +171,10 @@ def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
     from ..json_parser import JSONParser  # type: ignore
 
     parser = JSONParser()
-    js_rvc = parser.parse(r_rvc.text or "", {"ok": bool, "audio_wav_base64": str, "sample_rate": int})
+    js_rvc = parser.parse_superset(
+        r_rvc.text or "",
+        {"ok": bool, "audio_wav_base64": str, "sample_rate": int},
+    )["coerced"]
     if not isinstance(js_rvc, dict) or not bool(js_rvc.get("ok")):
         import traceback as _tb
         return {
@@ -221,7 +224,7 @@ def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
         try:
             from ..json_parser import JSONParser  # type: ignore
             parser = JSONParser()
-            js_vf = parser.parse(
+            js_vf = parser.parse_superset(
                 r_vf.text or "",
                 {
                     "ok": bool,
@@ -230,7 +233,7 @@ def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
                     "metrics_before": dict,
                     "metrics_after": dict,
                 },
-            )
+            )["coerced"]
         except Exception:
             js_vf = {}
         if not isinstance(js_vf, dict) or not bool(js_vf.get("ok")):

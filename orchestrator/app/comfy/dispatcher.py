@@ -19,7 +19,9 @@ WF_PATH    = os.getenv("COMFY_WORKFLOW_PATH", "/workspace/services/image/workflo
 
 def load_workflow() -> Dict[str, Any]:
     text = Path(WF_PATH).read_text(encoding="utf-8")
-    return JSONParser().parse(text, {"nodes": list})
+    schema = {"nodes": list}
+    sup = JSONParser().parse_superset(text, schema)
+    return sup["coerced"]
 
 
 def _patch_text_prompts(graph: Dict[str, Any], positive: Optional[str], negative: Optional[str]) -> None:
@@ -103,34 +105,43 @@ def patch_assets(graph: Dict[str, Any], assets: Dict[str, Any]) -> None:
 async def submit(graph: Dict[str, Any]) -> Dict[str, Any]:
     prompt_graph = graph.get("prompt") if isinstance(graph, dict) and ("prompt" in graph) else graph
     payload = {"prompt": prompt_graph, "client_id": "wrapper-001"}
-    async with httpx.AsyncClient() as client:
-        url = COMFY_BASE + "/prompt"
-        preview = json.dumps(payload, ensure_ascii=False)
-        print(f"[comfy.submit] POST {url} bytes={len(preview)}")
-        r = await client.post(url, json=payload)
-        r.raise_for_status()
-        j = JSONParser().parse(r.text, {"prompt_id": (str), "uuid": (str), "id": (str)})
+        async with httpx.AsyncClient() as client:
+            url = COMFY_BASE + "/prompt"
+            preview = json.dumps(payload, ensure_ascii=False)
+            print(f"[comfy.submit] POST {url} bytes={len(preview)}")
+            r = await client.post(url, json=payload)
+            r.raise_for_status()
+            schema = {"prompt_id": str, "uuid": str, "id": str}
+            sup = JSONParser().parse_superset(r.text, schema)
+            j = sup["coerced"]
         pid = j.get("prompt_id") or j.get("uuid") or j.get("id")
         if not isinstance(pid, str):
             return {"error": "missing prompt_id from comfy"}
     # WS wait
-    import websockets  # type: ignore
-    async with websockets.connect(COMFY_WS, ping_interval=None) as ws:
-        while True:
-            msg = await ws.recv()
-            d = JSONParser().parse(msg, {"type": (str), "data": dict}) if isinstance(msg, (str, bytes)) else {}
+        import websockets  # type: ignore
+        async with websockets.connect(COMFY_WS, ping_interval=None) as ws:
+            while True:
+                msg = await ws.recv()
+                if isinstance(msg, (str, bytes)):
+                    schema = {"type": str, "data": dict}
+                    sup = JSONParser().parse_superset(msg, schema)
+                    d = sup["coerced"]
+                else:
+                    d = {}
             if isinstance(d, dict) and d.get("type") == "executed" and (d.get("data") or {}).get("prompt_id") == pid:
                 break
     # History
-    async with httpx.AsyncClient() as client:
-        hurl = COMFY_BASE + f"/history/{pid}"
-        print(f"[comfy.history] GET {hurl}")
-        hr = await client.get(hurl)
-        if hr.status_code == 200:
-            parser = JSONParser()
-            hist = parser.parse(hr.text or "", {"history": dict})
-            return {"prompt_id": pid, "history": hist if isinstance(hist, dict) else {}}
-        return {"prompt_id": pid, "history_error": hr.text}
+        async with httpx.AsyncClient() as client:
+            hurl = COMFY_BASE + f"/history/{pid}"
+            print(f"[comfy.history] GET {hurl}")
+            hr = await client.get(hurl)
+            if hr.status_code == 200:
+                parser = JSONParser()
+                schema = {"history": dict}
+                sup = parser.parse_superset(hr.text or "", schema)
+                hist = sup["coerced"]
+                return {"prompt_id": pid, "history": hist if isinstance(hist, dict) else {}}
+            return {"prompt_id": pid, "history_error": hr.text}
 
 
 def patch_workflow(base_graph: Dict[str, Any], *, prompt: Optional[str] = None, negative: Optional[str] = None, seed: Optional[int] = None, width: Optional[int] = None, height: Optional[int] = None, assets: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:

@@ -34,11 +34,12 @@ def read_tail(path: str, n: int = 10) -> List[Dict[str, Any]]:
     parser = JSONParser()
     with open(path, "r", encoding="utf-8") as f:
         lines = f.readlines()[-max(1, int(n)) :]
+    schema = {"t": int, "step_id": str, "kind": str, "data": dict}
     for ln in lines:
         ln = ln.strip()
         if not ln:
             continue
-        obj = parser.parse(ln, {})
+        obj = parser.parse_superset(ln, schema)["coerced"]
         if isinstance(obj, dict):
             out.append(obj)
     return out
@@ -77,12 +78,13 @@ def read_all(root: str, key: str) -> List[Dict[str, Any]]:
         return []
     parser = JSONParser()
     out: List[Dict[str, Any]] = []
+    schema = {"t": int, "step_id": str, "kind": str, "data": dict}
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
             ln = line.strip()
             if not ln:
                 continue
-            obj = parser.parse(ln, {})
+            obj = parser.parse_superset(ln, schema)["coerced"]
             if isinstance(obj, dict):
                 out.append(obj)
     return out

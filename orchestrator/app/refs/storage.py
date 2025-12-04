@@ -49,7 +49,9 @@ def load_manifest(ref_id: str) -> dict | None:
         from ..json_parser import JSONParser
         with open(p, "r", encoding="utf-8") as f:
             parser = JSONParser()
-            data = parser.parse(f.read(), {})
+            # Manifests are stored as arbitrary dicts; coerce to generic mapping.
+            sup = parser.parse_superset(f.read(), dict)
+            data = sup["coerced"]
             return data if isinstance(data, dict) else None
     except FileNotFoundError:
         return None

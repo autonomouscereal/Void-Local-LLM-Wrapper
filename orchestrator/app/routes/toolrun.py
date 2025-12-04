@@ -90,7 +90,10 @@ async def _post_json(url: str, obj: dict) -> dict:
 	async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
 		resp = await client.post(url, json=obj)
 		parser = JSONParser()
-		data = parser.parse(resp.text or "{}", {})
+		# ComfyUI /prompt returns an object with at least prompt_id/client_id,
+		# but we treat the entire JSON body as a free-form mapping so callers
+		# can inspect any fields they care about.
+		data = parser.parse_superset(resp.text or "{}", dict)["coerced"]
 		if 200 <= resp.status_code < 300 and isinstance(data, dict):
 			return _ok_env(True, **data)
 		return _ok_env(False, code="http_error", status=resp.status_code, detail=data)
@@ -100,7 +103,9 @@ async def _get_json(url: str) -> dict:
 	async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
 		resp = await client.get(url, headers={"accept": "application/json"})
 		parser = JSONParser()
-		data = parser.parse(resp.text or "{}", {})
+		# ComfyUI /history/{id} returns a history object whose exact keys are
+		# workflow-dependent; keep the response as an untyped mapping.
+		data = parser.parse_superset(resp.text or "{}", dict)["coerced"]
 		if 200 <= resp.status_code < 300 and isinstance(data, dict):
 			return _ok_env(True, **data)
 		return _ok_env(False, code="http_error", status=resp.status_code, detail=data)
@@ -304,7 +309,10 @@ def _append_jsonl(path: str, obj: dict) -> None:
 async def tool_run(req: Request):
 	raw = await req.body()
 	parser = JSONParser()
-	body = parser.parse(raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw or ""), {"name": str, "args": dict, "trace_id": str, "cid": str})
+	body = parser.parse_superset(
+		raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw or ""),
+		{"name": str, "args": dict, "trace_id": str, "cid": str},
+	)["coerced"]
 	trace_val = None
 	if isinstance(body, dict):
 		if isinstance(body.get("trace_id"), str) and body.get("trace_id"):
@@ -371,7 +379,7 @@ async def tool_run(req: Request):
 			wf_text = _read_text(wf_path)
 			parser = JSONParser()
 			# Workflow graphs are open-ended; parse with open schema.
-			wf_obj = parser.parse(wf_text, {})
+			wf_obj = parser.parse_superset(wf_text, {})["coerced"]
 		else:
 			# Fallback: proceed without file; we'll synthesize a valid graph below
 			wf_obj = {}

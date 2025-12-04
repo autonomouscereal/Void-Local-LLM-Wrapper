@@ -555,7 +555,8 @@ async def committee_jsonify(
             idx,
             txt,
         )
-        obj = parser.parse(txt or "{}", expected_schema)
+        sup = parser.parse_superset(txt or "{}", expected_schema)
+        obj = sup["coerced"]
         log.info(
             "[committee.jsonify] parsed_candidate trace_id=%s index=%d obj=%s",
             trace_base,
@@ -605,7 +606,11 @@ async def committee_jsonify(
         if parsed_candidates:
             merged = parsed_candidates[0]
         else:
-            merged = parser.parse("{}", expected_schema) if isinstance(expected_schema, dict) else {}
+            if isinstance(expected_schema, dict):
+                sup_default = parser.parse_superset("{}", expected_schema)
+                merged = sup_default["coerced"]
+            else:
+                merged = {}
 
     emit_trace(
         STATE_DIR,

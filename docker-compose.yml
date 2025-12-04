@@ -375,8 +375,8 @@ services:
 
   orchestrator:
     build:
-      context: ./orchestrator
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: orchestrator/Dockerfile
       args:
         <<: *cu118_args
     container_name: void_orchestrator
@@ -881,8 +881,8 @@ services:
 
   chatui:
     build:
-      context: ./services/chatui
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: services/chatui/Dockerfile
     container_name: chatui
     restart: unless-stopped
     network_mode: host

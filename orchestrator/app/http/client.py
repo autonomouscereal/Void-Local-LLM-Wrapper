@@ -216,7 +216,7 @@ async def perform_http_request(config: HttpRequestConfig) -> Tuple[bool, Dict[st
             parser = JSONParser()
             try:
                 expected = {} if txt.lstrip().startswith("{") else []
-                parsed = parser.parse(txt, expected)
+                parsed = parser.parse_superset(txt, expected)["coerced"]
             except Exception as ex:
                 return False, {
                     "code": "remote_invalid_json",
@@ -252,7 +252,7 @@ async def perform_http_request(config: HttpRequestConfig) -> Tuple[bool, Dict[st
             parser = JSONParser()
             try:
                 expected = {} if txt.lstrip().startswith("{") else []
-                details["remote_body"] = parser.parse(txt, expected)
+                details["remote_body"] = parser.parse_superset(txt, expected)["coerced"]
             except Exception:
                 details["remote_body"] = txt
                 details["remote_body_truncated"] = len(txt) == BODY_PREVIEW_BYTES

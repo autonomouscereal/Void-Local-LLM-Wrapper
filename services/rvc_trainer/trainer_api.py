@@ -47,7 +47,7 @@ def get_speaker_encoder() -> Any:
     This runs only once per process.
     """
     global _SPKREC_MODEL
-    if not SPKREC_AVAILABLE:
+    
     if _SPKREC_MODEL is None:
         _SPKREC_MODEL = EncoderClassifier.from_hparams(
             source=SPKREC_MODEL_ID,
@@ -62,7 +62,6 @@ def compute_speaker_embedding(wav_path: str) -> np.ndarray:
     """
     encoder = get_speaker_encoder()
     waveform, sample_rate = torchaudio.load(wav_path)
-    if sample_rate <= 0:
     target_sr = 16000
     if sample_rate != target_sr:
         waveform = torchaudio.functional.resample(waveform, sample_rate, target_sr)
@@ -177,8 +176,6 @@ def setup_dataset(speaker_id: str, ref_paths: List[str]) -> str:
         # Store absolute path for train.list/val.list
         wav_abs_paths.append(os.path.abspath(target_path))
     
-    if not wav_abs_paths:
-    
     # Create train.list and val.list (80/20 split)
     train_paths = wav_abs_paths[:int(len(wav_abs_paths) * 0.8)]
     val_paths = wav_abs_paths[int(len(wav_abs_paths) * 0.8):]
@@ -217,8 +214,6 @@ def generate_training_config(dataset_root: str, model_name: str, train_steps: in
     Returns the path to the generated config.
     """
     base_config_path = os.path.join(RVC_WEBUI_ROOT, "configs", "48k", "config.json")
-    if not os.path.exists(base_config_path):
-    
     with open(base_config_path, "r", encoding="utf-8") as f:
         config = json.load(f)
     

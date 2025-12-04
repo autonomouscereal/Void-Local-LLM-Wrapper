@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
+import json
 import traceback
 
 from ..analysis.media import analyze_audio, _load_audio  # type: ignore
@@ -280,7 +281,10 @@ def _build_music_eval_summary(all_axes: Dict[str, Any], film_context: Optional[D
         "axes": all_axes,
         "film_context": film_context or {},
     }
-    return JSONParser().dumps(payload)
+    # This summary is consumed by LLM-based committee paths and must be valid
+    # JSON. Use the standard json module here instead of the JSONParser, which
+    # is focused on parsing/repair rather than serialization.
+    return json.dumps(payload, ensure_ascii=False)
 
 
 def _call_music_eval_committee(summary: str) -> Dict[str, Any]:

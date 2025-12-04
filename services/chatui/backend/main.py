@@ -120,7 +120,8 @@ def _decode_json(value: Any) -> Dict[str, Any]:
             try:
                 parser = JSONParser()
                 expected = {"text": str}
-                obj = parser.parse(txt, expected)
+                sup = parser.parse_superset(txt, expected)
+                obj = sup["coerced"]
                 # If the normalized parse still doesn't look like a dict, fall back to raw text
                 return obj if isinstance(obj, dict) and obj else {"text": value}
             except Exception:

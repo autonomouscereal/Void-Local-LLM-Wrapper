@@ -46,7 +46,7 @@ def _yt_dlp_info(url: str) -> Dict[str, Any]:
         except json.JSONDecodeError:
             pass
     p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if p.returncode != 0:
+    
     return json.loads(p.stdout)
 
 
@@ -63,7 +63,6 @@ def _http_get(url: str, max_bytes: int = 32 * 1024 * 1024, timeout: int | None =
             out = bytearray()
             for chunk in r.iter_bytes():
                 out.extend(chunk)
-                if len(out) > max_bytes:
             return bytes(out)
 
 

@@ -14,7 +14,8 @@ async def call_mcp_tool(bridge_url: str | None, name: str, arguments: Dict[str, 
             json={"name": name, "arguments": arguments or {}},
         )
         parser = JSONParser()
-        js = parser.parse(r.text or "", {})
+        sup = parser.parse_superset(r.text or "", {})
+        js = sup["coerced"]
         return js if isinstance(js, dict) else {"error": "invalid mcp bridge response"}
 
 

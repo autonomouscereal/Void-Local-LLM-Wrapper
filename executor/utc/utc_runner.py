@@ -25,7 +25,12 @@ def _post(url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     r = requests.post(url, json=payload, timeout=None)
     text = r.text or ""
     parser = JSONParser()
-    body = parser.parse(text, {})
+    # Executor → orchestrator calls are expected to return an envelope-like
+    # body with ok/result/error. Use a shallow schema so callers always see a
+    # dict with those keys, and attach the HTTP status out-of-band.
+    env_schema = {"ok": bool, "result": dict, "error": dict}
+    sup = parser.parse_superset(text or "{}", env_schema)
+    body = sup["coerced"]
     if isinstance(body, dict):
         body.setdefault("_http_status", r.status_code)
         return body
@@ -120,9 +125,28 @@ async def utc_run_tool(trace_id: Optional[str], step_id: Optional[str], name: st
             },
         }
 
-    # Ensure we always attach a trace_id to the response envelope
+    # Ensure we always attach a trace_id to the response envelope.
     if "trace_id" not in res or res.get("trace_id") is None:
         res["trace_id"] = trace_id
+
+    # Guard against envelopes that fail to include an explicit ok flag. These
+    # are treated as hard failures so executor logs always see a concrete code
+    # and message instead of (code=None, msg=None, detail=None).
+    if "ok" not in res:
+        status = int(res.get("status") or res.get("_http_status") or 422)
+        return {
+            "schema_version": 1,
+            "trace_id": trace_id,
+            "ok": False,
+            "result": None,
+            "error": {
+                "code": "tool_missing_ok",
+                "message": f"orchestrator /tool.run did not return an 'ok' field for tool {name}",
+                "status": status,
+                "raw": res,
+                "stack": _stack_str(),
+            },
+        }
 
     # If orchestrator indicates success (ok != False), pass envelope through.
     if res.get("ok") is not False:

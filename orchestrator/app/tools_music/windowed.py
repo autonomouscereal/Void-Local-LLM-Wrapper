@@ -12,7 +12,7 @@ from ..music.eval import compute_music_eval  # type: ignore
 from ..artifacts.manifest import add_manifest_row
 from ..context.index import add_artifact as _ctx_add
 from ..datasets.trace import append_sample as _trace_append
-from ..jsonio.normalize import normalize_to_envelope
+from ..jsonio.normalize import normalize_to_envelope, normalize_envelope
 from ..jsonio.versioning import bump_envelope, assert_envelope
 
 
@@ -1083,11 +1083,23 @@ def run_music_infinite_windowed(job: Dict[str, Any], provider, manifest: Dict[st
             "notes": [],
         },
     }
-    env = normalize_to_envelope(env)
+    # Normalize the already-constructed envelope dict without stringifying
+    # and reparsing it, to avoid JSONParser noise and accidental shape drift.
+    env = normalize_envelope(env)
     env = bump_envelope(env)
     assert_envelope(env)
     env = stamp_env(env, "music.infinite.windowed", env.get("meta", {}).get("model"))
-    env["wav_bytes"] = stitched_pcm
+    # Expose only JSON-serializable audio metadata; raw PCM is persisted on disk
+    # and referenced via artifacts/meta.
+    env.setdefault("audio", {})
+    if isinstance(env["audio"], dict):
+        env["audio"].update(
+            {
+                "bytes": int(len(stitched_pcm)),
+                "sample_rate": int(stitched_sr),
+                "channels": int(stitched_ch),
+            }
+        )
     return env
 
 

@@ -115,7 +115,7 @@ def _run_ocr(path: str) -> Dict[str, Any]:
         r = requests.post(OCR_API_URL.rstrip("/") + "/ocr", json={"b64": b64, "ext": ext})
         from ..json_parser import JSONParser  # local import to avoid cycles at module import time
         parser = JSONParser()
-        js = parser.parse(r.text or "{}", {"text": str})
+        js = parser.parse_superset(r.text or "{}", {"text": str})["coerced"]
         txt = (js.get("text") or "").strip() if isinstance(js, dict) else ""
         out["ocr_text"] = txt
         out["has_text"] = bool(txt)
@@ -147,7 +147,7 @@ def _run_yolo(path: str) -> Dict[str, Any]:
         )
         from ..json_parser import JSONParser  # local import to avoid cycles at module import time
         parser = JSONParser()
-        js = parser.parse(r.text or "{}", {"objects": list, "faces": list})
+        js = parser.parse_superset(r.text or "{}", {"objects": list, "faces": list})["coerced"]
         objects = js.get("objects") or [] if isinstance(js, dict) else []
         yolo_list: List[Dict[str, Any]] = []
         entity_tags: List[str] = []
@@ -253,7 +253,7 @@ def _qwen_vl_analyze(path: str, prompt: Optional[str]) -> Dict[str, Any]:
         )
         from ..json_parser import JSONParser  # local import to avoid cycles at module import time
         parser = JSONParser()
-        js = parser.parse(r.text or "{}", {"text": str})
+        js = parser.parse_superset(r.text or "{}", {"text": str})["coerced"]
         text = (js.get("text") or "").strip() if isinstance(js, dict) else ""
         if not text:
             res["error"] = "vlm_empty_text"
@@ -261,7 +261,7 @@ def _qwen_vl_analyze(path: str, prompt: Optional[str]) -> Dict[str, Any]:
         from ..json_parser import JSONParser  # local import to avoid cycles at module import time
         parser = JSONParser()
         # VLM JSON is free-form but expected to contain at least caption/keywords/tags.
-        parsed = parser.parse(text, {"caption": str, "keywords": list, "tags": list})
+        parsed = parser.parse_superset(text, {"caption": str, "keywords": list, "tags": list})["coerced"]
         caption = parsed.get("caption")
         if isinstance(caption, str):
             res["caption"] = caption.strip()
