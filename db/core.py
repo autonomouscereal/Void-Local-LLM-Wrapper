@@ -40,9 +40,8 @@ class Tx:
             await self.tr.commit()
 
 
-async def with_tx():
+async def with_tx() -> Tx:
     pool = await get_pool()
-    if pool is None:
     conn = await pool.acquire()
     return Tx(conn)
 

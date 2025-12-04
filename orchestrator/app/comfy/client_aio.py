@@ -91,8 +91,8 @@ async def comfy_upload_image(name_hint: str, b64_png: str) -> str:
         schema = {"name": str}
         sup = parser.parse_superset(text, schema)
         obj = sup["coerced"]
-            stored = obj.get("name") or filename if isinstance(obj, dict) else filename
-            return stored
+        stored = obj.get("name") or filename if isinstance(obj, dict) else filename
+        return stored
 
 
 async def comfy_upload_mask(name_hint: str, b64_png: str) -> str:
@@ -110,7 +110,7 @@ async def comfy_upload_mask(name_hint: str, b64_png: str) -> str:
         schema = {"name": str}
         sup = parser.parse_superset(text, schema)
         obj = sup["coerced"]
-            return obj.get("name") or filename if isinstance(obj, dict) else filename
+        return obj.get("name") or filename if isinstance(obj, dict) else filename
 
 
 async def comfy_view(filename: str) -> Tuple[bytes, str]:
@@ -133,7 +133,7 @@ async def comfy_object_info(session: aiohttp.ClientSession, node_class: str) -> 
     schema = {"inputs": dict}
     sup = parser.parse_superset(text, schema)
     obj = sup["coerced"]
-        return obj if isinstance(obj, dict) else {}
+    return obj if isinstance(obj, dict) else {}
 
 
 def _norm(name: str) -> str:

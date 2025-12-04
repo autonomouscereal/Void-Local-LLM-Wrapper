@@ -30,13 +30,10 @@ def _check_antelopev2_present() -> None:
         path = os.path.join(_ANTELOPE_DIR, name)
         if not (os.path.isfile(path) and os.path.getsize(path) > 0):
             missing.append(path)
-    if missing:
-
 
 def get_model():
     global _model
     if _model is None:
-        if insightface is None:
         _check_antelopev2_present()
         # Use antelopev2 pack (glintr100 + scrfd_10g_bnkps) from the shared models root.
         ctx_id = int(os.environ.get("FACEID_CTX_ID", "0"))  # 0 = first GPU, -1 = CPU

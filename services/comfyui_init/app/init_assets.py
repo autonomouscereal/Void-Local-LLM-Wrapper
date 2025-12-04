@@ -72,7 +72,7 @@ def dl_candidates(repo: str, filenames: list[str], target_dir: str, rename: Opti
     print("All candidates failed for", repo, filenames)
 
 
-def download_with_retries(url: str, dst: str, timeout: int = 300, max_retries: int = 3, backoff_seconds: int = 2, headers: Optional[dict] = None) -> None:
+def download_with_retries(url: str, dst: str, max_retries: int = 3, backoff_seconds: int = 2, headers: Optional[dict] = None) -> None:
     last_err: Optional[Exception] = None
     for attempt in range(1, max_retries + 1):
         try:
@@ -87,7 +87,6 @@ def download_with_retries(url: str, dst: str, timeout: int = 300, max_retries: i
             print(f"Download failed (attempt {attempt}/{max_retries}):", url, ex)
             if attempt < max_retries:
                 time.sleep(backoff_seconds * attempt)
-    if last_err:
 
 
 def download_url(url: str, target_dir: str, filename: str) -> None:

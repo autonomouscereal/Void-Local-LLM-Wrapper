@@ -27,10 +27,6 @@ class RVCFeatureExtractor:
     def __init__(self, *args: Any, **kwargs: Any) -> None:  # pragma: no cover
         self.config: Dict[str, Any] = {"args": args, "kwargs": kwargs}
 
-    def __call__(self, *args: Any, **kwargs: Any) -> Any:  # pragma: no cover
-            "hf_rvc.RVCFeatureExtractor shim was called; this code path is deprecated. "
-            "The RVC service should use the HTTP-based rvc-python engine instead."
-        )
 
 
 class RVCModel:
@@ -44,9 +40,5 @@ class RVCModel:
     def __init__(self, *args: Any, **kwargs: Any) -> None:  # pragma: no cover
         self.config: Dict[str, Any] = {"args": args, "kwargs": kwargs}
 
-    def __call__(self, *args: Any, **kwargs: Any) -> Any:  # pragma: no cover
-            "hf_rvc.RVCModel shim was called; this code path is deprecated. "
-            "The RVC service should use the HTTP-based rvc-python engine instead."
-        )
 
 

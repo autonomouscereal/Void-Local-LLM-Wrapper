@@ -25,7 +25,6 @@ def get_detector():
     """
     global _detector
     if _detector is None:
-        if YOLO is None:
         # Use a reasonably strong default; callers do not depend on exact variant.
         model_name = os.getenv("VISION_REPAIR_YOLO_MODEL", "yolov8x.pt")
         _detector = YOLO(model_name)
@@ -33,9 +32,7 @@ def get_detector():
 
 
 def _load_image(path: str) -> np.ndarray:
-    if not path:
     img = cv2.imread(path)
-    if img is None:
     return img
 
 
