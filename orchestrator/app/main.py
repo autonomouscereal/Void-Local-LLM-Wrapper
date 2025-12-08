@@ -34,7 +34,6 @@ import sys
 from types import SimpleNamespace
 from io import BytesIO
 import base64 as _b64
-import base64 as _b
 import imageio.v3 as iio  # type: ignore
 from PIL import Image, ImageDraw, ImageFont  # type: ignore
 import asyncio as _as
@@ -47,7 +46,6 @@ import hashlib as _hl
 import hashlib as _h
 import json
 import re as _re
-import base64
 import uuid
 import subprocess
 from glob import glob as _glob
@@ -56,7 +54,6 @@ import audioop
 import colorsys
 import random as _rnd
 from urllib.parse import urlparse, urlencode
-import requests as _rq
 import tempfile
 import cv2  # type: ignore
 import mediapipe as mp  # type: ignore
@@ -85,7 +82,6 @@ from .analysis.media import (
     stem_balance_score as _stem_balance_score,
 )  # type: ignore
 from .ingest.core import ingest_file
-import re
 import asyncpg  # type: ignore
 from sentence_transformers import SentenceTransformer  # type: ignore
 from .tools_schema import get_builtin_tools_schema as _ext
@@ -158,9 +154,6 @@ from .artifacts.shard import newest_part as _art_newest_part, list_parts as _art
 from .artifacts.manifest import add_manifest_row as _art_manifest_add, write_manifest_atomic as _art_manifest_write
 from .datasets.trace import append_sample as _trace_append
 from .embeddings.core import build_embeddings_response as _build_embeddings_response
-from types import SimpleNamespace
-import base64 as _b64local
-import asyncio as _asyncio
 from .traces.writer import (
     log_request as _trace_log_request,
     log_tool as _trace_log_tool,
@@ -1699,10 +1692,6 @@ def estimate_usage(messages: List[Dict[str, Any]], completion_text: str) -> Dict
 
 # ---- ICW pack helpers (must be top-level; no nested defs) ----
 
-def _round6(x: float) -> float:
-    return float(f"{float(x):.6f}")
-
-
 def _tok(s: str) -> List[str]:
     return [w for w in _re.findall(r"[a-z0-9]{3,}", (s or "").lower())]
 
@@ -1773,7 +1762,7 @@ def _icw_pack(messages: List[Dict[str, Any]], seed: int, budget_tokens: int = 35
     # Composite score (weights): topical 0.40, authority 0.25, recency 0.20, diversity 0.15
     for it in items:
         s = 0.40 * it["topical"] + 0.25 * it["authority"] + 0.20 * it["recency"] + 0.15 * it["diversity"]
-        it["score"] = _round6(s)
+        it["score"] = det_round6(s)
         it["sha"] = _hl.sha256((it.get("role") + "\n" + it.get("content")).encode("utf-8")).hexdigest()
     # Stable sort: score desc, topical desc, authority desc, recency desc, sha asc
     items.sort(key=lambda x: (-x["score"], -x["topical"], -x["authority"], -x["recency"], x["sha"]))
@@ -1782,8 +1771,8 @@ def _icw_pack(messages: List[Dict[str, Any]], seed: int, budget_tokens: int = 35
     ph = _hl.sha256(pack.encode("utf-8")).hexdigest()
     scores_summary = {
         "selected": len([1 for _ in ranked_texts]),
-        "dup_rate": _round6(0.0),
-        "independence_index": _round6(min(1.0, len(owner_counts.keys()) / 6.0)),
+        "dup_rate": det_round6(0.0),
+        "independence_index": det_round6(min(1.0, len(owner_counts.keys()) / 6.0)),
     }
     return {"pack": pack, "hash": f"sha256:{ph}", "budget_tokens": budget_tokens, "estimated_tokens": estimate_tokens_from_text(pack), "scores_summary": scores_summary}
 
@@ -1800,7 +1789,7 @@ def merge_usages(usages: List[Optional[Dict[str, int]]]) -> Dict[str, int]:
 
 
 def _save_base64_file(b64: str, suffix: str) -> str:
-    raw = base64.b64decode(b64)
+    raw = _b64.b64decode(b64)
     filename = f"{uuid.uuid4().hex}{suffix}"
     path = os.path.join(UPLOAD_DIR, filename)
     with open(path, "wb") as f:
@@ -2652,7 +2641,7 @@ def _derive_movie_prefs_from_text(text: str) -> Dict[str, Any]:
     m_fps = _re.search(r"(\d{2,3})\s*fps", s)
     if m_fps and m_fps.group(1):
         num = m_fps.group(1)
-        if re.fullmatch(r"[-+]?\d+(\.\d+)?", num):
+        if _re.fullmatch(r"[-+]?\d+(\.\d+)?", num):
             prefs["fps"] = float(num)
     elif "60fps" in s or "60 fps" in s:
         prefs["fps"] = 60.0
@@ -2940,7 +2929,7 @@ def _tool_cast_to_float(v: Any) -> Optional[float]:
     if isinstance(v, (int, float)):
         return float(v)
     s = str(v).strip()
-    if re.fullmatch(r"[-+]?\d+(\.\d+)?", s):
+    if _re.fullmatch(r"[-+]?\d+(\.\d+)?", s):
         return float(s)
     return None
 
@@ -2949,9 +2938,25 @@ def _tool_cast_to_int(v: Any) -> Optional[int]:
     if isinstance(v, int):
         return int(v)
     s = str(v).strip()
-    if re.fullmatch(r"[-+]?\d+", s):
+    if _re.fullmatch(r"[-+]?\d+", s):
         return int(s)
     return None
+
+
+def _tool_error(name: str, code: str, message: str, status: int = 422, **details: Any) -> Dict[str, Any]:
+    """
+    Canonical error payload for internal tool handlers.
+    This is what /tool.run will wrap into a ToolEnvelope and what the executor
+    will surface as tool_result.error, so always include code/message/status.
+    """
+    err: Dict[str, Any] = {
+        "code": code,
+        "message": message,
+        "status": int(status),
+    }
+    if details:
+        err.update(details)
+    return {"name": name, "error": err}
 
 
 async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
@@ -3108,9 +3113,9 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         image_url = str(a.get("image_url") or "").strip()
         options = a.get("options") if isinstance(a.get("options"), dict) else {}
         if not character_id:
-            return {"name": name, "error": "missing_character_id"}
+            return _tool_error(name, "missing_character_id", "character_id is required")
         if not image_url:
-            return {"name": name, "error": "missing_image_url"}
+            return _tool_error(name, "missing_image_url", "image_url is required")
         bundle = await _build_image_lock_bundle(character_id, image_url, options, locks_root_dir=LOCKS_ROOT_DIR)
         existing = await _lock_load(character_id) or {}
         existing = _lock_migrate_visual(existing)
@@ -3129,9 +3134,9 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         max_frames_val = a.get("max_frames")
         max_frames = int(max_frames_val) if isinstance(max_frames_val, int) and max_frames_val > 0 else 16
         if not character_id:
-            return {"name": name, "error": "missing_character_id"}
+            return _tool_error(name, "missing_character_id", "character_id is required")
         if not video_path:
-            return {"name": name, "error": "missing_video_path"}
+            return _tool_error(name, "missing_video_path", "video_path is required")
         bundle = await _build_video_lock_bundle(character_id, video_path, locks_root_dir=LOCKS_ROOT_DIR, max_frames=max_frames)
         existing = await _lock_load(character_id) or {}
         existing = _lock_migrate_visual(existing)
@@ -3148,9 +3153,9 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         character_id = str(a.get("character_id") or "").strip()
         audio_url = str(a.get("audio_url") or "").strip()
         if not character_id:
-            return {"name": name, "error": "missing_character_id"}
+            return _tool_error(name, "missing_character_id", "character_id is required")
         if not audio_url:
-            return {"name": name, "error": "missing_image_url"}
+            return _tool_error(name, "missing_audio_url", "audio_url is required")
         bundle = await _build_audio_lock_bundle(character_id, audio_url, locks_root_dir=LOCKS_ROOT_DIR)
         existing = await _lock_load(character_id) or {}
         existing = _lock_migrate_visual(existing)
@@ -3168,9 +3173,9 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         image_url = str(a.get("image_url") or "").strip()
         regions_arg = a.get("regions") if isinstance(a.get("regions"), list) else None
         if not character_id:
-            return {"name": name, "error": "missing_character_id"}
+            return _tool_error(name, "missing_character_id", "character_id is required")
         if not image_url:
-            return {"name": name, "error": "missing_image_url"}
+            return _tool_error(name, "missing_image_url", "image_url is required")
         bundle = await _build_region_lock_bundle(character_id, image_url, regions_arg, locks_root_dir=LOCKS_ROOT_DIR)
         existing = await _lock_load(character_id) or {}
         existing = _lock_migrate_visual(existing)
@@ -3192,7 +3197,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         # requiring character identity. This avoids noisy failures in revise
         # flows when only a bundle snapshot is available.
         if not character_id and bundle_arg is None:
-            return {"name": name, "error": "missing_character_id"}
+            return _tool_error(name, "missing_character_id", "character_id or lock_bundle is required")
         if character_id:
             existing = await _lock_load(character_id) or {}
         else:
@@ -3213,7 +3218,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         character_id = str(a.get("character_id") or "").strip()
         update_payload = a.get("update") if isinstance(a.get("update"), dict) else {}
         if not character_id:
-            return {"name": name, "error": "missing_character_id"}
+            return _tool_error(name, "missing_character_id", "character_id is required")
         existing = await _lock_load(character_id) or {}
         existing = _lock_migrate_visual(existing)
         existing = _lock_migrate_music(existing)
@@ -3426,7 +3431,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
     if name == "image.detect" and VISION_REPAIR_API_URL and ALLOW_TOOL_EXECUTION:
         src = args.get("src") or args.get("image_path") or ""
         if not isinstance(src, str) or not src:
-            return {"name": name, "error": "missing_src"}
+            return _tool_error(name, "missing_src", "src/image_path is required")
         payload: Dict[str, Any] = {"image_path": src}
         locks = args.get("locks")
         if isinstance(locks, dict):
@@ -3435,18 +3440,29 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             async with httpx.AsyncClient() as client:
                 r = await client.post(VISION_REPAIR_API_URL.rstrip("/") + "/v1/image/analyze", json=payload)
             if r.status_code < 200 or r.status_code >= 300:
-                return {"name": name, "error": f"vision_repair_error_status_{r.status_code}"}
+                return _tool_error(
+                    name,
+                    "vision_repair_http_error",
+                    f"vision_repair analyze returned HTTP {r.status_code}",
+                    status=r.status_code,
+                )
             parser = JSONParser()
             js = parser.parse_superset(r.text or "", {"faces": list, "hands": list, "objects": list, "quality": dict})["coerced"]
             return {"name": name, "result": js}
         except Exception as ex:
             _tb = traceback.format_exc()
             logging.error(_tb)
-            return {"name": name, "error": f"vision_repair_error: {ex}", "traceback": _tb}
+            return _tool_error(
+                name,
+                "vision_repair_exception",
+                f"vision_repair image.detect failed: {ex}",
+                status=500,
+                traceback=_tb,
+            )
     if name == "image.repair" and VISION_REPAIR_API_URL and ALLOW_TOOL_EXECUTION:
         src = args.get("src") or args.get("image_path") or ""
         if not isinstance(src, str) or not src:
-            return {"name": name, "error": "missing_src"}
+            return _tool_error(name, "missing_src", "src/image_path is required")
         payload: Dict[str, Any] = {"image_path": src}
         regions = args.get("regions")
         if isinstance(regions, list):
@@ -3461,14 +3477,25 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             async with httpx.AsyncClient() as client:
                 r = await client.post(VISION_REPAIR_API_URL.rstrip("/") + "/v1/image/repair", json=payload)
             if r.status_code < 200 or r.status_code >= 300:
-                return {"name": name, "error": f"vision_repair_error_status_{r.status_code}"}
+                return _tool_error(
+                    name,
+                    "vision_repair_http_error",
+                    f"vision_repair repair returned HTTP {r.status_code}",
+                    status=r.status_code,
+                )
             parser = JSONParser()
             js = parser.parse_superset(r.text or "", {"repaired_image_path": str, "regions": list, "mode": (str,)})["coerced"]
             return {"name": name, "result": js}
         except Exception as ex:
             _tb = traceback.format_exc()
             logging.error(_tb)
-            return {"name": name, "error": f"vision_repair_error: {ex}", "traceback": _tb}
+            return _tool_error(
+                name,
+                "vision_repair_exception",
+                f"vision_repair image.repair failed: {ex}",
+                status=500,
+                traceback=_tb,
+            )
     if name == "video.refine.clip" and ALLOW_TOOL_EXECUTION:
         a = args if isinstance(args, dict) else {}
         segment_id_val = a.get("segment_id")
@@ -4971,10 +4998,16 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         except Exception as ex:
             _tb = traceback.format_exc()
             logging.error(_tb)
-            return {"name": name, "error": str(ex), "traceback": _tb}
+            return _tool_error(
+                name,
+                "tts_error",
+                f"tts.speak failed: {ex}",
+                status=500,
+                traceback=_tb,
+            )
     if name == "ocr.read" and ALLOW_TOOL_EXECUTION:
         if not OCR_API_URL:
-            return {"name": name, "error": "OCR_API_URL not configured"}
+            return _tool_error(name, "ocr_backend_unconfigured", "OCR_API_URL not configured", status=500)
         ext = (args.get("ext") or "").strip().lower()
         b64 = None
         if isinstance(args.get("b64"), str) and args.get("b64").strip():
@@ -4991,13 +5024,19 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             except Exception as ex:
                 _tb = traceback.format_exc()
                 logging.error(_tb)
-                return {"name": name, "error": f"fetch_error: {str(ex)}", "traceback": _tb}
+                return _tool_error(
+                    name,
+                    "ocr_fetch_error",
+                    f"failed to fetch image from URL: {ex}",
+                    status=502,
+                    traceback=_tb,
+                )
         elif isinstance(args.get("path"), str) and args.get("path").strip():
             try:
                 rel = args.get("path").strip()
                 full = os.path.abspath(os.path.join(UPLOAD_DIR, rel)) if not os.path.isabs(rel) else rel
                 if not full.startswith(os.path.abspath(UPLOAD_DIR)):
-                    return {"name": name, "error": "path escapes uploads"}
+                    return _tool_error(name, "path_escapes_uploads", "path escapes uploads directory")
                 with open(full, "rb") as f:
                     data = f.read()
                 b64 = _b.b64encode(data).decode("ascii")
@@ -5006,9 +5045,15 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             except Exception as ex:
                 _tb = traceback.format_exc()
                 logging.error(_tb)
-                return {"name": name, "error": f"path_error: {str(ex)}", "traceback": _tb}
+                return _tool_error(
+                    name,
+                    "ocr_path_error",
+                    f"failed to read local image path: {ex}",
+                    status=500,
+                    traceback=_tb,
+                )
         else:
-            return {"name": name, "error": "missing b64|url|path"}
+            return _tool_error(name, "missing_input", "one of b64, url, or path is required")
         async with httpx.AsyncClient() as client:
             r = await client.post(OCR_API_URL.rstrip("/") + "/ocr", json={"b64": b64, "ext": ext})
             parser = JSONParser()
@@ -5017,7 +5062,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             return {"name": name, "result": {"text": text_val, "ext": ext}}
     if name == "vlm.analyze" and ALLOW_TOOL_EXECUTION:
         if not VLM_API_URL:
-            return {"name": name, "error": "VLM_API_URL not configured"}
+            return _tool_error(name, "vlm_backend_unconfigured", "VLM_API_URL not configured", status=500)
         ext = (args.get("ext") or "").strip().lower()
         b64 = None
         if isinstance(args.get("b64"), str) and args.get("b64").strip():
@@ -5034,13 +5079,19 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             except Exception as ex:
                 _tb = traceback.format_exc()
                 logging.error(_tb)
-                return {"name": name, "error": f"fetch_error: {str(ex)}", "traceback": _tb}
+                return _tool_error(
+                    name,
+                    "vlm_fetch_error",
+                    f"failed to fetch image from URL: {ex}",
+                    status=502,
+                    traceback=_tb,
+                )
         elif isinstance(args.get("path"), str) and args.get("path").strip():
             try:
                 rel = args.get("path").strip()
                 full = os.path.abspath(os.path.join(UPLOAD_DIR, rel)) if not os.path.isabs(rel) else rel
                 if not full.startswith(os.path.abspath(UPLOAD_DIR)):
-                    return {"name": name, "error": "path escapes uploads"}
+                    return _tool_error(name, "path_escapes_uploads", "path escapes uploads directory")
                 with open(full, "rb") as f:
                     data = f.read()
                 b64 = _b.b64encode(data).decode("ascii")
@@ -5049,9 +5100,15 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             except Exception as ex:
                 _tb = traceback.format_exc()
                 logging.error(_tb)
-                return {"name": name, "error": f"path_error: {str(ex)}", "traceback": _tb}
+                return _tool_error(
+                    name,
+                    "vlm_path_error",
+                    f"failed to read local image path: {ex}",
+                    status=500,
+                    traceback=_tb,
+                )
         else:
-            return {"name": name, "error": "missing b64|url|path"}
+            return _tool_error(name, "missing_input", "one of b64, url, or path is required")
         async with httpx.AsyncClient() as client:
             r = await client.post(VLM_API_URL.rstrip("/") + "/analyze", json={"b64": b64, "ext": ext})
             parser = JSONParser()
@@ -5281,10 +5338,16 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         except Exception as ex:
             _tb = traceback.format_exc()
             logging.error(_tb)
-            return {"name": name, "error": str(ex), "traceback": _tb}
+            return _tool_error(
+                name,
+                "music_variation_exception",
+                f"music.variation failed: {ex}",
+                status=500,
+                traceback=_tb,
+            )
     if name == "music.refine.window" and ALLOW_TOOL_EXECUTION:
         if not MUSIC_API_URL:
-            return {"name": name, "error": "MUSIC_API_URL not configured"}
+            return _tool_error(name, "music_backend_unconfigured", "MUSIC_API_URL not configured", status=500)
         provider = _MusicRefineProvider()
         manifest = {"items": []}
         try:
@@ -5432,7 +5495,13 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         except Exception as ex:
             _tb = traceback.format_exc()
             logging.error(_tb)
-            return {"name": name, "error": str(ex), "traceback": _tb}
+            return _tool_error(
+                name,
+                "music_refine_exception",
+                f"music.refine.window failed: {ex}",
+                status=500,
+                traceback=_tb,
+            )
     if name == "music.mixdown" and ALLOW_TOOL_EXECUTION:
         manifest = {"items": []}
         try:
@@ -5523,7 +5592,13 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         except Exception as ex:
             _tb = traceback.format_exc()
             logging.error(_tb)
-            return {"name": name, "error": str(ex), "traceback": _tb}
+            return _tool_error(
+                name,
+                "music_mixdown_exception",
+                f"music.mixdown failed: {ex}",
+                status=500,
+                traceback=_tb,
+            )
     # --- Creative helpers ---
     if name == "creative.alt_takes" and ALLOW_TOOL_EXECUTION:
         # Run N variants with orthogonal seeds, score via committee, pick best, return all URLs
@@ -5952,7 +6027,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     with open(transformed_vocals, "rb") as _f:
                         src_bytes = _f.read()
                     payload_rvc = {
-                        "source_wav_b64": _b64local.b64encode(src_bytes).decode("ascii"),
+                        "source_wav_b64": _b64.b64encode(src_bytes).decode("ascii"),
                         "voice_lock_id": voice_lock_id.strip(),
                     }
                     async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
@@ -5979,7 +6054,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                                 "message": "RVC /v1/audio/convert returned no audio_wav_base64",
                             },
                         }
-                    out_bytes = _b64local.b64decode(b64_rvc)
+                    out_bytes = _b64.b64decode(b64_rvc)
                     # Write converted vocals next to original.
                     v_dir, v_name = os.path.dirname(vocals_path), os.path.basename(vocals_path)
                     v_base, v_ext = os.path.splitext(v_name)
@@ -6001,7 +6076,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 with open(transformed_vocals, "rb") as _f2:
                     vf_src = _f2.read()
                 payload_vf = {
-                    "audio_wav_base64": _b64local.b64encode(vf_src).decode("ascii"),
+                    "audio_wav_base64": _b64.b64encode(vf_src).decode("ascii"),
                     "sample_rate": int(args.get("sample_rate") or 44100),
                     "ops": ["pitch", "align", "deess"],
                 }
@@ -6041,7 +6116,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                             "message": "VocalFix /v1/vocal/fix returned no audio_wav_base64",
                         },
                     }
-                out_vf = _b64local2.b64decode(b64_vf)
+                out_vf = _b64.b64decode(b64_vf)
                 v_dir2, v_name2 = os.path.dirname(transformed_vocals), os.path.basename(transformed_vocals)
                 v_base2, v_ext2 = os.path.splitext(v_name2)
                 vf_path = os.path.join(v_dir2, f"{v_base2}.vf{v_ext2 or '.wav'}")

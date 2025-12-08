@@ -175,8 +175,32 @@ async def utc_run_tool(trace_id: Optional[str], step_id: Optional[str], name: st
         return res
 
     # Non-ok orchestrator response: wrap with a canonical error envelope.
-    status = int(res.get("status") or res.get("_http_status") or 422)
     err_obj = res.get("error") if isinstance(res.get("error"), dict) else {}
+    # Prefer the tool-layer status when present, fall back to transport status.
+    status = int(
+        (err_obj.get("status") if isinstance(err_obj, dict) and isinstance(err_obj.get("status"), int) else None)
+        or res.get("status")
+        or res.get("_http_status")
+        or 422
+    )
+    # Preserve the ORIGINAL tool traceback/stack when available.
+    tool_stack: str | bytes | None = None
+    containers = [
+        err_obj,
+        (err_obj.get("details") if isinstance(err_obj, dict) and isinstance(err_obj.get("details"), dict) else None),
+        res,
+    ]
+    for c in containers:
+        if not isinstance(c, dict):
+            continue
+        for k in ("traceback", "stack", "stacktrace"):
+            v = c.get(k)
+            if isinstance(v, (str, bytes)) and v:
+                tool_stack = v
+                break
+        if tool_stack is not None:
+            break
+    final_stack = tool_stack if isinstance(tool_stack, (str, bytes)) and tool_stack else _stack_str()
     return {
         "schema_version": 1,
         "trace_id": trace_id,
@@ -187,7 +211,7 @@ async def utc_run_tool(trace_id: Optional[str], step_id: Optional[str], name: st
             "message": err_obj.get("message") or f"tool {name} failed",
             "status": status,
             "raw": res,
-            "stack": _stack_str(),
+            "stack": final_stack,
         },
     }
 

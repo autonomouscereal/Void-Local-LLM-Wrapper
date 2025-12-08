@@ -340,20 +340,61 @@ async def tool_run(req: Request):
 			"arguments": (args if isinstance(args, dict) else {}),
 			"trace_id": rid,
 		}
-		# try/except here; any real exceptions will surface as HTTP errors with full
-		# stack traces, in line with the global "no silent failures" policy.
-		res = await execute_tool_call(call)
+		# Guard the internal tool switchboard so unexpected exceptions are surfaced
+		# as structured error envelopes with the ORIGINAL tool traceback attached.
+		try:
+			res = await execute_tool_call(call)
+		except Exception as ex:
+			tb = traceback.format_exc()
+			details = {
+				"exception_type": ex.__class__.__name__ or "Exception",
+				"traceback": tb,
+				"tool": name or "tool",
+				"args_keys": sorted(list((args or {}).keys())) if isinstance(args, dict) else [],
+			}
+			msg = str(ex) or f"{name or 'tool'} raised {ex.__class__.__name__}"
+			log.error("[toolrun] tool=%s raised %s", name, ex, exc_info=True)
+			return ToolEnvelope.failure(
+				"tool_exception",
+				msg,
+				status=500,
+				request_id=rid,
+				details=details,
+			)
 		if isinstance(res, dict) and isinstance(res.get("result"), dict):
 			return ToolEnvelope.success(res["result"], request_id=rid)
 		err_obj = res.get("error") if isinstance(res, dict) else None
 		if isinstance(err_obj, dict):
+			# Normalize inner tool error so we always expose a clear code/message/status,
+			# while still preserving full traceback/stack fields for debugging.
 			code = str(err_obj.get("code") or "tool_error")
-			message = str(err_obj.get("message") or "")
-			status = int(err_obj.get("status") or err_obj.get("_http_status") or 422)
+			raw_msg = err_obj.get("message")
+			status_val = err_obj.get("status") or err_obj.get("_http_status") or 422
+			try:
+				status_int = int(status_val)
+			except Exception:
+				status_int = 422
+			message = (
+				str(raw_msg).strip()
+				if isinstance(raw_msg, str) and raw_msg.strip()
+				else f"{name or 'tool'} failed with status {status_int}"
+			)
+			normalized_details = dict(err_obj)
+			normalized_details.setdefault("code", code)
+			normalized_details.setdefault("message", message)
+			normalized_details.setdefault("status", status_int)
 			# Preserve any traceback/details from inner tool handlers so executor logs see real stack lines.
-			return ToolEnvelope.failure(code, message, status=status, request_id=rid, details=err_obj)
+			return ToolEnvelope.failure(code, message, status=status_int, request_id=rid, details=normalized_details)
 		if isinstance(err_obj, str):
-			return ToolEnvelope.failure("tool_error", err_obj, status=422, request_id=rid, details={})
+			# Attach any traceback captured at the tool layer so callers can see both
+			# a clean message and the underlying stack.
+			trace_val = None
+			if isinstance(res, dict) and isinstance(res.get("traceback"), str):
+				trace_val = res.get("traceback")
+			details: dict = {}
+			if trace_val:
+				details["traceback"] = trace_val
+			return ToolEnvelope.failure("tool_error", err_obj, status=422, request_id=rid, details=details)
 		# Fallback: surface the raw response for debugging instead of hiding it behind a generic message.
 		log.error("[toolrun] tool=%s returned non-standard error payload: %r", name, res)
 		return ToolEnvelope.failure(

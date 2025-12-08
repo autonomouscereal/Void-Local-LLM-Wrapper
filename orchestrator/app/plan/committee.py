@@ -39,7 +39,9 @@ SYSTEM_VIDEO = (
 SYSTEM_AUDIO = (
     "You are AudioOps. Output ONLY JSON per the schema. "
     "Always think in multi-step plans: separate composition, vocal generation, mastering, and lock adjustments into distinct steps with clear purposes. "
-    "If any audio/music/voice is implied, include music generate and optional vocal + master/mix steps. "
+    "If any music is implied, you MUST use the single front-door music tool 'music.infinite.windowed' for composition and windowed scoring. "
+    "Do not invent or call other music tools such as 'audio.music.generate' or 'search'; they are invalid. "
+    "For vocals, use tts.speak, and for audio mastering/mixdown use audio.master or music.mixdown when available in the tool catalog. "
     "Manage lock bundles via locks.get_bundle, locks.update_audio_modes, and locks.update_region_modes (for visuals linked to audio). "
     "Keep tempo/key/stem/lyrics/voice locks aligned with the user directive and with any committee/QA metrics from prior runs."
 )

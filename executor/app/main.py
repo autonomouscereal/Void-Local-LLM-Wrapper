@@ -625,13 +625,29 @@ async def run_steps(trace_id: str, request_id: str, steps: list[dict]) -> Dict[s
                     err_det,
                     json.dumps(env_fields, sort_keys=True),
                 )
+                # Normalize the error payload so it always carries a meaningful message.
+                error_dict: Dict[str, Any] = err_obj if isinstance(err_obj, dict) else {}
+                if not isinstance(error_dict, dict):
+                    error_dict = {}
+                # Prefer status from the tool error payload when present.
+                status_val = error_dict.get("status") if isinstance(error_dict.get("status"), int) else (
+                    res.get("status") if isinstance(res.get("status"), int) else 422
+                )
+                if "code" not in error_dict and code:
+                    error_dict["code"] = code
+                if not error_dict.get("message"):
+                    error_dict["message"] = msg or f"{tool_name} failed with status {status_val}"
+                if "status" not in error_dict:
+                    error_dict["status"] = status_val
+                if tb and not any(k in error_dict for k in ("traceback", "stack", "stacktrace")):
+                    error_dict["traceback"] = tb
                 produced[sid] = {
                     "name": tool_name,
                     "result": {
                         "ids": {},
                         "meta": {},
-                        "error": (res.get("error") if isinstance(res.get("error"), dict) else {"message": msg}),
-                        "status": (res.get("status") if isinstance(res.get("status"), int) else 422),
+                        "error": error_dict,
+                        "status": status_val,
                         "trace_id": (res.get("trace_id") if isinstance(res.get("trace_id"), str) else (trace_id or request_id)),
                     },
                 }
@@ -690,14 +706,13 @@ async def execute_http(body: Dict[str, Any]):
     error_obj: Dict[str, Any] | None = None
 
     if not steps:
-        # No steps: synthesize an explicit invalid_plan error, but still return
-        # the same envelope shape as for non-empty plans. Per policy, the
-        # primary error field (.message) carries the full stack trace.
+        # No steps: synthesize an explicit invalid_plan error, but keep the
+        # human-friendly message separate from the low-level stack trace.
         produced = {}
         stk = _stack_str()
         error_obj = {
             "code": "invalid_plan",
-            "message": stk,
+            "message": "no steps provided to executor; 'steps' field is required",
             "status": 422,
             "details": {"reason": "steps required"},
             "traceback": stk,
@@ -723,17 +738,14 @@ async def execute_http(body: Dict[str, Any]):
                 failing.append((str(sid), step, res))
 
         if failing:
-            # Surface the first failing step as the canonical executor error,
-            # including the underlying traceback so callers can see the real
-            # stack without digging through produced[...] manually.
+            # Surface the first failing step as the canonical executor error.
             first_sid, first_step, first_res = failing[0]
             err_obj = first_res.get("error") if isinstance(first_res.get("error"), dict) else {}
             tool_name = first_step.get("name") if isinstance(first_step.get("name"), str) else first_step.get("tool")
             code_val = err_obj.get("code") if isinstance(err_obj, dict) else None
             msg_val = err_obj.get("message") if isinstance(err_obj, dict) else None
             status_val = err_obj.get("status") if isinstance(err_obj, dict) else first_res.get("status")
-            # Try very hard to preserve the ORIGINAL tool traceback/stack
-            # without truncation.
+            # Preserve the ORIGINAL tool traceback/stack when available.
             traceback_text: str | bytes | None = None
             if isinstance(err_obj, dict):
                 for k in ("traceback", "stack", "stacktrace"):
@@ -748,11 +760,11 @@ async def execute_http(body: Dict[str, Any]):
                         traceback_text = v
                         break
             code = str(code_val) if isinstance(code_val, str) and code_val else "executor_step_failed"
-            # FULL stack goes into .message, human summary is preserved under details.summary.
+            # Human-readable message: prefer the tool's own message, fall back to concise summary.
             human_msg = (
-                str(msg_val)
-                if isinstance(msg_val, str) and msg_val
-                else f"step {first_sid} ({tool_name or 'tool'}) failed"
+                str(msg_val).strip()
+                if isinstance(msg_val, str) and msg_val and msg_val.strip()
+                else f"step {first_sid} ({tool_name or 'tool'}) failed with status {status_val}"
             )
             stk = (
                 traceback_text
@@ -762,17 +774,15 @@ async def execute_http(body: Dict[str, Any]):
             status_int = int(status_val) if isinstance(status_val, int) else 422
             error_obj = {
                 "code": code,
-                "message": stk,
+                "message": human_msg,
                 "status": status_int,
                 "tool": tool_name,
                 "step": first_sid,
-                "details": {"summary": human_msg},
-                # FULL underlying traceback/stack from the failing tool, when
-                # available. This is NEVER truncated here.
+                "details": {"summary": human_msg, "tool_error": err_obj or {}},
+                # Full underlying traceback/stack from the failing tool is still present here.
                 "traceback": stk,
                 "stack": stk,
-                # Also expose the raw step result so nothing about the failure is
-                # hidden: callers can inspect ids/meta/error/status directly.
+                # Also expose the raw step result so nothing about the failure is hidden.
                 "tool_result": first_res,
             }
 
