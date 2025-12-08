@@ -4,12 +4,12 @@ from typing import Any, Dict, List, Optional, Tuple, Callable
 
 from ..datasets.trace import append_sample as _trace_append
 from ..locks.runtime import quality_thresholds as _lock_quality_thresholds
-from ..analysis.media import (
-    assets_compute_domain_qa,
-    assets_count_images,
-    assets_count_video,
-    assets_count_audio,
-    assets_collect_urls,
+from ..pipeline.assets import (
+    compute_domain_qa,
+    count_images,
+    count_video,
+    count_audio,
+    collect_urls,
 )
 from ..review.referee import postrun_committee_decide
 from ..plan.catalog import PLANNER_VISIBLE_TOOLS
