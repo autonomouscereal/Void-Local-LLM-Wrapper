@@ -215,6 +215,54 @@ def _distill_summary(result_obj: Any) -> Dict[str, Any]:
     return out
 
 
+def _build_executor_envelope(
+    request_id: str,
+    ok: bool,
+    produced: Dict[str, Any] | None,
+    error: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    """
+    Canonical executor envelope builder.
+
+    This mirrors the orchestrator ToolEnvelope shape:
+    {
+      "schema_version": 1,
+      "request_id": "...",
+      "ok": bool,
+      "result": {"produced": {...}},
+      "error": {... or None}
+    }
+    The caller is responsible for ensuring error.message/traceback contain the
+    full stack trace when ok is False.
+    """
+    # Derive the final ok flag from both the explicit ok hint and any per-step
+    # tool results. If any step reports a non-2xx status, the overall executor
+    # run is considered failed, and callers must inspect .error/.result for
+    # details instead of relying on transport status.
+    final_ok = bool(ok)
+    try:
+        for step in (produced or {}).values():
+            if not isinstance(step, dict):
+                continue
+            res = step.get("result")
+            if not isinstance(res, dict):
+                continue
+            st = res.get("status")
+            if isinstance(st, int) and st != 200:
+                final_ok = False
+                break
+    except Exception:
+        # Never let envelope construction fail; fall back to the provided ok hint.
+        final_ok = bool(ok)
+    return {
+        "schema_version": 1,
+        "request_id": request_id,
+        "ok": final_ok,
+        "result": {"produced": produced or {}},
+        "error": error,
+    }
+
+
 def _canonical_tool_result(x: Dict[str, Any] | Any) -> Dict[str, Any]:
     data: Dict[str, Any] = {}
     if isinstance(x, dict) and "ok" in x and isinstance(x.get("result"), dict):
@@ -240,11 +288,35 @@ async def execute_plan(body: Dict[str, Any]):
     # Accept either {plan: {...}} or a raw plan object
     plan_obj = body.get("plan") if isinstance(body, dict) and isinstance(body.get("plan"), dict) else (body if isinstance(body, dict) else None)
     if not isinstance(plan_obj, dict):
-        return JSONResponse(status_code=400, content={"error": "missing_or_invalid_plan"})
+        # Use canonical executor envelope even for invalid bodies so callers
+        # never have to special-case this endpoint.
+        rid = str(uuid.uuid4().hex)
+        stk = _stack_str()
+        err_env = {
+            "code": "invalid_plan_body",
+            "message": stk,
+            "status": 400,
+            "details": {"reason": "missing_or_invalid_plan"},
+            "traceback": stk,
+            "stack": stk,
+        }
+        body_env = _build_executor_envelope(rid, False, {}, err_env)
+        return JSONResponse(body_env, status_code=200)
 
     raw_steps = plan_obj.get("plan") or []
     if not isinstance(raw_steps, list):
-        return JSONResponse(status_code=422, content={"error": "invalid_plan_type"})
+        rid = str(plan_obj.get("request_id") or uuid.uuid4().hex)
+        stk = _stack_str()
+        err_env = {
+            "code": "invalid_plan_type",
+            "message": stk,
+            "status": 422,
+            "details": {"reason": "plan.plan must be a list"},
+            "traceback": stk,
+            "stack": stk,
+        }
+        body_env = _build_executor_envelope(rid, False, {}, err_env)
+        return JSONResponse(body_env, status_code=200)
 
     # Normalize steps: ids, needs, inputs
     norm_steps: Dict[str, Dict[str, Any]] = {}
@@ -300,14 +372,36 @@ async def execute_plan(body: Dict[str, Any]):
         satisfied = set(produced.keys())
         runnable = [sid for sid in pending if deps[sid].issubset(satisfied)]
         if not runnable:
-            return JSONResponse(status_code=422, content={"error": "deadlock_or_missing", "pending": sorted(list(pending))})
+            rid = str(plan_obj.get("request_id") or trace_id or uuid.uuid4().hex)
+            stk = _stack_str()
+            err_env = {
+                "code": "deadlock_or_missing",
+                "message": stk,
+                "status": 422,
+                "details": {"pending": sorted(list(pending))},
+                "traceback": stk,
+                "stack": stk,
+            }
+            body_env = _build_executor_envelope(rid, False, produced, err_env)
+            return JSONResponse(body_env, status_code=200)
         batch_tools = [{"step_id": sid, "tool": norm_steps[sid].get("tool")} for sid in runnable]
         logging.info(f"[executor] batch_start trace_id={trace_id} runnable={batch_tools}")
         for sid in runnable:
             step = norm_steps[sid]
             tool_name = (step.get("tool") or "").strip()
             if not tool_name:
-                return JSONResponse(status_code=422, content={"error": "missing_tool", "step": sid})
+                rid = str(plan_obj.get("request_id") or trace_id or uuid.uuid4().hex)
+                stk = _stack_str()
+                err_env = {
+                    "code": "missing_tool",
+                    "message": stk,
+                    "status": 422,
+                    "details": {"step": sid},
+                    "traceback": stk,
+                    "stack": stk,
+                }
+                body_env = _build_executor_envelope(rid, False, produced, err_env)
+                return JSONResponse(body_env, status_code=200)
             args = _merge_inputs(step)
             t0 = time.time()
             # Use UTC runner directly; any exceptions bubble to the global exception handler.
@@ -317,25 +411,33 @@ async def execute_plan(body: Dict[str, Any]):
                 produced[sid] = res.get("result")
                 ok = True
             elif isinstance(res, dict) and bool(res.get("ok")) is False:
+                # Canonicalize tool error into the same envelope shape used by
+                # /execute, including full stack trace in the message field.
                 err_obj = res.get("error") if isinstance(res.get("error"), dict) else {}
                 code_val = err_obj.get("code") if isinstance(err_obj, dict) else None
                 msg_val = err_obj.get("message") if isinstance(err_obj, dict) else None
                 tb_val = err_obj.get("traceback") if isinstance(err_obj, dict) else None
                 code = code_val if isinstance(code_val, str) and code_val else "tool_error"
-                msg = msg_val if isinstance(msg_val, str) else ""
-                tb = tb_val if isinstance(tb_val, (str, bytes)) else ""
+                human_msg = msg_val if isinstance(msg_val, str) else ""
+                tb = tb_val if isinstance(tb_val, (str, bytes)) else _stack_str()
                 if tb:
                     logging.error(tb if isinstance(tb, str) else str(tb))
-                return JSONResponse(
-                    status_code=422,
-                    content={
-                        "error": code,
-                        "step": sid,
-                        "detail": msg,
-                        "traceback": (tb if isinstance(tb, str) else None),
-                        "attempts": int(max(1, MAX_TOOL_ATTEMPTS)),
-                    },
+                err_env = {
+                    "code": code,
+                    "message": tb,
+                    "status": 422,
+                    "step": sid,
+                    "details": {"summary": human_msg, "attempts": int(max(1, MAX_TOOL_ATTEMPTS))},
+                    "traceback": tb,
+                    "stack": tb,
+                }
+                body = _build_executor_envelope(
+                    str(plan_obj.get("request_id") or trace_id or "executor-plan"),
+                    False,
+                    produced,
+                    err_env,
                 )
+                return JSONResponse(body, status_code=200)
             else:
                 produced[sid] = (res or {})
                 ok = True
@@ -345,7 +447,12 @@ async def execute_plan(body: Dict[str, Any]):
             pending.remove(sid)
         logging.info(f"[executor] batch_finish trace_id={trace_id} runnable={batch_tools}")
     logging.info(f"[executor] plan_finish trace_id={trace_id} produced_keys={sorted(list(produced.keys()))}")
-    return {"produced": produced}
+    # For legacy execute_plan, still return a canonical executor envelope so
+    # callers can rely on a single shape. No error object here because all
+    # steps completed without tool_error.
+    rid = str(plan_obj.get("request_id") or trace_id or "executor-plan")
+    body = _build_executor_envelope(rid, True, produced, None)
+    return JSONResponse(body, status_code=200)
 
 
 async def run_steps(trace_id: str, request_id: str, steps: list[dict]) -> Dict[str, Any]:
@@ -578,17 +685,100 @@ async def execute_http(body: Dict[str, Any]):
     tid = str(body.get("trace_id") or uuid.uuid4().hex)
     steps = body.get("steps") if isinstance(body.get("steps"), list) else None
 
-    if not steps:
-        return JSONResponse(
-            {"schema_version": 1, "request_id": rid, "ok": False,
-             "error": {"code": "invalid_plan", "message": "steps required", "details": {}},
-             "result": {"produced": []}},
-            status_code=200
-        )
+    # Single unified return: always build a full envelope and return once.
+    produced: Dict[str, Any] = {}
+    error_obj: Dict[str, Any] | None = None
 
-    produced = await run_steps(tid, rid, steps)
-    return JSONResponse(
-        {"schema_version": 1, "request_id": rid, "ok": True, "result": {"produced": produced}},
-        status_code=200,
-    )
+    if not steps:
+        # No steps: synthesize an explicit invalid_plan error, but still return
+        # the same envelope shape as for non-empty plans. Per policy, the
+        # primary error field (.message) carries the full stack trace.
+        produced = {}
+        stk = _stack_str()
+        error_obj = {
+            "code": "invalid_plan",
+            "message": stk,
+            "status": 422,
+            "details": {"reason": "steps required"},
+            "traceback": stk,
+            "stack": stk,
+        }
+    else:
+        produced = await run_steps(tid, rid, steps)
+
+    # Derive overall executor status from per-step results when we actually ran
+    # a plan. Any step with a non-200 status is treated as a hard failure and
+    # surfaces as a top-level error so callers never see ok:true with
+    # step.status != 200.
+    if error_obj is None:
+        failing: list[tuple[str, Dict[str, Any], Dict[str, Any]]] = []
+        for sid, step in produced.items():
+            if not isinstance(step, dict):
+                continue
+            res = step.get("result")
+            if not isinstance(res, dict):
+                continue
+            st = res.get("status")
+            if isinstance(st, int) and st != 200:
+                failing.append((str(sid), step, res))
+
+        if failing:
+            # Surface the first failing step as the canonical executor error,
+            # including the underlying traceback so callers can see the real
+            # stack without digging through produced[...] manually.
+            first_sid, first_step, first_res = failing[0]
+            err_obj = first_res.get("error") if isinstance(first_res.get("error"), dict) else {}
+            tool_name = first_step.get("name") if isinstance(first_step.get("name"), str) else first_step.get("tool")
+            code_val = err_obj.get("code") if isinstance(err_obj, dict) else None
+            msg_val = err_obj.get("message") if isinstance(err_obj, dict) else None
+            status_val = err_obj.get("status") if isinstance(err_obj, dict) else first_res.get("status")
+            # Try very hard to preserve the ORIGINAL tool traceback/stack
+            # without truncation.
+            traceback_text: str | bytes | None = None
+            if isinstance(err_obj, dict):
+                for k in ("traceback", "stack", "stacktrace"):
+                    v = err_obj.get(k)
+                    if isinstance(v, (str, bytes)) and v:
+                        traceback_text = v
+                        break
+            if traceback_text is None and isinstance(first_res, dict):
+                for k in ("traceback", "stack", "stacktrace"):
+                    v = first_res.get(k)
+                    if isinstance(v, (str, bytes)) and v:
+                        traceback_text = v
+                        break
+            code = str(code_val) if isinstance(code_val, str) and code_val else "executor_step_failed"
+            # FULL stack goes into .message, human summary is preserved under details.summary.
+            human_msg = (
+                str(msg_val)
+                if isinstance(msg_val, str) and msg_val
+                else f"step {first_sid} ({tool_name or 'tool'}) failed"
+            )
+            stk = (
+                traceback_text
+                if isinstance(traceback_text, (str, bytes)) and traceback_text
+                else _stack_str()
+            )
+            status_int = int(status_val) if isinstance(status_val, int) else 422
+            error_obj = {
+                "code": code,
+                "message": stk,
+                "status": status_int,
+                "tool": tool_name,
+                "step": first_sid,
+                "details": {"summary": human_msg},
+                # FULL underlying traceback/stack from the failing tool, when
+                # available. This is NEVER truncated here.
+                "traceback": stk,
+                "stack": stk,
+                # Also expose the raw step result so nothing about the failure is
+                # hidden: callers can inspect ids/meta/error/status directly.
+                "tool_result": first_res,
+            }
+
+    body = _build_executor_envelope(rid, error_obj is None, produced, error_obj)
+    # Always return HTTP 200; callers MUST inspect error.status / ok to
+    # determine failure. This keeps the transport-layer status stable while
+    # still surfacing the exact tool failure and full stack trace.
+    return JSONResponse(body, status_code=200)
 

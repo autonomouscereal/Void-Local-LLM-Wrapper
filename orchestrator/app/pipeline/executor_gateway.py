@@ -56,10 +56,13 @@ async def execute(tool_calls: List[Dict[str, Any]], trace_id: Optional[str], exe
 			}
 	results: List[Dict[str, Any]] = []
 	if isinstance(env, dict) and env.get("ok") and isinstance((env.get("result") or {}).get("produced"), dict):
-		for _, step in (env.get("result") or {}).get("produced", {}).items():
-			if isinstance(step, dict):
-				res = step.get("result") if isinstance(step.get("result"), dict) else {}
-				results.append({"name": (res.get("name") or "tool") if isinstance(res, dict) else "tool", "result": res})
+		produced = (env.get("result") or {}).get("produced", {}) or {}
+		for _, step in produced.items():
+			if not isinstance(step, dict):
+				continue
+			res = step.get("result") if isinstance(step.get("result"), dict) else {}
+			tool_name = step.get("name") if isinstance(step.get("name"), str) else "tool"
+			results.append({"name": tool_name, "result": res})
 		return results
 	err = (env or {}).get("error") or (env.get("result") or {}).get("error") or {}
 	# Surface full structured error; never truncate to a generic 'executor_failed'.

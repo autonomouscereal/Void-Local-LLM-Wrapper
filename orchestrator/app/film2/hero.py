@@ -17,6 +17,27 @@ def _extract_meta(frame: Dict[str, Any]) -> Dict[str, Any]:
     return {}
 
 
+def frame_image_path(frame: Dict[str, Any]) -> Optional[str]:
+    """
+    Best-effort helper to extract an image path from a film2 frame record.
+
+    Prefers explicit result.paths entries, then falls back to any meta.image_path/path
+    surfaced by _extract_meta.
+    """
+    result_obj = frame.get("result") if isinstance(frame, dict) else None
+    if isinstance(result_obj, dict):
+        paths = result_obj.get("paths")
+        if isinstance(paths, list) and paths:
+            first = paths[0]
+            if isinstance(first, str) and first:
+                return first
+    meta = _extract_meta(frame)
+    candidate = meta.get("image_path") or meta.get("path")
+    if isinstance(candidate, str) and candidate:
+        return candidate
+    return None
+
+
 def score_frame_for_locks(
     frame: Dict[str, Any],
     thresholds: Dict[str, float],

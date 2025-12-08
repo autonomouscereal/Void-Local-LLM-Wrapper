@@ -776,7 +776,8 @@ async def tool_run(req: Request):
 				if isinstance(meta_block, dict):
 					meta_block["locks"] = locks_meta
 			# Global face/identity lock score derived from the lock bundle's
-			# face embedding and the generated image.
+			# face embedding and the generated image. This is best-effort and
+			# should never break the tool, but failures must be logged.
 			try:
 				face_ref: Optional[list] = None
 				vis = lock_bundle.get("visual")
@@ -798,9 +799,14 @@ async def tool_run(req: Request):
 							# Use keys that compute_domain_qa already understands.
 							img_qa["face_lock"] = float(face_score)
 							img_qa["id_lock"] = float(face_score)
-			except Exception:
-				# Identity scoring is best-effort and should never break the tool.
-				pass
+			except Exception as ex:
+				# Identity scoring is best-effort and should never break the tool,
+				# but we still log structured errors for observability.
+				log.error(
+					"[toolrun] image.dispatch face_lock QA failed: %s",
+					str(ex),
+					exc_info=True,
+				)
 			# Trace for distillation: emit chat.append with media parts for this trace
 			trc = args.get("trace_id") or args.get("cid")
 			if isinstance(trc, str) and trc.strip():

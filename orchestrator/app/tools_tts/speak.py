@@ -4,35 +4,55 @@ import os
 import json
 from typing import Any, Dict
 import logging
+import wave
+import struct
+import math
+
 from .common import now_ts, ensure_dir, tts_edge_defaults, sidecar, stamp_env
 from ..locks import voice_embedding_from_path, tts_get_global, tts_get_voices
 from ..determinism.seeds import stamp_tool_args
 from ..artifacts.manifest import add_manifest_row
 from ..jsonio.normalize import normalize_to_envelope
 from ..jsonio.versioning import bump_envelope, assert_envelope
-from ..refs.voice import resolve_voice_lock
+from ..refs.voice import resolve_voice_lock, resolve_voice_identity
 from ..refs.registry import append_provenance
 from .export import append_tts_sample
 from ..context.index import add_artifact as _ctx_add
 from ..context.index import list_recent as _ctx_list
-import wave
-import struct
-import math
-from ..analysis.media import analyze_audio, normalize_lufs
+from ..analysis.media import analyze_audio, normalize_lufs, cosine_similarity
 from ..datasets.trace import append_sample as _trace_append
 import httpx  # type: ignore
 
 
 log = logging.getLogger(__name__)
-def _cosine_similarity(vec_a, vec_b):
-    if not vec_a or not vec_b or len(vec_a) != len(vec_b):
-        return None
-    num = sum(float(x) * float(y) for x, y in zip(vec_a, vec_b))
-    den_a = math.sqrt(sum(float(x) * float(x) for x in vec_a))
-    den_b = math.sqrt(sum(float(y) * float(y) for y in vec_b))
-    if den_a == 0.0 or den_b == 0.0:
-        return None
-    return num / (den_a * den_b)
+
+
+def _augment_voice_refs_from_context(job: dict, cid: str) -> None:
+    """
+    Best-effort helper: if no explicit voice_refs are provided but a voice_id
+    is known, pull any recent audio artifacts tagged with that voice from the
+    context index and use them as implicit voice_samples.
+    """
+    if isinstance(job.get("voice_refs"), dict):
+        return
+    vid = job.get("voice_id")
+    if not isinstance(vid, str) or not vid.strip():
+        return
+    voice_tag = f"voice:{vid.strip()}"
+    try:
+        recents = _ctx_list(cid, limit=50, kind_hint="audio")
+    except Exception:
+        return
+    samples: list[str] = []
+    for it in recents or []:
+        tags = it.get("tags") or []
+        if not any(isinstance(t, str) and t == voice_tag for t in tags):
+            continue
+        pth = it.get("path")
+        if isinstance(pth, str) and pth:
+            samples.append(pth)
+    if samples:
+        job["voice_refs"] = {"voice_samples": samples}
 
 
 def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
@@ -55,6 +75,25 @@ def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
     cid = job.get("cid") or f"tts-{now_ts()}"
     outdir = os.path.join("/workspace", "uploads", "artifacts", "audio", "tts", cid)
     ensure_dir(outdir)
+    # If no explicit refs were provided, try to infer reference samples for the
+    # requested voice_id from recent context so that music/film pipelines and
+    # prior TTS runs automatically feed into voice matching/training.
+    try:
+        _augment_voice_refs_from_context(job, cid)
+    except Exception:
+        # Context augmentation is strictly best-effort; failures should not
+        # interfere with the main TTS path.
+        pass
+    # Resolve canonical voice identity and lock from any provided voice_id / refs
+    raw_voice_id = job.get("voice_id")
+    raw_voice_refs = job.get("voice_refs") if isinstance(job.get("voice_refs"), dict) else None
+    resolved_voice_id, lock, voice_meta = resolve_voice_identity(raw_voice_id, raw_voice_refs)
+    if resolved_voice_id:
+        job["voice_id"] = resolved_voice_id
+    else:
+        # Fall back to simple lock resolution for non-ref cases so existing behavior
+        # (env defaults, lock-bundle defaults) still works.
+        lock = resolve_voice_lock(raw_voice_id, raw_voice_refs)
     params = tts_edge_defaults(
         {
             "sample_rate": job.get("sample_rate"),
@@ -63,7 +102,6 @@ def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
         },
         edge=bool(job.get("edge")),
     )
-    lock = resolve_voice_lock(job.get("voice_id"), job.get("voice_refs"))
     lock_bundle = job.get("lock_bundle") if isinstance(job.get("lock_bundle"), dict) else None
     quality_profile = job.get("quality_profile")
     # TTS-specific lock defaults from lock_bundle.tts when present
@@ -96,7 +134,137 @@ def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
     if not isinstance(lang, str) or not lang.strip():
         lang = "en"
     # Logical voice identifier used for XTTS base-speaker mapping and RVC locks.
-    logical_voice_id = job.get("voice_id") or params.get("voice") or tts_voice_id or inferred_voice
+    logical_voice_id = resolved_voice_id or job.get("voice_id") or params.get("voice") or tts_voice_id or inferred_voice
+    # Hard policy: always resolve a concrete voice_id before calling downstream
+    # XTTS/RVC/VocalFix. When missing, fall back to configured defaults instead
+    # of letting microservices raise "no speaker" style errors.
+    voice_source = "explicit"
+    if not isinstance(logical_voice_id, str) or not logical_voice_id.strip():
+        logical_voice_id = None
+        voice_source = "unset"
+    else:
+        logical_voice_id = logical_voice_id.strip()
+    if logical_voice_id is None:
+        # Try lock-bundle-provided default voice first.
+        dv = None
+        if isinstance(tts_global, dict):
+            dv = tts_global.get("default_voice_id")
+            if isinstance(dv, str) and dv.strip():
+                logical_voice_id = dv.strip()
+                voice_source = "lock_bundle_default"
+    if logical_voice_id is None:
+        # Environment-level defaults for RVC/XTTS. Prefer gender-specific
+        # defaults when a hint is available, otherwise fall back to a generic.
+        gender_hint = str(job.get("voice_gender") or "").lower()
+        default_female = os.getenv("RVC_DEFAULT_FEMALE_VOICE_ID")
+        default_male = os.getenv("RVC_DEFAULT_MALE_VOICE_ID")
+        default_generic = os.getenv("RVC_DEFAULT_VOICE_ID")
+        chosen = None
+        if "female" in gender_hint and isinstance(default_female, str) and default_female.strip():
+            chosen = default_female.strip()
+            voice_source = "env_default_female"
+        elif "male" in gender_hint and isinstance(default_male, str) and default_male.strip():
+            chosen = default_male.strip()
+            voice_source = "env_default_male"
+        elif isinstance(default_generic, str) and default_generic.strip():
+            chosen = default_generic.strip()
+            voice_source = "env_default_generic"
+        elif isinstance(default_female, str) and default_female.strip():
+            chosen = default_female.strip()
+            voice_source = "env_default_female"
+        elif isinstance(default_male, str) and default_male.strip():
+            chosen = default_male.strip()
+            voice_source = "env_default_male"
+        logical_voice_id = chosen
+    if logical_voice_id is None:
+        # Final guardrail: if we still cannot resolve a voice, fail BEFORE
+        # calling XTTS so the error surfaces explicitly in the envelope instead
+        # of as an opaque runtime from the microservice.
+        import traceback as _tb_voice
+        return {
+            "ok": False,
+            "error": {
+                "code": "voice_resolution_failed",
+                "status": 500,
+                "message": "Unable to resolve TTS voice_id; no explicit voice, lock-bundle default, or env default configured.",
+                "stack": "".join(_tb_voice.format_stack()),
+            },
+        }
+    # Log the resolved voice for traceability.
+    try:
+        log.info(
+            "[voice.resolve] cid=%s voice_id=%s source=%s",
+            cid,
+            logical_voice_id,
+            voice_source,
+        )
+    except Exception:
+        pass
+    # If new reference samples were attached for this voice, register and train
+    # the corresponding RVC model *before* conversion so this call benefits
+    # from updated weights. Training is mandatory when refs are provided.
+    new_samples = voice_meta.get("new_samples") if isinstance(voice_meta, dict) else []
+    if logical_voice_id and new_samples:
+        rvc_url_train = os.getenv("RVC_API_URL")
+        if not isinstance(rvc_url_train, str) or not rvc_url_train.strip():
+            import traceback as _tb_train_env
+            return {
+                "ok": False,
+                "error": {
+                    "code": "ValidationError",
+                    "status": 500,
+                    "message": "RVC_API_URL is not set; required for voice registration/training in tts.speak.",
+                    "stack": "".join(_tb_train_env.format_stack()),
+                },
+            }
+        payload_reg = {
+            "voice_lock_id": str(logical_voice_id),
+            "model_name": str(logical_voice_id),
+            "reference_wav_path": new_samples[0],
+            "additional_refs": new_samples[1:],
+        }
+        from ..json_parser import JSONParser as _TrainParser  # type: ignore
+
+        with httpx.Client(timeout=None, trust_env=False) as client:
+            # Voice registration
+            r_reg = client.post(rvc_url_train.rstrip("/") + "/v1/voice/register", json=payload_reg)
+            parser_reg = _TrainParser()
+            raw_reg = r_reg.text or ""
+            reg_env = parser_reg.parse_superset(raw_reg or "{}", {"ok": bool, "error": dict})["coerced"]
+            if not isinstance(reg_env, dict) or not bool(reg_env.get("ok")):
+                import traceback as _tb_reg
+                err_obj = reg_env.get("error") if isinstance(reg_env, dict) else {}
+                return {
+                    "ok": False,
+                    "error": {
+                        "code": (err_obj or {}).get("code") if isinstance(err_obj, dict) else "rvc_register_failed",
+                        "status": int(getattr(r_reg, "status_code", 500) or 500),
+                        "message": "RVC /v1/voice/register failed for tts.speak",
+                        "raw": reg_env,
+                        "stack": (err_obj or {}).get("stack") if isinstance(err_obj, dict) else _tb_reg.format_exc(),
+                    },
+                }
+            # Blocking training: ensure updated model is ready before conversion.
+            r_train = client.post(
+                rvc_url_train.rstrip("/") + "/v1/voice/train",
+                json={"voice_lock_id": str(logical_voice_id)},
+            )
+            parser_train = _TrainParser()
+            raw_train = r_train.text or ""
+            train_env = parser_train.parse_superset(raw_train or "{}", {"ok": bool, "error": dict})["coerced"]
+            if not isinstance(train_env, dict) or not bool(train_env.get("ok")):
+                import traceback as _tb_train
+                err_obj = train_env.get("error") if isinstance(train_env, dict) else {}
+                return {
+                    "ok": False,
+                    "error": {
+                        "code": (err_obj or {}).get("code") if isinstance(err_obj, dict) else "rvc_train_failed",
+                        "status": int(getattr(r_train, "status_code", 500) or 500),
+                        "message": "RVC /v1/voice/train failed for tts.speak",
+                        "raw": train_env,
+                        "stack": (err_obj or {}).get("stack") if isinstance(err_obj, dict) else _tb_train.format_exc(),
+                    },
+                }
     # Ensure each call is associated with a stable segment identifier for downstream
     # RVC conversion and Film2/audio mixing.
     seg_raw = job.get("segment_id")
@@ -363,7 +531,7 @@ def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
     if isinstance(ref_voice, list):
         voice_embed = voice_embedding_from_path(wav_path)
         if isinstance(voice_embed, list):
-            sim = _cosine_similarity(ref_voice, voice_embed)
+            sim = cosine_similarity(ref_voice, voice_embed)
             if sim is not None:
                 locks_meta["voice_score"] = max(0.0, min((sim + 1.0) / 2.0, 1.0))
                 locks_meta["voice_embedding"] = voice_embed

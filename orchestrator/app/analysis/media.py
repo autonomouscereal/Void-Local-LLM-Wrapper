@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import base64
 import os
-from typing import Any, Dict, Optional, List, Tuple
+from typing import Any, Dict, Optional, List, Tuple, Sequence
 import uuid
 
 import cv2  # type: ignore
@@ -36,6 +36,24 @@ _AESTHETIC_AVAILABLE: bool = False
 
 def _clamp01(x: float) -> float:
     return 0.0 if x <= 0.0 else 1.0 if x >= 1.0 else float(x)
+
+
+def cosine_similarity(vec_a: Sequence[float], vec_b: Sequence[float]) -> Optional[float]:
+    """
+    Generic cosine similarity helper for real-valued vectors.
+
+    Returns a value in [-1, 1] or None if inputs are empty, mismatched, or degenerate.
+    """
+    a = [float(x) for x in (vec_a or [])]
+    b = [float(x) for x in (vec_b or [])]
+    if not a or not b or len(a) != len(b):
+        return None
+    num = float(sum(x * y for x, y in zip(a, b)))
+    den_a = float(sum(x * x for x in a)) ** 0.5
+    den_b = float(sum(y * y for y in b)) ** 0.5
+    if den_a == 0.0 or den_b == 0.0:
+        return None
+    return num / (den_a * den_b)
 
 
 def _image_quality_metrics(path: str) -> Dict[str, float]:
@@ -866,6 +884,101 @@ def analyze_audio(path: str) -> Dict[str, Any]:
     except Exception:
         pass
     return out
+
+
+def audio_detect_tempo(path: str) -> Optional[float]:
+    """
+    Lightweight helper to extract tempo (BPM) for a single audio file.
+
+    Delegates to analyze_audio to share caching/logic and returns tempo_bpm
+    as a positive float when available, otherwise None.
+    """
+    info = analyze_audio(path)
+    tempo = info.get("tempo_bpm") if isinstance(info, dict) else None
+    try:
+        tempo_f = float(tempo) if tempo is not None else 0.0
+    except Exception:
+        return None
+    return tempo_f if tempo_f > 0.0 else None
+
+
+def audio_detect_key(path: str) -> Optional[str]:
+    """
+    Lightweight helper to extract musical key for a single audio file.
+
+    Uses analyze_audio's key detection and normalizes to a simple pitch-class
+    token (e.g. "C", "G#", "F") for compatibility with existing lock scoring.
+    """
+    info = analyze_audio(path)
+    key_val = info.get("key") if isinstance(info, dict) else None
+    if not isinstance(key_val, str) or not key_val.strip():
+        return None
+    base = key_val.split()[0].upper()
+    return base or None
+
+
+def key_similarity(target: Optional[str], detected: Optional[str]) -> Optional[float]:
+    """
+    Coarse key similarity in [0,1] based on pitch-class equality.
+
+    Treats None/empty as unknown and returns None, otherwise 1.0 if the base
+    pitch classes match (e.g. "C maj" vs "C minor"), else 0.0.
+    """
+    if not target or not detected:
+        return None
+    target_norm = target.split()[0].upper()
+    detected_norm = detected.upper()
+    return 1.0 if target_norm == detected_norm else 0.0
+
+
+def audio_band_energy_profile(path: str, band_map: Dict[str, Tuple[float, float]]) -> Dict[str, float]:
+    """
+    Compute a normalized energy profile over named frequency bands for an audio file.
+
+    Returns a mapping {band_name: normalized_energy} where values sum to ~1.0 when
+    any energy is present, or an empty/non-normalized dict on failure.
+    """
+    try:
+        y, sr = librosa.load(path, sr=22050)
+        if y.size == 0:
+            return {}
+        stft = librosa.stft(y)
+        magnitude = np.abs(stft)
+        freqs = librosa.fft_frequencies(sr=sr)
+        profile: Dict[str, float] = {}
+        for name, (low, high) in band_map.items():
+            mask = (freqs >= low) & (freqs < high)
+            if not np.any(mask):
+                profile[name] = 0.0
+                continue
+            energy = float(np.mean(magnitude[mask, :]))
+            profile[name] = energy
+        total = sum(profile.values())
+        if total > 0:
+            profile = {k: v / total for k, v in profile.items()}
+        return profile
+    except Exception:
+        return {}
+
+
+def stem_balance_score(target_profile: Dict[str, float], detected_profile: Dict[str, float]) -> Optional[float]:
+    """
+    Compute a coarse similarity score between target and detected stem-energy profiles.
+
+    Both profiles are interpreted as sparse distributions over the same key space;
+    cosine similarity is mapped from [-1,1] into [0,1].
+    """
+    if not target_profile or not detected_profile:
+        return None
+    keys = [k for k in target_profile.keys() if k in detected_profile]
+    if not keys:
+        return None
+    target_vec = [float(target_profile[k]) for k in keys]
+    detected_vec = [float(detected_profile[k]) for k in keys]
+    sim = cosine_similarity(target_vec, detected_vec)
+    if sim is None:
+        return None
+    return max(0.0, min((sim + 1.0) / 2.0, 1.0))
 
 
 def normalize_lufs(path: str, target_lufs: float) -> Optional[float]:

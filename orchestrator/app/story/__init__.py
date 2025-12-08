@@ -5,6 +5,7 @@ from .engine import (
     check_story_consistency,
     fix_story,
     derive_scenes_and_shots,
+    ensure_tts_locks_and_dialogue_audio,
 )
 
 __all__ = [
@@ -12,6 +13,7 @@ __all__ = [
     "check_story_consistency",
     "fix_story",
     "derive_scenes_and_shots",
+    "ensure_tts_locks_and_dialogue_audio",
 ]
 
 

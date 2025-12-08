@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import os
 import json
+from typing import List, Dict, Any
+
 from .storage import ref_dir, write_atomic
+from ..locks.builder import _blocking_voice_embedding
 
 
 def _path(ref_id: str, name: str) -> str:
@@ -16,7 +19,28 @@ def compute_face_embeddings(ref_id: str, image_paths: list[str]) -> dict:
 
 
 def compute_voice_embedding(ref_id: str, sample_paths: list[str]) -> dict:
-    emb = {"type": "voice", "items": [{"path": p, "vec": None} for p in (sample_paths or [])], "has_vectors": False}
+    """
+    Compute and persist simple voice embeddings for a voice ref.
+
+    - Uses the same blocking embedding routine as locks.builder so matching
+      is consistent with voice QA.
+    - Stores one vector per sample under items[].vec and flips has_vectors
+      to True when at least one embedding is available.
+    """
+    items: List[Dict[str, Any]] = []
+    has_vectors = False
+    for p in (sample_paths or []):
+        vec = None
+        try:
+            if isinstance(p, str) and p:
+                vec = _blocking_voice_embedding(p)
+        except Exception:
+            # Embeddings are best-effort; callers can still use raw paths.
+            vec = None
+        if isinstance(vec, list):
+            has_vectors = True
+        items.append({"path": p, "vec": vec})
+    emb: Dict[str, Any] = {"type": "voice", "items": items, "has_vectors": has_vectors}
     write_atomic(_path(ref_id, "voice_embed"), json.dumps(emb, ensure_ascii=False))
     return emb
 

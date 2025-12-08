@@ -76,6 +76,25 @@ async def comfy_history(prompt_id: str) -> Dict[str, Any]:
             return sup["coerced"]
 
 
+def comfy_is_completed(detail: Dict[str, Any]) -> bool:
+    """
+    Best-effort completion detector for a single ComfyUI history entry.
+
+    Considers explicit status.completed, common terminal status strings, or the
+    presence of any outputs as signals of completion.
+    """
+    st = detail.get("status") or {}
+    if st.get("completed") is True:
+        return True
+    s = (st.get("status") or "").lower()
+    if s in ("completed", "success", "succeeded", "done", "finished"):
+        return True
+    outs = detail.get("outputs")
+    if isinstance(outs, dict) and any(isinstance(v, list) and len(v) > 0 for v in outs.values()):
+        return True
+    return False
+
+
 async def comfy_upload_image(name_hint: str, b64_png: str) -> str:
     data = base64.b64decode(b64_png)
     filename = f"{name_hint or 'ref'}_{uuid.uuid4().hex[:8]}.png"

@@ -2,12 +2,18 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 import json
+import os
 import traceback
 
 from ..analysis.media import analyze_audio, _load_audio  # type: ignore
 from ..json_parser import JSONParser
 from ..committee_client import committee_jsonify  # type: ignore
 from .style_pack import _embed_music_clap, _cos_sim, MusicEvalError
+
+
+MUSIC_HERO_QUALITY_MIN = 0.85
+MUSIC_HERO_FIT_MIN = 0.85
+_MUSIC_ACCEPT_THRESHOLDS: Dict[str, float] | None = None
 
 
 def _map_technical_to_score(metrics: Dict[str, Any]) -> float:
@@ -394,5 +400,32 @@ def compute_music_eval(
         "aesthetic": aesthetic,
         "overall": overall,
     }
+
+
+def get_music_acceptance_thresholds() -> Dict[str, float]:
+    """
+    Load music acceptance thresholds from review/acceptance_audio.json.
+
+    This helper enforces that the config must exist and be well-formed; any
+    failure here will surface as an exception instead of silently falling back.
+    """
+    global _MUSIC_ACCEPT_THRESHOLDS
+    if _MUSIC_ACCEPT_THRESHOLDS is not None:
+        return _MUSIC_ACCEPT_THRESHOLDS
+    # acceptance_audio.json lives at orchestrator/app/review/acceptance_audio.json
+    root_dir = os.path.dirname(os.path.dirname(__file__))
+    cfg_path = os.path.join(root_dir, "review", "acceptance_audio.json")
+    with open(cfg_path, "r", encoding="utf-8") as f:
+        txt = f.read()
+    parser = JSONParser()
+    cfg = parser.parse_superset(txt or "{}", {"music": dict})["coerced"]
+    music_cfg = cfg.get("music") if isinstance(cfg.get("music"), dict) else {}
+    overall_min = float(music_cfg.get("overall_quality_min"))
+    fit_min = float(music_cfg.get("fit_score_min"))
+    _MUSIC_ACCEPT_THRESHOLDS = {
+        "overall_quality_min": overall_min,
+        "fit_score_min": fit_min,
+    }
+    return _MUSIC_ACCEPT_THRESHOLDS
 
 

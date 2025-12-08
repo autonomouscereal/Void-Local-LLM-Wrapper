@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import base64
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Callable
 
 from .store import upsert_lock_bundle
 from .builder import build_image_bundle
@@ -305,6 +305,46 @@ def migrate_visual_bundle(bundle: Dict[str, Any]) -> Dict[str, Any]:
     return bundle
 
 
+def merge_lock_bundles(existing: Dict[str, Any], update: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Merge an updated lock bundle into an existing one, preserving schema
+    invariants and migrating into the latest visual/music/tts/sfx/film2 shape.
+    """
+    base: Dict[str, Any] = dict(existing or {})
+    for key in ("schema_version", "character_id"):
+        if update.get(key) is not None:
+            base[key] = update[key]
+    for section in ("face", "pose", "style", "audio"):
+        existing_section = base.get(section) if isinstance(base.get(section), dict) else {}
+        update_section = update.get(section) if isinstance(update.get(section), dict) else {}
+        merged = dict(existing_section or {})
+        for subkey, value in update_section.items():
+            merged[subkey] = value
+        if merged:
+            base[section] = merged
+    existing_regions = base.get("regions") if isinstance(base.get("regions"), dict) else {}
+    update_regions = update.get("regions") if isinstance(update.get("regions"), dict) else {}
+    if update_regions:
+        merged_regions = dict(existing_regions or {})
+        for region_id, region_data in update_regions.items():
+            if isinstance(region_data, dict):
+                merged_regions[region_id] = dict(region_data)
+        base["regions"] = merged_regions
+    existing_scene = base.get("scene") if isinstance(base.get("scene"), dict) else {}
+    update_scene = update.get("scene") if isinstance(update.get("scene"), dict) else {}
+    if update_scene:
+        merged_scene = dict(existing_scene or {})
+        merged_scene.update(update_scene)
+        base["scene"] = merged_scene
+    # Ensure any newer branches (visual/music/tts/sfx/film2) are present and schema_version bumped.
+    base = migrate_visual_bundle(base)
+    base = migrate_music_bundle(base)
+    base = migrate_tts_bundle(base)
+    base = migrate_sfx_bundle(base)
+    base = migrate_film2_bundle(base)
+    return base
+
+
 def music_get_voices(bundle: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Return the list of music voices from a lock bundle (may be empty)."""
     mus = _get_music(bundle)
@@ -415,6 +455,431 @@ def film2_get_project(bundle: Dict[str, Any]) -> Dict[str, Any]:
     film2 = _get_film2(bundle)
     proj = film2.get("project")
     return proj if isinstance(proj, dict) else {}
+
+
+async def ensure_visual_lock_bundle(character_id: str, bundle: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Ensure that a character-scoped lock bundle exists with a minimal visual
+    skeleton suitable for image/film generation flows.
+
+    If an existing bundle is provided it is returned unchanged (after an
+    upsert); otherwise a new skeleton bundle is created and persisted.
+    """
+    if not isinstance(character_id, str) or not character_id.strip():
+        return bundle or {}
+    if not isinstance(bundle, dict):
+        bundle = {
+            "schema_version": 2,
+            "character_id": character_id.strip(),
+            "face": {},
+            "pose": {},
+            "style": {},
+            "audio": {},
+            "regions": {},
+            "scene": {
+                "background_embedding": None,
+                "camera_style_tags": [],
+                "lighting_tags": [],
+                "lock_mode": "soft",
+            },
+        }
+    await upsert_lock_bundle(character_id.strip(), bundle)
+    return bundle
+
+
+async def ensure_tts_lock_bundle(character_id: str, bundle: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Ensure that a character-scoped lock bundle exists with a minimal TTS/audio
+    skeleton suitable for speech generation flows.
+
+    If an existing bundle is provided it is returned unchanged (after an
+    upsert); otherwise a new skeleton bundle is created and persisted.
+    """
+    if not isinstance(character_id, str) or not character_id.strip():
+        return bundle or {}
+    if not isinstance(bundle, dict):
+        bundle = {
+            "schema_version": 2,
+            "character_id": character_id.strip(),
+            "tts": {},
+            "audio": {},
+        }
+    await upsert_lock_bundle(character_id.strip(), bundle)
+    return bundle
+
+
+def summarize_visual_bundle_for_context(
+    ctx_add: Callable[[str, str, str, Optional[str], Optional[int], List[str], Dict[str, Any]], None],
+    character_id: str,
+    bundle: Dict[str, Any],
+) -> None:
+    """
+    Emit lightweight text/symbol summaries of visual locks into OmniContext.
+
+    This creates per-entity artifacts keyed by entity_id so natural-language
+    references like "that flower on the left" can be resolved to entities.
+    """
+    if not isinstance(character_id, str) or not character_id:
+        return
+    vis = bundle.get("visual")
+    if not isinstance(vis, dict):
+        return
+    entities = vis.get("entities")
+    if not isinstance(entities, list):
+        return
+    for ent in entities:
+        if not isinstance(ent, dict):
+            continue
+        ent_id = ent.get("entity_id")
+        if not isinstance(ent_id, str) or not ent_id:
+            continue
+        ent_type = ent.get("entity_type") or "object"
+        role = ent.get("role") or ""
+        region = ent.get("region") if isinstance(ent.get("region"), dict) else {}
+        bbox = region.get("bbox")
+        tags: List[str] = ["entity", f"entity_type:{ent_type}"]
+        if isinstance(role, str) and role:
+            tags.append(f"role:{role}")
+        text_desc = f"{ent_type} {role} (entity_id={ent_id}) for character {character_id}"
+        meta = {
+            "text": text_desc,
+            "entity_id": ent_id,
+            "entity_type": ent_type,
+            "role": role,
+            "bbox": bbox,
+        }
+        # Use entity_id as a synthetic path key; context index does not require an actual file.
+        ctx_add(character_id, "image.entity", ent_id, None, None, tags, meta)
+
+
+def summarize_music_bundle_for_context(
+    ctx_add: Callable[[str, str, str, Optional[str], Optional[int], List[str], Dict[str, Any]], None],
+    character_id: str,
+    bundle: Dict[str, Any],
+) -> None:
+    """
+    Emit lightweight summaries of music locks (voices/sections/motifs) into OmniContext.
+    """
+    if not isinstance(character_id, str) or not character_id:
+        return
+    mus = bundle.get("music")
+    if not isinstance(mus, dict):
+        return
+    # Voices
+    voices = mus.get("voices")
+    if isinstance(voices, list):
+        for v in voices:
+            if not isinstance(v, dict):
+                continue
+            vid = v.get("voice_id")
+            if not isinstance(vid, str) or not vid:
+                continue
+            role = v.get("role") or ""
+            tags: List[str] = ["music.voice"]
+            if isinstance(role, str) and role:
+                tags.append(f"role:{role}")
+            text_desc = f"music voice {vid} ({role}) for character {character_id}"
+            meta = {
+                "text": text_desc,
+                "voice_id": vid,
+                "role": role,
+                "style_tags": list(v.get("style_tags") or []),
+            }
+            ctx_add(character_id, "audio.voice", vid, None, None, tags, meta)
+    # Sections
+    sections = mus.get("sections")
+    if isinstance(sections, list):
+        for sec in sections:
+            if not isinstance(sec, dict):
+                continue
+            sid = sec.get("section_id")
+            if not isinstance(sid, str) or not sid:
+                continue
+            stype = sec.get("type") or ""
+            tags = ["music.section"]
+            if isinstance(stype, str) and stype:
+                tags.append(f"type:{stype}")
+            text_desc = f"music section {sid} ({stype}) for character {character_id}"
+            meta = {
+                "text": text_desc,
+                "section_id": sid,
+                "type": stype,
+                "order_index": sec.get("order_index"),
+                "bar_start": sec.get("bar_start"),
+                "bar_end": sec.get("bar_end"),
+            }
+            ctx_add(character_id, "audio.section", sid, None, None, tags, meta)
+    # Motifs
+    motifs = mus.get("motifs")
+    if isinstance(motifs, list):
+        for m in motifs:
+            if not isinstance(m, dict):
+                continue
+            mid = m.get("motif_id")
+            if not isinstance(mid, str) or not mid:
+                continue
+            role = m.get("role") or ""
+            tags = ["music.motif"]
+            if isinstance(role, str) and role:
+                tags.append(f"role:{role}")
+            text_desc = f"music motif {mid} ({role}) for character {character_id}"
+            meta = {
+                "text": text_desc,
+                "motif_id": mid,
+                "role": role,
+                "source_section_id": m.get("source_section_id"),
+            }
+            ctx_add(character_id, "audio.motif", mid, None, None, tags, meta)
+
+
+def summarize_tts_bundle_for_context(
+    ctx_add: Callable[[str, str, str, Optional[str], Optional[int], List[str], Dict[str, Any]], None],
+    character_id: str,
+    bundle: Dict[str, Any],
+) -> None:
+    """
+    Summarize TTS voices/styles/segments into OmniContext.
+    """
+    if not isinstance(character_id, str) or not character_id:
+        return
+    tts = bundle.get("tts")
+    if not isinstance(tts, dict):
+        return
+    # Voices
+    voices = tts.get("voices")
+    if isinstance(voices, list):
+        for v in voices:
+            if not isinstance(v, dict):
+                continue
+            vid = v.get("voice_id")
+            if not isinstance(vid, str) or not vid:
+                continue
+            role = v.get("role") or ""
+            tags = ["tts.voice"]
+            if isinstance(role, str) and role:
+                tags.append(f"role:{role}")
+            text_desc = f"tts voice {vid} ({role}) for character {character_id}"
+            meta = {
+                "text": text_desc,
+                "voice_id": vid,
+                "role": role,
+                "style_tags": list(v.get("style_tags") or []),
+            }
+            ctx_add(character_id, "tts.voice", vid, None, None, tags, meta)
+    # Styles
+    styles = tts.get("styles")
+    if isinstance(styles, list):
+        for s in styles:
+            if not isinstance(s, dict):
+                continue
+            sid = s.get("style_id")
+            if not isinstance(sid, str) or not sid:
+                continue
+            name = s.get("name") or ""
+            tags = ["tts.style"]
+            text_desc = f"tts style {sid} ({name})"
+            meta = {
+                "text": text_desc,
+                "style_id": sid,
+                "name": name,
+                "tags": list(s.get("tags") or []),
+            }
+            ctx_add(character_id, "tts.style", sid, None, None, tags, meta)
+    # Segments
+    segments = tts.get("segments")
+    if isinstance(segments, list):
+        for seg in segments:
+            if not isinstance(seg, dict):
+                continue
+            seg_id = seg.get("segment_id")
+            if not isinstance(seg_id, str) or not seg_id:
+                continue
+            text_ref = seg.get("text_ref") if isinstance(seg.get("text_ref"), dict) else {}
+            txt = text_ref.get("text") or ""
+            tags = ["tts.segment"]
+            text_desc = f"tts segment {seg_id} text={txt!r}"
+            meta = {
+                "text": text_desc,
+                "segment_id": seg_id,
+                "scene_id": seg.get("scene_id"),
+                "line_index": seg.get("line_index"),
+            }
+            ctx_add(character_id, "tts.segment", seg_id, None, None, tags, meta)
+
+
+def summarize_sfx_bundle_for_context(
+    ctx_add: Callable[[str, str, str, Optional[str], Optional[int], List[str], Dict[str, Any]], None],
+    character_id: str,
+    bundle: Dict[str, Any],
+) -> None:
+    """
+    Summarize SFX assets/layers/events/ambiences into OmniContext.
+    """
+    if not isinstance(character_id, str) or not character_id:
+        return
+    sfx = bundle.get("sfx")
+    if not isinstance(sfx, dict):
+        return
+    assets = sfx.get("assets")
+    if isinstance(assets, list):
+        for a in assets:
+            if not isinstance(a, dict):
+                continue
+            aid = a.get("asset_id")
+            if not isinstance(aid, str) or not aid:
+                continue
+            tags = ["sfx.asset"]
+            tags.extend(list(a.get("tags") or []))
+            text_desc = f"sfx asset {aid} for character {character_id}"
+            meta = {
+                "text": text_desc,
+                "asset_id": aid,
+                "ucs": a.get("ucs"),
+                "tags": a.get("tags"),
+            }
+            ctx_add(character_id, "sfx.asset", aid, None, None, tags, meta)
+    layers = sfx.get("layers")
+    if isinstance(layers, list):
+        for layer in layers:
+            if not isinstance(layer, dict):
+                continue
+            lid = layer.get("layer_id")
+            if not isinstance(lid, str) or not lid:
+                continue
+            role = layer.get("role") or ""
+            tags = ["sfx.layer"]
+            if isinstance(role, str) and role:
+                tags.append(f"role:{role}")
+            text_desc = f"sfx layer {lid} ({role}) for character {character_id}"
+            meta = {
+                "text": text_desc,
+                "layer_id": lid,
+                "role": role,
+                "components": layer.get("components"),
+            }
+            ctx_add(character_id, "sfx.layer", lid, None, None, tags, meta)
+    events = sfx.get("events")
+    if isinstance(events, list):
+        for ev in events:
+            if not isinstance(ev, dict):
+                continue
+            eid = ev.get("event_id")
+            if not isinstance(eid, str) or not eid:
+                continue
+            role = ev.get("role") or ""
+            tags = ["sfx.event"]
+            if isinstance(role, str) and role:
+                tags.append(f"role:{role}")
+            text_desc = f"sfx event {eid} ({role})"
+            meta = {
+                "text": text_desc,
+                "event_id": eid,
+                "scene_id": ev.get("scene_id"),
+                "shot_id": ev.get("shot_id"),
+            }
+            ctx_add(character_id, "sfx.event", eid, None, None, tags, meta)
+    ambs = sfx.get("ambiences")
+    if isinstance(ambs, list):
+        for amb in ambs:
+            if not isinstance(amb, dict):
+                continue
+            amb_id = amb.get("ambience_id")
+            if not isinstance(amb_id, str) or not amb_id:
+                continue
+            tags = ["sfx.ambience"]
+            tags.extend(list(amb.get("tags") or []))
+            text_desc = f"sfx ambience {amb_id} for character {character_id}"
+            meta = {
+                "text": text_desc,
+                "ambience_id": amb_id,
+                "ucs": amb.get("ucs"),
+                "tags": amb.get("tags"),
+            }
+            ctx_add(character_id, "sfx.ambience", amb_id, None, None, tags, meta)
+
+
+def summarize_film2_bundle_for_context(
+    ctx_add: Callable[[str, str, str, Optional[str], Optional[int], List[str], Dict[str, Any]], None],
+    character_id: str,
+    bundle: Dict[str, Any],
+) -> None:
+    """
+    Summarize film scenes/shots/segments into OmniContext.
+    """
+    if not isinstance(character_id, str) or not character_id:
+        return
+    film2 = bundle.get("film2")
+    if not isinstance(film2, dict):
+        return
+    scenes = film2.get("scenes")
+    if isinstance(scenes, list):
+        for sc in scenes:
+            if not isinstance(sc, dict):
+                continue
+            sid = sc.get("scene_id")
+            if not isinstance(sid, str) or not sid:
+                continue
+            slug = ((sc.get("script_ref") or {}) or {}).get("slugline")
+            tags = ["film2.scene"]
+            text_desc = f"film2 scene {sid} slugline={slug!r}"
+            meta = {
+                "text": text_desc,
+                "scene_id": sid,
+                "sequence_id": sc.get("sequence_id"),
+                "tags": sc.get("tags"),
+            }
+            ctx_add(character_id, "film2.scene", sid, None, None, tags, meta)
+    shots = film2.get("shots")
+    if isinstance(shots, list):
+        for sh in shots:
+            if not isinstance(sh, dict):
+                continue
+            shot_id = sh.get("shot_id")
+            if not isinstance(shot_id, str) or not shot_id:
+                continue
+            scene_id = sh.get("scene_id")
+            tags = ["film2.shot"]
+            text_desc = f"film2 shot {shot_id} in scene {scene_id}"
+            meta = {
+                "text": text_desc,
+                "shot_id": shot_id,
+                "scene_id": scene_id,
+                "dominant_characters": sh.get("dominant_characters"),
+            }
+            ctx_add(character_id, "film2.shot", shot_id, None, None, tags, meta)
+    segments = film2.get("segments")
+    if isinstance(segments, list):
+        for seg in segments:
+            if not isinstance(seg, dict):
+                continue
+            seg_id = seg.get("segment_id")
+            if not isinstance(seg_id, str) or not seg_id:
+                continue
+            shot_id = seg.get("shot_id")
+            tags = ["film2.segment"]
+            text_desc = f"film2 segment {seg_id} (shot {shot_id})"
+            meta = {
+                "text": text_desc,
+                "segment_id": seg_id,
+                "shot_id": shot_id,
+                "scene_id": seg.get("scene_id"),
+            }
+            ctx_add(character_id, "film2.segment", seg_id, None, None, tags, meta)
+
+
+def summarize_all_locks_for_context(
+    ctx_add: Callable[[str, str, str, Optional[str], Optional[int], List[str], Dict[str, Any]], None],
+    character_id: str,
+    bundle: Dict[str, Any],
+) -> None:
+    """
+    Convenience helper: summarize all lock branches into context for a character.
+    """
+    summarize_visual_bundle_for_context(ctx_add, character_id, bundle)
+    summarize_music_bundle_for_context(ctx_add, character_id, bundle)
+    summarize_tts_bundle_for_context(ctx_add, character_id, bundle)
+    summarize_sfx_bundle_for_context(ctx_add, character_id, bundle)
+    summarize_film2_bundle_for_context(ctx_add, character_id, bundle)
 
 
 def film2_get_sequences(bundle: Dict[str, Any]) -> List[Dict[str, Any]]:

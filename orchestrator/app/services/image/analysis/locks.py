@@ -1,21 +1,9 @@
 from __future__ import annotations
 
-import math
 from typing import Any, Dict, List, Optional
 
-from ....analysis.media import analyze_image
+from ....analysis.media import analyze_image, cosine_similarity
 from ....locks.builder import _compute_face_embedding
-
-
-def _cosine_similarity(vec_a: List[float], vec_b: List[float]) -> Optional[float]:
-    if not vec_a or not vec_b or len(vec_a) != len(vec_b):
-        return None
-    num = sum(float(x) * float(y) for x, y in zip(vec_a, vec_b))
-    den_a = math.sqrt(sum(float(x) * float(x) for x in vec_a))
-    den_b = math.sqrt(sum(float(y) * float(y) for y in vec_b))
-    if den_a == 0.0 or den_b == 0.0:
-        return None
-    return num / (den_a * den_b)
 
 
 def _normalize_similarity(sim: Optional[float]) -> Optional[float]:
@@ -67,7 +55,7 @@ async def compute_face_lock_score(image_path: str, ref_embedding: List[float]) -
     if not isinstance(img_vec, list):
         return None
 
-    sim = _cosine_similarity(ref_vec, img_vec)  # type: ignore[arg-type]
+    sim = cosine_similarity(ref_vec, img_vec)  # type: ignore[arg-type]
     return _normalize_similarity(sim)
 
 
@@ -93,7 +81,7 @@ async def compute_style_similarity(image_path: str, style_ref: Dict[str, Any]) -
             img_vec.append(float(x))
         else:
             return None
-    sim = _cosine_similarity(img_vec, ref_vec)
+    sim = cosine_similarity(img_vec, ref_vec)
     return _normalize_similarity(sim)
 
 
@@ -119,7 +107,7 @@ async def compute_pose_similarity(image_path: str, pose_ref: Dict[str, Any]) -> 
             img_vec.append(float(x))
         else:
             return None
-    sim = _cosine_similarity(img_vec, ref_vec)
+    sim = cosine_similarity(img_vec, ref_vec)
     return _normalize_similarity(sim)
 
 
@@ -165,11 +153,11 @@ async def compute_region_scores(image_path: str, region_data: Dict[str, Any]) ->
     texture_score = None
     clip_lock = None
     if img_vec is not None and shape_vec is not None:
-        shape_score = _normalize_similarity(_cosine_similarity(img_vec, shape_vec))
+        shape_score = _normalize_similarity(cosine_similarity(img_vec, shape_vec))
     if img_vec is not None and texture_vec is not None:
-        texture_score = _normalize_similarity(_cosine_similarity(img_vec, texture_vec))
+        texture_score = _normalize_similarity(cosine_similarity(img_vec, texture_vec))
     if img_vec is not None and clip_vec is not None:
-        clip_lock = _normalize_similarity(_cosine_similarity(img_vec, clip_vec))
+        clip_lock = _normalize_similarity(cosine_similarity(img_vec, clip_vec))
     # Color score is left as None for now; populate later when color histograms are available.
     return {
         "shape_score": shape_score,

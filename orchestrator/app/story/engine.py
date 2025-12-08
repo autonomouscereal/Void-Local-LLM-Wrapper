@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Callable, Awaitable
+
+from ..datasets.trace import append_sample as _trace_append
 
 
 def draft_story_graph(user_prompt: str, duration_hint_s: Optional[float]) -> Dict[str, Any]:
@@ -258,6 +260,124 @@ def check_story_consistency(story: Dict[str, Any], user_prompt: str) -> List[Dic
                         state_entry[key] = val
                     character_state[target] = state_entry
     return issues
+
+
+async def ensure_tts_locks_and_dialogue_audio(
+    story: Dict[str, Any],
+    locks_arg: Dict[str, Any],
+    profile_name: str,
+    trace_id: Optional[str],
+    tts_runner: Callable[[Dict[str, Any]], Awaitable[Dict[str, Any]]],
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """
+    Ensure basic TTS lock entries and pre-generate dialogue audio for lines in the story.
+
+    Returns an updated lock bundle and a dialogue_index mapping line_id -> metadata.
+    """
+    updated_locks = dict(locks_arg) if isinstance(locks_arg, dict) else {}
+    dialogue_index: Dict[str, Any] = {}
+    if not isinstance(story, dict):
+        return updated_locks, dialogue_index
+    acts = story.get("acts") if isinstance(story.get("acts"), list) else []
+    characters = story.get("characters") if isinstance(story.get("characters"), list) else []
+    character_ids = [c.get("char_id") for c in characters if isinstance(c, dict) and isinstance(c.get("char_id"), str)]
+    # Ensure a basic TTS lock branch exists per character
+    tts_branch = updated_locks.get("tts")
+    if not isinstance(tts_branch, dict):
+        tts_branch = {}
+        updated_locks["tts"] = tts_branch
+    char_voice_locks = tts_branch.get("characters")
+    if not isinstance(char_voice_locks, dict):
+        char_voice_locks = {}
+        tts_branch["characters"] = char_voice_locks
+    for c_id in character_ids:
+        if not isinstance(c_id, str) or not c_id:
+            continue
+        if c_id not in char_voice_locks:
+            char_voice_locks[c_id] = {
+                "char_id": c_id,
+                "voice_profile": {
+                    "description": f"Default voice profile for {c_id} based on story context",
+                },
+            }
+    # Collect dialogue lines
+    for act in acts:
+        scenes = act.get("scenes") if isinstance(act.get("scenes"), list) else []
+        for scene in scenes:
+            beats = scene.get("beats") if isinstance(scene.get("beats"), list) else []
+            for beat in beats:
+                lines = beat.get("dialogue") if isinstance(beat.get("dialogue"), list) else []
+                for line in lines:
+                    if not isinstance(line, dict):
+                        continue
+                    line_id = line.get("line_id")
+                    speaker = line.get("speaker")
+                    text = line.get("text")
+                    if not isinstance(line_id, str) or not line_id or not isinstance(text, str) or not text.strip():
+                        continue
+                    if not isinstance(speaker, str) or not speaker:
+                        continue
+                    dialogue_index[line_id] = {
+                        "char_id": speaker,
+                        "text": text,
+                        "audio_path": None,
+                        "duration_s": None,
+                        "error": None,
+                    }
+    if not dialogue_index:
+        return updated_locks, dialogue_index
+    # Pre-generate audio via tts.speak for each unique line
+    for line_id, entry in dialogue_index.items():
+        speaker = entry.get("char_id")
+        text = entry.get("text")
+        if not isinstance(speaker, str) or not isinstance(text, str):
+            continue
+        args_tts: Dict[str, Any] = {
+            "text": text,
+            "cid": trace_id or "",
+            "quality_profile": profile_name,
+        }
+        if isinstance(updated_locks, dict) and updated_locks:
+            args_tts["lock_bundle"] = updated_locks
+        args_tts["character_id"] = speaker
+        res = await tts_runner({"name": "tts.speak", "arguments": args_tts})
+        if isinstance(res, Dict) and isinstance(res.get("result"), dict):
+            r = res.get("result") or {}
+            meta_audio = r.get("meta") if isinstance(r.get("meta"), dict) else {}
+            ids_audio = r.get("ids") if isinstance(r.get("ids"), dict) else {}
+            audio_id = ids_audio.get("audio_id")
+            url = meta_audio.get("url")
+            if isinstance(audio_id, str) and audio_id:
+                entry["audio_path"] = audio_id
+            elif isinstance(url, str) and url:
+                entry["audio_path"] = url
+            dur = meta_audio.get("full_duration_s")
+            if isinstance(dur, (int, float)):
+                entry["duration_s"] = float(dur)
+            _trace_append(
+                "film2",
+                {
+                    "event": "tts_dialogue_generated",
+                    "line_id": line_id,
+                    "char_id": speaker,
+                    "text": (text[:128] if isinstance(text, str) else ""),
+                    "audio_path": entry.get("audio_path"),
+                    "duration_s": entry.get("duration_s"),
+                    "quality_profile": profile_name,
+                },
+            )
+        elif isinstance(res, Dict) and res.get("error") is not None:
+            entry["error"] = str(res.get("error"))
+            _trace_append(
+                "film2",
+                {
+                    "event": "tts_dialogue_failed",
+                    "line_id": line_id,
+                    "char_id": speaker,
+                    "error": str(res.get("error")),
+                },
+            )
+    return updated_locks, dialogue_index
 
 
 def fix_story(story: Dict[str, Any], issues: List[Dict[str, Any]]) -> Dict[str, Any]:
