@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import Dict, List, Set
 
 
 # Minimal tool catalog for shape validation only (not routing)
@@ -27,4 +27,12 @@ REQUIRED_INPUTS: Dict[str, List[str]] = {
     "http.request": ["url", "method"],
 }
 
+# Planner-visible tool whitelist: only expose the four generative front doors.
+# All other tools (locks, SFX, HTTP, search, analysis) remain internal-only.
+PLANNER_VISIBLE_TOOLS: Set[str] = {
+    "image.dispatch",
+    "music.infinite.windowed",
+    "film2.run",
+    "tts.speak",
+}
 

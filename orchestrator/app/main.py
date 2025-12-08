@@ -239,6 +239,7 @@ from .analysis.media import analyze_image as _analyze_image
 from .artifacts.manifest import add_manifest_row as _man_add, write_manifest_atomic as _man_write
 from .datasets.trace import append_sample as _trace_append
 from .review.referee import build_delta_plan as _committee, postrun_committee_decide
+from .plan.catalog import PLANNER_VISIBLE_TOOLS
 from .qa.segments import (
     build_segments_for_tool,
     ALLOWED_PATCH_TOOLS,
@@ -273,16 +274,6 @@ ACTION_TOOL_NAMES = {
     "film2.run",      # Film-2 front door (planner-visible)
     "tts.speak",
 }
-
-# Planner-visible tool whitelist: only expose the four generative front doors.
-# All other tools (locks, SFX, HTTP, search, analysis) remain internal-only.
-PLANNER_VISIBLE_TOOLS = {
-    "image.dispatch",
-    "music.infinite.windowed",
-    "film2.run",
-    "tts.speak",
-}
-
 
 def _filter_tool_names_by_mode(names: List[str], mode: Optional[str]) -> List[str]:
     """
