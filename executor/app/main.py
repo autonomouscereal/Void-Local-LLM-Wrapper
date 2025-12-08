@@ -355,14 +355,15 @@ async def execute_plan(body: Dict[str, Any]):
         for need in (step.get("needs") or []):
             if need in produced and isinstance(produced[need], dict):
                 inputs.update(produced[need])
-        # Attach trace metadata for orchestrator tracing
+        # Attach trace metadata for orchestrator tracing; overwrite any caller-
+        # supplied values so ids remain fully server-controlled.
         rid = plan_obj.get("request_id") if isinstance(plan_obj.get("request_id"), str) else None
         if rid:
-            inputs.setdefault("cid", rid)
-            inputs.setdefault("trace_id", rid)
+            inputs["cid"] = rid
+            inputs["trace_id"] = rid
         sid_local = (step.get("id") or "").strip()
         if sid_local:
-            inputs.setdefault("step_id", sid_local)
+            inputs["step_id"] = sid_local
         return inputs
 
     pending = set(norm_steps.keys())
@@ -499,12 +500,13 @@ async def run_steps(trace_id: str, request_id: str, steps: list[dict]) -> Dict[s
         for need in (step.get("needs") or []):
             if need in produced and isinstance(produced[need], dict):
                 merged.update(produced[need])
+        # IDs are server-only; overwrite any upstream/model-provided values.
         if request_id:
-            merged.setdefault("cid", request_id)
-            merged.setdefault("trace_id", request_id)
+            merged["cid"] = request_id
+            merged["trace_id"] = request_id
         sid_local = (step.get("id") or "").strip()
         if sid_local:
-            merged.setdefault("step_id", sid_local)
+            merged["step_id"] = sid_local
         return merged
 
     pending = set(norm_steps.keys())

@@ -65,9 +65,7 @@ def get_builtin_tools_schema() -> List[Dict[str, Any]]:
 						"interpolate": {"type": "boolean"},
 						"scale": {"type": "number"},
 						"quality_profile": {"type": "string"},
-						"locks": {"type": "object"},
-						"cid": {"type": "string"},
-						"trace_id": {"type": "string"}
+						"locks": {"type": "object"}
 					},
 					"required": []
 				}
@@ -84,14 +82,14 @@ def get_builtin_tools_schema() -> List[Dict[str, Any]]:
 			"type": "function",
 			"function": {
 				"name": "creative.pro_polish",
-				"parameters": {"type": "object", "properties": {"kind": {"type": "string"}, "src": {"type": "string"}, "strength": {"type": "number"}, "cid": {"type": "string"}}, "required": ["kind", "src"]}
+				"parameters": {"type": "object", "properties": {"kind": {"type": "string"}, "src": {"type": "string"}, "strength": {"type": "number"}}, "required": ["kind", "src"]}
 			}
 		},
 		{
 			"type": "function",
 			"function": {
 				"name": "creative.repro_pack",
-				"parameters": {"type": "object", "properties": {"tool": {"type": "string"}, "args": {"type": "object"}, "artifact_path": {"type": "string"}, "cid": {"type": "string"}}, "required": ["tool", "args"]}
+				"parameters": {"type": "object", "properties": {"tool": {"type": "string"}, "args": {"type": "object"}, "artifact_path": {"type": "string"}}, "required": ["tool", "args"]}
 			}
 		},
 		{
@@ -131,8 +129,7 @@ def get_builtin_tools_schema() -> List[Dict[str, Any]]:
 					"properties": {
 						"mix_wav": {"type": "string"},
 						"stem_gains": {"type": "object"},
-						"stems": {"type": "array", "items": {"type": "string"}},
-						"cid": {"type": "string"}
+						"stems": {"type": "array", "items": {"type": "string"}}
 					},
 					"required": ["mix_wav"]
 				}
@@ -147,8 +144,7 @@ def get_builtin_tools_schema() -> List[Dict[str, Any]]:
 					"properties": {
 						"mix_wav": {"type": "string"},
 						"pitch_shift_semitones": {"type": "number"},
-						"voice_lock_id": {"type": "string"},
-						"cid": {"type": "string"}
+						"voice_lock_id": {"type": "string"}
 					},
 					"required": ["mix_wav"]
 				}
@@ -192,7 +188,6 @@ def get_builtin_tools_schema() -> List[Dict[str, Any]]:
 							}
 						},
 						"changed_line_ids": {"type": "array", "items": {"type": "string"}},
-						"cid": {"type": "string"},
 						"character_id": {"type": "string"},
 						"lock_bundle": {"type": "object"}
 					},
@@ -308,7 +303,6 @@ def get_builtin_tools_schema() -> List[Dict[str, Any]]:
 					"type": "object",
 					"properties": {
 						"segment_id": {"type": "string"},
-						"cid": {"type": "string"},
 						"prompt": {"type": "string"},
 						"lock_bundle": {"type": "object"},
 						"quality_profile": {"type": "string"},
@@ -324,35 +318,35 @@ def get_builtin_tools_schema() -> List[Dict[str, Any]]:
 			"type": "function",
 			"function": {
 				"name": "image.edit",
-				"parameters": {"type": "object", "properties": {"image_ref": {"type": "string"}, "mask_ref": {"type": "string"}, "prompt": {"type": "string"}, "negative": {"type": "string"}, "size": {"type": "string"}, "seed": {"type": "integer"}, "refs": {"type": "object"}, "cid": {"type": "string"}}, "required": ["image_ref", "prompt"]}
+				"parameters": {"type": "object", "properties": {"image_ref": {"type": "string"}, "mask_ref": {"type": "string"}, "prompt": {"type": "string"}, "negative": {"type": "string"}, "size": {"type": "string"}, "seed": {"type": "integer"}, "refs": {"type": "object"}}, "required": ["image_ref", "prompt"]}
 			}
 		},
 		{
 			"type": "function",
 			"function": {
 				"name": "image.upscale",
-				"parameters": {"type": "object", "properties": {"image_ref": {"type": "string"}, "scale": {"type": "integer"}, "denoise": {"type": "number"}, "seed": {"type": "integer"}, "cid": {"type": "string"}}, "required": ["image_ref"]}
+				"parameters": {"type": "object", "properties": {"image_ref": {"type": "string"}, "scale": {"type": "integer"}, "denoise": {"type": "number"}, "seed": {"type": "integer"}}, "required": ["image_ref"]}
 			}
 		},
 		{
 			"type": "function",
 			"function": {
 				"name": "image.super_gen",
-				"parameters": {"type": "object", "properties": {"prompt": {"type": "string"}, "size": {"type": "string"}, "refs": {"type": "object"}, "seed": {"type": "integer"}, "cid": {"type": "string"}}, "required": ["prompt"]}
+				"parameters": {"type": "object", "properties": {"prompt": {"type": "string"}, "size": {"type": "string"}, "refs": {"type": "object"}, "seed": {"type": "integer"}}, "required": ["prompt"]}
 			}
 		},
 		{
 			"type": "function",
 			"function": {
 				"name": "music.variation",
-				"parameters": {"type": "object", "properties": {"variation_of": {"type": "string"}, "n": {"type": "integer"}, "intensity": {"type": "number"}, "music_id": {"type": "string"}, "music_refs": {"type": "object"}, "seed": {"type": "integer"}, "cid": {"type": "string"}}, "required": ["variation_of"]}
+				"parameters": {"type": "object", "properties": {"variation_of": {"type": "string"}, "n": {"type": "integer"}, "intensity": {"type": "number"}, "music_id": {"type": "string"}, "music_refs": {"type": "object"}, "seed": {"type": "integer"}}, "required": ["variation_of"]}
 			}
 		},
 		{
 			"type": "function",
 			"function": {
 				"name": "music.mixdown",
-				"parameters": {"type": "object", "properties": {"stems": {"type": "array", "items": {"type": "object"}}, "sample_rate": {"type": "integer"}, "channels": {"type": "integer"}, "seed": {"type": "integer"}, "cid": {"type": "string"}}, "required": ["stems"]}
+				"parameters": {"type": "object", "properties": {"stems": {"type": "array", "items": {"type": "object"}}, "sample_rate": {"type": "integer"}, "channels": {"type": "integer"}, "seed": {"type": "integer"}}, "required": ["stems"]}
 			}
 		},
 		{
@@ -373,8 +367,7 @@ def get_builtin_tools_schema() -> List[Dict[str, Any]]:
 						"character_id": {"type": "string"},
 						"lock_bundle": {"type": "object"},
 						"quality_profile": {"type": "string"},
-						"seed": {"type": "integer"},
-						"cid": {"type": "string"}
+						"seed": {"type": "integer"}
 					},
 					"required": ["prompt", "length_s"]
 				}
@@ -389,7 +382,6 @@ def get_builtin_tools_schema() -> List[Dict[str, Any]]:
 					"properties": {
 						"segment_id": {"type": "string"},
 						"window_id": {"type": "string"},
-						"cid": {"type": "string"},
 						"lock_bundle": {"type": "object"},
 						"quality_profile": {"type": "string"},
 						"reason": {"type": "string"}
@@ -409,21 +401,21 @@ def get_builtin_tools_schema() -> List[Dict[str, Any]]:
 			"type": "function",
 			"function": {
 				"name": "video.flow.derive",
-				"parameters": {"type": "object", "properties": {"src": {"type": "string"}, "frame_a": {"type": "string"}, "frame_b": {"type": "string"}, "step": {"type": "integer"}, "cid": {"type": "string"}}, "required": []}
+				"parameters": {"type": "object", "properties": {"src": {"type": "string"}, "frame_a": {"type": "string"}, "frame_b": {"type": "string"}, "step": {"type": "integer"}}, "required": []}
 			}
 		},
 		{
 			"type": "function",
 			"function": {
 				"name": "video.hv.t2v",
-				"parameters": {"type": "object", "properties": {"prompt": {"type": "string"}, "negative": {"type": "string"}, "width": {"type": "integer"}, "height": {"type": "integer"}, "fps": {"type": "integer"}, "seconds": {"type": "integer"}, "seed": {"type": "integer"}, "locks": {"type": "object"}, "post": {"type": "object"}, "latent_reinit_every": {"type": "integer"}, "cid": {"type": "string"}}, "required": ["prompt", "width", "height", "fps", "seconds"]}
+				"parameters": {"type": "object", "properties": {"prompt": {"type": "string"}, "negative": {"type": "string"}, "width": {"type": "integer"}, "height": {"type": "integer"}, "fps": {"type": "integer"}, "seconds": {"type": "integer"}, "seed": {"type": "integer"}, "locks": {"type": "object"}, "post": {"type": "object"}, "latent_reinit_every": {"type": "integer"}}, "required": ["prompt", "width", "height", "fps", "seconds"]}
 			}
 		},
 		{
 			"type": "function",
 			"function": {
 				"name": "video.hv.i2v",
-				"parameters": {"type": "object", "properties": {"init_image": {"type": "string"}, "prompt": {"type": "string"}, "negative": {"type": "string"}, "width": {"type": "integer"}, "height": {"type": "integer"}, "fps": {"type": "integer"}, "seconds": {"type": "integer"}, "seed": {"type": "integer"}, "locks": {"type": "object"}, "post": {"type": "object"}, "latent_reinit_every": {"type": "integer"}, "cid": {"type": "string"}}, "required": ["init_image", "prompt", "width", "height", "fps", "seconds"]}
+				"parameters": {"type": "object", "properties": {"init_image": {"type": "string"}, "prompt": {"type": "string"}, "negative": {"type": "string"}, "width": {"type": "integer"}, "height": {"type": "integer"}, "fps": {"type": "integer"}, "seconds": {"type": "integer"}, "seed": {"type": "integer"}, "locks": {"type": "object"}, "post": {"type": "object"}, "latent_reinit_every": {"type": "integer"}}, "required": ["init_image", "prompt", "width", "height", "fps", "seconds"]}
 			}
 		},
 		{
@@ -437,49 +429,49 @@ def get_builtin_tools_schema() -> List[Dict[str, Any]]:
 			"type": "function",
 			"function": {
 				"name": "video.text.overlay",
-				"parameters": {"type": "object", "properties": {"src": {"type": "string"}, "texts": {"type": "array", "items": {"type": "object"}}, "cid": {"type": "string"}}, "required": ["src", "texts"]}
+				"parameters": {"type": "object", "properties": {"src": {"type": "string"}, "texts": {"type": "array", "items": {"type": "object"}}}, "required": ["src", "texts"]}
 			}
 		},
 		{
 			"type": "function",
 			"function": {
 				"name": "image.cleanup",
-				"parameters": {"type": "object", "properties": {"src": {"type": "string"}, "denoise": {"type": "boolean"}, "sharpen": {"type": "boolean"}, "dehalo": {"type": "boolean"}, "clahe": {"type": "boolean"}, "cid": {"type": "string"}}, "required": ["src"]}
+				"parameters": {"type": "object", "properties": {"src": {"type": "string"}, "denoise": {"type": "boolean"}, "sharpen": {"type": "boolean"}, "dehalo": {"type": "boolean"}, "clahe": {"type": "boolean"}}, "required": ["src"]}
 			}
 		},
 		{
 			"type": "function",
 			"function": {
 				"name": "video.cleanup",
-				"parameters": {"type": "object", "properties": {"src": {"type": "string"}, "denoise": {"type": "boolean"}, "deband": {"type": "boolean"}, "sharpen": {"type": "boolean"}, "stabilize_faces": {"type": "boolean"}, "cid": {"type": "string"}}, "required": ["src"]}
+				"parameters": {"type": "object", "properties": {"src": {"type": "string"}, "denoise": {"type": "boolean"}, "deband": {"type": "boolean"}, "sharpen": {"type": "boolean"}, "stabilize_faces": {"type": "boolean"}}, "required": ["src"]}
 			}
 		},
 		{
 			"type": "function",
 			"function": {
 				"name": "image.artifact_fix",
-				"parameters": {"type": "object", "properties": {"src": {"type": "string"}, "type": {"type": "string"}, "target_time": {"type": "string"}, "region": {"type": "array", "items": {"type": "integer"}}, "cid": {"type": "string"}}, "required": ["src", "type"]}
+				"parameters": {"type": "object", "properties": {"src": {"type": "string"}, "type": {"type": "string"}, "target_time": {"type": "string"}, "region": {"type": "array", "items": {"type": "integer"}}}, "required": ["src", "type"]}
 			}
 		},
 		{
 			"type": "function",
 			"function": {
 				"name": "video.artifact_fix",
-				"parameters": {"type": "object", "properties": {"src": {"type": "string"}, "type": {"type": "string"}, "target_time": {"type": "string"}, "region": {"type": "array", "items": {"type": "integer"}}, "cid": {"type": "string"}}, "required": ["src", "type"]}
+				"parameters": {"type": "object", "properties": {"src": {"type": "string"}, "type": {"type": "string"}, "target_time": {"type": "string"}, "region": {"type": "array", "items": {"type": "integer"}}}, "required": ["src", "type"]}
 			}
 		},
 		{
 			"type": "function",
 			"function": {
 				"name": "image.hands.fix",
-				"parameters": {"type": "object", "properties": {"src": {"type": "string"}, "cid": {"type": "string"}}, "required": ["src"]}
+				"parameters": {"type": "object", "properties": {"src": {"type": "string"}}, "required": ["src"]}
 			}
 		},
 		{
 			"type": "function",
 			"function": {
 				"name": "video.hands.fix",
-				"parameters": {"type": "object", "properties": {"src": {"type": "string"}, "cid": {"type": "string"}}, "required": ["src"]}
+				"parameters": {"type": "object", "properties": {"src": {"type": "string"}}, "required": ["src"]}
 			}
 		},
 		{

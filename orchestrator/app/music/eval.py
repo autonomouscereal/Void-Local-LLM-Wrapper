@@ -293,7 +293,7 @@ def _build_music_eval_summary(all_axes: Dict[str, Any], film_context: Optional[D
     return json.dumps(payload, ensure_ascii=False)
 
 
-def _call_music_eval_committee(summary: str) -> Dict[str, Any]:
+async def _call_music_eval_committee(summary: str) -> Dict[str, Any]:
     """
     Use the existing committee infrastructure to obtain aesthetic judgements.
     """
@@ -313,8 +313,6 @@ def _call_music_eval_committee(summary: str) -> Dict[str, Any]:
             "content": summary,
         },
     ]
-    import asyncio
-
     schema = {
         "overall_quality_score": float,
         "fit_score": float,
@@ -340,16 +338,16 @@ def _call_music_eval_committee(summary: str) -> Dict[str, Any]:
         )
         return parsed if isinstance(parsed, dict) else {}
 
-    return asyncio.run(_run())
+    return await _run()
 
 
-def eval_aesthetic(all_axes: Dict[str, Any], film_context: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+async def eval_aesthetic(all_axes: Dict[str, Any], film_context: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     summary = _build_music_eval_summary(all_axes, film_context)
-    judge = _call_music_eval_committee(summary)
+    judge = await _call_music_eval_committee(summary)
     return judge
 
 
-def compute_music_eval(
+async def compute_music_eval(
     track_path: str,
     song_graph: Dict[str, Any],
     style_pack: Optional[Dict[str, Any]],
@@ -382,7 +380,7 @@ def compute_music_eval(
         "structure": structure,
         "emotion": emotion,
     }
-    aesthetic = eval_aesthetic(all_axes, film_context)
+    aesthetic = await eval_aesthetic(all_axes, film_context)
 
     overall_quality = float(aesthetic.get("overall_quality_score") or 0.0)
     fit_score = float(aesthetic.get("fit_score") or 0.0)

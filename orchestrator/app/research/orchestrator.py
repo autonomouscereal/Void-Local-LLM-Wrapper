@@ -23,7 +23,7 @@ from ..datasets.trace import append_sample as _trace_append
 RAG_TTL = int(os.getenv("RAG_TTL_SECONDS", "3600"))
 
 
-def run_research(job: Dict[str, Any]) -> Dict[str, Any]:
+async def run_research(job: Dict[str, Any]) -> Dict[str, Any]:
     """
     job: {"query": str, "scope": "public|internal", "since": str|None, "until": str|None, "cid": str}
     Returns: {"phase": "done", "artifacts": [...], "cid": str}
@@ -47,7 +47,7 @@ def run_research(job: Dict[str, Any]) -> Dict[str, Any]:
             pass
 
     # Phase: discover + collect
-    sources = discover_sources(q, job.get("scope", "public"), job.get("since"), job.get("until"))
+    sources = await discover_sources(q, job.get("scope", "public"), job.get("since"), job.get("until"))
     sources = rag_filter(sources, ttl_s=RAG_TTL)
     if jid:
         try:

@@ -105,6 +105,144 @@ async def ensure_story_character_bundles(locks_arg: Dict[str, Any]) -> Dict[str,
     return out
 
 
+async def ensure_visual_locks_for_story(
+    story: Dict[str, Any],
+    locks_arg: Dict[str, Any],
+    profile_name: str,
+    trace_id: Optional[str],
+) -> Dict[str, Any]:
+    """
+    Best-effort helper to enrich a locks payload with basic story/film2 metadata.
+
+    This function ensures that:
+    - All characters known from locks_arg and the story graph have a persisted
+      visual lock bundle (via the canonical locks.runtime helpers), and
+    - The film2.project block is populated with basic structural metadata.
+
+    It never raises; on any failure it simply returns the original locks
+    mapping unchanged.
+    """
+    updated: Dict[str, Any] = dict(locks_arg) if isinstance(locks_arg, dict) else {}
+    if not isinstance(story, dict):
+        return updated
+    try:
+        # ------------------------------------------------------------------
+        # 1) Ensure character entries exist in the locks payload
+        # ------------------------------------------------------------------
+        char_entries = updated.get("characters")
+        if not isinstance(char_entries, list):
+            char_entries = []
+            updated["characters"] = char_entries
+        existing_ids = {
+            c.get("id")
+            for c in char_entries
+            if isinstance(c, dict) and isinstance(c.get("id"), str) and c.get("id").strip()
+        }
+        # Characters declared on the story graph (engine.draft_story_graph)
+        story_chars = story.get("characters") if isinstance(story.get("characters"), list) else []
+        for c in story_chars:
+            if not isinstance(c, dict):
+                continue
+            cid = c.get("char_id")
+            if not isinstance(cid, str) or not cid.strip():
+                continue
+            cid = cid.strip()
+            if cid in existing_ids:
+                continue
+            # Create a best-effort character entry using story metadata so that
+            # downstream visual/music/TTS pipelines can lock against it.
+            entry: Dict[str, Any] = {"id": cid}
+            name = c.get("name")
+            descr = c.get("description")
+            traits = c.get("traits")
+            if isinstance(name, str) and name.strip():
+                entry["name"] = name.strip()
+            if isinstance(descr, str) and descr.strip():
+                entry["description"] = descr.strip()
+            if isinstance(traits, dict):
+                entry["traits"] = traits
+            char_entries.append(entry)
+            existing_ids.add(cid)
+        # Also scan beat-level character references to catch any IDs not present
+        # in the top-level story.characters list (defensive).
+        acts = story.get("acts") if isinstance(story.get("acts"), list) else []
+        for act in acts:
+            if not isinstance(act, dict):
+                continue
+            scenes = act.get("scenes") if isinstance(act.get("scenes"), list) else []
+            for scene in scenes:
+                if not isinstance(scene, dict):
+                    continue
+                beats = scene.get("beats") if isinstance(scene.get("beats"), list) else []
+                for beat in beats:
+                    if not isinstance(beat, dict):
+                        continue
+                    char_ids = beat.get("characters") if isinstance(beat.get("characters"), list) else []
+                    for cid in char_ids:
+                        if not isinstance(cid, str) or not cid.strip():
+                            continue
+                        cid = cid.strip()
+                        if cid in existing_ids:
+                            continue
+                        char_entries.append({"id": cid})
+                        existing_ids.add(cid)
+
+        # ------------------------------------------------------------------
+        # 2) Ensure persisted per-character bundles exist and are migrated
+        # ------------------------------------------------------------------
+        # This will create/migrate bundles in the lock store for any
+        # characters referenced in updated["characters"].
+        await ensure_story_character_bundles(updated)
+
+        # ------------------------------------------------------------------
+        # 3) Populate film2.project from the story structure
+        # ------------------------------------------------------------------
+        film2_branch = updated.get("film2")
+        if not isinstance(film2_branch, dict):
+            film2_branch = {}
+            updated["film2"] = film2_branch
+        project = film2_branch.get("project")
+        if not isinstance(project, dict):
+            project = {}
+            film2_branch["project"] = project
+        # Populate minimal project fields if absent
+        prompt_val = story.get("prompt")
+        if "prompt" not in project and isinstance(prompt_val, str):
+            project["prompt"] = prompt_val
+        dur = story.get("duration_hint_s")
+        if "duration_s" not in project and isinstance(dur, (int, float)):
+            project["duration_s"] = float(dur)
+        acts = story.get("acts") if isinstance(story.get("acts"), list) else []
+        acts_count = len(acts)
+        scenes_count = 0
+        beats_count = 0
+        for act in acts:
+            scenes = act.get("scenes") if isinstance(act.get("scenes"), list) else []
+            scenes_count += len(scenes)
+            for scene in scenes:
+                beats = scene.get("beats") if isinstance(scene.get("beats"), list) else []
+                beats_count += len(beats)
+        project.setdefault("acts_count", acts_count)
+        project.setdefault("scenes_count", scenes_count)
+        project.setdefault("beats_count", beats_count)
+        if trace_id:
+            _trace_append(
+                "film2",
+                {
+                    "event": "locks_story_project_enriched",
+                    "trace_id": trace_id,
+                    "quality_profile": profile_name,
+                    "acts_count": project.get("acts_count"),
+                    "scenes_count": project.get("scenes_count"),
+                    "beats_count": project.get("beats_count"),
+                },
+            )
+    except Exception:
+        # Best-effort only: never break callers on enrichment failures.
+        return updated
+    return updated
+
+
 async def generate_scene_storyboards(
     scenes: List[Dict[str, Any]],
     locks_arg: Dict[str, Any],

@@ -31,7 +31,7 @@ MAX_REGEN_PASSES = 2
 MAX_WINDOW_SECONDS = 20
 
 
-def _eval_window_clip(
+async def _eval_window_clip(
     win: Dict[str, Any],
     clip_path: str,
     cid: str,
@@ -58,7 +58,7 @@ def _eval_window_clip(
     }
     style_pack = music_branch.get("style_pack") if isinstance(music_branch.get("style_pack"), dict) else None
     film_context: Dict[str, Any] = {}
-    eval_out = compute_music_eval(
+    eval_out = await compute_music_eval(
         track_path=clip_path,
         song_graph=local_song_graph,
         style_pack=style_pack,
@@ -83,12 +83,12 @@ def _eval_window_clip(
     return eval_out
 
 
-def _eval_full_track(full_path: str, music_branch: Dict[str, Any]) -> Dict[str, Any]:
+async def _eval_full_track(full_path: str, music_branch: Dict[str, Any]) -> Dict[str, Any]:
     """
     Evaluate the stitched full track for multi-axis MusicEval.
     """
     style_pack = music_branch.get("style_pack") if isinstance(music_branch.get("style_pack"), dict) else None
-    track_eval = compute_music_eval(
+    track_eval = await compute_music_eval(
         track_path=full_path,
         song_graph=music_branch,
         style_pack=style_pack,
@@ -115,7 +115,7 @@ def _find_bad_windows(windows: List[Dict[str, Any]]) -> List[str]:
     return ids
 
 
-def _recompose_single_window(
+async def _recompose_single_window(
     job: Dict[str, Any],
     provider,
     manifest: Dict[str, Any],
@@ -260,7 +260,7 @@ def _recompose_single_window(
     ainfo["motif_lock"] = motif_lock
     win["artifact_path"] = clip_path
     win["metrics"] = ainfo
-    _eval_window_clip(win, clip_path, cid, music_branch)
+    await _eval_window_clip(win, clip_path, cid, music_branch)
     return wav_bytes, sr_local, ch_local
 
 
@@ -322,7 +322,7 @@ def _stitch_from_windows(
     return stitched_pcm, stitched_sr, stitched_ch
 
 
-def _regenerate_bad_windows_only(
+async def _regenerate_bad_windows_only(
     job: Dict[str, Any],
     provider,
     manifest: Dict[str, Any],
@@ -342,7 +342,7 @@ def _regenerate_bad_windows_only(
     for win in windows:
         wid = win.get("window_id")
         if isinstance(wid, str) and wid in bad_set:
-            _recompose_single_window(job, provider, manifest, cid, win, music_branch, global_block, bpm, params)
+            await _recompose_single_window(job, provider, manifest, cid, win, music_branch, global_block, bpm, params)
     stitched_pcm, stitched_sr, stitched_ch = _stitch_from_windows(windows, crossfade_frames)
     outdir = os.path.join("/workspace", "uploads", "artifacts", "music", cid)
     ensure_dir(outdir)
@@ -357,7 +357,7 @@ def _regenerate_bad_windows_only(
     return windows, full_path
 
 
-def _regenerate_full_music(
+async def _regenerate_full_music(
     job: Dict[str, Any],
     provider,
     manifest: Dict[str, Any],
@@ -376,7 +376,7 @@ def _regenerate_full_music(
     for win in windows:
         if not isinstance(win, dict):
             continue
-        wav_bytes, sr_local, ch_local = _recompose_single_window(
+        wav_bytes, sr_local, ch_local = await _recompose_single_window(
             job,
             provider,
             manifest,
@@ -606,7 +606,7 @@ def _stitch_windows_pcm(clips: List[Tuple[bytes, int, int]], crossfade_frames: i
     return bytes(out), base_sr, base_ch
 
 
-def run_music_infinite_windowed(job: Dict[str, Any], provider, manifest: Dict[str, Any]) -> Dict[str, Any]:
+async def run_music_infinite_windowed(job: Dict[str, Any], provider, manifest: Dict[str, Any]) -> Dict[str, Any]:
     cid = job.get("cid") or f"music-{now_ts()}"
     prompt = job.get("prompt") or ""
     outdir = os.path.join("/workspace", "uploads", "artifacts", "music", cid)
@@ -861,7 +861,7 @@ def run_music_infinite_windowed(job: Dict[str, Any], provider, manifest: Dict[st
         win["artifact_path"] = clip_path
         win["metrics"] = ainfo
         # Per-window multi-axis evaluation (MusicEval 2.0).
-        _eval_window_clip(win, clip_path, cid, music_branch)
+        await _eval_window_clip(win, clip_path, cid, music_branch)
         window_clips.append((wav_bytes, sr_local, ch_local, win))
     # For canonical windows we have PCM in memory; for reuse windows we read
     # their audio from disk before stitching.
@@ -962,7 +962,7 @@ def run_music_infinite_windowed(job: Dict[str, Any], provider, manifest: Dict[st
         "motifs_count": len(music_branch.get("motifs") or []),
     }
     # Track-level multi-axis evaluation (MusicEval 2.0) on the initial full track.
-    track_eval = _eval_full_track(full_path, music_branch)
+    track_eval = await _eval_full_track(full_path, music_branch)
     overall_block = track_eval.get("overall") if isinstance(track_eval.get("overall"), dict) else {}
     track_quality = overall_block.get("overall_quality_score")
     track_fit = overall_block.get("fit_score")
@@ -978,7 +978,7 @@ def run_music_infinite_windowed(job: Dict[str, Any], provider, manifest: Dict[st
         if quality_ok and fit_ok and not bad_window_ids:
             break
         if bad_window_ids:
-            windows, full_path = _regenerate_bad_windows_only(
+            windows, full_path = await _regenerate_bad_windows_only(
                 job,
                 provider,
                 manifest,
@@ -992,7 +992,7 @@ def run_music_infinite_windowed(job: Dict[str, Any], provider, manifest: Dict[st
                 crossfade_frames,
             )
         else:
-            windows, full_path = _regenerate_full_music(
+            windows, full_path = await _regenerate_full_music(
                 job,
                 provider,
                 manifest,
@@ -1004,7 +1004,7 @@ def run_music_infinite_windowed(job: Dict[str, Any], provider, manifest: Dict[st
                 params,
                 crossfade_frames,
             )
-        track_eval = _eval_full_track(full_path, music_branch)
+        track_eval = await _eval_full_track(full_path, music_branch)
         overall_block = track_eval.get("overall") if isinstance(track_eval.get("overall"), dict) else {}
         track_quality = overall_block.get("overall_quality_score")
         track_fit = overall_block.get("fit_score")

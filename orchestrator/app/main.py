@@ -221,6 +221,7 @@ from .film2.hero import choose_hero_frame, _extract_meta as _frame_meta_payload,
 from .film2.timeline import text_to_simple_srt as _text_to_simple_srt
 from .film2.locks import (
     ensure_story_character_bundles,
+    ensure_visual_locks_for_story as _ensure_visual_locks_for_story,
     generate_scene_storyboards as _film2_generate_scene_storyboards,
     generate_shot_storyboards as _film2_generate_shot_storyboards,
 )
@@ -2972,6 +2973,16 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             call_trace_id = str(meta_val.get("trace_id"))
         else:
             call_trace_id = "tt_unknown"
+    # The executor is not a callable tool; it is invoked only via
+    # the external executor service (pipeline.executor_gateway).
+    if name == "executor":
+        return _tool_error(
+            "executor",
+            "executor_not_callable",
+            "The executor must be invoked via execute_tools(), not as a tool.",
+            status=500,
+        )
+
     # Generic HTTP API request tool (public APIs only; no internal SSRF)
     if name == "api.request":
         # Backwards-compatible shim: route api.request to http.request implementation.
@@ -4032,7 +4043,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             # Call the infinite/windowed engine directly to avoid nested /tool.run recursion.
             provider = RestMusicProvider(MUSIC_API_URL)
             manifest_music: Dict[str, Any] = {"items": []}
-            music_env = run_music_infinite_windowed(music_args, provider, manifest_music)
+            music_env = await run_music_infinite_windowed(music_args, provider, manifest_music)
             if isinstance(music_env, dict):
                 music_meta = music_env
         final_music_mix_path: str | None = None
@@ -4195,7 +4206,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                                 break
                     final_music_mix_path = mix_path or backing_full_path
                     if isinstance(final_music_mix_path, str) and final_music_mix_path:
-                        final_music_eval = compute_music_eval(
+                        final_music_eval = await compute_music_eval(
                             track_path=final_music_mix_path,
                             song_graph=music_branch,
                             style_pack=music_branch.get("style_pack") if isinstance(music_branch.get("style_pack"), dict) else None,
@@ -5229,7 +5240,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 "bpm": bpm_int,
                 "key": key_txt,
             })
-        env = run_music_infinite_windowed(a, provider, manifest)
+        env = await run_music_infinite_windowed(a, provider, manifest)
 
         # Persist updated lock bundle (including song graph and windows) when character_id present.
         if char_id and lock_bundle:
@@ -6848,7 +6859,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         try:
             job_args = args if isinstance(args, dict) else {}
             job_args.setdefault("job_id", uuid.uuid4().hex)
-            result = run_research(job_args)
+            result = await run_research(job_args)
             if isinstance(result, dict):
                 result.setdefault("job_id", job_args.get("job_id"))
             return {"name": name, "result": result}
