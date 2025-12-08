@@ -13,6 +13,49 @@ from .pipeline.compression_orchestrator import co_pack, frames_to_messages
 from .trace_utils import emit_trace
 
 
+def _sanitize_mojibake_text(text: str) -> str:
+    """
+    Best-effort fixer for common UTF-8 mojibake sequences that frequently
+    appear in committee outputs (especially around apostrophes/quotes).
+
+    This is intentionally conservative and only replaces a few known bad
+    byte-sequence patterns with their intended ASCII equivalents.
+    """
+    if not isinstance(text, str) or not text:
+        return text
+    replacements = (
+        ("Ã¢Â\x80Â\x99", "'"),
+        ("Ã¢ÂÂ", "'"),
+        ("â\x80\x99", "'"),
+        ("â€™", "'"),
+        ("â", "'"),
+    )
+    out = text
+    for bad, good in replacements:
+        if bad in out:
+            out = out.replace(bad, good)
+    return out
+
+
+def _is_empty_song_candidate(obj: Any) -> bool:
+    """
+    Heuristic to detect essentially-empty Song Graph candidates.
+
+    Used only when the expected_schema is a {"song": SONG_GRAPH_SCHEMA} wrapper.
+    """
+    if not isinstance(obj, dict):
+        return True
+    global_block = obj.get("global") if isinstance(obj.get("global"), dict) else {}
+    sections = obj.get("sections") if isinstance(obj.get("sections"), list) else []
+    lyrics = obj.get("lyrics") if isinstance(obj.get("lyrics"), dict) else {}
+    lyrics_sections = lyrics.get("sections") if isinstance(lyrics.get("sections"), list) else []
+    bpm = global_block.get("bpm")
+    # Treat as empty when there is no timing info and no structural sections.
+    if (not isinstance(bpm, (int, float)) or float(bpm) == 0.0) and not sections and not lyrics_sections:
+        return True
+    return False
+
+
 # Committee model routing and context configuration.
 QWEN_BASE_URL = os.getenv("QWEN_BASE_URL", "http://localhost:11435")
 QWEN_MODEL_ID = os.getenv("QWEN_MODEL_ID", "qwen3:30b-a3b-instruct-2507-q4_K_M")
@@ -555,8 +598,18 @@ async def committee_jsonify(
             idx,
             txt,
         )
-        sup = parser.parse_superset(txt or "{}", expected_schema)
-        obj = sup["coerced"]
+        clean_txt = _sanitize_mojibake_text(txt or "")
+        try:
+            sup = parser.parse_superset(clean_txt or "{}", expected_schema)
+            obj = sup["coerced"]
+        except Exception as ex:  # pragma: no cover - defensive logging
+            log.info(
+                "[committee.jsonify] JSONParser error trace_id=%s index=%d error=%s",
+                trace_base,
+                idx,
+                str(ex),
+            )
+            continue
         log.info(
             "[committee.jsonify] parsed_candidate trace_id=%s index=%d obj=%s",
             trace_base,
@@ -579,6 +632,13 @@ async def committee_jsonify(
         return ""
 
     merged: Dict[str, Any] = {}
+    # Detect Song Graph wrapper schemas so we can downweight "empty" candidates.
+    song_schema: Dict[str, Any] | None = None
+    if isinstance(expected_schema, dict):
+        maybe_song = expected_schema.get("song")
+        if isinstance(maybe_song, dict) and "global" in maybe_song and "sections" in maybe_song:
+            song_schema = maybe_song
+
     if isinstance(expected_schema, dict):
         for key, expected_type in expected_schema.items():
             value_set = False
@@ -590,10 +650,19 @@ async def committee_jsonify(
                         value_set = True
                         break
                 elif isinstance(expected_type, dict):
-                    if isinstance(v, dict) and v:
-                        merged[key] = v
-                        value_set = True
-                        break
+                    # Special-case Song Graph wrapper: prefer structurally
+                    # non-empty song candidates (with bpm/sections/lyrics)
+                    # over default/empty shells.
+                    if key == "song" and song_schema is not None:
+                        if isinstance(v, dict) and not _is_empty_song_candidate(v):
+                            merged[key] = v
+                            value_set = True
+                            break
+                    else:
+                        if isinstance(v, dict) and v:
+                            merged[key] = v
+                            value_set = True
+                            break
                 else:
                     if isinstance(v, expected_type):
                         merged[key] = v

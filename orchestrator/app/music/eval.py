@@ -303,9 +303,13 @@ async def _call_music_eval_committee(summary: str) -> Dict[str, Any]:
             "content": (
                 "You are MusicEval. You receive JSON with technical/style/structure/emotion metrics "
                 "for a music segment or track, plus optional film context. "
-                "Respond ONLY with JSON containing keys: "
+                "You MUST ALWAYS respond with a single JSON object with EXACTLY these keys: "
                 '{"overall_quality_score": float, "fit_score": float, "originality_score": float, '
-                '"cohesion_score": float, "issues": [str]}.'
+                '"cohesion_score": float, "issues": [str]}.\n'
+                "- Do NOT output any natural language, explanations, or formatting outside the JSON object.\n"
+                "- Do NOT add any extra keys or remove/rename any keys.\n"
+                "- If the input is missing, empty, or meaningless, still return this JSON with all scores 0.0 "
+                "and a short explanation string in issues[0]."
             ),
         },
         {
@@ -347,6 +351,33 @@ async def eval_aesthetic(all_axes: Dict[str, Any], film_context: Optional[Dict[s
     return judge
 
 
+def _axes_are_effectively_empty(all_axes: Dict[str, Any]) -> bool:
+    """
+    Heuristic to detect when we have no meaningful features for MusicEval.
+
+    When this returns True, we skip calling the committee and instead return
+    a static "no data" evaluation.
+    """
+    tech = all_axes.get("technical") if isinstance(all_axes.get("technical"), dict) else {}
+    style = all_axes.get("style") if isinstance(all_axes.get("style"), dict) else {}
+    struct = all_axes.get("structure") if isinstance(all_axes.get("structure"), dict) else {}
+    emo = all_axes.get("emotion") if isinstance(all_axes.get("emotion"), dict) else {}
+
+    tq = tech.get("technical_quality_score")
+    if isinstance(tq, (int, float)) and float(tq) != 0.0:
+        return False
+    track_embed = style.get("track_embed")
+    if isinstance(track_embed, list) and track_embed:
+        return False
+    for k in ("energy_alignment_score", "repetition_score", "transition_score"):
+        v = struct.get(k)
+        if isinstance(v, (int, float)) and float(v) != 0.0:
+            return False
+    if emo.get("emotion_guess") or emo.get("genre") or emo.get("tempo_bpm"):
+        return False
+    return True
+
+
 async def compute_music_eval(
     track_path: str,
     song_graph: Dict[str, Any],
@@ -380,7 +411,16 @@ async def compute_music_eval(
         "structure": structure,
         "emotion": emotion,
     }
-    aesthetic = await eval_aesthetic(all_axes, film_context)
+    if _axes_are_effectively_empty(all_axes):
+        aesthetic = {
+            "overall_quality_score": 0.0,
+            "fit_score": 0.0,
+            "originality_score": 0.0,
+            "cohesion_score": 0.0,
+            "issues": ["music.eval: skipped (no usable features)"],
+        }
+    else:
+        aesthetic = await eval_aesthetic(all_axes, film_context)
 
     overall_quality = float(aesthetic.get("overall_quality_score") or 0.0)
     fit_score = float(aesthetic.get("fit_score") or 0.0)
