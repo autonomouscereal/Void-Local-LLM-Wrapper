@@ -232,10 +232,10 @@ def build_music_segments_from_result(
     """
     Build SegmentResult list for music tools.
 
-    For legacy tools (music.compose, music.mixdown, etc.) we emit a single
-    segment for the full track. For windowed tools that include a "windows"
-    list in result["meta"]["windows"], we emit one segment per window so the
-    committee can reason about and refine specific windows.
+    For mixdown-style tools we emit a single segment for the full track.
+    For windowed tools that include a "windows" list in result["meta"]["windows"],
+    we emit one segment per window so the committee can reason about and refine
+    specific windows.
     """
     if not isinstance(result, dict):
         return []

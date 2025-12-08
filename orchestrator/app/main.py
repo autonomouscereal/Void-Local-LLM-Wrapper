@@ -149,7 +149,6 @@ from .tools_tts.speak import run_tts_speak
 from .tools_tts.sfx import run_sfx_compose
 from .tools_tts.provider import _TTSProvider
 from .tools_tts.voice_tools import run_voice_register, run_voice_train
-from .tools_music.compose import run_music_compose
 from .tools_music.variation import run_music_variation
 from .tools_music.mixdown import run_music_mixdown
 from .tools_music.vocals import render_vocal_stems_for_track
@@ -251,6 +250,8 @@ from .qa.segments import (
 )
 from .plan.song import plan_song_graph
 from .tools_music.windowed import run_music_infinite_windowed, restitch_music_from_windows
+from .tools_music.export import append_music_sample as _append_music_sample
+from .tools_music.provider import RestMusicProvider
 from .music.eval import compute_music_eval, get_music_acceptance_thresholds, MUSIC_HERO_QUALITY_MIN, MUSIC_HERO_FIT_MIN
 from functools import partial
 from .context.index import add_artifact as _ctx_add
@@ -2616,7 +2617,7 @@ def build_compact_tool_catalog() -> str:
                 {"intent": "generate image", "steps": ["image.dispatch", "image.qa"]},
                 {"intent": "generate video", "steps": ["film2.run"]},
                 {"intent": "tts", "steps": ["tts.speak", "tts.eval"]},
-                {"intent": "music", "steps": ["music.compose"]},
+                {"intent": "music", "steps": ["music.infinite.windowed"]},
                 {"intent": "sfx", "steps": ["audio.sfx.compose"]},
                 {"intent": "deep research", "steps": ["research.run"]}
             ],
@@ -4001,10 +4002,12 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     "tool": "music.infinite.windowed",
                     "args": {k: v for k, v in music_args.items() if k not in ("lock_bundle",)},
                 })
-            # Avoid recursion into execute_tool_call; call the canonical /tool.run bridge instead.
-            music_call = await http_tool_run("music.infinite.windowed", music_args)
-            if isinstance(music_call, dict):
-                music_meta = music_call.get("result") or music_call
+            # Call the infinite/windowed engine directly to avoid nested /tool.run recursion.
+            provider = RestMusicProvider(MUSIC_API_URL)
+            manifest_music: Dict[str, Any] = {"items": []}
+            music_env = run_music_infinite_windowed(music_args, provider, manifest_music)
+            if isinstance(music_env, dict):
+                music_meta = music_env
         final_music_mix_path: str | None = None
         final_music_eval: Dict[str, Any] | None = None
         if music_meta and isinstance(result.get("meta"), dict):
@@ -5067,7 +5070,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 },
             }
 
-        provider = _WindowMusicProvider()
+        provider = RestMusicProvider(MUSIC_API_URL)
         manifest = {"items": []}
 
         # NOTE: Intentionally avoid a broad try/except here so that real errors surface
@@ -5175,151 +5178,69 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         if char_id and lock_bundle:
             await _lock_save(char_id, lock_bundle)
 
+        # Optional: dataset logging + RAG indexing for the full music track.
+        if isinstance(env, dict):
+            meta_env = env.get("meta") if isinstance(env.get("meta"), dict) else {}
+            cid_env = meta_env.get("cid") or a.get("cid")
+            artifacts_env = env.get("artifacts") if isinstance(env.get("artifacts"), list) else []
+            main_artifact_id: Optional[str] = None
+            for art in artifacts_env:
+                if not isinstance(art, dict):
+                    continue
+                if art.get("kind") == "audio-ref" and isinstance(art.get("id"), str):
+                    main_artifact_id = art["id"]
+                    break
+            if isinstance(cid_env, str) and cid_env and isinstance(main_artifact_id, str) and main_artifact_id:
+                outdir_music = os.path.join(UPLOAD_DIR, "artifacts", "audio", "music", cid_env)
+                full_path_music = os.path.join(outdir_music, main_artifact_id)
+                # Dataset JSONL sample row
+                locks_meta = meta_env.get("locks") if isinstance(meta_env.get("locks"), dict) else {}
+                style_score = locks_meta.get("style_score") if isinstance(locks_meta, dict) else None
+                try:
+                    _append_music_sample(
+                        outdir_music,
+                        {
+                            "prompt": prompt_text,
+                            "bpm": bpm_int,
+                            "length_s": length_s,
+                            "seed": int(a.get("seed") or 0),
+                            "music_lock": bool(locks_meta),
+                            "track_ref": full_path_music,
+                            "stems": [],
+                            "model": meta_env.get("model") or "music",
+                            "style_score": style_score,
+                            "created_at": _now_ts(),
+                        },
+                    )
+                except Exception:
+                    logging.info("music_samples append failed:\n%s", traceback.format_exc())
+                # RAG: embed prompt text against the full track path
+                try:
+                    pool = await get_pg_pool()
+                    txt = prompt_text
+                    if pool is not None and txt and txt.strip():
+                        emb = get_embedder()
+                        vec = emb.encode([txt])[0]
+                        async with pool.acquire() as conn:
+                            rel = os.path.relpath(full_path_music, UPLOAD_DIR).replace("\\", "/")
+                            await conn.execute(
+                                "INSERT INTO rag_docs (path, chunk, embedding) VALUES ($1, $2, $3)",
+                                rel,
+                                txt,
+                                list(vec),
+                            )
+                except Exception:
+                    logging.info("music RAG insert failed:\n%s", traceback.format_exc())
+
         # Trace: standalone music.infinite.windowed finish
         if trace_val:
-            meta_env = env.get("meta") if isinstance(env, dict) else {}
+            meta_env2 = env.get("meta") if isinstance(env, dict) else {}
             trace_append("music.infinite.windowed.finish", {
                 "trace_id": trace_val,
                 "tool": "music.infinite.windowed",
-                "meta": meta_env if isinstance(meta_env, dict) else {},
+                "meta": meta_env2 if isinstance(meta_env2, dict) else {},
             })
         return {"name": name, "result": env}
-    if name == "music.compose" and ALLOW_TOOL_EXECUTION:
-        # Route all compose requests through music.infinite.windowed so the infinite
-        # windowed music path is the only caller of the music backend.
-        a = args if isinstance(args, dict) else {}
-        a.setdefault("length_s", int(a.get("length_s") or 30))
-        a.setdefault("bpm", None)
-        a.setdefault("key", None)
-        a.setdefault("instrumental_only", False)
-        a["prompt"] = str(a.get("prompt") or "").strip()
-        a["length_s"] = int(a.get("length_s") or 30)
-        return await http_tool_run("music.infinite.windowed", a)
-        if not MUSIC_API_URL:
-            return {"name": name, "error": "MUSIC_API_URL not configured"}
-        manifest = {"items": []}
-        try:
-            a = args if isinstance(args, dict) else {}
-            quality_profile = (a.get("quality_profile") or "standard")
-            bundle_arg = a.get("lock_bundle")
-            lock_bundle: Optional[Dict[str, Any]] = None
-            if isinstance(bundle_arg, dict):
-                lock_bundle = bundle_arg
-            elif isinstance(bundle_arg, str) and bundle_arg.strip():
-                lock_bundle = await _lock_load(bundle_arg.strip()) or {}
-            if not lock_bundle:
-                char_id = str(a.get("character_id") or "").strip()
-                if char_id:
-                    lock_bundle = await _lock_load(char_id) or {}
-            if lock_bundle:
-                lock_bundle = _lock_migrate_visual(lock_bundle)
-                lock_bundle = _lock_migrate_music(lock_bundle)
-                lock_bundle = _lock_migrate_tts(lock_bundle)
-                a["lock_bundle"] = lock_bundle
-            env = run_music_compose(a, provider, manifest)
-            wav = env.get("wav_bytes") if isinstance(env, dict) else None
-            if isinstance(wav, (bytes, bytearray)) and len(wav) > 0:
-                cid = "aud-" + str(_now_ts())
-                outdir = os.path.join(UPLOAD_DIR, "artifacts", "audio", "music", cid)
-                _ensure_dir(outdir)
-                stem = "music_00_00"
-                wav_path = os.path.join(outdir, stem + ".wav")
-                with open(wav_path, "wb") as _wf:
-                    _wf.write(wav)
-                locks_meta: Dict[str, Any] = {}
-                if lock_bundle:
-                    locks_meta["bundle"] = lock_bundle
-                    locks_meta["quality_profile"] = quality_profile
-                    audio_section = lock_bundle.get("audio") if isinstance(lock_bundle.get("audio"), dict) else {}
-                    ref_voice = audio_section.get("voice_embedding")
-                    if isinstance(ref_voice, list):
-                        voice_embed = await _lock_voice_embedding_from_path(wav_path)
-                        if voice_embed:
-                            sim = _cosine_similarity(ref_voice, voice_embed)
-                            if sim is not None:
-                                voice_score = max(0.0, min((sim + 1.0) / 2.0, 1.0))
-                                locks_meta["voice_score"] = voice_score
-                                locks_meta["voice_embedding"] = voice_embed
-                    tempo_target = audio_section.get("tempo_bpm")
-                    tempo_mode = audio_section.get("tempo_lock_mode", "off")
-                    if tempo_target is not None and tempo_mode != "off":
-                        try:
-                            tempo_target_f = float(tempo_target)
-                            tempo_detected = _audio_detect_tempo(wav_path)
-                            if tempo_detected is not None and tempo_target_f > 0:
-                                tempo_score = max(0.0, min(1.0 - (abs(tempo_detected - tempo_target_f) / tempo_target_f), 1.0))
-                                locks_meta["tempo_detected"] = tempo_detected
-                                locks_meta["tempo_score"] = tempo_score
-                                locks_meta["tempo_lock_mode"] = tempo_mode
-                        except Exception as ex:
-                            _log("music.lock.tempo_score.fail", error=str(ex), path=wav_path)
-                    key_target = audio_section.get("key")
-                    key_mode = audio_section.get("key_lock_mode", "off")
-                    if isinstance(key_target, str) and key_mode != "off":
-                        detected_key = _audio_detect_key(wav_path)
-                        locks_meta["key_detected"] = detected_key
-                        score_key = _key_similarity(key_target, detected_key)
-                        if score_key is not None:
-                            locks_meta["key_score"] = score_key
-                            locks_meta["key_lock_mode"] = key_mode
-                    stem_profile = audio_section.get("stem_profile") if isinstance(audio_section.get("stem_profile"), dict) else {}
-                    if stem_profile and audio_section.get("stem_lock_mode", "off") != "off":
-                        total_target = sum(float(v) for v in stem_profile.values() if isinstance(v, (int, float)))
-                        normalized_target = {k: (float(v) / total_target) if total_target else float(v) for k, v in stem_profile.items() if isinstance(v, (int, float))}
-                        detected_profile = _audio_band_energy_profile(wav_path, DEFAULT_STEM_BANDS)
-                        score_stem = _stem_balance_score(normalized_target, detected_profile)
-                        if score_stem is not None:
-                            locks_meta["stem_balance_score"] = score_stem
-                            locks_meta["stem_detected_profile"] = detected_profile
-                            locks_meta["stem_lock_mode"] = audio_section.get("stem_lock_mode")
-                    # Simple motif lock: reuse existing lock scores as a coarse proxy when available
-                    if "tempo_score" in locks_meta and "key_score" in locks_meta:
-                        ts = locks_meta.get("tempo_score")
-                        ks = locks_meta.get("key_score")
-                        if isinstance(ts, (int, float)) and isinstance(ks, (int, float)):
-                            locks_meta["motif_lock"] = min(float(ts), float(ks))
-                    locks_meta.setdefault("lyrics_score", None)
-                sidecar_meta = {"tool": "music.compose", "prompt": a.get("prompt")}
-                if locks_meta:
-                    # Composite music lock score for this track
-                    components: List[float] = []
-                    for k in ("voice_score", "tempo_score", "key_score", "stem_balance_score", "motif_lock", "lyrics_score"):
-                        v = locks_meta.get(k)
-                        if isinstance(v, (int, float)):
-                            components.append(float(v))
-                    if components:
-                        locks_meta["lock_score_music"] = min(components)
-                    sidecar_meta["locks"] = locks_meta
-                _sidecar(wav_path, sidecar_meta)
-                _ctx_add(cid, "audio", wav_path, _uri_from_upload_path(wav_path), None, [], {"prompt": a.get("prompt")})
-                tr = (a.get("trace_id") if isinstance(a.get("trace_id"), str) else None)
-                if tr:
-                    rel = os.path.relpath(wav_path, UPLOAD_DIR).replace("\\", "/")
-                    checkpoints_append_event(STATE_DIR, tr, "artifact", {"kind": "audio", "path": rel, "bytes": int(len(wav))})
-                # RAG: embed prompt
-                pool = await get_pg_pool()
-                txt = a.get("prompt") if isinstance(a.get("prompt"), str) else None
-                if pool is not None and txt and txt.strip():
-                    emb = get_embedder()
-                    vec = emb.encode([txt])[0]
-                    async with pool.acquire() as conn:
-                        rel = os.path.relpath(wav_path, UPLOAD_DIR).replace("\\", "/")
-                        await conn.execute("INSERT INTO rag_docs (path, chunk, embedding) VALUES ($1, $2, $3)", rel, txt, list(vec))
-                if isinstance(env, dict):
-                    meta_env = env.setdefault("meta", {})
-                    if isinstance(meta_env, dict) and quality_profile:
-                        meta_env.setdefault("quality_profile", quality_profile)
-                if isinstance(env, dict) and locks_meta:
-                    meta_block = env.get("meta")
-                    if not isinstance(meta_block, dict):
-                        meta_block = {}
-                        env["meta"] = meta_block
-                    meta_block["locks"] = locks_meta
-            return {"name": name, "result": env}
-        except Exception as ex:
-            _tb = traceback.format_exc()
-            logging.error(_tb)
-            return {"name": name, "error": str(ex), "traceback": _tb}
     if name == "music.variation" and ALLOW_TOOL_EXECUTION:
         manifest = {"items": []}
         try:
@@ -8573,7 +8494,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                                     "action": seg_outcome.get("action"),
                                 },
                             )
-                elif tname in ("music.compose", "music.dispatch", "music.variation", "music.mixdown", "music.infinite.windowed"):
+                elif tname in ("music.infinite.windowed", "music.dispatch", "music.variation", "music.mixdown"):
                     meta_block = res.get("meta") if isinstance(res, dict) else {}
                     profile_name = meta_block.get("quality_profile") if isinstance(meta_block, dict) and isinstance(meta_block.get("quality_profile"), str) else None
                     preset_music = LOCK_QUALITY_PRESETS.get((profile_name or "standard").lower(), LOCK_QUALITY_PRESETS["standard"])

@@ -13,8 +13,8 @@ REQUIRED_INPUTS: Dict[str, List[str]] = {
     # Film-2 (single entry point for all video)
     # Keep the schema minimal and forgiving; Film-2 will expand/validate shots internally.
     "film2.run": ["prompt"],
-    # Audio/Music
-    "audio.music.generate": ["style", "duration_s"],
+    # Audio/Music (front-door music generation goes through music.infinite.windowed)
+    "music.infinite.windowed": ["prompt", "length_s"],
     "audio.vocal.synthesis": ["lyrics"],
     "audio.master": ["audio_id"],
     "audio.stems.demucs": ["audio_id"],

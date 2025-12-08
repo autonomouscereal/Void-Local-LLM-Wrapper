@@ -51,11 +51,12 @@ def _soften_plan(plan: Dict[str, Any], user_text: str) -> Dict[str, Any]:
                 inputs["prompt"] = user_text
             if not isinstance(inputs.get("size"), str) or not inputs.get("size"):
                 inputs["size"] = "1024x1024"
-        if t == "audio.music.generate":
-            if not isinstance(inputs.get("style"), str) or not inputs.get("style"):
-                inputs["style"] = "auto"
-            if not isinstance(inputs.get("duration_s"), (int, float)):
-                inputs["duration_s"] = 15
+        if t == "music.infinite.windowed":
+            # Default music prompt/duration when planner omitted them.
+            if not isinstance(inputs.get("prompt"), str) or not inputs.get("prompt"):
+                inputs["prompt"] = user_text
+            if not isinstance(inputs.get("length_s"), (int, float)):
+                inputs["length_s"] = 30
         s2 = dict(s)
         s2["inputs"] = inputs
         out["steps"].append(s2)

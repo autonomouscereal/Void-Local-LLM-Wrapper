@@ -167,7 +167,7 @@ LOCK_BUNDLE_SCHEMA = {
     # Music branch (schema_version >= 3)
     #
     # This branch is a superset schema for controllable music generation and
-    # editing. It is internal to music tools (music.compose, film music, etc.)
+    # editing. It is internal to music tools (film music, mixdown, etc.)
     # and is not exposed as a planner-visible tool surface.
     "music": {
         "global": {

@@ -1016,6 +1016,9 @@ def run_music_infinite_windowed(job: Dict[str, Any], provider, manifest: Dict[st
     sp = music_branch.get("style_pack") if isinstance(music_branch.get("style_pack"), dict) else None
     if sp is not None and isinstance(full_path, str) and full_path:
         style_score = style_score_for_track(full_path, sp)
+        # Expose style_score on the locks meta block so downstream consumers and
+        # dataset logging can reuse it without re-running CLAP.
+        locks_meta["style_score"] = style_score
 
     _trace_append(
         "music",
