@@ -1,6 +1,14 @@
 from __future__ import annotations
 
 from typing import Any, Dict, List
+import json
+
+from ..pipeline.assets import collect_urls as assets_collect_urls
+from ..plan.catalog import PLANNER_VISIBLE_TOOLS
+from ..pipeline.catalog import build_allowed_tool_names as catalog_allowed
+from ..tools_schema import get_builtin_tools_schema
+from ..committee_client import committee_ai_text, committee_jsonify, STATE_DIR
+from ..trace_utils import emit_trace
 
 
 def build_delta_plan(scores: Dict[str, Any]) -> Dict[str, Any]:
@@ -64,5 +72,171 @@ def build_delta_plan(scores: Dict[str, Any]) -> Dict[str, Any]:
         "patch_plan": patch_plan,
         "targets": {"segment_min": segment_threshold},
     }
+
+
+def _allowed_tools_for_mode(mode: str | None) -> List[str]:
+    """
+    Return the allowed tool names for planner/committee use for a given mode.
+
+    All planner-visible tools are allowed in all modes; mode may still affect prompts, not tool lists.
+    """
+    allowed_set = catalog_allowed(get_builtin_tools_schema)
+    return sorted(
+        [
+            n
+            for n in allowed_set
+            if isinstance(n, str) and n.strip() and n in PLANNER_VISIBLE_TOOLS
+        ]
+    )
+
+
+async def postrun_committee_decide(
+    trace_id: str,
+    user_text: str,
+    tool_results: Dict[str, Any] | List[Dict[str, Any]],
+    qa_metrics: Dict[str, Any],
+    mode: str,
+) -> Dict[str, Any]:
+    """
+    Post-run committee decision: returns {"action": "go|revise|fail", "rationale": str, "patch_plan": [ {tool,args} ]}.
+    Reuses the same backend route as planner; strict JSON response required.
+    """
+    # Summarize tools used and artifact urls
+    tools_used: List[str] = []
+    for tr in (tool_results or []):
+        if isinstance(tr, dict):
+            nm = (tr.get("name") or tr.get("tool") or "")
+            if isinstance(nm, str) and nm.strip():
+                tools_used.append(nm.strip())
+    tools_used = list(dict.fromkeys(tools_used))
+    artifact_urls = assets_collect_urls(tool_results or [], lambda u: u)
+    # Allowed tools for this mode (front-door only)
+    allowed_for_mode = _allowed_tools_for_mode(mode)
+    # Build committee prompt
+    sys_hdr = (
+        "### [COMMITTEE POSTRUN / SYSTEM]\n"
+        "Decide whether to accept artifacts (go) or run one small revision (revise), or fail. "
+        "Return strict JSON only: {\"action\":\"go|revise|fail\",\"rationale\":\"...\"," 
+        "\"patch_plan\":[{\"tool\":\"<name>\",\"args\":{...}}]}.\n"
+        "- Inspect qa_metrics.counts and qa_metrics.domain.* to judge quality. Example triggers: "
+        "missing required modalities; images hands_ok_ratio < 0.85 or face/id/region/scene locks below profile thresholds; "
+        "videos seam_ok_ratio < 0.90; audio clipping_ratio > 0.0, tempo/key/stem/lyrics/voice lock scores below threshold, or LUFS far from -14.\n"
+        "- When any hard lock metric (face_lock, region_shape_min, scene_lock, voice_lock, tempo_lock, key_lock, stem_balance_lock, lyrics_lock) is below the quality_profile threshold, prefer action=\"revise\" with a patch_plan that increases lock strength or updates mode/inputs via locks.update_region_modes or locks.update_audio_modes; escalate to \"fail\" if refinement budget is exhausted.\n"
+        "- When tool_results contain errors (tr.error or tr.result.error), treat them as canonical envelope errors: read error.code, error.status, and error.details to understand what failed and why before deciding.\n"
+        "- Keep patch_plan minimal (<=2 steps) and prefer lock adjustment tools or a single regeneration step that reuses existing bundles. Tools must be chosen only from the planner-visible front-door set and allowed for the current mode. In chat/analysis mode, do not include any action tools in patch_plan.\n"
+        "- In chat/analysis mode, do not include any action tools in patch_plan.\n"
+        "- The executor validates once and runs each tool step once. It does NOT retry or repair automatically; any retries must be explicit new steps in patch_plan based on the observed errors and QA metrics.\n"
+        "- Document threshold violations, tool errors, and key metrics in rationale so humans understand why content was revised or failed.\n"
+    )
+    allowed_list = ", ".join(allowed_for_mode or [])
+    mode_note = f"mode={mode}"
+    # Compute per-tool failure counts so the committee can avoid proposing
+    # the same failing tools indefinitely.
+    fail_counts: Dict[str, int] = {}
+    for tr in (tool_results or []):
+        if not isinstance(tr, dict):
+            continue
+        err = tr.get("error")
+        if not err:
+            res_tr = tr.get("result") if isinstance(tr.get("result"), dict) else {}
+            err = res_tr.get("error")
+        if isinstance(err, (dict, str)):
+            nm = str((tr.get("name") or tr.get("tool") or "")).strip()
+            if nm:
+                fail_counts[nm] = int(fail_counts.get(nm, 0)) + 1
+    user_blob = {
+        "user_text": (user_text or ""),
+        "qa_metrics": (qa_metrics or {}),
+        "tools_used": tools_used,
+        "artifact_urls": artifact_urls[:8],
+        "allowed_tools_for_mode": allowed_for_mode,
+        "mode": mode,
+        "tool_failures": fail_counts,
+    }
+    msgs = [
+        {
+            "role": "system",
+            "content": sys_hdr
+            + f"Allowed tools: {allowed_list}\nCurrent {mode_note}.\n"
+            + "If a tool has already failed multiple times in this trace (see tool_failures), you MUST NOT propose running it again; "
+              "prefer either a different tool or action=\"fail\" instead of looping.",
+        },
+        {"role": "user", "content": json.dumps(user_blob, ensure_ascii=False)},
+        {"role": "system", "content": "Return ONLY a single JSON object with keys: action, rationale, patch_plan."},
+    ]
+    # Two-model postrun committee: gather decisions from all participants and merge.
+    # Post-run decision is now derived from a single committee debate call.
+    decisions: List[Dict[str, Any]] = []
+    env_decide = await committee_ai_text(
+        msgs,
+        trace_id=str(trace_id or "committee_postrun"),
+        temperature=0.0,
+    )
+    if isinstance(env_decide, dict) and env_decide.get("ok"):
+        res_decide = env_decide.get("result") or {}
+        txt_decide = res_decide.get("text") or ""
+        schema_decide = {"action": str, "rationale": str, "patch_plan": [{"tool": str, "args": dict}]}
+        obj = await committee_jsonify(
+            txt_decide or "{}",
+            expected_schema=schema_decide,
+            trace_id=str(trace_id or "committee_postrun"),
+            temperature=0.0,
+        )
+        action = (obj.get("action") or "").strip().lower() or "go"
+        rationale = (obj.get("rationale") or "") if isinstance(obj.get("rationale"), str) else ""
+        steps = obj.get("patch_plan") or []
+        decisions.append(
+            {
+                "member": "committee",
+                "action": action,
+                "rationale": rationale,
+                "patch_plan": steps if isinstance(steps, list) else [],
+            }
+        )
+        emit_trace(
+            STATE_DIR,
+            str(trace_id or "committee_postrun"),
+            "committee.postrun.member",
+            {"member": "committee", "action": action},
+        )
+
+    if not decisions:
+        out = {"action": "go", "rationale": "committee_unavailable", "patch_plan": []}
+        emit_trace(
+            STATE_DIR,
+            str(trace_id or "committee_postrun"),
+            "committee.postrun.ok",
+            {"action": out.get("action"), "rationale": out.get("rationale")},
+        )
+        return out
+
+    # Merge decisions: prefer more conservative actions when disagreeing.
+    rank = {"go": 0, "revise": 1, "fail": 2}
+    best = max(decisions, key=lambda d: rank.get(d.get("action") or "go", 0))
+    merged_action = best.get("action") or "go"
+    # Merge rationales and patch plans (cap patch_plan length to 2 steps).
+    merged_rationale_parts: List[str] = []
+    merged_patch_plan: List[Dict[str, Any]] = []
+    for d in decisions:
+        r = d.get("rationale") or ""
+        if isinstance(r, str) and r.strip():
+            merged_rationale_parts.append(r.strip())
+        steps = d.get("patch_plan") or []
+        if isinstance(steps, list):
+            for st in steps:
+                if isinstance(st, dict) and len(merged_patch_plan) < 2:
+                    merged_patch_plan.append(st)
+    out = {
+        "action": merged_action,
+        "rationale": "\n\n".join(merged_rationale_parts)[:2000],
+        "patch_plan": merged_patch_plan[:2],
+    }
+    emit_trace(
+        STATE_DIR,
+        str(trace_id or "committee_postrun"),
+        "committee.postrun.ok",
+        {"action": out.get("action"), "rationale": out.get("rationale")},
+    )
+    return out
 
 
