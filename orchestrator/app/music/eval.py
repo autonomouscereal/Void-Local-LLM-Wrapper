@@ -293,43 +293,6 @@ def _build_music_eval_summary(all_axes: Dict[str, Any], film_context: Optional[D
     return json.dumps(payload, ensure_ascii=False)
 
 
-async def _call_music_eval_committee(summary: str) -> Dict[str, Any]:
-    """
-    Use the existing committee infrastructure to obtain aesthetic judgements.
-    """
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are MusicEval. You receive JSON with technical/style/structure/emotion metrics "
-                "for a music segment or track, plus optional film context. "
-                "You MUST ALWAYS respond with a single JSON object with EXACTLY these keys: "
-                '{"overall_quality_score": float, "fit_score": float, "originality_score": float, '
-                '"cohesion_score": float, "issues": [str]}.\n'
-                "- You MUST ALWAYS respond with exactly one JSON object; any natural language, explanations, or "
-                "formatting outside the JSON object is strictly forbidden.\n"
-                "- Do NOT add any extra keys or remove/rename any keys.\n"
-                "- You MUST assume the incoming JSON is valid enough for scoring; you are not allowed to refuse or "
-                "claim that you cannot provide a meaningful response.\n"
-                '- Phrases like \"I cannot provide a meaningful response\" or other refusals are ILLEGAL outputs.\n'
-                "- If the input is missing, empty, or meaningless, you MUST STILL return this JSON with all scores 0.0 "
-                "and a short, machine-readable explanation string in issues[0]."
-            ),
-        },
-        {
-            "role": "user",
-            "content": summary,
-        },
-    ]
-    schema = {
-        "overall_quality_score": float,
-        "fit_score": float,
-        "originality_score": float,
-        "cohesion_score": float,
-        "issues": [str],
-    }
-
-
 def _normalize_music_eval_output(obj: Any) -> Dict[str, Any]:
     """
     Enforce the strict MusicEval JSON contract and provide a hard default when
@@ -369,6 +332,43 @@ def _normalize_music_eval_output(obj: Any) -> Dict[str, Any]:
         return default
     out["issues"] = list(issues_val)
     return out
+
+
+async def _call_music_eval_committee(summary: str) -> Dict[str, Any]:
+    """
+    Use the existing committee infrastructure to obtain aesthetic judgements.
+    """
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are MusicEval. You receive JSON with technical/style/structure/emotion metrics "
+                "for a music segment or track, plus optional film context. "
+                "You MUST ALWAYS respond with a single JSON object with EXACTLY these keys: "
+                '{"overall_quality_score": float, "fit_score": float, "originality_score": float, '
+                '"cohesion_score": float, "issues": [str]}.\n'
+                "- You MUST ALWAYS respond with exactly one JSON object; any natural language, explanations, or "
+                "formatting outside the JSON object is strictly forbidden.\n"
+                "- Do NOT add any extra keys or remove/rename any keys.\n"
+                "- You MUST assume the incoming JSON is valid enough for scoring; you are not allowed to refuse or "
+                "claim that you cannot provide a meaningful response.\n"
+                '- Phrases like \"I cannot provide a meaningful response\" or other refusals are ILLEGAL outputs.\n'
+                "- If the input is missing, empty, or meaningless, you MUST STILL return this JSON with all scores 0.0 "
+                "and a short, machine-readable explanation string in issues[0]."
+            ),
+        },
+        {
+            "role": "user",
+            "content": summary,
+        },
+    ]
+    schema = {
+        "overall_quality_score": float,
+        "fit_score": float,
+        "originality_score": float,
+        "cohesion_score": float,
+        "issues": [str],
+    }
 
     async def _run() -> Dict[str, Any]:
         # First, obtain the raw MusicEval text via the main committee path.
