@@ -37,7 +37,7 @@ RUN pip install --no-cache-dir \
       prettytable \
       requests
 
-# Core libs under constraints
+# Core libs under constraints (this is your canonical stack, including transformers==4.44.2)
 RUN pip install --no-cache-dir --no-deps -r /constraints.txt && \
     pip install --no-cache-dir --requirement /constraints.txt && \
     pip uninstall -y opencv-python || true
@@ -55,6 +55,7 @@ RUN rm -rf /comfyui/custom_nodes/ComfyUI-Real-ESRGAN /comfyui/custom_nodes/comfy
 RUN mkdir -p /comfyui/custom_nodes/ComfyUI_IPAdapter_plus && \
     curl -fL https://codeload.github.com/cubiq/ComfyUI_IPAdapter_plus/tar.gz/main \
       | tar -xzf - --strip-components=1 -C /comfyui/custom_nodes/ComfyUI_IPAdapter_plus
+
 ## Intentionally NOT installing ComfyUI-InstantID; use IPAdapter FaceID path instead
 RUN mkdir -p /comfyui/custom_nodes/ComfyUI-VideoHelperSuite && \
     curl -fL https://codeload.github.com/Kosinkadink/ComfyUI-VideoHelperSuite/tar.gz/main \
@@ -78,14 +79,26 @@ PY
 # Ensure model dirs for IPAdapter+ exist
 RUN mkdir -p /comfyui/models/ipadapter /comfyui/models/clip_vision /comfyui/models/loras /comfyui/models/insightface
 
-# Just ensure PyYAML is installed; do not re-run ComfyUI's requirements.txt to avoid transformers conflicts
-RUN pip install --no-cache-dir PyYAML==6.0.1
-
-# No custom node tarball pulls; rely on ComfyUI core only
+# === FIX: Let ComfyUI install its own extras, but strip its transformers pin ===
+# This keeps your global transformers==4.44.2 while still installing:
+#   - comfyui-frontend-package
+#   - comfyui-workflow-templates
+#   - comfyui-embedded-docs
+#   - and any other ComfyUI-specific deps
+RUN if [ -f /comfyui/requirements.txt ]; then \
+      # Drop any transformers requirement from ComfyUI's requirements to avoid
+      # conflict with constraints.txt (transformers==4.44.2) and ResolutionImpossible
+      sed -i '/^[Tt]ransformers[<>= ]/d' /comfyui/requirements.txt; \
+      # Ensure PyYAML is listed (even though it's already installed globally)
+      grep -qi '^PyYAML' /comfyui/requirements.txt || echo 'PyYAML==6.0.1' >> /comfyui/requirements.txt; \
+      # Now install ComfyUI requirements; constraints still apply via $PIP_CONSTRAINT
+      pip install --no-cache-dir -r /comfyui/requirements.txt; \
+    else \
+      echo 'PyYAML==6.0.1' > /comfyui/requirements.txt && \
+      pip install --no-cache-dir PyYAML==6.0.1; \
+    fi
 
 RUN mkdir -p /comfyui/models/upscale /comfyui/input /comfyui/output
 
 EXPOSE 8188
 CMD ["python","-u","main.py","--listen","--port","8188"]
-
-
