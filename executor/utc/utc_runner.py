@@ -30,11 +30,23 @@ def _post(url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     # body with ok/result/error. Use a shallow schema so callers always see a
     # dict with those keys, and attach the HTTP status out-of-band.
     env_schema = {"ok": bool, "result": dict, "error": dict}
-    sup = parser.parse_superset(text or "{}", env_schema)
-    body = sup["coerced"]
+    try:
+        sup = parser.parse_superset(text or "{}", env_schema)
+        body = sup["coerced"]
+    except Exception as e:
+        # Parsing should virtually never fail for orchestrator envelopes. When
+        # it does, surface the raw body and parse error so executor logs can
+        # explain exactly what went wrong instead of only reporting _http_status.
+        return {
+            "_http_status": r.status_code,
+            "raw": text[:4000],
+            "parse_error": repr(e),
+        }
     if isinstance(body, dict):
         body.setdefault("_http_status", r.status_code)
         return body
+    # Non-dict envelopes are treated as hard failures; preserve the raw body so
+    # callers (and logs) can inspect what the orchestrator actually returned.
     return {"_http_status": r.status_code, "raw": body}
 
 

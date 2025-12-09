@@ -602,6 +602,9 @@ async def run_steps(trace_id: str, request_id: str, steps: list[dict]) -> Dict[s
                 produced[sid] = {"name": tool_name, "result": _canonical_tool_result(res)}
                 ok = True
             elif bool(res.get("ok")) is False:
+                # Tool-layer error envelope (from utc_run_tool and/or orchestrator /tool.run).
+                # Prefer fields from the nested error object so logs always show a concrete
+                # code/message/detail instead of falling back to raw HTTP status only.
                 err_obj = res.get("error") if isinstance(res.get("error"), dict) else {}
                 code_val = err_obj.get("code") if isinstance(err_obj, dict) else None
                 msg_val = err_obj.get("message") if isinstance(err_obj, dict) else None
@@ -611,20 +614,26 @@ async def run_steps(trace_id: str, request_id: str, steps: list[dict]) -> Dict[s
                 tb = tb_val if isinstance(tb_val, (str, bytes)) else ""
                 if tb:
                     logging.error(tb if isinstance(tb, str) else str(tb))
-                env_fields = {}
+                # Capture a compact view of the executor/tool env for debugging.
+                env_fields: Dict[str, Any] = {}
                 for k in ("code", "message", "detail", "_http_status", "status"):
                     if k in res:
                         env_fields[k] = res[k]
-                err_code = res.get("code") or (res.get("error") or {}).get("code")
-                err_msg = res.get("message") or (res.get("error") or {}).get("message")
-                err_det = res.get("detail") or (res.get("error") or {}).get("detail")
+                # Also record the shape of the nested error payload so we can see where
+                # fields actually live when debugging.
+                if isinstance(err_obj, dict):
+                    env_fields["error_keys"] = sorted(err_obj.keys())
+                # Log using the normalized error object fields.
+                err_detail = None
+                if isinstance(err_obj, dict):
+                    err_detail = err_obj.get("details") or err_obj.get("detail")
                 logging.error(
                     "[executor] step=%s tool=%s FAILED code=%s msg=%s detail=%s env=%s",
                     sid,
                     tool_name,
-                    err_code,
-                    err_msg,
-                    err_det,
+                    code,
+                    msg,
+                    err_detail,
                     json.dumps(env_fields, sort_keys=True),
                 )
                 # Normalize the error payload so it always carries a meaningful message.

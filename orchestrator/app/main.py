@@ -3883,6 +3883,21 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         warnings: List[str] = []
         # Character context derived from locks (if present); reused for music + hero updates.
         current_character_bundles: Dict[str, Dict[str, Any]] = await ensure_story_character_bundles(locks_arg if isinstance(locks_arg, dict) else {})
+        # Derive character_ids once for downstream use (music + hero lock updates).
+        character_ids: List[str] = []
+        raw_character_ids = a.get("character_ids")
+        if isinstance(raw_character_ids, list):
+            character_ids = [
+                str(cid)
+                for cid in raw_character_ids
+                if isinstance(cid, (str, int))
+            ]
+        elif isinstance(current_character_bundles, dict):
+            character_ids = [
+                str(cid)
+                for cid in current_character_bundles.keys()
+                if isinstance(cid, (str, int))
+            ]
         if prompt:
             story_obj = _story_draft(prompt, duration_s)
             _trace_append(

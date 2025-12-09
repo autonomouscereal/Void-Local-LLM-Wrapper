@@ -60,8 +60,6 @@ def get_builtin_tools_schema() -> List[Dict[str, Any]]:
 					"type": "object",
 					"properties": {
 						"prompt": {"type": "string"},
-						"clips": {"type": "array", "items": {"type": "string"}},
-						"images": {"type": "array", "items": {"type": "object"}},
 						"interpolate": {"type": "boolean"},
 						"scale": {"type": "number"},
 						"quality_profile": {"type": "string"},
