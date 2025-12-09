@@ -202,20 +202,17 @@ async def perform_http_request(config: HttpRequestConfig) -> Tuple[bool, Dict[st
             txt = body_preview
             if not txt.strip():
                 return True, {"status": status, "headers": captured_headers, "body": None}
-            if not txt.lstrip().startswith("{") and not txt.lstrip().startswith("["):
-                return False, {
-                    "code": "remote_invalid_json",
-                    "message": "Remote response was not valid JSON",
-                    "status": status,
-                    "details": {
-                        "remote_status": status,
-                        "remote_headers": captured_headers,
-                        "remote_body": txt,
-                    },
-                }
             parser = JSONParser()
             try:
-                expected = {} if txt.lstrip().startswith("{") else []
+                # Use the first non-whitespace character as a loose hint for the
+                # top-level container shape, but always delegate full repair and
+                # parsing to JSONParser without any "looks like JSON" guards.
+                first = txt.lstrip()[:1]
+                expected: Any
+                if first == "[":
+                    expected = []
+                else:
+                    expected = {}
                 parsed = parser.parse_superset(txt, expected)["coerced"]
             except Exception as ex:
                 return False, {
@@ -248,15 +245,15 @@ async def perform_http_request(config: HttpRequestConfig) -> Tuple[bool, Dict[st
     }
     if expect_json:
         txt = body_preview
-        if txt.lstrip().startswith("{") or txt.lstrip().startswith("["):
-            parser = JSONParser()
-            try:
-                expected = {} if txt.lstrip().startswith("{") else []
-                details["remote_body"] = parser.parse_superset(txt, expected)["coerced"]
-            except Exception:
-                details["remote_body"] = txt
-                details["remote_body_truncated"] = len(txt) == BODY_PREVIEW_BYTES
-        else:
+        parser = JSONParser()
+        try:
+            first = txt.lstrip()[:1]
+            if first == "[":
+                expected = []
+            else:
+                expected = {}
+            details["remote_body"] = parser.parse_superset(txt, expected)["coerced"]
+        except Exception:
             details["remote_body"] = txt
             details["remote_body_truncated"] = len(txt) == BODY_PREVIEW_BYTES
     else:

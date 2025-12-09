@@ -2837,7 +2837,8 @@ async def planner_produce_plan(messages: List[Dict[str, Any]], tools: Optional[L
         "- When editing, include the input image via attachments (preferred) or set args.images to an array of objects containing absolute /uploads/... URLs.\n"
         "- For denoise/inpaint style edits, include a strength field (0.0–1.0) when applicable; keep the prompt aligned with the edit intent.\n"
         "- You MAY produce multiple steps in one plan in the 'steps' array; preserve the intended order. When the user requests media, choose one or more of the front-door tools (image.dispatch, music.infinite.windowed, film2.run, tts.speak) and do not reference any other tools.\n"
-        "- Returning an empty 'steps' list is ONLY allowed for purely textual questions with no media intent at all. If the user asks for any images, video/film, music, audio, or TTS, you MUST include at least one tool step.\n"
+        "- For purely textual questions with no media intent at all, returning an empty 'steps' list (i.e., no tools) is preferred.\n"
+        "- If the user asks for any images, video/film, music, audio, or TTS, you MUST include at least one tool step.\n"
         "- Do NOT propose internal tools such as locks.*, rag_search, research.run, web.smart_get, or http.request."
     )
     committee_review = (
@@ -2863,7 +2864,8 @@ async def planner_produce_plan(messages: List[Dict[str, Any]], tools: Optional[L
     tool_catalog_frame = {"role": "system", "content": "\n".join(catalog_lines)}
 
     contract_return = (
-        "Return ONLY strict JSON: {\"steps\":[{\"tool\":\"<name>\",\"args\":{...}}]} — no extra keys or commentary."
+        "Return ONLY strict JSON: {\"steps\":[{\"tool\":\"<name>\",\"args\":{...}}]} — no extra keys or commentary. "
+        "For pure chat answers with no tool use, you may return {\"steps\":[]}."
     )
     plan_messages = frames_msgs + [
         tool_catalog_frame,
@@ -4252,7 +4254,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                         overall_block = final_music_eval.get("overall") if isinstance(final_music_eval.get("overall"), dict) else {}
                         oq = float(overall_block.get("overall_quality_score") or 0.0)
                         fs = float(overall_block.get("fit_score") or 0.0)
-                        th_music = _get_music_acceptance_thresholds()
+                        th_music = get_music_acceptance_thresholds()
                         # Acceptance thresholds loaded from review/acceptance_audio.json
                         accepted = (oq >= th_music.get("overall_quality_min", 0.0) and fs >= th_music.get("fit_score_min", 0.0))
                         # Hero thresholds: stricter than acceptance

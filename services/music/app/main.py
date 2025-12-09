@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import io
 import os
+import time
 from typing import Any, Dict
 
 import numpy as np
@@ -29,6 +30,31 @@ async def healthz():
 
 @app.post("/generate")
 async def generate(body: Dict[str, Any]):
+    """
+    Simple synchronous music generation endpoint.
+
+    Contract:
+      - Request JSON:
+          {
+            "prompt": str,
+            "seconds": int,
+            "seed": Optional[int],
+            "refs": Optional[list],
+            "cid": Optional[str]
+          }
+      - Response JSON on success:
+          {
+            "wav_bytes_b64": str,
+            "wav_base64": str,
+            "audio_base64": str,
+            "sample_rate": int,
+            "artifact_id": str,
+            "relative_url": str,
+            "duration_s": int
+          }
+    The file is persisted under UPLOAD_DIR/artifacts/music/{cid}/{artifact_id}.wav
+    so the orchestrator/UI can serve it via /uploads/.
+    """
     prompt = body.get("prompt") or ""
     seconds = int(body.get("seconds", 8))
     if not prompt:
@@ -59,8 +85,36 @@ async def generate(body: Dict[str, Any]):
             arr = np.asarray(wav, dtype=np.float32)
             sf.write(buf, arr, 32000, format="WAV")
             wav = buf.getvalue()
+
+        # Persist clip to disk so orchestrator/UI have a stable artifact URL.
+        upload_root = os.getenv("UPLOAD_DIR", "/workspace/uploads")
+        cid = body.get("cid") or body.get("trace_id") or "music"
+        cid = str(cid)
+        outdir = os.path.join(upload_root, "artifacts", "music", cid)
+        os.makedirs(outdir, exist_ok=True)
+        artifact_id = f"clip_{int(time.time())}"
+        path = os.path.join(outdir, f"{artifact_id}.wav")
+        with open(path, "wb") as f:
+            f.write(wav)
+
+        rel = os.path.relpath(path, upload_root).replace("\\", "/")
+        relative_url = f"/uploads/{rel}"
+
         b64 = base64.b64encode(wav).decode("utf-8")
-        return {"audio_wav_base64": b64, "sample_rate": 32000}
+        # Provide multiple key aliases so different callers (RestMusicProvider,
+        # legacy tools, etc.) can consume the same payload without changes.
+        content = {
+            "wav_bytes_b64": b64,
+            "wav_base64": b64,
+            "audio_base64": b64,
+            "sample_rate": 32000,
+            "artifact_id": artifact_id,
+            "relative_url": relative_url,
+            "duration_s": seconds,
+            "path": path,
+            "cid": cid,
+        }
+        return content
     except Exception as ex:  # surface full error as structured JSON
         logging.exception("music.generate error")
         return JSONResponse(

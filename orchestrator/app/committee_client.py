@@ -598,6 +598,15 @@ async def committee_jsonify(
 
     parser = JSONParser()
     parsed_candidates: List[Dict[str, Any]] = []
+
+    # Detect Song Graph wrapper schemas so we can handle parse failures with a
+    # canonical empty song object and downweight empty candidates.
+    song_schema: Dict[str, Any] | None = None
+    if isinstance(expected_schema, dict):
+        maybe_song = expected_schema.get("song")
+        if isinstance(maybe_song, dict) and "global" in maybe_song and "sections" in maybe_song:
+            song_schema = maybe_song
+
     for idx, txt in enumerate(candidates):
         log.info(
             "[committee.jsonify] parse_candidate trace_id=%s index=%d text=%s",
@@ -616,7 +625,16 @@ async def committee_jsonify(
                 idx,
                 str(ex),
             )
-            continue
+            # For Song Graph wrappers, treat parse failures as an explicit
+            # empty song shell instead of dropping the candidate entirely.
+            if song_schema is not None:
+                try:
+                    sup_default = parser.parse_superset("{}", expected_schema)
+                    obj = sup_default["coerced"]
+                except Exception:
+                    continue
+            else:
+                continue
         log.info(
             "[committee.jsonify] parsed_candidate trace_id=%s index=%d obj=%s",
             trace_base,
@@ -639,13 +657,6 @@ async def committee_jsonify(
         return ""
 
     merged: Dict[str, Any] = {}
-    # Detect Song Graph wrapper schemas so we can downweight "empty" candidates
-    # and prefer the richest candidate (most sections, then voices/instruments/motifs).
-    song_schema: Dict[str, Any] | None = None
-    if isinstance(expected_schema, dict):
-        maybe_song = expected_schema.get("song")
-        if isinstance(maybe_song, dict) and "global" in maybe_song and "sections" in maybe_song:
-            song_schema = maybe_song
 
     # For Song Graph wrappers, drop obviously-empty/default song candidates from
     # consideration when at least one non-empty candidate exists, and reorder

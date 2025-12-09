@@ -109,23 +109,29 @@ async def _startup():
 def _pool() -> asyncpg.pool.Pool:
     assert pool is not None, "DB pool not initialized"
     return pool
+
+
 def _decode_json(value: Any) -> Dict[str, Any]:
+    """
+    Decode DB JSON-ish fields into a stable dict shape.
+
+    Always delegate parsing to the global JSONParser; do not pre-screen on
+    leading characters. This lets the repair logic handle messy strings while
+    still falling back cleanly to a {"text": ...} wrapper when needed.
+    """
     if isinstance(value, dict):
         return value
     if isinstance(value, str):
-        # Use custom JSON parser only when the string looks like JSON; otherwise
-        # treat it as plain text to avoid over-eager coercion.
-        txt = value.strip()
-        if txt.startswith("{") or txt.startswith("["):
-            try:
-                parser = JSONParser()
-                expected = {"text": str}
-                sup = parser.parse_superset(txt, expected)
-                obj = sup["coerced"]
-                # If the normalized parse still doesn't look like a dict, fall back to raw text
-                return obj if isinstance(obj, dict) and obj else {"text": value}
-            except Exception:
-                return {"text": value}
+        parser = JSONParser()
+        try:
+            expected = {"text": str}
+            sup = parser.parse_superset(value, expected)
+            obj = sup["coerced"]
+            if isinstance(obj, dict) and obj:
+                return obj
+        except Exception:
+            # Fall through to plain-text wrapper below
+            pass
         return {"text": value}
     return {"text": str(value or "")}
 

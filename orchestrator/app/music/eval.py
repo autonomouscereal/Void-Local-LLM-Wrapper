@@ -283,55 +283,31 @@ def eval_emotion(track_path: str) -> Dict[str, Any]:
 
 
 def _build_music_eval_summary(all_axes: Dict[str, Any], film_context: Optional[Dict[str, Any]]) -> str:
+    # Strip out heavy embedding vectors and non-essential blobs so that the
+    # LLM-based MusicEval path only sees compact, scalar-style metrics rather
+    # than raw embeddings intended for the lock/RAG systems.
+    axes_slim: Dict[str, Any] = {}
+    for key, val in (all_axes or {}).items():
+        if not isinstance(val, dict):
+            axes_slim[key] = val
+            continue
+        cur = dict(val)
+        if key == "style":
+            # Embeddings and large per-ref maps are for lock/RAG, not the LLM.
+            cur.pop("track_embed", None)
+            cur.pop("style_embed", None)
+            cur.pop("per_ref_scores", None)
+            cur.pop("refs", None)
+        axes_slim[key] = cur
+
     payload: Dict[str, Any] = {
-        "axes": all_axes,
+        "axes": axes_slim,
         "film_context": film_context or {},
     }
     # This summary is consumed by LLM-based committee paths and must be valid
     # JSON. Use the standard json module here instead of the JSONParser, which
     # is focused on parsing/repair rather than serialization.
     return json.dumps(payload, ensure_ascii=False)
-
-
-def _normalize_music_eval_output(obj: Any) -> Dict[str, Any]:
-    """
-    Enforce the strict MusicEval JSON contract and provide a hard default when
-    the candidate is malformed or missing required fields.
-
-    This acts as a final safety net on top of committee_jsonify so downstream
-    consumers never see prose or schema-breaking content.
-    """
-    default: Dict[str, Any] = {
-        "overall_quality_score": 0.0,
-        "fit_score": 0.0,
-        "originality_score": 0.0,
-        "cohesion_score": 0.0,
-        "issues": ["Input missing or invalid, returned default scores."],
-    }
-    if not isinstance(obj, dict):
-        return default
-    required_keys = (
-        "overall_quality_score",
-        "fit_score",
-        "originality_score",
-        "cohesion_score",
-        "issues",
-    )
-    if any(k not in obj for k in required_keys):
-        return default
-    issues_val = obj.get("issues")
-    if not isinstance(issues_val, list) or not issues_val or not all(isinstance(x, str) for x in issues_val):
-        return default
-    out: Dict[str, Any] = {}
-    try:
-        out["overall_quality_score"] = float(obj.get("overall_quality_score"))
-        out["fit_score"] = float(obj.get("fit_score"))
-        out["originality_score"] = float(obj.get("originality_score"))
-        out["cohesion_score"] = float(obj.get("cohesion_score"))
-    except Exception:
-        return default
-    out["issues"] = list(issues_val)
-    return out
 
 
 async def _call_music_eval_committee(summary: str) -> Dict[str, Any]:
@@ -385,7 +361,7 @@ async def _call_music_eval_committee(summary: str) -> Dict[str, Any]:
             trace_id="music_eval",
             temperature=0.0,
         )
-        return _normalize_music_eval_output(parsed)
+        return parsed if isinstance(parsed, dict) else {}
 
     return await _run()
 

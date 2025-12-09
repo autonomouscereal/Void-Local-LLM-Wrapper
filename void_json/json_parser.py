@@ -83,43 +83,23 @@ class JSONParser:
     def parse_best_effort(self, text: str, expected_structure: Any) -> Any:
         return self.parse(text, expected_structure)
 
-    def parse_strict(self, text: str) -> Tuple[bool, Optional[Any]]:
-        """
-        Strict load without schema coercion: returns (ok, raw_obj).
-        Still uses markdown stripping and basic repair, but does not enforce shape.
-        """
-        if not isinstance(text, str):
-            text = "" if text is None else str(text)
-        s = self.strip_markdown(text)
-        try:
-            obj = json.loads(s)
-            return True, obj
-        except Exception as e1:
-            self._err(f"parse_strict_pristine:{e1}")
-        repaired = self.attempt_repair(s)
-        try:
-            obj = json.loads(repaired)
-            return True, obj
-        except Exception as e2:
-            self._err(f"parse_strict_repaired:{e2}")
-            return False, None
-
     def parse_superset(self, text: str, expected_structure: Any) -> Dict[str, Any]:
         """
         Return a richer result that includes:
           - coerced: structure shaped to expected_structure
-          - raw: best-effort raw object from JSON
-          - extras: parts of raw not represented in coerced
+          - raw: best-effort raw object from JSON (same as coerced for now)
+          - extras: parts of raw not represented in coerced (empty when using best-effort path)
           - vars: numeric hints extracted from string leaves
           - repairs/errors/last_error: diagnostics
         """
-        ok, raw = self.parse_strict(text)
-        if not ok:
-            raw = {} if isinstance(expected_structure, dict) else (
-                [] if isinstance(expected_structure, list) else None
-            )
-        coerced = self.ensure_structure(raw, expected_structure)
-        extras = self._diff_extras(raw, coerced)
+        # Delegate to the main best-effort parser so we never rely on strict
+        # json.loads() semantics here. This keeps parse_superset aligned with the
+        # "magical" repair logic and avoids brittle strict-parse failures.
+        coerced = self.parse(text, expected_structure)
+        # In the current design most callers only care about the coerced value.
+        # We still expose a minimal superset view for compatibility.
+        raw: Any = coerced
+        extras: Any = {}
         vars_map = self._extract_vars(raw)
         return {
             "coerced": coerced,
