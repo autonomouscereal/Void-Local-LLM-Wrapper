@@ -22,6 +22,7 @@ services:
     volumes:
       - film2_models:/opt/models
       - ./bootstrap:/bootstrap:ro
+      - void_artifacts:/workspace/uploads
     restart: "no"
 
 
@@ -43,6 +44,8 @@ services:
     network_mode: host
     expose:
       - "7861"
+    volumes:
+      - void_artifacts:/workspace/uploads
     
 
   dsinger:
@@ -62,6 +65,8 @@ services:
     network_mode: host
     expose:
       - "7862"
+    volumes:
+      - void_artifacts:/workspace/uploads
     
 
   rvc_python:
@@ -85,6 +90,7 @@ services:
       - rvc_models:/srv/rvc_models
       # Access to Titan pretrained weights from bootstrap (read-only)
       - film2_models:/opt/models:ro
+      - void_artifacts:/workspace/uploads
     network_mode: host
     expose:
       - "5050"
@@ -118,6 +124,7 @@ services:
       # Training data + logs
       - rvc_train_data:/srv/data
       - rvc_logs:/srv/logs
+      - void_artifacts:/workspace/uploads
     network_mode: host
     expose:
       - "7070"
@@ -164,6 +171,7 @@ services:
       - rvc_models:/srv/rvc_models
       # Training data access
       - rvc_train_data:/srv/data
+      - void_artifacts:/workspace/uploads
     
 
   vocalfix:
@@ -183,6 +191,8 @@ services:
     network_mode: host
     expose:
       - "7864"
+    volumes:
+      - void_artifacts:/workspace/uploads
     
 
   master:
@@ -194,6 +204,8 @@ services:
     network_mode: host
     expose:
       - "7865"
+    volumes:
+      - void_artifacts:/workspace/uploads
     
 
   mfa:
@@ -205,6 +217,8 @@ services:
     network_mode: host
     expose:
       - "7867"
+    volumes:
+      - void_artifacts:/workspace/uploads
     
     
 
@@ -217,6 +231,8 @@ services:
     network_mode: host
     expose:
       - "7868"
+    volumes:
+      - void_artifacts:/workspace/uploads
     
       
   sfx:
@@ -236,6 +252,8 @@ services:
     network_mode: host
     expose:
       - "7866"
+    volumes:
+      - void_artifacts:/workspace/uploads
     
       
   nvidia_init:
@@ -255,6 +273,7 @@ services:
       - /dev:/host/dev:rw
       - /run/systemd/resolve:/host/run/systemd/resolve:ro
       - ./docker/nvidia-init/nvidia-init-safe.sh:/init.sh:ro
+      - void_artifacts:/workspace/uploads
     entrypoint: ["/bin/bash","-lc","cp /init.sh /tmp/init.sh; chmod +x /tmp/init.sh; sed -i 's/\\r$//' /tmp/init.sh || true; bash /tmp/init.sh || true"]
 
   
@@ -272,6 +291,7 @@ services:
     # host networking: no ports mapping needed
     volumes:
       - pgvector_data:/var/lib/postgresql/data
+      - void_artifacts:/workspace/uploads
     
   ollama_qwen:
     network_mode: host
@@ -291,6 +311,7 @@ services:
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     volumes:
       - ollama_qwen_data:/root/.ollama
+      - void_artifacts:/workspace/uploads
     
 
   init_qwen:
@@ -321,6 +342,7 @@ services:
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     volumes:
       - ollama_glm_data:/root/.ollama
+      - void_artifacts:/workspace/uploads
 
 
   deepseek_ollama:
@@ -341,6 +363,7 @@ services:
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     volumes:
       - ollama_deepseek_data:/root/.ollama
+      - void_artifacts:/workspace/uploads
 
   init_glm:
     image: curlimages/curl:8.7.1
@@ -453,7 +476,7 @@ services:
     command: ["uvicorn","app.main:app","--host","0.0.0.0","--port","8000","--log-level","info","--access-log","--use-colors"]
     volumes:
       - ./:/workspace
-      - uploads_data:/workspace/uploads
+      - void_artifacts:/workspace/uploads
       - film2_models:/opt/models
       - film2_data:/srv/film2
       - ./assets/comfyui/input:/comfyui/input
@@ -475,9 +498,12 @@ services:
       - PYTHONUNBUFFERED=1
       - NVIDIA_VISIBLE_DEVICES=${MUSIC_GPU:-all}
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - UPLOAD_DIR=/workspace/uploads
     network_mode: host
     expose:
       - "7860"
+    volumes:
+      - void_artifacts:/workspace/uploads
 
 
   xtts:
@@ -517,6 +543,7 @@ services:
       - torch_cache:/models/torch
       # Persist XTTS cache and voice_model_map.json on a named volume.
       - tts_cache:/root/.local/share/tts
+      - void_artifacts:/workspace/uploads
       - film2_models:/opt/models:ro
       - film2_data:/srv/film2
     
@@ -539,7 +566,8 @@ services:
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     expose:
       - "9090"
-    
+    volumes:
+      - void_artifacts:/workspace/uploads
 
   faceid:
     build:
@@ -560,6 +588,7 @@ services:
     volumes:
       # Share the same antelopev2 ONNX pack used by ComfyUI/InstantID.
       - comfyui_models:/opt/models
+      - void_artifacts:/workspace/uploads
 
   vision_repair:
     build:
@@ -579,6 +608,8 @@ services:
     network_mode: host
     expose:
       - "8095"
+    volumes:
+      - void_artifacts:/workspace/uploads
 
   comfyui:
     build:
@@ -604,8 +635,8 @@ services:
       - comfyui_models:/comfyui/models
       - ./assets/comfyui/models/upscale:/comfyui/models/upscale
       - ./assets/comfyui/input:/comfyui/input
-      # Share uploads_data with orchestrator/executor so Comfy outputs are visible under /uploads
-      - uploads_data:/comfyui/output
+      # Share void_artifacts with orchestrator/executor so Comfy outputs are visible under /uploads
+      - void_artifacts:/comfyui/output
     # For GPU deployments, create additional comfyui-* services and set COMFYUI_API_URLS accordingly
 
   # Optional additional ComfyUI replicas for dynamic distribution
@@ -636,8 +667,8 @@ services:
       - comfyui_models:/comfyui/models
       - ./assets/comfyui/models/upscale:/comfyui/models/upscale
       - ./assets/comfyui/input:/comfyui/input
-      # Share uploads_data with orchestrator/executor so Comfy outputs are visible under /uploads
-      - uploads_data:/comfyui/output
+      # Share void_artifacts with orchestrator/executor so Comfy outputs are visible under /uploads
+      - void_artifacts:/comfyui/output
 
   comfyui-2:
     build:
@@ -663,8 +694,8 @@ services:
       - comfyui_models:/comfyui/models
       - ./assets/comfyui/models/upscale:/comfyui/models/upscale
       - ./assets/comfyui/input:/comfyui/input
-      # Share uploads_data with orchestrator/executor so Comfy outputs are visible under /uploads
-      - uploads_data:/comfyui/output
+      # Share void_artifacts with orchestrator/executor so Comfy outputs are visible under /uploads
+      - void_artifacts:/comfyui/output
 
   comfyui_init:
     build:
@@ -679,6 +710,7 @@ services:
     volumes:
       - comfyui_models:/comfyui/models
       # Do not mount host or named custom_nodes to avoid resurrecting Real-ESRGAN
+      - void_artifacts:/workspace/uploads
     command: ["python", "/app/init_assets.py"]
 
   n8n:
@@ -704,6 +736,7 @@ services:
       - "5678:5678"
     volumes:
       - n8n_data:/home/node/.n8n
+      - void_artifacts:/workspace/uploads
     
 
   n8n_init:
@@ -720,6 +753,7 @@ services:
     volumes:
       - n8n_data:/home/node/.n8n
       - ./services/n8n/workflows:/workflows:ro
+      - void_artifacts:/workspace/uploads
     command: sh -lc "n8n import:workflow --input /workflows/film_assemble.json --separate"
 
 
@@ -749,6 +783,7 @@ services:
       - demucs_cache:/root/.cache/demucs
       - film2_models:/opt/models:ro
       - film2_data:/srv/film2
+      - void_artifacts:/workspace/uploads
 
   
 
@@ -782,6 +817,7 @@ services:
       - torch_cache:/models/torch
       - film2_models:/opt/models:ro
       - film2_data:/srv/film2
+      - void_artifacts:/workspace/uploads
     
 
   ocr:
@@ -792,6 +828,8 @@ services:
     restart: unless-stopped
     expose:
       - "8070"
+    volumes:
+      - void_artifacts:/workspace/uploads
 
   executor:
     
@@ -810,7 +848,7 @@ services:
       - ORCHESTRATOR_BASE_URL=http://127.0.0.1:8000
     volumes:
       - ./:/workspace
-      - uploads_data:/workspace/uploads
+      - void_artifacts:/workspace/uploads
 
   drt:
     build:
@@ -828,6 +866,7 @@ services:
       - "8086"
     volumes:
       - ./:/workspace
+      - void_artifacts:/workspace/uploads
 
   film2:
     build:
@@ -855,6 +894,7 @@ services:
       - ./:/workspace
       - film2_models:/opt/models:ro
       - film2_data:/srv/film2
+      - void_artifacts:/workspace/uploads
 
   ablation:
     build:
@@ -869,6 +909,7 @@ services:
       - "8095"
     volumes:
       - ./:/workspace
+      - void_artifacts:/workspace/uploads
 
   teacher:
     build:
@@ -882,6 +923,7 @@ services:
       - "8097"
     volumes:
       - ./:/workspace
+      - void_artifacts:/workspace/uploads
 
   chatui:
     build:
@@ -899,6 +941,8 @@ services:
       - POSTGRES_USER=rag
       - POSTGRES_PASSWORD=ragpass
     # host networking exposes 3000 directly; no ports mapping needed
+    volumes:
+      - void_artifacts:/workspace/uploads
 
 volumes:
   ollama_qwen_data: {}
@@ -915,7 +959,7 @@ volumes:
   film2_models: {}
   film2_data: {}
   comfyui_input: {}
-  uploads_data: {}
+  void_artifacts: {}
   rvc_models: {}
   rvc_assets: {}
   rvc_train_data: {}

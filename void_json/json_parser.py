@@ -121,13 +121,14 @@ class JSONParser:
             obj = json.loads(s)
             return True, obj
         except Exception as e1:
-            self._err(f"parse_strict_pristine:{e1}")
+            self._err(f"parse_strict:{e1}")
         repaired = self.attempt_repair(s)
         try:
             obj = json.loads(repaired)
             return True, obj
         except Exception as e2:
             self._err(f"parse_strict_repaired:{e2}")
+            # Never raise to callers; strict mode simply reports failure.
             return False, None
 
     def parse_superset(self, source: Any, expected_structure: Any) -> Dict[str, Any]:
@@ -244,6 +245,8 @@ class JSONParser:
         unquoted keys. This is intentionally permissive and only used after
         simpler strategies fail.
         """
+        if not isinstance(json_string, str):
+            json_string = "" if json_string is None else str(json_string)
         try:
             return json.loads(json_string)
         except Exception as exc:
@@ -256,26 +259,56 @@ class JSONParser:
             r'"\1":',
             json_string,
         )
-        return json.loads(json_string)
+        try:
+            return json.loads(json_string)
+        except Exception as exc:
+            self._err(f"regex_parse:{exc}")
+            return None
 
     # ---------- method variants, each using json.loads ----------
 
     def method_json_loads(self, json_string: str) -> Any:
-        return json.loads(json_string)
+        if not isinstance(json_string, str):
+            json_string = "" if json_string is None else str(json_string)
+        try:
+            return json.loads(json_string)
+        except Exception as exc:
+            self._err(f"json_loads:{exc}")
+            return None
 
     def method_replace_quotes(self, json_string: str) -> Any:
+        if not isinstance(json_string, str):
+            json_string = "" if json_string is None else str(json_string)
         json_string = json_string.replace("\\'", "'").replace('\\"', '"')
-        return json.loads(json_string)
+        try:
+            return json.loads(json_string)
+        except Exception as exc:
+            self._err(f"replace_quotes:{exc}")
+            return None
 
     def method_fix_braces(self, json_string: str) -> Any:
-        json_string = json_string.replace('"{', "{").replace('}"', "}")
-        return json.loads(json_string)
+        if not isinstance(json_string, str):
+            json_string = "" if json_string is None else str(json_string)
+        try:
+            json_string = json_string.replace('"{', "{").replace('}"', "}")
+            return json.loads(json_string)
+        except Exception as exc:
+            self._err(f"fix_braces:{exc}")
+            return None
 
     def method_fix_commas(self, json_string: str) -> Any:
+        if not isinstance(json_string, str):
+            json_string = "" if json_string is None else str(json_string)
         json_string = json_string.replace(",}", "}").replace(",]", "]")
-        return json.loads(json_string)
+        try:
+            return json.loads(json_string)
+        except Exception as exc:
+            self._err(f"fix_commas:{exc}")
+            return None
 
     def method_fix_all(self, json_string: str) -> Any:
+        if not isinstance(json_string, str):
+            json_string = "" if json_string is None else str(json_string)
         json_string = (
             json_string.replace('"{', "{")
             .replace('}"', "}")
@@ -283,12 +316,22 @@ class JSONParser:
             .replace(",]", "]")
         )
         json_string = self.fix_missing_commas(json_string)
-        return json.loads(json_string)
+        try:
+            return json.loads(json_string)
+        except Exception as exc:
+            self._err(f"fix_all:{exc}")
+            return None
 
     def method_extract_segment(self, json_string: str) -> Any:
+        if not isinstance(json_string, str):
+            json_string = "" if json_string is None else str(json_string)
         json_segments = self.extract_json_segment(json_string)
         if json_segments:
-            return json.loads(json_segments[-1])
+            try:
+                return json.loads(json_segments[-1])
+            except Exception as exc:
+                self._err(f"extract_segment:{exc}")
+                return None
         return {}
 
     # ---------- schema coercion (shape enforcement) ----------
