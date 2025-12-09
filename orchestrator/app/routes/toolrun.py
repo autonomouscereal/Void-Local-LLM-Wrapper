@@ -207,11 +207,15 @@ def _apply_overrides(graph: dict, bind: dict, args: dict) -> None:
     # Sampler
     if bind.get("ks"):
         ks_in = graph[bind["ks"]]["inputs"]
+        # Seed: allow explicit None to mean "leave as-is".
         if "seed" in args and args.get("seed") is not None:
             ks_in["seed"] = int(args["seed"])
-        if "steps" in args:
+        # Only override numeric fields when the arg is non-None and non-empty;
+        # this avoids int/float(None) while still letting the underlying graph
+        # defaults apply when values are omitted.
+        if "steps" in args and args.get("steps") not in (None, ""):
             ks_in["steps"] = int(args["steps"])
-        if "cfg" in args:
+        if "cfg" in args and args.get("cfg") not in (None, ""):
             ks_in["cfg"] = float(args["cfg"])
         if "sampler" in args:
             ks_in["sampler_name"] = str(args["sampler"]).strip()
@@ -222,8 +226,27 @@ def _apply_overrides(graph: dict, bind: dict, args: dict) -> None:
     # Latent size
     if bind.get("latent"):
         li = graph[bind["latent"]]["inputs"]
-        if "width" in args: li["width"] = int(args["width"])
-        if "height" in args: li["height"] = int(args["height"])
+        # Width / height: treat None/"" as "not set".
+        if "width" in args and args.get("width") not in (None, ""):
+            li["width"] = int(args["width"])
+        if "height" in args and args.get("height") not in (None, ""):
+            li["height"] = int(args["height"])
+        # If width/height were not provided but a resolution string like
+        # "1920x1080" is present, parse it and use that as a best-effort size.
+        width_missing = ("width" not in args) or (args.get("width") in (None, ""))
+        height_missing = ("height" not in args) or (args.get("height") in (None, ""))
+        if width_missing and height_missing:
+            res = args.get("resolution")
+            if isinstance(res, str) and "x" in res.lower():
+                w_str, h_str = res.lower().split("x", 1)
+                try:
+                    w_val = int(w_str.strip())
+                    h_val = int(h_str.strip())
+                except Exception:
+                    w_val = h_val = None
+                if isinstance(w_val, int) and isinstance(h_val, int) and w_val > 0 and h_val > 0:
+                    li["width"] = w_val
+                    li["height"] = h_val
     # Model checkpoint
     if bind.get("ckpt") and ("model" in args) and args.get("model"):
         graph[bind["ckpt"]]["inputs"]["ckpt_name"] = str(args["model"]).strip()

@@ -29,21 +29,28 @@ class JSONParser:
 
     # ---------- public API ----------
 
-    def parse(self, json_string: str, expected_structure: Any) -> Any:
+    def parse(self, source: Any, expected_structure: Any) -> Any:
         """
         Best-effort parsing with repairs, followed by coercion into expected_structure.
         Never raises; always returns something matching the expected shape.
+
+        Accepts:
+          - str containing JSON (with or without markdown fences)
+          - dict / list objects (already-parsed JSON)
+          - any other value, which will be stringified before parsing
         """
-        if not isinstance(json_string, str):
-            json_string = "" if json_string is None else str(json_string)
+        # Fast path: already a JSON-like structure; just coerce to the schema.
+        if isinstance(source, (dict, list)):
+            return self.ensure_structure(source, expected_structure)
 
-        # Step 1: normalize wrapper noise (markdown fences, BOM, whitespace)
-        json_string = self.strip_markdown(json_string)
+        # Normalize non-string scalars into text so the repair pipeline can run.
+        if not isinstance(source, str):
+            source = "" if source is None else str(source)
 
-        # Step 2: quick repair pass for very common issues
+        json_string = self.strip_markdown(source)
         json_string = self.attempt_repair(json_string)
 
-        # Step 3: apply a sequence of parsing strategies, keeping the "best" result
+        # Apply a sequence of parsing strategies, keeping the "best" result.
         methods = [
             self.method_json_loads,
             self.method_replace_quotes,
@@ -67,39 +74,104 @@ class JSONParser:
                 logger.debug(msg, exc_info=True)
                 self._err(msg)
 
-        # Final fallback: if nothing succeeded, synthesise structure from schema alone
+        # Final fallback: if nothing succeeded, synthesise structure from schema alone.
         if best_result is None:
             if isinstance(expected_structure, list):
                 best_result = self.ensure_structure([], expected_structure)
             else:
                 best_result = self.ensure_structure({}, expected_structure)
         else:
-            # Ensure the final result conforms exactly to the expected schema.
             best_result = self.ensure_structure(best_result, expected_structure)
+
+        # Salvage pass: when the source was textual, attempt to recover missing
+        # scalar fields (str/int/float) directly from the raw text by scanning
+        # for "key: value" style patterns, even if the JSON structure itself
+        # was badly malformed.
+        if isinstance(source, str):
+            best_result = self._salvage_from_text(source, expected_structure, best_result)
 
         return best_result
 
     # Backwards-compatible alias
-    def parse_best_effort(self, text: str, expected_structure: Any) -> Any:
-        return self.parse(text, expected_structure)
+    def parse_best_effort(self, source: Any, expected_structure: Any) -> Any:
+        """
+        Alias for parse(...); kept for compatibility with older call sites.
+        Accepts any JSON-like source (str/dict/list/scalar).
+        """
+        return self.parse(source, expected_structure)
 
-    def parse_superset(self, text: str, expected_structure: Any) -> Dict[str, Any]:
+    def parse_strict(self, source: Any) -> Tuple[bool, Optional[Any]]:
+        """
+        Strict load without schema coercion: returns (ok, raw_obj).
+        Still uses markdown stripping and basic repair, but does not enforce shape.
+
+        Accepts:
+          - dict / list → treated as already-strict JSON (returns (True, source))
+          - str → parsed via json.loads with a light repair pass
+          - other scalars → stringified and parsed as JSON when possible
+        """
+        # Already-parsed JSON objects are treated as strictly valid.
+        if isinstance(source, (dict, list)):
+            return True, source
+
+        if not isinstance(source, str):
+            source = "" if source is None else str(source)
+        s = self.strip_markdown(source)
+        try:
+            obj = json.loads(s)
+            return True, obj
+        except Exception as e1:
+            self._err(f"parse_strict_pristine:{e1}")
+        repaired = self.attempt_repair(s)
+        try:
+            obj = json.loads(repaired)
+            return True, obj
+        except Exception as e2:
+            self._err(f"parse_strict_repaired:{e2}")
+            return False, None
+
+    def parse_superset(self, source: Any, expected_structure: Any) -> Dict[str, Any]:
         """
         Return a richer result that includes:
-          - coerced: structure shaped to expected_structure
-          - raw: best-effort raw object from JSON (same as coerced for now)
-          - extras: parts of raw not represented in coerced (empty when using best-effort path)
+          - coerced: structure shaped to expected_structure (best-effort, with repairs)
+          - raw: the best raw JSON object we could parse (preferring strict JSON when possible)
+          - extras: parts of raw not represented in coerced (keys/values outside the schema)
           - vars: numeric hints extracted from string leaves
           - repairs/errors/last_error: diagnostics
+
+        Strategy:
+          1) Attempt a strict json.loads on the response text (via parse_strict), so we
+             retain the most faithful view of the model/tool output when it's valid JSON.
+          2) Independently run the full repair/heuristic pipeline via parse(...), which
+             searches multiple strategies and coerces into expected_structure.
+          3) Use the best-effort result from parse(...) as `coerced`, but keep the strict
+             JSON object (when available) as `raw`. Any information present in raw but
+             not representable in the schema is surfaced under `extras`.
         """
-        # Delegate to the main best-effort parser so we never rely on strict
-        # json.loads() semantics here. This keeps parse_superset aligned with the
-        # "magical" repair logic and avoids brittle strict-parse failures.
-        coerced = self.parse(text, expected_structure)
-        # In the current design most callers only care about the coerced value.
-        # We still expose a minimal superset view for compatibility.
-        raw: Any = coerced
-        extras: Any = {}
+        # Step 1: strict-ish raw JSON
+        ok, raw_strict = self.parse_strict(source)
+        if not ok:
+            # When strict parsing fails entirely, raw_strict becomes a typed empty shell
+            # so callers still see a shape that matches the schema.
+            if isinstance(expected_structure, dict):
+                raw_strict = {}
+            elif isinstance(expected_structure, list):
+                raw_strict = []
+            else:
+                raw_strict = None
+
+        # Step 2: best-effort coerced structure using all repair strategies
+        coerced = self.parse(source, expected_structure)
+
+        # Step 3: choose raw baseline and compute extras/vars
+        # Prefer genuine strict JSON structure (dict/list) when we have one, otherwise
+        # fall back to the coerced structure so raw is never "less informative" than coerced.
+        if ok and isinstance(raw_strict, (dict, list)):
+            raw: Any = raw_strict
+        else:
+            raw = coerced
+
+        extras = self._diff_extras(raw, coerced)
         vars_map = self._extract_vars(raw)
         return {
             "coerced": coerced,
@@ -441,6 +513,101 @@ class JSONParser:
 
         _walk(raw)
         return vars_map
+
+    def _salvage_from_text(self, text: str, expected_structure: Any, result: Any) -> Any:
+        """
+        Best-effort salvage of scalar fields from raw, possibly non-JSON text.
+
+        This is intended as a last resort when normal JSON parsing/repair cannot
+        recover certain fields. We scan the original text for simple "key: value"
+        style patterns and, when we find something that looks like a valid scalar
+        for that key, we inject it into the coerced result without overwriting
+        non-default values.
+
+        Salvage is **schema-driven but fully generic**: it walks the expected
+        structure recursively (dicts/lists) and tries to recover any scalar
+        (int/float/str) fields it finds, regardless of depth.
+        """
+        if not isinstance(text, str):
+            return result
+        lower_text = text
+
+        def _is_default(val: Any, typ: Any) -> bool:
+            if typ is int:
+                return not isinstance(val, int) or val == 0
+            if typ is float:
+                return not isinstance(val, (int, float)) or float(val) == 0.0
+            if typ is str:
+                return not isinstance(val, str) or not val.strip()
+            if isinstance(val, (list, dict)):
+                return not bool(val)
+            return val is None
+
+        def _salvage_node(exp: Any, res: Any) -> Any:
+            # Dict: recurse into nested fields.
+            if isinstance(exp, dict):
+                if not isinstance(res, dict):
+                    res = {}  # type: ignore[assignment]
+                for key, et in exp.items():
+                    if isinstance(et, (dict, list)):
+                        cur = res.get(key)
+                        res[key] = _salvage_node(et, cur)
+                        continue
+                    # Scalar salvage (int/float/str)
+                    if et not in (int, float, str):
+                        continue
+                    cur_val = res.get(key)
+                    if not _is_default(cur_val, et):
+                        continue
+                    try:
+                        key_pattern = re.escape(str(key))
+                        if et in (int, float):
+                            val_pattern = r"([-+]?\d+(?:\.\d+)?)"
+                        else:
+                            val_pattern = r"(.+?)"
+                        pattern = rf"{key_pattern}\s*[:=\-]?\s*{val_pattern}(?:[\n\r,;]|$)"
+                        m = re.search(pattern, lower_text)
+                        if not m:
+                            continue
+                        raw_val = m.group(1)
+                        if not isinstance(raw_val, str):
+                            raw_val = str(raw_val)
+                        raw_val = raw_val.strip().strip("\"' \t")
+                        if not raw_val:
+                            continue
+                        if et is int:
+                            try:
+                                res[key] = int(float(raw_val))
+                            except Exception:
+                                continue
+                        elif et is float:
+                            try:
+                                res[key] = float(raw_val)
+                            except Exception:
+                                continue
+                        else:  # str
+                            cleaned = re.sub(r"\s+", " ", raw_val)
+                            res[key] = cleaned
+                    except Exception:
+                        continue
+                return res
+
+            # List: apply salvage to each element using the first element as schema.
+            if isinstance(exp, list) and exp:
+                prototype = exp[0]
+                if not isinstance(res, list):
+                    res_list: List[Any] = []
+                else:
+                    res_list = res
+                out_list: List[Any] = []
+                for item in res_list:
+                    out_list.append(_salvage_node(prototype, item))
+                return out_list
+
+            # Scalar or unsupported schema node: nothing to salvage here.
+            return res
+
+        return _salvage_node(expected_structure, result)
 
     # ---------- diagnostics ----------
 

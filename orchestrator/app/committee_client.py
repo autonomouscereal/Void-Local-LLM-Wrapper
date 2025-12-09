@@ -658,6 +658,20 @@ async def committee_jsonify(
 
     merged: Dict[str, Any] = {}
 
+    def _is_default_scalar(val: Any, typ: Any) -> bool:
+        """
+        Treat "empty" scalar values (0, 0.0, "", None) as defaults that should
+        not overwrite richer values from other candidates. Only when no
+        candidate provides a non-default value do we fall back to these.
+        """
+        if typ is int:
+            return not isinstance(val, int) or int(val) == 0
+        if typ is float:
+            return not isinstance(val, (int, float)) or float(val) == 0.0
+        if typ is str:
+            return not isinstance(val, str) or not val.strip()
+        return val is None
+
     # For Song Graph wrappers, drop obviously-empty/default song candidates from
     # consideration when at least one non-empty candidate exists, and reorder
     # parsed_candidates so the richest candidate is considered first.
@@ -715,7 +729,10 @@ async def committee_jsonify(
                             value_set = True
                             break
                 else:
-                    if isinstance(v, expected_type):
+                    # Scalars: only accept non-default values; 0/0.0/""/None are
+                    # treated as weaker than any non-default from another
+                    # candidate and used only as a final fallback.
+                    if isinstance(v, expected_type) and not _is_default_scalar(v, expected_type):
                         merged[key] = v
                         value_set = True
                         break

@@ -1154,6 +1154,22 @@ def _load_wrapper_config() -> None:
 _load_wrapper_config()
 
 
+def _get_music_acceptance_thresholds() -> Dict[str, float]:
+    """
+    Backwards-compatible helper for film2.run and any other paths that still
+    reference the underscored variant. Delegates to the canonical
+    get_music_acceptance_thresholds() in app.music.eval.
+
+    Pure data, deterministic, no network; the underlying helper reads the
+    static review/acceptance_audio.json at most once per process.
+    """
+    th = get_music_acceptance_thresholds()
+    return {
+        "overall_quality_min": float(th.get("overall_quality_min", 0.6)),
+        "fit_score_min": float(th.get("fit_score_min", 0.6)),
+    }
+
+
 # removed: robust_json_loads — use JSONParser().parse with explicit expected structures everywhere
 
 
