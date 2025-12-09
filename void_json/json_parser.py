@@ -514,100 +514,150 @@ class JSONParser:
         _walk(raw)
         return vars_map
 
-    def _salvage_from_text(self, text: str, expected_structure: Any, result: Any) -> Any:
+    def _is_default_scalar(self, value: Any, expected_type: Any) -> bool:
+        """
+        Return True if the current value should be considered "missing" for the
+        purposes of salvage. We only overwrite such default-ish values; any
+        non-default (already sensible) value is left untouched.
+        """
+        if expected_type is int:
+            return not isinstance(value, int) or value == 0
+        if expected_type is float:
+            return not isinstance(value, (int, float)) or float(value) == 0.0
+        if expected_type is str:
+            return not isinstance(value, str) or not value.strip()
+        if isinstance(value, (list, dict)):
+            return len(value) == 0
+        return value is None
+
+    def _extract_scalar_from_text(self, text: str, key: str, expected_type: Any) -> Optional[Any]:
+        """
+        Extract a scalar value for a given key from arbitrary text. This is a
+        heuristic, last-resort helper and must tolerate spaces, punctuation,
+        and partial JSON or natural language fragments.
+        """
+        if not isinstance(text, str) or not text:
+            return None
+        key_pattern = re.escape(str(key))
+        # Look for "key: <value>" or "key = <value>" patterns; capture everything
+        # to the end of the line or until a closing delimiter, then trim.
+        pattern = rf"{key_pattern}\s*[:=]\s*(?P<val>.+)"
+        m = re.search(pattern, text)
+        if m:
+            raw_val = m.group("val")
+            if not isinstance(raw_val, str):
+                raw_val = str(raw_val)
+            raw = raw_val.lstrip()
+            # First, if another key-like token appears later on this line
+            # (e.g., "color: blue color2: red"), treat the start of that token
+            # as a delimiter so we only keep "blue".
+            next_key = re.search(r"\s+[A-Za-z0-9_\-]+\s*:", raw)
+            if next_key:
+                raw = raw[: next_key.start()].rstrip()
+            # Then truncate at common structural delimiters while allowing
+            # punctuation and spaces within the value itself.
+            for sep in [",", "\n", "\r", ";", "}", "]"]:
+                idx = raw.find(sep)
+                if idx != -1:
+                    raw = raw[:idx]
+                    break
+        else:
+            # Fallback: handle the pattern where the key appears on its own line
+            # and the value is on the next non-empty line, e.g.:
+            #   color
+            #   red
+            raw = ""
+            lines = text.splitlines()
+            for idx, line in enumerate(lines):
+                if re.fullmatch(rf"\s*{key_pattern}\s*[:=]?\s*$", line):
+                    # Find the next non-empty line.
+                    for j in range(idx + 1, len(lines)):
+                        candidate = lines[j].strip()
+                        if not candidate:
+                            continue
+                        # If the next non-empty line looks like another key
+                        # declaration (e.g., "color2:"), treat this as no value.
+                        if re.match(r"[A-Za-z0-9_\-]+\s*[:=]\s*", candidate):
+                            raw = ""
+                            break
+                        raw = candidate
+                        break
+                    break
+        raw = raw.strip().strip("\"'")
+        if not raw:
+            return None
+        # If the extracted chunk immediately looks like the *next* key (e.g.
+        # "color: color2: blue"), treat this as "no value" for the current key.
+        # i.e., a new identifier followed by ":" means we shouldn't salvage.
+        if re.match(r"[A-Za-z0-9_\-]+\s*:", raw):
+            return None
+        # Treat common "no value" markers as intentional empties; do not try to
+        # salvage a concrete value from them.
+        lowered = raw.lower()
+        if lowered in ("none", "null", "n/a", "na", "-", "--"):
+            return None
+        try:
+            if expected_type is int:
+                return int(float(raw))
+            if expected_type is float:
+                return float(raw)
+            if expected_type is str:
+                # Collapse excessive whitespace but preserve punctuation.
+                return re.sub(r"\s+", " ", raw)
+        except (ValueError, TypeError):
+            return None
+        return None
+
+    def _salvage_node_from_text(self, text: str, expected: Any, current: Any) -> Any:
+        """
+        Walk the expected structure (dicts/lists) and, for any scalar fields
+        that are still default/missing in `current`, attempt to salvage a value
+        from the raw text. Never overwrites non-default values.
+        """
+        # Dict: recurse into nested fields.
+        if isinstance(expected, dict):
+            if not isinstance(current, dict):
+                current = {}  # type: ignore[assignment]
+            for key, expected_type in expected.items():
+                if isinstance(expected_type, (dict, list)):
+                    cur_val = current.get(key)
+                    current[key] = self._salvage_node_from_text(text, expected_type, cur_val)
+                    continue
+                if expected_type not in (int, float, str):
+                    continue
+                cur_val = current.get(key)
+                if not self._is_default_scalar(cur_val, expected_type):
+                    # Do not clobber an already-meaningful value.
+                    continue
+                extracted = self._extract_scalar_from_text(text, key, expected_type)
+                if extracted is not None:
+                    current[key] = extracted
+            return current
+
+        # List: apply salvage to each element using the first element as schema.
+        if isinstance(expected, list) and expected:
+            proto = expected[0]
+            if not isinstance(current, list):
+                items: List[Any] = [current] if current is not None else []
+            else:
+                items = list(current)
+            return [self._salvage_node_from_text(text, proto, item) for item in items]
+
+        # Scalar or unsupported schema node: nothing to salvage here.
+        return current
+
+    def _salvage_from_text(self, text: Any, expected_structure: Any, result: Any) -> Any:
         """
         Best-effort salvage of scalar fields from raw, possibly non-JSON text.
 
-        This is intended as a last resort when normal JSON parsing/repair cannot
-        recover certain fields. We scan the original text for simple "key: value"
-        style patterns and, when we find something that looks like a valid scalar
-        for that key, we inject it into the coerced result without overwriting
-        non-default values.
-
-        Salvage is **schema-driven but fully generic**: it walks the expected
-        structure recursively (dicts/lists) and tries to recover any scalar
-        (int/float/str) fields it finds, regardless of depth.
+        This is a last-resort path: it is only invoked after best-effort JSON
+        parsing, and it is only allowed to fill in fields that are clearly
+        default/missing (0, 0.0, empty string, empty list/dict, or None).
+        It never overwrites non-default values.
         """
         if not isinstance(text, str):
             return result
-        lower_text = text
-
-        def _is_default(val: Any, typ: Any) -> bool:
-            if typ is int:
-                return not isinstance(val, int) or val == 0
-            if typ is float:
-                return not isinstance(val, (int, float)) or float(val) == 0.0
-            if typ is str:
-                return not isinstance(val, str) or not val.strip()
-            if isinstance(val, (list, dict)):
-                return not bool(val)
-            return val is None
-
-        def _salvage_node(exp: Any, res: Any) -> Any:
-            # Dict: recurse into nested fields.
-            if isinstance(exp, dict):
-                if not isinstance(res, dict):
-                    res = {}  # type: ignore[assignment]
-                for key, et in exp.items():
-                    if isinstance(et, (dict, list)):
-                        cur = res.get(key)
-                        res[key] = _salvage_node(et, cur)
-                        continue
-                    # Scalar salvage (int/float/str)
-                    if et not in (int, float, str):
-                        continue
-                    cur_val = res.get(key)
-                    if not _is_default(cur_val, et):
-                        continue
-                    try:
-                        key_pattern = re.escape(str(key))
-                        if et in (int, float):
-                            val_pattern = r"([-+]?\d+(?:\.\d+)?)"
-                        else:
-                            val_pattern = r"(.+?)"
-                        pattern = rf"{key_pattern}\s*[:=\-]?\s*{val_pattern}(?:[\n\r,;]|$)"
-                        m = re.search(pattern, lower_text)
-                        if not m:
-                            continue
-                        raw_val = m.group(1)
-                        if not isinstance(raw_val, str):
-                            raw_val = str(raw_val)
-                        raw_val = raw_val.strip().strip("\"' \t")
-                        if not raw_val:
-                            continue
-                        if et is int:
-                            try:
-                                res[key] = int(float(raw_val))
-                            except Exception:
-                                continue
-                        elif et is float:
-                            try:
-                                res[key] = float(raw_val)
-                            except Exception:
-                                continue
-                        else:  # str
-                            cleaned = re.sub(r"\s+", " ", raw_val)
-                            res[key] = cleaned
-                    except Exception:
-                        continue
-                return res
-
-            # List: apply salvage to each element using the first element as schema.
-            if isinstance(exp, list) and exp:
-                prototype = exp[0]
-                if not isinstance(res, list):
-                    res_list: List[Any] = []
-                else:
-                    res_list = res
-                out_list: List[Any] = []
-                for item in res_list:
-                    out_list.append(_salvage_node(prototype, item))
-                return out_list
-
-            # Scalar or unsupported schema node: nothing to salvage here.
-            return res
-
-        return _salvage_node(expected_structure, result)
+        return self._salvage_node_from_text(text, expected_structure, result)
 
     # ---------- diagnostics ----------
 

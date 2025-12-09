@@ -1459,12 +1459,31 @@ async def v1_image_generate(request: Request):
     res = await http_tool_run("image.dispatch", args)
     if isinstance(res, dict) and isinstance(res.get("result"), dict):
         result_obj = res.get("result") or {}
-        # Preserve existing shape: prompt_id, cid, paths for compatibility
+        # Preserve existing shape: prompt_id, cid, paths for compatibility,
+        # but adapt to the canonical image.dispatch result which exposes
+        # artifacts + meta.{orch_view_urls,view_urls}.
         paths = result_obj.get("paths") if isinstance(result_obj.get("paths"), list) else []
+        if not paths:
+            arts = result_obj.get("artifacts")
+            if isinstance(arts, list):
+                for a in arts:
+                    if not isinstance(a, dict):
+                        continue
+                    # Prefer view_url, then path/url
+                    p = a.get("view_url") or a.get("path") or a.get("url")
+                    if isinstance(p, str) and p.strip():
+                        paths.append(p)
+        if not paths:
+            meta = result_obj.get("meta") if isinstance(result_obj.get("meta"), dict) else {}
+            orch_urls = meta.get("orch_view_urls") if isinstance(meta.get("orch_view_urls"), list) else []
+            view_urls = meta.get("view_urls") if isinstance(meta.get("view_urls"), list) else []
+            for p in (orch_urls or view_urls or []):
+                if isinstance(p, str) and p.strip():
+                    paths.append(p)
         payload = {
-                "prompt_id": result_obj.get("prompt_id") or (result_obj.get("ids") or {}).get("prompt_id"),
-                "cid": result_obj.get("cid") or (result_obj.get("ids") or {}).get("client_id"),
-                "paths": paths,
+            "prompt_id": result_obj.get("prompt_id") or (result_obj.get("ids") or {}).get("prompt_id"),
+            "cid": result_obj.get("cid") or (result_obj.get("ids") or {}).get("client_id"),
+            "paths": paths,
         }
         return ToolEnvelope.success(payload, request_id=rid)
     # Tool failed; surface as envelope error but keep HTTP 200

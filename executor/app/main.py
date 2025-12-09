@@ -261,24 +261,104 @@ def _build_executor_envelope(
 
 
 def _canonical_tool_result(x: Dict[str, Any] | Any) -> Dict[str, Any]:
+    """
+    Normalize diverse tool result shapes into a minimal but faithful structure.
+
+    Historically we only preserved ``ids`` and ``meta`` which caused richer
+    fields like ``artifacts`` (image/video paths, etc.) and ``qa`` to be
+    silently dropped for tools such as ``image.dispatch``. This helper now
+    passes those through so downstream callers (planner, UI) can rely on them.
+    """
     data: Dict[str, Any] = {}
     if isinstance(x, dict) and "ok" in x and isinstance(x.get("result"), dict):
+        # ToolEnvelope-style: {ok, result: {...}, error: ...}
         data = x.get("result") or {}
     elif isinstance(x, dict):
+        # Bare result object from a tool
         data = x
+
     ids = data.get("ids") if isinstance(data.get("ids"), dict) else {}
     meta = data.get("meta") if isinstance(data.get("meta"), dict) else {}
+
     # Lift common meta-like fields from top-level bare results to prevent accidental drops
     lift_keys = (
-        "url", "view_url", "poster_data_url", "preview_url",
-        "mime", "duration_s", "preview_duration_s", "data_url",
+        "url",
+        "view_url",
+        "poster_data_url",
+        "preview_url",
+        "mime",
+        "duration_s",
+        "preview_duration_s",
+        "data_url",
     )
     for k in lift_keys:
         if k in data and k not in meta:
             v = data.get(k)
             if isinstance(v, (str, int, float, bool)) or v is None:
                 meta[k] = v
-    return {"ids": ids, "meta": meta}
+
+    # Preserve simple identifiers that callers commonly rely on.
+    # music/tts/film tools often surface cid/project_id at the top level.
+    if "cid" in data and "cid" not in meta and isinstance(data.get("cid"), str):
+        meta["cid"] = data.get("cid")
+    if "project_id" in data and "project_id" not in ids and isinstance(data.get("project_id"), str):
+        ids["project_id"] = data.get("project_id")
+
+    # Heuristic normalization for single-artifact tools that don't emit an explicit
+    # artifacts list (e.g. services/music, some audio/video helpers).
+    artifacts = data.get("artifacts")
+    if not isinstance(artifacts, list):
+        artifacts = None
+        # Music service-style: artifact_id + relative_url + cid
+        rel = data.get("relative_url")
+        art_id = data.get("artifact_id") or data.get("id")
+        if isinstance(rel, str) and rel:
+            kind: str = "audio"
+            low = rel.lower()
+            if any(low.endswith(ext) for ext in (".mp4", ".mov", ".mkv", ".webm")):
+                kind = "video"
+            elif any(low.endswith(ext) for ext in (".wav", ".mp3", ".flac", ".aac", ".ogg")):
+                kind = "audio"
+            elif any(low.endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".webp")):
+                kind = "image"
+            artifacts = [
+                {
+                    "id": art_id or rel,
+                    "kind": kind,
+                    "path": rel,
+                    "view_url": rel,
+                }
+            ]
+        # Film export-style: master_uri / reel_mp4 etc.
+        elif isinstance(data.get("master_uri"), str):
+            artifacts = [
+                {
+                    "id": "master",
+                    "kind": "video",
+                    "path": data.get("master_uri"),
+                    "view_url": data.get("master_uri"),
+                }
+            ]
+        elif isinstance(data.get("reel_mp4"), str):
+            artifacts = [
+                {
+                    "id": "reel",
+                    "kind": "video",
+                    "path": data.get("reel_mp4"),
+                    "view_url": data.get("reel_mp4"),
+                }
+            ]
+
+    out: Dict[str, Any] = {"ids": ids, "meta": meta}
+
+    # Preserve rich artifact/QA blocks for media tools (image, video, audio, film, tts, music).
+    if isinstance(artifacts, list):
+        out["artifacts"] = artifacts
+    qa = data.get("qa")
+    if isinstance(qa, dict):
+        out["qa"] = qa
+
+    return out
 
 @app.post("/execute_plan")
 async def execute_plan(body: Dict[str, Any]):

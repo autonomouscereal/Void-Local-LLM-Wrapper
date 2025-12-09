@@ -96,15 +96,45 @@ async def apply_autofix(
         try:
             res = await http_tool_run("image.dispatch", dispatch_args)
             result_block = res.get("result") or {}
-            # Adapt to the actual result shape; fall back to generic keys.
-            new_image = (
-                result_block.get("image_url")
-                or result_block.get("image")
-                or result_block.get("view_url")
-            )
+            # Prefer canonical artifacts from image.dispatch, then fall back to
+            # legacy single-image fields and meta view URLs.
+            new_image: str | None = None
+            arts = result_block.get("artifacts")
+            if isinstance(arts, list) and arts:
+                first = arts[0]
+                if isinstance(first, dict):
+                    new_image = (
+                        first.get("view_url")
+                        or first.get("path")
+                        or first.get("url")
+                    )
+            if not isinstance(new_image, str) or not new_image.strip():
+                meta = result_block.get("meta") if isinstance(result_block.get("meta"), dict) else {}
+                orch_urls = meta.get("orch_view_urls") if isinstance(meta.get("orch_view_urls"), list) else []
+                view_urls = meta.get("view_urls") if isinstance(meta.get("view_urls"), list) else []
+                if orch_urls:
+                    cand = orch_urls[0]
+                    if isinstance(cand, str) and cand.strip():
+                        new_image = cand
+                elif view_urls:
+                    cand = view_urls[0]
+                    if isinstance(cand, str) and cand.strip():
+                        new_image = cand
+            if not isinstance(new_image, str) or not new_image.strip():
+                # Legacy fields (pre-artifacts shape)
+                legacy = (
+                    result_block.get("image_url")
+                    or result_block.get("image")
+                    or result_block.get("view_url")
+                )
+                if isinstance(legacy, str) and legacy.strip():
+                    new_image = legacy
             if isinstance(new_image, str) and new_image.strip():
                 shot["image"] = new_image
-            shot["qa_autofix"] = {"applied": True, "issues": shot_issues}
+                shot["qa_autofix"] = {"applied": True, "issues": shot_issues}
+            else:
+                # Autofix call succeeded but did not yield a usable image URL.
+                shot["qa_autofix"] = {"applied": False, "issues": shot_issues}
         except Exception:
             # Best-effort: keep the original shot if autofix fails.
             shot["qa_autofix"] = {"applied": False, "issues": shot_issues}

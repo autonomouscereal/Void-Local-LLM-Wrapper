@@ -601,7 +601,32 @@ async def tool_run(req: Request):
 				_first_hist = False
 			if not isinstance(hist, dict):
 				continue
-			entry = hist.get(prompt_id) or {}
+			# ComfyUI /history responses can appear in multiple shapes depending on
+			# version / plugins:
+			#   1) {"history": { "<pid>": {...} }, ...}
+			#   2) {"<pid>": {...}, ...}
+			#   3) {"outputs": {...}, "status": {...}, ...}  (direct entry)
+			# Normalize to a single entry dict so downstream code doesn't spin
+			# forever looking up hist[prompt_id] when the data lives under 'history'.
+			entry: dict | None = None
+			# Strip helper fields from _get_json (_ok_env wrapper)
+			data_candidates = dict(hist)
+			for k in ("ok", "code", "status", "detail"):
+				data_candidates.pop(k, None)
+			# Shape 1: nested history map
+			hblock = data_candidates.get("history")
+			if isinstance(hblock, dict):
+				entry = hblock.get(prompt_id) or next(iter(hblock.values()), None)
+			# Shape 2: top-level pid key
+			if entry is None and prompt_id in data_candidates:
+				val = data_candidates.get(prompt_id)
+				if isinstance(val, dict):
+					entry = val
+			# Shape 3: direct entry with outputs/status
+			if entry is None and isinstance(data_candidates.get("outputs"), dict):
+				entry = data_candidates
+			if not isinstance(entry, dict):
+				entry = {}
 			# Detect terminal error/success states when available
 			status_obj = entry.get("status") or {}
 			state = str((status_obj.get("status") or "")).lower()
