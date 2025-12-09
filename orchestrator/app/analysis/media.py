@@ -845,6 +845,11 @@ def analyze_audio(path: str) -> Dict[str, Any]:
     try:
         if y and sr:
             y_np = np.asarray(y, dtype=float)
+            # For extremely short clips, skip spectral/tempo analysis to avoid
+            # librosa warnings about n_fft being larger than the signal length.
+            n_samples = int(getattr(y_np, "size", len(y_np)))
+            if n_samples < 2048:
+                return out
             # tempo
             tempo, _ = librosa.beat.beat_track(y=y_np, sr=sr)
             out["tempo_bpm"] = float(tempo)
@@ -942,9 +947,15 @@ def audio_band_energy_profile(path: str, band_map: Dict[str, Tuple[float, float]
         y, sr = librosa.load(path, sr=22050)
         if y.size == 0:
             return {}
-        stft = librosa.stft(y)
+        # Clamp n_fft to the signal length to avoid librosa warnings on very
+        # short clips (e.g., tuning estimation from empty frequency sets).
+        n_samples = int(getattr(y, "size", len(y)))
+        if n_samples <= 0:
+            return {}
+        n_fft = min(2048, n_samples)
+        stft = librosa.stft(y, n_fft=n_fft)
         magnitude = np.abs(stft)
-        freqs = librosa.fft_frequencies(sr=sr)
+        freqs = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
         profile: Dict[str, float] = {}
         for name, (low, high) in band_map.items():
             mask = (freqs >= low) & (freqs < high)

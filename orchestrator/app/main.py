@@ -5323,11 +5323,14 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                         vec = emb.encode([txt])[0]
                         async with pool.acquire() as conn:
                             rel = os.path.relpath(full_path_music, UPLOAD_DIR).replace("\\", "/")
+                            # Store embeddings as JSON text to avoid asyncpg type
+                            # mismatches when the column is declared as text/varchar.
+                            embed_json = json.dumps(list(vec))
                             await conn.execute(
                                 "INSERT INTO rag_docs (path, chunk, embedding) VALUES ($1, $2, $3)",
                                 rel,
                                 txt,
-                                list(vec),
+                                embed_json,
                             )
                 except Exception:
                     logging.info("music RAG insert failed:\n%s", traceback.format_exc())

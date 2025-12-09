@@ -47,11 +47,14 @@ def _is_empty_song_candidate(obj: Any) -> bool:
         return True
     global_block = obj.get("global") if isinstance(obj.get("global"), dict) else {}
     sections = obj.get("sections") if isinstance(obj.get("sections"), list) else []
+    voices = obj.get("voices") if isinstance(obj.get("voices"), list) else []
+    instruments = obj.get("instruments") if isinstance(obj.get("instruments"), list) else []
+    motifs = obj.get("motifs") if isinstance(obj.get("motifs"), list) else []
     lyrics = obj.get("lyrics") if isinstance(obj.get("lyrics"), dict) else {}
     lyrics_sections = lyrics.get("sections") if isinstance(lyrics.get("sections"), list) else []
     bpm = global_block.get("bpm")
-    # Treat as empty when there is no timing info and no structural sections.
-    if (not isinstance(bpm, (int, float)) or float(bpm) == 0.0) and not sections and not lyrics_sections:
+    # Treat as empty when there is no usable timing info and no structural/voice/instrument/motif content.
+    if (not isinstance(bpm, (int, float)) or float(bpm) == 0.0) and not sections and not voices and not instruments and not motifs and not lyrics_sections:
         return True
     return False
 
@@ -636,12 +639,45 @@ async def committee_jsonify(
         return ""
 
     merged: Dict[str, Any] = {}
-    # Detect Song Graph wrapper schemas so we can downweight "empty" candidates.
+    # Detect Song Graph wrapper schemas so we can downweight "empty" candidates
+    # and prefer the richest candidate (most sections, then voices/instruments/motifs).
     song_schema: Dict[str, Any] | None = None
     if isinstance(expected_schema, dict):
         maybe_song = expected_schema.get("song")
         if isinstance(maybe_song, dict) and "global" in maybe_song and "sections" in maybe_song:
             song_schema = maybe_song
+
+    # For Song Graph wrappers, drop obviously-empty/default song candidates from
+    # consideration when at least one non-empty candidate exists, and reorder
+    # parsed_candidates so the richest candidate is considered first.
+    if song_schema is not None and parsed_candidates:
+        rich: List[tuple[int, int, int]] = []
+        for idx, cand in enumerate(parsed_candidates):
+            song_obj = cand.get("song")
+            if not isinstance(song_obj, dict) or _is_empty_song_candidate(song_obj):
+                continue
+            sections = song_obj.get("sections") if isinstance(song_obj.get("sections"), list) else []
+            voices = song_obj.get("voices") if isinstance(song_obj.get("voices"), list) else []
+            instruments = song_obj.get("instruments") if isinstance(song_obj.get("instruments"), list) else []
+            motifs = song_obj.get("motifs") if isinstance(song_obj.get("motifs"), list) else []
+            num_sections = len(sections)
+            richness = len(voices) + len(instruments) + len(motifs)
+            rich.append((idx, num_sections, richness))
+        if rich:
+            # Sort by: most sections, then most (voices+instruments+motifs), then lowest index.
+            rich_sorted = sorted(rich, key=lambda t: (-t[1], -t[2], t[0]))
+            best_idx = rich_sorted[0][0]
+            reordered: List[Dict[str, Any]] = []
+            best_cand = parsed_candidates[best_idx]
+            reordered.append(best_cand)
+            for i, cand in enumerate(parsed_candidates):
+                if i == best_idx:
+                    continue
+                song_obj = cand.get("song")
+                # Skip pure-default/empty song shells when we have at least one rich candidate.
+                if isinstance(song_obj, dict) and not _is_empty_song_candidate(song_obj):
+                    reordered.append(cand)
+            parsed_candidates = reordered
 
     if isinstance(expected_schema, dict):
         for key, expected_type in expected_schema.items():

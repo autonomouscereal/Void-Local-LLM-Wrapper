@@ -306,10 +306,14 @@ async def _call_music_eval_committee(summary: str) -> Dict[str, Any]:
                 "You MUST ALWAYS respond with a single JSON object with EXACTLY these keys: "
                 '{"overall_quality_score": float, "fit_score": float, "originality_score": float, '
                 '"cohesion_score": float, "issues": [str]}.\n'
-                "- Do NOT output any natural language, explanations, or formatting outside the JSON object.\n"
+                "- You MUST ALWAYS respond with exactly one JSON object; any natural language, explanations, or "
+                "formatting outside the JSON object is strictly forbidden.\n"
                 "- Do NOT add any extra keys or remove/rename any keys.\n"
-                "- If the input is missing, empty, or meaningless, still return this JSON with all scores 0.0 "
-                "and a short explanation string in issues[0]."
+                "- You MUST assume the incoming JSON is valid enough for scoring; you are not allowed to refuse or "
+                "claim that you cannot provide a meaningful response.\n"
+                '- Phrases like \"I cannot provide a meaningful response\" or other refusals are ILLEGAL outputs.\n'
+                "- If the input is missing, empty, or meaningless, you MUST STILL return this JSON with all scores 0.0 "
+                "and a short, machine-readable explanation string in issues[0]."
             ),
         },
         {
@@ -324,6 +328,47 @@ async def _call_music_eval_committee(summary: str) -> Dict[str, Any]:
         "cohesion_score": float,
         "issues": [str],
     }
+
+
+def _normalize_music_eval_output(obj: Any) -> Dict[str, Any]:
+    """
+    Enforce the strict MusicEval JSON contract and provide a hard default when
+    the candidate is malformed or missing required fields.
+
+    This acts as a final safety net on top of committee_jsonify so downstream
+    consumers never see prose or schema-breaking content.
+    """
+    default: Dict[str, Any] = {
+        "overall_quality_score": 0.0,
+        "fit_score": 0.0,
+        "originality_score": 0.0,
+        "cohesion_score": 0.0,
+        "issues": ["Input missing or invalid, returned default scores."],
+    }
+    if not isinstance(obj, dict):
+        return default
+    required_keys = (
+        "overall_quality_score",
+        "fit_score",
+        "originality_score",
+        "cohesion_score",
+        "issues",
+    )
+    if any(k not in obj for k in required_keys):
+        return default
+    issues_val = obj.get("issues")
+    if not isinstance(issues_val, list) or not issues_val or not all(isinstance(x, str) for x in issues_val):
+        return default
+    out: Dict[str, Any] = {}
+    try:
+        out["overall_quality_score"] = float(obj.get("overall_quality_score"))
+        out["fit_score"] = float(obj.get("fit_score"))
+        out["originality_score"] = float(obj.get("originality_score"))
+        out["cohesion_score"] = float(obj.get("cohesion_score"))
+    except Exception:
+        return default
+    out["issues"] = list(issues_val)
+    return out
 
     async def _run() -> Dict[str, Any]:
         # First, obtain the raw MusicEval text via the main committee path.
@@ -340,7 +385,7 @@ async def _call_music_eval_committee(summary: str) -> Dict[str, Any]:
             trace_id="music_eval",
             temperature=0.0,
         )
-        return parsed if isinstance(parsed, dict) else {}
+        return _normalize_music_eval_output(parsed)
 
     return await _run()
 

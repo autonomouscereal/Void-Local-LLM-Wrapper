@@ -207,12 +207,18 @@ def _apply_overrides(graph: dict, bind: dict, args: dict) -> None:
     # Sampler
     if bind.get("ks"):
         ks_in = graph[bind["ks"]]["inputs"]
-        if "seed" in args: ks_in["seed"] = int(args["seed"])
-        if "steps" in args: ks_in["steps"] = int(args["steps"])
-        if "cfg" in args: ks_in["cfg"] = float(args["cfg"])
-        if "sampler" in args: ks_in["sampler_name"] = str(args["sampler"]).strip()
-        if "sampler_name" in args: ks_in["sampler_name"] = str(args["sampler_name"]).strip()
-        if "scheduler" in args: ks_in["scheduler"] = str(args["scheduler"]).strip()
+        if "seed" in args and args.get("seed") is not None:
+            ks_in["seed"] = int(args["seed"])
+        if "steps" in args:
+            ks_in["steps"] = int(args["steps"])
+        if "cfg" in args:
+            ks_in["cfg"] = float(args["cfg"])
+        if "sampler" in args:
+            ks_in["sampler_name"] = str(args["sampler"]).strip()
+        if "sampler_name" in args:
+            ks_in["sampler_name"] = str(args["sampler_name"]).strip()
+        if "scheduler" in args:
+            ks_in["scheduler"] = str(args["scheduler"]).strip()
     # Latent size
     if bind.get("latent"):
         li = graph[bind["latent"]]["inputs"]
