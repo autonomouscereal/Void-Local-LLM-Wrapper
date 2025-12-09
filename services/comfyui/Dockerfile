@@ -78,13 +78,8 @@ PY
 # Ensure model dirs for IPAdapter+ exist
 RUN mkdir -p /comfyui/models/ipadapter /comfyui/models/clip_vision /comfyui/models/loras /comfyui/models/insightface
 
-# Ensure PyYAML is in ComfyUI requirements and install via requirements.txt (respects constraints)
-RUN if [ -f /comfyui/requirements.txt ]; then \
-      (grep -qi '^PyYAML' /comfyui/requirements.txt || echo 'PyYAML==6.0.1' >> /comfyui/requirements.txt); \
-      pip install --no-cache-dir -r /comfyui/requirements.txt; \
-    else \
-      echo 'PyYAML==6.0.1' > /comfyui/requirements.txt && pip install --no-cache-dir -r /comfyui/requirements.txt; \
-    fi
+# Just ensure PyYAML is installed; do not re-run ComfyUI's requirements.txt to avoid transformers conflicts
+RUN pip install --no-cache-dir PyYAML==6.0.1
 
 # No custom node tarball pulls; rely on ComfyUI core only
 
