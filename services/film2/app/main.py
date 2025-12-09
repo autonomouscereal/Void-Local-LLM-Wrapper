@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import hashlib
+import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -215,16 +216,31 @@ async def _get_manifest(project_id: str, kind: str) -> Optional[Any]:
             return None
         if name.endswith(".jsonl"):
             items = []
+            from void_json.json_parser import JSONParser
+
+            parser = JSONParser()
             with open(path, "r", encoding="utf-8") as f:
                 for ln in f:
                     if ln.strip():
                         try:
-                            items.append(json.loads(ln))
+                            sup = parser.parse_superset(ln, {})
+                            obj = sup.get("coerced") or {}
+                            if isinstance(obj, dict):
+                                items.append(obj)
                         except Exception:
                             continue
             return items
+        from void_json.json_parser import JSONParser
+
+        parser = JSONParser()
         with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+            raw = f.read()
+        try:
+            sup = parser.parse_superset(raw, {})
+            obj = sup.get("coerced") or {}
+            return obj if isinstance(obj, dict) else {}
+        except Exception:
+            return {}
     except Exception:
         return None
 
@@ -589,13 +605,19 @@ async def film_final(body: Dict[str, Any]):
     # Load shot durations from shots.jsonl
     durations_map: Dict[str, float] = {}
     try:
+        from void_json.json_parser import JSONParser
+
+        parser = JSONParser()
         sp = _proj_dir(project_id, "shots.jsonl")
         if os.path.exists(sp):
             with open(sp, "r", encoding="utf-8") as f:
                 for ln in f:
                     if ln.strip():
                         try:
-                            obj = json.loads(ln)
+                            sup = parser.parse_superset(ln, {})
+                            obj = sup.get("coerced") or {}
+                            if not isinstance(obj, dict):
+                                continue
                             sid = obj.get("id")
                             d = float(((obj.get("dsl") or {}).get("duration_s") or 3.0))
                             if sid:
@@ -634,36 +656,50 @@ async def film_final(body: Dict[str, Any]):
         if os.path.exists(lp):
             with open(lp, "r", encoding="utf-8") as f:
                 nodes_obj["locks"] = json.load(f)
-    except Exception:
+    except Exception as ex:
+        logging.error("film2: failed to read locks.json for project_id=%s: %s", project_id, ex, exc_info=True)
         nodes_obj["locks"] = {}
     try:
+        from void_json.json_parser import JSONParser
+
+        parser = JSONParser()
         sp = _proj_dir(project_id, "shots.jsonl")
         if os.path.exists(sp):
             with open(sp, "r", encoding="utf-8") as f:
                 for ln in f:
                     if ln.strip():
                         try:
-                            obj = json.loads(ln)
+                            sup = parser.parse_superset(ln, {})
+                            obj = sup.get("coerced") or {}
+                            if not isinstance(obj, dict):
+                                continue
                             sid = obj.get("id")
                             sseed = obj.get("seed")
                             if sid is not None:
                                 nodes_obj["shots"].append({"shot_id": sid, "seed": sseed})
-                        except Exception:
-                            continue
-    except Exception:
-        pass
+                        except Exception as ex:
+                            logging.error(
+                                "film2: failed to parse shots.jsonl line for project_id=%s: %s",
+                                project_id,
+                                ex,
+                                exc_info=True,
+                            )
+    except Exception as ex:
+        logging.error("film2: failed to load shots.jsonl for project_id=%s: %s", project_id, ex, exc_info=True)
     # Record post pipeline seeds (deterministic) and params if present
     post_nodes: Dict[str, Any] = {}
     try:
         # Persist post info based on export effective or last known post params
-        eff = (effective if isinstance(locals().get("effective"), dict) else {}) if "effective" in locals() else {}
+        eff_raw = locals().get("effective")
+        eff = eff_raw if isinstance(eff_raw, dict) else {}
         post_eff = eff.get("post") if isinstance(eff.get("post"), dict) else {}
         # Derive stable seeds
         if post_eff.get("interpolate"):
             post_nodes["interpolate"] = {"seed": _seed64("post", project_id, "interpolate"), **post_eff.get("interpolate")}
         if post_eff.get("upscale"):
             post_nodes["upscale"] = {"seed": _seed64("post", project_id, "upscale"), **post_eff.get("upscale")}
-    except Exception:
+    except Exception as ex:
+        logging.error("film2: failed to derive post pipeline seeds for project_id=%s: %s", project_id, ex, exc_info=True)
         post_nodes = {}
     if post_nodes:
         nodes_obj["post"] = post_nodes

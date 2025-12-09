@@ -366,9 +366,13 @@ class FetcherParser:
             out["og"] = og
             # JSON-LD
             jsonld_list: List[Dict[str, Any]] = []
+            from void_json.json_parser import JSONParser
+
+            parser = JSONParser()
             for sc in soup.select('script[type="application/ld+json"]'):
                 try:
-                    js = json.loads(sc.get_text() or "{}")
+                    sup = parser.parse_superset(sc.get_text() or "{}", {})
+                    js = sup.get("coerced") or {}
                     if isinstance(js, dict):
                         jsonld_list.append(js)
                     elif isinstance(js, list):

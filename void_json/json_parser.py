@@ -246,8 +246,10 @@ class JSONParser:
         """
         try:
             return json.loads(json_string)
-        except Exception:
-            pass
+        except Exception as exc:
+            # Record the failure so callers can see that the strict branch failed
+            # before we fall back to the more permissive regex-based repair.
+            self._err(f"regex_parse_strict:{exc}")
         json_string = re.sub(r"'", '"', json_string)
         json_string = re.sub(
             r"(?<=\{|,)\s*([A-Za-z0-9_]+)\s*:",

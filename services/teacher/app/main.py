@@ -313,10 +313,25 @@ async def trace_flush(body: Dict[str, Any]):
                 if not rr:
                     continue
                 rid = int(rr[0])
+                from void_json.json_parser import JSONParser
+
+                parser = JSONParser()
                 for tp in tp_lines:
-                    await db_execute("INSERT INTO distill_toolpolicy(run_id, policy_json) VALUES($1,$2)", rid, json.loads(tp))
+                    try:
+                        sup_tp = parser.parse_superset(tp, {})
+                        obj_tp = sup_tp.get("coerced") or {}
+                        if isinstance(obj_tp, dict):
+                            await db_execute("INSERT INTO distill_toolpolicy(run_id, policy_json) VALUES($1,$2)", rid, obj_tp)
+                    except Exception:
+                        continue
                 for dp in dpo_lines:
-                    await db_execute("INSERT INTO distill_dpo(run_id, pair_json) VALUES($1,$2)", rid, json.loads(dp))
+                    try:
+                        sup_dp = parser.parse_superset(dp, {})
+                        obj_dp = sup_dp.get("coerced") or {}
+                        if isinstance(obj_dp, dict):
+                            await db_execute("INSERT INTO distill_dpo(run_id, pair_json) VALUES($1,$2)", rid, obj_dp)
+                    except Exception:
+                        continue
     except Exception:
         pass
     # run record

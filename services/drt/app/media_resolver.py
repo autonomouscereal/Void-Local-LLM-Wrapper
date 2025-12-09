@@ -10,6 +10,7 @@ from typing import Dict, Any
 
 import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential
+from void_json.json_parser import JSONParser
 
 
 COOKIES_FILE = os.getenv("MEDIA_COOKIES_FILE", "")
@@ -39,25 +40,28 @@ def _yt_dlp_info(url: str) -> Dict[str, Any]:
     if COOKIES_FILE:
         cmd += ["--cookies", COOKIES_FILE]
     if HEADERS_JSON:
-        try:
-            hdrs = json.loads(HEADERS_JSON)
+        parser = JSONParser()
+        sup = parser.parse_superset(HEADERS_JSON, {})
+        hdrs = sup.get("coerced") or {}
+        if isinstance(hdrs, dict):
             for k, v in hdrs.items():
                 cmd += ["--add-header", f"{k}:{v}"]
-        except json.JSONDecodeError:
-            pass
     p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    
-    return json.loads(p.stdout)
+    parser = JSONParser()
+    sup = parser.parse_superset(p.stdout or "{}", {})
+    obj = sup.get("coerced") or {}
+    return obj if isinstance(obj, dict) else {}
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=0.5, max=8))
 def _http_get(url: str, max_bytes: int = 32 * 1024 * 1024, timeout: int | None = None) -> bytes:
     headers = {"User-Agent": DEFAULT_USER_AGENT}
     if HEADERS_JSON:
-        try:
-            headers.update(json.loads(HEADERS_JSON))
-        except json.JSONDecodeError:
-            pass
+        parser = JSONParser()
+        sup = parser.parse_superset(HEADERS_JSON, {})
+        hdrs = sup.get("coerced") or {}
+        if isinstance(hdrs, dict):
+            headers.update(hdrs)
     with httpx.Client(timeout=timeout, follow_redirects=True) as cli:
         with cli.stream("GET", url, headers=headers) as r:
             out = bytearray()

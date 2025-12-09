@@ -4,6 +4,8 @@ from typing import Any, Dict, Optional
 import urllib.request
 import urllib.error
 
+from void_json.json_parser import JSONParser
+
 
 def _get(url: str) -> Dict[str, Any]:
     req = urllib.request.Request(url, headers={"Content-Type": "application/json"}, method="GET")
@@ -11,7 +13,10 @@ def _get(url: str) -> Dict[str, Any]:
         with urllib.request.urlopen(req) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
         try:
-            return json.loads(raw)
+            parser = JSONParser()
+            sup = parser.parse_superset(raw, {})
+            obj = sup.get("coerced") or {}
+            return obj if isinstance(obj, dict) else {}
         except Exception:
             return {}
     except urllib.error.HTTPError as e:

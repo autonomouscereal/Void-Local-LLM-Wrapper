@@ -270,6 +270,23 @@ def build_ollama_payload(messages: List[Dict[str, Any]], model: str, num_ctx: in
             else:
                 rendered.append(str(content_val or ""))
     prompt = "\n\n".join(rendered)
+    # ICW / context orchestration: keep the rendered prompt within a rough
+    # character budget derived from DEFAULT_NUM_CTX so we don't saturate the
+    # backend's context window and get garbage like ".TabStop" instead of real
+    # output. No try/except here; DEFAULT_NUM_CTX is validated at import time.
+    max_chars = DEFAULT_NUM_CTX * 4  # ≈4 chars/token heuristic
+    if len(prompt) > max_chars:
+        # Prefer to retain the tail of the prompt (latest user + tool context)
+        # while trimming older system/history content from the front.
+        trimmed = prompt[-max_chars:]
+        log.info(
+            "[committee] prompt.truncated model=%s num_ctx=%s orig_chars=%d kept_chars=%d",
+            model,
+            DEFAULT_NUM_CTX,
+            len(prompt),
+            len(trimmed),
+        )
+        prompt = trimmed
     return {
         "model": model,
         "prompt": prompt,

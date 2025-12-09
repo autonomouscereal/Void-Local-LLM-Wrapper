@@ -409,10 +409,23 @@ async def ablate(body: Dict[str, Any]):
                     await db_execute("INSERT INTO ablation_clean(ablation_id, item_json) VALUES($1,$2)", aid, c)
                 # read drops.jsonl quickly
                 try:
+                    from void_json.json_parser import JSONParser
+
+                    parser = JSONParser()
                     with open(drops_path, "r", encoding="utf-8") as f:
                         for ln in f:
                             if ln.strip():
-                                await db_execute("INSERT INTO ablation_drop(ablation_id, item_json) VALUES($1,$2)", aid, json.loads(ln))
+                                try:
+                                    sup = parser.parse_superset(ln, {})
+                                    obj = sup.get("coerced") or {}
+                                    if isinstance(obj, dict):
+                                        await db_execute(
+                                            "INSERT INTO ablation_drop(ablation_id, item_json) VALUES($1,$2)",
+                                            aid,
+                                            obj,
+                                        )
+                                except Exception:
+                                    continue
                 except Exception:
                     pass
     except Exception:

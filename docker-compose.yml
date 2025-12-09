@@ -409,7 +409,7 @@ services:
       - ABLATE_EXPORT=${ABLATE_EXPORT:-on}
       - ABLATE_SCOPE=${ABLATE_SCOPE:-auto}
       - RAG_CACHE_TTL_SEC=${RAG_CACHE_TTL_SEC:-300}
-      - DEFAULT_NUM_CTX=${DEFAULT_NUM_CTX:-4096}
+      - DEFAULT_NUM_CTX=${DEFAULT_NUM_CTX:-8192}
       - DEFAULT_TEMPERATURE=${DEFAULT_TEMPERATURE:-0.3}
       - ENABLE_WEBSEARCH=${ENABLE_WEBSEARCH:-true}
       - SERPAPI_API_KEY
@@ -498,6 +498,9 @@ services:
     network_mode: host
     environment:
       - XTTS_MODEL_NAME=tts_models/multilingual/multi-dataset/xtts_v2
+      # Persistent per-voice model map; lives on tts_cache volume.
+      # Normally you don't need to override this.
+      - XTTS_VOICE_MODEL_MAP_PATH=/root/.local/share/tts/voice_model_map.json
       - COQUI_TOS_AGREED=1
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
@@ -512,6 +515,7 @@ services:
     volumes:
       - hf_cache:/models/hf
       - torch_cache:/models/torch
+      # Persist XTTS cache and voice_model_map.json on a named volume.
       - tts_cache:/root/.local/share/tts
       - film2_models:/opt/models:ro
       - film2_data:/srv/film2

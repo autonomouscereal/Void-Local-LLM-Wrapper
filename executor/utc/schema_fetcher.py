@@ -6,6 +6,8 @@ import time
 import logging
 import traceback
 
+from void_json.json_parser import JSONParser
+
 from .db import get_pg_pool
 
 
@@ -16,11 +18,15 @@ def _hash_schema(schema: Dict[str, Any]) -> str:
 
 def _get(url: str) -> Dict[str, Any]:
     import urllib.request
+
     req = urllib.request.Request(url, headers={"Content-Type": "application/json"}, method="GET")
     with urllib.request.urlopen(req) as resp:
         raw = resp.read().decode("utf-8", errors="replace")
     try:
-        return json.loads(raw)
+        parser = JSONParser()
+        sup = parser.parse_superset(raw, {})
+        obj = sup.get("coerced") or {}
+        return obj if isinstance(obj, dict) else {}
     except Exception as e:
         logging.error("schema_fetcher._get failed for url=%s: %s\n%s", url, e, traceback.format_exc())
         return {}

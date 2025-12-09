@@ -2,18 +2,19 @@ from __future__ import annotations
 
 import base64
 import io
-import json
 import logging
 import os
 import traceback
 from typing import Any, Dict, Optional, Tuple
 
+import json  # kept only for internal dumps; parsing goes via JSONParser
 import numpy as np
 import soundfile as sf
 import torch
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from TTS.api import TTS  # type: ignore
+from void_json.json_parser import JSONParser
 
 
 MODEL_NAME = os.getenv("XTTS_MODEL_NAME", "tts_models/multilingual/multi-dataset/xtts_v2")
@@ -40,21 +41,66 @@ def _load_voice_model_map() -> None:
     back to an empty map and logs a warning.
     """
     global _TTS_MODEL_MAP
+    # Primary source (if provided): environment variable.
     raw = os.getenv("XTTS_VOICE_MODEL_MAP", "").strip()
-    if not raw:
-        _TTS_MODEL_MAP = {}
-        return
-    try:
-        obj = json.loads(raw)
+    map_path = os.getenv(
+        "XTTS_VOICE_MODEL_MAP_PATH",
+        # Lives under the tts_cache volume in docker-compose so it persists.
+        "/root/.local/share/tts/voice_model_map.json",
+    )
+    os.makedirs(os.path.dirname(map_path), exist_ok=True)
+
+    if raw:
+        # Backwards-compatible: allow JSON from env, then persist it to disk
+        # so subsequent restarts don't rely on the env being present.
+        parser = JSONParser()
+        sup = parser.parse_superset(raw, {})
+        obj = sup.get("coerced") or {}
         if isinstance(obj, dict):
             _TTS_MODEL_MAP = {str(k): str(v) for k, v in obj.items()}
-            logging.info("xtts.voice_model_map.loaded keys=%s", sorted(_TTS_MODEL_MAP.keys()))
+            logging.info(
+                "xtts.voice_model_map.loaded_from_env keys=%s",
+                sorted(_TTS_MODEL_MAP.keys()),
+            )
+            tmp = map_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(
+                    _TTS_MODEL_MAP,
+                    f,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            os.replace(tmp, map_path)
+            return
         else:
             logging.warning("xtts.voice_model_map.invalid_type type=%s", type(obj))
             _TTS_MODEL_MAP = {}
-    except Exception:
-        logging.exception("xtts.voice_model_map.parse_error")
+            return
+
+    # Fallback: load from disk if present (zero-config path, backed by volume).
+    if os.path.exists(map_path):
+        with open(map_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            _TTS_MODEL_MAP = {str(k): str(v) for k, v in data.items()}
+            logging.info(
+                "xtts.voice_model_map.loaded_from_disk path=%s keys=%s",
+                map_path,
+                sorted(_TTS_MODEL_MAP.keys()),
+            )
+        else:
+            logging.warning(
+                "xtts.voice_model_map.disk_invalid_type path=%s type=%s",
+                map_path,
+                type(data),
+            )
+            _TTS_MODEL_MAP = {}
+    else:
+        # No env and no disk map: start with an empty mapping and log once.
         _TTS_MODEL_MAP = {}
+        logging.info(
+            "xtts.voice_model_map.empty_using_default path=%s", map_path
+        )
 
 
 _load_voice_model_map()

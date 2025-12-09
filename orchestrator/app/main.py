@@ -1697,6 +1697,24 @@ def build_ollama_payload(messages: List[Dict[str, Any]], model: str, num_ctx: in
                 content = content_val if content_val is not None else ""
             rendered.append(f"{role}: {content}")
     prompt = "\n".join(rendered)
+    # Keep the prompt within a coarse character budget derived from the global
+    # DEFAULT_NUM_CTX so we do not blow past the backend's context window when
+    # ICW/CO get large. No try/except; DEFAULT_NUM_CTX is sourced from env at
+    # import time.
+    from .plan.committee import DEFAULT_NUM_CTX  # reuse the same env-derived cap
+
+    max_chars = DEFAULT_NUM_CTX * 4  # ≈4 characters per token
+    if len(prompt) > max_chars:
+        # Preserve the most recent content at the tail.
+        trimmed = prompt[-max_chars:]
+        logging.info(
+            "[wrapper] prompt.truncated model=%s num_ctx=%s orig_chars=%d kept_chars=%d",
+            model,
+            DEFAULT_NUM_CTX,
+            len(prompt),
+            len(trimmed),
+        )
+        prompt = trimmed
     return {
         "model": model,
         "prompt": prompt,
@@ -2179,8 +2197,9 @@ def _datasets_emit(job_id: str, ev: Dict[str, Any]) -> None:
         ph = (ev or {}).get("phase") or "running"
         pr = float((ev or {}).get("progress") or 0.0)
         _orcjob_set_state(job_id, "running", phase=ph, progress=pr)
-    except Exception:
-        pass
+    except Exception as ex:
+        # Emitting dataset job progress is best-effort; log failures but never raise.
+        logging.error("datasets_emit failed for job_id=%s: %s", job_id, ex, exc_info=True)
 
 
 async def _datasets_runner(job_id: str, body: Dict[str, Any]) -> None:
@@ -3501,29 +3520,18 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         locks = args.get("locks")
         if isinstance(locks, dict):
             payload["locks"] = locks
-        try:
-            async with httpx.AsyncClient() as client:
-                r = await client.post(VISION_REPAIR_API_URL.rstrip("/") + "/v1/image/analyze", json=payload)
-            if r.status_code < 200 or r.status_code >= 300:
-                return _tool_error(
-                    name,
-                    "vision_repair_http_error",
-                    f"vision_repair analyze returned HTTP {r.status_code}",
-                    status=r.status_code,
-                )
-            parser = JSONParser()
-            js = parser.parse_superset(r.text or "", {"faces": list, "hands": list, "objects": list, "quality": dict})["coerced"]
-            return {"name": name, "result": js}
-        except Exception as ex:
-            _tb = traceback.format_exc()
-            logging.error(_tb)
+        async with httpx.AsyncClient() as client:
+            r = await client.post(VISION_REPAIR_API_URL.rstrip("/") + "/v1/image/analyze", json=payload)
+        if r.status_code < 200 or r.status_code >= 300:
             return _tool_error(
                 name,
-                "vision_repair_exception",
-                f"vision_repair image.detect failed: {ex}",
-                status=500,
-                traceback=_tb,
+                "vision_repair_http_error",
+                f"vision_repair analyze returned HTTP {r.status_code}",
+                status=r.status_code,
             )
+        parser = JSONParser()
+        js = parser.parse_superset(r.text or "", {"faces": list, "hands": list, "objects": list, "quality": dict})["coerced"]
+        return {"name": name, "result": js}
     if name == "image.repair" and VISION_REPAIR_API_URL and ALLOW_TOOL_EXECUTION:
         src = args.get("src") or args.get("image_path") or ""
         if not isinstance(src, str) or not src:
@@ -3538,29 +3546,18 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         mode = args.get("mode") or args.get("refine_mode")
         if isinstance(mode, str) and mode:
             payload["mode"] = mode
-        try:
-            async with httpx.AsyncClient() as client:
-                r = await client.post(VISION_REPAIR_API_URL.rstrip("/") + "/v1/image/repair", json=payload)
-            if r.status_code < 200 or r.status_code >= 300:
-                return _tool_error(
-                    name,
-                    "vision_repair_http_error",
-                    f"vision_repair repair returned HTTP {r.status_code}",
-                    status=r.status_code,
-                )
-            parser = JSONParser()
-            js = parser.parse_superset(r.text or "", {"repaired_image_path": str, "regions": list, "mode": (str,)})["coerced"]
-            return {"name": name, "result": js}
-        except Exception as ex:
-            _tb = traceback.format_exc()
-            logging.error(_tb)
+        async with httpx.AsyncClient() as client:
+            r = await client.post(VISION_REPAIR_API_URL.rstrip("/") + "/v1/image/repair", json=payload)
+        if r.status_code < 200 or r.status_code >= 300:
             return _tool_error(
                 name,
-                "vision_repair_exception",
-                f"vision_repair image.repair failed: {ex}",
-                status=500,
-                traceback=_tb,
+                "vision_repair_http_error",
+                f"vision_repair repair returned HTTP {r.status_code}",
+                status=r.status_code,
             )
+        parser = JSONParser()
+        js = parser.parse_superset(r.text or "", {"repaired_image_path": str, "regions": list, "mode": (str,)})["coerced"]
+        return {"name": name, "result": js}
     if name == "video.refine.clip" and ALLOW_TOOL_EXECUTION:
         a = args if isinstance(args, dict) else {}
         segment_id_val = a.get("segment_id")
@@ -3633,24 +3630,32 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         hv_prompt = (prompt or "") + prompt_suffix
         # First attempt: frame-level refinement using image tools and ffmpeg.
         refined_video_path: Optional[str] = None
-        try:
-            # Extract clip frames for the target window.
-            outdir = os.path.join(UPLOAD_DIR, "artifacts", "video", "refine", segment_id or f"seg-{int(time.time())}")
-            frames_dir = os.path.join(outdir, "frames")
-            os.makedirs(frames_dir, exist_ok=True)
-            ff_args = [
-                "ffmpeg",
-                "-y",
-                "-i",
-                src,
-            ]
-            # Limit to the specified time window when available.
-            if start_s > 0.0:
-                ff_args.extend(["-ss", f"{start_s:.3f}"])
-            if end_s > start_s:
-                ff_args.extend(["-to", f"{end_s:.3f}"])
-            ff_args.append(os.path.join(frames_dir, "%06d.png"))
-            subprocess.run(ff_args, check=True)
+        # Extract clip frames for the target window.
+        outdir = os.path.join(UPLOAD_DIR, "artifacts", "video", "refine", segment_id or f"seg-{int(time.time())}")
+        frames_dir = os.path.join(outdir, "frames")
+        os.makedirs(frames_dir, exist_ok=True)
+        ff_args = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            src,
+        ]
+        # Limit to the specified time window when available.
+        if start_s > 0.0:
+            ff_args.extend(["-ss", f"{start_s:.3f}"])
+        if end_s > start_s:
+            ff_args.extend(["-to", f"{end_s:.3f}"])
+        ff_args.append(os.path.join(frames_dir, "%06d.png"))
+        proc_extract = subprocess.run(ff_args, check=False)
+        if proc_extract.returncode != 0:
+            return {
+                "name": name,
+                "error": {
+                    "code": "ffmpeg_extract_failed",
+                    "message": f"ffmpeg extract exited with code {proc_extract.returncode}",
+                    "status": 500,
+                },
+            }
             frame_files = sorted(_glob(os.path.join(frames_dir, "*.png")))
             # Apply lightweight per-frame cleanup using image tools where available.
             cleaned_frames: List[str] = []
@@ -3733,21 +3738,10 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                             cleaned_path = p
                 cleaned_frames.append(cleaned_path)
                 # Per-frame identity score (best-effort; does not affect control flow).
-                try:
-                    if face_ref is not None:
-                        score = await _compute_face_lock_score(cleaned_path, face_ref)
-                        if isinstance(score, (int, float)):
-                            clip_identity_scores.append(float(score))
-                except Exception as ex:
-                    _log(
-                        "film2.frame_fix.face_lock_score.error",
-                        error=str(ex),
-                        frame_path=cleaned_path,
-                        segment_id=segment_id,
-                        film_id=film_id,
-                        scene_id=scene_id,
-                        shot_id=shot_id,
-                    )
+                if face_ref is not None:
+                    score = await _compute_face_lock_score(cleaned_path, face_ref)
+                    if isinstance(score, (int, float)):
+                        clip_identity_scores.append(float(score))
                 _trace_append(
                     "film2",
                     {
@@ -3770,7 +3764,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 # Rebuild clip from cleaned frames.
                 rebuilt_path = os.path.join(outdir, "refined.mp4")
                 # Use ffmpeg to assemble frames at the original fps.
-                subprocess.run(
+                proc_rebuild = subprocess.run(
                     [
                         "ffmpeg",
                         "-y",
@@ -3780,12 +3774,20 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                         os.path.join(frames_dir, "%06d.png"),
                         "-c:v",
                         "libx264",
-                        "-pix_fmt",
                         "yuv420p",
                         rebuilt_path,
                     ],
-                    check=True,
+                    check=False,
                 )
+                if proc_rebuild.returncode != 0:
+                    return {
+                        "name": name,
+                        "error": {
+                            "code": "ffmpeg_rebuild_failed",
+                            "message": f"ffmpeg rebuild exited with code {proc_rebuild.returncode}",
+                            "status": 500,
+                        },
+                    }
                 refined_video_path = rebuilt_path
                 _trace_append(
                     "film2",
@@ -3820,9 +3822,6 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                             "mean": id_mean,
                         },
                     )
-        except Exception:
-            refined_video_path = None
-            clip_sharpness = None
         video_path: Optional[str] = refined_video_path
         # Fallback: hv-based refine when frame-level path is unavailable.
         if video_path is None:
@@ -3914,7 +3913,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         a = raw_args if isinstance(raw_args, dict) else {}
         prompt = (a.get("prompt") or "").strip()
         trace_id = a.get("trace_id") if isinstance(a.get("trace_id"), str) else None
-        cid = a.get("cid") or ""
+        cid = a["cid"]
         clips = a.get("clips") if isinstance(a.get("clips"), list) else []
         images = a.get("images") if isinstance(a.get("images"), list) else []
         do_interpolate = bool(a.get("interpolate") or False)
@@ -5742,18 +5741,15 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         # Write a small repro bundle next to the artifact (or under /uploads/repros)
         tool_used = (args.get("tool") or "").strip()
         a = args.get("args") if isinstance(args.get("args"), dict) else {}
-        cid = (args.get("cid") or "")
+        cid = args["cid"]
         repro = {"tool": tool_used, "args": a, "seed": det_seed_tool(tool_used, str(det_seed_router("repro", 0))), "ts": int(time.time()), "cid": cid}
-        try:
-            outdir = os.path.join(UPLOAD_DIR, "repros", cid or "misc")
-            os.makedirs(outdir, exist_ok=True)
-            path = os.path.join(outdir, "repro.json")
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(json.dumps(repro, ensure_ascii=False, indent=2))
-            uri = path.replace("/workspace", "") if path.startswith("/workspace/") else path
-            return {"name": name, "result": {"uri": uri}}
-        except Exception as ex:
-            return {"name": name, "error": str(ex)}
+        outdir = os.path.join(UPLOAD_DIR, "repros", cid or "misc")
+        os.makedirs(outdir, exist_ok=True)
+        path = os.path.join(outdir, "repro.json")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(json.dumps(repro, ensure_ascii=False, indent=2))
+        uri = path.replace("/workspace", "") if path.startswith("/workspace/") else path
+        return {"name": name, "result": {"uri": uri}}
     if name == "style.dna.extract" and ALLOW_TOOL_EXECUTION:
         imgs = args.get("images") if isinstance(args.get("images"), list) else []
         palette = []
@@ -6917,14 +6913,29 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         final_path = _os.path.join(outdir, "final.png")
         canvas.save(final_path)
         url = final_path.replace("/workspace", "") if final_path.startswith("/workspace/") else final_path
-        try:
-            _ctx_add(args.get("cid") or "", "image", final_path, url, base_path, ["super_gen"], {"objects": objs, "boxes": boxes, "signage_text": exact_text})
-        except Exception:
-            pass
-        try:
-            trace_append("image", {"cid": args.get("cid"), "tool": "image.super_gen", "prompt": prompt, "size": f"{w}x{h}", "objects": objs, "boxes": boxes, "path": final_path, "signage_text": exact_text, "web_sources": web_sources})
-        except Exception:
-            pass
+        _ctx_add(
+            args["cid"],
+            "image",
+            final_path,
+            url,
+            base_path,
+            ["super_gen"],
+            {"objects": objs, "boxes": boxes, "signage_text": exact_text},
+        )
+        trace_append(
+            "image",
+            {
+                "cid": args["cid"],
+                "tool": "image.super_gen",
+                "prompt": prompt,
+                "size": f"{w}x{h}",
+                "objects": objs,
+                "boxes": boxes,
+                "path": final_path,
+                "signage_text": exact_text,
+                "web_sources": web_sources,
+            },
+        )
         return {"name": name, "result": {"path": url}}
     if name == "research.run" and ALLOW_TOOL_EXECUTION:
         # Prefer local orchestrator; on failure, try DRT service if configured
@@ -7069,8 +7080,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 try:
                     rel = os.path.relpath(dst, UPLOAD_DIR).replace("\\", "/")
                     checkpoints_append_event(STATE_DIR, tr, "artifact", {"kind": "video", "path": rel})
-                except Exception:
-                    pass
+                except Exception as ex:
+                    _log("video.interpolate.checkpoint.error", error=str(ex), path=dst)
             return {"name": name, "result": {"path": url}}
         except Exception as ex:
             return {"name": name, "error": str(ex)}
@@ -7136,14 +7147,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             dst = os.path.join(outdir, "clean.png")
             cv2.imwrite(dst, work)
             url = dst.replace("/workspace", "") if dst.startswith("/workspace/") else dst
-            try:
-                _ctx_add(args.get("cid") or "", "image", dst, url, src, ["cleanup"], {})
-            except Exception:
-                pass
-            try:
-                trace_append("image", {"cid": args.get("cid"), "tool": "image.cleanup", "src": src, "path": dst})
-            except Exception:
-                pass
+            _ctx_add(args["cid"], "image", dst, url, src, ["cleanup"], {})
+            trace_append("image", {"cid": args["cid"], "tool": "image.cleanup", "src": src, "path": dst})
             return {"name": name, "result": {"path": url}}
         except Exception as ex:
             return {"name": name, "error": str(ex)}
@@ -7164,14 +7169,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         try:
             subprocess.run(ff, check=True)
             url = dst.replace("/workspace", "") if dst.startswith("/workspace/") else dst
-            try:
-                _ctx_add(args.get("cid") or "", "video", dst, url, src, ["cleanup"], {"vf": vf})
-            except Exception:
-                pass
-            try:
-                trace_append("video", {"cid": args.get("cid"), "tool": "video.cleanup", "src": src, "vf": vf, "path": dst})
-            except Exception:
-                pass
+            _ctx_add(args["cid"], "video", dst, url, src, ["cleanup"], {"vf": vf})
+            trace_append("video", {"cid": args["cid"], "tool": "video.cleanup", "src": src, "vf": vf, "path": dst})
             return {"name": name, "result": {"path": url}}
         except Exception as ex:
             return {"name": name, "error": str(ex)}
@@ -7225,14 +7224,25 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             dst = os.path.join(outdir, "fixed.png")
             cv2.imwrite(dst, work)
             url = dst.replace("/workspace", "") if dst.startswith("/workspace/") else dst
-            try:
-                _ctx_add(args.get("cid") or "", "image", dst, url, src, ["artifact_fix", atype], {"region": region, "target_time": args.get("target_time")})
-            except Exception:
-                pass
-            try:
-                trace_append("image", {"cid": args.get("cid"), "tool": "image.artifact_fix", "src": src, "type": atype, "path": dst})
-            except Exception:
-                pass
+            _ctx_add(
+                args["cid"],
+                "image",
+                dst,
+                url,
+                src,
+                ["artifact_fix", atype],
+                {"region": region, "target_time": args.get("target_time")},
+            )
+            trace_append(
+                "image",
+                {
+                    "cid": args["cid"],
+                    "tool": "image.artifact_fix",
+                    "src": src,
+                    "type": atype,
+                    "path": dst,
+                },
+            )
             return {"name": name, "result": {"path": url}}
         except Exception as ex:
             return {"name": name, "error": str(ex)}
@@ -7253,14 +7263,17 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             # Reassemble
             subprocess.run(["ffmpeg", "-y", "-framerate", "30", "-i", os.path.join(frames_dir, "%06d.png"), "-c:v", "libx264", "-pix_fmt", "yuv420p", dst], check=True)
             url = dst.replace("/workspace", "") if dst.startswith("/workspace/") else dst
-            try:
-                _ctx_add(args.get("cid") or "", "video", dst, url, src, ["artifact_fix", atype], {})
-            except Exception:
-                pass
-            try:
-                trace_append("video", {"cid": args.get("cid"), "tool": "video.artifact_fix", "src": src, "type": atype, "path": dst})
-            except Exception:
-                pass
+            _ctx_add(args["cid"], "video", dst, url, src, ["artifact_fix", atype], {})
+            trace_append(
+                "video",
+                {
+                    "cid": args["cid"],
+                    "tool": "video.artifact_fix",
+                    "src": src,
+                    "type": atype,
+                    "path": dst,
+                },
+            )
             return {"name": name, "result": {"path": url}}
         except Exception as ex:
             return {"name": name, "error": str(ex)}
@@ -7326,14 +7339,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             dst = os.path.join(outdir, "fixed.png")
             cv2.imwrite(dst, out)
             url = dst.replace("/workspace", "") if dst.startswith("/workspace/") else dst
-            try:
-                _ctx_add(args.get("cid") or "", "image", dst, url, src, ["hands_fix"], {})
-            except Exception:
-                pass
-            try:
-                trace_append("image", {"cid": args.get("cid"), "tool": "image.hands.fix", "src": src, "path": dst})
-            except Exception:
-                pass
+            _ctx_add(args["cid"], "image", dst, url, src, ["hands_fix"], {})
+            trace_append("image", {"cid": args["cid"], "tool": "image.hands.fix", "src": src, "path": dst})
             return {"name": name, "result": {"path": url}}
         except Exception as ex:
             return {"name": name, "error": str(ex)}
@@ -7351,14 +7358,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 _ = await execute_tool_call({"name": "image.hands.fix", "arguments": {"src": fp, "cid": args.get("cid")}})
             subprocess.run(["ffmpeg", "-y", "-framerate", "30", "-i", os.path.join(frames_dir, "%06d.png"), "-c:v", "libx264", "-pix_fmt", "yuv420p", dst], check=True)
             url = dst.replace("/workspace", "") if dst.startswith("/workspace/") else dst
-            try:
-                _ctx_add(args.get("cid") or "", "video", dst, url, src, ["hands_fix"], {})
-            except Exception:
-                pass
-            try:
-                trace_append("video", {"cid": args.get("cid"), "tool": "video.hands.fix", "src": src, "path": dst})
-            except Exception:
-                pass
+            _ctx_add(args["cid"], "video", dst, url, src, ["hands_fix"], {})
+            trace_append("video", {"cid": args["cid"], "tool": "video.hands.fix", "src": src, "path": dst})
             return {"name": name, "result": {"path": url}}
         except Exception as ex:
             return {"name": name, "error": str(ex)}
@@ -7372,144 +7373,140 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         dst = os.path.join(outdir, "interpolated.mp4")
         vf = f"minterpolate=fps={target_fps}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1"
         ff = ["ffmpeg", "-y", "-i", src, "-vf", vf, "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-an", dst]
-        try:
-            subprocess.run(ff, check=True)
-            # Optional face/consistency lock stabilization pass
-            try:
-                locks = args.get("locks") or {}
-                face_images: list[str] = []
-                # Resolve ref_ids -> images via refs.apply
-                if isinstance(args.get("ref_ids"), list):
-                    try:
-                        for rid in args.get("ref_ids"):
-                            try:
-                                pack, code = _refs_apply({"ref_id": rid})
-                                if isinstance(pack, dict) and pack.get("ref_pack"):
-                                    imgs = (pack.get("ref_pack") or {}).get("images") or []
-                                    for p in imgs:
-                                        if isinstance(p, str):
-                                            face_images.append(p)
-                            except Exception:
-                                continue
-                    except Exception:
-                        pass
-                # Also accept direct locks.image.images
-                try:
-                    if isinstance(locks.get("image"), dict):
-                        for k in ("face_images", "images"):
-                            for p in (locks.get("image", {}).get(k) or []):
-                                if isinstance(p, str):
-                                    face_images.append(p)
-                except Exception:
-                    pass
-                if not face_images:
-                    try:
-                        cid_val = str(args.get("cid") or "").strip()
-                        if cid_val:
-                            recents = _ctx_list(cid_val, limit=20, kind_hint="image")
-                            for it in reversed(recents):
-                                p = it.get("path")
-                                if isinstance(p, str):
-                                    face_images.append(p)
-                                    break
-                    except Exception:
-                        pass
-                if COMFYUI_API_URL and FACEID_API_URL and face_images:
-                    # 1) Extract frames
-                    frames_dir = os.path.join(outdir, "frames"); os.makedirs(frames_dir, exist_ok=True)
-                    subprocess.run(["ffmpeg", "-y", "-i", dst, os.path.join(frames_dir, "%06d.png")], check=True)
-                    # 2) Compute face embedding from first ref
-                    # httpx imported at top as _hx
-                    face_src = face_images[0]
-                    if face_src.startswith("/workspace/"):
-                        face_url = face_src.replace("/workspace", "")
-                    else:
-                        face_url = face_src if face_src.startswith("/uploads/") else face_src
-                    with _hx.Client() as _c:
-                        er = _c.post(FACEID_API_URL.rstrip("/") + "/embed", json={"image_url": face_url})
-                        emb = None
-                        if er.status_code == 200:
+        proc = subprocess.run(ff, check=False)
+        if proc.returncode != 0:
+            return {"name": name, "error": f"ffmpeg interpolate exited with code {proc.returncode}"}
+        # Optional face/consistency lock stabilization pass
+        locks = args.get("locks") or {}
+        face_images: list[str] = []
+        # Resolve ref_ids -> images via refs.apply
+        if isinstance(args.get("ref_ids"), list):
+            for rid in args.get("ref_ids"):
+                pack, code = _refs_apply({"ref_id": rid})
+                if isinstance(pack, dict) and pack.get("ref_pack"):
+                    imgs = (pack.get("ref_pack") or {}).get("images") or []
+                    for p in imgs:
+                        if isinstance(p, str):
+                            face_images.append(p)
+        # Also accept direct locks.image.images
+        if isinstance(locks.get("image"), dict):
+            for k in ("face_images", "images"):
+                for p in (locks.get("image", {}).get(k) or []):
+                    if isinstance(p, str):
+                        face_images.append(p)
+        if not face_images:
+            cid_val = str(args["cid"]).strip()
+            if cid_val:
+                recents = _ctx_list(cid_val, limit=20, kind_hint="image")
+                for it in reversed(recents):
+                    p = it.get("path")
+                    if isinstance(p, str):
+                        face_images.append(p)
+                        break
+        if COMFYUI_API_URL and FACEID_API_URL and face_images:
+            # 1) Extract frames
+            frames_dir = os.path.join(outdir, "frames")
+            os.makedirs(frames_dir, exist_ok=True)
+            subprocess.run(["ffmpeg", "-y", "-i", dst, os.path.join(frames_dir, "%06d.png")], check=True)
+            # 2) Compute face embedding from first ref
+            face_src = face_images[0]
+            if face_src.startswith("/workspace/"):
+                face_url = face_src.replace("/workspace", "")
+            else:
+                face_url = face_src if face_src.startswith("/uploads/") else face_src
+            with _hx.Client() as _c:
+                er = _c.post(FACEID_API_URL.rstrip("/") + "/embed", json={"image_url": face_url})
+                emb = None
+                if er.status_code == 200:
+                    parser = JSONParser()
+                    ej = parser.parse_superset(er.text or "", {"embedding": list, "vec": list})["coerced"]
+                    if isinstance(ej, dict):
+                        emb = ej.get("embedding") or ej.get("vec")
+            # 3) Per-frame InstantID apply with low denoise
+            if emb and isinstance(emb, list):
+                frame_files = sorted(_glob(os.path.join(frames_dir, "*.png")))
+                for fp in frame_files:
+                    # Build minimal ComfyUI graph for stabilization
+                    g = {
+                        "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "sd_xl_base_1.0.safetensors"}},
+                        "2": {"class_type": "LoadImage", "inputs": {"image": fp}},
+                        "5": {"class_type": "VAEEncode", "inputs": {"pixels": ["2", 0], "vae": ["1", 2]}},
+                        "6": {
+                            "class_type": "KSampler",
+                            "inputs": {
+                                "seed": 0,
+                                "steps": 10,
+                                "cfg": 4.0,
+                                "sampler_name": "dpmpp_2m",
+                                "scheduler": "karras",
+                                "denoise": 0.15,
+                                "model": ["1", 0],
+                                "positive": ["3", 0],
+                                "negative": ["4", 0],
+                                "latent_image": ["5", 0],
+                            },
+                        },
+                        "3": {"class_type": "CLIPTextEncode", "inputs": {"text": "stabilize face, preserve identity", "clip": ["1", 1]}},
+                        "4": {"class_type": "CLIPTextEncode", "inputs": {"text": "", "clip": ["1", 1]}},
+                        "7": {"class_type": "VAEDecode", "inputs": {"samples": ["6", 0], "vae": ["1", 2]}},
+                        "8": {"class_type": "SaveImage", "inputs": {"filename_prefix": "frame_out", "images": ["7", 0]}},
+                    }
+                    # Inject InstantIDApply
+                    g["22"] = {
+                        "class_type": "InstantIDApply",
+                        "inputs": {"model": ["1", 0], "image": ["2", 0], "embedding": emb, "strength": 0.70},
+                    }
+                    g["6"]["inputs"]["model"] = ["22", 0]
+                    with _hx.Client() as _c2:
+                        pr = _c2.post(COMFYUI_API_URL.rstrip("/") + "/prompt", json={"prompt": g, "client_id": "wrapper-001"})
+                        if pr.status_code == 200:
                             parser = JSONParser()
-                            ej = parser.parse_superset(er.text or "", {"embedding": list, "vec": list})["coerced"]
-                            if isinstance(ej, dict):
-                                emb = ej.get("embedding") or ej.get("vec")
-                    # 3) Per-frame InstantID apply with low denoise
-                    if emb and isinstance(emb, list):
-                        frame_files = sorted(_glob(os.path.join(frames_dir, "*.png")))
-                        for fp in frame_files:
-                            try:
-                                # Build minimal ComfyUI graph for stabilization
-                                g = {
-                                    "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "sd_xl_base_1.0.safetensors"}},
-                                    "2": {"class_type": "LoadImage", "inputs": {"image": fp}},
-                                    "5": {"class_type": "VAEEncode", "inputs": {"pixels": ["2", 0], "vae": ["1", 2]}},
-                                    "6": {"class_type": "KSampler", "inputs": {"seed": 0, "steps": 10, "cfg": 4.0, "sampler_name": "dpmpp_2m", "scheduler": "karras", "denoise": 0.15, "model": ["1", 0], "positive": ["3", 0], "negative": ["4", 0], "latent_image": ["5", 0]}},
-                                    "3": {"class_type": "CLIPTextEncode", "inputs": {"text": "stabilize face, preserve identity", "clip": ["1", 1]}},
-                                    "4": {"class_type": "CLIPTextEncode", "inputs": {"text": "", "clip": ["1", 1]}},
-                                    "7": {"class_type": "VAEDecode", "inputs": {"samples": ["6", 0], "vae": ["1", 2]}},
-                                    "8": {"class_type": "SaveImage", "inputs": {"filename_prefix": "frame_out", "images": ["7", 0]}}
-                                }
-                                # Inject InstantIDApply
-                                g["22"] = {"class_type": "InstantIDApply", "inputs": {"model": ["1", 0], "image": ["2", 0], "embedding": emb, "strength": 0.70}}
-                                g["6"]["inputs"]["model"] = ["22", 0]
-                                with _hx.Client() as _c2:
-                                    pr = _c2.post(COMFYUI_API_URL.rstrip("/") + "/prompt", json={"prompt": g, "client_id": "wrapper-001"})
-                                    if pr.status_code == 200:
-                                        parser = JSONParser()
-                                        pj = parser.parse_superset(pr.text or "", {"prompt_id": str, "uuid": str, "id": str})["coerced"]
-                                        pid = (pj.get("prompt_id") or pj.get("uuid") or pj.get("id")) if isinstance(pj, dict) else None
-                                        # poll for completion
-                                        while True:
-                                            hr = _c2.get(COMFYUI_API_URL.rstrip("/") + f"/history/{pid}")
-                                            if hr.status_code == 200:
-                                                parser = JSONParser()
-                                                # History responses may be either {"history": {...}} or a direct
-                                                # {prompt_id: {...}} mapping; treat the full body as a generic
-                                                # mapping and preserve all keys.
-                                                hj = parser.parse_superset(hr.text or "{}", dict)["coerced"]
-                                                hist = hj.get("history") if isinstance(hj, dict) else {}
-                                                if not isinstance(hist, dict):
-                                                    hist = hj if isinstance(hj, dict) else {}
-                                                h = hist.get(pid)
-                                                if h and _comfy_is_completed(h):
-                                                    # find first output and overwrite frame
-                                                    outs = (h.get("outputs") or {})
-                                                    got = False
-                                                    for items in outs.values():
-                                                        if isinstance(items, list) and items:
-                                                            it = items[0]
-                                                            fn = it.get("filename"); sub = it.get("subfolder"); tp = it.get("type") or "output"
-                                                            if fn:
-                                                                q = {"filename": fn, "type": tp}
-                                                                if sub: q["subfolder"] = sub
-                                                                vr = _c2.get(COMFYUI_API_URL.rstrip("/") + "/view?" + urlencode(q))
-                                                                if vr.status_code == 200:
-                                                                    with open(fp, "wb") as wf:
-                                                                        wf.write(vr.content)
-                                                                    got = True
-                                                                    break
-                                                    break
-                                            time.sleep(0.5)
-                            except Exception:
-                                continue
-                        # 4) Reassemble stabilized video
-                        dst2 = os.path.join(outdir, "interpolated_stabilized.mp4")
-                        subprocess.run(["ffmpeg", "-y", "-framerate", str(target_fps), "-i", os.path.join(frames_dir, "%06d.png"), "-c:v", "libx264", "-pix_fmt", "yuv420p", dst2], check=True)
-                        dst = dst2
-            except Exception:
-                pass
-            url = dst.replace("/workspace", "") if dst.startswith("/workspace/") else dst
-            try:
-                _ctx_add(args.get("cid") or "", "video", dst, url, src, ["interpolate"], {"target_fps": target_fps})
-            except Exception:
-                pass
-            try:
-                trace_append("video", {"cid": args.get("cid"), "tool": "video.interpolate", "src": src, "target_fps": target_fps, "path": dst})
-            except Exception:
-                pass
-            return {"name": name, "result": {"path": url}}
-        except Exception as ex:
-            return {"name": name, "error": str(ex)}
+                            pj = parser.parse_superset(pr.text or "", {"prompt_id": str, "uuid": str, "id": str})["coerced"]
+                            pid = (pj.get("prompt_id") or pj.get("uuid") or pj.get("id")) if isinstance(pj, dict) else None
+                            # poll for completion
+                            while True:
+                                hr = _c2.get(COMFYUI_API_URL.rstrip("/") + f"/history/{pid}")
+                                if hr.status_code == 200:
+                                    parser = JSONParser()
+                                    # History responses may be either {"history": {...}} or a direct
+                                    # {prompt_id: {...}} mapping; treat the full body as a generic
+                                    # mapping and preserve all keys.
+                                    hj = parser.parse_superset(hr.text or "{}", dict)["coerced"]
+                                    hist = hj.get("history") if isinstance(hj, dict) else {}
+                                    if not isinstance(hist, dict):
+                                        hist = hj if isinstance(hj, dict) else {}
+                                    h = hist.get(pid)
+                                    if h and _comfy_is_completed(h):
+                                        # find first output and overwrite frame
+                                        outs = (h.get("outputs") or {})
+                                        for items in outs.values():
+                                            if isinstance(items, list) and items:
+                                                it = items[0]
+                                                fn = it.get("filename")
+                                                sub = it.get("subfolder")
+                                                tp = it.get("type") or "output"
+                                                if fn:
+                                                    q = {"filename": fn, "type": tp}
+                                                    if sub:
+                                                        q["subfolder"] = sub
+                                                    vr = _c2.get(COMFYUI_API_URL.rstrip("/") + "/view?" + urlencode(q))
+                                                    if vr.status_code == 200:
+                                                        with open(fp, "wb") as wf:
+                                                            wf.write(vr.content)
+                                                        break
+                                        break
+                                time.sleep(0.5)
+                # 4) Reassemble stabilized video
+                dst2 = os.path.join(outdir, "interpolated_stabilized.mp4")
+                subprocess.run(
+                    ["ffmpeg", "-y", "-framerate", str(target_fps), "-i", os.path.join(frames_dir, "%06d.png"), "-c:v", "libx264", "-pix_fmt", "yuv420p", dst2],
+                    check=True,
+                )
+                dst = dst2
+        url = dst.replace("/workspace", "") if dst.startswith("/workspace/") else dst
+        _ctx_add(args["cid"], "video", dst, url, src, ["interpolate"], {"target_fps": target_fps})
+        trace_append("video", {"cid": args["cid"], "tool": "video.interpolate", "src": src, "target_fps": target_fps, "path": dst})
+        return {"name": name, "result": {"path": url}}
     if name == "video.flow.derive":
         frame_a = args.get("frame_a") or ""
         frame_b = args.get("frame_b") or ""
@@ -7556,14 +7553,18 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             npz_path = os.path.join(outdir, "flow.npz")
             np.savez_compressed(npz_path, fx=fx, fy=fy, mag=mag)
             url = npz_path.replace("/workspace", "") if npz_path.startswith("/workspace/") else npz_path
-            try:
-                _ctx_add(args.get("cid") or "", "video", npz_path, url, src or (frame_a + "," + frame_b), ["flow"], {})
-            except Exception:
-                pass
-            try:
-                trace_append("video", {"cid": args.get("cid"), "tool": "video.flow.derive", "src": src, "frame_a": frame_a, "frame_b": frame_b, "path": npz_path})
-            except Exception:
-                pass
+            _ctx_add(args["cid"], "video", npz_path, url, src or (frame_a + "," + frame_b), ["flow"], {})
+            trace_append(
+                "video",
+                {
+                    "cid": args["cid"],
+                    "tool": "video.flow.derive",
+                    "src": src,
+                    "frame_a": frame_a,
+                    "frame_b": frame_b,
+                    "path": npz_path,
+                },
+            )
             return {"name": name, "result": {"path": url}}
         except Exception as ex:
             return {"name": name, "error": str(ex)}
@@ -7583,158 +7584,153 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         else:
             vf = "scale=iw*2:ih*2:flags=lanczos"
         ff = ["ffmpeg", "-y", "-i", src, "-vf", vf, "-c:v", "libx264", "-preset", "slow", "-crf", "18", "-an", dst]
-        try:
-            subprocess.run(ff, check=True)
-            # Optional stabilization pass via face lock
-            try:
-                locks = args.get("locks") or {}
-                face_images: list[str] = []
-                if isinstance(args.get("ref_ids"), list):
-                    try:
-                        for rid in args.get("ref_ids"):
-                            try:
-                                pack, code = _refs_apply({"ref_id": rid})
-                                if isinstance(pack, dict) and pack.get("ref_pack"):
-                                    imgs = (pack.get("ref_pack") or {}).get("images") or []
-                                    for p in imgs:
-                                        if isinstance(p, str):
-                                            face_images.append(p)
-                            except Exception:
-                                continue
-                    except Exception:
-                        pass
-                try:
-                    if isinstance(locks.get("image"), dict):
-                        for k in ("face_images", "images"):
-                            for p in (locks.get("image", {}).get(k) or []):
-                                if isinstance(p, str):
-                                    face_images.append(p)
-                except Exception:
-                    pass
-                if not face_images:
-                    try:
-                        cid_val = str(args.get("cid") or "").strip()
-                        if cid_val:
-                            recents = _ctx_list(cid_val, limit=20, kind_hint="image")
-                            for it in reversed(recents):
-                                p = it.get("path")
-                                if isinstance(p, str):
-                                    face_images.append(p)
-                                    break
-                    except Exception:
-                        pass
-                if COMFYUI_API_URL and FACEID_API_URL and face_images:
-                    frames_dir = os.path.join(outdir, "frames"); os.makedirs(frames_dir, exist_ok=True)
-                    subprocess.run(["ffmpeg", "-y", "-i", dst, os.path.join(frames_dir, "%06d.png")], check=True)
-                    face_src = face_images[0]
-                    face_url = face_src.replace("/workspace", "") if face_src.startswith("/workspace/") else (face_src if face_src.startswith("/uploads/") else face_src)
-                    with _hx.Client() as _c:
-                        er = _c.post(FACEID_API_URL.rstrip("/") + "/embed", json={"image_url": face_url})
-                        emb = None
-                        if er.status_code == 200:
+        proc = subprocess.run(ff, check=False)
+        if proc.returncode != 0:
+            return {"name": name, "error": f"ffmpeg upscale exited with code {proc.returncode}"}
+        # Optional stabilization pass via face lock
+        locks = args.get("locks") or {}
+        face_images: list[str] = []
+        if isinstance(args.get("ref_ids"), list):
+            for rid in args.get("ref_ids"):
+                pack, code = _refs_apply({"ref_id": rid})
+                if isinstance(pack, dict) and pack.get("ref_pack"):
+                    imgs = (pack.get("ref_pack") or {}).get("images") or []
+                    for p in imgs:
+                        if isinstance(p, str):
+                            face_images.append(p)
+        if isinstance(locks.get("image"), dict):
+            for k in ("face_images", "images"):
+                for p in (locks.get("image", {}).get(k) or []):
+                    if isinstance(p, str):
+                        face_images.append(p)
+        if not face_images:
+            cid_val = str(args["cid"]).strip()
+            if cid_val:
+                recents = _ctx_list(cid_val, limit=20, kind_hint="image")
+                for it in reversed(recents):
+                    p = it.get("path")
+                    if isinstance(p, str):
+                        face_images.append(p)
+                        break
+        if COMFYUI_API_URL and FACEID_API_URL and face_images:
+            frames_dir = os.path.join(outdir, "frames")
+            os.makedirs(frames_dir, exist_ok=True)
+            subprocess.run(["ffmpeg", "-y", "-i", dst, os.path.join(frames_dir, "%06d.png")], check=True)
+            face_src = face_images[0]
+            face_url = face_src.replace("/workspace", "") if face_src.startswith("/workspace/") else (
+                face_src if face_src.startswith("/uploads/") else face_src
+            )
+            with _hx.Client() as _c:
+                er = _c.post(FACEID_API_URL.rstrip("/") + "/embed", json={"image_url": face_url})
+                emb = None
+                if er.status_code == 200:
+                    parser = JSONParser()
+                    ej = parser.parse_superset(er.text or "", {"embedding": list, "vec": list})["coerced"]
+                    if isinstance(ej, dict):
+                        emb = ej.get("embedding") or ej.get("vec")
+            if emb and isinstance(emb, list):
+                frame_files = sorted(_glob(os.path.join(frames_dir, "*.png")))
+                for fp in frame_files:
+                    g = {
+                        "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "sd_xl_base_1.0.safetensors"}},
+                        "2": {"class_type": "LoadImage", "inputs": {"image": fp}},
+                        "5": {"class_type": "VAEEncode", "inputs": {"pixels": ["2", 0], "vae": ["1", 2]}},
+                        "6": {
+                            "class_type": "KSampler",
+                            "inputs": {
+                                "seed": 0,
+                                "steps": 10,
+                                "cfg": 4.0,
+                                "sampler_name": "dpmpp_2m",
+                                "scheduler": "karras",
+                                "denoise": 0.15,
+                                "model": ["1", 0],
+                                "positive": ["3", 0],
+                                "negative": ["4", 0],
+                                "latent_image": ["5", 0],
+                            },
+                        },
+                        "3": {"class_type": "CLIPTextEncode", "inputs": {"text": "stabilize face, preserve identity", "clip": ["1", 1]}},
+                        "4": {"class_type": "CLIPTextEncode", "inputs": {"text": "", "clip": ["1", 1]}},
+                        "7": {"class_type": "VAEDecode", "inputs": {"samples": ["6", 0], "vae": ["1", 2]}},
+                        "8": {"class_type": "SaveImage", "inputs": {"filename_prefix": "frame_out", "images": ["7", 0]}},
+                    }
+                    g["22"] = {
+                        "class_type": "InstantIDApply",
+                        "inputs": {"model": ["1", 0], "image": ["2", 0], "embedding": emb, "strength": 0.70},
+                    }
+                    g["6"]["inputs"]["model"] = ["22", 0]
+                    with _hx.Client() as _c2:
+                        pr = _c2.post(COMFYUI_API_URL.rstrip("/") + "/prompt", json={"prompt": g, "client_id": "wrapper-001"})
+                        if pr.status_code == 200:
                             parser = JSONParser()
-                            ej = parser.parse_superset(er.text or "", {"embedding": list, "vec": list})["coerced"]
-                            if isinstance(ej, dict):
-                                emb = ej.get("embedding") or ej.get("vec")
-                    if emb and isinstance(emb, list):
-                        frame_files = sorted(_glob(os.path.join(frames_dir, "*.png")))
-                        for fp in frame_files:
-                            try:
-                                g = {
-                                    "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "sd_xl_base_1.0.safetensors"}},
-                                    "2": {"class_type": "LoadImage", "inputs": {"image": fp}},
-                                    "5": {"class_type": "VAEEncode", "inputs": {"pixels": ["2", 0], "vae": ["1", 2]}},
-                                    "6": {"class_type": "KSampler", "inputs": {"seed": 0, "steps": 10, "cfg": 4.0, "sampler_name": "dpmpp_2m", "scheduler": "karras", "denoise": 0.15, "model": ["1", 0], "positive": ["3", 0], "negative": ["4", 0], "latent_image": ["5", 0]}},
-                                    "3": {"class_type": "CLIPTextEncode", "inputs": {"text": "stabilize face, preserve identity", "clip": ["1", 1]}},
-                                    "4": {"class_type": "CLIPTextEncode", "inputs": {"text": "", "clip": ["1", 1]}},
-                                    "7": {"class_type": "VAEDecode", "inputs": {"samples": ["6", 0], "vae": ["1", 2]}},
-                                    "8": {"class_type": "SaveImage", "inputs": {"filename_prefix": "frame_out", "images": ["7", 0]}}
-                                }
-                                g["22"] = {"class_type": "InstantIDApply", "inputs": {"model": ["1", 0], "image": ["2", 0], "embedding": emb, "strength": 0.70}}
-                                g["6"]["inputs"]["model"] = ["22", 0]
-                                with _hx.Client() as _c2:
-                                    pr = _c2.post(COMFYUI_API_URL.rstrip("/") + "/prompt", json={"prompt": g, "client_id": "wrapper-001"})
-                                    if pr.status_code == 200:
-                                        parser = JSONParser()
-                                        pj = parser.parse_superset(pr.text or "", {"prompt_id": str, "uuid": str, "id": str})["coerced"]
-                                        pid = (pj.get("prompt_id") or pj.get("uuid") or pj.get("id")) if isinstance(pj, dict) else None
-                                        while True:
-                                            hr = _c2.get(COMFYUI_API_URL.rstrip("/") + f"/history/{pid}")
-                                            if hr.status_code == 200:
-                                                parser = JSONParser()
-                                                hj = parser.parse_superset(hr.text or "", {"history": dict})["coerced"]
-                                                h = (hj.get("history") or {}).get(pid) if isinstance(hj, dict) else None
-                                                if h and _comfy_is_completed(h):
-                                                    outs = (h.get("outputs") or {})
-                                                    got = False
-                                                    for items in outs.values():
-                                                        if isinstance(items, list) and items:
-                                                            it = items[0]
-                                                            fn = it.get("filename"); sub = it.get("subfolder"); tp = it.get("type") or "output"
-                                                            if fn:
-                                                                q = {"filename": fn, "type": tp}
-                                                                if sub: q["subfolder"] = sub
-                                                                vr = _c2.get(COMFYUI_API_URL.rstrip("/") + "/view?" + urlencode(q))
-                                                                if vr.status_code == 200:
-                                                                    with open(fp, "wb") as wf:
-                                                                        wf.write(vr.content)
-                                                                    got = True
-                                                                    break
-                                            time.sleep(0.5)
-                            except Exception:
-                                continue
-                        dst2 = os.path.join(outdir, "upscaled_stabilized.mp4")
-                        subprocess.run(["ffmpeg", "-y", "-framerate", "30", "-i", os.path.join(frames_dir, "%06d.png"), "-c:v", "libx264", "-pix_fmt", "yuv420p", dst2], check=True)
-                        dst = dst2
-            except Exception:
-                pass
-            url = dst.replace("/workspace", "") if dst.startswith("/workspace/") else dst
-            try:
-                _ctx_add(args.get("cid") or "", "video", dst, url, src, ["upscale"], {"scale": scale, "width": w, "height": h})
-            except Exception:
-                pass
-            try:
-                trace_append("video", {"cid": args.get("cid"), "tool": "video.upscale", "src": src, "scale": scale, "width": w, "height": h, "path": dst})
-            except Exception:
-                pass
-            return {"name": name, "result": {"path": url}}
-        except Exception as ex:
-            return {"name": name, "error": str(ex)}
+                            pj = parser.parse_superset(pr.text or "", {"prompt_id": str, "uuid": str, "id": str})["coerced"]
+                            pid = (pj.get("prompt_id") or pj.get("uuid") or pj.get("id")) if isinstance(pj, dict) else None
+                            while True:
+                                hr = _c2.get(COMFYUI_API_URL.rstrip("/") + f"/history/{pid}")
+                                if hr.status_code == 200:
+                                    parser = JSONParser()
+                                    hj = parser.parse_superset(hr.text or "", {"history": dict})["coerced"]
+                                    h = (hj.get("history") or {}).get(pid) if isinstance(hj, dict) else None
+                                    if h and _comfy_is_completed(h):
+                                        outs = (h.get("outputs") or {})
+                                        for items in outs.values():
+                                            if isinstance(items, list) and items:
+                                                it = items[0]
+                                                fn = it.get("filename")
+                                                sub = it.get("subfolder")
+                                                tp = it.get("type") or "output"
+                                                if fn:
+                                                    q = {"filename": fn, "type": tp}
+                                                    if sub:
+                                                        q["subfolder"] = sub
+                                                    vr = _c2.get(COMFYUI_API_URL.rstrip("/") + "/view?" + urlencode(q))
+                                                    if vr.status_code == 200:
+                                                        with open(fp, "wb") as wf:
+                                                            wf.write(vr.content)
+                                                        break
+                                        break
+                                time.sleep(0.5)
+                dst2 = os.path.join(outdir, "upscaled_stabilized.mp4")
+                subprocess.run(
+                    ["ffmpeg", "-y", "-framerate", "30", "-i", os.path.join(frames_dir, "%06d.png"), "-c:v", "libx264", "-pix_fmt", "yuv420p", dst2],
+                    check=True,
+                )
+                dst = dst2
+        url = dst.replace("/workspace", "") if dst.startswith("/workspace/") else dst
+        _ctx_add(args["cid"], "video", dst, url, src, ["upscale"], {"scale": scale, "width": w, "height": h})
+        trace_append("video", {"cid": args["cid"], "tool": "video.upscale", "src": src, "scale": scale, "width": w, "height": h, "path": dst})
+        return {"name": name, "result": {"path": url}}
     if name == "video.text.overlay":
         src = args.get("src") or ""
         texts = args.get("texts") or []
         if not src or not isinstance(texts, list) or not texts:
             return {"name": name, "error": "missing src|texts"}
-        try:
-            # Extract frames
-            outdir = os.path.join(UPLOAD_DIR, "artifacts", "video", f"txtov-{int(_tm.time())}")
-            frames_dir = os.path.join(outdir, "frames")
-            os.makedirs(frames_dir, exist_ok=True)
-            subprocess.run(["ffmpeg", "-y", "-i", src, os.path.join(frames_dir, "%06d.png")], check=True)
-            frame_files = sorted(_glob(os.path.join(frames_dir, "*.png")))
-            for fp in frame_files:
-                try:
-                    im = Image.open(fp).convert("RGB")
-                    for spec in texts:
-                        im = _video_draw_on(im, spec)
-                    im.save(fp)
-                except Exception:
-                    continue
-            # Re-encode
-            dst = os.path.join(outdir, "overlay.mp4")
-            subprocess.run(["ffmpeg", "-y", "-framerate", "30", "-i", os.path.join(frames_dir, "%06d.png"), "-c:v", "libx264", "-pix_fmt", "yuv420p", dst], check=True)
-            url = dst.replace("/workspace", "") if dst.startswith("/workspace/") else dst
-            try:
-                _ctx_add(args.get("cid") or "", "video", dst, url, src, ["text_overlay"], {"count": len(texts)})
-            except Exception:
-                pass
-            try:
-                trace_append("video", {"cid": args.get("cid"), "tool": "video.text.overlay", "src": src, "path": dst, "texts": texts})
-            except Exception:
-                pass
-            return {"name": name, "result": {"path": url}}
-        except Exception as ex:
-            return {"name": name, "error": str(ex)}
+        # Extract frames
+        outdir = os.path.join(UPLOAD_DIR, "artifacts", "video", f"txtov-{int(_tm.time())}")
+        frames_dir = os.path.join(outdir, "frames")
+        os.makedirs(frames_dir, exist_ok=True)
+        proc1 = subprocess.run(["ffmpeg", "-y", "-i", src, os.path.join(frames_dir, "%06d.png")], check=False)
+        if proc1.returncode != 0:
+            return {"name": name, "error": f"ffmpeg text.extract exited with code {proc1.returncode}"}
+        frame_files = sorted(_glob(os.path.join(frames_dir, "*.png")))
+        for fp in frame_files:
+            im = Image.open(fp).convert("RGB")
+            for spec in texts:
+                im = _video_draw_on(im, spec)
+            im.save(fp)
+        # Re-encode
+        dst = os.path.join(outdir, "overlay.mp4")
+        proc2 = subprocess.run(
+            ["ffmpeg", "-y", "-framerate", "30", "-i", os.path.join(frames_dir, "%06d.png"), "-c:v", "libx264", "-pix_fmt", "yuv420p", dst],
+            check=False,
+        )
+        if proc2.returncode != 0:
+            return {"name": name, "error": f"ffmpeg text.encode exited with code {proc2.returncode}"}
+        url = dst.replace("/workspace", "") if dst.startswith("/workspace/") else dst
+        _ctx_add(args["cid"], "video", dst, url, src, ["text_overlay"], {"count": len(texts)})
+        trace_append("video", {"cid": args["cid"], "tool": "video.text.overlay", "src": src, "path": dst, "texts": texts})
+        return {"name": name, "result": {"path": url}}
     if name == "video.hv.t2v" and ALLOW_TOOL_EXECUTION:
         if not HUNYUAN_VIDEO_API_URL:
             return {"name": name, "error": "HUNYUAN_VIDEO_API_URL not configured"}
@@ -9671,7 +9667,7 @@ async def refs_apply(body: Dict[str, Any]):
 @app.post("/refs.resolve")
 async def refs_resolve(body: Dict[str, Any]):
     try:
-        cid = str((body or {}).get("cid") or "").strip()
+        cid = str((body or {})["cid"]).strip()
         text = str((body or {}).get("text") or "")
         kind = (body or {}).get("kind")
         rec = _ctx_resolve(cid, text, kind)
@@ -10114,8 +10110,8 @@ async def tool_describe(name: str, response: Response):
     shash = _hl.sha256(compact).hexdigest()
     try:
         response.headers["ETag"] = f'W/"{shash}"'
-    except Exception:
-        pass
+    except Exception as ex:
+        logging.debug("failed to set ETag header on /tool.describe: %s", ex, exc_info=True)
     return ToolEnvelope.success(
         {
             "name": meta["name"],
@@ -10924,8 +10920,8 @@ async def v1_capsules_project(project_id: str):
         for fn in sorted(os.listdir(wins_dir)):
             if fn.endswith('.json'):
                 windows.append(_read_json_safe(os.path.join(wins_dir, fn)))
-    except Exception:
-        pass
+    except Exception as ex:
+        logging.error("v1_state_icw: failed to list windows in %s: %s", wins_dir, ex, exc_info=True)
     return {"project_id": project_id, "omni": omni, "windows": windows}
 
 @app.post("/v1/distill/pack")
@@ -11025,12 +11021,12 @@ async def ws_alias(websocket: WebSocket):
     await websocket.accept()
     try:
         await websocket.send_text(json.dumps({"type": "error", "error": {"code": "gone", "message": "Deprecated. Use /v1/chat/completions"}}))
-    except Exception:
-        pass
+    except Exception as ex:
+        logging.debug("ws_alias: failed to send deprecation message: %s", ex, exc_info=True)
     try:
         await websocket.close(code=1000)
-    except Exception:
-        pass
+    except Exception as ex:
+        logging.debug("ws_alias: failed to close websocket cleanly: %s", ex, exc_info=True)
 
 
 @app.websocket("/tool.ws")
@@ -11132,8 +11128,8 @@ async def ws_tool(websocket: WebSocket):
         return
     try:
         await websocket.close(code=1000)
-    except Exception:
-        pass
+    except Exception as ex:
+        logging.debug("ws_tool: failed to close websocket cleanly: %s", ex, exc_info=True)
 
 @app.post("/upload")
 async def upload(file: UploadFile = File(...)):
@@ -11157,11 +11153,16 @@ async def upload(file: UploadFile = File(...)):
                     for t in texts[:20]:
                         try:
                             vec = emb.encode([t])[0]
-                            await conn.execute("INSERT INTO rag_docs (path, chunk, embedding) VALUES ($1, $2, $3)", name, t, list(vec))
-                        except Exception:
-                            continue
-    except Exception:
-        pass
+                            await conn.execute(
+                                "INSERT INTO rag_docs (path, chunk, embedding) VALUES ($1, $2, $3)",
+                                name,
+                                t,
+                                list(vec),
+                            )
+                        except Exception as ex:
+                            _log("upload.ingest.insert.error", error=str(ex), path=path)
+    except Exception as ex:
+        _log("upload.ingest.error", error=str(ex), path=path)
     return {"url": url, "name": file.filename}
 
 

@@ -369,27 +369,10 @@ async def tool_run(req: Request):
 			"arguments": (args if isinstance(args, dict) else {}),
 			"trace_id": rid,
 		}
-		# Guard the internal tool switchboard so unexpected exceptions are surfaced
-		# as structured error envelopes with the ORIGINAL tool traceback attached.
-		try:
-			res = await execute_tool_call(call)
-		except Exception as ex:
-			tb = traceback.format_exc()
-			details = {
-				"exception_type": ex.__class__.__name__ or "Exception",
-				"traceback": tb,
-				"tool": name or "tool",
-				"args_keys": sorted(list((args or {}).keys())) if isinstance(args, dict) else [],
-			}
-			msg = str(ex) or f"{name or 'tool'} raised {ex.__class__.__name__}"
-			log.error("[toolrun] tool=%s raised %s", name, ex, exc_info=True)
-			return ToolEnvelope.failure(
-				"tool_exception",
-				msg,
-				status=500,
-				request_id=rid,
-				details=details,
-			)
+		# Let execute_tool_call enforce its own invariants. Any unexpected exception
+		# will naturally raise and surface as a 500 from FastAPI instead of being
+		# hidden behind a generic try/except wrapper here.
+		res = await execute_tool_call(call)
 		if isinstance(res, dict) and isinstance(res.get("result"), dict):
 			return ToolEnvelope.success(res["result"], request_id=rid)
 		err_obj = res.get("error") if isinstance(res, dict) else None
@@ -555,7 +538,7 @@ async def tool_run(req: Request):
 		_apply_overrides(prompt_graph, bind, args)
 		# Ensure SaveImage nodes have a filename_prefix (required by newer ComfyUI)
 		_client_id = uuid.uuid4().hex
-		cid = (args.get("cid") or "").strip() if isinstance(args.get("cid"), str) else ""
+		cid = str(args["cid"]).strip()
 		trace = (args.get("trace_id") or "").strip() if isinstance(args.get("trace_id"), str) else ""
 		step_id = (args.get("step_id") or "").strip() if isinstance(args.get("step_id"), str) else ""
 		for nid, node in (prompt_graph or {}).items():
