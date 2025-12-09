@@ -2910,7 +2910,24 @@ async def planner_produce_plan(messages: List[Dict[str, Any]], tools: Optional[L
         trace_id=trace_id,
         steps=parsed_steps.get("steps"),
     )
-    steps = parsed_steps.get("steps") or []
+    steps_raw = parsed_steps.get("steps") or []
+    # Enforce a strict tool whitelist at the planner layer so downstream
+    # executors never see fabricated or unknown tool names.
+    allowed_tools = {
+        "image.dispatch",
+        "music.infinite.windowed",
+        "film2.run",
+        "tts.speak",
+    }
+    steps: list[dict] = []
+    for st in steps_raw:
+        if not isinstance(st, dict):
+            continue
+        tool_name = (st.get("tool") or "").strip()
+        if tool_name not in allowed_tools:
+            _log("planner.step.dropped_disallowed_tool", trace_id=trace_id, step=st)
+            continue
+        steps.append({"tool": tool_name, "args": dict(st.get("args") or {})})
     _log(
         "planner.steps.post_normalize",
         trace_id=trace_id,
@@ -4298,7 +4315,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 if isinstance(clean_path, str):
                     _film2_artifact_video(trace_id, clean_path)
                     shot_meta["clean_path"] = clean_path
-                _ev({"event": "film2.pass_cleanup_finish"})
+                _film2_trace_event(trace_id, {"event": "film2.pass_cleanup_finish"})
                 # Temporal interpolate (optional)
                 current = clean_path or src
                 if do_interpolate and isinstance(current, str):
@@ -4496,7 +4513,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                         "latent_reinit_every": 48,
                         "cid": cid,
                     }
-                    _ev({"event": "film2.pass_gen_start", "adapter": "hv.i2v", "image": img})
+                    _film2_trace_event(trace_id, {"event": "film2.pass_gen_start", "adapter": "hv.i2v", "image": img})
                     gv = await http_tool_run("video.hv.i2v", hv_args_img)
                     if isinstance(gv, dict):
                         segment_log.append(gv)
@@ -4510,7 +4527,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     if isinstance(gen_path, str):
                         _artifact_video(gen_path)
                         shot_meta["gen_path"] = gen_path
-                    _ev({"event": "film2.pass_gen_finish"})
+                    _film2_trace_event(trace_id, {"event": "film2.pass_gen_finish"})
                     if segment_log:
                         shot_meta["segment_results"] = segment_log
                     result["meta"]["shots"].append(shot_meta)
@@ -4531,7 +4548,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     "latent_reinit_every": 48,
                     "cid": cid,
                 }
-                _ev({"event": "film2.pass_gen_start", "adapter": "hv.t2v"})
+                _film2_trace_event(trace_id, {"event": "film2.pass_gen_start", "adapter": "hv.t2v"})
                 gv = await execute_tool_call({"name": "video.hv.t2v", "arguments": hv_args_prompt})
                 if isinstance(gv, dict):
                     segment_log.append(gv)
@@ -4545,11 +4562,11 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 if isinstance(gen_path, str):
                     _artifact_video(gen_path)
                     shot_meta["gen_path"] = gen_path
-                _ev({"event": "film2.pass_gen_finish"})
+                _film2_trace_event(trace_id, {"event": "film2.pass_gen_finish"})
                 if segment_log:
                     shot_meta["segment_results"] = segment_log
                 result["meta"]["shots"].append(shot_meta)
-        _ev({"event": "film2.shot_finish"})
+        _film2_trace_event(trace_id, {"event": "film2.shot_finish"})
         # Build a simple segment hierarchy: film -> scenes -> shots -> clips (one clip per shot for now)
         film_id = cid or f"film2_{str(trace_id or '')}"
         film_segment: Dict[str, Any] = {

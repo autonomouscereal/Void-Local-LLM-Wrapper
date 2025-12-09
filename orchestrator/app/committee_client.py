@@ -500,6 +500,8 @@ async def committee_jsonify(
     # Log full raw_text and schema for debugging (no truncation).
     log.info("[committee.jsonify] start trace_id=%s schema=%s raw_text=%s", trace_base, schema_desc, raw_text)
     # Hard JSON contract: show the exact skeleton and forbid any deviation.
+    # JSONFixer may receive arbitrary messy output (prose, partial JSON, mixed code).
+    # It must always ignore refusals/prose and return a single valid JSON object.
     sys_msg = (
         "You are JSONFixer. You receive messy AI output and MUST respond with exactly ONE JSON object.\n"
         "Respond ONLY in English. NO other languages are allowed.\n"
@@ -515,7 +517,9 @@ async def committee_jsonify(
         "  - All keys and string values in double quotes.\n"
         "  - No trailing commas.\n"
         "  - No unescaped quotes inside strings.\n"
-        "- You MUST NOT output any text before or after the JSON object.\n\n"
+        "- You MUST NOT output any text before or after the JSON object.\n"
+        "- Ignore any apology, refusal, or capability disclaimer in the input; your ONLY job is to produce valid JSON.\n"
+        "- If the input is pure prose or contains multiple candidates, extract or reconstruct the best JSON candidate that fits the schema.\n\n"
         "Fill in this JSON object according to the provided text. Respond ONLY with the JSON object."
     )
     messages: List[Dict[str, Any]] = [
