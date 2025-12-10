@@ -105,6 +105,10 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str) -> 
 
     This function is owned by the committee layer so that all committee-related
     backend calls are centralized here.
+
+    IMPORTANT: This function must **never** raise. All errors are logged and
+    returned in a structured envelope so upstream planner/committee callers can
+    surface them cleanly to HTTP responses instead of killing connections.
     """
     trace_key = str(trace_id or "committee")
     async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
@@ -130,15 +134,18 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str) -> 
             },
         )
         ppayload = dict(payload)
+        resp: httpx.Response | None = None
+        error_info: Dict[str, Any] | None = None
         try:
             resp = await client.post(f"{base_url.rstrip('/')}/api/generate", json=ppayload)
         except httpx.ConnectError as exc:
             # Surface a clear, structured connection failure instead of a raw httpcore traceback.
-            log.info(
+            msg = str(exc)
+            log.error(
                 "[committee] ollama.connect_error base=%s trace_id=%s error=%s",
                 base_url,
                 trace_key,
-                str(exc),
+                msg,
             )
             emit_trace(
                 STATE_DIR,
@@ -147,10 +154,45 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str) -> 
                 {
                     "trace_id": trace_key,
                     "base_url": base_url,
-                    "error": str(exc),
+                    "error": msg,
                 },
             )
-        raw_text = resp.text or ""
+            error_info = {
+                "code": "ollama_connect_error",
+                "message": msg,
+                "base_url": base_url,
+            }
+        except Exception as exc:  # pragma: no cover - defensive logging
+            msg = str(exc)
+            log.error(
+                "[committee] ollama.request_error base=%s trace_id=%s error=%s",
+                base_url,
+                trace_key,
+                msg,
+                exc_info=True,
+            )
+            emit_trace(
+                STATE_DIR,
+                trace_key,
+                "committee.ollama.request_error",
+                {
+                    "trace_id": trace_key,
+                    "base_url": base_url,
+                    "error": msg,
+                },
+            )
+            error_info = {
+                "code": "ollama_request_error",
+                "message": msg,
+                "base_url": base_url,
+            }
+        # On error, skip response parsing and return a structured error envelope.
+        if error_info is not None:
+            return {
+                "ok": False,
+                "error": error_info,
+            }
+        raw_text = (resp.text or "") if resp is not None else ""
         # Extract only the fields we care about from the Ollama JSON, without
         # relying on a full JSONParser round-trip. When the upstream JSON is
         # malformed, this extractor still tries to recover the 'response' text
@@ -212,6 +254,7 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str) -> 
                 except Exception:
                     eval_count = 0
         data: Dict[str, Any] = {
+            "ok": True,
             "response": response_str,
             "prompt_eval_count": prompt_eval,
             "eval_count": eval_count,
@@ -230,7 +273,7 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str) -> 
             base_url,
             payload.get("model"),
             trace_key,
-            getattr(resp, "status_code", None),
+            getattr(resp, "status_code", None) if resp is not None else None,
             response_str,
             usage,
         )
@@ -240,7 +283,7 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str) -> 
             "committee.ollama.response",
             {
                 "trace_id": trace_key,
-                "status_code": int(getattr(resp, "status_code", 0) or 0),
+                "status_code": int(getattr(resp, "status_code", 0) or 0) if resp is not None else 0,
                 "usage": usage or {},
                 "response": data,
             },
@@ -381,7 +424,11 @@ async def committee_ai_text(
                 # Annotate with backend base URL for downstream diagnostics.
                 res["_base_url"] = base
                 member_results[member] = res
-                txt = (res.get("response") or "").strip()
+                if res.get("ok") is False and res.get("error"):
+                    # Backend-level error; no usable text response.
+                    txt = ""
+                else:
+                    txt = (res.get("response") or "").strip()
             else:
                 member_results[member] = {}
                 txt = ""
@@ -418,6 +465,20 @@ async def committee_ai_text(
         synth_result = {"response": final_text}
     result_payload["synth"] = synth_result
     ok = bool(final_text)
+    # Collect backend errors from members so callers can inspect underlying
+    # issues (e.g., Ollama connectivity) instead of seeing only a generic
+    # "committee_no_answer" wrapper.
+    backend_errors: List[Dict[str, Any]] = []
+    for mid, mres in member_results.items():
+        if not isinstance(mres, dict):
+            continue
+        if mres.get("ok") is False and isinstance(mres.get("error"), dict):
+            backend_errors.append(
+                {
+                    "member": mid,
+                    "error": mres.get("error"),
+                }
+            )
     emit_trace(
         STATE_DIR,
         str(trace_id or "committee"),
@@ -434,9 +495,12 @@ async def committee_ai_text(
         "trace_id": trace_id or "committee",
         "ok": ok,
         "result": result_payload if ok else None,
-        "error": None if ok else {
+        "error": None
+        if ok
+        else {
             "code": "committee_no_answer",
             "message": "Committee did not produce a non-empty answer",
+            "backend_errors": backend_errors,
         },
     }
 

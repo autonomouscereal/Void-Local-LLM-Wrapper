@@ -1245,7 +1245,20 @@ def _collect_urls_from_results(results: List[Dict[str, Any]], abs_url_fn) -> Lis
     urls = list(dict.fromkeys(urls))
     return [abs_url_fn(u) for u in urls]
 
-def finalize_response(trace_id: str, messages: List[Dict[str, Any]], state: RunState, abs_url_fn, seed: int) -> Dict[str, Any]:
+def finalize_response(trace_id: str, messages: List[Dict[str, Any]], state: RunState, abs_url_fn, seed: int, cid: str | None = None) -> Dict[str, Any]:
+    # Best-effort cid inference when not provided explicitly: use the first
+    # tool_result.meta.cid we can find so that all preview envelopes carry a
+    # stable client/conversation id for downstream consumers.
+    if cid is None:
+        for tr in state.get("tool_results") or []:
+            res_obj = (tr or {}).get("result") if isinstance(tr, dict) else {}
+            meta_part = res_obj.get("meta") if isinstance(res_obj, dict) and isinstance(res_obj.get("meta"), dict) else {}
+            cid_val = None
+            if isinstance(meta_part, dict):
+                cid_val = meta_part.get("cid") or (meta_part.get("ids") or {}).get("client_id")
+            if isinstance(cid_val, (str, int)):
+                cid = str(cid_val)
+                break
     urls = _collect_urls_from_results(state.get("tool_results") or [], abs_url_fn)
     state["img_count"] = len(urls)
     lines: List[str] = []
@@ -1278,7 +1291,15 @@ def finalize_response(trace_id: str, messages: List[Dict[str, Any]], state: RunS
         seed=seed,
         id_="orc-1",
     )
-    resp["_meta"] = {"errors": state.get("errors") or [], "warnings": state.get("warnings") or [], "assets": urls}
+    meta_block: Dict[str, Any] = {
+        "errors": state.get("errors") or [],
+        "warnings": state.get("warnings") or [],
+        "assets": urls,
+        "trace_id": str(trace_id),
+    }
+    if isinstance(cid, (str, int)):
+        meta_block["cid"] = str(cid)
+    resp["_meta"] = meta_block
     checkpoints_append_event(STATE_DIR, str(trace_id), "response.preview", {"ok": ok_flag, "assets": len(urls)})
     return resp
 
@@ -2085,12 +2106,12 @@ def _compute_tools_hash(body: Dict[str, Any], *, planner_visible_only: bool) -> 
 # ---- Committee / composing helpers ----
 
 def _env_text(env: Dict[str, Any]) -> str:
-    if not isinstance(env, dict) or not env.get("ok"):
-        return ""
-    res = env.get("result") or {}
-    if isinstance(res, dict) and isinstance(res.get("text"), str):
-        return res.get("text") or ""
-    return ""
+    text = ""
+    if isinstance(env, dict) and env.get("ok"):
+        res = env.get("result") or {}
+        if isinstance(res, dict) and isinstance(res.get("text"), str):
+            text = res.get("text") or ""
+    return text
 
 
 def _is_trivial(s: str) -> bool:
@@ -2506,12 +2527,20 @@ async def propose_search_queries(messages: List[Dict[str, Any]]) -> List[str]:
         trace_id="search_suggest",
         temperature=DEFAULT_TEMPERATURE,
     )
+    queries: List[str] = []
     if not isinstance(env, dict) or not env.get("ok"):
-        return []
-    res_env = env.get("result") or {}
-    text = res_env.get("text") or ""
-    lines = [ln.strip("- ") for ln in text.splitlines() if ln.strip()]
-    return lines[:3]
+        # Log committee failure instead of silently returning no suggestions.
+        _log(
+            "search_suggest.error",
+            trace_id="search_suggest",
+            error=(env or {}).get("error") if isinstance(env, dict) else {"code": "committee_invalid_env", "message": str(env)},
+        )
+    else:
+        res_env = env.get("result") or {}
+        text = res_env.get("text") or ""
+        lines = [ln.strip("- ") for ln in text.splitlines() if ln.strip()]
+        queries = lines[:3]
+    return queries
 
 
 def meta_prompt(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -2941,10 +2970,21 @@ async def planner_produce_plan(messages: List[Dict[str, Any]], tools: Optional[L
         trace_id=str(trace_id or "planner"),
         temperature=temperature,
     )
+    # Default planner text + tool calls; populated when the committee call succeeds.
+    text: str = ""
+    res_env: Dict[str, Any] = {}
+    tool_calls: List[Dict[str, Any]] = []
     if not isinstance(env, dict) or not env.get("ok"):
-        return "", []
-    res_env = env.get("result") or {}
-    text = res_env.get("text") or ""
+        # Committee-level planner failure. Log and leave tool_calls empty,
+        # but preserve the error text so callers can attach it to envelopes.
+        _log(
+            "planner.error",
+            trace_id=trace_id,
+            error=(env or {}).get("error") if isinstance(env, dict) else {"code": "planner_env_invalid", "message": str(env)},
+        )
+    else:
+        res_env = env.get("result") or {}
+        text = res_env.get("text") or ""
     # Log the raw planner text response from the committee, before JSON fixing.
     _log(
         "planner.raw_text",
@@ -2996,7 +3036,9 @@ async def planner_produce_plan(messages: List[Dict[str, Any]], tools: Optional[L
         if isinstance(st, dict) and st.get("tool") == "image.dispatch":
             _log("planner.image.dispatch.args", trace_id=trace_id, args=st.get("args") or {})
     tool_calls = [{"name": s.get("tool"), "arguments": (s.get("args") or {})} for s in steps if isinstance(s, dict)]
-    return "", tool_calls
+    # Return the raw planner text along with normalized tool_calls so callers can
+    # inspect the original planner response when needed.
+    return text, tool_calls
 
 
 def _tool_cast_to_float(v: Any) -> Optional[float]:
@@ -3913,7 +3955,15 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         a = raw_args if isinstance(raw_args, dict) else {}
         prompt = (a.get("prompt") or "").strip()
         trace_id = a.get("trace_id") if isinstance(a.get("trace_id"), str) else None
-        cid = a["cid"]
+        # Ensure a stable film cid; do not rely on planner/LLM providing one.
+        _cid_raw = a.get("cid")
+        if isinstance(_cid_raw, (str, int)):
+            cid = str(_cid_raw).strip()
+        else:
+            cid = ""
+        if not cid:
+            cid = f"film-{int(time.time())}"
+            a["cid"] = cid
         clips = a.get("clips") if isinstance(a.get("clips"), list) else []
         images = a.get("images") if isinstance(a.get("images"), list) else []
         do_interpolate = bool(a.get("interpolate") or False)
@@ -5741,7 +5791,14 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         # Write a small repro bundle next to the artifact (or under /uploads/repros)
         tool_used = (args.get("tool") or "").strip()
         a = args.get("args") if isinstance(args.get("args"), dict) else {}
-        cid = args["cid"]
+        _cid_raw = args.get("cid")
+        if isinstance(_cid_raw, (str, int)):
+            cid = str(_cid_raw).strip()
+        else:
+            cid = ""
+        if not cid:
+            cid = f"repro-{int(time.time())}"
+            args["cid"] = cid
         repro = {"tool": tool_used, "args": a, "seed": det_seed_tool(tool_used, str(det_seed_router("repro", 0))), "ts": int(time.time()), "cid": cid}
         outdir = os.path.join(UPLOAD_DIR, "repros", cid or "misc")
         os.makedirs(outdir, exist_ok=True)
@@ -6913,8 +6970,16 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         final_path = _os.path.join(outdir, "final.png")
         canvas.save(final_path)
         url = final_path.replace("/workspace", "") if final_path.startswith("/workspace/") else final_path
+        cid_val = args.get("cid")
+        if isinstance(cid_val, (str, int)):
+            cid_str = str(cid_val).strip()
+        else:
+            cid_str = ""
+        if not cid_str:
+            cid_str = f"img-{_now_ts()}"
+            args["cid"] = cid_str
         _ctx_add(
-            args["cid"],
+            cid_str,
             "image",
             final_path,
             url,
@@ -6925,7 +6990,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         trace_append(
             "image",
             {
-                "cid": args["cid"],
+                "cid": cid_str,
                 "tool": "image.super_gen",
                 "prompt": prompt,
                 "size": f"{w}x{h}",
@@ -6977,6 +7042,15 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     res = env.get("result") or {}
                     if isinstance(res, dict) and isinstance(res.get("text"), str):
                         txt = res.get("text") or ""
+                else:
+                    # Log committee failure for code.super_loop instead of silently
+                    # returning an empty string; the super loop will still see a
+                    # valid text field, but traces capture the underlying error.
+                    _log(
+                        "code_super_loop.committee_error",
+                        trace_id="code_super_loop",
+                        error=(env or {}).get("error") if isinstance(env, dict) else {"code": "committee_invalid_env", "message": str(env)},
+                    )
                 return SimpleNamespace(text=str(txt), model_name="committee")
 
         prov = _CommitteeProvider()
@@ -7147,8 +7221,16 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             dst = os.path.join(outdir, "clean.png")
             cv2.imwrite(dst, work)
             url = dst.replace("/workspace", "") if dst.startswith("/workspace/") else dst
-            _ctx_add(args["cid"], "image", dst, url, src, ["cleanup"], {})
-            trace_append("image", {"cid": args["cid"], "tool": "image.cleanup", "src": src, "path": dst})
+            cid_val = args.get("cid")
+            if isinstance(cid_val, (str, int)):
+                cid_str = str(cid_val).strip()
+            else:
+                cid_str = ""
+            if not cid_str:
+                cid_str = f"img-{_now_ts()}"
+                args["cid"] = cid_str
+            _ctx_add(cid_str, "image", dst, url, src, ["cleanup"], {})
+            trace_append("image", {"cid": cid_str, "tool": "image.cleanup", "src": src, "path": dst})
             return {"name": name, "result": {"path": url}}
         except Exception as ex:
             return {"name": name, "error": str(ex)}
@@ -7169,8 +7251,16 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         try:
             subprocess.run(ff, check=True)
             url = dst.replace("/workspace", "") if dst.startswith("/workspace/") else dst
-            _ctx_add(args["cid"], "video", dst, url, src, ["cleanup"], {"vf": vf})
-            trace_append("video", {"cid": args["cid"], "tool": "video.cleanup", "src": src, "vf": vf, "path": dst})
+            cid_val = args.get("cid")
+            if isinstance(cid_val, (str, int)):
+                cid_str = str(cid_val).strip()
+            else:
+                cid_str = ""
+            if not cid_str:
+                cid_str = f"vid-{_now_ts()}"
+                args["cid"] = cid_str
+            _ctx_add(cid_str, "video", dst, url, src, ["cleanup"], {"vf": vf})
+            trace_append("video", {"cid": cid_str, "tool": "video.cleanup", "src": src, "vf": vf, "path": dst})
             return {"name": name, "result": {"path": url}}
         except Exception as ex:
             return {"name": name, "error": str(ex)}
@@ -7224,8 +7314,16 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             dst = os.path.join(outdir, "fixed.png")
             cv2.imwrite(dst, work)
             url = dst.replace("/workspace", "") if dst.startswith("/workspace/") else dst
+            cid_val = args.get("cid")
+            if isinstance(cid_val, (str, int)):
+                cid_str = str(cid_val).strip()
+            else:
+                cid_str = ""
+            if not cid_str:
+                cid_str = f"img-{_now_ts()}"
+                args["cid"] = cid_str
             _ctx_add(
-                args["cid"],
+                cid_str,
                 "image",
                 dst,
                 url,
@@ -7236,7 +7334,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             trace_append(
                 "image",
                 {
-                    "cid": args["cid"],
+                    "cid": cid_str,
                     "tool": "image.artifact_fix",
                     "src": src,
                     "type": atype,
@@ -7263,11 +7361,19 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             # Reassemble
             subprocess.run(["ffmpeg", "-y", "-framerate", "30", "-i", os.path.join(frames_dir, "%06d.png"), "-c:v", "libx264", "-pix_fmt", "yuv420p", dst], check=True)
             url = dst.replace("/workspace", "") if dst.startswith("/workspace/") else dst
-            _ctx_add(args["cid"], "video", dst, url, src, ["artifact_fix", atype], {})
+            cid_val = args.get("cid")
+            if isinstance(cid_val, (str, int)):
+                cid_str = str(cid_val).strip()
+            else:
+                cid_str = ""
+            if not cid_str:
+                cid_str = f"vid-{_now_ts()}"
+                args["cid"] = cid_str
+            _ctx_add(cid_str, "video", dst, url, src, ["artifact_fix", atype], {})
             trace_append(
                 "video",
                 {
-                    "cid": args["cid"],
+                    "cid": cid_str,
                     "tool": "video.artifact_fix",
                     "src": src,
                     "type": atype,
@@ -7339,8 +7445,16 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             dst = os.path.join(outdir, "fixed.png")
             cv2.imwrite(dst, out)
             url = dst.replace("/workspace", "") if dst.startswith("/workspace/") else dst
-            _ctx_add(args["cid"], "image", dst, url, src, ["hands_fix"], {})
-            trace_append("image", {"cid": args["cid"], "tool": "image.hands.fix", "src": src, "path": dst})
+            cid_val = args.get("cid")
+            if isinstance(cid_val, (str, int)):
+                cid_str = str(cid_val).strip()
+            else:
+                cid_str = ""
+            if not cid_str:
+                cid_str = f"img-{_now_ts()}"
+                args["cid"] = cid_str
+            _ctx_add(cid_str, "image", dst, url, src, ["hands_fix"], {})
+            trace_append("image", {"cid": cid_str, "tool": "image.hands.fix", "src": src, "path": dst})
             return {"name": name, "result": {"path": url}}
         except Exception as ex:
             return {"name": name, "error": str(ex)}
@@ -7358,8 +7472,16 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 _ = await execute_tool_call({"name": "image.hands.fix", "arguments": {"src": fp, "cid": args.get("cid")}})
             subprocess.run(["ffmpeg", "-y", "-framerate", "30", "-i", os.path.join(frames_dir, "%06d.png"), "-c:v", "libx264", "-pix_fmt", "yuv420p", dst], check=True)
             url = dst.replace("/workspace", "") if dst.startswith("/workspace/") else dst
-            _ctx_add(args["cid"], "video", dst, url, src, ["hands_fix"], {})
-            trace_append("video", {"cid": args["cid"], "tool": "video.hands.fix", "src": src, "path": dst})
+            cid_val = args.get("cid")
+            if isinstance(cid_val, (str, int)):
+                cid_str = str(cid_val).strip()
+            else:
+                cid_str = ""
+            if not cid_str:
+                cid_str = f"vid-{_now_ts()}"
+                args["cid"] = cid_str
+            _ctx_add(cid_str, "video", dst, url, src, ["hands_fix"], {})
+            trace_append("video", {"cid": cid_str, "tool": "video.hands.fix", "src": src, "path": dst})
             return {"name": name, "result": {"path": url}}
         except Exception as ex:
             return {"name": name, "error": str(ex)}
@@ -7395,7 +7517,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     if isinstance(p, str):
                         face_images.append(p)
         if not face_images:
-            cid_val = str(args["cid"]).strip()
+            cid_raw = args.get("cid")
+            cid_val = str(cid_raw).strip() if isinstance(cid_raw, (str, int)) else ""
             if cid_val:
                 recents = _ctx_list(cid_val, limit=20, kind_hint="image")
                 for it in reversed(recents):
@@ -7504,8 +7627,16 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 )
                 dst = dst2
         url = dst.replace("/workspace", "") if dst.startswith("/workspace/") else dst
-        _ctx_add(args["cid"], "video", dst, url, src, ["interpolate"], {"target_fps": target_fps})
-        trace_append("video", {"cid": args["cid"], "tool": "video.interpolate", "src": src, "target_fps": target_fps, "path": dst})
+        cid_val = args.get("cid")
+        if isinstance(cid_val, (str, int)):
+            cid_str = str(cid_val).strip()
+        else:
+            cid_str = ""
+        if not cid_str:
+            cid_str = f"vid-{_now_ts()}"
+            args["cid"] = cid_str
+        _ctx_add(cid_str, "video", dst, url, src, ["interpolate"], {"target_fps": target_fps})
+        trace_append("video", {"cid": cid_str, "tool": "video.interpolate", "src": src, "target_fps": target_fps, "path": dst})
         return {"name": name, "result": {"path": url}}
     if name == "video.flow.derive":
         frame_a = args.get("frame_a") or ""
@@ -7553,11 +7684,19 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             npz_path = os.path.join(outdir, "flow.npz")
             np.savez_compressed(npz_path, fx=fx, fy=fy, mag=mag)
             url = npz_path.replace("/workspace", "") if npz_path.startswith("/workspace/") else npz_path
-            _ctx_add(args["cid"], "video", npz_path, url, src or (frame_a + "," + frame_b), ["flow"], {})
+            cid_val = args.get("cid")
+            if isinstance(cid_val, (str, int)):
+                cid_str = str(cid_val).strip()
+            else:
+                cid_str = ""
+            if not cid_str:
+                cid_str = f"vid-{_now_ts()}"
+                args["cid"] = cid_str
+            _ctx_add(cid_str, "video", npz_path, url, src or (frame_a + "," + frame_b), ["flow"], {})
             trace_append(
                 "video",
                 {
-                    "cid": args["cid"],
+                    "cid": cid_str,
                     "tool": "video.flow.derive",
                     "src": src,
                     "frame_a": frame_a,
@@ -7604,7 +7743,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     if isinstance(p, str):
                         face_images.append(p)
         if not face_images:
-            cid_val = str(args["cid"]).strip()
+            cid_raw = args.get("cid")
+            cid_val = str(cid_raw).strip() if isinstance(cid_raw, (str, int)) else ""
             if cid_val:
                 recents = _ctx_list(cid_val, limit=20, kind_hint="image")
                 for it in reversed(recents):
@@ -7698,8 +7838,16 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 )
                 dst = dst2
         url = dst.replace("/workspace", "") if dst.startswith("/workspace/") else dst
-        _ctx_add(args["cid"], "video", dst, url, src, ["upscale"], {"scale": scale, "width": w, "height": h})
-        trace_append("video", {"cid": args["cid"], "tool": "video.upscale", "src": src, "scale": scale, "width": w, "height": h, "path": dst})
+        cid_val = args.get("cid")
+        if isinstance(cid_val, (str, int)):
+            cid_str = str(cid_val).strip()
+        else:
+            cid_str = ""
+        if not cid_str:
+            cid_str = f"vid-{_now_ts()}"
+            args["cid"] = cid_str
+        _ctx_add(cid_str, "video", dst, url, src, ["upscale"], {"scale": scale, "width": w, "height": h})
+        trace_append("video", {"cid": cid_str, "tool": "video.upscale", "src": src, "scale": scale, "width": w, "height": h, "path": dst})
         return {"name": name, "result": {"path": url}}
     if name == "video.text.overlay":
         src = args.get("src") or ""
@@ -7728,8 +7876,16 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         if proc2.returncode != 0:
             return {"name": name, "error": f"ffmpeg text.encode exited with code {proc2.returncode}"}
         url = dst.replace("/workspace", "") if dst.startswith("/workspace/") else dst
-        _ctx_add(args["cid"], "video", dst, url, src, ["text_overlay"], {"count": len(texts)})
-        trace_append("video", {"cid": args["cid"], "tool": "video.text.overlay", "src": src, "path": dst, "texts": texts})
+        cid_val = args.get("cid")
+        if isinstance(cid_val, (str, int)):
+            cid_str = str(cid_val).strip()
+        else:
+            cid_str = ""
+        if not cid_str:
+            cid_str = f"vid-{_now_ts()}"
+            args["cid"] = cid_str
+        _ctx_add(cid_str, "video", dst, url, src, ["text_overlay"], {"count": len(texts)})
+        trace_append("video", {"cid": cid_str, "tool": "video.text.overlay", "src": src, "path": dst, "texts": texts})
         return {"name": name, "result": {"path": url}}
     if name == "video.hv.t2v" and ALLOW_TOOL_EXECUTION:
         if not HUNYUAN_VIDEO_API_URL:
@@ -8237,26 +8393,29 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     tool_results: List[Dict[str, Any]] = []
     # Defer execution until after validate; execution happens below when tool_calls is non-empty.
     # No heuristic upgrades; planner decides exact tools
-    # Surface attachments in tool arguments so downstream jobs can use user media
-    if tool_calls and attachments:
+    # Surface attachments in tool arguments so downstream jobs can use user media,
+    # and ensure every planner-emitted tool call carries a cid when we have one.
+    if tool_calls:
         enriched: List[Dict[str, Any]] = []
         for tc in tool_calls:
             args = tc.get("arguments") or {}
             if not isinstance(args, dict):
                 args = {"_raw": args}
-            # Attachments by type for convenience
-            imgs = [a for a in attachments if a.get("type") == "image"]
-            auds = [a for a in attachments if a.get("type") == "audio"]
-            vids = [a for a in attachments if a.get("type") == "video"]
-            files = [a for a in attachments if a.get("type") == "file"]
-            if imgs:
-                args.setdefault("images", imgs)
-            if auds:
-                args.setdefault("audio", auds)
-            if vids:
-                args.setdefault("video", vids)
-            if files:
-                args.setdefault("files", files)
+            if attachments:
+                # Attachments by type for convenience
+                imgs = [a for a in attachments if a.get("type") == "image"]
+                auds = [a for a in attachments if a.get("type") == "audio"]
+                vids = [a for a in attachments if a.get("type") == "video"]
+                files = [a for a in attachments if a.get("type") == "file"]
+                if imgs:
+                    args.setdefault("images", imgs)
+                if auds:
+                    args.setdefault("audio", auds)
+                if vids:
+                    args.setdefault("video", vids)
+                if files:
+                    args.setdefault("files", files)
+            # Always inject a cid into tool args when we have a conversation id.
             if conv_cid and isinstance(args, dict):
                 args.setdefault("cid", conv_cid)
             tc = {**tc, "arguments": args}
@@ -9528,6 +9687,12 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         final_env=None,  # will be attached below after bump/assert/stamp
         ok=pipeline_ok,
     )
+    # Attach trace/cid metadata for clients that need stable ids on responses.
+    response_meta = response.setdefault("_meta", {})
+    if isinstance(response_meta, dict):
+        response_meta.setdefault("trace_id", str(trace_id))
+        if isinstance(conv_cid, (str, int)):
+            response_meta.setdefault("cid", str(conv_cid))
     if isinstance(final_env, dict) and final_env:
         final_env = _env_bump(final_env); _env_assert(final_env)
         final_env = _env_stamp(final_env, tool=None, model=COMMITTEE_MODEL_ID)
@@ -9667,7 +9832,10 @@ async def refs_apply(body: Dict[str, Any]):
 @app.post("/refs.resolve")
 async def refs_resolve(body: Dict[str, Any]):
     try:
-        cid = str((body or {})["cid"]).strip()
+        cid_val = (body or {}).get("cid")
+        cid = str(cid_val).strip() if isinstance(cid_val, (str, int)) else ""
+        if not cid:
+            return JSONResponse(status_code=400, content={"error": "missing cid"})
         text = str((body or {}).get("text") or "")
         kind = (body or {}).get("kind")
         rec = _ctx_resolve(cid, text, kind)
@@ -10194,7 +10362,8 @@ async def datasets_index(name: str, version: str):
 @app.post("/film2/qa")
 async def film2_qa(body: Dict[str, Any]):
     try:
-        cid = body.get("cid") or body.get("film_id")
+        cid_raw = body.get("cid") or body.get("film_id")
+        cid = str(cid_raw).strip() if isinstance(cid_raw, (str, int)) else ""
         if not cid:
             return JSONResponse(status_code=400, content={"error": "missing cid"})
         shots = body.get("shots") or []
@@ -10868,7 +11037,10 @@ async def debug():
         temperature=0.0,
     )
     ok = bool(isinstance(env, dict) and env.get("ok"))
-    return {"committee_ok": ok, "envelope": env}
+    # Never raise here; always return a small envelope, but include any
+    # structured error so callers can see why the committee ping failed.
+    err = (env or {}).get("error") if isinstance(env, dict) else None
+    return {"committee_ok": ok, "error": err, "envelope": env}
 
 
 @app.get("/v1/models")

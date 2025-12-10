@@ -62,19 +62,38 @@ async def _call_llm_json(prompt: str, trace_id: str) -> Dict[str, Any]:
         ],
         trace_id=trace_id,
     )
+    result: Dict[str, Any]
     if not isinstance(env, dict) or not env.get("ok"):
-        return {"request_id": "", "plan": []}
-    res = env.get("result") or {}
-    text = res.get("text") or ""
-
-    # Then, run the raw planner text through committee.jsonify to enforce PLAN_SCHEMA.
-    parsed = await committee_jsonify(
-        text or "{}",
-        expected_schema=PLAN_SCHEMA,
-        trace_id=trace_id,
-        temperature=0.0,
-    )
-    return parsed if isinstance(parsed, dict) else {"request_id": "", "plan": []}
+        # Legacy planner committee failure: log and return a minimal plan with
+        # an embedded error so callers can surface it if they choose to.
+        import logging
+        logging.getLogger("orchestrator.plan.committee").error(
+            "legacy_planner committee failed (trace_id=%s): env=%r",
+            trace_id,
+            env,
+        )
+        result = {
+            "request_id": "",
+            "plan": [],
+            "error": (env or {}).get("error")
+            if isinstance(env, dict)
+            else {
+                "code": "planner_committee_error",
+                "message": str(env),
+            },
+        }
+    else:
+        res = env.get("result") or {}
+        text = res.get("text") or ""
+        # Then, run the raw planner text through committee.jsonify to enforce PLAN_SCHEMA.
+        parsed = await committee_jsonify(
+            text or "{}",
+            expected_schema=PLAN_SCHEMA,
+            trace_id=trace_id,
+            temperature=0.0,
+        )
+        result = parsed if isinstance(parsed, dict) else {"request_id": "", "plan": []}
+    return result
 
 
 async def _plan_with_role(system: str, user_text: str, request_id: str) -> Dict[str, Any]:
@@ -129,12 +148,45 @@ async def _plan_with_role(system: str, user_text: str, request_id: str) -> Dict[
 
 
 async def _plan_with_retry(system: str, user_text: str, request_id: str, attempts: int = 2) -> Dict[str, Any]:
+    """
+    Call the modality-specific planner with a small number of retries.
+
+    This helper MUST NOT raise; on repeated failure it returns a minimal plan
+    with an embedded error so callers and HTTP layers can surface what went
+    wrong instead of silently dropping the exception.
+    """
+    last_error: str | None = None
+    result: Dict[str, Any] = {"request_id": request_id, "plan": []}
     for i in range(attempts):
         try:
-            return await _plan_with_role(system, user_text, request_id)
-        except Exception:
+            result = await _plan_with_role(system, user_text, request_id)
+            break
+        except Exception as ex:  # pragma: no cover - defensive logging
+            last_error = str(ex)
+            # Best-effort log; committee/planner traces live under the main orchestrator logger.
+            import logging, traceback as _tb  # local import to avoid cycles
+            logging.getLogger("orchestrator.plan.committee").error(
+                "planner._plan_with_retry failed (attempt %d/%d, system=%s, request_id=%s): %s\n%s",
+                i + 1,
+                attempts,
+                system,
+                request_id,
+                last_error,
+                _tb.format_exc(),
+            )
             if i == attempts - 1:
-                return {"request_id": request_id, "plan": []}
+                # Final fallback: surface the error in-band so upstream callers can
+                # include it in their envelopes instead of fabricating an empty plan.
+                result = {
+                    "request_id": request_id,
+                    "plan": [],
+                    "error": {
+                        "code": "planner_error",
+                        "message": last_error or "planner failed with unknown error",
+                        "system": system,
+                    },
+                }
+    return result
 
 
 async def make_full_plan(user_text: str) -> Dict[str, Any]:

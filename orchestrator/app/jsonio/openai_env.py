@@ -19,7 +19,7 @@ def build_openai_envelope(
     This is used by orchestrator endpoints that expose OpenAI-compatible
     responses on top of the internal ToolEnvelope / committee pipeline.
     """
-    return {
+    env: Dict[str, Any] = {
         "id": id_ or "orc-1",
         "object": "chat.completion",
         "model": model,
@@ -35,5 +35,8 @@ def build_openai_envelope(
         "error": (error or None),
         "seed": seed,
     }
+    # cid/trace_id are injected by orchestrator callers (e.g., finalize_response)
+    # via an out-of-band _meta block to keep the OpenAI schema surface stable.
+    return env
 
 

@@ -200,43 +200,56 @@ async def postrun_committee_decide(
             {"member": "committee", "action": action},
         )
 
+    # Default outcome if committee fails to produce a decision.
+    out: Dict[str, Any]
     if not decisions:
-        out = {"action": "go", "rationale": "committee_unavailable", "patch_plan": []}
+        # Committee path failed or produced no usable decision. Surface a clear
+        # marker and attach any underlying error from env_decide instead of
+        # returning a plain "committee_unavailable" with no details.
+        err = (env_decide or {}).get("error") if isinstance(env_decide, dict) else {
+            "code": "committee_postrun_invalid_env",
+            "message": str(env_decide),
+        }
+        out = {
+            "action": "go",
+            "rationale": "committee_unavailable",
+            "patch_plan": [],
+            "committee_error": err,
+        }
+        emit_trace(
+            STATE_DIR,
+            str(trace_id or "committee_postrun"),
+            "committee.postrun.ok",
+            {"action": out.get("action"), "rationale": out.get("rationale"), "error": err},
+        )
+    else:
+        # Merge decisions: prefer more conservative actions when disagreeing.
+        rank = {"go": 0, "revise": 1, "fail": 2}
+        best = max(decisions, key=lambda d: rank.get(d.get("action") or "go", 0))
+        merged_action = best.get("action") or "go"
+        # Merge rationales and patch plans (cap patch_plan length to 2 steps).
+        merged_rationale_parts: List[str] = []
+        merged_patch_plan: List[Dict[str, Any]] = []
+        for d in decisions:
+            r = d.get("rationale") or ""
+            if isinstance(r, str) and r.strip():
+                merged_rationale_parts.append(r.strip())
+            steps = d.get("patch_plan") or []
+            if isinstance(steps, list):
+                for st in steps:
+                    if isinstance(st, dict) and len(merged_patch_plan) < 2:
+                        merged_patch_plan.append(st)
+        out = {
+            "action": merged_action,
+            "rationale": "\n\n".join(merged_rationale_parts)[:2000],
+            "patch_plan": merged_patch_plan[:2],
+        }
         emit_trace(
             STATE_DIR,
             str(trace_id or "committee_postrun"),
             "committee.postrun.ok",
             {"action": out.get("action"), "rationale": out.get("rationale")},
         )
-        return out
-
-    # Merge decisions: prefer more conservative actions when disagreeing.
-    rank = {"go": 0, "revise": 1, "fail": 2}
-    best = max(decisions, key=lambda d: rank.get(d.get("action") or "go", 0))
-    merged_action = best.get("action") or "go"
-    # Merge rationales and patch plans (cap patch_plan length to 2 steps).
-    merged_rationale_parts: List[str] = []
-    merged_patch_plan: List[Dict[str, Any]] = []
-    for d in decisions:
-        r = d.get("rationale") or ""
-        if isinstance(r, str) and r.strip():
-            merged_rationale_parts.append(r.strip())
-        steps = d.get("patch_plan") or []
-        if isinstance(steps, list):
-            for st in steps:
-                if isinstance(st, dict) and len(merged_patch_plan) < 2:
-                    merged_patch_plan.append(st)
-    out = {
-        "action": merged_action,
-        "rationale": "\n\n".join(merged_rationale_parts)[:2000],
-        "patch_plan": merged_patch_plan[:2],
-    }
-    emit_trace(
-        STATE_DIR,
-        str(trace_id or "committee_postrun"),
-        "committee.postrun.ok",
-        {"action": out.get("action"), "rationale": out.get("rationale")},
-    )
     return out
 
 

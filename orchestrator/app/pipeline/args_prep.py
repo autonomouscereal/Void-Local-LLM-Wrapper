@@ -3,9 +3,6 @@ from __future__ import annotations
 from typing import Any, Dict, List, Callable
 
 
-SERVER_ONLY_KEYS = {"trace_id", "cid", "step_id", "film_id", "segment_id"}
-
-
 def ensure_object_args(tool_calls: List[Dict[str, Any]], parse_json: Callable[[str, Any], Any]) -> List[Dict[str, Any]]:
 	"""
 	Ensure each tool call has dict arguments. If arguments is a JSON string, parse to dict.
@@ -21,25 +18,6 @@ def ensure_object_args(tool_calls: List[Dict[str, Any]], parse_json: Callable[[s
 			parsed = parse_json(args_obj, {})
 			tc = {**tc, "arguments": (parsed if isinstance(parsed, dict) else {})}
 		out.append(tc)
-	return out
-
-
-def strip_server_ids(tool_calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-	"""
-	Remove server-reserved id fields from tool arguments so models can never
-	control trace_id/cid/step_id or internal film/segment ids.
-	"""
-	out: List[Dict[str, Any]] = []
-	for tc in tool_calls or []:
-		if not isinstance(tc, dict):
-			continue
-		args = (tc.get("arguments") or {})
-		if not isinstance(args, dict):
-			args = {}
-		for k in SERVER_ONLY_KEYS:
-			if k in args:
-				args.pop(k, None)
-		out.append({**tc, "arguments": args})
 	return out
 
 

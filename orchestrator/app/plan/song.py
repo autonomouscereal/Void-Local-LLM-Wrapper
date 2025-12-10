@@ -194,45 +194,54 @@ async def plan_song_graph(
         ],
         trace_id=trace_id or "song_plan",
     )
+    song: Dict[str, Any] = {}
     if not isinstance(env, dict) or not env.get("ok"):
-        return {}
-    res_env = env.get("result") or {}
-    txt = res_env.get("text") or ""
+        # Log committee failure instead of silently returning an empty song graph.
+        import logging
 
-    # Then, run the Song Graph text through committee.jsonify to enforce strict JSON.
-    parsed = await committee_jsonify(
-        txt or "{}",
-        expected_schema=schema_wrapper,
-        trace_id=trace_id or "song_plan",
-        temperature=0.0,
-    )
-    song = parsed.get("song")
-    if isinstance(song, dict):
-        # Normalize textual fields (lyrics, section names, motif descriptions, etc.)
-        # to clean up common UTF-8 mojibake before downstream tools consume them.
-        song = _normalize_text_fields(song)
-        sections = song.get("sections") if isinstance(song.get("sections"), list) else []
-        lyrics_obj = song.get("lyrics") if isinstance(song.get("lyrics"), dict) else {}
-        lyrics_sections = lyrics_obj.get("sections") if isinstance(lyrics_obj.get("sections"), list) else []
-        motifs = song.get("motifs") if isinstance(song.get("motifs"), list) else []
-        voices = song.get("voices") if isinstance(song.get("voices"), list) else []
-        _trace_append(
-            "music",
-            {
-                "event": "music.song_graph.plan",
-                "trace_id": trace_id,
-                "length_s": approx_len,
-                "bpm": bpm_val,
-                "key": key_txt,
-                "has_music_profile": bool(music_profile),
-                "sections_count": len(sections),
-                "lyrics_sections_count": len(lyrics_sections),
-                "motifs_count": len(motifs),
-                "voices_count": len(voices),
-            },
+        logging.getLogger("orchestrator.plan.song").error(
+            "plan_song_graph committee failed (trace_id=%s): env=%r",
+            trace_id,
+            env,
         )
-        return song
-    return {}
+    else:
+        res_env = env.get("result") or {}
+        txt = res_env.get("text") or ""
+
+        # Then, run the Song Graph text through committee.jsonify to enforce strict JSON.
+        parsed = await committee_jsonify(
+            txt or "{}",
+            expected_schema=schema_wrapper,
+            trace_id=trace_id or "song_plan",
+            temperature=0.0,
+        )
+        song_obj = parsed.get("song")
+        if isinstance(song_obj, dict):
+            # Normalize textual fields (lyrics, section names, motif descriptions, etc.)
+            # to clean up common UTF-8 mojibake before downstream tools consume them.
+            song_obj = _normalize_text_fields(song_obj)
+            sections = song_obj.get("sections") if isinstance(song_obj.get("sections"), list) else []
+            lyrics_obj = song_obj.get("lyrics") if isinstance(song_obj.get("lyrics"), dict) else {}
+            lyrics_sections = lyrics_obj.get("sections") if isinstance(lyrics_obj.get("sections"), list) else []
+            motifs = song_obj.get("motifs") if isinstance(song_obj.get("motifs"), list) else []
+            voices = song_obj.get("voices") if isinstance(song_obj.get("voices"), list) else []
+            _trace_append(
+                "music",
+                {
+                    "event": "music.song_graph.plan",
+                    "trace_id": trace_id,
+                    "length_s": approx_len,
+                    "bpm": bpm_val,
+                    "key": key_txt,
+                    "has_music_profile": bool(music_profile),
+                    "sections_count": len(sections),
+                    "lyrics_sections_count": len(lyrics_sections),
+                    "motifs_count": len(motifs),
+                    "voices_count": len(voices),
+                },
+            )
+            song = song_obj
+    return song
 
 
 

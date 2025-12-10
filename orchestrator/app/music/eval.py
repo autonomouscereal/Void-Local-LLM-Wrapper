@@ -349,19 +349,42 @@ async def _call_music_eval_committee(summary: str) -> Dict[str, Any]:
     async def _run() -> Dict[str, Any]:
         # First, obtain the raw MusicEval text via the main committee path.
         from ..committee_client import CommitteeClient  # type: ignore
+        import logging
 
         client = CommitteeClient()
         env = await client.run(messages, trace_id="music_eval")
-        result = env.get("result") or {}
-        txt = result.get("text") or ""
-        # Then, pass the raw text through committee_jsonify to enforce the schema.
-        parsed = await committee_jsonify(
-            txt or "{}",
-            expected_schema=schema,
-            trace_id="music_eval",
-            temperature=0.0,
-        )
-        return parsed if isinstance(parsed, dict) else {}
+        # Default error-shaped result; overwritten on success.
+        result_payload: Dict[str, Any] = {
+            "overall_quality_score": 0.0,
+            "fit_score": 0.0,
+            "originality_score": 0.0,
+            "cohesion_score": 0.0,
+            "issues": ["music_eval_committee_error"],
+        }
+        if not isinstance(env, dict) or not env.get("ok"):
+            # Committee-level failure: log and return a minimal, explicit error payload
+            # instead of silently falling back to an empty dict.
+            logging.getLogger("orchestrator.music.eval").error(
+                "music_eval committee failed: env=%r", env
+            )
+            err = (env or {}).get("error") if isinstance(env, dict) else {
+                "code": "music_eval_env_invalid",
+                "message": str(env),
+            }
+            result_payload["error"] = err
+        else:
+            committee_result = env.get("result") or {}
+            txt = committee_result.get("text") or ""
+            # Then, pass the raw text through committee_jsonify to enforce the schema.
+            parsed = await committee_jsonify(
+                txt or "{}",
+                expected_schema=schema,
+                trace_id="music_eval",
+                temperature=0.0,
+            )
+            if isinstance(parsed, Dict):
+                result_payload = parsed
+        return result_payload
 
     return await _run()
 

@@ -74,7 +74,7 @@ def shape_request(
 	# Meta prompt
 	messages = meta_prompt_fn(normalized_msgs)
 	# Keep CO as the first frame; any tool steering now lives in meta/system frames
-	# Conversation id
+	# Conversation id (always present; server-minted when client does not supply one)
 	conv_cid = None
 	if isinstance(body.get("cid"), (int, str)):
 		conv_cid = str(body.get("cid"))
@@ -98,7 +98,10 @@ def shape_request(
 	provided_seed = int(body.get("seed")) if isinstance(body.get("seed"), (int, float)) else None
 	master_seed = provided_seed if provided_seed is not None else derive_seed_fn("chat", msgs_for_seed)
 	import hashlib as _hl
-	trace_id = (f"cid_{conv_cid}" if conv_cid else None) or ("tt_" + _hl.sha256(msgs_for_seed.encode("utf-8")).hexdigest()[:16])
+	# Server-mint a stable conversation id when client does not provide one.
+	if conv_cid is None:
+		conv_cid = "chat_" + _hl.sha256(msgs_for_seed.encode("utf-8")).hexdigest()[:16]
+	trace_id = f"cid_{conv_cid}" if conv_cid else "tt_" + _hl.sha256(msgs_for_seed.encode("utf-8")).hexdigest()[:16]
 	# Allow client-provided idempotency key to override trace_id for deduplication
 	ikey = body.get("idempotency_key")
 	if isinstance(ikey, str) and len(ikey) >= 8:

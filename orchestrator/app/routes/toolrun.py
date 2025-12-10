@@ -22,14 +22,29 @@ def _build_success_envelope(result: dict | None, rid: str) -> dict:
 	"""
 	Canonical success envelope for tool-ish routes.
 	Always includes schema_version, request_id, ok, result, error.
+
+	When a client/conversation id (cid) is present in the result payload, it is
+	also mirrored to the top-level envelope so callers can rely on a stable
+	location for cid across tools.
 	"""
-	return {
+	res_obj = result or {}
+	cid_val = None
+	if isinstance(res_obj, dict):
+		cid_val = res_obj.get("cid")
+		if not cid_val:
+			meta_part = res_obj.get("meta") if isinstance(res_obj.get("meta"), dict) else {}
+			if isinstance(meta_part, dict):
+				cid_val = meta_part.get("cid") or (meta_part.get("ids") or {}).get("client_id")
+	env: dict = {
 		"schema_version": 1,
 		"request_id": rid,
 		"ok": True,
-		"result": result or {},
+		"result": res_obj,
 		"error": None,
 	}
+	if isinstance(cid_val, (str, int)):
+		env["cid"] = str(cid_val)
+	return env
 
 
 def _build_error_envelope(code: str, message: str, rid: str, status: int, details: dict | None = None) -> dict:
@@ -39,7 +54,7 @@ def _build_error_envelope(code: str, message: str, rid: str, status: int, detail
 	"""
 	err_details = dict(details or {})
 	err_details.setdefault("status", int(status))
-	return {
+	env: dict = {
 		"schema_version": 1,
 		"request_id": rid,
 		"ok": False,
@@ -51,6 +66,12 @@ def _build_error_envelope(code: str, message: str, rid: str, status: int, detail
 			"details": err_details,
 		},
 	}
+	# If a cid was provided in details, mirror it at the top level for
+	# consistency with success envelopes.
+	cid_val = err_details.get("cid")
+	if isinstance(cid_val, (str, int)):
+		env["cid"] = str(cid_val)
+	return env
 
 
 def _ok_response(result: dict | None, rid: str) -> JSONResponse:
@@ -538,7 +559,15 @@ async def tool_run(req: Request):
 		_apply_overrides(prompt_graph, bind, args)
 		# Ensure SaveImage nodes have a filename_prefix (required by newer ComfyUI)
 		_client_id = uuid.uuid4().hex
-		cid = str(args["cid"]).strip()
+		# Always have a deterministic cid for artifact paths / prefixes; fall back to request id/client id.
+		_cid_raw = args.get("cid")
+		if isinstance(_cid_raw, (str, int)):
+			cid = str(_cid_raw).strip()
+		else:
+			cid = ""
+		if not cid:
+			cid = rid or _client_id
+			args["cid"] = cid
 		trace = (args.get("trace_id") or "").strip() if isinstance(args.get("trace_id"), str) else ""
 		step_id = (args.get("step_id") or "").strip() if isinstance(args.get("step_id"), str) else ""
 		for nid, node in (prompt_graph or {}).items():
