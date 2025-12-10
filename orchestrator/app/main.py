@@ -8448,8 +8448,11 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     # catalog, mode, RoE, and routing rules; a single planner_produce_plan call
     # governs tool selection.
     _log("planner.call", trace_id=trace_id)
+    # Feed the planner the normalized chat history (without meta-prompt/ICW
+    # system frames) so the user's input and prior turns are preserved
+    # faithfully in the planning context.
     plan_text, tool_calls, planner_env = await planner_produce_plan(
-        messages,
+        normalized_msgs,
         body.get("tools"),
         body.get("temperature") or DEFAULT_TEMPERATURE,
         trace_id=trace_id,
@@ -8545,8 +8548,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 js_schema = meta.get("schema") or {}
                 expected_schema = _tool_expected_from_jsonschema(js_schema)
                 # When we have a known schema (planner-visible tools), use committee_jsonify
-                # to coerce the messy text into strict JSON. Fallback to JSONParser when
-                # schema is unknown.
+                # to coerce the messy text into strict JSON.
                 if expected_schema:
                     fixed = await committee_jsonify(
                         raw_text,
@@ -8559,9 +8561,20 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                     else:
                         args_obj = {}
                 else:
-                    # Best-effort direct parse for tools without a registered schema:
-                    # treat arguments as an untyped mapping.
-                    args_obj = parser.parse_superset(raw_text or "{}", dict)["coerced"]
+                    # For tools without a registered JSON schema, still route through
+                    # committee_jsonify so that LLM-originated JSON always passes
+                    # through the JSONFixer path before any JSONParser handling.
+                    generic_schema = {"data": dict}
+                    fixed = await committee_jsonify(
+                        raw_text,
+                        expected_schema=generic_schema,
+                        trace_id=str(trace_id or f"{name or 'tool'}.args"),
+                        temperature=0.0,
+                    )
+                    if isinstance(fixed, dict) and isinstance(fixed.get("data"), dict):
+                        args_obj = fixed.get("data")  # type: ignore[assignment]
+                    else:
+                        args_obj = {}
             if not isinstance(args_obj, dict):
                 args_obj = {}  # ensure downstream sees an object
             normalized_calls.append({**tc, "arguments": args_obj})
@@ -10026,10 +10039,30 @@ async def refs_compose_character(body: Dict[str, Any]):
 async def http_tool_run(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     base = (PUBLIC_BASE_URL or "http://127.0.0.1:8000").rstrip("/")
     async with _hx.AsyncClient(trust_env=False, timeout=None) as client:
-        r = await client.post(base + "/tool.run", json={"name": name, "args": args})
+        # Best-effort propagation of a stable trace identifier to /tool.run so
+        # inner tool execution and envelopes can correlate with the outer
+        # orchestrator trace. Prefer explicit trace_id, then tid, then cid from
+        # the arguments when present.
+        payload: Dict[str, Any] = {"name": name, "args": args}
+        if isinstance(args, dict):
+            _trace_val = args.get("trace_id") or args.get("tid") or args.get("cid")
+            if isinstance(_trace_val, (str, int)) and str(_trace_val).strip():
+                payload["trace_id"] = str(_trace_val).strip()
+        r = await client.post(base + "/tool.run", json=payload)
         raw_body = r.text or ""
         parser = JSONParser()
-        env_schema = {"schema_version": int, "request_id": str, "ok": bool, "result": dict, "error": dict}
+        # Include cid/trace_id in the schema so they survive coercion and can be
+        # surfaced in error payloads for robust correlation, matching how cid is
+        # treated elsewhere in the system.
+        env_schema = {
+            "schema_version": int,
+            "request_id": str,
+            "ok": bool,
+            "result": dict,
+            "error": dict,
+            "cid": str,
+            "trace_id": str,
+        }
         env = parser.parse_superset(raw_body or "{}", env_schema)["coerced"]
         # Canonical consumer: interpret ok/error from envelope; propagate full error object.
         if isinstance(env, dict) and env.get("ok") and isinstance(env.get("result"), dict):
@@ -10040,6 +10073,12 @@ async def http_tool_run(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
             err_obj = env.get("error") or {}
             error_out: Dict[str, Any] = dict(err_obj)
             error_out.setdefault("status", int(err_obj.get("status") or 0))
+            # Preserve any top-level cid/trace_id derived by /tool.run so callers
+            # can join error telemetry back to conversation and trace identifiers.
+            if isinstance(env.get("cid"), str) and env.get("cid"):
+                error_out.setdefault("cid", env.get("cid"))
+            if isinstance(env.get("trace_id"), str) and env.get("trace_id"):
+                error_out.setdefault("trace_id", env.get("trace_id"))
             error_out.setdefault("body", raw_body)
             error_out.setdefault("stack_local", "".join(traceback.format_stack()))
             return {

@@ -445,7 +445,6 @@ services:
       - N8N_WEBHOOK_URL=${N8N_WEBHOOK_URL:-}
       - ASSEMBLER_API_URL=http://127.0.0.1:9095
       - DRT_API_URL=http://127.0.0.1:8086
-      - ICW_API_URL=http://127.0.0.1:8085
       - TEACHER_API_URL=http://teacher:8097
       - POSTGRES_HOST=127.0.0.1
       - POSTGRES_PORT=5432

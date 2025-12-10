@@ -27,18 +27,24 @@ def _build_success_envelope(result: dict | None, rid: str) -> dict:
 	Canonical success envelope for tool-ish routes.
 	Always includes schema_version, request_id, ok, result, error.
 
-	When a client/conversation id (cid) is present in the result payload, it is
-	also mirrored to the top-level envelope so callers can rely on a stable
-	location for cid across tools.
+	When a client/conversation id (cid) or trace identifier (trace_id) is present
+	in the result payload, it is also mirrored to the top-level envelope so
+	callers can rely on a stable location for these identifiers across tools.
 	"""
 	res_obj = result or {}
 	cid_val = None
+	trace_val = None
 	if isinstance(res_obj, dict):
+		# cid: prefer top-level, then meta.cid, then meta.ids.client_id
 		cid_val = res_obj.get("cid")
-		if not cid_val:
-			meta_part = res_obj.get("meta") if isinstance(res_obj.get("meta"), dict) else {}
-			if isinstance(meta_part, dict):
+		# trace_id: prefer top-level, then meta.trace_id, then meta.ids.trace_id
+		trace_val = res_obj.get("trace_id")
+		meta_part = res_obj.get("meta") if isinstance(res_obj.get("meta"), dict) else {}
+		if isinstance(meta_part, dict):
+			if not cid_val:
 				cid_val = meta_part.get("cid") or (meta_part.get("ids") or {}).get("client_id")
+			if not trace_val:
+				trace_val = meta_part.get("trace_id") or (meta_part.get("ids") or {}).get("trace_id")
 	env: dict = {
 		"schema_version": 1,
 		"request_id": rid,
@@ -48,6 +54,8 @@ def _build_success_envelope(result: dict | None, rid: str) -> dict:
 	}
 	if isinstance(cid_val, (str, int)):
 		env["cid"] = str(cid_val)
+	if isinstance(trace_val, (str, int)) and str(trace_val).strip():
+		env["trace_id"] = str(trace_val)
 	return env
 
 
@@ -71,10 +79,14 @@ def _build_error_envelope(code: str, message: str, rid: str, status: int, detail
 		},
 	}
 	# If a cid was provided in details, mirror it at the top level for
-	# consistency with success envelopes.
+	# consistency with success envelopes. Do the same for trace_id so callers
+	# can correlate errors with traces as robustly as with cid.
 	cid_val = err_details.get("cid")
 	if isinstance(cid_val, (str, int)):
 		env["cid"] = str(cid_val)
+	trace_val = err_details.get("trace_id") or err_details.get("tid")
+	if isinstance(trace_val, (str, int)) and str(trace_val).strip():
+		env["trace_id"] = str(trace_val)
 	return env
 
 
