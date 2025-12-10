@@ -6,6 +6,7 @@ import time
 from fastapi import APIRouter, Request
 from app.routes.toolrun import ToolEnvelope  # canonical envelope
 from app.trace_utils import emit_trace as _emit_trace
+from app.json_parser import JSONParser
 
 
 router = APIRouter()

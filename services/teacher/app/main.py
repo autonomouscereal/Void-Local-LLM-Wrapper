@@ -5,6 +5,7 @@ import json
 import os
 import hashlib
 import time
+import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -185,8 +186,9 @@ async def trace_append(body: Dict[str, Any]):
             rr = await db_fetchrow("SELECT id FROM run WHERE trace_id=$1", line.get("trace_id"))
             if rr:
                 await db_execute("INSERT INTO teacher_trace(run_id, trace_line) VALUES($1,$2)", int(rr[0]), line)
-    except Exception:
-        pass
+    except Exception as ex:
+        # DB persistence is best-effort; do not fail request but surface telemetry.
+        logging.warning("teacher.trace_db_write_failed: %s", ex, exc_info=True)
     return {"ok": True, "buffer_size": len(_BUFFER[label]), "label": label, "trace_id": trace_id}
 
 
@@ -284,7 +286,8 @@ async def trace_flush(body: Dict[str, Any]):
         _write_text(paths["toolpolicy"], (open(paths["toolpolicy"], "r", encoding="utf-8").read() if os.path.exists(paths["toolpolicy"]) else "") + "\n".join(tp_lines) + "\n")
     if dpo_lines:
         _write_text(paths["dpo"], (open(paths["dpo"], "r", encoding="utf-8").read() if os.path.exists(paths["dpo"]) else "") + "\n".join(dpo_lines) + "\n")
-    # Optional DB: materialize distill rows linked to run
+    # Optional DB: materialize distill rows linked to run. Failures here should not
+    # break trace flushing, but we log them instead of swallowing silently.
     try:
         pool = await get_pool()
         if pool is not None:
@@ -322,7 +325,8 @@ async def trace_flush(body: Dict[str, Any]):
                         obj_tp = sup_tp.get("coerced") or {}
                         if isinstance(obj_tp, dict):
                             await db_execute("INSERT INTO distill_toolpolicy(run_id, policy_json) VALUES($1,$2)", rid, obj_tp)
-                    except Exception:
+                    except Exception as ex:
+                        logging.warning("teacher.distill_toolpolicy_db_write_failed: %s", ex, exc_info=True)
                         continue
                 for dp in dpo_lines:
                     try:
@@ -330,10 +334,11 @@ async def trace_flush(body: Dict[str, Any]):
                         obj_dp = sup_dp.get("coerced") or {}
                         if isinstance(obj_dp, dict):
                             await db_execute("INSERT INTO distill_dpo(run_id, pair_json) VALUES($1,$2)", rid, obj_dp)
-                    except Exception:
+                    except Exception as ex:
+                        logging.warning("teacher.distill_dpo_db_write_failed: %s", ex, exc_info=True)
                         continue
-    except Exception:
-        pass
+    except Exception as ex:
+        logging.error("teacher.distill_db_materialize_failed: %s", ex, exc_info=True)
     # run record
     inputs_hash = _sha256_str("".join([x.get("trace_id") or "" for x in buf]))
     # include wrapper config hash if present

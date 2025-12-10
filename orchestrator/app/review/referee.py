@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any, Dict, List
+import logging
 import json
 
 from ..pipeline.assets import collect_urls as assets_collect_urls
@@ -205,11 +206,18 @@ async def postrun_committee_decide(
     if not decisions:
         # Committee path failed or produced no usable decision. Surface a clear
         # marker and attach any underlying error from env_decide instead of
-        # returning a plain "committee_unavailable" with no details.
+        # returning a plain "committee_unavailable" with no details, and emit
+        # a high‑visibility log so this failure is never silent.
         err = (env_decide or {}).get("error") if isinstance(env_decide, dict) else {
             "code": "committee_postrun_invalid_env",
             "message": str(env_decide),
         }
+        logging.getLogger("orchestrator.committee.postrun").error(
+            "postrun_committee_decide failed (trace_id=%s): env=%r error=%r",
+            str(trace_id or "committee_postrun"),
+            env_decide,
+            err,
+        )
         out = {
             "action": "go",
             "rationale": "committee_unavailable",

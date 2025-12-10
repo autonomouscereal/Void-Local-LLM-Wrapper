@@ -4,9 +4,13 @@ import os
 import threading
 import json
 import time
+import logging
 from typing import Dict, Any, List, Optional, Tuple
 
+from ..json_parser import JSONParser
 
+
+_LOG = logging.getLogger(__name__)
 _LOCK = threading.RLock()
 _CTX: Dict[str, List[Dict[str, Any]]] = {}
 _GLOBAL_PATH = os.getenv("ARTIFACTS_INDEX_PATH", os.path.join("/workspace", "uploads", "artifacts", "index.jsonl"))
@@ -32,7 +36,8 @@ _COLOR_NAMES = {
 def _dominant_color(path: str) -> Optional[Tuple[int, int, int]]:
     try:
         from PIL import Image  # type: ignore
-    except Exception:
+    except Exception as ex:
+        _LOG.debug("context._dominant_color.import_error", exc_info=ex)
         return None
     try:
         with Image.open(path) as im:  # type: ignore
@@ -44,7 +49,8 @@ def _dominant_color(path: str) -> Optional[Tuple[int, int, int]]:
             g = sum(p[1] for p in pixels) // len(pixels)
             b = sum(p[2] for p in pixels) // len(pixels)
             return (int(r), int(g), int(b))
-    except Exception:
+    except Exception as ex:
+        _LOG.warning("context._dominant_color.error", extra={"path": path}, exc_info=ex)
         return None
 
 
@@ -61,7 +67,8 @@ def _cos(a, b) -> float:
         da = math.sqrt(sum(x*x for x in a))
         db = math.sqrt(sum(y*y for y in b))
         return float(num) / (da*db + 1e-9)
-    except Exception:
+    except Exception as ex:
+        _LOG.warning("context._cos.error", exc_info=ex)
         return 0.0
 
 
@@ -78,7 +85,8 @@ def _embed_text(text: str) -> Optional[List[float]]:
             return vec.tolist()[0]
         if isinstance(vec, list) and vec:
             return vec[0]
-    except Exception:
+    except Exception as ex:
+        _LOG.warning("context._embed_text.error", extra={"model": _TEXT_EMB_MODEL}, exc_info=ex)
         return None
     return None
 
@@ -100,8 +108,8 @@ def add_artifact(cid: str, kind: str, path: str, url: Optional[str] = None, pare
         tvec = _embed_text(txt) if txt else None
         if tvec:
             rec.setdefault("emb", {})["text"] = tvec
-    except Exception:
-        pass
+    except Exception as ex:
+        _LOG.warning("context.add_artifact.embed_error", extra={"cid": cid, "kind": kind, "path": path}, exc_info=ex)
     if kind.startswith("image") and os.path.exists(path):
         dc = _dominant_color(path)
         if dc:
@@ -125,8 +133,12 @@ def add_artifact(cid: str, kind: str, path: str, url: Optional[str] = None, pare
         }
         with open(_GLOBAL_PATH, "a", encoding="utf-8") as f:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
-    except Exception:
-        pass
+    except Exception as ex:
+        _LOG.error(
+            "context.add_artifact.index_write_error",
+            extra={"cid": cid, "kind": kind, "path": path, "index_path": _GLOBAL_PATH},
+            exc_info=ex,
+        )
 
 
 def resolve_reference(cid: str, text: str, kind_hint: Optional[str] = None) -> Optional[Dict[str, Any]]:
@@ -208,7 +220,12 @@ def resolve_global(text: str, kind_hint: Optional[str] = None, search_limit: int
                         buf = parts[0]
                 if buf:
                     lines.insert(0, buf)
-            except Exception:
+            except Exception as ex:
+                _LOG.warning(
+                    "context.resolve_global.tail_read_fallback",
+                    extra={"index_path": _GLOBAL_PATH},
+                    exc_info=ex,
+                )
                 f.seek(0)
                 lines = f.readlines()[-search_limit:]
         # Score
@@ -241,8 +258,12 @@ def resolve_global(text: str, kind_hint: Optional[str] = None, search_limit: int
             try:
                 if qvec is not None and isinstance(obj.get("emb"), dict) and obj["emb"].get("text"):
                     score += 3.0 * max(0.0, _cos(qvec, obj["emb"]["text"]))
-            except Exception:
-                pass
+            except Exception as ex:
+                _LOG.debug(
+                    "context.resolve_global.emb_similarity_error",
+                    extra={"kind": obj.get("kind")},
+                    exc_info=ex,
+                )
             # color heuristic for images
             if obj.get("kind", "").startswith("image"):
                 for cname, rgb in _COLOR_NAMES.items():
@@ -253,7 +274,8 @@ def resolve_global(text: str, kind_hint: Optional[str] = None, search_limit: int
                 best_score = score
                 best = obj
         return best
-    except Exception:
+    except Exception as ex:
+        _LOG.error("context.resolve_global.error", exc_info=ex)
         return None
 
 
@@ -278,7 +300,8 @@ def infer_audio_emotion(text_hint: str) -> Optional[str]:
                 best_s = s
                 best = lab
         return best
-    except Exception:
+    except Exception as ex:
+        _LOG.warning("context.infer_audio_emotion.error", exc_info=ex)
         return None
 
 

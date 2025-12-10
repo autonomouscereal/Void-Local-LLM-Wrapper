@@ -10,6 +10,7 @@ import os
 import re
 import time
 import asyncio
+import logging
 import urllib.parse
 import urllib.robotparser
 from datetime import datetime, timezone
@@ -729,8 +730,9 @@ async def research_collect(body: Dict[str, Any]):
             if not _robots_allowed(url):
                 blocked_count += 1
                 continue
-        except Exception:
-            pass
+        except Exception as ex:
+            # If robots.txt lookup fails, treat as allowed but record telemetry.
+            logging.warning("robots_allowed_check_failed url=%s error=%s", url, ex, exc_info=True)
         # Unified media-aware fetch: try media resolver first, fall back to HTTP fetch
         text = ""
         tables: List[Dict[str, str]] = []
@@ -868,11 +870,29 @@ async def research_collect(body: Dict[str, Any]):
         # horizon check via published_at if available in future; count as within if unknown
         within_horizon += 1
         fetched_rows.append(row)
-        # observability: compact JSON log per fetch
+        # observability: compact JSON log per fetch (best-effort)
         try:
-            print(json.dumps({"event": "fetch", "url": url, "mode": fetch_mode, "bytes": size, "challenge": bool(render_signals.get("challenge_detected"))}))
-        except Exception:
-            pass
+            print(
+                json.dumps(
+                    {
+                        "event": "fetch",
+                        "url": url,
+                        "mode": fetch_mode,
+                        "bytes": size,
+                        "challenge": bool(render_signals.get("challenge_detected")),
+                    }
+                )
+            )
+        except Exception as ex:
+            # Logging to stderr here so we don't lose visibility entirely, but never
+            # fail the research run because of telemetry formatting.
+            logging.warning(
+                "drt.fetch.log_failed url=%s mode=%s error=%s",
+                url,
+                fetch_mode,
+                ex,
+                exc_info=True,
+            )
 
     # Deduplicate
     deduped, removed_exact = DeduperNormalizer.collapse_dups(fetched_rows)

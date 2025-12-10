@@ -490,6 +490,24 @@ async def committee_ai_text(
             "members": member_summaries,
         },
     )
+    # When the committee fails to produce a non-empty answer, surface a clear,
+    # high‑visibility log entry so callers are never left with a "silent" miss.
+    if not ok:
+        # Log only lightweight per‑member status to avoid dumping full responses.
+        members_status = {
+            mid: {
+                "ok": bool(isinstance(mres, dict) and mres.get("ok", True)),
+                "has_error": bool(isinstance(mres, dict) and mres.get("error")),
+                "error": (mres.get("error") if isinstance(mres, dict) else None),
+            }
+            for mid, mres in member_results.items()
+        }
+        log.error(
+            "[committee] no_answer trace_id=%s backend_errors=%s members=%s",
+            str(trace_id or "committee"),
+            backend_errors,
+            members_status,
+        )
     return {
         "schema_version": 1,
         "trace_id": trace_id or "committee",
@@ -698,10 +716,9 @@ async def committee_jsonify(
         clean_txt = _sanitize_mojibake_text(txt or "")
         try:
             sup = parser.parse_superset(clean_txt or "{}", expected_schema)
-            obj = sup["coerced"]
         except Exception as ex:  # pragma: no cover - defensive logging
             log.info(
-                "[committee.jsonify] JSONParser error trace_id=%s index=%d error=%s",
+                "[committee.jsonify] JSONParser exception trace_id=%s index=%d error=%s",
                 trace_base,
                 idx,
                 str(ex),
@@ -710,12 +727,25 @@ async def committee_jsonify(
             # empty song shell instead of dropping the candidate entirely.
             if song_schema is not None:
                 try:
-                    sup_default = parser.parse_superset("{}", expected_schema)
-                    obj = sup_default["coerced"]
+                    sup = parser.parse_superset("{}", expected_schema)
                 except Exception:
                     continue
             else:
                 continue
+
+        # Surface JSONParser-internal errors (which never raise) so pack/compression
+        # failures are visible in logs instead of being silently repaired.
+        errors = (sup.get("errors") or []) if isinstance(sup, dict) else []
+        last_error = sup.get("last_error") if isinstance(sup, dict) else None
+        if errors:
+            log.warning(
+                "[committee.jsonify] JSONParser reported errors trace_id=%s index=%d last_error=%s errors=%s",
+                trace_base,
+                idx,
+                last_error,
+                errors[:5],
+            )
+        obj = sup.get("coerced") if isinstance(sup, dict) else None
         log.info(
             "[committee.jsonify] parsed_candidate trace_id=%s index=%d obj=%s",
             trace_base,

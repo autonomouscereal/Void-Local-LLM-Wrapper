@@ -1163,8 +1163,12 @@ def restitch_music_from_windows(lock_bundle: Dict[str, Any], cid: str, crossfade
     add_manifest_row({}, full_path, step_id="music.infinite.windowed.full")
     try:
         _ctx_add(cid, "audio", full_path, None, None, ["music", "windowed"], {})
-    except Exception:
-        pass
+    except Exception as ex:
+        log.warning(
+            "music.windowed.ctx_add_error",
+            extra={"cid": cid, "path": full_path},
+            exc_info=ex,
+        )
     return full_path
 
 

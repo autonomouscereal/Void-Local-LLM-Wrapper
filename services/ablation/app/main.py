@@ -5,6 +5,7 @@ import json
 import os
 import hashlib
 import time
+import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -424,12 +425,13 @@ async def ablate(body: Dict[str, Any]):
                                             aid,
                                             obj,
                                         )
-                                except Exception:
+                                except Exception as ex:
+                                    logging.warning("ablation.drop_row_write_failed: %s", ex, exc_info=True)
                                     continue
-                except Exception:
-                    pass
-    except Exception:
-        pass
+                except Exception as ex:
+                    logging.error("ablation.drop_ingest_failed: %s", ex, exc_info=True)
+    except Exception as ex:
+        logging.error("ablation.run_commit_failed: %s", ex, exc_info=True)
     return result
 
 

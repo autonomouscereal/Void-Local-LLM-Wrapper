@@ -7,14 +7,13 @@ from pathlib import Path
 import copy
 from typing import Dict, Any, Optional
 
-import httpx
 from ..json_parser import JSONParser
+from .client_aio import BASE as COMFY_BASE, comfy_submit as _comfy_submit_aio, comfy_history as _comfy_history_aio
 
 
-COMFY_BASE = os.getenv("COMFYUI_API_URL", "http://comfyui:8188").rstrip("/")
-COMFY_WS   = COMFY_BASE.replace("http", "ws") + "/ws?clientId=wrapper-001"
-INPUT_DIR  = os.getenv("COMFY_INPUT_DIR", "/comfyui/input")
-WF_PATH    = os.getenv("COMFY_WORKFLOW_PATH", "/workspace/services/image/workflows/pipeline_complex.json")
+COMFY_WS = COMFY_BASE.replace("http", "ws") + "/ws?clientId=wrapper-001"
+INPUT_DIR = os.getenv("COMFY_INPUT_DIR", "/comfyui/input")
+WF_PATH = os.getenv("COMFY_WORKFLOW_PATH", "/workspace/services/image/workflows/pipeline_complex.json")
 
 
 def load_workflow() -> Dict[str, Any]:
@@ -103,23 +102,13 @@ def patch_assets(graph: Dict[str, Any], assets: Dict[str, Any]) -> None:
 
 
 async def submit(graph: Dict[str, Any]) -> Dict[str, Any]:
-    prompt_graph = graph.get("prompt") if isinstance(graph, dict) and ("prompt" in graph) else graph
-    payload = {"prompt": prompt_graph, "client_id": "wrapper-001"}
-
-    # Submit prompt to ComfyUI
-    async with httpx.AsyncClient() as client:
-        url = COMFY_BASE + "/prompt"
-        preview = json.dumps(payload, ensure_ascii=False)
-        print(f"[comfy.submit] POST {url} bytes={len(preview)}")
-        r = await client.post(url, json=payload)
-        r.raise_for_status()
-        schema = {"prompt_id": str, "uuid": str, "id": str}
-        sup = JSONParser().parse_superset(r.text, schema)
-        j = sup["coerced"]
-
+    # Delegate HTTP submission to the shared aiohttp-based client so that
+    # all Comfy prompt requests share the same BASE/JSON parsing logic.
+    j = await _comfy_submit_aio(graph, client_id="wrapper-001")
     pid = j.get("prompt_id") or j.get("uuid") or j.get("id")
     if not isinstance(pid, str):
-        return {"error": "missing prompt_id from comfy"}
+        # Preserve previous error contract but surface the raw response for debugging.
+        return {"error": "missing prompt_id from comfy", "detail": j}
 
     # WS wait for execution completion
     import websockets  # type: ignore
@@ -136,18 +125,15 @@ async def submit(graph: Dict[str, Any]) -> Dict[str, Any]:
             if isinstance(d, dict) and d.get("type") == "executed" and (d.get("data") or {}).get("prompt_id") == pid:
                 break
 
-    # History fetch
-    async with httpx.AsyncClient() as client:
-        hurl = COMFY_BASE + f"/history/{pid}"
-        print(f"[comfy.history] GET {hurl}")
-        hr = await client.get(hurl)
-        if hr.status_code == 200:
-            parser = JSONParser()
-            schema = {"history": dict}
-            sup = parser.parse_superset(hr.text or "", schema)
-            hist = sup["coerced"]
-            return {"prompt_id": pid, "history": hist if isinstance(hist, dict) else {}}
-        return {"prompt_id": pid, "history_error": hr.text}
+    # History fetch – reuse the shared comfy_history helper so parsing and
+    # error-shaping stay consistent with other callers. Unwrap the nested
+    # {"history": {...}} shape so callers see the direct history mapping.
+    hist = await _comfy_history_aio(pid)
+    if isinstance(hist, dict) and "history" in hist:
+        inner = hist.get("history") or {}
+        return {"prompt_id": pid, "history": inner}
+    # On error or unexpected shape, surface best-effort diagnostic payload.
+    return {"prompt_id": pid, "history_error": hist}
 
 
 def patch_workflow(base_graph: Dict[str, Any], *, prompt: Optional[str] = None, negative: Optional[str] = None, seed: Optional[int] = None, width: Optional[int] = None, height: Optional[int] = None, assets: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:

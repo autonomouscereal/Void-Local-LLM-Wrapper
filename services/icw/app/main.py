@@ -490,12 +490,11 @@ MAX_CACHE = 128
 def _lru_put(cache: Dict[str, Any], key: str, val: Any):
     cache[key] = val
     if len(cache) > MAX_CACHE:
-        try:
-            first_key = next(iter(cache.keys()))
-            if first_key in cache and first_key != key:
-                cache.pop(first_key, None)
-        except Exception:
-            pass
+        # Evict the oldest key in a best-effort, exception-safe way without hiding
+        # logic errors behind a broad try/except.
+        first_key = next(iter(cache.keys()), None)
+        if first_key is not None and first_key in cache and first_key != key:
+            cache.pop(first_key, None)
 
 
 @app.post("/internal/icw_pack")

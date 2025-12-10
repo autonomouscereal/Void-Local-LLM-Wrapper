@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
 import os
+from types import SimpleNamespace
+
 from .assembler import assemble_window
 from .continuation import (
     detect_cont_or_halt,
@@ -13,7 +14,6 @@ from .continuation import (
 from .tokenizer import byte_budget_for_model, bytes_len
 from .reframe import need_reframe, build_reframe_prompt
 from ..adapters.providers import model_chat_with_retry, ProviderError
-import os
 
 
 def solve(
@@ -42,6 +42,8 @@ def solve(
     threshold = int(os.getenv("ICW_STALL_N", "3") or 3)
     while step < max_steps:
         step += 1
+        # Keep goals/state_hash aligned to the latest user request for stable CONT/HALT tags.
+        global_state["goals"] = request.get("content", "")
         global_state["state_hash"] = state_hash_from(global_state)
         state_hashes.append(global_state["state_hash"])
         # Stall reframe

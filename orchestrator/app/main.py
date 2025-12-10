@@ -93,6 +93,9 @@ from fastapi.middleware.cors import CORSMiddleware  # type: ignore
 from .json_parser import JSONParser
 from .determinism import seed_router as det_seed_router, seed_tool as det_seed_tool, round6 as det_round6
 from .icw.windowed_solver import solve as windowed_solve
+from .icw.assembler import assemble_window
+from .icw.continuation import state_hash_from as icw_state_hash_from
+from .icw.tokenizer import byte_budget_for_model as icw_byte_budget_for_model
 from .jsonio.normalize import normalize_to_envelope
 from .search.meta import rrf_fuse as _rrf_fuse
 from .tools.progress import emit_progress, set_progress_queue, get_progress_queue
@@ -175,6 +178,10 @@ from .comfy.client_aio import (
     comfy_view as _comfy_view,
     choose_sampler_name as _choose_sampler_name,
     comfy_is_completed as _comfy_is_completed,
+)
+from .comfy.assets import (
+    normalize_history_entry as _normalize_comfy_history_entry,
+    extract_comfy_asset_urls as _extract_comfy_asset_urls,
 )
 from .locks.store import locks_root as _locks_root, upsert_lock_bundle as _lock_save, get_lock_bundle as _lock_load
 from .locks.builder import (
@@ -408,7 +415,10 @@ async def segment_qa_and_committee(
     temperature: float,
     last_user_text: str,
     tool_catalog_hash: str,
-    planner_callable: Callable[[List[Dict[str, Any]], Optional[List[Dict[str, Any]]], float, Optional[str]], Tuple[str, List[Dict[str, Any]]]],
+    planner_callable: Callable[
+        [List[Dict[str, Any]], Optional[List[Dict[str, Any]]], float, Optional[str]],
+        Tuple[str, List[Dict[str, Any]], Dict[str, Any]],
+    ],
     normalize_fn: Callable[[Any], List[Dict[str, Any]]],
     absolutize_url: Callable[[str], str],
     quality_profile: Optional[str] = None,
@@ -569,7 +579,16 @@ async def segment_qa_and_committee(
                 committee_outcome["action"] = "fail"
                 committee_outcome.setdefault("threshold_violations", {}).update(violations)
                 action = "fail"
-        _log("committee.decision.segment", trace_id=trace_id, tool=tool_name, attempt=attempt, action=action, rationale=committee_outcome.get("rationale"), violations=violations)
+        _log(
+            "committee.decision.segment",
+            trace_id=trace_id,
+            tool=tool_name,
+            attempt=attempt,
+            action=action,
+            rationale=committee_outcome.get("rationale"),
+            violations=violations,
+            committee_error=committee_outcome.get("committee_error"),
+        )
         # Auto-suggest video.refine.clip steps for low-quality clips based on per-segment QA.
         if action == "revise":
             auto_patch_steps: List[Dict[str, Any]] = []
@@ -1908,14 +1927,18 @@ def _creative_alt_score(tr: Dict[str, Any], base_tool: str) -> float:
                     ai = _analyze_image(img_path, prompt=None)
                     score_block = ai.get("score") or {}
                     return float(score_block.get("overall") or 0.0)
-                except Exception:
+                except Exception as ex:
+                    # Image QA is best-effort; log and fall back to neutral score.
+                    logging.warning("creative_alt_score.image_analysis_failed: %s", ex, exc_info=True)
                     return 0.0
             if kind.startswith("audio") or base_tool.startswith("music"):
                 try:
                     m = analyze_audio(f"/uploads/artifacts/music/{cid}/{aid}")
                     # Simple composite: louder within safe LUFS and richer spectrum
                     return float((m.get("spectral_flatness") or 0.0))
-                except Exception:
+                except Exception as ex:
+                    # Audio QA is best-effort; log and fall back to neutral score.
+                    logging.warning("creative_alt_score.audio_analysis_failed: %s", ex, exc_info=True)
                     return 0.0
     return 0.0
 
@@ -2197,7 +2220,8 @@ def _asset_urls_from_tools2(results: List[Dict[str, Any]]) -> List[str]:
                             urls.append(f"/uploads/artifacts/music/{cid}/{aid}")
             if isinstance(res, dict):
                 _asset_urls_walk(res, urls)
-        except Exception:
+        except Exception as ex:
+            _log("asset_urls.walk.error", error=str(ex))
             continue
     # de-duplicate while preserving order
     return list(dict.fromkeys(urls))
@@ -2266,15 +2290,6 @@ def _normalize_job(js: Dict[str, Any]) -> Dict[str, Any]:
         "updated_at": ua,
     }
     return out
-
-
-# ---- Comfy asset helpers ----
-
-def _comfy_view_url(base: str, fn: str, ftype: str, sub: Optional[str]) -> str:
-    q = {"filename": fn, "type": ftype or "output"}
-    if sub:
-        q["subfolder"] = sub
-    return f"{base.rstrip('/')}/view?{urlencode(q)}"
 
 
 # ---- Teacher / streaming helpers ----
@@ -2388,7 +2403,8 @@ async def _tool_ws_keepalive(websocket: WebSocket) -> None:
     while True:
         try:
             await websocket.send_text(json.dumps({"keepalive": True}))
-        except Exception:
+        except Exception as ex:
+            logging.debug("ws_tool.keepalive_failed: %s", ex, exc_info=True)
             break
         await _as.sleep(10)
 
@@ -2787,7 +2803,13 @@ def merge_tool_schemas(client_tools: Optional[List[Dict[str, Any]]]) -> List[Dic
             out.append(t)
     return out
 
-async def planner_produce_plan(messages: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]], temperature: float, trace_id: Optional[str] = None, mode: Optional[str] = None) -> Tuple[str, List[Dict[str, Any]]]:
+async def planner_produce_plan(
+    messages: List[Dict[str, Any]],
+    tools: Optional[List[Dict[str, Any]]],
+    temperature: float,
+    trace_id: Optional[str] = None,
+    mode: Optional[str] = None,
+) -> Tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
     # Treat any 'qwen*' value as Qwen route (e.g., 'qwen3')
     use_qwen = str(PLANNER_MODEL or "qwen").lower().startswith("qwen")
     planner_id = QWEN_MODEL_ID if use_qwen else GLM_MODEL_ID
@@ -2897,6 +2919,60 @@ async def planner_produce_plan(messages: List[Dict[str, Any]], tools: Optional[L
     _log("planner.co_env", trace_id=trace_id, co_env=co_env)
     co_out = _co_pack(co_env)
     frames_msgs = _co_frames_to_msgs(co_out.get("frames") or [])
+
+    # Inject a real ICW window for planner context instead of relying solely on
+    # ICW meta-instructions. This window is built from the current conversation
+    # history and kept within the ICW byte budget derived from the CO allocator.
+    rt = co_out.get("ratio_telemetry") or {}
+    bb = rt.get("byte_budget") or {}
+    total_budget_bytes = int((bb.get("total_budget_bytes") or 0) or 0)
+    icw_bytes_nominal = int((bb.get("icw_bytes") or 0) or 0)
+    if icw_bytes_nominal <= 0 and total_budget_bytes > 0:
+        icw_budget_bytes = int(total_budget_bytes * 0.6)
+    elif icw_bytes_nominal > 0:
+        icw_budget_bytes = icw_bytes_nominal
+    else:
+        icw_budget_bytes = int(icw_byte_budget_for_model(DEFAULT_NUM_CTX) * 0.6)
+
+    try:
+        # Build lightweight ICW state from chat history for the planner.
+        icw_candidates: List[str] = []
+        for m in messages or []:
+            if not isinstance(m, dict):
+                continue
+            role = (m.get("role") or "").strip()
+            content = (m.get("content") or "").strip()
+            if role in ("user", "assistant") and content:
+                icw_candidates.append(f"{role}: {content}")
+        icw_state: Dict[str, Any] = {
+            "entities": [],
+            "goals": last_user,
+            "anchor_text": "",
+            "candidates": icw_candidates,
+            "retrieved": [],
+        }
+        icw_state["state_hash"] = icw_state_hash_from(icw_state)
+        icw_request = {"role": "user", "content": last_user}
+        icw_window = assemble_window(icw_request, icw_state, icw_budget_bytes, step_out_tokens=512)
+        icw_prompt = getattr(icw_window, "prompt", "") if icw_window is not None else ""
+        if isinstance(icw_prompt, str) and icw_prompt.strip():
+            icw_frame = {
+                "role": "system",
+                "content": "### [ICW CONTEXT]\n" + icw_prompt,
+            }
+            if frames_msgs:
+                # Insert ICW context immediately after the primary CO allocator frame.
+                frames_msgs = [frames_msgs[0], icw_frame] + frames_msgs[1:]
+            else:
+                frames_msgs = [icw_frame]
+    except Exception as ex:
+        # ICW assembly is best-effort for planner; log failures explicitly instead of
+        # swallowing them so they surface in traces.
+        _log(
+            "planner.icw_assemble.error",
+            trace_id=str(trace_id or ""),
+            error=str(ex),
+        )
     # Minimal planner/committee frames
     # Add Mode/Palette and allowed tools guidance
     _mode_palette = (
@@ -2970,20 +3046,31 @@ async def planner_produce_plan(messages: List[Dict[str, Any]], tools: Optional[L
         trace_id=str(trace_id or "planner"),
         temperature=temperature,
     )
+    # Normalize planner env so callers can inspect ok/error without losing detail.
+    if isinstance(env, dict):
+        planner_env: Dict[str, Any] = env
+    else:
+        planner_env = {
+            "ok": False,
+            "error": {
+                "code": "planner_env_invalid",
+                "message": str(env),
+            },
+        }
     # Default planner text + tool calls; populated when the committee call succeeds.
     text: str = ""
     res_env: Dict[str, Any] = {}
     tool_calls: List[Dict[str, Any]] = []
-    if not isinstance(env, dict) or not env.get("ok"):
+    if not isinstance(planner_env, dict) or not planner_env.get("ok"):
         # Committee-level planner failure. Log and leave tool_calls empty,
-        # but preserve the error text so callers can attach it to envelopes.
+        # but preserve the error payload so callers can surface it.
         _log(
             "planner.error",
             trace_id=trace_id,
-            error=(env or {}).get("error") if isinstance(env, dict) else {"code": "planner_env_invalid", "message": str(env)},
+            error=(planner_env or {}).get("error") if isinstance(planner_env, dict) else {"code": "planner_env_invalid", "message": str(env)},
         )
     else:
-        res_env = env.get("result") or {}
+        res_env = planner_env.get("result") or {}
         text = res_env.get("text") or ""
     # Log the raw planner text response from the committee, before JSON fixing.
     _log(
@@ -3030,15 +3117,16 @@ async def planner_produce_plan(messages: List[Dict[str, Any]], tools: Optional[L
         steps=steps,
     )
     if not steps:
-        return "", []
+        return "", [], planner_env
     _log("planner.steps", trace_id=trace_id, steps=steps)
     for st in steps:
         if isinstance(st, dict) and st.get("tool") == "image.dispatch":
             _log("planner.image.dispatch.args", trace_id=trace_id, args=st.get("args") or {})
     tool_calls = [{"name": s.get("tool"), "arguments": (s.get("args") or {})} for s in steps if isinstance(s, dict)]
-    # Return the raw planner text along with normalized tool_calls so callers can
-    # inspect the original planner response when needed.
-    return text, tool_calls
+    # Return the raw planner text, normalized tool_calls, and the raw planner env
+    # so callers can inspect ok/error and propagate failures instead of silently
+    # treating planner errors as empty plans.
+    return text, tool_calls, planner_env
 
 
 def _tool_cast_to_float(v: Any) -> Optional[float]:
@@ -3271,7 +3359,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         existing = _lock_migrate_sfx(existing)
         existing = _lock_migrate_film2(existing)
         merged = _merge_lock_bundles(existing, bundle)
-        _summarize_all_locks_for_context(character_id, merged)
+        _lock_summarize_all_locks_for_context(_ctx_add, character_id, merged)
         await _lock_save(character_id, merged)
         return {"name": name, "result": {"lock_bundle": merged}}
     if name == "locks.build_audio_bundle":
@@ -3290,7 +3378,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         existing = _lock_migrate_sfx(existing)
         existing = _lock_migrate_film2(existing)
         merged = _merge_lock_bundles(existing, bundle)
-        _summarize_all_locks_for_context(character_id, merged)
+        _lock_summarize_all_locks_for_context(_ctx_add, character_id, merged)
         await _lock_save(character_id, merged)
         return {"name": name, "result": {"lock_bundle": merged}}
     if name == "locks.build_region_locks":
@@ -3310,7 +3398,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         existing = _lock_migrate_sfx(existing)
         existing = _lock_migrate_film2(existing)
         merged = _merge_lock_bundles(existing, bundle)
-        _summarize_all_locks_for_context(character_id, merged)
+        _lock_summarize_all_locks_for_context(_ctx_add, character_id, merged)
         await _lock_save(character_id, merged)
         return {"name": name, "result": {"lock_bundle": merged}}
     if name == "locks.update_region_modes":
@@ -3336,7 +3424,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         updated_bundle = _apply_region_mode_updates(existing, updates)
         # Persist and summarize only when operating on a character-scoped bundle.
         if character_id:
-            _summarize_all_locks_for_context(character_id, updated_bundle)
+            _lock_summarize_all_locks_for_context(_ctx_add, character_id, updated_bundle)
             await _lock_save(character_id, updated_bundle)
         return {"name": name, "result": {"lock_bundle": updated_bundle}}
     if name == "locks.update_audio_modes":
@@ -3352,7 +3440,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         existing = _lock_migrate_sfx(existing)
         existing = _lock_migrate_film(existing)
         updated_bundle = _apply_audio_mode_updates(existing, update_payload)
-        _summarize_all_locks_for_context(character_id, updated_bundle)
+        _lock_summarize_all_locks_for_context(_ctx_add, character_id, updated_bundle)
         await _lock_save(character_id, updated_bundle)
         return {"name": name, "result": {"lock_bundle": updated_bundle}}
     if name == "locks.get_bundle":
@@ -5761,7 +5849,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                             urls.append(f"/uploads/artifacts/image/{cid}/{aid}")
                         elif base_tool.startswith("music"):
                             urls.append(f"/uploads/artifacts/music/{cid}/{aid}")
-            except Exception:
+            except Exception as ex:
+                logging.warning("creative.alts.asset_collect_failed: %s", ex, exc_info=True)
                 continue
         return {"name": name, "result": {"variants": len(results), "assets": urls, "best": (urls[0] if urls else None)}}
     if name == "creative.pro_polish" and ALLOW_TOOL_EXECUTION:
@@ -7591,32 +7680,18 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                                 hr = _c2.get(COMFYUI_API_URL.rstrip("/") + f"/history/{pid}")
                                 if hr.status_code == 200:
                                     parser = JSONParser()
-                                    # History responses may be either {"history": {...}} or a direct
-                                    # {prompt_id: {...}} mapping; treat the full body as a generic
-                                    # mapping and preserve all keys.
                                     hj = parser.parse_superset(hr.text or "{}", dict)["coerced"]
-                                    hist = hj.get("history") if isinstance(hj, dict) else {}
-                                    if not isinstance(hist, dict):
-                                        hist = hj if isinstance(hj, dict) else {}
-                                    h = hist.get(pid)
+                                    h = _normalize_comfy_history_entry(hj if isinstance(hj, dict) else {}, str(pid))
                                     if h and _comfy_is_completed(h):
-                                        # find first output and overwrite frame
-                                        outs = (h.get("outputs") or {})
-                                        for items in outs.values():
-                                            if isinstance(items, list) and items:
-                                                it = items[0]
-                                                fn = it.get("filename")
-                                                sub = it.get("subfolder")
-                                                tp = it.get("type") or "output"
-                                                if fn:
-                                                    q = {"filename": fn, "type": tp}
-                                                    if sub:
-                                                        q["subfolder"] = sub
-                                                    vr = _c2.get(COMFYUI_API_URL.rstrip("/") + "/view?" + urlencode(q))
-                                                    if vr.status_code == 200:
-                                                        with open(fp, "wb") as wf:
-                                                            wf.write(vr.content)
-                                                        break
+                                        assets = _extract_comfy_asset_urls(h, COMFYUI_API_URL or "http://comfyui:8188")
+                                        if assets:
+                                            src = assets[0].get("url")
+                                            if isinstance(src, str) and src:
+                                                vr = _c2.get(src)
+                                                if vr.status_code == 200:
+                                                    with open(fp, "wb") as wf:
+                                                        wf.write(vr.content)
+                                                    break
                                         break
                                 time.sleep(0.5)
                 # 4) Reassemble stabilized video
@@ -7811,24 +7886,17 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                                 if hr.status_code == 200:
                                     parser = JSONParser()
                                     hj = parser.parse_superset(hr.text or "", {"history": dict})["coerced"]
-                                    h = (hj.get("history") or {}).get(pid) if isinstance(hj, dict) else None
+                                    h = _normalize_comfy_history_entry(hj if isinstance(hj, dict) else {}, str(pid))
                                     if h and _comfy_is_completed(h):
-                                        outs = (h.get("outputs") or {})
-                                        for items in outs.values():
-                                            if isinstance(items, list) and items:
-                                                it = items[0]
-                                                fn = it.get("filename")
-                                                sub = it.get("subfolder")
-                                                tp = it.get("type") or "output"
-                                                if fn:
-                                                    q = {"filename": fn, "type": tp}
-                                                    if sub:
-                                                        q["subfolder"] = sub
-                                                    vr = _c2.get(COMFYUI_API_URL.rstrip("/") + "/view?" + urlencode(q))
-                                                    if vr.status_code == 200:
-                                                        with open(fp, "wb") as wf:
-                                                            wf.write(vr.content)
-                                                        break
+                                        assets = _extract_comfy_asset_urls(h, COMFYUI_API_URL or "http://comfyui:8188")
+                                        if assets:
+                                            src = assets[0].get("url")
+                                            if isinstance(src, str) and src:
+                                                vr = _c2.get(src)
+                                                if vr.status_code == 200:
+                                                    with open(fp, "wb") as wf:
+                                                        wf.write(vr.content)
+                                                    break
                                         break
                                 time.sleep(0.5)
                 dst2 = os.path.join(outdir, "upscaled_stabilized.mp4")
@@ -7991,8 +8059,9 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     res["latex"] = _sp.latex(se)
                 try:
                     res["approx"] = float(_sp.N(e, 20))
-                except Exception:
-                    pass
+                except Exception as ex:
+                    # Approximate evaluation is best-effort; preserve the exact result but surface telemetry.
+                    logging.debug("sympy_approx_failed", exc_info=True)
                 return {"name": name, "result": res}
             except Exception:
                 allowed = {k: getattr(math, k) for k in dir(math) if not k.startswith("_")}
@@ -8240,6 +8309,10 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     t0 = time.time()
     # Single-exit accumulator for prebuilt final responses (avoid early returns)
     response_prebuilt = None
+    # Planner hard error flag, e.g. media request with no tool calls.
+    planner_hard_error = False
+    # Optional planner error payload when the planner/committee path fails.
+    planner_error_payload: Optional[Dict[str, Any]] = None
     # Initialize per-backend envelopes upfront so they are always defined,
     # even if upstream committee calls fail early.
     qwen_result: Dict[str, Any] = {}
@@ -8375,11 +8448,38 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     # catalog, mode, RoE, and routing rules; a single planner_produce_plan call
     # governs tool selection.
     _log("planner.call", trace_id=trace_id)
-    plan_text, tool_calls = await planner_produce_plan(messages, body.get("tools"), body.get("temperature") or DEFAULT_TEMPERATURE, trace_id=trace_id, mode=mode)
+    plan_text, tool_calls, planner_env = await planner_produce_plan(
+        messages,
+        body.get("tools"),
+        body.get("temperature") or DEFAULT_TEMPERATURE,
+        trace_id=trace_id,
+        mode=mode,
+    )
+    # Detect planner/committee failures early so they do not silently degrade into
+    # an empty plan. This also flips pipeline_ok to False so the final envelope
+    # reflects that the tool pipeline did not fully succeed.
+    if not isinstance(planner_env, dict) or not planner_env.get("ok"):
+        planner_hard_error = True
+        # Derive a canonical error block from the planner env.
+        err_block = planner_env.get("error") if isinstance(planner_env, dict) else None
+        if not isinstance(err_block, dict):
+            err_block = {
+                "code": "planner_committee_error",
+                "message": str(planner_env) if planner_env is not None else "planner committee failed with unknown error",
+            }
+        planner_error_payload = err_block
+        _log("planner.env.error", trace_id=trace_id, error=err_block)
     _log("planner.done", trace_id=trace_id, tool_count=len(tool_calls or []))
     _log("flow.after_plan", trace_id=trace_id, tool_count=len(tool_calls or []))
     # Normalize planner tool calls into orchestrator internal schema {name, arguments}
     tool_calls = _normalize_tool_calls(tool_calls)
+    if (not tool_calls) and (effective_mode == "film"):
+        planner_hard_error = True
+        _log(
+            "planner.no_tool_calls_for_film",
+            trace_id=trace_id,
+            mode=effective_mode,
+        )
     _log("planner.tools.normalized", trace_id=trace_id, tool_count=len(tool_calls))
     # Emit planner.steps and catalog hash for traceability (derived from allowed tool names)
     _cat_hash = _compute_tools_hash(body, planner_visible_only=True)
@@ -8543,8 +8643,10 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     validation_failures: List[Dict[str, Any]] = []
     tool_results: List[Dict[str, Any]] = []
     tool_exec_meta: List[Dict[str, Any]] = []
-    # Pipeline success flag: flipped to False when any critical front-door tool fails.
-    pipeline_ok: bool = True
+    # Pipeline success flag: flipped to False when any critical front-door tool fails,
+    # when the planner produced no tool calls for a media/film request, or when the
+    # planner/committee env itself reports a failure.
+    pipeline_ok: bool = not planner_hard_error
     _ledger_shard = None
     _ledger_root = os.path.join(UPLOAD_DIR, "artifacts", "runs", trace_id)
     _ledger_name = "ledger"
@@ -9367,27 +9469,10 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 final_text = text_candidate or ""
     if not final_text:
         final_text = qwen_text or glm_text or deepseek_text or ""
-    # Append discovered asset URLs from tool results so users see concrete outputs inline
+    # Append discovered asset URLs from tool results so users see concrete outputs inline.
+    # Do NOT synthesize or reuse artifacts from unrelated runs; only attach URLs that
+    # actually come from the current tool_results set.
     asset_urls = assets_collect_urls(tool_results, _abs_url)
-    # Fallback: if no URLs surfaced from tool results (e.g. async image jobs that finished out-of-band),
-    # look up recent artifacts from multimodal memory for this conversation and attach their public URLs.
-    if (not asset_urls) and conv_cid:
-        recents = _ctx_list(str(conv_cid), limit=5, kind_hint="image")
-        for it in (recents or []):
-            u = (it or {}).get("url") or ""
-            p = (it or {}).get("path") or ""
-            if isinstance(u, str) and u.startswith("/uploads/"):
-                asset_urls.append(u)
-                continue
-            if isinstance(p, str) and p:
-                # Convert filesystem paths under /workspace/uploads to public /uploads
-                if p.startswith("/workspace/") and "/uploads/" in p:
-                    parts = p.split("/workspace", 1)
-                    if len(parts) > 1:
-                        asset_urls.append(parts[1])
-                elif "/uploads/" in p:
-                    asset_urls.append(p)
-        asset_urls = list(dict.fromkeys(asset_urls))
     if asset_urls:
         assets_block = "\n".join(["Assets:"] + [f"- {u}" for u in asset_urls])
         final_text = (final_text + "\n\n" + assets_block).strip()
@@ -9468,32 +9553,19 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             merged_main.append("### GLM4-9B\n" + glm_text.strip())
         if merged_main:
             cleaned = "\n\n".join(merged_main)
-    # Ensure asset URLs are appended even if we fell back to merged model answers
+    # Ensure asset URLs are appended even if we fell back to merged model answers.
+    # Only attach URLs that come directly from the current tool_results; do not
+    # reach into multimodal memory to avoid hallucinated or stale artifacts.
     try:
         asset_urls2 = _asset_urls_from_tools2(tool_results)
-        if (not asset_urls2) and conv_cid:
-            try:
-                recents = _ctx_list(str(conv_cid), limit=5, kind_hint="image")
-                for it in recents or []:
-                    u = (it or {}).get("url") or ""; p = (it or {}).get("path") or ""
-                    if isinstance(u, str) and u.startswith("/uploads/"):
-                        asset_urls2.append(u)
-                    elif isinstance(p, str) and p:
-                        if p.startswith("/workspace/") and "/uploads/" in p:
-                            try:
-                                tail = p.split("/workspace", 1)[1]
-                                asset_urls2.append(tail)
-                            except Exception:
-                                pass
-                        elif "/uploads/" in p:
-                            asset_urls2.append(p)
-            except Exception:
-                pass
-            asset_urls2 = list(dict.fromkeys(asset_urls2))
         if asset_urls2:
             cleaned = (cleaned + "\n\n" + "\n".join(["Assets:"] + [f"- {u}" for u in asset_urls2])).strip()
-    except Exception:
-        pass
+    except Exception as ex:
+        _log(
+            "final.assets_from_tools.error",
+            trace_id=str(trace_id or ""),
+            error=str(ex),
+        )
     # If tools/plan/critique exist, wrap them into a hidden metadata block and present a concise final answer
     meta_sections: List[str] = []
     if plan_text:
@@ -9501,8 +9573,9 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     if tool_results:
         try:
             meta_sections.append("Tool Results:\n" + json.dumps(tool_results, indent=2))
-        except Exception:
-            pass
+        except Exception as ex:
+            # This metadata block is non-critical; log and continue.
+            logging.warning("final.tool_results.meta_serialize_failed: %s", ex, exc_info=True)
     # Instead of verbose plan/critique footers, append a minimal Tool Results summary (IDs/errors) only
     tool_summary_lines: List[str] = []
     tool_tracebacks: List[str] = []
@@ -9518,8 +9591,17 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                     res_field = tr.get("result")
                     if isinstance(res_field, str):
                         try:
-                            res_field = JSONParser().parse_superset(res_field, {"film_id": str, "job_id": str, "prompt_id": str, "created": [ {"result": dict, "job_id": str, "prompt_id": str} ]})["coerced"]
-                        except Exception:
+                            res_field = JSONParser().parse_superset(
+                                res_field,
+                                {
+                                    "film_id": str,
+                                    "job_id": str,
+                                    "prompt_id": str,
+                                    "created": [{"result": dict, "job_id": str, "prompt_id": str}],
+                                },
+                            )["coerced"]
+                        except Exception as ex:
+                            logging.warning("tool_results.parse_superset.failed: %s", ex, exc_info=True)
                             res_field = {}
                     if not isinstance(res_field, dict):
                         res_field = {}
@@ -9562,8 +9644,8 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                     tool_summary_lines.append("- **prompts**: " + ", ".join([f"`{p}`" for p in puniq[:20]]))
             if errors:
                 tool_summary_lines.append("- **errors**: " + "; ".join(errors)[:800])
-        except Exception:
-            pass
+        except Exception as ex:
+            logging.error("tool_results.summary_failed: %s", ex, exc_info=True)
     footer = ("\n\n### Tool Results\n" + "\n".join(tool_summary_lines)) if tool_summary_lines else ""
     if tool_tracebacks:
         # Include full tracebacks verbatim (truncated to a safe length per item)
@@ -9577,30 +9659,30 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     display_content = f"{cleaned}{footer}"
     try:
         checkpoints_append_event(STATE_DIR, trace_id, "response", {"trace_id": trace_id, "seed": int(master_seed), "pack_hash": pack_hash, "route_mode": route_mode, "tool_results_count": len(tool_results or []), "content_preview": (display_content or "")[:800]})
-    except Exception:
-        pass
+    except Exception as ex:
+        logging.warning("final.response.checkpoint_failed: %s", ex, exc_info=True)
     # Provide an appendix with raw model answers to avoid any perception of truncation
-        try:
-            raw_q = (qwen_text or "").strip()
-            raw_g = (glm_text or "").strip()
-            raw_d = (deepseek_text or "").strip()
-            appendix_parts: List[str] = []
-            if raw_q or raw_g or raw_d:
-                appendix_parts.append("\n\n### Appendix — Model Answers")
-            if raw_q:
-                appendix_parts.append("\n\n#### Qwen\n" + _shorten(raw_q))
-            if raw_g:
-                appendix_parts.append("\n\n#### GLM4-9B\n" + _shorten(raw_g))
-            if raw_d:
-                appendix_parts.append("\n\n#### DeepSeek Coder\n" + _shorten(raw_d))
-            if appendix_parts:
-                display_content += "".join(appendix_parts)
-        except Exception:
-            pass
+    try:
+        raw_q = (qwen_text or "").strip()
+        raw_g = (glm_text or "").strip()
+        raw_d = (deepseek_text or "").strip()
+        appendix_parts: List[str] = []
+        if raw_q or raw_g or raw_d:
+            appendix_parts.append("\n\n### Appendix — Model Answers")
+        if raw_q:
+            appendix_parts.append("\n\n#### Qwen\n" + _shorten(raw_q))
+        if raw_g:
+            appendix_parts.append("\n\n#### GLM4-9B\n" + _shorten(raw_g))
+        if raw_d:
+            appendix_parts.append("\n\n#### DeepSeek Coder\n" + _shorten(raw_d))
+        if appendix_parts:
+            display_content += "".join(appendix_parts)
+    except Exception as ex:
+        logging.warning("final.appendix.build_failed: %s", ex, exc_info=True)
     # Evaluate fallback after footer creation, but using main-only flags
     if looks_empty or looks_refusal:
-        # Suppress status blocks entirely; do not append any status text
-        pass
+        # For now, log detection without overriding the composed content.
+        logging.info("final.response.empty_or_refusal_detected; no automatic fallback applied")
     # Build artifacts block from tool_results (prefer film2.run)
     artifacts: Dict[str, Any] = {}
     try:
@@ -9636,8 +9718,8 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         if tool_results:
             try:
                 step_texts.append(json.dumps(tool_results, ensure_ascii=False))
-            except Exception:
-                pass
+            except Exception as ex:
+                logging.warning("final.step_texts.tool_results_serialize_failed: %s", ex, exc_info=True)
         if isinstance(qwen_text, str) and qwen_text.strip():
             step_texts.append(qwen_text)
         if isinstance(glm_text, str) and glm_text.strip():
@@ -9693,6 +9775,21 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         response_meta.setdefault("trace_id", str(trace_id))
         if isinstance(conv_cid, (str, int)):
             response_meta.setdefault("cid", str(conv_cid))
+        # Surface planner failures explicitly in the response metadata so callers
+        # are not left with a silent empty plan when the planner/committee path fails.
+        if isinstance(planner_error_payload, dict):
+            errors_list = response_meta.setdefault("errors", [])
+            if isinstance(errors_list, list):
+                errors_list.append(
+                    {
+                        "source": "planner",
+                        "error": planner_error_payload,
+                    }
+                )
+            # Also attach a top-level error when no tool results were produced,
+            # so OpenAI-style clients can detect planner failures directly.
+            if not tool_results and not response.get("error"):
+                response["error"] = planner_error_payload
     if isinstance(final_env, dict) and final_env:
         final_env = _env_bump(final_env); _env_assert(final_env)
         final_env = _env_stamp(final_env, tool=None, model=COMMITTEE_MODEL_ID)
@@ -10507,16 +10604,24 @@ async def v1_icw_pack(body: Dict[str, Any]):
     windows_dir = _windows_dir(job_id)
     # Find prior window for modality
     try:
-        files = sorted([p for p in os.listdir(windows_dir) if p.endswith('.json')])
-    except Exception:
+        files = sorted([p for p in os.listdir(windows_dir) if p.endswith(".json")])
+    except Exception as ex:
+        logging.warning(
+            "v1_icw_pack.listdir_failed windows_dir=%r", windows_dir, exc_info=ex
+        )
         files = []
     last_cap = {}
     for fn in reversed(files):
+        path = os.path.join(windows_dir, fn)
         try:
-            c = _read_json_safe(os.path.join(windows_dir, fn))
+            c = _read_json_safe(path)
             if (c.get("modality") or "").lower() == modality:
-                last_cap = c; break
-        except Exception:
+                last_cap = c
+                break
+        except Exception as ex:
+            logging.warning(
+                "v1_icw_pack.read_window_failed path=%r", path, exc_info=ex
+            )
             continue
     # Anchor-first pack skeleton
     packed = {
@@ -10553,11 +10658,19 @@ async def v1_icw_advance(body: Dict[str, Any]):
         os.makedirs(os.path.dirname(edl_path), exist_ok=True)
         edl = []
         if os.path.exists(edl_path):
-            with open(edl_path, "r", encoding="utf-8") as f: edl = json.load(f)
-        edl.append({"capsule_id": cid, "modality": cap.get("modality"), "timecode": cap.get("timecode")})
-        with open(edl_path, "w", encoding="utf-8") as f: json.dump(edl, f, ensure_ascii=False)
-    except Exception:
-        pass
+            with open(edl_path, "r", encoding="utf-8") as f:
+                edl = json.load(f)
+        edl.append(
+            {
+                "capsule_id": cid,
+                "modality": cap.get("modality"),
+                "timecode": cap.get("timecode"),
+            }
+        )
+        with open(edl_path, "w", encoding="utf-8") as f:
+            json.dump(edl, f, ensure_ascii=False)
+    except Exception as ex:
+        logging.warning("v1_icw_advance.edl_append_failed path=%r", edl_path, exc_info=ex)
     return {"ok": True, "capsule_id": cid}
 
 @app.get("/v1/state/project")
@@ -11639,12 +11752,7 @@ async def _track_comfy_job(job_id: str, prompt_id: str) -> None:
         data = await _comfy_history(prompt_id)
         _jobs_store[job_id]["updated_at"] = time.time()
         _jobs_store[job_id]["last_history"] = data
-        history = (data or {}).get("history", {})
-        if not isinstance(history, dict):
-            # Some ComfyUI builds return {<pid>:{...}} at the top level
-            if isinstance(data, dict):
-                history = data
-        detail = history.get(prompt_id) if isinstance(history, dict) else None
+        detail = _normalize_comfy_history_entry(data if isinstance(data, dict) else {}, prompt_id)
         if isinstance(detail, dict):
             outputs = detail.get("outputs", {}) or {}
             outputs_count = 0
@@ -11837,41 +11945,6 @@ async def _index_job_into_rag(job_id: str) -> None:
             await conn.execute("INSERT INTO rag_docs (path, chunk, embedding) VALUES ($1, $2, $3)", f"job:{job_id}", chunk, list(vec))
 
 
-def _extract_comfy_asset_urls(detail: Dict[str, Any] | str, base_override: Optional[str] = None) -> List[Dict[str, Any]]:
-    if isinstance(detail, str):
-        try:
-            detail = JSONParser().parse_superset(detail, {"outputs": dict, "status": dict})["coerced"]
-        except Exception:
-            detail = {}
-    outputs = (detail or {}).get("outputs", {}) or {}
-    urls: List[Dict[str, Any]] = []
-    base_url = base_override or COMFYUI_API_URL
-    if not base_url:
-        return urls
-    base = base_url.rstrip("/")
-    if isinstance(outputs, dict):
-        for node_id, items in outputs.items():
-            # items are typically lists of {filename, type, subfolder}
-            if isinstance(items, list):
-                for it in items:
-                    if not isinstance(it, dict):
-                        continue
-                    fn = it.get("filename")
-                    tp = it.get("type") or "output"
-                    sub = it.get("subfolder")
-                    if fn:
-                        urls.append(
-                            {
-                                "node": node_id,
-                                "filename": fn,
-                                "type": tp,
-                                "subfolder": sub,
-                                "url": _comfy_view_url(base, fn, tp, sub),
-                            }
-                        )
-    return urls
-
-
 async def _update_scene_from_job(job_id: str, detail: Dict[str, Any] | str, failed: bool = False) -> None:
     pool = await get_pg_pool()
     if pool is None:
@@ -11887,7 +11960,11 @@ async def _update_scene_from_job(job_id: str, detail: Dict[str, Any] | str, fail
             detail = JSONParser().parse_superset(detail, {"outputs": dict, "status": dict})["coerced"]
         except Exception:
             detail = {}
-    assets = {"outputs": (detail or {}).get("outputs", {}), "status": (detail or {}).get("status"), "urls": _extract_comfy_asset_urls(detail, base)}
+    assets = {
+        "outputs": (detail or {}).get("outputs", {}),
+        "status": (detail or {}).get("status"),
+        "urls": _extract_comfy_asset_urls(detail, base or COMFYUI_API_URL or ""),
+    }
     async with pool.acquire() as conn:
         row = await conn.fetchrow("SELECT id, film_id, plan FROM scenes WHERE job_id=$1", job_id)
         if not row:

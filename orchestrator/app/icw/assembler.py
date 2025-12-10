@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import json
+import logging
+import os
 from types import SimpleNamespace
+from typing import Any
+
 from .tokenizer import bytes_len
 from .compress import (
     cleanup_lossless,
@@ -12,8 +17,9 @@ from .compress import (
 from .relevance import score_chunk
 from .continuation import make_system_hint
 from ..rag.hygiene import rag_filter, evidence_binding_footer
-import os
 from ..artifacts.shard import newest_part, list_parts
+
+log = logging.getLogger("orchestrator.icw.assembler")
 
 
 def render_header(entity_header: str) -> str:
@@ -56,13 +62,27 @@ def compress_until_fit(parts: list[str], budget_bytes: int) -> list[str]:
     return parts
 
 
+def _normalize_candidate(c: Any) -> str:
+    if isinstance(c, str):
+        return c
+    if isinstance(c, dict):
+        try:
+            return json.dumps(c, ensure_ascii=False)
+        except Exception:
+            return repr(c)
+    if c is None:
+        return ""
+    return str(c)
+
+
 def assemble_window(request_msg: dict, state: dict, in_limit_bytes: int, step_out_tokens: int):
     """Return a prompt string that fits the byte budget."""
     goal = request_msg.get("content", "")
     anchor = state.get("anchor_text", "")  # recent exact turns (verbatim)
     header = make_entity_header({"entities": state.get("entities", []), "goals": goal})
     # Candidates = history chunks + RAG chunks + artifacts summaries (strings)
-    candidates = list(state.get("candidates", []) or [])
+    raw_candidates = state.get("candidates", []) or []
+    candidates = [_normalize_candidate(c) for c in raw_candidates if c is not None]
     # Optional: append filtered RAG evidence footer at the tail (newest-first)
     retrieved = state.get("retrieved") or state.get("retrieved_chunks") or []
     footer = ""
@@ -71,33 +91,41 @@ def assemble_window(request_msg: dict, state: dict, in_limit_bytes: int, step_ou
             ttl = None
             try:
                 ttl = int(os.getenv("RAG_TTL_SECONDS", "3600"))
-            except Exception:
+            except Exception as exc:  # defensive logging
+                log.error("icw.assembler RAG_TTL_SECONDS parse failed: %s", exc, exc_info=True)
                 ttl = None
             distilled = rag_filter(retrieved, ttl_s=ttl)
             footer = evidence_binding_footer(distilled)
-    except Exception:
-        footer = ""
-    # Artifacts preference (research ledger): include newest shard summary if present
-    try:
-        cid = state.get("cid")
-        if cid:
-            root = os.path.join(os.getenv("UPLOAD_DIR", "/workspace/uploads"), "artifacts", "research", str(cid))
-            latest = newest_part(root, "ledger")
-            if latest:
-                parts.append(render_chunk(f"[Ledger newest] {latest.get('path')} ~{int(latest.get('bytes') or 0)} bytes"))
-                # Summarize older shards as one-liners
-                older = list_parts(root, "ledger")[:-1]
-                for p in older[-5:]:  # cap summaries
-                    sha = (p.get('sha256') or '')
-                    parts.append(render_chunk(f"[Ledger older] {p.get('path')} sha256:{sha[:8]}"))
-    except Exception:
-        pass
+    except Exception as exc:  # defensive logging
+        log.error("icw.assembler RAG footer build failed: %s", exc, exc_info=True)
+        footer = "[RAG] evidence temporarily unavailable due to error."
 
     # Rank by relevance
     ranked = sorted(candidates, key=lambda t: score_chunk(t, goal), reverse=True)
     # Build parts in priority order
     system_hint = make_system_hint(step_out_tokens, state.get("state_hash", ""))
     parts: list[str] = [system_hint, render_anchor(anchor), render_header(header)]
+    # Artifacts preference (research ledger): include newest shard summary if present (best-effort)
+    cid = state.get("cid") if isinstance(state, dict) else None
+    try:
+        if cid:
+            root = os.path.join(os.getenv("UPLOAD_DIR", "/workspace/uploads"), "artifacts", "research", str(cid))
+            latest = newest_part(root, "ledger")
+            if latest:
+                parts.append(
+                    render_chunk(
+                        f"[Ledger newest] {latest.get('path')} ~{int(latest.get('bytes') or 0)} bytes"
+                    )
+                )
+                # Summarize older shards as one-liners
+                older = list_parts(root, "ledger")[:-1]
+                for p in older[-5:]:  # cap summaries
+                    sha = (p.get("sha256") or "")
+                    parts.append(
+                        render_chunk(f"[Ledger older] {p.get('path')} sha256:{sha[:8]}")
+                    )
+    except Exception as exc:  # defensive logging
+        log.error("icw.assembler ledger summary build failed for cid=%r: %s", cid, exc, exc_info=True)
     for c in ranked:
         parts.append(render_chunk(c))
         prompt = _joined(parts)

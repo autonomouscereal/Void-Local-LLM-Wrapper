@@ -159,8 +159,8 @@ async def _get_locked_config(project_id: str) -> Dict[str, Any]:
         row = await db_fetchrow("SELECT config_json FROM film_project WHERE project_uid=$1", project_id)
         if row and isinstance(row.get("config_json"), dict):
             return dict(row.get("config_json"))
-    except Exception:
-        pass
+    except Exception as ex:
+        logging.warning("film2.get_locked_config.db_failed project_id=%s error=%s", project_id, ex, exc_info=True)
     # Try reading plan.json as fallback
     try:
         plan = os.path.join(_proj_dir(project_id), "plan.json")
@@ -168,8 +168,8 @@ async def _get_locked_config(project_id: str) -> Dict[str, Any]:
             with open(plan, "r", encoding="utf-8") as f:
                 _ = json.load(f)
                 # Not authoritative for lock; return empty
-    except Exception:
-        pass
+    except Exception as ex:
+        logging.warning("film2.get_locked_config.plan_read_failed project_id=%s error=%s", project_id, ex, exc_info=True)
     return {}
 
 
@@ -198,8 +198,8 @@ async def _get_manifest(project_id: str, kind: str) -> Optional[Any]:
                 row = await db_fetchrow("SELECT json FROM film_manifest WHERE project_id=$1 AND kind=$2 ORDER BY id DESC LIMIT 1", int(prow["id"]), kind)
                 if row and (row.get("json") is not None):
                     return row.get("json")
-    except Exception:
-        pass
+    except Exception as ex:
+        logging.warning("film2.get_manifest.db_failed project_id=%s kind=%s error=%s", project_id, kind, ex, exc_info=True)
     # Fallback to JSON files under uploads
     try:
         name = {

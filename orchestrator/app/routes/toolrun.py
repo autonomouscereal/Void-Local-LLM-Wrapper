@@ -9,6 +9,10 @@ import base64 as _b64
 from typing import Optional
 from app.state.checkpoints import append_event as checkpoints_append_event
 from app.trace_utils import emit_trace as _emit_trace
+from app.comfy.assets import (
+	normalize_history_entry as _normalize_comfy_history_entry,
+	extract_comfy_asset_urls as _extract_comfy_asset_urls,
+)
 from app.analysis.media import analyze_image as _qa_analyze_image, analyze_image_regions as _qa_analyze_image_regions  # type: ignore
 from app.json_parser import JSONParser
 import httpx
@@ -334,10 +338,6 @@ def patch_workflow_in_place(g: dict, args: dict) -> None:
 		_set_inputs(g, ckpt_nodes[0], ckpt_name=str(model))
 
 
-def _build_view_url(base: str, filename: str, subfolder: str, ftype: str) -> str:
-	return f"{base.rstrip('/')}/view?filename={quote(filename or '')}&subfolder={quote((subfolder or ''))}&type={quote(ftype or 'output')}"
-
-
 STATE_DIR_LOCAL = os.path.join(os.getenv("UPLOAD_DIR", "/workspace/uploads"), "state")
 
 # Runtime guard: force loopback base in host networking even if a container hostname sneaks in
@@ -613,34 +613,11 @@ async def tool_run(req: Request):
 				_first_hist = False
 			if not isinstance(hist, dict):
 				continue
-			# ComfyUI /history responses can appear in multiple shapes depending on
-			# version / plugins:
-			#   1) {"history": { "<pid>": {...} }, ...}
-			#   2) {"<pid>": {...}, ...}
-			#   3) {"outputs": {...}, "status": {...}, ...}  (direct entry)
-			# Normalize to a single entry dict so downstream code doesn't spin
-			# forever looking up hist[prompt_id] when the data lives under 'history'.
-			entry: dict | None = None
-			# Strip helper fields from _get_json (_ok_env wrapper)
-			data_candidates = dict(hist)
-			for k in ("ok", "code", "status", "detail"):
-				data_candidates.pop(k, None)
-			# Shape 1: nested history map
-			hblock = data_candidates.get("history")
-			if isinstance(hblock, dict):
-				entry = hblock.get(prompt_id) or next(iter(hblock.values()), None)
-			# Shape 2: top-level pid key
-			if entry is None and prompt_id in data_candidates:
-				val = data_candidates.get(prompt_id)
-				if isinstance(val, dict):
-					entry = val
-			# Shape 3: direct entry with outputs/status
-			if entry is None and isinstance(data_candidates.get("outputs"), dict):
-				entry = data_candidates
-			if not isinstance(entry, dict):
-				entry = {}
+
+			entry = _normalize_comfy_history_entry(hist, str(prompt_id))
+
 			# Detect terminal error/success states when available
-			status_obj = entry.get("status") or {}
+			status_obj = (entry.get("status") or {}) if isinstance(entry, dict) else {}
 			state = str((status_obj.get("status") or "")).lower()
 			if state in ("error", "failed", "canceled", "cancelled"):
 				return ToolEnvelope.failure(
@@ -650,12 +627,13 @@ async def tool_run(req: Request):
 					request_id=rid,
 					details={"prompt_id": prompt_id, "status": status_obj},
 				)
-			outs = entry.get("outputs") or {}
+
+			outs = (entry or {}).get("outputs") or {}
 			if not outs:
 				# progressive backoff to avoid busy spin
 				_poll_delay = _POLL_MAX if _poll_delay >= _POLL_MAX else min(_POLL_MAX, _poll_delay * 2.0)
 				# If history reports a completed/executed state but no outputs, fail deterministically
-				status_obj = entry.get("status") or {}
+				status_obj = (entry.get("status") or {}) if isinstance(entry, dict) else {}
 				state = str((status_obj.get("status") or "")).lower()
 				if state in ("completed", "success", "executed"):
 					return ToolEnvelope.failure(
@@ -666,18 +644,17 @@ async def tool_run(req: Request):
 						details={"prompt_id": prompt_id, "status": status_obj},
 					)
 				continue
-			for _, out in outs.items():
-				for im in (out.get("images") or []):
-					fn = im.get("filename")
-					sf = im.get("subfolder") or ""
-					tp = im.get("type") or "output"
-					if fn:
-						images.append({
-							"filename": fn,
-							"subfolder": sf,
-							"type": tp,
-							"view_url": _build_view_url(COMFY_BASE, fn, sf, tp),
-						})
+
+			assets = _extract_comfy_asset_urls(entry, COMFY_BASE)
+			for a in assets:
+				images.append(
+					{
+						"filename": a.get("filename"),
+						"subfolder": a.get("subfolder") or "",
+						"type": a.get("type") or "output",
+						"view_url": a.get("url"),
+					}
+				)
 			if images:
 				break
 
