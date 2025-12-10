@@ -7,6 +7,7 @@ import logging, sys, traceback
 from urllib.parse import quote, urlsplit, urlparse
 import base64 as _b64
 from typing import Optional
+from void_envelopes import ToolEnvelope, _build_success_envelope, _build_error_envelope
 from app.state.checkpoints import append_event as checkpoints_append_event
 from app.trace_utils import emit_trace as _emit_trace
 from app.comfy.assets import (
@@ -22,74 +23,6 @@ router = APIRouter()
 log = logging.getLogger("orchestrator.toolrun")
 
 
-def _build_success_envelope(result: dict | None, rid: str) -> dict:
-	"""
-	Canonical success envelope for tool-ish routes.
-	Always includes schema_version, request_id, ok, result, error.
-
-	When a client/conversation id (cid) or trace identifier (trace_id) is present
-	in the result payload, it is also mirrored to the top-level envelope so
-	callers can rely on a stable location for these identifiers across tools.
-	"""
-	res_obj = result or {}
-	cid_val = None
-	trace_val = None
-	if isinstance(res_obj, dict):
-		# cid: prefer top-level, then meta.cid, then meta.ids.client_id
-		cid_val = res_obj.get("cid")
-		# trace_id: prefer top-level, then meta.trace_id, then meta.ids.trace_id
-		trace_val = res_obj.get("trace_id")
-		meta_part = res_obj.get("meta") if isinstance(res_obj.get("meta"), dict) else {}
-		if isinstance(meta_part, dict):
-			if not cid_val:
-				cid_val = meta_part.get("cid") or (meta_part.get("ids") or {}).get("client_id")
-			if not trace_val:
-				trace_val = meta_part.get("trace_id") or (meta_part.get("ids") or {}).get("trace_id")
-	env: dict = {
-		"schema_version": 1,
-		"request_id": rid,
-		"ok": True,
-		"result": res_obj,
-		"error": None,
-	}
-	if isinstance(cid_val, (str, int)):
-		env["cid"] = str(cid_val)
-	if isinstance(trace_val, (str, int)) and str(trace_val).strip():
-		env["trace_id"] = str(trace_val)
-	return env
-
-
-def _build_error_envelope(code: str, message: str, rid: str, status: int, details: dict | None = None) -> dict:
-	"""
-	Canonical error envelope for tool-ish routes.
-	HTTP status is always 200; semantic status lives on error.status.
-	"""
-	err_details = dict(details or {})
-	err_details.setdefault("status", int(status))
-	env: dict = {
-		"schema_version": 1,
-		"request_id": rid,
-		"ok": False,
-		"result": None,
-		"error": {
-			"code": code,
-			"message": message,
-			"status": int(status),
-			"details": err_details,
-		},
-	}
-	# If a cid was provided in details, mirror it at the top level for
-	# consistency with success envelopes. Do the same for trace_id so callers
-	# can correlate errors with traces as robustly as with cid.
-	cid_val = err_details.get("cid")
-	if isinstance(cid_val, (str, int)):
-		env["cid"] = str(cid_val)
-	trace_val = err_details.get("trace_id") or err_details.get("tid")
-	if isinstance(trace_val, (str, int)) and str(trace_val).strip():
-		env["trace_id"] = str(trace_val)
-	return env
-
-
 def _ok_response(result: dict | None, rid: str) -> JSONResponse:
 	return JSONResponse(_build_success_envelope(result or {}, rid), status_code=200)
 
@@ -97,25 +30,6 @@ def _ok_response(result: dict | None, rid: str) -> JSONResponse:
 def _err_response(code: str, message: str, rid: str, status: int = 200, details: dict | None = None) -> JSONResponse:
 	env = _build_error_envelope(code, message, rid, status=status, details=details)
 	return JSONResponse(env, status_code=200)
-
-
-class ToolEnvelope:
-	@staticmethod
-	def success(result: dict, *, request_id: str | None = None) -> JSONResponse:
-		rid = request_id or uuid.uuid4().hex
-		return _ok_response(result, rid)
-
-	@staticmethod
-	def failure(
-		code: str,
-		message: str,
-		*,
-		status: int,
-		details: dict | None = None,
-		request_id: str | None = None,
-	) -> JSONResponse:
-		rid = request_id or uuid.uuid4().hex
-		return _err_response(code, message, rid, status=int(status), details=details)
 
 
 def _ok_env(ok: bool, **kwargs) -> dict:

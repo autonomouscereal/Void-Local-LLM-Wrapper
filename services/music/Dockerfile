@@ -16,7 +16,10 @@ ENV TORCH_CUDA_ARCH_LIST="6.1;7.5;8.0;8.6;8.9"
 
 WORKDIR /app
 
-COPY app /app/app
+# When built via docker-compose, the context is the repo root, so we copy the
+# music app package and the shared envelopes package into /app.
+COPY services/music/app /app/app
+COPY void_envelopes /app/void_envelopes
 
 EXPOSE 7860
 

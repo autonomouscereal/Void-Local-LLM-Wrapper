@@ -8,13 +8,12 @@ from typing import Any, Dict
 
 import numpy as np
 from fastapi import FastAPI
-from fastapi.responses import JSONResponse
 import logging, sys, traceback
 
 logger = logging.getLogger(__name__)
 
 from .music_engine import generate_music
-from orchestrator.app.routes.toolrun import ToolEnvelope  # canonical envelope
+from void_envelopes import ToolEnvelope  # canonical envelope (shared)
 
 
 # Primary music model directory (generic).

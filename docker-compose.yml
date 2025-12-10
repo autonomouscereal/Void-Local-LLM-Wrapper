@@ -483,8 +483,8 @@ services:
 
   music:
     build:
-      context: ./services/music
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: services/music/Dockerfile
     container_name: music_service
     restart: unless-stopped
     runtime: nvidia

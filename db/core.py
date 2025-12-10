@@ -9,6 +9,32 @@ import asyncpg
 _pool: Optional[asyncpg.pool.Pool] = None
 
 
+async def _ensure_base_schema(pool: asyncpg.pool.Pool) -> None:
+    """
+    Best-effort bootstrap for the core Postgres schema.
+
+    This executes the bundled SQL migration (0001_init.sql) against the
+    current database connection. The file is intentionally plain SQL with
+    IF NOT EXISTS guards so it can be safely re-run.
+    """
+    try:
+        migrations_path = os.path.join(
+            os.path.dirname(__file__),
+            "migrations",
+            "0001_init.sql",
+        )
+        if not os.path.exists(migrations_path):
+            return
+        async with pool.acquire() as conn:
+            with open(migrations_path, "r", encoding="utf-8") as f:
+                sql = f.read()
+            if sql.strip():
+                await conn.execute(sql)
+    except Exception:
+        # Schema bootstrap is best-effort; never break the caller on failure.
+        return
+
+
 async def get_pool() -> Optional[asyncpg.pool.Pool]:
     global _pool
     if _pool is not None:
@@ -20,7 +46,18 @@ async def get_pool() -> Optional[asyncpg.pool.Pool]:
     port = int(os.getenv("POSTGRES_PORT", "5432"))
     if not (host and db and user and password):
         return None
-    _pool = await asyncpg.create_pool(host=host, port=port, user=user, password=password, database=db, min_size=1, max_size=10)
+    _pool = await asyncpg.create_pool(
+        host=host,
+        port=port,
+        user=user,
+        password=password,
+        database=db,
+        min_size=1,
+        max_size=10,
+    )
+    # Ensure the core schema (run / artifact / film / teacher / ablation tables)
+    # is present for services that depend on db.core.
+    await _ensure_base_schema(_pool)
     return _pool
 
 

@@ -1198,8 +1198,8 @@ def _get_music_acceptance_thresholds() -> Dict[str, float]:
 app = FastAPI(title="Void Orchestrator", version="0.1.0")
 # Mount canonical tool routes (validate/run) so /tool.run is served by the orchestrator
 from app.routes import toolrun as _toolrun_routes  # type: ignore
+from void_envelopes import ToolEnvelope  # canonical envelope (shared)
 app.include_router(_toolrun_routes.router)
-ToolEnvelope = _toolrun_routes.ToolEnvelope
 # Middleware order matters: last added runs first.
 # We want Preflight to run FIRST, so add it LAST.
 from .middleware.ws_permissive import PermissiveWebSocketMiddleware
@@ -1207,6 +1207,7 @@ app.add_middleware(PermissiveWebSocketMiddleware)
 from .middleware.cors_extra import AppendCommonHeadersMiddleware
 app.add_middleware(AppendCommonHeadersMiddleware)
 from .middleware.preflight import Preflight204Middleware
+
 
 def _json_response(obj: Dict[str, Any], status_code: int = 200) -> Response:
     body = json.dumps(obj, ensure_ascii=False)
@@ -3080,12 +3081,23 @@ async def planner_produce_plan(
         result=res_env,
     )
     schema_steps = {"steps": [{"tool": str, "args": dict}]}
-    parsed_steps = await committee_jsonify(
-        text or "{}",
-        expected_schema=schema_steps,
-        trace_id=str(trace_id or "planner"),
-        temperature=0.0,
-    )
+    # JSONFixer/JSONParser are allowed to be noisy but must not kill planning;
+    # if committee_jsonify ever raises, treat it as an empty plan and let the
+    # caller surface a structured planner error instead of returning a blank 500.
+    try:
+        parsed_steps = await committee_jsonify(
+            text or "{}",
+            expected_schema=schema_steps,
+            trace_id=str(trace_id or "planner"),
+            temperature=0.0,
+        )
+    except Exception as ex:
+        _log(
+            "planner.jsonify.error",
+            trace_id=trace_id,
+            error=str(ex),
+        )
+        parsed_steps = {"steps": []}
     # Log raw planner steps before any normalization/cleanup so we can debug
     # JSONFixer / parser behavior end-to-end.
     _log(
@@ -5497,14 +5509,14 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                         vec = emb.encode([txt])[0]
                         async with pool.acquire() as conn:
                             rel = os.path.relpath(full_path_music, UPLOAD_DIR).replace("\\", "/")
-                            # Store embeddings as JSON text to avoid asyncpg type
-                            # mismatches when the column is declared as text/varchar.
-                            embed_json = json.dumps(list(vec))
+                            # Store embeddings as pgvector-compatible arrays so the
+                            # `embedding` column (vector(1024)) and `<=>` queries in
+                            # rag.core stay in sync with inserts.
                             await conn.execute(
                                 "INSERT INTO rag_docs (path, chunk, embedding) VALUES ($1, $2, $3)",
                                 rel,
                                 txt,
-                                embed_json,
+                                list(vec),
                             )
                 except Exception:
                     logging.info("music RAG insert failed:\n%s", traceback.format_exc())
@@ -8550,12 +8562,21 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 # When we have a known schema (planner-visible tools), use committee_jsonify
                 # to coerce the messy text into strict JSON.
                 if expected_schema:
-                    fixed = await committee_jsonify(
-                        raw_text,
-                        expected_schema=expected_schema,
-                        trace_id=str(trace_id or f"{name or 'tool'}.args"),
-                        temperature=0.0,
-                    )
+                    try:
+                        fixed = await committee_jsonify(
+                            raw_text,
+                            expected_schema=expected_schema,
+                            trace_id=str(trace_id or f"{name or 'tool'}.args"),
+                            temperature=0.0,
+                        )
+                    except Exception as ex:
+                        _log(
+                            "planner.args_jsonify.error",
+                            trace_id=trace_id,
+                            tool=name,
+                            error=str(ex),
+                        )
+                        fixed = {}
                     if isinstance(fixed, dict):
                         args_obj = fixed
                     else:
@@ -8565,12 +8586,21 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                     # committee_jsonify so that LLM-originated JSON always passes
                     # through the JSONFixer path before any JSONParser handling.
                     generic_schema = {"data": dict}
-                    fixed = await committee_jsonify(
-                        raw_text,
-                        expected_schema=generic_schema,
-                        trace_id=str(trace_id or f"{name or 'tool'}.args"),
-                        temperature=0.0,
-                    )
+                    try:
+                        fixed = await committee_jsonify(
+                            raw_text,
+                            expected_schema=generic_schema,
+                            trace_id=str(trace_id or f"{name or 'tool'}.args"),
+                            temperature=0.0,
+                        )
+                    except Exception as ex:
+                        _log(
+                            "planner.args_jsonify.error",
+                            trace_id=trace_id,
+                            tool=name,
+                            error=str(ex),
+                        )
+                        fixed = {}
                     if isinstance(fixed, dict) and isinstance(fixed.get("data"), dict):
                         args_obj = fixed.get("data")  # type: ignore[assignment]
                     else:
@@ -9763,7 +9793,11 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         if isinstance(final_env, dict):
             final_env["tool_calls"] = tc_merged
             final_env["artifacts"] = arts
-    except Exception:
+    except Exception as ex:
+        # Do not let final envelope stitching fail silently; log and fall back
+        # to an empty envelope so the main /v1/chat/completions response still
+        # returns a well-formed JSON body to clients.
+        logging.error("chat.final_env_build_failed: %s", ex, exc_info=True)
         final_env = {}
 
     # Compose final OpenAI-compatible response envelope. The ok flag reflects

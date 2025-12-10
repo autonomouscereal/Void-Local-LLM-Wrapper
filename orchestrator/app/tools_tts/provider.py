@@ -8,7 +8,7 @@ import httpx as _hxsync  # type: ignore
 
 from ..json_parser import JSONParser
 from ..tools import emit_progress
-from ..routes.toolrun import _build_success_envelope, _build_error_envelope
+from void_envelopes import _build_success_envelope, _build_error_envelope
 
 
 class _TTSProvider:

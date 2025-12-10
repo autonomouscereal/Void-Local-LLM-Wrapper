@@ -564,6 +564,36 @@ def _schema_to_template(expected: Any) -> Any:
     return expected
 
 
+def _default_for(expected: Any) -> Any:
+    """
+    Return a JSON-serializable default value for a given expected schema type.
+    """
+    if expected is int:
+        return 0
+    if expected is float:
+        return 0.0
+    if expected is list:
+        return []
+    if expected is dict:
+        return {}
+    return ""
+
+
+def _is_default_scalar(val: Any, typ: Any) -> bool:
+    """
+    Treat "empty" scalar values (0, 0.0, "", None or blank strings) as defaults
+    that should not overwrite richer values from other candidates. Only when no
+    candidate provides a non-default value do we fall back to these.
+    """
+    if typ is int:
+        return not isinstance(val, int) or int(val) == 0
+    if typ is float:
+        return not isinstance(val, (int, float)) or float(val) == 0.0
+    if typ is str:
+        return not isinstance(val, str) or not val.strip()
+    return val is None
+
+
 async def committee_jsonify(
     raw_text: str,
     expected_schema: Any,
@@ -756,32 +786,7 @@ async def committee_jsonify(
             parsed_candidates.append(obj)
 
     # Merge candidates field-wise, preferring the first non-empty value across candidates.
-    def _default_for(expected: Any) -> Any:
-        if expected is int:
-            return 0
-        if expected is float:
-            return 0.0
-        if expected is list:
-            return []
-        if expected is dict:
-            return {}
-        return ""
-
     merged: Dict[str, Any] = {}
-
-    def _is_default_scalar(val: Any, typ: Any) -> bool:
-        """
-        Treat "empty" scalar values (0, 0.0, "", None) as defaults that should
-        not overwrite richer values from other candidates. Only when no
-        candidate provides a non-default value do we fall back to these.
-        """
-        if typ is int:
-            return not isinstance(val, int) or int(val) == 0
-        if typ is float:
-            return not isinstance(val, (int, float)) or float(val) == 0.0
-        if typ is str:
-            return not isinstance(val, str) or not val.strip()
-        return val is None
 
     # For Song Graph wrappers, drop obviously-empty/default song candidates from
     # consideration when at least one non-empty candidate exists, and reorder
