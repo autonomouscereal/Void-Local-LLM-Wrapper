@@ -39,7 +39,6 @@ from PIL import Image, ImageDraw, ImageFont  # type: ignore
 import asyncio as _as
 import asyncio as _asyncio
 import contextlib
-import aiohttp  # type: ignore
 import httpx as _hx  # type: ignore
 import httpx  # type: ignore
 import hashlib as _hl
@@ -68,8 +67,13 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, TypedDi
 import time
 import traceback
 
+# --- Legacy alias shims for older callsites (avoid NameError without touching all usages) ---
+_os = os          # for legacy _os.* uses
+_b = _b64         # for legacy _b.* uses
+_tm = time        # for legacy _tm.time() uses
+# -------------------------------------------------------------------------------------------
+
 ## httpx imported above as _hx
-import requests
 
 from .analysis.media import (
     analyze_audio,
@@ -235,9 +239,6 @@ from .film2.locks import (
 from .image.graph_builder import build_full_graph as _build_full_graph
 from .tools_image.common import ensure_dir as _ensure_dir, sidecar as _sidecar, make_outpaths as _make_outpaths, now_ts as _now_ts
 from .tools_image.refine import build_image_refine_dispatch_args
-from .analysis.media import analyze_image as _analyze_image
-from .artifacts.manifest import add_manifest_row as _man_add, write_manifest_atomic as _man_write
-from .datasets.trace import append_sample as _trace_append
 from .review.referee import build_delta_plan as _committee, postrun_committee_decide
 from .plan.catalog import PLANNER_VISIBLE_TOOLS
 from .qa.segments import (
@@ -255,7 +256,6 @@ from .tools_music.export import append_music_sample as _append_music_sample
 from .tools_music.provider import RestMusicProvider
 from .music.eval import compute_music_eval, get_music_acceptance_thresholds, MUSIC_HERO_QUALITY_MIN, MUSIC_HERO_FIT_MIN
 from functools import partial
-from .context.index import add_artifact as _ctx_add
 from .story import (
     draft_story_graph as _story_draft,
     check_story_consistency as _story_check,
@@ -1821,7 +1821,7 @@ def _fit(texts: List[str], budget: int) -> str:
     return "\n\n".join(acc)
 
 
-def _icw_pack(messages: List[Dict[str, Any]], seed: int, budget_tokens: int = 3500) -> Dict[str, Any]:
+def _icw_pack(messages: List[Dict[str, Any]], seed: int, budget_tokens: int = DEFAULT_NUM_CTX) -> Dict[str, Any]:
     # Inline, deterministic packer with simple multi-signal scoring and graded budget allocation.
     # No network; JSON-only; scores rounded to 1e-6; stable tie-break by sha256.
     # Query = latest user message
@@ -2351,6 +2351,11 @@ async def _jobs_stream_gen(job_id: str, interval_ms: Optional[int] = None):
         if state in ("succeeded", "failed", "cancelled"):
             yield "data: [DONE]\n\n"
             break
+        if state is None:
+            # Treat unknown/malformed snapshots as terminal errors instead of spinning forever.
+            yield 'data: {"error": "invalid_status"}\n\n'
+            yield "data: [DONE]\n\n"
+            break
         await _as.sleep(max(0.01, (interval_ms or 1000) / 1000.0))
 
 
@@ -2539,18 +2544,31 @@ async def propose_search_queries(messages: List[Dict[str, Any]]) -> List[str]:
         "Return each query on its own line with no extra text."
     )
     prompt_messages = messages + [{"role": "user", "content": guidance}]
-    env = await committee_ai_text(
-        prompt_messages,
-        trace_id="search_suggest",
-        temperature=DEFAULT_TEMPERATURE,
-    )
+    try:
+        env = await committee_ai_text(
+            prompt_messages,
+            trace_id="search_suggest",
+            temperature=DEFAULT_TEMPERATURE,
+        )
+    except Exception as ex:
+        # Fail-soft: log and return no suggestions instead of killing the request
+        _log(
+            "search_suggest.exception",
+            trace_id="search_suggest",
+            error=str(ex),
+        )
+        return []
+
     queries: List[str] = []
     if not isinstance(env, dict) or not env.get("ok"):
         # Log committee failure instead of silently returning no suggestions.
         _log(
             "search_suggest.error",
             trace_id="search_suggest",
-            error=(env or {}).get("error") if isinstance(env, dict) else {"code": "committee_invalid_env", "message": str(env)},
+            error=(env or {}).get("error") if isinstance(env, dict) else {
+                "code": "committee_invalid_env",
+                "message": str(env),
+            },
         )
     else:
         res_env = env.get("result") or {}
@@ -2637,10 +2655,19 @@ def meta_prompt(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         "percent_budget": {"icw_pct": [65, 70], "tools_pct": [18, 20], "roe_pct": [5, 10], "misc_pct": [3, 5], "buffer_pct": 5},
         "sweep_plan": ["0-90", "30-120", "60-150+wrap"],
     }
-    co_out = _co_pack(co_env)
+    # Fail-soft: if CO packing fails, log and fall back to original messages
+    try:
+        co_out = _co_pack(co_env)
+    except Exception as ex:
+        _log("meta_prompt.co_pack.error", error=str(ex))
+        return messages
     _rt = co_out.get("ratio_telemetry") or {}
     _log("co.pack", call_kind="committee", alloc=_rt.get("alloc"), used_pct=_rt.get("used_pct"), free_pct=_rt.get("free_pct"))
-    frames = _co_frames_to_msgs(co_out.get("frames") or [])
+    try:
+        frames = _co_frames_to_msgs(co_out.get("frames") or [])
+    except Exception as ex:
+        _log("meta_prompt.co_frames_to_msgs.error", error=str(ex))
+        return messages
     _log("co.frames", call_kind="committee", count=len(frames or []))
     if not frames:
         return messages
@@ -2918,8 +2945,26 @@ async def planner_produce_plan(
     }
     # Log full CO envelope before compression so we can see the exact planner context.
     _log("planner.co_env", trace_id=trace_id, co_env=co_env)
-    co_out = _co_pack(co_env)
-    frames_msgs = _co_frames_to_msgs(co_out.get("frames") or [])
+    try:
+        co_out = _co_pack(co_env)
+    except Exception as ex:
+        _log(
+            "planner.co_pack.error",
+            trace_id=trace_id,
+            error=str(ex),
+        )
+        co_out = {"frames": [], "ratio_telemetry": {}}
+
+    try:
+        frames_msgs = _co_frames_to_msgs(co_out.get("frames") or [])
+    except Exception as ex:
+        _log(
+            "planner.co_frames_to_msgs.error",
+            trace_id=trace_id,
+            error=str(ex),
+        )
+        # Fall back to raw messages if CO framing fails
+        frames_msgs = list(messages or [])
 
     # Inject a real ICW window for planner context instead of relying solely on
     # ICW meta-instructions. This window is built from the current conversation
@@ -3042,11 +3087,28 @@ async def planner_produce_plan(
         trace_id=trace_id,
         messages=plan_messages,
     )
-    env = await committee_ai_text(
-        plan_messages,
-        trace_id=str(trace_id or "planner"),
-        temperature=temperature,
-    )
+    try:
+        env = await committee_ai_text(
+            plan_messages,
+            trace_id=str(trace_id or "planner"),
+            temperature=temperature,
+        )
+    except Exception as ex:
+        # Planner committee call must never explode up to /v1/chat/completions;
+        # surface a structured planner_env instead.
+        _log(
+            "planner.committee_call.error",
+            trace_id=trace_id,
+            error=str(ex),
+        )
+        planner_env = {
+            "ok": False,
+            "error": {
+                "code": "planner_committee_exception",
+                "message": str(ex),
+            },
+        }
+        return "", [], planner_env
     # Normalize planner env so callers can inspect ok/error without losing detail.
     if isinstance(env, dict):
         planner_env: Dict[str, Any] = env
@@ -3450,7 +3512,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         existing = _lock_migrate_music(existing)
         existing = _lock_migrate_tts(existing)
         existing = _lock_migrate_sfx(existing)
-        existing = _lock_migrate_film(existing)
+        existing = _lock_migrate_film2(existing)
         updated_bundle = _apply_audio_mode_updates(existing, update_payload)
         _lock_summarize_all_locks_for_context(_ctx_add, character_id, updated_bundle)
         await _lock_save(character_id, updated_bundle)
@@ -3724,6 +3786,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     "status": 422,
                 },
             }
+
         timecode = a.get("timecode") if isinstance(a.get("timecode"), dict) else {}
         prompt_val = a.get("prompt")
         prompt = str(prompt_val or "").strip() if prompt_val is not None else ""
@@ -3735,6 +3798,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         film_id = a.get("film_id")
         scene_id = a.get("scene_id")
         shot_id = a.get("shot_id")
+
         _trace_append(
             "film2",
             {
@@ -3749,7 +3813,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 "refine_mode": refine_mode,
             },
         )
-        # Derive common parameters from timecode and clip metadata.
+
+        # Derive basic timing from timecode; fall back to a 2s window.
         start_s = float(timecode.get("start_s") or 0.0)
         end_s = float(timecode.get("end_s") or 0.0)
         fps_val = int(timecode.get("fps") or 60)
@@ -3759,7 +3824,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         seconds_val = max(1, int(round(duration_s)))
         width_val = int(a.get("width") or 1920)
         height_val = int(a.get("height") or 1080)
-        # Adjust prompt based on refine_mode to emphasize what needs improvement.
+
+        # Prompt suffix to bias fix mode.
         prompt_suffix = ""
         if refine_mode == "fix_faces":
             prompt_suffix = " | improve facial consistency, correct facial features, match character identity"
@@ -3770,19 +3836,13 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         elif refine_mode == "improve_quality":
             prompt_suffix = " | enhance overall visual quality and temporal stability"
         hv_prompt = (prompt or "") + prompt_suffix
-        # First attempt: frame-level refinement using image tools and ffmpeg.
+
+        # 1) Extract clip frames.
         refined_video_path: Optional[str] = None
-        # Extract clip frames for the target window.
         outdir = os.path.join(UPLOAD_DIR, "artifacts", "video", "refine", segment_id or f"seg-{int(time.time())}")
         frames_dir = os.path.join(outdir, "frames")
         os.makedirs(frames_dir, exist_ok=True)
-        ff_args = [
-            "ffmpeg",
-            "-y",
-            "-i",
-            src,
-        ]
-        # Limit to the specified time window when available.
+        ff_args = ["ffmpeg", "-y", "-i", src]
         if start_s > 0.0:
             ff_args.extend(["-ss", f"{start_s:.3f}"])
         if end_s > start_s:
@@ -3798,174 +3858,204 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     "status": 500,
                 },
             }
-            frame_files = sorted(_glob(os.path.join(frames_dir, "*.png")))
-            # Apply lightweight per-frame cleanup using image tools where available.
-            cleaned_frames: List[str] = []
-            # Optional: per-frame identity scores when a face embedding is available
-            clip_identity_scores: List[float] = []
-            face_ref: Optional[list] = None
-            lock_bundle = locks.get("bundle") if isinstance(locks.get("bundle"), dict) else None
-            if isinstance(lock_bundle, dict):
-                vis = lock_bundle.get("visual")
-                if isinstance(vis, dict):
-                    faces = vis.get("faces")
-                    if isinstance(faces, list) and faces:
-                        emb_block = faces[0].get("embeddings") or {}
-                        if isinstance(emb_block, dict) and isinstance(emb_block.get("id_embedding"), list):
-                            face_ref = emb_block.get("id_embedding")  # type: ignore[assignment]
-                if face_ref is None:
-                    fallback_face = lock_bundle.get("face")
-                    if isinstance(fallback_face, dict) and isinstance(fallback_face.get("embedding"), list):
-                        face_ref = fallback_face.get("embedding")  # type: ignore[assignment]
-            for idx, fp in enumerate(frame_files):
-                cleaned_path = fp
-                frame_sharpness_val: Optional[float] = None
-                # First, try vision_repair-based detection + repair when available.
-                if VISION_REPAIR_API_URL:
-                    det_res = await execute_tool_call({"name": "image.detect", "arguments": {"src": fp, "locks": locks}})
-                    det_out = det_res.get("result") if isinstance(det_res, dict) else {}
-                    regions: List[Dict[str, Any]] = []
-                    if isinstance(det_out, dict):
-                        qual = det_out.get("quality") if isinstance(det_out.get("quality"), dict) else {}
-                        sh_val = qual.get("sharpness")
-                        if isinstance(sh_val, (int, float)):
-                            frame_sharpness_val = float(sh_val)
-                        objs = det_out.get("objects") if isinstance(det_out.get("objects"), list) else []
-                        for ob in objs:
-                            if not isinstance(ob, dict):
-                                continue
-                            bbox = ob.get("bbox")
-                            conf = ob.get("conf")
-                            cls_name = ob.get("class_name")
-                            if not isinstance(bbox, list) or not isinstance(conf, (int, float)):
-                                continue
-                            if refine_mode in ("fix_faces", "fix_lipsync"):
-                                # Focus on person/face-like detections.
-                                if isinstance(cls_name, str) and cls_name.lower() == "person" and conf > 0.5:
-                                    regions.append({"type": "face", "bbox": bbox})
-                            elif refine_mode in ("stabilize_motion", "improve_quality"):
-                                # Generic quality/motion fixes: include all high-confidence objects.
-                                if conf > 0.5:
-                                    regions.append({"type": "object", "bbox": bbox})
-                    if regions:
-                        _trace_append(
-                            "film2",
-                            {
-                                "event": "frame_detect",
-                                "segment_id": segment_id,
-                                "film_id": film_id,
-                                "scene_id": scene_id,
-                                "shot_id": shot_id,
-                                "frame_index": idx,
-                                "regions": regions,
-                                "refine_mode": refine_mode,
-                            },
-                        )
-                    if regions:
-                        rep_args: Dict[str, Any] = {"src": fp, "regions": regions, "mode": refine_mode, "locks": locks}
-                        rep_res = await execute_tool_call({"name": "image.repair", "arguments": rep_args})
-                        rep_out = rep_res.get("result") if isinstance(rep_res, dict) else {}
-                        if isinstance(rep_out, dict):
-                            rp = rep_out.get("repaired_image_path")
-                            if isinstance(rp, str) and rp:
-                                cleaned_path = rp
-                # Fallback to generic cleanup if no repair path produced a better frame.
-                if cleaned_path == fp:
-                    im_args: Dict[str, Any] = {"src": fp}
-                    im_res = await execute_tool_call({"name": "image.cleanup", "arguments": im_args})
-                    if isinstance(im_res, dict) and isinstance(im_res.get("result"), dict):
-                        r = im_res.get("result") or {}
-                        p = r.get("path") or r.get("view_url") or r.get("url")
-                        if isinstance(p, str) and p:
-                            cleaned_path = p
-                cleaned_frames.append(cleaned_path)
-                # Per-frame identity score (best-effort; does not affect control flow).
-                if face_ref is not None:
-                    score = await _compute_face_lock_score(cleaned_path, face_ref)
-                    if isinstance(score, (int, float)):
-                        clip_identity_scores.append(float(score))
-                _trace_append(
-                    "film2",
-                    {
-                        "event": "frame_fix",
-                        "segment_id": segment_id,
-                        "film_id": film_id,
-                        "scene_id": scene_id,
-                        "shot_id": shot_id,
-                        "frame_index": idx,
-                        "source_frame": fp,
-                        "cleaned_frame": cleaned_path,
-                        "refine_mode": refine_mode,
-                    },
-                )
-                # Accumulate per-frame sharpness, if available.
-                if frame_sharpness_val is not None:
-                    sharpness_sum += frame_sharpness_val
-                    sharpness_count += 1
-            if cleaned_frames:
-                # Rebuild clip from cleaned frames.
-                rebuilt_path = os.path.join(outdir, "refined.mp4")
-                # Use ffmpeg to assemble frames at the original fps.
-                proc_rebuild = subprocess.run(
-                    [
-                        "ffmpeg",
-                        "-y",
-                        "-framerate",
-                        str(fps_val),
-                        "-i",
-                        os.path.join(frames_dir, "%06d.png"),
-                        "-c:v",
-                        "libx264",
-                        "yuv420p",
-                        rebuilt_path,
-                    ],
-                    check=False,
-                )
-                if proc_rebuild.returncode != 0:
-                    return {
-                        "name": name,
-                        "error": {
-                            "code": "ffmpeg_rebuild_failed",
-                            "message": f"ffmpeg rebuild exited with code {proc_rebuild.returncode}",
-                            "status": 500,
-                        },
-                    }
-                refined_video_path = rebuilt_path
-                _trace_append(
-                    "film2",
-                    {
-                        "event": "clip_rebuild_success",
-                        "segment_id": segment_id,
-                        "film_id": film_id,
-                        "scene_id": scene_id,
-                        "shot_id": shot_id,
-                        "video_path": rebuilt_path,
-                        "refine_mode": refine_mode,
-                    },
-                )
-            if sharpness_count > 0:
-                clip_sharpness = sharpness_sum / float(sharpness_count)
-            else:
-                clip_sharpness = None
-            # Emit a clip-level identity QA summary when we have scores.
-            if clip_identity_scores:
-                    id_min = min(clip_identity_scores)
-                    id_mean = sum(clip_identity_scores) / float(len(clip_identity_scores))
+
+        frame_files = sorted(_glob(os.path.join(frames_dir, "*.png")))
+        cleaned_frames: List[str] = []
+        clip_identity_scores: List[float] = []
+        sharpness_sum: float = 0.0
+        sharpness_count: int = 0
+
+        # Derive reference face embedding from lock bundle when available
+        face_ref: Optional[list] = None
+        lock_bundle = locks.get("bundle") if isinstance(locks.get("bundle"), dict) else None
+        if isinstance(lock_bundle, dict):
+            vis = lock_bundle.get("visual")
+            if isinstance(vis, dict):
+                faces = vis.get("faces")
+                if isinstance(faces, list) and faces:
+                    emb_block = faces[0].get("embeddings") or {}
+                    if isinstance(emb_block, dict) and isinstance(emb_block.get("id_embedding"), list):
+                        face_ref = emb_block.get("id_embedding")  # type: ignore[assignment]
+            if face_ref is None:
+                fallback_face = lock_bundle.get("face")
+                if isinstance(fallback_face, dict) and isinstance(fallback_face.get("embedding"), list):
+                    face_ref = fallback_face.get("embedding")  # type: ignore[assignment]
+
+        for idx, fp in enumerate(frame_files):
+            cleaned_path = fp
+            frame_sharpness_val: Optional[float] = None
+
+            # 2) Best-effort detection + repair via vision_repair, when configured.
+            if VISION_REPAIR_API_URL:
+                det_res = await execute_tool_call({"name": "image.detect", "arguments": {"src": fp, "locks": locks}})
+                det_out = det_res.get("result") if isinstance(det_res, dict) else {}
+                regions: List[Dict[str, Any]] = []
+                if isinstance(det_out, dict):
+                    qual = det_out.get("quality") if isinstance(det_out.get("quality"), dict) else {}
+                    sh_val = qual.get("sharpness")
+                    if isinstance(sh_val, (int, float)):
+                        frame_sharpness_val = float(sh_val)
+                    objs = det_out.get("objects") if isinstance(det_out.get("objects"), list) else []
+                    for ob in objs:
+                        if not isinstance(ob, dict):
+                            continue
+                        bbox = ob.get("bbox")
+                        conf = ob.get("conf")
+                        cls_name = ob.get("class_name")
+                        if not isinstance(bbox, list) or not isinstance(conf, (int, float)):
+                            continue
+                        if refine_mode in ("fix_faces", "fix_lipsync"):
+                            if isinstance(cls_name, str) and cls_name.lower() == "person" and conf > 0.5:
+                                regions.append({"type": "face", "bbox": bbox})
+                        elif refine_mode in ("stabilize_motion", "improve_quality"):
+                            if conf > 0.5:
+                                regions.append({"type": "object", "bbox": bbox})
+
+                if regions:
                     _trace_append(
                         "film2",
                         {
-                            "event": "clip_identity_qa",
+                            "event": "frame_detect",
                             "segment_id": segment_id,
                             "film_id": film_id,
                             "scene_id": scene_id,
                             "shot_id": shot_id,
-                            "scores": clip_identity_scores,
-                            "min": id_min,
-                            "mean": id_mean,
+                            "frame_index": idx,
+                            "regions": regions,
+                            "refine_mode": refine_mode,
                         },
                     )
+                    rep_args: Dict[str, Any] = {"src": fp, "regions": regions, "mode": refine_mode, "locks": locks}
+                    rep_res = await execute_tool_call({"name": "image.repair", "arguments": rep_args})
+                    rep_out = rep_res.get("result") if isinstance(rep_res, dict) else {}
+                    if isinstance(rep_out, dict):
+                        rp = rep_out.get("repaired_image_path")
+                        if isinstance(rp, str) and rp:
+                            cleaned_path = rp
+
+            # 3) Fallback cleanup if no repair happened
+            if cleaned_path == fp:
+                im_res = await execute_tool_call({"name": "image.cleanup", "arguments": {"src": fp}})
+                if isinstance(im_res, dict) and isinstance(im_res.get("result"), dict):
+                    r = im_res.get("result") or {}
+                    p = r.get("path") or r.get("view_url") or r.get("url")
+                    if isinstance(p, str) and p:
+                        cleaned_path = p
+
+            cleaned_frames.append(cleaned_path)
+
+            # 4) Per-frame identity score (best-effort)
+            if face_ref is not None:
+                score = await _compute_face_lock_score(cleaned_path, face_ref)
+                if isinstance(score, (int, float)):
+                    clip_identity_scores.append(float(score))
+
+            _trace_append(
+                "film2",
+                {
+                    "event": "frame_fix",
+                    "segment_id": segment_id,
+                    "film_id": film_id,
+                    "scene_id": scene_id,
+                    "shot_id": shot_id,
+                    "frame_index": idx,
+                    "source_frame": fp,
+                    "cleaned_frame": cleaned_path,
+                    "refine_mode": refine_mode,
+                },
+            )
+
+            if frame_sharpness_val is not None:
+                sharpness_sum += frame_sharpness_val
+                sharpness_count += 1
+
+        # 5) Rebuild the clip from cleaned frames, if any.
+        clip_sharpness: Optional[float] = None
+        if cleaned_frames:
+            rebuilt_path = os.path.join(outdir, "refined.mp4")
+            proc_rebuild = subprocess.run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-framerate",
+                    str(fps_val),
+                    "-i",
+                    os.path.join(frames_dir, "%06d.png"),
+                    "-c:v",
+                    "libx264",
+                    "yuv420p",
+                    rebuilt_path,
+                ],
+                check=False,
+            )
+            if proc_rebuild.returncode != 0:
+                return {
+                    "name": name,
+                    "error": {
+                        "code": "ffmpeg_rebuild_failed",
+                        "message": f"ffmpeg rebuild exited with code {proc_rebuild.returncode}",
+                        "status": 500,
+                    },
+                }
+            refined_video_path = rebuilt_path
+            _film2_artifact_video(call_trace_id, rebuilt_path)
+            _trace_append(
+                "film2",
+                {
+                    "event": "clip_rebuild_success",
+                    "segment_id": segment_id,
+                    "film_id": film_id,
+                    "scene_id": scene_id,
+                    "shot_id": shot_id,
+                    "video_path": rebuilt_path,
+                    "refine_mode": refine_mode,
+                },
+            )
+
+        if sharpness_count > 0:
+            clip_sharpness = sharpness_sum / float(sharpness_count)
+        else:
+            clip_sharpness = None
+
+        # 6) Clip-level identity QA summary
+        qa_video: Dict[str, Any] = {}
+        if clip_identity_scores:
+            id_min = min(clip_identity_scores)
+            id_mean = sum(clip_identity_scores) / float(len(clip_identity_scores))
+            preset_hero = LOCK_QUALITY_PRESETS.get("hero", LOCK_QUALITY_PRESETS["standard"])
+            try:
+                face_min = float(preset_hero.get("face_min", 0.9))
+            except Exception:
+                face_min = 0.9
+            weak_margin = 0.1 * face_min
+            if id_min >= face_min and id_mean >= face_min:
+                identity_status = "ok"
+            elif id_min >= max(0.0, face_min - weak_margin) and id_mean >= max(0.0, face_min - weak_margin):
+                identity_status = "weak"
+            else:
+                identity_status = "fail"
+            qa_video = {
+                "identity_min": id_min,
+                "identity_mean": id_mean,
+                "identity_status": identity_status,
+            }
+            _trace_append(
+                "film2",
+                {
+                    "event": "clip_identity_qa",
+                    "segment_id": segment_id,
+                    "film_id": film_id,
+                    "scene_id": scene_id,
+                    "shot_id": shot_id,
+                    "scores": clip_identity_scores,
+                    "min": id_min,
+                    "mean": id_mean,
+                },
+            )
+
         video_path: Optional[str] = refined_video_path
-        # Fallback: hv-based refine when frame-level path is unavailable.
+
+        # 7) Hunyuan fallback if frame-level path is unavailable.
         if video_path is None:
             hv_args: Dict[str, Any] = {
                 "prompt": hv_prompt,
@@ -3991,6 +4081,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     path_val = first.get("path") or first.get("view_url") or first.get("url")
                     if isinstance(path_val, str) and path_val:
                         video_path = path_val
+
         result_meta: Dict[str, Any] = {
             "timecode": timecode,
             "locks": locks,
@@ -4000,35 +4091,14 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         artifacts: List[Dict[str, Any]] = []
         if isinstance(video_path, str) and video_path:
             artifacts.append({"kind": "video", "path": video_path})
-        # Optional clip-level identity QA summary for downstream controllers.
-        qa_video: Dict[str, Any] = {}
-        if clip_identity_scores:
-            id_min = min(clip_identity_scores)
-            id_mean = sum(clip_identity_scores) / float(len(clip_identity_scores))
-            # Classify identity health using hero-mode face_min threshold.
-            preset_hero = LOCK_QUALITY_PRESETS.get("hero", LOCK_QUALITY_PRESETS["standard"])
-            try:
-                face_min = float(preset_hero.get("face_min", 0.9))
-            except Exception:
-                face_min = 0.9
-            weak_margin = 0.1 * face_min
-            if id_min >= face_min and id_mean >= face_min:
-                identity_status = "ok"
-            elif id_min >= max(0.0, face_min - weak_margin) and id_mean >= max(0.0, face_min - weak_margin):
-                identity_status = "weak"
-            else:
-                identity_status = "fail"
-            qa_video = {
-                "identity_min": id_min,
-                "identity_mean": id_mean,
-                "identity_status": identity_status,
-            }
+
         out: Dict[str, Any] = {
             "meta": result_meta,
             "artifacts": artifacts,
         }
         if qa_video:
             out["qa"] = {"video": qa_video}
+
         _trace_append(
             "film2",
             {
@@ -8397,9 +8467,22 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     # ICW pack (always-on) — inline; record pack_hash for traces
     pack_hash = None
     # Derive ICW seed deterministically from normalized messages
-    msgs_for_seed = json.dumps([{"role": (m.get("role")), "content": (m.get("content"))} for m in (normalized_msgs or [])], ensure_ascii=False, separators=(",", ":"))
+    msgs_for_seed = json.dumps(
+        [{"role": (m.get("role")), "content": (m.get("content"))} for m in (normalized_msgs or [])],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
     seed_icw = _derive_seed("icw", msgs_for_seed)
-    icw = _icw_pack(normalized_msgs, seed_icw, budget_tokens=3500)
+    try:
+        icw = _icw_pack(normalized_msgs, seed_icw, budget_tokens=DEFAULT_NUM_CTX)
+    except Exception as ex:
+        _log("icw.pack.error", trace_id=trace_id, error=str(ex))
+        icw = {
+            "pack": "",
+            "hash": None,
+            "budget_tokens": DEFAULT_NUM_CTX,
+            "scores_summary": {},
+        }
     pack_text = icw.get("pack") or ""
     if isinstance(pack_text, str) and pack_text.strip():
         messages = [{"role": "system", "content": f"ICW PACK (hash tracked):\n{pack_text[:12000]}"}] + messages
@@ -9255,11 +9338,27 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     # Idempotency fast-path disabled to prevent early returns; defer any cached reuse to finalization if desired
 
     # Use the central committee path to derive a single merged LLM view over exec_messages.
-    llm_env = await committee_ai_text(
-        exec_messages,
-        trace_id=str(trace_id or "executor_summary"),
-        temperature=body.get("temperature") or DEFAULT_TEMPERATURE,
-    )
+    try:
+        llm_env = await committee_ai_text(
+            exec_messages,
+            trace_id=str(trace_id or "executor_summary"),
+            temperature=body.get("temperature") or DEFAULT_TEMPERATURE,
+        )
+    except Exception as ex:
+        _log(
+            "executor.committee_call.error",
+            trace_id=trace_id,
+            error=str(ex),
+        )
+        # Mark pipeline as not-OK so response reflects degraded tool lane
+        pipeline_ok = False
+        llm_env = {
+            "ok": False,
+            "error": {
+                "code": "executor_committee_exception",
+                "message": str(ex),
+            },
+        }
     # Synthesize per-backend result views from the unified committee envelope for fallback logic.
     if isinstance(llm_env, dict):
         err = llm_env.get("error")
@@ -9383,21 +9482,47 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         ]
 
         # Route cross-critique through the committee path as well.
-        qcrit_env = await committee_ai_text(
-            qwen_critique_msg,
-            trace_id=str(trace_id or "code_crit_qwen"),
-            temperature=body.get("temperature") or DEFAULT_TEMPERATURE,
-        )
-        gcrit_env = await committee_ai_text(
-            glm_critique_msg,
-            trace_id=str(trace_id or "code_crit_glm"),
-            temperature=body.get("temperature") or DEFAULT_TEMPERATURE,
-        )
-        dcrit_env = await committee_ai_text(
-            deepseek_critique_msg,
-            trace_id=str(trace_id or "code_crit_deepseek"),
-            temperature=body.get("temperature") or DEFAULT_TEMPERATURE,
-        )
+        try:
+            qcrit_env = await committee_ai_text(
+                qwen_critique_msg,
+                trace_id=str(trace_id or "code_crit_qwen"),
+                temperature=body.get("temperature") or DEFAULT_TEMPERATURE,
+            )
+        except Exception as ex:
+            _log(
+                "debate.qwen_committee.error",
+                trace_id=trace_id,
+                error=str(ex),
+            )
+            qcrit_env = {"ok": False, "error": {"code": "debate_qwen_exception", "message": str(ex)}}
+
+        try:
+            gcrit_env = await committee_ai_text(
+                glm_critique_msg,
+                trace_id=str(trace_id or "code_crit_glm"),
+                temperature=body.get("temperature") or DEFAULT_TEMPERATURE,
+            )
+        except Exception as ex:
+            _log(
+                "debate.glm_committee.error",
+                trace_id=trace_id,
+                error=str(ex),
+            )
+            gcrit_env = {"ok": False, "error": {"code": "debate_glm_exception", "message": str(ex)}}
+
+        try:
+            dcrit_env = await committee_ai_text(
+                deepseek_critique_msg,
+                trace_id=str(trace_id or "code_crit_deepseek"),
+                temperature=body.get("temperature") or DEFAULT_TEMPERATURE,
+            )
+        except Exception as ex:
+            _log(
+                "debate.deepseek_committee.error",
+                trace_id=trace_id,
+                error=str(ex),
+            )
+            dcrit_env = {"ok": False, "error": {"code": "debate_deepseek_exception", "message": str(ex)}}
         qcrit_text = _env_text(qcrit_env)
         gcrit_text = _env_text(gcrit_env)
         dcrit_text = _env_text(dcrit_env)
@@ -9435,10 +9560,36 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         "tel_blocks": [],
     }
     _log("compose.start", trace_id=trace_id, tool_results_count=len(tool_results or []))
-    co_out_final = _co_pack(co_env_final)
+    try:
+        co_out_final = _co_pack(co_env_final)
+    except Exception as ex:
+        _log(
+            "compose.co_pack.error",
+            trace_id=trace_id,
+            error=str(ex),
+        )
+        co_out_final = {"frames": [], "ratio_telemetry": {}, "roe_digest": []}
+
     # Persist updated RoE digest for continuity across turns
-    _roe_save(STATE_DIR, trace_id, co_out_final.get("roe_digest") or [])
-    frames_final = _co_frames_to_msgs(co_out_final.get("frames") or [])
+    try:
+        _roe_save(STATE_DIR, trace_id, co_out_final.get("roe_digest") or [])
+    except Exception as ex:
+        _log(
+            "compose.roe_save.error",
+            trace_id=trace_id,
+            error=str(ex),
+        )
+
+    try:
+        frames_final = _co_frames_to_msgs(co_out_final.get("frames") or [])
+    except Exception as ex:
+        _log(
+            "compose.co_frames_to_msgs.error",
+            trace_id=trace_id,
+            error=str(ex),
+        )
+        frames_final = []
+
     _rtf = co_out_final.get("ratio_telemetry") or {}
     _log("co.pack", trace_id=trace_id, call_kind="compose", alloc=_rtf.get("alloc"), used_pct=_rtf.get("used_pct"), free_pct=_rtf.get("free_pct"))
     _finality = {"role": "system", "content": (
@@ -9491,11 +9642,26 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         final_request = [_finality, _light_qa, _compose, committee_frame, {"role": "user", "content": _compose_instruction}]
 
     # Final synthesis also goes through the committee path.
-    synth_env = await committee_ai_text(
-        final_request,
-        trace_id=str(trace_id or "compose_final"),
-        temperature=body.get("temperature") or DEFAULT_TEMPERATURE,
-    )
+    try:
+        synth_env = await committee_ai_text(
+            final_request,
+            trace_id=str(trace_id or "compose_final"),
+            temperature=body.get("temperature") or DEFAULT_TEMPERATURE,
+        )
+    except Exception as ex:
+        _log(
+            "compose.committee_call.error",
+            trace_id=trace_id,
+            error=str(ex),
+        )
+        pipeline_ok = False
+        synth_env = {
+            "ok": False,
+            "error": {
+                "code": "compose_committee_exception",
+                "message": str(ex),
+            },
+        }
     final_text = ""
     # Prefer the structured synth result when available.
     if isinstance(synth_env, dict) and synth_env.get("ok"):
@@ -11216,17 +11382,21 @@ async def orcjob_stream(job_id: str, interval_ms: Optional[int] = None):
 
 @app.get("/debug")
 async def debug():
-    # Committee-backed sanity check: single ping via committee path.
-    env = await committee_ai_text(
-        [{"role": "user", "content": "ping"}],
-        trace_id="debug_ping",
-        temperature=0.0,
-    )
-    ok = bool(isinstance(env, dict) and env.get("ok"))
-    # Never raise here; always return a small envelope, but include any
-    # structured error so callers can see why the committee ping failed.
-    err = (env or {}).get("error") if isinstance(env, dict) else None
-    return {"committee_ok": ok, "error": err, "envelope": env}
+    try:
+        env = await committee_ai_text(
+            [{"role": "user", "content": "ping"}],
+            trace_id="debug_ping",
+            temperature=0.0,
+        )
+        ok = bool(isinstance(env, dict) and env.get("ok"))
+        err = (env or {}).get("error") if isinstance(env, dict) else None
+        return {"committee_ok": ok, "error": err, "envelope": env}
+    except Exception as ex:
+        return {
+            "committee_ok": False,
+            "error": {"code": "debug_committee_exception", "message": str(ex)},
+            "envelope": None,
+        }
 
 
 @app.get("/v1/models")
