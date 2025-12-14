@@ -1821,7 +1821,9 @@ def _fit(texts: List[str], budget: int) -> str:
     return "\n\n".join(acc)
 
 
-def _icw_pack(messages: List[Dict[str, Any]], seed: int, budget_tokens: int = DEFAULT_NUM_CTX) -> Dict[str, Any]:
+def _icw_pack(messages: List[Dict[str, Any]], seed: int, budget_tokens: Optional[int] = None) -> Dict[str, Any]:
+    if budget_tokens is None:
+        budget_tokens = DEFAULT_NUM_CTX
     # Inline, deterministic packer with simple multi-signal scoring and graded budget allocation.
     # No network; JSON-only; scores rounded to 1e-6; stable tie-break by sha256.
     # Query = latest user message
