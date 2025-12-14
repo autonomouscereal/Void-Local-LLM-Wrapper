@@ -52,7 +52,7 @@ def ingest_file(path: str, vlm_url: str | None = None, whisper_url: str | None =
                 import httpx
                 b64 = _b64_of(path, max_bytes=10_000_000)
                 # TIMEOUTS FORBIDDEN: never pass timeout to HTTP clients
-                with httpx.Client() as client:
+                with httpx.Client(timeout=None, trust_env=False) as client:
                     r = client.post(ocr_url.rstrip("/") + "/ocr", json={"b64": b64, "ext": ext})
                     parser = JSONParser()
                     sup = parser.parse_superset(r.text or "", {"text": str})
@@ -74,7 +74,7 @@ def ingest_file(path: str, vlm_url: str | None = None, whisper_url: str | None =
                 import httpx
                 b64 = _b64_of(path)
                 # TIMEOUTS FORBIDDEN
-                with httpx.Client() as client:
+                with httpx.Client(timeout=None, trust_env=False) as client:
                     r = client.post(vlm_url.rstrip("/") + "/analyze", json={"b64": b64})
                     parser = JSONParser()
                     sup = parser.parse_superset(r.text or "", {"caption": str, "text": str})
@@ -89,7 +89,7 @@ def ingest_file(path: str, vlm_url: str | None = None, whisper_url: str | None =
                 import httpx
                 b64 = _b64_of(path)
                 # TIMEOUTS FORBIDDEN
-                with httpx.Client() as client:
+                with httpx.Client(timeout=None, trust_env=False) as client:
                     r = client.post(ocr_url.rstrip("/") + "/ocr", json={"b64": b64, "ext": ext})
                     parser = JSONParser()
                     sup = parser.parse_superset(r.text or "", {"text": str})
@@ -107,7 +107,7 @@ def ingest_file(path: str, vlm_url: str | None = None, whisper_url: str | None =
                 import httpx
                 b64 = _b64_of(path)
                 # TIMEOUTS FORBIDDEN
-                with httpx.Client() as client:
+                with httpx.Client(timeout=None, trust_env=False) as client:
                     r = client.post(whisper_url.rstrip("/") + "/transcribe", json={"b64": b64})
                     parser = JSONParser()
                     sup = parser.parse_superset(r.text or "", {"text": str, "transcript": str})

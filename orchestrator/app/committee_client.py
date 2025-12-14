@@ -758,7 +758,14 @@ async def committee_jsonify(
             if song_schema is not None:
                 try:
                     sup = parser.parse_superset("{}", expected_schema)
-                except Exception:
+                except Exception as ex2:
+                    log.warning(
+                        "[committee.jsonify] JSONParser exception on fallback trace_id=%s index=%d error=%s",
+                        trace_base,
+                        idx,
+                        str(ex2),
+                        exc_info=True,
+                    )
                     continue
             else:
                 continue

@@ -139,9 +139,9 @@ def _decode_json(value: Any) -> Dict[str, Any]:
 
 
 logging.basicConfig(
-	level=logging.INFO,
-	format="%(asctime)s.%(msecs)03d %(levelname)s %(process)d/%(threadName)s %(name)s %(pathname)s:%(funcName)s:%(lineno)d - %(message)s",
-	datefmt="%Y-%m-%d %H:%M:%S",
+    level=logging.INFO,
+    format="%(asctime)s.%(msecs)03d %(levelname)s %(process)d/%(threadName)s %(name)s %(pathname)s:%(funcName)s:%(lineno)d - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
 @app.exception_handler(Exception)
 async def _unhandled_exception_handler(request: Request, exc: Exception):
@@ -225,37 +225,37 @@ async def _unhandled_exception_handler(request: Request, exc: Exception):
 
 @app.middleware("http")
 async def global_cors_middleware(request: Request, call_next):
-	logging.info("REQ %s %s", request.method, request.url.path)
-	# Preflight short-circuit for any path: respond quickly and add permissive headers
-	if request.method == "OPTIONS":
-		hdrs = {
-			"Access-Control-Allow-Origin": (request.headers.get("origin") or "*"),
-			"Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
-			"Access-Control-Allow-Headers": (request.headers.get("access-control-request-headers") or "*"),
-			"Access-Control-Allow-Credentials": "true",
-			"Access-Control-Expose-Headers": "*",
-			"Access-Control-Allow-Private-Network": "true",
-			"Connection": "close",
-			"Vary": "Origin",
-			"Content-Length": "0",
-		}
-		return Response(status_code=200, headers=hdrs)
-	resp = await call_next(request)
-	logging.info("RES %s %s %s", request.method, request.url.path, getattr(resp, 'status_code', ''))
-	# Inject permissive CORS headers on every response
-	origin = request.headers.get("origin") or "*"
-	resp.headers["Access-Control-Allow-Origin"] = origin
-	resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
-	resp.headers["Access-Control-Allow-Headers"] = "*"
-	resp.headers["Access-Control-Allow-Credentials"] = "true"
-	resp.headers["Access-Control-Expose-Headers"] = "*"
-	resp.headers["Access-Control-Allow-Private-Network"] = "true"
-	resp.headers["Vary"] = "Origin"
-	# Help browsers load media without ORB/CORP issues when proxied through this backend
-	if request.url.path.startswith("/uploads/") or request.url.path.endswith(".mp4") or request.url.path.endswith(".png"):
-		resp.headers.setdefault("Cross-Origin-Resource-Policy", "cross-origin")
-		resp.headers.setdefault("Timing-Allow-Origin", "*")
-	return resp
+    logging.info("REQ %s %s", request.method, request.url.path)
+    # Preflight short-circuit for any path: respond quickly and add permissive headers
+    if request.method == "OPTIONS":
+        hdrs = {
+            "Access-Control-Allow-Origin": (request.headers.get("origin") or "*"),
+            "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+            "Access-Control-Allow-Headers": (request.headers.get("access-control-request-headers") or "*"),
+            "Access-Control-Allow-Credentials": "true",
+            "Access-Control-Expose-Headers": "*",
+            "Access-Control-Allow-Private-Network": "true",
+            "Connection": "close",
+            "Vary": "Origin",
+            "Content-Length": "0",
+        }
+        return Response(status_code=200, headers=hdrs)
+    resp = await call_next(request)
+    logging.info("RES %s %s %s", request.method, request.url.path, getattr(resp, "status_code", ""))
+    # Inject permissive CORS headers on every response
+    origin = request.headers.get("origin") or "*"
+    resp.headers["Access-Control-Allow-Origin"] = origin
+    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+    resp.headers["Access-Control-Allow-Headers"] = "*"
+    resp.headers["Access-Control-Allow-Credentials"] = "true"
+    resp.headers["Access-Control-Expose-Headers"] = "*"
+    resp.headers["Access-Control-Allow-Private-Network"] = "true"
+    resp.headers["Vary"] = "Origin"
+    # Help browsers load media without ORB/CORP issues when proxied through this backend
+    if request.url.path.startswith("/uploads/") or request.url.path.endswith(".mp4") or request.url.path.endswith(".png"):
+        resp.headers.setdefault("Cross-Origin-Resource-Policy", "cross-origin")
+        resp.headers.setdefault("Timing-Allow-Origin", "*")
+    return resp
 
 
 @app.post("/api/conversations")

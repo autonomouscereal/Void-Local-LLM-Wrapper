@@ -51,6 +51,7 @@ class JSONParser:
         json_string = self.attempt_repair(json_string)
 
         # Apply a sequence of parsing strategies, keeping the "best" result.
+        # This is cumulative: every successful strategy is merged into best_result.
         methods = [
             self.method_json_loads,
             self.method_replace_quotes,
@@ -235,6 +236,10 @@ class JSONParser:
         return json_string
 
     def attempt_repair(self, json_string: str) -> str:
+        """
+        Apply a cumulative sequence of text-level repairs.
+        Each step builds on the previous one; nothing is mutually exclusive.
+        """
         json_string = self.correct_common_errors(json_string)
         json_string = self.fix_missing_commas(json_string)
         return json_string
@@ -395,10 +400,30 @@ class JSONParser:
         return self._coerce_scalar(data, expected)
 
     def _coerce_scalar(self, value: Any, expected_type: Any) -> Any:
+        # IMPORTANT: bool is a subclass of int in Python.
+        # Handle bool first so True/False never get accepted as ints/floats.
+        if expected_type is bool:
+            if isinstance(value, bool):
+                return bool(value)
+            # Numeric-ish: 0/1 (or floats) -> bool(int(x))
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                try:
+                    return bool(int(value))
+                except (TypeError, ValueError):
+                    return False
+            # String-ish: common truthy/falsey tokens
+            if isinstance(value, str):
+                low = value.strip().lower()
+                if low in ("true", "1", "yes", "y", "on"):
+                    return True
+                if low in ("false", "0", "no", "n", "off"):
+                    return False
+            return False
+
         if expected_type is int:
-            return value if isinstance(value, int) else 0
+            return value if isinstance(value, int) and not isinstance(value, bool) else 0
         if expected_type is float:
-            return value if isinstance(value, (int, float)) else 0.0
+            return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else 0.0
         if expected_type is list:
             return value if isinstance(value, list) else []
         if expected_type is dict:
@@ -406,6 +431,8 @@ class JSONParser:
         return value if isinstance(value, str) else ""
 
     def default_value(self, expected_type: Any) -> Any:
+        if expected_type == bool:
+            return False
         if expected_type == int:
             return 0
         if expected_type == float:
@@ -419,15 +446,36 @@ class JSONParser:
     def ensure_list_structure(
         self, parsed_json_list: List[Dict[str, Any]], expected_structure: Dict[str, Any]
     ) -> List[Dict[str, Any]]:
+        """
+        Legacy helper retained for compatibility.
+
+        Now implemented via the main coercion engine so it cannot raise
+        TypeError on non-type schema entries. Every item is coerced against
+        the provided expected_structure, and any internal issues are logged
+        via _err instead of raising.
+        """
         result_list: List[Dict[str, Any]] = []
         for item in parsed_json_list:
-            result: Dict[str, Any] = {}
-            for key, expected_type in expected_structure.items():
-                value = item.get(key, self.default_value(expected_type))
-                if not isinstance(value, expected_type):
-                    value = self.default_value(expected_type)
-                result[key] = value
-            result_list.append(result)
+            try:
+                coerced = self._ensure_structure_internal(item, expected_structure)
+                if isinstance(coerced, dict):
+                    result_list.append(coerced)
+                else:
+                    # If coercion yielded a non-dict, fall back to an empty shell.
+                    fallback = self._ensure_structure_internal({}, expected_structure)
+                    if isinstance(fallback, dict):
+                        result_list.append(fallback)
+                    else:
+                        # As a last resort, append an empty dict so callers don't break.
+                        self._err(
+                            "ensure_list_structure: coercion produced non-dict "
+                            "result for item; using {} fallback"
+                        )
+                        result_list.append({})
+            except Exception as exc:
+                self._err(f"ensure_list_structure_item:{exc}")
+                # On error, keep the list length stable with a shaped empty dict.
+                result_list.append({})
         return result_list
 
     def select_best_result(
@@ -466,6 +514,24 @@ class JSONParser:
                         current_best[key] = self.default_value(expected_type)
                     continue
                 # Scalar leaf types (str, int, float, etc.)
+                if expected_type is int:
+                    if isinstance(new_val, int) and not isinstance(new_val, bool):
+                        current_best[key] = new_val
+                    elif key not in current_best:
+                        current_best[key] = self.default_value(expected_type)
+                    continue
+                if expected_type is float:
+                    if isinstance(new_val, (int, float)) and not isinstance(new_val, bool):
+                        current_best[key] = float(new_val)
+                    elif key not in current_best:
+                        current_best[key] = self.default_value(expected_type)
+                    continue
+                if expected_type is bool:
+                    if isinstance(new_val, bool):
+                        current_best[key] = bool(new_val)
+                    elif key not in current_best:
+                        current_best[key] = self.default_value(expected_type)
+                    continue
                 if isinstance(new_val, expected_type):
                     current_best[key] = new_val
                 elif key not in current_best:
@@ -565,10 +631,12 @@ class JSONParser:
         purposes of salvage. We only overwrite such default-ish values; any
         non-default (already sensible) value is left untouched.
         """
+        if expected_type is bool:
+            return not isinstance(value, bool) or value is False
         if expected_type is int:
-            return not isinstance(value, int) or value == 0
+            return not (isinstance(value, int) and not isinstance(value, bool)) or value == 0
         if expected_type is float:
-            return not isinstance(value, (int, float)) or float(value) == 0.0
+            return not (isinstance(value, (int, float)) and not isinstance(value, bool)) or float(value) == 0.0
         if expected_type is str:
             return not isinstance(value, str) or not value.strip()
         if isinstance(value, (list, dict)):
@@ -649,7 +717,9 @@ class JSONParser:
             if expected_type is str:
                 # Collapse excessive whitespace but preserve punctuation.
                 return re.sub(r"\s+", " ", raw)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError) as exc:
+            # Log, but do not raise; salvage is best-effort only.
+            self._err(f"_extract_scalar_from_text:{key}:{exc}")
             return None
         return None
 
@@ -715,5 +785,3 @@ class JSONParser:
         # Surface parser diagnostics through the shared logger so they land
         # in the central orchestrator logs instead of a private file.
         logger.info(f"JSONParser error: {msg}")
-
-

@@ -236,7 +236,7 @@ class Discoverer:
         q = query.strip()
         urls: List[str] = []
         try:
-            async with httpx.AsyncClient() as client:
+            async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
                 r = await client.get("https://duckduckgo.com/html/", params={"q": q})
                 if r.status_code == 200:
                     soup = BeautifulSoup(r.text, "html.parser")
@@ -288,7 +288,7 @@ class Discoverer:
 class FetcherParser:
     @staticmethod
     async def fetch(url: str) -> Tuple[bytes, str]:
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
             r = await client.get(url)
             r.raise_for_status()
             return r.content, r.headers.get("content-type", "application/octet-stream")
@@ -1268,7 +1268,7 @@ async def api_smart_get(body: Dict[str, Any]):
         html = str(mres.get("html") or "")
     else:
         try:
-            async with httpx.AsyncClient() as cli:
+            async with httpx.AsyncClient(timeout=None, trust_env=False) as cli:
                 r = await cli.get(url)
                 status = r.status_code
                 ctype = r.headers.get("content-type", ctype)

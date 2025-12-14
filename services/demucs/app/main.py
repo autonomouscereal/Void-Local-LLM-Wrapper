@@ -28,7 +28,7 @@ def _write_temp_wav(b64: str | None, url: str | None) -> str:
             f.write(base64.b64decode(b64))
         return path
     if isinstance(url, str) and url:
-        with httpx.Client() as c:
+        with httpx.Client(timeout=None, trust_env=False) as c:
             r = c.get(url)
             r.raise_for_status()
             with open(path, "wb") as f:

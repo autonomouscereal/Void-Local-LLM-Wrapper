@@ -436,7 +436,6 @@ async def execute_plan(body: Dict[str, Any]):
         # supplied values so ids remain fully server-controlled.
         rid = plan_obj.get("request_id") if isinstance(plan_obj.get("request_id"), str) else None
         if rid:
-            inputs["cid"] = rid
             inputs["trace_id"] = rid
         sid_local = (step.get("id") or "").strip()
         if sid_local:
@@ -577,10 +576,10 @@ async def run_steps(trace_id: str, request_id: str, steps: list[dict]) -> Dict[s
         for need in (step.get("needs") or []):
             if need in produced and isinstance(produced[need], dict):
                 merged.update(produced[need])
-        # IDs are server-only; overwrite any upstream/model-provided values.
-        if request_id:
-            merged["cid"] = request_id
-            merged["trace_id"] = request_id
+        # Trace id must be stable and come from the /execute payload.
+        # CID should be taken from step args when present; do not fabricate one.
+        if trace_id:
+            merged["trace_id"] = trace_id
         sid_local = (step.get("id") or "").strip()
         if sid_local:
             merged["step_id"] = sid_local
@@ -591,7 +590,7 @@ async def run_steps(trace_id: str, request_id: str, steps: list[dict]) -> Dict[s
     _post_json(ORCHESTRATOR_BASE_URL.rstrip("/") + "/logs/tools.append", {
         "t": int(time.time()*1000),
         "event": "exec_plan_start",
-        "trace_id": request_id,
+        "trace_id": trace_id,
         "steps": len(pending),
     }, expected={})
 
@@ -620,7 +619,7 @@ async def run_steps(trace_id: str, request_id: str, steps: list[dict]) -> Dict[s
         _post_json(ORCHESTRATOR_BASE_URL.rstrip("/") + "/logs/tools.append", {
             "t": int(time.time()*1000),
             "event": "exec_batch_start",
-            "trace_id": request_id,
+            "trace_id": trace_id,
             "items": batch_tools,
         }, expected={})
         for sid in runnable:
@@ -643,19 +642,19 @@ async def run_steps(trace_id: str, request_id: str, steps: list[dict]) -> Dict[s
                 }
                 continue
             args = merge_inputs(step)
+            cid_val = args.get("cid") if isinstance(args, dict) else None
+            cid_val = cid_val.strip() if isinstance(cid_val, str) else None
             t0 = time.time()
-            _post_json(
-                ORCHESTRATOR_BASE_URL.rstrip("/") + "/logs/tools.append",
-                {
-                    "t": int(time.time() * 1000),
-                    "event": "exec_step_start",
-                    "tool": tool_name,
-                    "trace_id": request_id,
-                    "cid": request_id,
-                    "step_id": sid,
-                },
-                expected={},
-            )
+            step_start_payload = {
+                "t": int(time.time() * 1000),
+                "event": "exec_step_start",
+                "tool": tool_name,
+                "trace_id": trace_id,
+                "step_id": sid,
+            }
+            if cid_val:
+                step_start_payload["cid"] = cid_val
+            _post_json(ORCHESTRATOR_BASE_URL.rstrip("/") + "/logs/tools.append", step_start_payload, expected={})
             res = await utc_run_tool(trace_id, sid, tool_name, args)
             ok = False
             # Guard: utc_run_tool must never return None/non-dict; if it does, wrap in a result block
@@ -742,42 +741,47 @@ async def run_steps(trace_id: str, request_id: str, steps: list[dict]) -> Dict[s
             else:
                 produced[sid] = {"name": tool_name, "result": _canonical_tool_result(res or {})}
                 ok = True
-            _post_json(ORCHESTRATOR_BASE_URL.rstrip("/") + "/logs/tools.append", {
+            end_payload = {
                 "t": int(time.time()*1000),
                 "event": "end",
                 "tool": tool_name,
                 "ok": bool(ok),
                 "duration_ms": int((time.time() - t0) * 1000.0),
-                "trace_id": request_id,
-                "cid": request_id,
+                "trace_id": trace_id,
                 "step_id": sid,
                 "error": (None if ok else "tool_error"),
                 "traceback": None,
                 "summary": (_distill_summary(produced.get(sid)) if ok else None),
-            }, expected={})
-            _post_json(ORCHESTRATOR_BASE_URL.rstrip("/") + "/logs/tools.append", {
+            }
+            if cid_val:
+                end_payload["cid"] = cid_val
+            _post_json(ORCHESTRATOR_BASE_URL.rstrip("/") + "/logs/tools.append", end_payload, expected={})
+
+            step_finish_payload = {
                 "t": int(time.time()*1000),
                 "event": "exec_step_finish",
                 "tool": tool_name,
-                "trace_id": request_id,
-                "cid": request_id,
+                "trace_id": trace_id,
                 "step_id": sid,
                 "ok": bool(ok),
-            }, expected={})
+            }
+            if cid_val:
+                step_finish_payload["cid"] = cid_val
+            _post_json(ORCHESTRATOR_BASE_URL.rstrip("/") + "/logs/tools.append", step_finish_payload, expected={})
         for sid in runnable:
             pending.remove(sid)
         logging.info(f"[executor] batch_finish trace_id={trace_id} runnable={batch_tools}")
         _post_json(ORCHESTRATOR_BASE_URL.rstrip("/") + "/logs/tools.append", {
             "t": int(time.time()*1000),
             "event": "exec_batch_finish",
-            "trace_id": request_id,
+            "trace_id": trace_id,
             "items": batch_tools,
         }, expected={})
     logging.info(f"[executor] steps_finish trace_id={trace_id} produced_keys={sorted(list(produced.keys()))}")
     _post_json(ORCHESTRATOR_BASE_URL.rstrip("/") + "/logs/tools.append", {
         "t": int(time.time()*1000),
         "event": "exec_plan_finish",
-        "trace_id": request_id,
+        "trace_id": trace_id,
         "produced_keys": sorted(list(produced.keys())),
     }, expected={})
     return produced
