@@ -86,8 +86,7 @@ def export_research(dst_dir: str) -> Dict[str, Any]:
         with open(idx, "r", encoding="utf-8") as fh:
             parser = JSONParser()
             schema = {"parts": list}
-            sup = parser.parse_superset(fh.read(), schema)
-            parsed = sup["coerced"]
+            parsed = parser.parse(fh.read(), schema)
             parts = parsed if isinstance(parsed, dict) else {}
         fam = {"root": base, "index": _copy(idx, os.path.join(dst_dir, os.path.relpath(idx, "/workspace/uploads/artifacts/research"))), "parts": []}
         for pr in (parts.get("parts") or []):

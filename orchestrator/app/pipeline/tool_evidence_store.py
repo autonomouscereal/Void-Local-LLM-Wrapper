@@ -57,7 +57,7 @@ def load_recent_tool_evidence(state_dir: str, trace_id: str, limit: int = 4) -> 
             if not line:
                 continue
             # Evidence rows are arbitrary dicts; coerce to generic mapping.
-            obj = parser.parse_superset(line, dict)["coerced"]
+            obj = parser.parse(line, {})
             if isinstance(obj, dict):
                 entries.append(obj)
     # Return last 'limit' entries in reverse chronological order

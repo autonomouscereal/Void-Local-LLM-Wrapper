@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Dict, Any
 import os
 import traceback
+import uuid
 
 import httpx as _hxsync  # type: ignore
 
@@ -24,6 +25,8 @@ class _TTSProvider:
 
     def speak(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         trace_id = payload.get("trace_id") if isinstance(payload.get("trace_id"), str) else "tt_xtts_unknown"
+        request_id = payload.get("request_id") if isinstance(payload.get("request_id"), str) and payload.get("request_id") else None
+        rid = request_id or uuid.uuid4().hex
         emit_progress({"stage": "request", "target": "xtts"})
         # Ensure language is always set; default to English if absent.
         lang = payload.get("language")
@@ -34,9 +37,9 @@ class _TTSProvider:
             return _build_error_envelope(
                 "xtts_unconfigured",
                 "XTTS_API_URL is not configured for TTS provider.",
-                trace_id,
+                rid,
                 status=500,
-                details={"stack": "".join(traceback.format_stack())},
+                details={"trace_id": trace_id, "stack": "".join(traceback.format_stack())},
             )
         with _hxsync.Client(timeout=None, trust_env=False) as client:
             r = client.post(base + "/tts", json=payload)
@@ -46,7 +49,7 @@ class _TTSProvider:
                 # XTTS service returns a canonical envelope: decode audio and adapt to internal shape.
                 if "application/json" in ct:
                     parser = JSONParser()
-                    env = parser.parse_superset(
+                    env = parser.parse(
                         r.text or "",
                         {
                             "schema_version": int,
@@ -91,15 +94,16 @@ class _TTSProvider:
                         "voice": payload.get("voice"),
                         "xtts_speaker": xtts_speaker,
                         "segment_id": segment_id,
+                        "trace_id": trace_id,
                     }
-                    return _build_success_envelope(result, trace_id)
+                    return _build_success_envelope(result, rid)
                 # Any non-ok env from XTTS is wrapped as a tool error.
                 return _build_error_envelope(
                     "tts_invalid_envelope",
                     "XTTS /tts returned non-ok envelope",
-                    trace_id,
+                    rid,
                     status=status,
-                    details={"raw": env, "stack": "".join(traceback.format_stack())},
+                    details={"trace_id": trace_id, "raw": env, "stack": "".join(traceback.format_stack())},
                 )
             # Non-2xx status: construct error envelope.
             raw_body = r.text
@@ -108,13 +112,14 @@ class _TTSProvider:
                 # Best-effort parse of error bodies from XTTS; we treat the
                 # whole object as an untyped mapping here.
                 parser = JSONParser()
-                data = parser.parse_superset(raw_body or "", dict)["coerced"]
+                data = parser.parse(raw_body or "", {})
             return _build_error_envelope(
                 "tts_http_error",
                 "XTTS /tts returned non-2xx or invalid body",
-                trace_id,
+                rid,
                 status=status,
                 details={
+                    "trace_id": trace_id,
                     "raw": data if data is not None else {"body": raw_body},
                     "stack": "".join(traceback.format_stack()),
                 },

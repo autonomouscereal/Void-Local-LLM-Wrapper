@@ -57,8 +57,7 @@ def append_sample(kind: str, row: Dict[str, Any]) -> str:
         with open(idx_path, "r", encoding="utf-8") as f:
             parser = JSONParser()
             # Index is an arbitrary dict; coerce to generic mapping.
-            sup = parser.parse_superset(f.read(), dict)
-            parsed = sup["coerced"]
+            parsed = parser.parse(f.read(), {})
             idx = parsed if isinstance(parsed, dict) else {}
     sz = os.path.getsize(path) if os.path.exists(path) else 0
     idx[kind] = {"path": _public_url(path.replace(UPLOAD_DIR, "/uploads")), "size_bytes": int(sz)}

@@ -26,7 +26,7 @@ try:
     # Optional; only used when render_fetch is invoked
     from playwright.async_api import async_playwright  # type: ignore
     _HAS_PLAYWRIGHT = True
-except Exception:
+except ImportError:
     _HAS_PLAYWRIGHT = False
 
 
@@ -72,7 +72,8 @@ def _robots_allowed(url: str, ua: str = "VoidBot/1.0") -> bool:
             try:
                 rpp.set_url(robots_url)
                 rpp.read()
-            except Exception:
+            except Exception as ex:
+                logging.debug("robots.read_failed url=%s: %s", robots_url, ex, exc_info=True)
                 rpp = None  # type: ignore
             if rpp is None:
                 _ROBOTS_CACHE[base] = (now, urllib.robotparser.RobotFileParser())
@@ -83,7 +84,8 @@ def _robots_allowed(url: str, ua: str = "VoidBot/1.0") -> bool:
         if rp is None:
             return True
         return rp.can_fetch(ua, url)
-    except Exception:
+    except Exception as ex:
+        logging.debug("robots.allowed_failed url=%s: %s", url, ex, exc_info=True)
         return True
 
 
@@ -98,7 +100,8 @@ def _transcribe_with_whisper(wav_path: str) -> str:
             r = httpx.post(WHISPER_URL, files={"file": ("a.wav", f, "audio/wav")})
         r.raise_for_status()
         return (r.json() or {}).get("text", "")
-    except Exception:
+    except Exception as ex:
+        logging.warning("whisper.transcribe_failed path=%s: %s", wav_path, ex, exc_info=True)
         return ""
 
 async def _ocr_images(paths: list[str]) -> list[dict]:
@@ -110,17 +113,17 @@ async def _ocr_images(paths: list[str]) -> list[dict]:
                     r = await cli.post(OCR_URL, files={"file": ("f.png", f, "image/png")})
                 if r.status_code == 200:
                     out.append(r.json())
-    except Exception:
+    except Exception as ex:
+        logging.warning("ocr.batch_failed count=%s: %s", len(paths or []), ex, exc_info=True)
         return out
     return out
 
 
 
 def _safe_get(d: Dict[str, Any], k: str, default: Any = None) -> Any:
-    try:
-        return d.get(k, default)
-    except Exception:
+    if not isinstance(d, dict):
         return default
+    return d.get(k, default)
 
 
 def _parse_date_ymd(s: Optional[str]) -> Optional[datetime]:
@@ -128,16 +131,12 @@ def _parse_date_ymd(s: Optional[str]) -> Optional[datetime]:
         return None
     try:
         return datetime.strptime(s[:10], "%Y-%m-%d").replace(tzinfo=timezone.utc)
-    except Exception:
+    except ValueError:
         return None
 
 
 def _domain_from_url(url: str) -> str:
-    try:
-        from urllib.parse import urlparse
-        return (urlparse(url).netloc or "").lower()
-    except Exception:
-        return ""
+    return (urllib.parse.urlparse(url).netloc or "").lower()
 
 
 def _owner_from_domain(domain: str) -> str:
@@ -187,13 +186,9 @@ ENGINE_WEIGHTS = {
 
 
 def _canonical_id(url: str) -> str:
-    try:
-        from urllib.parse import urlparse
-        u = DeduperNormalizer.canonical_url(url)
-        p = urlparse(u)
-        return (p.netloc + p.path).lower()
-    except Exception:
-        return url.lower()
+    u = DeduperNormalizer.canonical_url(url)
+    p = urllib.parse.urlparse(u)
+    return (p.netloc + p.path).lower()
 
 
 def _rrf_fuse(results_by_engine: Dict[str, List[Dict[str, Any]]], weights: Dict[str, float], k: int = 60) -> List[Dict[str, Any]]:
@@ -244,7 +239,8 @@ class Discoverer:
                         href = a.get("href")
                         if isinstance(href, str) and href.startswith("http"):
                             urls.append(href)
-        except Exception:
+        except httpx.HTTPError as ex:
+            logging.warning("discover.ddg_failed query=%s: %s", q, ex, exc_info=True)
             urls = []
         # Deterministic truncation and domain enforcement
         allow = set([d.lower() for d in (domains_allow or [])])
@@ -316,7 +312,8 @@ class FetcherParser:
                     for r in rows:
                         cw.writerow(r)
                     tables.append({"csv": buf.getvalue()})
-        except Exception:
+        except Exception as ex:
+            logging.debug("parse_html.failed: %s", ex, exc_info=True)
             text = ""
         return text, tables
 
@@ -327,15 +324,17 @@ class FetcherParser:
             from pdfminer.high_level import extract_text
             text = extract_text(io.BytesIO(raw)) or ""
             return text, []
-        except Exception:
+        except ImportError:
+            return "", []
+        except Exception as ex:
+            logging.warning("parse_pdf.failed: %s", ex, exc_info=True)
             return "", []
 
     @staticmethod
     def extract_metadata(raw_or_html: Any) -> Dict[str, Any]:
-        try:
-            html = raw_or_html if isinstance(raw_or_html, str) else raw_or_html.decode("utf-8", "replace")
-        except Exception:
-            html = ""
+        html = raw_or_html if isinstance(raw_or_html, str) else (
+            raw_or_html.decode("utf-8", "replace") if isinstance(raw_or_html, (bytes, bytearray, memoryview)) else str(raw_or_html or "")
+        )
         out: Dict[str, Any] = {"title": "", "author": "", "date": "", "og": {}, "jsonld": []}
         try:
             soup = BeautifulSoup(html, "html.parser")
@@ -371,19 +370,16 @@ class FetcherParser:
 
             parser = JSONParser()
             for sc in soup.select('script[type="application/ld+json"]'):
-                try:
-                    sup = parser.parse_superset(sc.get_text() or "{}", {})
-                    js = sup.get("coerced") or {}
-                    if isinstance(js, dict):
-                        jsonld_list.append(js)
-                    elif isinstance(js, list):
-                        for it in js:
-                            if isinstance(it, dict):
-                                jsonld_list.append(it)
-                except Exception:
-                    continue
+                js = parser.parse(sc.get_text() or "{}", {}) or {}
+                if isinstance(js, dict):
+                    jsonld_list.append(js)
+                elif isinstance(js, list):
+                    for it in js:
+                        if isinstance(it, dict):
+                            jsonld_list.append(it)
             out["jsonld"] = jsonld_list
-        except Exception:
+        except Exception as ex:
+            logging.debug("extract_metadata.failed: %s", ex, exc_info=True)
             return out
         return out
 
@@ -756,23 +752,27 @@ async def research_collect(body: Dict[str, Any]):
                 fetch_mode = "media"
             elif kind == "pdf":
                 try:
-                    with open(mres.get("pdf_path"), "rb") as f:
+                    pdf_path = mres.get("pdf_path")
+                    with open(str(pdf_path), "rb") as f:
                         raw = f.read()
                     ctype = "application/pdf"
                     text, tables = FetcherParser.parse_pdf(raw)
-                except Exception:
+                except (OSError, TypeError, ValueError) as ex:
+                    logging.debug("fetch.loop.pdf_local_read_failed url=%s: %s", url, ex, exc_info=True)
                     raw, ctype = await FetcherParser.fetch(url)
                 fetch_mode = "httpx"
             elif kind == "image":
                 try:
-                    with open(mres.get("image_path"), "rb") as f:
+                    image_path = mres.get("image_path")
+                    with open(str(image_path), "rb") as f:
                         raw = f.read()
                     ctype = "image/octet-stream"
                     # optional OCR: enable by modes["ocr"]
                     if bool(modes.get("ocr", False)):
                         o = await _ocr_images([mres.get("image_path")])
                         text = json.dumps(o) if o else ""
-                except Exception:
+                except (OSError, TypeError, ValueError) as ex:
+                    logging.debug("fetch.loop.image_local_read_failed url=%s: %s", url, ex, exc_info=True)
                     raw, ctype = await FetcherParser.fetch(url)
                 fetch_mode = "httpx"
             elif kind == "html":
@@ -785,24 +785,23 @@ async def research_collect(body: Dict[str, Any]):
                 # unknown kind: fallback
                 raw, ctype = await FetcherParser.fetch(url)
                 fetch_mode = "httpx"
-        except Exception:
+        except Exception as ex:
+            logging.warning("fetch.loop.primary_failed url=%s: %s", url, ex, exc_info=True)
             try:
                 raw, ctype = await FetcherParser.fetch(url)
                 fetch_mode = "httpx"
-            except Exception:
+            except Exception as ex2:
+                logging.warning("fetch.loop.fallback_failed url=%s: %s", url, ex2, exc_info=True)
                 continue
         # Heuristics: escalate to browser render when HTML appears script-heavy or too small
         def _should_render_html(html_text: str) -> bool:
-            try:
-                tlen = len(html_text or "")
-                if tlen < 2048:
-                    return True
-                sl = html_text.lower()
-                sc = sl.count("<script")
-                # crude script-to-length heuristic
-                return (sc >= 10) or (sc > 0 and (sc * 150) > tlen)
-            except Exception:
-                return False
+            tlen = len(html_text or "")
+            if tlen < 2048:
+                return True
+            sl = (html_text or "").lower()
+            sc = sl.count("<script")
+            # crude script-to-length heuristic
+            return (sc >= 10) or (sc > 0 and (sc * 150) > tlen)
         size = len(raw)
         bytes_total += size
         if (bytes_total / (1024 * 1024)) > max_fetch_mb:
@@ -813,11 +812,7 @@ async def research_collect(body: Dict[str, Any]):
                 text, tables = FetcherParser.parse_pdf(raw)
             elif modes.get("web", True):
                 # Prefer browser render for dynamic pages
-                html_guess = ""
-                try:
-                    html_guess = raw.decode("utf-8", "replace")
-                except Exception:
-                    html_guess = ""
+                html_guess = raw.decode("utf-8", "replace")
                 did_render = False
                 if _should_render_html(html_guess) and _HAS_PLAYWRIGHT:
                     try:
@@ -828,7 +823,8 @@ async def research_collect(body: Dict[str, Any]):
                             did_render = True
                             fetch_mode = "browser"
                             render_signals = rres.get("signals") or {}
-                    except Exception:
+                    except Exception as ex:
+                        logging.debug("fetch.loop.render_failed url=%s: %s", url, ex, exc_info=True)
                         did_render = False
                 if not did_render:
                     text, tables = FetcherParser.parse_html(raw)
@@ -1097,8 +1093,8 @@ async def render_fetch(url: str, opts: Dict[str, Any] | None = None) -> Dict[str
             if extra_headers:
                 try:
                     await ctx.set_extra_http_headers({str(k): str(v) for k, v in extra_headers.items()})
-                except Exception:
-                    pass
+                except Exception as ex:
+                    logging.debug("render_fetch.headers_failed url=%s: %s", url, ex, exc_info=True)
             page = await ctx.new_page()
             resp = await page.goto(url, wait_until="domcontentloaded", timeout=0)
             try:
@@ -1106,26 +1102,28 @@ async def render_fetch(url: str, opts: Dict[str, Any] | None = None) -> Dict[str
                 btn = await page.query_selector("button:has-text('Accept'), button:has-text('I agree')")
                 if btn:
                     await btn.click(timeout=0)
-            except Exception:
-                pass
+            except Exception as ex:
+                logging.debug("render_fetch.consent_click_failed url=%s: %s", url, ex, exc_info=True)
             if scroll_max > 0:
                 signals["scrolled"] = True
                 for _ in range(max(0, scroll_max)):
                     try:
                         await page.evaluate("window.scrollBy(0, Math.max(400, window.innerHeight*0.8));")
                         await page.wait_for_timeout(scroll_sleep_ms)
-                    except Exception:
+                    except Exception as ex:
+                        logging.debug("render_fetch.scroll_failed url=%s: %s", url, ex, exc_info=True)
                         break
             try:
                 await page.wait_for_load_state("networkidle", timeout=0)
-            except Exception:
-                pass
+            except Exception as ex:
+                logging.debug("render_fetch.networkidle_wait_failed url=%s: %s", url, ex, exc_info=True)
             html = await page.content()
             title = (await page.title()) or ""
             body_text = ""
             try:
                 body_text = await page.evaluate("document.body ? document.body.innerText : ''")
-            except Exception:
+            except Exception as ex:
+                logging.debug("render_fetch.body_text_failed url=%s: %s", url, ex, exc_info=True)
                 body_text = ""
             # Challenge detection
             low = (title + " " + body_text).lower()
@@ -1139,7 +1137,8 @@ async def render_fetch(url: str, opts: Dict[str, Any] | None = None) -> Dict[str
                     png = await page.screenshot(full_page=True)
                     name = f"render_{int(time.time())}_{_sha256_str(url)[:8]}.png"
                     screenshot_url = _save_bytes(name, png)
-                except Exception:
+                except Exception as ex:
+                    logging.debug("render_fetch.screenshot_failed url=%s: %s", url, ex, exc_info=True)
                     screenshot_url = None
             await ctx.close()
             await browser.close()
@@ -1195,11 +1194,8 @@ async def api_smart_get(body: Dict[str, Any]):
     if not url:
         return {"ok": False, "error": {"code": "missing_url", "message": "url is required"}}
     # robots gate
-    try:
-        if not _robots_allowed(url):
-            return {"ok": False, "fetch_mode": "robots", "signals": {"blocked": True, "note": "robots disallow"}, "error": {"code": "robots", "message": "robots.txt disallows fetch"}}
-    except Exception:
-        pass
+    if not _robots_allowed(url):
+        return {"ok": False, "fetch_mode": "robots", "signals": {"blocked": True, "note": "robots disallow"}, "error": {"code": "robots", "message": "robots.txt disallows fetch"}}
     # classify via media resolver (includes HTML fallback)
     try:
         mres = resolve_media(url)
@@ -1211,10 +1207,7 @@ async def api_smart_get(body: Dict[str, Any]):
         wav_path = mres.get("audio_wav")
         text = ""
         if bool(modes.get("audio", True)) and wav_path:
-            try:
-                text = _transcribe_with_whisper(wav_path) or ""
-            except Exception:
-                text = ""
+            text = _transcribe_with_whisper(wav_path) or ""
         return {
             "ok": True,
             "fetch_mode": "media",
@@ -1273,19 +1266,17 @@ async def api_smart_get(body: Dict[str, Any]):
                 status = r.status_code
                 ctype = r.headers.get("content-type", ctype)
                 html = r.text if "html" in (ctype or "") else ""
-        except Exception:
+        except httpx.HTTPError as ex:
+            logging.warning("smart_get.http_fetch_failed url=%s: %s", url, ex, exc_info=True)
             html = ""
     # Decide to render
     def _should_render_html(html_text: str) -> bool:
-        try:
-            tlen = len(html_text or "")
-            if tlen < 2048:
-                return True
-            sl = html_text.lower()
-            sc = sl.count("<script")
-            return (sc >= 10) or (sc > 0 and (sc * 150) > tlen)
-        except Exception:
-            return False
+        tlen = len(html_text or "")
+        if tlen < 2048:
+            return True
+        sl = (html_text or "").lower()
+        sc = sl.count("<script")
+        return (sc >= 10) or (sc > 0 and (sc * 150) > tlen)
     if bool(modes.get("render")) or _should_render_html(html):
         rres = await render_fetch(url, {"scroll_max": 3, "wait_networkidle_ms": 3000, "screenshot": True, "headers": headers})
         signals = rres.get("signals") or {}

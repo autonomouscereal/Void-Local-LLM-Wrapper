@@ -41,15 +41,13 @@ def _yt_dlp_info(url: str) -> Dict[str, Any]:
         cmd += ["--cookies", COOKIES_FILE]
     if HEADERS_JSON:
         parser = JSONParser()
-        sup = parser.parse_superset(HEADERS_JSON, {})
-        hdrs = sup.get("coerced") or {}
+        hdrs = parser.parse(HEADERS_JSON, {}) or {}
         if isinstance(hdrs, dict):
             for k, v in hdrs.items():
                 cmd += ["--add-header", f"{k}:{v}"]
     p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     parser = JSONParser()
-    sup = parser.parse_superset(p.stdout or "{}", {})
-    obj = sup.get("coerced") or {}
+    obj = parser.parse(p.stdout or "{}", {}) or {}
     return obj if isinstance(obj, dict) else {}
 
 
@@ -58,8 +56,7 @@ def _http_get(url: str, max_bytes: int = 32 * 1024 * 1024, timeout: int | None =
     headers = {"User-Agent": DEFAULT_USER_AGENT}
     if HEADERS_JSON:
         parser = JSONParser()
-        sup = parser.parse_superset(HEADERS_JSON, {})
-        hdrs = sup.get("coerced") or {}
+        hdrs = parser.parse(HEADERS_JSON, {}) or {}
         if isinstance(hdrs, dict):
             headers.update(hdrs)
     with httpx.Client(timeout=timeout, follow_redirects=True) as cli:

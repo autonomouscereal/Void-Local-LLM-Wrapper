@@ -176,7 +176,22 @@ async def postrun_committee_decide(
     if isinstance(env_decide, dict) and env_decide.get("ok"):
         res_decide = env_decide.get("result") or {}
         txt_decide = res_decide.get("text") or ""
-        schema_decide = {"action": str, "rationale": str, "patch_plan": [{"tool": str, "args": dict}]}
+        # IMPORTANT: patch args can be dict OR JSON string OR other scalar-ish values.
+        # Use `object` passthrough so we do not drop/overwrite LLM-provided fields.
+        schema_decide = {
+            "action": str,
+            "rationale": str,
+            "patch_plan": [
+                {
+                    "tool": str,
+                    "name": str,
+                    "id": str,
+                    "args": object,
+                    "arguments": object,
+                    "meta": dict,
+                }
+            ],
+        }
         obj = await committee_jsonify(
             txt_decide or "{}",
             expected_schema=schema_decide,

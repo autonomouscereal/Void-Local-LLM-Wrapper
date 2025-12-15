@@ -25,10 +25,10 @@ async def tools_append(req: Request):
         "tool": str,
         "payload": dict,
     }
-    body = parser.parse_superset(
+    body = parser.parse(
         raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw or ""),
         schema,
-    )["coerced"]
+    )
     trace_id = str(body.get("trace_id") or body.get("tid") or "unknown") if isinstance(body, dict) else "unknown"
     entry = {
         "t": int(time.time() * 1000),

@@ -38,8 +38,7 @@ def load_checkpoint(cid: str) -> Checkpoint:
         with open(_cp_path(cid), "r", encoding="utf-8") as f:
             parser = JSONParser()
             schema = {"phase": int, "extra": dict}
-            sup = parser.parse_superset(f.read(), schema)
-            js = sup["coerced"]
+            js = parser.parse(f.read(), schema)
             return Checkpoint(
                 cid=cid,
                 phase=int(js.get("phase", 0)),
@@ -75,8 +74,7 @@ def mark_shot_done(cid: str, shot_id: str) -> None:
             with open(p, "r", encoding="utf-8") as f:
                 parser = JSONParser()
                 schema = [str]
-                sup = parser.parse_superset(f.read(), schema)
-                parsed = sup["coerced"]
+                parsed = parser.parse(f.read(), schema)
                 done = parsed if isinstance(parsed, list) else []
         if shot_id not in done:
             done.append(shot_id)
@@ -97,8 +95,7 @@ def is_shot_done(cid: str, shot_id: str) -> bool:
         with open(p, "r", encoding="utf-8") as f:
             parser = JSONParser()
             schema = [str]
-            sup = parser.parse_superset(f.read(), schema)
-            parsed = sup["coerced"]
+            parsed = parser.parse(f.read(), schema)
             done = parsed if isinstance(parsed, list) else []
         return shot_id in (done or [])
     except Exception:

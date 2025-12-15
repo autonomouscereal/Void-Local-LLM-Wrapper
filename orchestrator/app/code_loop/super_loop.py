@@ -2,33 +2,63 @@ from __future__ import annotations
 
 import os
 import json
-from types import SimpleNamespace
+from typing import Any, Dict
+
 from .indexer import build_index
 from .prompts import build_architect_input, build_implementer_input, build_reviewer_input
 from .diffutil import apply_patch_in_memory
 from .fsview import read_text
 from .envelope import make_artifact, make_envelope
-from ..json_parser import JSONParser
+from ..committee_client import committee_ai_text, committee_jsonify
 
 
-def _parse_json(text: str) -> dict:
-    parser = JSONParser()
-    # Architect/implementer/reviewer JSON is loosely structured; coerce to mapping.
-    sup = parser.parse_superset(text or "{}", dict)
-    obj = sup["coerced"]
-    return obj if isinstance(obj, dict) else {}
+ARCH_SCHEMA: Dict[str, Any] = {
+    "plan": [{"file": str, "intent": str, "reason": str}],
+    "notes": [str],
+}
+IMPL_SCHEMA: Dict[str, Any] = {
+    "patch": str,
+    "notes": [str],
+}
+REV_SCHEMA: Dict[str, Any] = {
+    "patch": str,
+    "findings": [str],
+}
 
 
-def run_super_loop(task: str, repo_root: str, model, step_tokens: int = 900) -> dict:
+async def _parse_json(text: str, expected_schema: Any, *, trace_id: str) -> Dict[str, Any]:
     """
-    model: object exposing .chat(prompt, max_tokens) -> SimpleNamespace(text, model_name)
+    IMPORTANT:
+    - Only used for JSON emitted by LLMs (committee-backed in this module).
+    - Always route through committee_jsonify BEFORE any JSONParser coercion.
+    """
+    parsed = await committee_jsonify(
+        text or "{}",
+        expected_schema=expected_schema,
+        trace_id=str(trace_id or "code_super_loop"),
+        temperature=0.0,
+    )
+    return parsed if isinstance(parsed, dict) else {}
+
+
+async def run_super_loop(task: str, repo_root: str, *, trace_id: str, step_tokens: int = 900) -> dict:
+    """
     Returns canonical envelope with a unified diff and small artifacts.
     """
     idx = build_index(repo_root)
     # Phase 1: Architect
     arch_in = build_architect_input(task, idx)
-    arch_out = model.chat(arch_in, max_tokens=step_tokens)
-    plan = _parse_json(getattr(arch_out, "text", ""))
+    arch_env = await committee_ai_text(
+        [{"role": "user", "content": arch_in}],
+        trace_id=str(trace_id or "code_super_loop") + ".architect",
+        temperature=0.3,
+    )
+    arch_txt = ""
+    if isinstance(arch_env, dict) and arch_env.get("ok"):
+        arch_res = arch_env.get("result") or {}
+        if isinstance(arch_res, dict) and isinstance(arch_res.get("text"), str):
+            arch_txt = arch_res.get("text") or ""
+    plan = await _parse_json(arch_txt, ARCH_SCHEMA, trace_id=str(trace_id or "code_super_loop") + ".architect.json")
     decisions = ["architect plan produced"]
     # Prepare excerpts
     excerpts = []
@@ -40,14 +70,32 @@ def run_super_loop(task: str, repo_root: str, model, step_tokens: int = 900) -> 
         excerpts.append({"file": f, "head": txt[:4000]})
     # Phase 2: Implementer
     impl_in = build_implementer_input(plan, excerpts)
-    impl_out = model.chat(impl_in, max_tokens=step_tokens)
-    impl = _parse_json(getattr(impl_out, "text", ""))
+    impl_env = await committee_ai_text(
+        [{"role": "user", "content": impl_in}],
+        trace_id=str(trace_id or "code_super_loop") + ".implementer",
+        temperature=0.3,
+    )
+    impl_txt = ""
+    if isinstance(impl_env, dict) and impl_env.get("ok"):
+        impl_res = impl_env.get("result") or {}
+        if isinstance(impl_res, dict) and isinstance(impl_res.get("text"), str):
+            impl_txt = impl_res.get("text") or ""
+    impl = await _parse_json(impl_txt, IMPL_SCHEMA, trace_id=str(trace_id or "code_super_loop") + ".implementer.json")
     patch = impl.get("patch", "")
     decisions.append("implementer patch produced")
     # Phase 3: Reviewer
     rev_in = build_reviewer_input(task, plan, patch)
-    rev_out = model.chat(rev_in, max_tokens=step_tokens)
-    rev = _parse_json(getattr(rev_out, "text", ""))
+    rev_env = await committee_ai_text(
+        [{"role": "user", "content": rev_in}],
+        trace_id=str(trace_id or "code_super_loop") + ".reviewer",
+        temperature=0.3,
+    )
+    rev_txt = ""
+    if isinstance(rev_env, dict) and rev_env.get("ok"):
+        rev_res = rev_env.get("result") or {}
+        if isinstance(rev_res, dict) and isinstance(rev_res.get("text"), str):
+            rev_txt = rev_res.get("text") or ""
+    rev = await _parse_json(rev_txt, REV_SCHEMA, trace_id=str(trace_id or "code_super_loop") + ".reviewer.json")
     final_patch = rev.get("patch", patch)
     decisions += ["reviewer pass", "diff verified"]
     # In-memory verification
@@ -60,7 +108,7 @@ def run_super_loop(task: str, repo_root: str, model, step_tokens: int = 900) -> 
         make_artifact("patch.diff", "code", "unified diff", bytes_count=len((final_patch or "").encode())),
     ]
     tool_calls = [{"tool": "code.super_loop", "args": {"task": task, "repo_root": repo_root}, "status": "done", "result_ref": "patch.diff"}]
-    env = make_envelope(getattr(model, "model_name", "model"), final_patch, arts, tool_calls, decisions)
+    env = make_envelope("committee", final_patch, arts, tool_calls, decisions)
     env["artifacts_data"] = {"patch.diff": final_patch or "", "plan.json": json.dumps(plan, ensure_ascii=False)}
     return env
 

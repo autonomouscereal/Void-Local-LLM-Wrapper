@@ -64,13 +64,16 @@ EOF
   # Force Docker default runtime to runc (version-agnostic CDI path)
   chroot "$HOST_ROOT" /usr/bin/bash -lc 'python3 - <<PY
 import json, os
+from json import JSONDecodeError
 p="/etc/docker/daemon.json"
 d={}
-try:
-    with open(p,"r") as f:
-        d=json.load(f)
-except Exception:
-    d={}
+if os.path.exists(p):
+    try:
+        with open(p,"r") as f:
+            d=json.load(f)
+    except (OSError, JSONDecodeError) as ex:
+        print(f"warn: failed to read {p}: {ex}")
+        d={}
 # ensure runtimes.nvidia exists (non-default)
 d.setdefault("runtimes", {}).setdefault("nvidia", {"path":"nvidia-container-runtime","runtimeArgs":[]})
 # remove default-runtime or set to runc

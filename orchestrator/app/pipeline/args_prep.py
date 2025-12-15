@@ -1,23 +1,38 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Callable
+from typing import Any, Dict, List, Callable, Optional
+
+from ..json_parser import JSONParser
 
 
-def ensure_object_args(tool_calls: List[Dict[str, Any]], parse_json: Callable[[str, Any], Any]) -> List[Dict[str, Any]]:
+def ensure_object_args(
+    tool_calls: List[Dict[str, Any]],
+    parse_json: Optional[Callable[[str, Any], Any]] = None,
+) -> List[Dict[str, Any]]:
     """
     Ensure each tool call has dict arguments. If arguments is a JSON string, parse to dict.
-    Accepts a parse_json callback to avoid importing the app.main helper.
+    If parse_json is not provided, uses JSONParser().parse.
     """
+    parser = JSONParser()
+    parse_fn = parse_json if callable(parse_json) else (lambda raw, schema: parser.parse(raw or "", schema))
     out: List[Dict[str, Any]] = []
     for tc in tool_calls or []:
         args_obj = (tc or {}).get("arguments")
         if isinstance(args_obj, dict) and isinstance(args_obj.get("_raw"), str):
-            parsed = parse_json(args_obj.get("_raw"), {})
-            tc = {**tc, "arguments": (parsed if isinstance(parsed, dict) else {})}
+            raw = args_obj.get("_raw")
+            parsed = parse_fn(raw, dict)
+            # Never drop args: if parsing fails, preserve the original string.
+            tc = {**tc, "arguments": (dict(parsed) if isinstance(parsed, dict) else {"_raw": raw})}
         elif isinstance(args_obj, str):
-            parsed = parse_json(args_obj, {})
-            tc = {**tc, "arguments": (parsed if isinstance(parsed, dict) else {})}
+            parsed = parse_fn(args_obj, dict)
+            # Never drop args: if parsing fails, preserve the original string.
+            tc = {**tc, "arguments": (dict(parsed) if isinstance(parsed, dict) else {"_raw": args_obj})}
+        elif args_obj is None:
+            tc = {**tc, "arguments": {}}
+        elif not isinstance(args_obj, dict):
+            # Preserve any non-object args under "_raw" instead of coercing to {}.
+            tc = {**tc, "arguments": {"_raw": args_obj}}
         out.append(tc)
     return out
 

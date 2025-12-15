@@ -21,10 +21,9 @@ EXPECTED_ENVELOPE_SHAPE: Dict[str, Any] = {
 def normalize_envelope(obj: Dict[str, Any]) -> Dict[str, Any]:
     # Fill defaults for the envelope structure described by the user
     parser = JSONParser()
-    base = parser.ensure_structure(
-        obj if isinstance(obj, dict) else {},
-        EXPECTED_ENVELOPE_SHAPE,
-    )
+    # IMPORTANT: `ensure_structure` is an internal coercion implementation detail.
+    # Use parse so normalization stays on the public API surface.
+    base = parser.parse(obj if isinstance(obj, dict) else {}, EXPECTED_ENVELOPE_SHAPE)
     meta = base.get("meta", {}) or {}
     meta.setdefault("schema_version", 1)
     meta.setdefault("model", "")
@@ -53,7 +52,7 @@ def _parse_json(text: str) -> Dict[str, Any]:
     # Parse provider/tool output into the high-level envelope shape. Fields not
     # represented in EXPECTED_ENVELOPE_SHAPE are ignored at this layer;
     # downstream helpers (coerce_to_envelope, limits) operate on the coerced envelope.
-    return parser.parse_superset(text or "{}", EXPECTED_ENVELOPE_SHAPE)["coerced"]
+    return parser.parse(text or "{}", EXPECTED_ENVELOPE_SHAPE)
 
 
 

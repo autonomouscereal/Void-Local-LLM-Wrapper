@@ -5,14 +5,9 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 def build_allowed_tool_names(builtins_provider: Optional[Callable[[], List[Dict[str, Any]]]] = None) -> Set[str]:
     """
-    Collect allowed tool names from the route registry and built-in OpenAI-style schema.
+    Collect allowed tool names from the built-in OpenAI-style schema.
     """
-    # Route registry
-    try:
-        from app.routes.tools import _REGISTRY as _TOOL_REG  # type: ignore
-    except Exception:
-        _TOOL_REG = {}
-    allowed: Set[str] = set([str(k) for k in (_TOOL_REG or {}).keys()])
+    allowed: Set[str] = set()
     # Builtins (OpenAI-style)
     builtins: List[Dict[str, Any]] = []
     if callable(builtins_provider):

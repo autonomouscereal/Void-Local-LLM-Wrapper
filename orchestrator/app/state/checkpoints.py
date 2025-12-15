@@ -11,20 +11,32 @@ from ..json_parser import JSONParser
 
 log = logging.getLogger(__name__)
 def _append_atomic(path: str, text: str) -> None:
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     tmp = path + ".tmp"
-    with open(tmp, "a", encoding="utf-8") as f:
-        f.write(text)
-    with open(tmp, "rb") as rf:
-        chunk = rf.read()
-    with open(path, "ab") as wf:
-        wf.write(chunk)
-    os.remove(tmp)
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(tmp, "a", encoding="utf-8") as f:
+            f.write(text)
+        with open(tmp, "rb") as rf:
+            chunk = rf.read()
+        with open(path, "ab") as wf:
+            wf.write(chunk)
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            # Best-effort cleanup; never raise from trace persistence.
+            pass
 
 
 def append_ndjson(path: str, obj: Dict[str, Any]) -> None:
-    line = json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n"
-    _append_atomic(path, line)
+    try:
+        line = json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n"
+        _append_atomic(path, line)
+    except Exception as ex:
+        # Trace/checkpoint I/O must never break request handling.
+        log.warning("checkpoints.append_ndjson failed for path=%s: %s", path, ex, exc_info=True)
+        return
 
 
 def read_tail(path: str, n: int = 10) -> List[Dict[str, Any]]:
@@ -39,7 +51,7 @@ def read_tail(path: str, n: int = 10) -> List[Dict[str, Any]]:
         ln = ln.strip()
         if not ln:
             continue
-        obj = parser.parse_superset(ln, schema)["coerced"]
+        obj = parser.parse(ln, schema)
         if isinstance(obj, dict):
             out.append(obj)
     return out
@@ -58,18 +70,22 @@ def _path(root: str, key: str) -> str:
 
 
 def append_event(root: str, key: str, kind: str, data: Dict[str, Any]) -> None:
-    rec = {"t": int(time.time() * 1000), "step_id": step_id(), "kind": kind, "data": data or {}}
-    path = _path(root, key)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        f.flush()
-        try:
-            os.fsync(f.fileno())
-        except Exception as ex:
-            # Fsync failure shouldn't break request handling, but we still want
-            # to see it in logs instead of swallowing it.
-            log.warning("checkpoints.append_event: fsync failed for path=%s: %s", path, ex, exc_info=True)
+    try:
+        rec = {"t": int(time.time() * 1000), "step_id": step_id(), "kind": kind, "data": data or {}}
+        path = _path(root, key)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception as ex:
+                # Fsync failure shouldn't break request handling, but we still want
+                # to see it in logs instead of swallowing it.
+                log.warning("checkpoints.append_event: fsync failed for path=%s: %s", path, ex, exc_info=True)
+    except Exception as ex:
+        log.warning("checkpoints.append_event failed for key=%s kind=%s: %s", key, kind, ex, exc_info=True)
+        return
 
 
 def read_all(root: str, key: str) -> List[Dict[str, Any]]:
@@ -84,7 +100,7 @@ def read_all(root: str, key: str) -> List[Dict[str, Any]]:
             ln = line.strip()
             if not ln:
                 continue
-            obj = parser.parse_superset(ln, schema)["coerced"]
+            obj = parser.parse(ln, schema)
             if isinstance(obj, dict):
                 out.append(obj)
     return out

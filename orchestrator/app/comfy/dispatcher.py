@@ -19,8 +19,7 @@ WF_PATH = os.getenv("COMFY_WORKFLOW_PATH", "/workspace/services/image/workflows/
 def load_workflow() -> Dict[str, Any]:
     text = Path(WF_PATH).read_text(encoding="utf-8")
     schema = {"nodes": list}
-    sup = JSONParser().parse_superset(text, schema)
-    return sup["coerced"]
+    return JSONParser().parse(text, schema)
 
 
 def _patch_text_prompts(graph: Dict[str, Any], positive: Optional[str], negative: Optional[str]) -> None:
@@ -118,8 +117,7 @@ async def submit(graph: Dict[str, Any]) -> Dict[str, Any]:
             msg = await ws.recv()
             if isinstance(msg, (str, bytes)):
                 schema = {"type": str, "data": dict}
-                sup = JSONParser().parse_superset(msg, schema)
-                d = sup["coerced"]
+                d = JSONParser().parse(msg, schema)
             else:
                 d = {}
             if isinstance(d, dict) and d.get("type") == "executed" and (d.get("data") or {}).get("prompt_id") == pid:

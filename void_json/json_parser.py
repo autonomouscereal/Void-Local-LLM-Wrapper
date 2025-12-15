@@ -2,786 +2,1109 @@ from __future__ import annotations
 
 import json
 import logging
-import re
-from typing import Any, Dict, List, Optional, Tuple
+import math
+import unicodedata
+from typing import Any, Dict, List, Optional, Tuple, get_args, get_origin
 
-
-# Use the process-wide logging configuration only; no per-module handlers or
-# import-time I/O. This logger is typically configured in the orchestrator
-# entrypoint so all parser diagnostics go to the same sinks.
 logger = logging.getLogger()
 
 
 class JSONParser:
     """
-    Robust, schema-driven JSON parser and normalizer.
+    parse(source, expected_structure) -> coerced result
 
-    - Always returns a structure shaped by the explicit expected schema.
-    - Never raises to callers; all failures are contained inside this class.
-    - Aggressively repairs common LLM / tool JSON formatting issues.
+    Strict ordering (your rule):
+    1) If source already dict/list: return it immediately (no fixes).
+    2) If source is str: try json.loads immediately (no fixes). If ok, return it.
+    3) Only if json.loads fails: then do repairs/extraction/fallback parsing.
+    4) Finally: coerce to expected_structure without dropping extras, and pack misplaced keys.
     """
 
     def __init__(self) -> None:
-        # Diagnostic fields kept for compatibility; callers can inspect if desired.
         self.errors: List[str] = []
         self.repairs: List[str] = []
         self.last_error: Optional[str] = None
 
-    # ---------- public API ----------
+    # ---------------- public API ----------------
 
     def parse(self, source: Any, expected_structure: Any) -> Any:
-        """
-        Best-effort parsing with repairs, followed by coercion into expected_structure.
-        Never raises; always returns something matching the expected shape.
-
-        Accepts:
-          - str containing JSON (with or without markdown fences)
-          - dict / list objects (already-parsed JSON)
-          - any other value, which will be stringified before parsing
-        """
-        # Fast path: already a JSON-like structure; just coerce to the schema.
+        # 1) already json-like: return as-is immediately
         if isinstance(source, (dict, list)):
-            return self.ensure_structure(source, expected_structure)
+            raw = source
+            return self._coerce_node_safe(raw, expected_structure)
 
-        # Normalize non-string scalars into text so the repair pipeline can run.
-        if not isinstance(source, str):
-            source = "" if source is None else str(source)
-
-        json_string = self.strip_markdown(source)
-        json_string = self.attempt_repair(json_string)
-
-        # Apply a sequence of parsing strategies, keeping the "best" result.
-        # This is cumulative: every successful strategy is merged into best_result.
-        methods = [
-            self.method_json_loads,
-            self.method_replace_quotes,
-            self.method_fix_braces,
-            self.method_fix_commas,
-            self.method_fix_all,
-            self.method_extract_segment,
-            self.regex_parse,
-        ]
-
-        best_result: Any = None
-
-        for method in methods:
-            try:
-                parsed_json = method(json_string)
-                best_result = self.select_best_result(
-                    best_result, parsed_json, expected_structure
-                )
-            except Exception as exc:
-                msg = f"method:{method.__name__} failed:{exc}"
-                logger.debug(msg, exc_info=True)
-                self._err(msg)
-
-        # Final fallback: if nothing succeeded, synthesise structure from schema alone.
-        if best_result is None:
-            if isinstance(expected_structure, list):
-                best_result = self.ensure_structure([], expected_structure)
-            else:
-                best_result = self.ensure_structure({}, expected_structure)
-        else:
-            best_result = self.ensure_structure(best_result, expected_structure)
-
-        # Salvage pass: when the source was textual, attempt to recover missing
-        # scalar fields (str/int/float) directly from the raw text by scanning
-        # for "key: value" style patterns, even if the JSON structure itself
-        # was badly malformed.
+        # 2) if string, try json.loads before ANY fixes
         if isinstance(source, str):
-            best_result = self._salvage_from_text(source, expected_structure, best_result)
+            obj = self._try_json_loads(source, "json.loads.raw")
+            if obj is not None:
+                raw = obj
+                return self._coerce_node_safe(raw, expected_structure)
+            # only now do the heavy stuff
+            raw = self._parse_raw_from_text_safe(source, expected_structure)
+            return self._coerce_node_safe(raw, expected_structure)
 
-        return best_result
+        # Non-string / non-dict/list types:
+        # Try to preserve type while still obeying "loads before fixes" for text.
+        raw = self._parse_raw_any_safe(source, expected_structure)
+        return self._coerce_node_safe(raw, expected_structure)
 
-    # Backwards-compatible alias
-    def parse_best_effort(self, source: Any, expected_structure: Any) -> Any:
-        """
-        Alias for parse(...); kept for compatibility with older call sites.
-        Accepts any JSON-like source (str/dict/list/scalar).
-        """
-        return self.parse(source, expected_structure)
+    # ---------------- safe wrappers ----------------
 
-    def parse_strict(self, source: Any) -> Tuple[bool, Optional[Any]]:
-        """
-        Strict load without schema coercion: returns (ok, raw_obj).
-        Still uses markdown stripping and basic repair, but does not enforce shape.
-
-        Accepts:
-          - dict / list → treated as already-strict JSON (returns (True, source))
-          - str → parsed via json.loads with a light repair pass
-          - other scalars → stringified and parsed as JSON when possible
-        """
-        # Already-parsed JSON objects are treated as strictly valid.
-        if isinstance(source, (dict, list)):
-            return True, source
-
-        if not isinstance(source, str):
-            source = "" if source is None else str(source)
-        s = self.strip_markdown(source)
+    def _parse_raw_any_safe(self, source: Any, expected_structure: Any) -> Any:
         try:
-            obj = json.loads(s)
-            return True, obj
-        except Exception as e1:
-            self._err(f"parse_strict:{e1}")
-        repaired = self.attempt_repair(s)
-        try:
-            obj = json.loads(repaired)
-            return True, obj
-        except Exception as e2:
-            self._err(f"parse_strict_repaired:{e2}")
-            # Never raise to callers; strict mode simply reports failure.
-            return False, None
-
-    def parse_superset(self, source: Any, expected_structure: Any) -> Dict[str, Any]:
-        """
-        Return a richer result that includes:
-          - coerced: structure shaped to expected_structure (best-effort, with repairs)
-          - raw: the best raw JSON object we could parse (preferring strict JSON when possible)
-          - extras: parts of raw not represented in coerced (keys/values outside the schema)
-          - vars: numeric hints extracted from string leaves
-          - repairs/errors/last_error: diagnostics
-
-        Strategy:
-          1) Attempt a strict json.loads on the response text (via parse_strict), so we
-             retain the most faithful view of the model/tool output when it's valid JSON.
-          2) Independently run the full repair/heuristic pipeline via parse(...), which
-             searches multiple strategies and coerces into expected_structure.
-          3) Use the best-effort result from parse(...) as `coerced`, but keep the strict
-             JSON object (when available) as `raw`. Any information present in raw but
-             not representable in the schema is surfaced under `extras`.
-        """
-        # Step 1: strict-ish raw JSON
-        ok, raw_strict = self.parse_strict(source)
-        if not ok:
-            # When strict parsing fails entirely, raw_strict becomes a typed empty shell
-            # so callers still see a shape that matches the schema.
-            if isinstance(expected_structure, dict):
-                raw_strict = {}
-            elif isinstance(expected_structure, list):
-                raw_strict = []
-            else:
-                raw_strict = None
-
-        # Step 2: best-effort coerced structure using all repair strategies
-        coerced = self.parse(source, expected_structure)
-
-        # Step 3: choose raw baseline and compute extras/vars
-        # Prefer genuine strict JSON structure (dict/list) when we have one, otherwise
-        # fall back to the coerced structure so raw is never "less informative" than coerced.
-        if ok and isinstance(raw_strict, (dict, list)):
-            raw: Any = raw_strict
-        else:
-            raw = coerced
-
-        extras = self._diff_extras(raw, coerced)
-        vars_map = self._extract_vars(raw)
-        return {
-            "coerced": coerced,
-            "raw": raw,
-            "extras": extras,
-            "vars": vars_map,
-            "repairs": list(self.repairs),
-            "errors": list(self.errors),
-            "last_error": self.last_error or "",
-        }
-
-    # ---------- original "GOOD" repair helpers ----------
-
-    def strip_markdown(self, response: str) -> str:
-        """Remove common ```json fences and surrounding whitespace."""
-        if not isinstance(response, str):
-            response = "" if response is None else str(response)
-        response = response.replace("```json", "").replace("```", "").strip()
-        # Also strip BOM / stray whitespace
-        response = response.replace("\ufeff", "").strip()
-        return response
-
-    def correct_common_errors(self, text: str) -> str:
-        corrections = [
-            ('\\"', '"'),
-            ("\\'", "'"),
-            ('"{', "{"),
-            ('}"', "}"),
-            (",}", "}"),
-            (",]", "]"),
-            ('"False"', "false"),
-            ('"True"', "true"),
-        ]
-        for old, new in corrections:
-            if old in text:
-                text = text.replace(old, new)
-        return text
-
-    def extract_json_segment(
-        self, text: str, start_delim: str = "{", end_delim: str = "}"
-    ) -> List[str]:
-        """Return all balanced {...} segments from text (last one is usually the answer)."""
-        stack: List[str] = []
-        json_segments: List[str] = []
-        start_index = -1
-        for i, char in enumerate(text):
-            if char == start_delim:
-                if not stack:
-                    start_index = i
-                stack.append(char)
-            elif char == end_delim and stack:
-                stack.pop()
-                if not stack and start_index != -1:
-                    segment = text[start_index : i + 1]
-                    json_segments.append(segment)
-        return json_segments
-
-    def fix_missing_commas(self, json_string: str) -> str:
-        json_string = json_string.replace("}{", "},{")
-        return json_string
-
-    def attempt_repair(self, json_string: str) -> str:
-        """
-        Apply a cumulative sequence of text-level repairs.
-        Each step builds on the previous one; nothing is mutually exclusive.
-        """
-        json_string = self.correct_common_errors(json_string)
-        json_string = self.fix_missing_commas(json_string)
-        return json_string
-
-    def regex_parse(self, json_string: str) -> Any:
-        """
-        Regex-based fallback: handle common LLM quirks like single quotes and
-        unquoted keys. This is intentionally permissive and only used after
-        simpler strategies fail.
-        """
-        if not isinstance(json_string, str):
-            json_string = "" if json_string is None else str(json_string)
-        try:
-            return json.loads(json_string)
+            return self._parse_raw_any(source, expected_structure)
         except Exception as exc:
-            # Record the failure so callers can see that the strict branch failed
-            # before we fall back to the more permissive regex-based repair.
-            self._err(f"regex_parse_strict:{exc}")
-        json_string = re.sub(r"'", '"', json_string)
-        json_string = re.sub(
-            r"(?<=\{|,)\s*([A-Za-z0-9_]+)\s*:",
-            r'"\1":',
-            json_string,
-        )
+            self._err(f"parse_raw_any:{type(exc).__name__}:{exc}")
+            return self._default_for_schema(expected_structure)
+
+    def _parse_raw_from_text_safe(self, text: str, expected_structure: Any) -> Any:
         try:
-            return json.loads(json_string)
+            return self._parse_raw_from_text(text, expected_structure)
         except Exception as exc:
-            self._err(f"regex_parse:{exc}")
-            return None
+            self._err(f"parse_raw_from_text:{type(exc).__name__}:{exc}")
+            return self._default_for_schema(expected_structure)
 
-    # ---------- method variants, each using json.loads ----------
-
-    def method_json_loads(self, json_string: str) -> Any:
-        if not isinstance(json_string, str):
-            json_string = "" if json_string is None else str(json_string)
+    def _coerce_node_safe(self, raw: Any, expected_structure: Any) -> Any:
         try:
-            return json.loads(json_string)
+            coerced = self._coerce_node(raw, expected_structure)
         except Exception as exc:
-            self._err(f"json_loads:{exc}")
-            return None
+            self._err(f"coerce_node:{type(exc).__name__}:{exc}")
+            coerced = self._default_for_schema(expected_structure)
+        if coerced is None:
+            coerced = self._default_for_schema(expected_structure)
+        return coerced
 
-    def method_replace_quotes(self, json_string: str) -> Any:
-        if not isinstance(json_string, str):
-            json_string = "" if json_string is None else str(json_string)
-        json_string = json_string.replace("\\'", "'").replace('\\"', '"')
-        try:
-            return json.loads(json_string)
-        except Exception as exc:
-            self._err(f"replace_quotes:{exc}")
-            return None
+    # ---------------- any-type raw parsing ----------------
 
-    def method_fix_braces(self, json_string: str) -> Any:
-        if not isinstance(json_string, str):
-            json_string = "" if json_string is None else str(json_string)
-        try:
-            json_string = json_string.replace('"{', "{").replace('}"', "}")
-            return json.loads(json_string)
-        except Exception as exc:
-            self._err(f"fix_braces:{exc}")
-            return None
+    def _parse_raw_any(self, source: Any, expected_structure: Any) -> Any:
+        # mapping-like
+        if self._is_mapping_like(source):
+            d = self._to_dict_safe(source)
+            return d if d is not None else {}
 
-    def method_fix_commas(self, json_string: str) -> Any:
-        if not isinstance(json_string, str):
-            json_string = "" if json_string is None else str(json_string)
-        json_string = json_string.replace(",}", "}").replace(",]", "]")
-        try:
-            return json.loads(json_string)
-        except Exception as exc:
-            self._err(f"fix_commas:{exc}")
-            return None
-
-    def method_fix_all(self, json_string: str) -> Any:
-        if not isinstance(json_string, str):
-            json_string = "" if json_string is None else str(json_string)
-        json_string = (
-            json_string.replace('"{', "{")
-            .replace('}"', "}")
-            .replace(",}", "}")
-            .replace(",]", "]")
-        )
-        json_string = self.fix_missing_commas(json_string)
-        try:
-            return json.loads(json_string)
-        except Exception as exc:
-            self._err(f"fix_all:{exc}")
-            return None
-
-    def method_extract_segment(self, json_string: str) -> Any:
-        if not isinstance(json_string, str):
-            json_string = "" if json_string is None else str(json_string)
-        json_segments = self.extract_json_segment(json_string)
-        if json_segments:
+        # iterable containers -> list
+        if isinstance(source, (tuple, set, frozenset)):
             try:
-                return json.loads(json_segments[-1])
+                return list(source)
             except Exception as exc:
-                self._err(f"extract_segment:{exc}")
+                self._err(f"iterable_to_list:{type(exc).__name__}:{exc}")
+                return []
+
+        # bytes -> decode, then obey "loads before fixes"
+        if isinstance(source, (bytes, bytearray, memoryview)):
+            try:
+                s = bytes(source).decode("utf-8", errors="replace")
+            except Exception as exc:
+                self._err(f"bytes_decode:{type(exc).__name__}:{exc}")
+                return self._default_for_schema(expected_structure)
+
+            obj = self._try_json_loads(s, "json.loads.bytes")
+            if obj is not None:
+                return obj
+            return self._parse_raw_from_text(s, expected_structure)
+
+        # dataclass / __dict__ object -> dict
+        d2 = self._object_to_dict_safe(source)
+        if d2 is not None:
+            return d2
+
+        # fallback stringify -> obey "loads before fixes"
+        try:
+            s2 = str(source)
+        except Exception as exc:
+            self._err(f"str_source_failed:{type(exc).__name__}:{exc}")
+            return self._default_for_schema(expected_structure)
+
+        obj = self._try_json_loads(s2, "json.loads.str")
+        if obj is not None:
+            return obj
+        return self._parse_raw_from_text(s2, expected_structure)
+
+    # ---------------- text raw parsing ----------------
+
+    def _parse_raw_from_text(self, text: str, expected_structure: Any) -> Any:
+        s = self._normalize_text(text)
+
+        # We already tried json.loads(text) before reaching here.
+        # Do NOT re-try json.loads(s) until after we extract/repair.
+        s = self._strip_fence_tokens(s)
+
+        # Collect candidates (JSON segments embedded anywhere)
+        segments = self._collect_balanced_segments(s)
+
+        best_obj: Any = None
+        best_score = -1
+
+        i = 0
+        while i < len(segments):
+            seg = segments[i]
+            repaired = self._repair_json_text(seg)
+            obj2 = self._try_json_loads(repaired, "json.loads.segment.repaired")
+            if obj2 is not None:
+                score = self._score_candidate(obj2, expected_structure)
+                if score > best_score:
+                    best_score = score
+                    best_obj = obj2
+            i += 1
+
+        if best_obj is not None:
+            return best_obj
+
+        # Repair whole string and try
+        repaired_all = self._repair_json_text(s)
+        obj3 = self._try_json_loads(repaired_all, "json.loads.repaired_all")
+        if obj3 is not None:
+            return obj3
+
+        # Markdown table fallback
+        table_obj = self._parse_markdown_table(repaired_all)
+        if table_obj is not None:
+            return table_obj
+
+        # Key/value prose fallback
+        kv_obj = self._parse_key_value_fallback(repaired_all)
+        if kv_obj is not None:
+            return kv_obj
+
+        return {} if isinstance(expected_structure, dict) else []
+
+    # ---------------- strict json.loads ----------------
+
+    def _try_json_loads(self, s: str, tag: str) -> Optional[Any]:
+        try:
+            return json.loads(s)
+        except Exception as exc:
+            self._err(f"{tag}:{type(exc).__name__}:{exc}")
+            return None
+
+    # ---------------- normalization ----------------
+
+    def _normalize_text(self, s: str) -> str:
+        try:
+            out = s if isinstance(s, str) else ("" if s is None else str(s))
+        except Exception:
+            return ""
+
+        try:
+            out = unicodedata.normalize("NFKC", out)
+        except Exception as exc:
+            self._err(f"normalize_nfkc:{type(exc).__name__}:{exc}")
+
+        out = out.replace("\u201c", '"').replace("\u201d", '"')
+        out = out.replace("\u2018", "'").replace("\u2019", "'")
+        out = out.replace("\uFF1A", ":")
+        out = out.replace("\u2192", "->")
+        out = out.replace("\u21D2", "=>")
+        out = out.replace("\u2013", "-").replace("\u2014", "-")
+        out = out.replace("\u200b", "").replace("\u2060", "")
+        out = out.replace("\r\n", "\n").replace("\r", "\n").replace("\ufeff", "")
+        return out.strip()
+
+    def _strip_fence_tokens(self, s: str) -> str:
+        try:
+            out = s.replace("```json", "").replace("```JSON", "").replace("```", "")
+            out = out.replace("'''json", "").replace("'''JSON", "").replace("'''", "")
+
+            lines = out.splitlines()
+            kept: List[str] = []
+            i = 0
+            while i < len(lines):
+                t = lines[i].strip().lower()
+                if t == "json":
+                    i += 1
+                    continue
+                kept.append(lines[i])
+                i += 1
+            return "\n".join(kept).strip()
+        except Exception as exc:
+            self._err(f"strip_fence_tokens:{type(exc).__name__}:{exc}")
+            return s if isinstance(s, str) else ""
+
+    # ---------------- balanced extraction ----------------
+
+    def _collect_balanced_segments(self, s: str) -> List[str]:
+        try:
+            segs: List[str] = []
+            segs.extend(self._collect_balanced_for_delims(s, "{", "}"))
+            segs.extend(self._collect_balanced_for_delims(s, "[", "]"))
+
+            # prefer longer first (manual sort)
+            i = 0
+            while i < len(segs):
+                j = i + 1
+                while j < len(segs):
+                    if len(segs[j]) > len(segs[i]):
+                        tmp = segs[i]
+                        segs[i] = segs[j]
+                        segs[j] = tmp
+                    j += 1
+                i += 1
+            return segs
+        except Exception as exc:
+            self._err(f"collect_balanced_segments:{type(exc).__name__}:{exc}")
+            return []
+
+    def _collect_balanced_for_delims(self, s: str, start: str, end: str) -> List[str]:
+        out: List[str] = []
+        in_string = False
+        escape = False
+        quote = ""
+        depth = 0
+        start_idx = -1
+
+        i = 0
+        while i < len(s):
+            ch = s[i]
+
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == quote:
+                    in_string = False
+                    quote = ""
+                i += 1
+                continue
+
+            if ch == '"' or ch == "'":
+                in_string = True
+                quote = ch
+                i += 1
+                continue
+
+            if ch == start:
+                if depth == 0:
+                    start_idx = i
+                depth += 1
+                i += 1
+                continue
+
+            if ch == end and depth > 0:
+                depth -= 1
+                if depth == 0 and start_idx != -1:
+                    out.append(s[start_idx : i + 1])
+                    start_idx = -1
+                i += 1
+                continue
+
+            i += 1
+
+        return out
+
+    # ---------------- deterministic repair (no regex) ----------------
+
+    def _repair_json_text(self, s: str) -> str:
+        try:
+            out = s.strip()
+            out2 = self._remove_trailing_commas(out)
+            if out2 != out:
+                self.repairs.append("remove_trailing_commas")
+                out = out2
+
+            out2 = self._normalize_python_constants(out)
+            if out2 != out:
+                self.repairs.append("normalize_python_constants")
+                out = out2
+
+            out2 = self._single_quotes_to_double_quotes(out)
+            if out2 != out:
+                self.repairs.append("single_to_double_quotes")
+                out = out2
+
+            out2 = self._quote_unquoted_keys_and_values(out)
+            if out2 != out:
+                self.repairs.append("quote_unquoted_keys_and_values")
+                out = out2
+
+            out2 = self._close_unbalanced(out)
+            if out2 != out:
+                self.repairs.append("close_unbalanced")
+                out = out2
+
+            return out
+        except Exception as exc:
+            self._err(f"repair_json_text:{type(exc).__name__}:{exc}")
+            return s if isinstance(s, str) else ""
+
+    def _remove_trailing_commas(self, s: str) -> str:
+        out: List[str] = []
+        in_string = False
+        escape = False
+        quote = ""
+        i = 0
+        while i < len(s):
+            ch = s[i]
+            if in_string:
+                out.append(ch)
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == quote:
+                    in_string = False
+                    quote = ""
+                i += 1
+                continue
+
+            if ch == '"' or ch == "'":
+                in_string = True
+                quote = ch
+                out.append(ch)
+                i += 1
+                continue
+
+            if ch == ",":
+                j = i + 1
+                while j < len(s) and s[j] in (" ", "\t", "\n"):
+                    j += 1
+                if j < len(s) and (s[j] == "}" or s[j] == "]"):
+                    i += 1
+                    continue
+
+            out.append(ch)
+            i += 1
+        return "".join(out)
+
+    def _normalize_python_constants(self, s: str) -> str:
+        out: List[str] = []
+        in_string = False
+        escape = False
+        quote = ""
+        i = 0
+        while i < len(s):
+            ch = s[i]
+            if in_string:
+                out.append(ch)
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == quote:
+                    in_string = False
+                    quote = ""
+                i += 1
+                continue
+
+            if ch == '"' or ch == "'":
+                in_string = True
+                quote = ch
+                out.append(ch)
+                i += 1
+                continue
+
+            if ch.isalpha():
+                start = i
+                j = i
+                while j < len(s) and (s[j].isalpha() or s[j].isdigit() or s[j] == "_"):
+                    j += 1
+                token = s[start:j]
+                if token == "True":
+                    out.append("true")
+                elif token == "False":
+                    out.append("false")
+                elif token == "None":
+                    out.append("null")
+                else:
+                    out.append(token)
+                i = j
+                continue
+
+            out.append(ch)
+            i += 1
+        return "".join(out)
+
+    def _single_quotes_to_double_quotes(self, s: str) -> str:
+        out: List[str] = []
+        in_string = False
+        escape = False
+        quote = ""
+        i = 0
+        while i < len(s):
+            ch = s[i]
+
+            if in_string:
+                if escape:
+                    out.append(ch)
+                    escape = False
+                    i += 1
+                    continue
+                if ch == "\\":
+                    out.append(ch)
+                    escape = True
+                    i += 1
+                    continue
+                if ch == quote:
+                    out.append('"')
+                    in_string = False
+                    quote = ""
+                    i += 1
+                    continue
+                if quote == "'" and ch == '"':
+                    out.append("\\")
+                    out.append('"')
+                    i += 1
+                    continue
+                out.append(ch)
+                i += 1
+                continue
+
+            if ch == "'":
+                in_string = True
+                quote = "'"
+                out.append('"')
+                i += 1
+                continue
+            if ch == '"':
+                in_string = True
+                quote = '"'
+                out.append('"')
+                i += 1
+                continue
+
+            out.append(ch)
+            i += 1
+
+        if in_string and quote == "'":
+            out.append('"')
+        return "".join(out)
+
+    def _quote_unquoted_keys_and_values(self, s: str) -> str:
+        out: List[str] = []
+        stack: List[str] = []
+        in_string = False
+        escape = False
+        quote = ""
+        expecting_key = False
+        expecting_value = False
+
+        i = 0
+        while i < len(s):
+            ch = s[i]
+
+            if in_string:
+                out.append(ch)
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == quote:
+                    in_string = False
+                    quote = ""
+                i += 1
+                continue
+
+            if ch == '"' or ch == "'":
+                in_string = True
+                quote = '"'
+                out.append('"')
+                i += 1
+                continue
+
+            if ch == "{":
+                stack.append("{")
+                out.append("{")
+                expecting_key = True
+                expecting_value = False
+                i += 1
+                continue
+            if ch == "[":
+                stack.append("[")
+                out.append("[")
+                expecting_key = False
+                expecting_value = True
+                i += 1
+                continue
+            if ch == "}" or ch == "]":
+                if stack:
+                    stack.pop()
+                out.append(ch)
+                expecting_key = (stack and stack[-1] == "{")
+                expecting_value = False
+                i += 1
+                continue
+            if ch == ":":
+                out.append(":")
+                expecting_key = False
+                expecting_value = True
+                i += 1
+                continue
+            if ch == ",":
+                out.append(",")
+                expecting_key = (stack and stack[-1] == "{")
+                expecting_value = (stack and stack[-1] == "[")
+                i += 1
+                continue
+
+            if ch in (" ", "\t", "\n"):
+                out.append(ch)
+                i += 1
+                continue
+
+            if stack and stack[-1] == "{" and expecting_key:
+                if self._is_bareword_start(ch):
+                    token, j = self._read_bareword(s, i)
+                    k = j
+                    while k < len(s) and s[k] in (" ", "\t", "\n"):
+                        k += 1
+                    next_ch = s[k] if k < len(s) else ""
+
+                    out.append('"'); out.append(token); out.append('"'); out.append(":")
+                    expecting_key = False
+                    expecting_value = True
+
+                    if next_ch == ":" or next_ch == "=":
+                        i = k + 1
+                    else:
+                        i = k
+                    continue
+
+            if expecting_value:
+                if self._is_bareword_start(ch) or ch.isdigit() or ch in ("+", "-", "."):
+                    token, j = self._read_value_token(s, i)
+                    low = token.lower()
+
+                    if low in ("true", "false", "null"):
+                        out.append(low)
+                    elif self._looks_number(token):
+                        out.append(token)
+                    else:
+                        out.append('"'); out.append(token); out.append('"')
+
+                    expecting_value = False
+                    i = j
+                    continue
+
+            out.append(ch)
+            i += 1
+
+        return "".join(out)
+
+    def _close_unbalanced(self, s: str) -> str:
+        in_string = False
+        escape = False
+        quote = ""
+        brace = 0
+        bracket = 0
+        i = 0
+        while i < len(s):
+            ch = s[i]
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == quote:
+                    in_string = False
+                    quote = ""
+                i += 1
+                continue
+            if ch == '"' or ch == "'":
+                in_string = True
+                quote = ch
+                i += 1
+                continue
+            if ch == "{":
+                brace += 1
+            elif ch == "}":
+                brace = max(0, brace - 1)
+            elif ch == "[":
+                bracket += 1
+            elif ch == "]":
+                bracket = max(0, bracket - 1)
+            i += 1
+        if brace > 0:
+            s = s + ("}" * brace)
+        if bracket > 0:
+            s = s + ("]" * bracket)
+        return s
+
+    def _is_bareword_start(self, ch: str) -> bool:
+        return ch.isalpha() or ch == "_" or ch == "-"
+
+    def _read_bareword(self, s: str, start: int) -> Tuple[str, int]:
+        i = start
+        out: List[str] = []
+        while i < len(s):
+            ch = s[i]
+            if ch.isalnum() or ch in ("_", "-", "."):
+                out.append(ch)
+                i += 1
+            else:
+                break
+        return "".join(out), i
+
+    def _read_value_token(self, s: str, start: int) -> Tuple[str, int]:
+        i = start
+        out: List[str] = []
+        while i < len(s):
+            ch = s[i]
+            if ch in (",", "}", "]"):
+                break
+            if ch in (" ", "\t", "\n"):
+                break
+            out.append(ch)
+            i += 1
+        return "".join(out), i
+
+    def _looks_number(self, token: str) -> bool:
+        if not token:
+            return False
+        t = token.strip()
+        if not t:
+            return False
+        i = 0
+        if t[0] in ("+", "-"):
+            i = 1
+        dot = 0
+        digit = 0
+        while i < len(t):
+            ch = t[i]
+            if ch.isdigit():
+                digit += 1
+            elif ch == ".":
+                dot += 1
+                if dot > 1:
+                    return False
+            else:
+                return False
+            i += 1
+        return digit > 0
+
+    # ---------------- markdown table fallback ----------------
+
+    def _parse_markdown_table(self, s: str) -> Optional[Any]:
+        try:
+            lines = s.splitlines()
+            table_lines: List[str] = []
+            i = 0
+            while i < len(lines):
+                t = lines[i].strip()
+                if "|" in t:
+                    table_lines.append(t)
+                i += 1
+            if len(table_lines) < 2:
                 return None
-        return {}
 
-    # ---------- schema coercion (shape enforcement) ----------
+            header = self._split_md_table_row(table_lines[0])
+            if not header:
+                return None
+            if not self._looks_like_md_separator(table_lines[1]):
+                return None
 
-    def ensure_structure(self, parsed_json: Any, expected_structure: Any) -> Any:
-        """
-        Public wrapper around the coercion logic. Always returns something that
-        matches expected_structure (dict, list, or scalar).
-        """
-        return self._ensure_structure_internal(parsed_json, expected_structure)
+            rows: List[Dict[str, Any]] = []
+            r = 2
+            while r < len(table_lines):
+                cols = self._split_md_table_row(table_lines[r])
+                if cols:
+                    row: Dict[str, Any] = {}
+                    c = 0
+                    while c < len(header):
+                        key = header[c]
+                        val = cols[c] if c < len(cols) else ""
+                        row[key] = val
+                        c += 1
+                    rows.append(row)
+                r += 1
 
-    def _ensure_structure_internal(self, data: Any, expected: Any) -> Any:
+            return rows if rows else None
+        except Exception as exc:
+            self._err(f"parse_markdown_table:{type(exc).__name__}:{exc}")
+            return None
+
+    def _split_md_table_row(self, line: str) -> List[str]:
+        t = line.strip()
+        if not t:
+            return []
+        if t.startswith("|"):
+            t = t[1:]
+        if t.endswith("|"):
+            t = t[:-1]
+        parts = t.split("|")
+        out: List[str] = []
+        i = 0
+        while i < len(parts):
+            part = parts[i].strip()
+            if part != "":
+                out.append(part)
+            i += 1
+        return out
+
+    def _looks_like_md_separator(self, line: str) -> bool:
+        t = line.strip()
+        if not t:
+            return False
+        chars: List[str] = []
+        i = 0
+        while i < len(t):
+            ch = t[i]
+            if ch not in ("|", " ", "\t"):
+                chars.append(ch)
+            i += 1
+        if not chars:
+            return False
+        dash = 0
+        i = 0
+        while i < len(chars):
+            if chars[i] == "-":
+                dash += 1
+            elif chars[i] == ":":
+                pass
+            else:
+                return False
+            i += 1
+        return dash >= 3
+
+    # ---------------- prose/key-value fallback ----------------
+
+    def _parse_key_value_fallback(self, s: str) -> Optional[Dict[str, Any]]:
+        try:
+            if not isinstance(s, str) or not s.strip():
+                return None
+            root: Dict[str, Any] = {}
+            lines = s.splitlines()
+            i = 0
+            while i < len(lines):
+                t = lines[i].strip()
+                if not t:
+                    i += 1
+                    continue
+                # key:value or key value
+                key, val = self._split_kv_line(t)
+                if key:
+                    root[key] = self._coerce_fallback_scalar(val)
+                i += 1
+            return root if root else None
+        except Exception as exc:
+            self._err(f"parse_key_value_fallback:{type(exc).__name__}:{exc}")
+            return None
+
+    def _split_kv_line(self, t: str) -> Tuple[str, str]:
+        delims = [":", "=", "->", "=>"]
+        i = 0
+        while i < len(delims):
+            d = delims[i]
+            pos = t.find(d)
+            if pos != -1:
+                return t[:pos].strip(), t[pos + len(d):].strip()
+            i += 1
+        j = 0
+        while j < len(t) and t[j] not in (" ", "\t"):
+            j += 1
+        return t[:j].strip(), t[j:].strip()
+
+    def _coerce_fallback_scalar(self, v: str) -> Any:
+        if v is None:
+            return ""
+        t = v.strip()
+        if not t:
+            return ""
+        low = t.lower()
+        if low in ("true", "false"):
+            return low == "true"
+        if low in ("null", "none"):
+            return None
+        if self._looks_number(t):
+            try:
+                if "." in t:
+                    f = float(t)
+                    return f if math.isfinite(f) else t
+                return int(t)
+            except Exception:
+                return t
+        if len(t) >= 2 and ((t[0] == '"' and t[-1] == '"') or (t[0] == "'" and t[-1] == "'")):
+            return t[1:-1]
+        return t
+
+    # ---------------- coercion: preserve extras + pack keys ----------------
+
+    def _coerce_node(self, data: Any, expected: Any) -> Any:
+        origin = get_origin(expected)
+        if origin is list:
+            args = get_args(expected)
+            item_schema = args[0] if args else Any
+            return self._coerce_node(data, [item_schema])
+
+        if origin is dict:
+            args = get_args(expected)
+            value_schema = args[1] if len(args) == 2 else Any
+            src = self._as_dict(data)
+            if src is None:
+                return {} if data is None else {"_raw": data}
+            out: Dict[str, Any] = dict(src)
+            for k in list(out.keys()):
+                out[k] = self._coerce_node(out.get(k), value_schema)
+            return out
+
         if isinstance(expected, list):
-            item_shape = expected[0] if expected else {}
-            if not isinstance(data, list):
-                if isinstance(data, dict) and isinstance(item_shape, dict):
-                    data = [data]
-                elif data is None:
-                    data = []
-                else:
-                    data = [data]
-            out_list: List[Any] = []
-            for v in data:
-                if isinstance(item_shape, dict):
-                    out_list.append(
-                        self._ensure_structure_internal(
-                            v if isinstance(v, dict) else {}, item_shape
-                        )
-                    )
-                elif isinstance(item_shape, list):
-                    out_list.append(
-                        self._ensure_structure_internal(
-                            v if isinstance(v, list) else [], item_shape
-                        )
-                    )
-                else:
-                    out_list.append(self._coerce_scalar(v, item_shape))
-            return out_list
+            if not expected:
+                if isinstance(data, list):
+                    return data
+                return [] if data is None else [data]
+            item_schema = expected[0]
+            if isinstance(data, list):
+                out_list: List[Any] = []
+                i = 0
+                while i < len(data):
+                    out_list.append(self._coerce_node(data[i], item_schema))
+                    i += 1
+                return out_list
+            if isinstance(data, dict):
+                return [self._coerce_node(data, item_schema)]
+            return [] if data is None else [self._coerce_node(data, item_schema)]
 
         if isinstance(expected, dict):
-            src = data if isinstance(data, dict) else {}
-            out: Dict[str, Any] = {}
-            for key, expected_type in expected.items():
-                value = src.get(key) if isinstance(src, dict) else None
-                if isinstance(expected_type, list):
-                    if not isinstance(value, list):
-                        value = [] if not isinstance(value, dict) else [value]
-                    out[key] = self._ensure_structure_internal(value, expected_type)
-                elif isinstance(expected_type, dict):
-                    if isinstance(value, list) and value:
-                        v0 = value[0] if isinstance(value[0], dict) else {}
-                        out[key] = self._ensure_structure_internal(v0, expected_type)
-                    else:
-                        out[key] = self._ensure_structure_internal(
-                            value if isinstance(value, dict) else {}, expected_type
-                        )
+            src = self._as_dict(data)
+            if src is None:
+                src = {} if data is None else {"_raw": data}
+            if not expected:
+                return src
+
+            out: Dict[str, Any] = dict(src)  # preserve extras
+            for key, schema in expected.items():
+                if key in src:
+                    out[key] = self._coerce_node(src.get(key), schema)
                 else:
-                    out[key] = self._coerce_scalar(value, expected_type)
+                    out[key] = self._default_for_schema(schema)
+
+            self._pack_children_from_parent(out, expected)
             return out
 
         return self._coerce_scalar(data, expected)
 
-    def _coerce_scalar(self, value: Any, expected_type: Any) -> Any:
-        # IMPORTANT: bool is a subclass of int in Python.
-        # Handle bool first so True/False never get accepted as ints/floats.
-        if expected_type is bool:
-            if isinstance(value, bool):
-                return bool(value)
-            # Numeric-ish: 0/1 (or floats) -> bool(int(x))
-            if isinstance(value, (int, float)) and not isinstance(value, bool):
-                try:
-                    return bool(int(value))
-                except (TypeError, ValueError):
-                    return False
-            # String-ish: common truthy/falsey tokens
-            if isinstance(value, str):
-                low = value.strip().lower()
-                if low in ("true", "1", "yes", "y", "on"):
-                    return True
-                if low in ("false", "0", "no", "n", "off"):
-                    return False
-            return False
-
-        if expected_type is int:
-            return value if isinstance(value, int) and not isinstance(value, bool) else 0
-        if expected_type is float:
-            return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else 0.0
-        if expected_type is list:
-            return value if isinstance(value, list) else []
-        if expected_type is dict:
-            return value if isinstance(value, dict) else {}
-        return value if isinstance(value, str) else ""
-
-    def default_value(self, expected_type: Any) -> Any:
-        if expected_type == bool:
-            return False
-        if expected_type == int:
-            return 0
-        if expected_type == float:
-            return 0.0
-        if expected_type == list:
-            return []
-        if expected_type == dict:
-            return {}
-        return ""
-
-    def ensure_list_structure(
-        self, parsed_json_list: List[Dict[str, Any]], expected_structure: Dict[str, Any]
-    ) -> List[Dict[str, Any]]:
-        """
-        Legacy helper retained for compatibility.
-
-        Now implemented via the main coercion engine so it cannot raise
-        TypeError on non-type schema entries. Every item is coerced against
-        the provided expected_structure, and any internal issues are logged
-        via _err instead of raising.
-        """
-        result_list: List[Dict[str, Any]] = []
-        for item in parsed_json_list:
-            try:
-                coerced = self._ensure_structure_internal(item, expected_structure)
-                if isinstance(coerced, dict):
-                    result_list.append(coerced)
-                else:
-                    # If coercion yielded a non-dict, fall back to an empty shell.
-                    fallback = self._ensure_structure_internal({}, expected_structure)
-                    if isinstance(fallback, dict):
-                        result_list.append(fallback)
-                    else:
-                        # As a last resort, append an empty dict so callers don't break.
-                        self._err(
-                            "ensure_list_structure: coercion produced non-dict "
-                            "result for item; using {} fallback"
-                        )
-                        result_list.append({})
-            except Exception as exc:
-                self._err(f"ensure_list_structure_item:{exc}")
-                # On error, keep the list length stable with a shaped empty dict.
-                result_list.append({})
-        return result_list
-
-    def select_best_result(
-        self,
-        current_best: Any,
-        new_result: Any,
-        expected_structure: Any,
-    ) -> Any:
-        if isinstance(expected_structure, list):
-            if isinstance(new_result, list):
-                parsed_list = new_result
-            elif isinstance(new_result, dict):
-                parsed_list = [new_result]
-            else:
-                parsed_list = []
-            return self.ensure_structure(parsed_list, expected_structure)
-
-        if not isinstance(expected_structure, dict):
-            return self._coerce_scalar(new_result, expected_structure)
-
-        if not isinstance(current_best, dict):
-            current_best = {}
-        if isinstance(new_result, dict):
-            for key, expected_type in expected_structure.items():
-                new_val = new_result.get(key)
-                # Nested list/dict schemas are handled via full structure coercion
-                # instead of direct isinstance checks, to avoid treating schema
-                # templates (e.g. [{"tool": str, "args": dict}]) as type objects.
-                if isinstance(expected_type, (list, dict)):
-                    if new_val is not None:
-                        current_best[key] = self._ensure_structure_internal(
-                            new_val,
-                            expected_type,
-                        )
-                    elif key not in current_best:
-                        current_best[key] = self.default_value(expected_type)
-                    continue
-                # Scalar leaf types (str, int, float, etc.)
-                if expected_type is int:
-                    if isinstance(new_val, int) and not isinstance(new_val, bool):
-                        current_best[key] = new_val
-                    elif key not in current_best:
-                        current_best[key] = self.default_value(expected_type)
-                    continue
-                if expected_type is float:
-                    if isinstance(new_val, (int, float)) and not isinstance(new_val, bool):
-                        current_best[key] = float(new_val)
-                    elif key not in current_best:
-                        current_best[key] = self.default_value(expected_type)
-                    continue
-                if expected_type is bool:
-                    if isinstance(new_val, bool):
-                        current_best[key] = bool(new_val)
-                    elif key not in current_best:
-                        current_best[key] = self.default_value(expected_type)
-                    continue
-                if isinstance(new_val, expected_type):
-                    current_best[key] = new_val
-                elif key not in current_best:
-                    current_best[key] = self.default_value(expected_type)
-        return current_best
-
-    # ---------- extras diff & vars extraction ----------
-
-    def _diff_extras(self, raw: Any, coerced: Any) -> Any:
-        if isinstance(raw, dict) and isinstance(coerced, dict):
-            out: Dict[str, Any] = {}
-            for k, v in raw.items():
-                if k not in coerced:
-                    out[k] = v
-                else:
-                    sub = self._diff_extras(v, coerced.get(k))
-                    if self._non_empty(sub):
-                        out[k] = sub
-            return out
-        if isinstance(raw, list) and isinstance(coerced, list):
-            extras_list: List[Any] = []
-            n = max(len(raw), len(coerced))
-            for i in range(n):
-                rv = raw[i] if i < len(raw) else None
-                cv = coerced[i] if i < len(coerced) else None
-                sub = self._diff_extras(rv, cv)
-                if self._non_empty(sub):
-                    extras_list.append(sub)
-            if len(raw) > len(coerced):
-                for j in range(len(coerced), len(raw)):
-                    extras_list.append(raw[j])
-            return extras_list
-        if raw == coerced:
-            return None
-        return raw
-
-    def _non_empty(self, v: Any) -> bool:
-        if v is None:
-            return False
-        if isinstance(v, (list, dict)):
-            return len(v) > 0
-        return True
-
-    def _extract_vars(self, raw: Any) -> Dict[str, Any]:
-        vars_map: Dict[str, Any] = {}
-
-        def _scan_str(s: str) -> None:
-            t = s.strip()
-            for key in ("width", "height", "steps", "cfg", "seed"):
-                pat = r"\b" + key + r"\s*[:=]?\s*([0-9]+(?:\.[0-9]+)?)\b"
-                for m in re.finditer(pat, t, flags=re.IGNORECASE):
-                    val = m.group(1)
-                    if "." in val and key not in ("steps", "seed"):
-                        if val.replace(".", "", 1).isdigit():
-                            if key in ("steps", "seed"):
-                                vars_map[key] = int(float(val))
-                            else:
-                                vars_map[key] = float(val)
-                    elif val.isdigit():
-                        if key in ("steps", "seed"):
-                            vars_map[key] = int(val)
-                        else:
-                            vars_map[key] = int(val)
-            for m in re.finditer(
-                r"\b([A-Za-z0-9_\-]+)\s*[:=]\s*([A-Za-z0-9_\-\.]+)\b", t
-            ):
-                k = m.group(1).lower()
-                v = m.group(2)
-                if k not in vars_map:
-                    if v.replace(".", "", 1).isdigit():
-                        if "." in v:
-                            vars_map[k] = float(v)
-                        else:
-                            vars_map[k] = int(v)
-                    else:
-                        vars_map[k] = v
-
-        def _walk(x: Any) -> None:
-            if isinstance(x, str):
-                _scan_str(x)
-                return
-            if isinstance(x, list):
-                for it in x:
-                    _walk(it)
-                return
-            if isinstance(x, dict):
-                for it in x.values():
-                    _walk(it)
-                return
-
-        _walk(raw)
-        return vars_map
-
-    def _is_default_scalar(self, value: Any, expected_type: Any) -> bool:
-        """
-        Return True if the current value should be considered "missing" for the
-        purposes of salvage. We only overwrite such default-ish values; any
-        non-default (already sensible) value is left untouched.
-        """
-        if expected_type is bool:
-            return not isinstance(value, bool) or value is False
-        if expected_type is int:
-            return not (isinstance(value, int) and not isinstance(value, bool)) or value == 0
-        if expected_type is float:
-            return not (isinstance(value, (int, float)) and not isinstance(value, bool)) or float(value) == 0.0
-        if expected_type is str:
-            return not isinstance(value, str) or not value.strip()
-        if isinstance(value, (list, dict)):
-            return len(value) == 0
-        return value is None
-
-    def _extract_scalar_from_text(self, text: str, key: str, expected_type: Any) -> Optional[Any]:
-        """
-        Extract a scalar value for a given key from arbitrary text. This is a
-        heuristic, last-resort helper and must tolerate spaces, punctuation,
-        and partial JSON or natural language fragments.
-        """
-        if not isinstance(text, str) or not text:
-            return None
-        key_pattern = re.escape(str(key))
-        # Look for "key: <value>" or "key = <value>" patterns; capture everything
-        # to the end of the line or until a closing delimiter, then trim.
-        pattern = rf"{key_pattern}\s*[:=]\s*(?P<val>.+)"
-        m = re.search(pattern, text)
-        if m:
-            raw_val = m.group("val")
-            if not isinstance(raw_val, str):
-                raw_val = str(raw_val)
-            raw = raw_val.lstrip()
-            # First, if another key-like token appears later on this line
-            # (e.g., "color: blue color2: red"), treat the start of that token
-            # as a delimiter so we only keep "blue".
-            next_key = re.search(r"\s+[A-Za-z0-9_\-]+\s*:", raw)
-            if next_key:
-                raw = raw[: next_key.start()].rstrip()
-            # Then truncate at common structural delimiters while allowing
-            # punctuation and spaces within the value itself.
-            for sep in [",", "\n", "\r", ";", "}", "]"]:
-                idx = raw.find(sep)
-                if idx != -1:
-                    raw = raw[:idx]
-                    break
-        else:
-            # Fallback: handle the pattern where the key appears on its own line
-            # and the value is on the next non-empty line, e.g.:
-            #   color
-            #   red
-            raw = ""
-            lines = text.splitlines()
-            for idx, line in enumerate(lines):
-                if re.fullmatch(rf"\s*{key_pattern}\s*[:=]?\s*$", line):
-                    # Find the next non-empty line.
-                    for j in range(idx + 1, len(lines)):
-                        candidate = lines[j].strip()
-                        if not candidate:
-                            continue
-                        # If the next non-empty line looks like another key
-                        # declaration (e.g., "color2:"), treat this as no value.
-                        if re.match(r"[A-Za-z0-9_\-]+\s*[:=]\s*", candidate):
-                            raw = ""
-                            break
-                        raw = candidate
-                        break
-                    break
-        raw = raw.strip().strip("\"'")
-        if not raw:
-            return None
-        # If the extracted chunk immediately looks like the *next* key (e.g.
-        # "color: color2: blue"), treat this as "no value" for the current key.
-        # i.e., a new identifier followed by ":" means we shouldn't salvage.
-        if re.match(r"[A-Za-z0-9_\-]+\s*:", raw):
-            return None
-        # Treat common "no value" markers as intentional empties; do not try to
-        # salvage a concrete value from them.
-        lowered = raw.lower()
-        if lowered in ("none", "null", "n/a", "na", "-", "--"):
-            return None
+    def _pack_children_from_parent(self, out: Dict[str, Any], expected: Dict[str, Any]) -> None:
+        # Move matching keys from parent into nested dicts if expected
         try:
-            if expected_type is int:
-                return int(float(raw))
-            if expected_type is float:
-                return float(raw)
-            if expected_type is str:
-                # Collapse excessive whitespace but preserve punctuation.
-                return re.sub(r"\s+", " ", raw)
-        except (ValueError, TypeError) as exc:
-            # Log, but do not raise; salvage is best-effort only.
-            self._err(f"_extract_scalar_from_text:{key}:{exc}")
+            for child_key, child_schema in expected.items():
+                if not isinstance(child_schema, dict) or not child_schema:
+                    continue
+                child_val = out.get(child_key)
+                if not isinstance(child_val, dict):
+                    child_val = {} if child_val is None else {"_raw": child_val}
+                    out[child_key] = child_val
+                for ck, cschema in child_schema.items():
+                    if ck in out and ck not in child_val:
+                        child_val[ck] = self._coerce_node(out.get(ck), cschema)
+                        del out[ck]
+        except Exception as exc:
+            self._err(f"pack_children_from_parent:{type(exc).__name__}:{exc}")
+
+    def _default_for_schema(self, schema: Any) -> Any:
+        try:
+            if isinstance(schema, dict):
+                return {}
+            if isinstance(schema, list):
+                return []
+            origin = get_origin(schema)
+            if origin is list:
+                return []
+            if origin is dict:
+                return {}
+            if schema is bool:
+                return False
+            if schema is int:
+                return 0
+            if schema is float:
+                return 0.0
+            if schema is str:
+                return ""
+            return None
+        except Exception as exc:
+            self._err(f"default_for_schema:{type(exc).__name__}:{exc}")
+            return None
+
+    def _coerce_scalar(self, value: Any, schema: Any) -> Any:
+        try:
+            if schema is Any or schema is object:
+                return value
+            origin = get_origin(schema)
+            if origin is not None:
+                args = list(get_args(schema) or [])
+                if args:
+                    for a in args:
+                        if a is type(None):
+                            continue
+                        v = self._coerce_scalar(value, a)
+                        if v not in (None, "", 0, 0.0, False, [], {}):
+                            return v
+                    for a in args:
+                        if a is not type(None):
+                            return self._coerce_scalar(value, a)
+                return None
+            if schema is bool:
+                return self._to_bool(value)
+            if schema is int:
+                return self._to_int(value)
+            if schema is float:
+                return self._to_float(value)
+            if schema is str:
+                return "" if value is None else str(value)
+            return value
+        except Exception as exc:
+            self._err(f"coerce_scalar:{type(exc).__name__}:{exc}")
+            return self._default_for_schema(schema)
+
+    def _to_bool(self, v: Any) -> bool:
+        try:
+            if isinstance(v, bool):
+                return v
+            if v is None:
+                return False
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                try:
+                    return bool(int(v))
+                except Exception:
+                    return False
+            if isinstance(v, str):
+                t = v.strip().lower()
+                if t in ("true", "1", "yes", "y", "on"):
+                    return True
+                if t in ("false", "0", "no", "n", "off", ""):
+                    return False
+                return True
+            return bool(v)
+        except Exception as exc:
+            self._err(f"to_bool:{type(exc).__name__}:{exc}")
+            return False
+
+    def _to_int(self, v: Any) -> int:
+        try:
+            if v is None:
+                return 0
+            if isinstance(v, bool):
+                return 1 if v else 0
+            if isinstance(v, int):
+                return v
+            if isinstance(v, float):
+                if not math.isfinite(v):
+                    return 0
+                return int(v)
+            if isinstance(v, str):
+                t = v.strip()
+                if not t:
+                    return 0
+                try:
+                    f = float(t)
+                    if not math.isfinite(f):
+                        return 0
+                    return int(f)
+                except Exception:
+                    return 0
+            return int(v)
+        except Exception as exc:
+            self._err(f"to_int:{type(exc).__name__}:{exc}")
+            return 0
+
+    def _to_float(self, v: Any) -> float:
+        try:
+            if v is None:
+                return 0.0
+            if isinstance(v, bool):
+                return 1.0 if v else 0.0
+            if isinstance(v, (int, float)):
+                f = float(v)
+                return f if math.isfinite(f) else 0.0
+            if isinstance(v, str):
+                t = v.strip()
+                if not t:
+                    return 0.0
+                try:
+                    f = float(t)
+                    return f if math.isfinite(f) else 0.0
+                except Exception:
+                    return 0.0
+            f = float(v)
+            return f if math.isfinite(f) else 0.0
+        except Exception as exc:
+            self._err(f"to_float:{type(exc).__name__}:{exc}")
+            return 0.0
+
+    def _as_dict(self, v: Any) -> Optional[Dict[str, Any]]:
+        try:
+            if isinstance(v, dict):
+                return v
+            if hasattr(v, "items") and callable(getattr(v, "items")):
+                out: Dict[str, Any] = {}
+                for k, val in v.items():  # type: ignore[attr-defined]
+                    out[k] = val
+                return out
+        except Exception as exc:
+            self._err(f"as_dict:{type(exc).__name__}:{exc}")
             return None
         return None
 
-    def _salvage_node_from_text(self, text: str, expected: Any, current: Any) -> Any:
-        """
-        Walk the expected structure (dicts/lists) and, for any scalar fields
-        that are still default/missing in `current`, attempt to salvage a value
-        from the raw text. Never overwrites non-default values.
-        """
-        # Dict: recurse into nested fields.
-        if isinstance(expected, dict):
-            if not isinstance(current, dict):
-                current = {}  # type: ignore[assignment]
-            for key, expected_type in expected.items():
-                if isinstance(expected_type, (dict, list)):
-                    cur_val = current.get(key)
-                    current[key] = self._salvage_node_from_text(text, expected_type, cur_val)
-                    continue
-                if expected_type not in (int, float, str):
-                    continue
-                cur_val = current.get(key)
-                if not self._is_default_scalar(cur_val, expected_type):
-                    # Do not clobber an already-meaningful value.
-                    continue
-                extracted = self._extract_scalar_from_text(text, key, expected_type)
-                if extracted is not None:
-                    current[key] = extracted
-            return current
+    # ---------------- scoring ----------------
 
-        # List: apply salvage to each element using the first element as schema.
-        if isinstance(expected, list) and expected:
-            proto = expected[0]
-            if not isinstance(current, list):
-                items: List[Any] = [current] if current is not None else []
-            else:
-                items = list(current)
-            return [self._salvage_node_from_text(text, proto, item) for item in items]
+    def _score_candidate(self, candidate: Any, expected: Any) -> int:
+        try:
+            if isinstance(expected, dict):
+                if not isinstance(candidate, dict):
+                    return 0
+                if not expected:
+                    return len(candidate)
+                score = 0
+                for k, sub in expected.items():
+                    if k in candidate:
+                        score += 2
+                        if isinstance(sub, dict) and isinstance(candidate.get(k), dict):
+                            score += 1
+                score += min(len(candidate), 50)
+                return score
+            if isinstance(expected, list):
+                if isinstance(candidate, list):
+                    return len(candidate) + 1
+                if isinstance(candidate, dict):
+                    return 1
+                return 0
+            return 0 if candidate is None else 1
+        except Exception as exc:
+            self._err(f"score_candidate:{type(exc).__name__}:{exc}")
+            return 0
 
-        # Scalar or unsupported schema node: nothing to salvage here.
-        return current
+    # ---------------- helpers ----------------
 
-    def _salvage_from_text(self, text: Any, expected_structure: Any, result: Any) -> Any:
-        """
-        Best-effort salvage of scalar fields from raw, possibly non-JSON text.
+    def _is_mapping_like(self, obj: Any) -> bool:
+        try:
+            return hasattr(obj, "items") and callable(getattr(obj, "items"))
+        except Exception:
+            return False
 
-        This is a last-resort path: it is only invoked after best-effort JSON
-        parsing, and it is only allowed to fill in fields that are clearly
-        default/missing (0, 0.0, empty string, empty list/dict, or None).
-        It never overwrites non-default values.
-        """
-        if not isinstance(text, str):
-            return result
-        return self._salvage_node_from_text(text, expected_structure, result)
+    def _to_dict_safe(self, obj: Any) -> Optional[Dict[str, Any]]:
+        try:
+            if isinstance(obj, dict):
+                return obj
+            if hasattr(obj, "items"):
+                out: Dict[str, Any] = {}
+                for k, v in obj.items():  # type: ignore[attr-defined]
+                    out[k] = v
+                return out
+        except Exception as exc:
+            self._err(f"to_dict_safe:{type(exc).__name__}:{exc}")
+            return None
+        return None
 
-    # ---------- diagnostics ----------
+    def _object_to_dict_safe(self, obj: Any) -> Optional[Dict[str, Any]]:
+        try:
+            # dataclass
+            try:
+                import dataclasses
+                if dataclasses.is_dataclass(obj):
+                    return dataclasses.asdict(obj)
+            except Exception:
+                pass
+            # __dict__
+            if hasattr(obj, "__dict__"):
+                d = getattr(obj, "__dict__", None)
+                if isinstance(d, dict):
+                    return dict(d)
+        except Exception as exc:
+            self._err(f"object_to_dict_safe:{type(exc).__name__}:{exc}")
+            return None
+        return None
 
-    def _note(self, msg: str) -> None:
-        self.repairs.append(msg)
+    # ---------------- diagnostics ----------------
 
     def _err(self, msg: str) -> None:
         self.last_error = msg
         self.errors.append(msg)
-        # Surface parser diagnostics through the shared logger so they land
-        # in the central orchestrator logs instead of a private file.
-        logger.info(f"JSONParser error: {msg}")
+        logger.info("JSONParser error: %s", msg)

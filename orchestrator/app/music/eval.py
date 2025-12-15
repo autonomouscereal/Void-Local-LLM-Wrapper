@@ -500,7 +500,7 @@ def get_music_acceptance_thresholds() -> Dict[str, float]:
     with open(cfg_path, "r", encoding="utf-8") as f:
         txt = f.read()
     parser = JSONParser()
-    cfg = parser.parse_superset(txt or "{}", {"music": dict})["coerced"]
+    cfg = parser.parse(txt or "{}", {"music": dict})
     music_cfg = cfg.get("music") if isinstance(cfg.get("music"), dict) else {}
     overall_min = float(music_cfg.get("overall_quality_min"))
     fit_min = float(music_cfg.get("fit_score_min"))

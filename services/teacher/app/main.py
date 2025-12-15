@@ -321,8 +321,7 @@ async def trace_flush(body: Dict[str, Any]):
                 parser = JSONParser()
                 for tp in tp_lines:
                     try:
-                        sup_tp = parser.parse_superset(tp, {})
-                        obj_tp = sup_tp.get("coerced") or {}
+                        obj_tp = parser.parse(tp, {}) or {}
                         if isinstance(obj_tp, dict):
                             await db_execute("INSERT INTO distill_toolpolicy(run_id, policy_json) VALUES($1,$2)", rid, obj_tp)
                     except Exception as ex:
@@ -330,8 +329,7 @@ async def trace_flush(body: Dict[str, Any]):
                         continue
                 for dp in dpo_lines:
                     try:
-                        sup_dp = parser.parse_superset(dp, {})
-                        obj_dp = sup_dp.get("coerced") or {}
+                        obj_dp = parser.parse(dp, {}) or {}
                         if isinstance(obj_dp, dict):
                             await db_execute("INSERT INTO distill_dpo(run_id, pair_json) VALUES($1,$2)", rid, obj_dp)
                     except Exception as ex:

@@ -26,9 +26,13 @@ def _write_jsonl(state_dir: str, trace_id: str, filename: str, obj: Dict[str, An
     Append a single JSON object to traces/<trace_id>/<filename> as JSONL.
     Uses the existing append_ndjson helper for atomic writes.
     """
-    base = _base_dir(state_dir, trace_id)
-    path = os.path.join(base, filename)
-    append_ndjson(path, obj)
+    try:
+        base = _base_dir(state_dir, trace_id)
+        path = os.path.join(base, filename)
+        append_ndjson(path, obj)
+    except Exception:
+        # Trace writing is best-effort; never allow it to break request handling.
+        return
 
 
 def log_request(state_dir: str, trace_id: str, record: Dict[str, Any]) -> None:

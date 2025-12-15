@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import io
 from typing import Dict, Any
 import numpy as np
@@ -24,6 +25,6 @@ async def sing(body: Dict[str, Any]):
     wav = np.zeros(sr * int(body.get("seconds", 4) or 4), dtype=np.float32)
     buf = io.BytesIO()
     sf.write(buf, wav, sr, format="WAV")
-    return {"audio_wav_base64": buf.getvalue().hex(), "sample_rate": sr}
+    return {"audio_wav_base64": base64.b64encode(buf.getvalue()).decode("ascii"), "sample_rate": sr}
 
 

@@ -1,26 +1,12 @@
 from __future__ import annotations
 
 import json
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional, Tuple
 
-from ..json_parser import JSONParser
 from ..pipeline.compression_orchestrator import co_pack, frames_to_string
-from ..committee_client import CommitteeClient, committee_jsonify
-
-
-PLAN_SCHEMA: Dict[str, Any] = {
-    "request_id": str,
-    "plan": [
-        {
-            "id": str,
-            "tool": str,
-            "inputs": dict,
-            "needs": [str],
-            "provides": dict,
-        }
-    ],
-}
-
+from ..committee_client import committee_ai_text, committee_jsonify
+from .catalog import PLANNER_VISIBLE_TOOLS
+from ..tools_schema import get_builtin_tools_schema
 
 SYSTEM_IMAGE = (
     "You are ImageOps. Output ONLY JSON per the schema. "
@@ -47,64 +33,70 @@ SYSTEM_AUDIO = (
 )
 
 
-async def _call_llm_json(prompt: str, trace_id: str) -> Dict[str, Any]:
+def _tool_schema_by_name(name: str) -> Dict[str, Any]:
     """
-    Legacy planner helper now routed through the central committee path.
-    The committee debate produces free-form text; we then parse that text
-    into PLAN_SCHEMA via JSONParser. No direct calls to Ollama here.
+    Extract the OpenAI-style JSON schema parameters block for a built-in tool.
+    Returns {} when the tool isn't found or has no parameters block.
     """
-    # First, route through the main planner committee to get a rich text answer.
-    client = CommitteeClient()
-    env = await client.run(
-        [
-            {"role": "system", "content": "You are a multimodal planner. Output ONLY JSON per the schema."},
-            {"role": "user", "content": prompt},
-        ],
-        trace_id=trace_id,
-    )
-    result: Dict[str, Any]
-    if not isinstance(env, dict) or not env.get("ok"):
-        # Legacy planner committee failure: log and return a minimal plan with
-        # an embedded error so callers can surface it if they choose to.
-        import logging
-        logging.getLogger("orchestrator.plan.committee").error(
-            "legacy_planner committee failed (trace_id=%s): env=%r",
-            trace_id,
-            env,
-        )
-        result = {
-            "request_id": "",
-            "plan": [],
-            "error": (env or {}).get("error")
-            if isinstance(env, dict)
-            else {
-                "code": "planner_committee_error",
-                "message": str(env),
-            },
-        }
-    else:
-        res = env.get("result") or {}
-        text = res.get("text") or ""
-        # Then, run the raw planner text through committee.jsonify to enforce PLAN_SCHEMA.
-        parsed = await committee_jsonify(
-            text or "{}",
-            expected_schema=PLAN_SCHEMA,
-            trace_id=trace_id,
-            temperature=0.0,
-        )
-        result = parsed if isinstance(parsed, dict) else {"request_id": "", "plan": []}
-    return result
+    nm = str(name or "").strip()
+    if not nm:
+        return {}
+    for t in get_builtin_tools_schema() or []:
+        if not isinstance(t, dict):
+            continue
+        fn = t.get("function") if isinstance(t.get("function"), dict) else {}
+        tool_name = fn.get("name") if isinstance(fn.get("name"), str) else None
+        if tool_name == nm:
+            params = fn.get("parameters")
+            return params if isinstance(params, dict) else {}
+    return {}
 
 
-async def _plan_with_role(system: str, user_text: str, request_id: str) -> Dict[str, Any]:
-    # Build CO frames for planner/committee via internal pack (prompt-only, no enforcement)
+async def produce_tool_plan(
+    messages: List[Dict[str, Any]],
+    tools: Optional[List[Dict[str, Any]]],
+    temperature: float,
+    trace_id: Optional[str] = None,
+    mode: Optional[str] = None,
+) -> Tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
+    """
+    Central chat planner entry point.
+
+    - Owns planning (no planner logic in /v1/chat/completions).
+    - Uses the committee layer for model calls.
+    - Returns (raw_planner_text, normalized_tool_calls, planner_env).
+    """
+    effective_mode = str(mode or "general").strip() or "general"
+    msgs = messages or []
+
+    # Latest user text for goal anchoring.
+    last_user = ""
+    for m in reversed(msgs):
+        if (
+            isinstance(m, dict)
+            and m.get("role") == "user"
+            and isinstance(m.get("content"), str)
+            and m.get("content").strip()
+        ):
+            last_user = m.get("content").strip()
+            break
+
+    # Planner-visible tool palette (fixed) — keep consistent with plan.catalog.
+    allowed_tools = sorted([t for t in (PLANNER_VISIBLE_TOOLS or set()) if isinstance(t, str) and t.strip()])
+
+    # Mode steering (kept inside the planner module, not in /v1/chat/completions).
+    mode_system = "You are PlannerOps. Output ONLY JSON per the schema."
+    if effective_mode == "film":
+        mode_system = SYSTEM_VIDEO
+
+    # CO frames (prompt-only) to provide compact guidance + tail-safe RoE.
     co_env = {
         "schema_version": 1,
-        "trace_id": request_id,
+        "trace_id": str(trace_id or ""),
         "call_kind": "planner",
         "model_caps": {"num_ctx": 8192},
-        "user_turn": {"role": "user", "content": user_text},
-        "history": [],
+        "user_turn": {"role": "user", "content": last_user},
+        "history": msgs,
         "attachments": [],
         "tool_memory": [],
         "rag_hints": [],
@@ -115,112 +107,87 @@ async def _plan_with_role(system: str, user_text: str, request_id: str) -> Dict[
     }
     co_out = co_pack(co_env)
     frames_text = frames_to_string(co_out.get("frames") or [])
-    prompt = (
-        frames_text
-        + "\n\n"
-        + f"Return JSON exactly matching this schema: {json.dumps(PLAN_SCHEMA, ensure_ascii=False)}\n"
-        + f"User request: {user_text}\n"
-        + f"Your role: {system}\n"
-        + "Include ALL relevant steps for your modality; do not omit sub-steps.\n"
-        + "### [PLANNER / SYSTEM]\n"
-        + "- Think in explicit plans, not single shots. For each step, decide its purpose, which tool to call (or if it is reasoning-only), and what it depends on.\n"
-        + "- Plan minimal but complete steps, prefer tools over pure text when external data, media generation, or locks are involved.\n"
-        + "- When prior tool results are available in the CO/TOOLS frames, read their summaries (success/fail, key args, artifact ids, short diagnosis) and incorporate failures into the new plan.\n"
-        + "- If a previous step failed (ok=false or error present), do NOT assume it will be retried automatically; instead, add a new step that fixes the inputs or uses a different tool.\n"
-        + "### [LOCK ENGINE DIRECTIVES]\n"
-        + "- Fetch existing lock bundles with locks.get_bundle when the user references prior characters, outfits, props, scenery, or voices.\n"
-        + "- Use locks.build_region_locks when new reference images define clothing/props/background regions to preserve.\n"
-        + "- Adjust lock modes instead of re-prompting: locks.update_region_modes for vision regions (shape/texture/color hard|soft|off) and locks.update_audio_modes for tempo/key/stem/lyrics.\n"
-        + "- When user requests partial changes (e.g., \"same coat shape, new color\"), keep shape hard and relax color/texture via the update tools; carry forward the bundle ID into downstream image.dispatch/film2.run/music/tts calls.\n"
-        + "- Always pass lock_bundle and quality_profile into image.dispatch, film2.run, music.*, and tts.speak so downstream QA can enforce thresholds.\n"
-        + "### [HTTP TOOL]\n"
-        + "- Use http.request (or api.request where exposed) to call external APIs when needed. Provide url, method, headers/query/body, and set expect_json=false if the endpoint returns plain text.\n"
-        + "- Treat http.request results as envelopes: ok=true means success; ok=false responses include error.status and error.details.remote_* fields. Plan a new step with corrected args instead of assuming automatic retries.\n"
-        + "### [EXECUTOR / VALIDATION INVARIANTS]\n"
-        + "- The executor validates once and runs each tool step once. It will NOT automatically retry or repair; all retries must be explicit new steps you plan.\n"
-        + "- Do not count on hidden retries or side effects; always assume tools are run exactly as you specify them.\n"
-        + "### [FINALITY / SYSTEM]\n"
-        + "Do not output assistant content until committee consensus; one final answer only."
+
+    # Tool catalog: strict, explicit, planner-visible tools only.
+    catalog_lines: List[str] = [
+        "### [TOOL CATALOG / SYSTEM]",
+        "You must plan using ONLY these front-door tools. For each, the JSON args must follow the given schema.",
+    ]
+    for name in allowed_tools:
+        schema = _tool_schema_by_name(name)
+        catalog_lines.append(f"- tool: {name}")
+        catalog_lines.append("  json_schema: " + json.dumps(schema or {}, ensure_ascii=False, sort_keys=True))
+    tool_catalog_frame = {"role": "system", "content": "\n".join(catalog_lines)}
+
+    planner_rules = (
+        "### [PLANNER / SYSTEM]\n"
+        "Return ONLY strict JSON: {\"steps\":[{\"tool\":\"<name>\",\"args\":{...}}]} — no extra keys.\n"
+        "For pure chat answers with no tool use, return {\"steps\":[]}.\n"
+        "Rules:\n"
+        f"- mode: {effective_mode}\n"
+        f"- allowed_tools: {', '.join(allowed_tools) if allowed_tools else '(none)'}\n"
+        "- Do NOT invent tool names.\n"
+        "- If the user asks for any images/video/music/audio/TTS, you MUST include at least one tool step.\n"
     )
-    out = await _call_llm_json(prompt, trace_id=request_id)
-    out["request_id"] = request_id
-    return out
 
+    plan_messages = [
+        {"role": "system", "content": mode_system},
+        {"role": "system", "content": frames_text},
+        tool_catalog_frame,
+        {"role": "system", "content": planner_rules},
+    ] + msgs
 
-async def _plan_with_retry(system: str, user_text: str, request_id: str, attempts: int = 2) -> Dict[str, Any]:
-    """
-    Call the modality-specific planner with a small number of retries.
+    try:
+        env = await committee_ai_text(
+            plan_messages,
+            trace_id=str(trace_id or "planner"),
+            temperature=float(temperature),
+        )
+    except Exception as ex:
+        return "", [], {"ok": False, "error": {"code": "planner_committee_exception", "message": str(ex)}}
 
-    This helper MUST NOT raise; on repeated failure it returns a minimal plan
-    with an embedded error so callers and HTTP layers can surface what went
-    wrong instead of silently dropping the exception.
-    """
-    last_error: str | None = None
-    result: Dict[str, Any] = {"request_id": request_id, "plan": []}
-    for i in range(attempts):
-        try:
-            result = await _plan_with_role(system, user_text, request_id)
-            break
-        except Exception as ex:  # pragma: no cover - defensive logging
-            last_error = str(ex)
-            # Best-effort log; committee/planner traces live under the main orchestrator logger.
-            import logging, traceback as _tb  # local import to avoid cycles
-            logging.getLogger("orchestrator.plan.committee").error(
-                "planner._plan_with_retry failed (attempt %d/%d, system=%s, request_id=%s): %s\n%s",
-                i + 1,
-                attempts,
-                system,
-                request_id,
-                last_error,
-                _tb.format_exc(),
-            )
-            if i == attempts - 1:
-                # Final fallback: surface the error in-band so upstream callers can
-                # include it in their envelopes instead of fabricating an empty plan.
-                result = {
-                    "request_id": request_id,
-                    "plan": [],
-                    "error": {
-                        "code": "planner_error",
-                        "message": last_error or "planner failed with unknown error",
-                        "system": system,
-                    },
-                }
-    return result
+    planner_env: Dict[str, Any] = env if isinstance(env, dict) else {"ok": False, "error": {"code": "planner_env_invalid", "message": str(env)}}
+    if not planner_env.get("ok"):
+        return "", [], planner_env
 
+    res = planner_env.get("result") if isinstance(planner_env.get("result"), dict) else {}
+    raw_text = res.get("text") if isinstance(res.get("text"), str) else ""
 
-async def make_full_plan(user_text: str) -> Dict[str, Any]:
-    import uuid as _uuid
-    rid = str(_uuid.uuid4())
-    # Sequential planning: run IMAGE, VIDEO, AUDIO planners one after another for stability.
-    parts: List[Dict[str, Any]] = []
-    img_plan = await _plan_with_retry(SYSTEM_IMAGE, user_text, rid)
-    if isinstance(img_plan, dict):
-        parts.append(img_plan)
-    vid_plan = await _plan_with_retry(SYSTEM_VIDEO, user_text, rid)
-    if isinstance(vid_plan, dict):
-        parts.append(vid_plan)
-    aud_plan = await _plan_with_retry(SYSTEM_AUDIO, user_text, rid)
-    if isinstance(aud_plan, dict):
-        parts.append(aud_plan)
-    merged = {"request_id": rid, "plan": []}
-    seen = set()
-    for p in parts:
-        if not isinstance(p, dict):
+    schema_steps = {
+        "steps": [
+            {
+                "tool": str,
+                "name": str,
+                "id": str,
+                "args": object,
+                "arguments": object,
+                "needs": list,
+                "meta": dict,
+            }
+        ]
+    }
+    try:
+        parsed = await committee_jsonify(
+            raw_text or "{}",
+            expected_schema=schema_steps,
+            trace_id=str(trace_id or "planner"),
+            temperature=0.0,
+        )
+    except Exception as ex:
+        parsed = {"steps": [], "error": {"code": "planner_jsonify_error", "message": str(ex)}}
+
+    steps_raw = parsed.get("steps") if isinstance(parsed, dict) else []
+    tool_calls: List[Dict[str, Any]] = []
+    allowed_set = set(allowed_tools)
+    for st in steps_raw or []:
+        if not isinstance(st, dict):
             continue
-        for step in p.get("plan", []):
-            key = (step.get("tool"), json.dumps(step.get("inputs", {}), ensure_ascii=False, sort_keys=True))
-            if key in seen:
-                continue
-            seen.add(key)
-            merged["plan"].append(step)
-    # Post-process: unify all video intents under film2.run (no bare video.*)
-    has_video = any(isinstance(s, dict) and isinstance(s.get("tool"), str) and s.get("tool", "").startswith("video.") for s in (merged.get("plan") or []))
-    if has_video:
-        merged["plan"] = [s for s in merged.get("plan") or [] if not (isinstance(s, dict) and isinstance(s.get("tool"), str) and s.get("tool", "").startswith("video."))]
-        merged["plan"].append({"id": "film-1", "tool": "film2.run", "inputs": {"prompt": user_text}, "needs": [], "provides": {}})
-    if not (merged.get("plan") or []):
-        merged["plan"] = [{"id": "img-1", "tool": "image.dispatch", "inputs": {"prompt": user_text}, "needs": [], "provides": {}}]
-    return merged
+        tool_name = str(st.get("tool") or st.get("name") or "").strip()
+        if not tool_name or tool_name not in allowed_set:
+            continue
+        args_val = st.get("args") if ("args" in st) else st.get("arguments")
+        tool_calls.append({"name": tool_name, "arguments": args_val})
+
+    return raw_text, tool_calls, planner_env
 
 

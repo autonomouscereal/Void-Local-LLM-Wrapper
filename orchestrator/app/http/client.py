@@ -46,12 +46,13 @@ def _coerce_query_map(query: Dict[str, Any]) -> Dict[str, str]:
     for key, value in query.items():
         if not isinstance(key, str):
             continue
-        if isinstance(value, (str, int, float)):
-            out[key] = str(value)
-        elif isinstance(value, bool):
+        # IMPORTANT: bool is a subclass of int; handle it first.
+        if isinstance(value, bool):
             out[key] = "true" if value else "false"
         elif value is None:
             out[key] = ""
+        elif isinstance(value, (str, int, float)):
+            out[key] = str(value)
         else:
             out[key] = str(value)
     return out
@@ -213,7 +214,7 @@ async def perform_http_request(config: HttpRequestConfig) -> Tuple[bool, Dict[st
                     expected = []
                 else:
                     expected = {}
-                parsed = parser.parse_superset(txt, expected)["coerced"]
+                parsed = parser.parse(txt, expected)
             except Exception as ex:
                 return False, {
                     "code": "remote_invalid_json",
@@ -252,7 +253,7 @@ async def perform_http_request(config: HttpRequestConfig) -> Tuple[bool, Dict[st
                 expected = []
             else:
                 expected = {}
-            details["remote_body"] = parser.parse_superset(txt, expected)["coerced"]
+            details["remote_body"] = parser.parse(txt, expected)
         except Exception:
             details["remote_body"] = txt
             details["remote_body_truncated"] = len(txt) == BODY_PREVIEW_BYTES

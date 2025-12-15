@@ -31,8 +31,7 @@ def _post(url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     # dict with those keys, and attach the HTTP status out-of-band.
     env_schema = {"ok": bool, "result": dict, "error": dict}
     try:
-        sup = parser.parse_superset(text or "{}", env_schema)
-        body = sup["coerced"]
+        body = parser.parse(text or "{}", env_schema)
     except Exception as e:
         # Parsing should virtually never fail for orchestrator envelopes. When
         # it does, surface the raw body and parse error so executor logs can

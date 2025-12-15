@@ -55,8 +55,7 @@ def ingest_file(path: str, vlm_url: str | None = None, whisper_url: str | None =
                 with httpx.Client(timeout=None, trust_env=False) as client:
                     r = client.post(ocr_url.rstrip("/") + "/ocr", json={"b64": b64, "ext": ext})
                     parser = JSONParser()
-                    sup = parser.parse_superset(r.text or "", {"text": str})
-                    js = sup["coerced"]
+                    js = parser.parse(r.text or "", {"text": str})
                     txt = (js.get("text") or "").strip() if isinstance(js, dict) else ""
                     if txt:
                         texts.append(txt)
@@ -77,8 +76,7 @@ def ingest_file(path: str, vlm_url: str | None = None, whisper_url: str | None =
                 with httpx.Client(timeout=None, trust_env=False) as client:
                     r = client.post(vlm_url.rstrip("/") + "/analyze", json={"b64": b64})
                     parser = JSONParser()
-                    sup = parser.parse_superset(r.text or "", {"caption": str, "text": str})
-                    js = sup["coerced"]
+                    js = parser.parse(r.text or "", {"caption": str, "text": str})
                     cap = (js.get("caption") or js.get("text") or "").strip() if isinstance(js, dict) else ""
                     if cap:
                         texts.append(f"[image] {os.path.basename(path)}\n{cap}")
@@ -92,8 +90,7 @@ def ingest_file(path: str, vlm_url: str | None = None, whisper_url: str | None =
                 with httpx.Client(timeout=None, trust_env=False) as client:
                     r = client.post(ocr_url.rstrip("/") + "/ocr", json={"b64": b64, "ext": ext})
                     parser = JSONParser()
-                    sup = parser.parse_superset(r.text or "", {"text": str})
-                    js = sup["coerced"]
+                    js = parser.parse(r.text or "", {"text": str})
                     tx = (js.get("text") or "").strip() if isinstance(js, dict) else ""
                     if tx:
                         texts.append(f"[ocr] {tx}")
@@ -110,8 +107,7 @@ def ingest_file(path: str, vlm_url: str | None = None, whisper_url: str | None =
                 with httpx.Client(timeout=None, trust_env=False) as client:
                     r = client.post(whisper_url.rstrip("/") + "/transcribe", json={"b64": b64})
                     parser = JSONParser()
-                    sup = parser.parse_superset(r.text or "", {"text": str, "transcript": str})
-                    js = sup["coerced"]
+                    js = parser.parse(r.text or "", {"text": str, "transcript": str})
                     tx = (js.get("text") or js.get("transcript") or "").strip() if isinstance(js, dict) else ""
                     if tx:
                         texts.append(f"[audio] {os.path.basename(path)}\n{tx}")

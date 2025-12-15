@@ -12,7 +12,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 try:
     from db.core import get_pool, execute as db_execute, fetchrow as db_fetchrow
-except Exception:  # optional DB
+except ImportError:  # optional DB
     async def get_pool():
         return None
     async def db_execute(*args, **kwargs):
@@ -44,14 +44,10 @@ def _check_models_exist(model_root: str, keys: List[str]) -> List[str]:
 
 @app.on_event("startup")
 async def _startup_model_guard():
-    try:
-        missing = _check_models_exist(MODEL_ROOT, REQUIRED_MODELS)
-        if missing:
-            _MODEL_HEALTH["ok"] = False
-            _MODEL_HEALTH["missing"] = missing
-    except Exception:
+    missing = _check_models_exist(MODEL_ROOT, REQUIRED_MODELS)
+    if missing:
         _MODEL_HEALTH["ok"] = False
-        _MODEL_HEALTH["missing"] = REQUIRED_MODELS
+        _MODEL_HEALTH["missing"] = missing
 
 
 # -------------------- Helpers --------------------
@@ -75,7 +71,7 @@ def _seed64(*parts: str) -> int:
         for p in parts:
             h.update(str(p))
         return h.intdigest() & ((1 << 64) - 1)
-    except Exception:
+    except ImportError:
         # fallback: lower 64 bits of sha256
         return int(_sha256_str("::".join(parts))[:16], 16)
 
@@ -134,7 +130,9 @@ def _trace_append(kind: str, row: Dict[str, Any]) -> None:
         row.setdefault("ts", _now_iso())
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
-    except Exception:
+    except Exception as ex:
+        # Best-effort: never break API calls due to trace logging failures.
+        logging.debug("film2.trace_append_failed kind=%s error=%s", kind, ex, exc_info=True)
         return
 
 
@@ -182,7 +180,8 @@ async def _get_project_row(project_id: str) -> Optional[Dict[str, Any]]:
         row = await db_fetchrow("SELECT id FROM film_project WHERE project_uid=$1", project_id)
         if row and (row.get("id") is not None):
             return {"id": int(row.get("id"))}
-    except Exception:
+    except Exception as ex:
+        logging.warning("film2.get_project_row.db_failed project_id=%s error=%s", project_id, ex, exc_info=True)
         return None
     return None
 
@@ -223,8 +222,7 @@ async def _get_manifest(project_id: str, kind: str) -> Optional[Any]:
                 for ln in f:
                     if ln.strip():
                         try:
-                            sup = parser.parse_superset(ln, {})
-                            obj = sup.get("coerced") or {}
+                            obj = parser.parse(ln, {}) or {}
                             if isinstance(obj, dict):
                                 items.append(obj)
                         except Exception:
@@ -236,8 +234,7 @@ async def _get_manifest(project_id: str, kind: str) -> Optional[Any]:
         with open(path, "r", encoding="utf-8") as f:
             raw = f.read()
         try:
-            sup = parser.parse_superset(raw, {})
-            obj = sup.get("coerced") or {}
+            obj = parser.parse(raw, {}) or {}
             return obj if isinstance(obj, dict) else {}
         except Exception:
             return {}
@@ -614,8 +611,7 @@ async def film_final(body: Dict[str, Any]):
                 for ln in f:
                     if ln.strip():
                         try:
-                            sup = parser.parse_superset(ln, {})
-                            obj = sup.get("coerced") or {}
+                            obj = parser.parse(ln, {}) or {}
                             if not isinstance(obj, dict):
                                 continue
                             sid = obj.get("id")
@@ -669,8 +665,7 @@ async def film_final(body: Dict[str, Any]):
                 for ln in f:
                     if ln.strip():
                         try:
-                            sup = parser.parse_superset(ln, {})
-                            obj = sup.get("coerced") or {}
+                            obj = parser.parse(ln, {}) or {}
                             if not isinstance(obj, dict):
                                 continue
                             sid = obj.get("id")

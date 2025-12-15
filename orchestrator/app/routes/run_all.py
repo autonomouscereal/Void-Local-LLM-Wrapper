@@ -14,7 +14,6 @@ from fastapi import APIRouter, Request, WebSocket
 from app.routes.toolrun import ToolEnvelope  # canonical envelope
 
 from ..json_parser import JSONParser
-from ..plan.committee import make_full_plan
 from ..plan.validator import validate_plan
 from ..review.referee import build_delta_plan as _build_delta_plan
 EXECUTOR_BASE_URL = os.getenv("EXECUTOR_BASE_URL", "http://127.0.0.1:8081")
@@ -32,8 +31,7 @@ def _post_json(url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         raw = resp.read().decode("utf-8", errors="replace")
         # Strict parse with expected structure only (no std json.loads fallback)
         expected = {"produced": dict, "error": str, "detail": str, "traceback": str}
-        sup = JSONParser().parse_superset(raw, expected)
-        return sup["coerced"]
+        return JSONParser().parse(raw, expected)
 
 
 

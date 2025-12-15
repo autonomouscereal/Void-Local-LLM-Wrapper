@@ -14,8 +14,7 @@ def _get(url: str) -> Dict[str, Any]:
             raw = resp.read().decode("utf-8", errors="replace")
         try:
             parser = JSONParser()
-            sup = parser.parse_superset(raw, {})
-            obj = sup.get("coerced") or {}
+            obj = parser.parse(raw, {}) or {}
             return obj if isinstance(obj, dict) else {}
         except Exception:
             return {}

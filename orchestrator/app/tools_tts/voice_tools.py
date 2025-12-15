@@ -62,7 +62,7 @@ async def run_voice_register(args: Dict[str, Any]) -> Dict[str, Any]:
         r = await client.post(rvc_url.rstrip("/") + "/v1/voice/register", json=payload_reg)
         raw = r.text or ""
         parser = JSONParser()
-        env = parser.parse_superset(raw or "{}", {"ok": bool, "error": dict})["coerced"]
+        env = parser.parse(raw or "{}", {"ok": bool, "error": dict})
     if isinstance(env, dict) and env.get("ok"):
         return {
             "result": {
@@ -113,7 +113,7 @@ async def run_voice_train(args: Dict[str, Any]) -> Dict[str, Any]:
         r = await client.post(rvc_url.rstrip("/") + "/v1/voice/train", json=payload_train)
         raw = r.text or ""
         parser = JSONParser()
-        env = parser.parse_superset(raw or "{}", {"ok": bool, "error": dict})["coerced"]
+        env = parser.parse(raw or "{}", {"ok": bool, "error": dict})
     if isinstance(env, dict) and env.get("ok"):
         return {"result": env}
     err_obj = env.get("error") if isinstance(env, dict) else {}

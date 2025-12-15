@@ -417,8 +417,7 @@ async def ablate(body: Dict[str, Any]):
                         for ln in f:
                             if ln.strip():
                                 try:
-                                    sup = parser.parse_superset(ln, {})
-                                    obj = sup.get("coerced") or {}
+                                    obj = parser.parse(ln, {}) or {}
                                     if isinstance(obj, dict):
                                         await db_execute(
                                             "INSERT INTO ablation_drop(ablation_id, item_json) VALUES($1,$2)",

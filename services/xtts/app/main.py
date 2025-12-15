@@ -54,8 +54,7 @@ def _load_voice_model_map() -> None:
         # Backwards-compatible: allow JSON from env, then persist it to disk
         # so subsequent restarts don't rely on the env being present.
         parser = JSONParser()
-        sup = parser.parse_superset(raw, {})
-        obj = sup.get("coerced") or {}
+        obj = parser.parse(raw, {}) or {}
         if isinstance(obj, dict):
             _TTS_MODEL_MAP = {str(k): str(v) for k, v in obj.items()}
             logging.info(

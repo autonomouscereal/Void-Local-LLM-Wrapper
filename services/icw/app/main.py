@@ -70,6 +70,45 @@ def _round6(x: float) -> float:
     return float(f"{x:.6f}")
 
 
+def _to_int(v: Any, default: int) -> int:
+    # Accept int/float/numeric strings; reject bool.
+    if isinstance(v, bool) or v is None:
+        return int(default)
+    if isinstance(v, int):
+        return int(v)
+    if isinstance(v, float):
+        return int(v)
+    if isinstance(v, str):
+        s = v.strip()
+        if not s:
+            return int(default)
+        try:
+            return int(s)
+        except Exception:
+            try:
+                return int(float(s))
+            except Exception:
+                return int(default)
+    return int(default)
+
+
+def _to_float(v: Any, default: float) -> float:
+    # Accept int/float/numeric strings; reject bool.
+    if isinstance(v, bool) or v is None:
+        return float(default)
+    if isinstance(v, (int, float)):
+        return float(v)
+    if isinstance(v, str):
+        s = v.strip()
+        if not s:
+            return float(default)
+        try:
+            return float(s)
+        except Exception:
+            return float(default)
+    return float(default)
+
+
 class TokenEstimator:
     # Default calibration; can be overridden at runtime
     a = 0.25  # ~ 1 token per 4 chars
@@ -369,10 +408,10 @@ class BudgetAllocator:
 class OutputPlanner:
     @staticmethod
     def plan(seed: int, style: str, global_budget: Dict[str, Any], outline_policy: Dict[str, Any], goal: str, pack: str) -> Dict[str, Any]:
-        seg_budget = int(_safe_get(global_budget, "segment_tokens", 800) or 800)
+        seg_budget = _to_int(_safe_get(global_budget, "segment_tokens", 800), 800)
         auto = bool(_safe_get(outline_policy, "auto_outline", True))
-        max_depth = int(_safe_get(outline_policy, "max_depth", 3) or 3)
-        min_sections = int(_safe_get(outline_policy, "min_sections", 3) or 3)
+        max_depth = _to_int(_safe_get(outline_policy, "max_depth", 3), 3)
+        min_sections = _to_int(_safe_get(outline_policy, "min_sections", 3), 3)
 
         # Deterministic outline using proportional allocation 15/70/15
         outline: List[Dict[str, Any]] = []
@@ -424,8 +463,8 @@ class OutputRenderer:
     @staticmethod
     def render(seed: int, plan_id: str, segment_budget: int, cursor: Dict[str, Any], style: str, pack: str, goal: str, outline: List[Dict[str, Any]]) -> Dict[str, Any]:
         sid = str(_safe_get(cursor, "section_id", "S1"))
-        offset = int(_safe_get(cursor, "offset", 0) or 0)
-        seg_idx = int(_safe_get(cursor, "segment_index", 0) or 0)
+        offset = _to_int(_safe_get(cursor, "offset", 0), 0)
+        seg_idx = _to_int(_safe_get(cursor, "segment_index", 0), 0)
         node = OutputRenderer._section_by_id(outline, sid) or {"title": "Section", "est_tokens": segment_budget}
 
         # Deterministic content: header + a slice of the context pack
@@ -452,7 +491,7 @@ class OutputRenderer:
         next_cursor = {"section_id": sid, "offset": offset + est_tokens, "segment_index": seg_idx + 1, "done": False}
 
         # Mark section done if we've consumed estimated section tokens worth of content
-        est_total = int(_safe_get(node, "est_tokens", segment_budget) or segment_budget)
+        est_total = _to_int(_safe_get(node, "est_tokens", segment_budget), int(segment_budget))
         if offset + est_tokens >= est_total:
             # linearize outline to get next section id
             order: List[str] = []
@@ -500,8 +539,8 @@ def _lru_put(cache: Dict[str, Any], key: str, val: Any):
 @app.post("/internal/icw_pack")
 async def context_pack(body: Dict[str, Any]):
     t0 = time.perf_counter()
-    seed = int(_safe_get(body, "seed", 0) or 0)
-    budget_tokens = int(_safe_get(body, "budget_tokens", 3500) or 3500)
+    seed = _to_int(_safe_get(body, "seed", 0), 0)
+    budget_tokens = _to_int(_safe_get(body, "budget_tokens", 3500), 3500)
     goal = str(_safe_get(body, "goal", ""))
     query = str(_safe_get(body, "query", ""))
     candidates = _safe_get(body, "candidates", []) or []
@@ -536,8 +575,8 @@ async def context_pack(body: Dict[str, Any]):
         hash_counts[h] = hash_counts.get(h, 0) + 1
         prefiltered.append(c)
 
-    preferred_delta = float(_safe_get(policies, "preferred_authority_delta", 0.05) or 0.05)
-    decay = float(_safe_get(policies, "decay", 1.0/365.0) or (1.0/365.0))
+    preferred_delta = _to_float(_safe_get(policies, "preferred_authority_delta", 0.05), 0.05)
+    decay = _to_float(_safe_get(policies, "decay", 1.0 / 365.0), (1.0 / 365.0))
     scorer = CandidateScorer(goal, query, hints, (horizon_s, horizon_e), preferred_domains_delta=preferred_delta, decay=decay)
     scored: List[Tuple[Dict[str, Any], Dict[str, float]]] = []
     t1 = time.perf_counter()
@@ -549,8 +588,8 @@ async def context_pack(body: Dict[str, Any]):
 
     ordered = DeterministicSorter.sort(scored)
 
-    max_per_source = int(_safe_get(policies, "max_per_source", 2) or 2)
-    reserve_frac = float(_safe_get(policies, "reserve_frac", 0.12) or 0.12)
+    max_per_source = _to_int(_safe_get(policies, "max_per_source", 2), 2)
+    reserve_frac = _to_float(_safe_get(policies, "reserve_frac", 0.12), 0.12)
     allocator = BudgetAllocator(budget_tokens, reserve_ratio=reserve_frac)
     t2 = time.perf_counter()
     evidence, audit = allocator.allocate(ordered, max_per_source=max_per_source)
@@ -645,7 +684,7 @@ async def context_pack(body: Dict[str, Any]):
 
 @app.post("/output/plan")
 async def output_plan(body: Dict[str, Any]):
-    seed = int(_safe_get(body, "seed", 0) or 0)
+    seed = _to_int(_safe_get(body, "seed", 0), 0)
     target_style = str(_safe_get(body, "target_style", "plain"))
     global_budget = _safe_get(body, "global_budget", {}) or {}
     outline_policy = _safe_get(body, "outline_policy", {}) or {}
@@ -666,9 +705,9 @@ async def output_plan(body: Dict[str, Any]):
 
 @app.post("/output/render")
 async def output_render(body: Dict[str, Any]):
-    seed = int(_safe_get(body, "seed", 0) or 0)
+    seed = _to_int(_safe_get(body, "seed", 0), 0)
     plan_id = str(_safe_get(body, "plan_id", ""))
-    segment_budget = int(_safe_get(body, "segment_budget", 800) or 800)
+    segment_budget = _to_int(_safe_get(body, "segment_budget", 800), 800)
     cursor = _safe_get(body, "cursor", {}) or {}
     style = str(_safe_get(body, "style", "plain"))
     pack = str(_safe_get(body, "context_pack", ""))

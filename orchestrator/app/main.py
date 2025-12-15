@@ -88,7 +88,13 @@ from .analysis.media import (
 from .ingest.core import ingest_file
 import asyncpg  # type: ignore
 from sentence_transformers import SentenceTransformer  # type: ignore
-from .tools_schema import get_builtin_tools_schema as _ext
+from .tools_schema import (
+    get_builtin_tools_schema,
+    get_tool_introspection_registry,
+    merge_tool_schemas,
+    compute_tools_hash,
+    tool_expected_from_jsonschema,
+)
 from fastapi import FastAPI, Request, UploadFile, File, WebSocket, WebSocketDisconnect  # type: ignore
 from fastapi.responses import JSONResponse, StreamingResponse, Response  # type: ignore
 from fastapi.staticfiles import StaticFiles  # type: ignore
@@ -379,13 +385,8 @@ async def _run_patch_call(
     exec_results: List[Dict[str, Any]] = []
     exec_batch = patch_validated or patch_calls
     if exec_batch:
-        _log("tool.run.start", trace_id=trace_id, executor="local", count=len(exec_batch or []), attempt=0)
-        for c in exec_batch:
-            tn = (c.get("name") or "tool")
-            args_call = c.get("arguments") if isinstance(c.get("arguments"), dict) else {}
-            _log("tool.run.before", trace_id=trace_id, tool=str(tn), args_keys=list((args_call or {}).keys()), attempt=0)
-            res = await execute_tool_call(c)
-            exec_results.append(res)
+        _log("exec.payload", trace_id=trace_id, steps=[{"tool": (c.get("name") or "")} for c in exec_batch[:5]])
+        exec_results = await gateway_execute(exec_batch, trace_id, executor_base_url, request_id=str(uuid.uuid4().hex))
     # Prefer direct results; if none, return first failure snapshot.
     if exec_results:
         return exec_results[0]
@@ -453,7 +454,7 @@ async def segment_qa_and_committee(
             meta_part = result_obj.get("meta")
             if isinstance(meta_part, dict) and isinstance(meta_part.get("cid"), str):
                 parent_cid = meta_part.get("cid")
-            segs = build_segments_for_tool(tool_name, parent_cid or trace_id, result_obj)
+            segs = build_segments_for_tool(tool_name, trace_id=str(trace_id), cid=parent_cid, result=result_obj)
             for seg in (segs or []):
                 if not isinstance(seg, dict):
                     continue
@@ -501,7 +502,7 @@ async def segment_qa_and_committee(
             seg_meta = seg.get("meta") if isinstance(seg.get("meta"), dict) else {}
             profile_val = seg_meta.get("profile") if isinstance(seg_meta.get("profile"), str) else None
             locks_val = seg.get("locks") if isinstance(seg.get("locks"), dict) else None
-            parent_cid = seg.get("parent_cid")
+            cid_val = seg.get("cid")
             _trace_append(
                 "segments",
                 {
@@ -512,7 +513,7 @@ async def segment_qa_and_committee(
                     "profile": profile_val,
                     "attempt": attempt,
                     "event": "qa",
-                    "parent_cid": parent_cid,
+                    "cid": cid_val,
                     "locks": locks_val,
                     "qa_scores": scores,
                 },
@@ -849,9 +850,9 @@ def _append_jsonl(path: str, obj: dict) -> None:
 
 def trace_append(kind: str, obj: Dict[str, Any]) -> None:
     """
-    Unified trace appender: Chooses key from trace_id | tid | cid | 'global'.
+    Unified trace appender: Chooses key from trace_id | tid | 'global'.
     """
-    key = str((obj.get("trace_id") or obj.get("tid") or obj.get("cid") or "global"))
+    key = str((obj.get("trace_id") or obj.get("tid") or "global"))
     emit_trace(STATE_DIR, key, kind, obj)
 
 def _trace_response(trace_id: str, envelope: Dict[str, Any]) -> None:
@@ -882,7 +883,8 @@ def _trace_response(trace_id: str, envelope: Dict[str, Any]) -> None:
         STATE_DIR,
         str(trace_id),
         {
-            "request_id": str(trace_id),
+            # request_id and trace_id are distinct; this trace log is keyed by trace_id.
+            "request_id": str(envelope.get("id") or ""),
             "kind": "final_response",
             "mode": "chat",
             "content": content,
@@ -920,8 +922,6 @@ ENABLE_WEBSEARCH = True
 MCP_HTTP_BRIDGE_URL = os.getenv("MCP_HTTP_BRIDGE_URL")  # e.g., http://host.docker.internal:9999
 EXECUTOR_BASE_URL = os.getenv("EXECUTOR_BASE_URL", "http://127.0.0.1:8081")
 PLANNER_MODEL = os.getenv("PLANNER_MODEL", "qwen")  # qwen | glm
-ENABLE_DEBATE = True
-MAX_DEBATE_TURNS = 1
 AUTO_EXECUTE_TOOLS = True
 # Always allow tool execution
 ALLOW_TOOL_EXECUTION = True
@@ -1085,69 +1085,6 @@ def _summarize_invalid(errors: List[Dict[str, Any]]) -> List[Dict[str, str]]:
         out.append({"field": path, "reason": reason})
     return out
 
-def _make_tool_failure_message(*, tool: str, err: Dict[str, Any], attempted_args: Dict[str, Any], trace_id: str) -> str:
-    code    = str((err.get("code") or "tool_error"))
-    details = err.get("details") or {}
-    missing = list(details.get("missing") or [])
-    invalid = list(details.get("invalid") or [])
-    if not (missing or invalid) and isinstance(details.get("errors"), list):
-        m, inv = [], []
-        for e in details["errors"]:
-            if e.get("code") in ("required_missing","required"):
-                m.append(e.get("path"))
-            else:
-                inv.append({"field": e.get("path"), "reason": e.get("code")})
-        missing, invalid = m, inv
-    inv_rows = _summarize_invalid(details.get("errors") or []) or invalid
-    tried    = {k: attempted_args.get(k) for k in _DISPLAY_KEYS if isinstance(attempted_args, dict) and (k in attempted_args)}
-    lines: List[str] = []
-    lines.append(f"### ❌ {tool or 'tool'} failed ({code})")
-    bullets: List[str] = []
-    if missing:
-        _miss_parts = [f"`{str(m)}`" for m in missing if m is not None]
-        if _miss_parts:
-            bullets.append("**Missing:** " + ", ".join(_miss_parts))
-    if inv_rows:
-        _inv_rows_parts: List[str] = []
-        for r in inv_rows:
-            fld = r.get("field")
-            rsn = r.get("reason")
-            if fld:
-                _inv_rows_parts.append(f"`{fld}` ({rsn})")
-        if _inv_rows_parts:
-            bullets.append("**Invalid:** " + ", ".join(_inv_rows_parts))
-    if bullets:
-        lines.extend(bullets)
-    else:
-        lines.append("**Reason:** See diagnostic details below.")
-    if tried:
-        lines.append("**AI attempted args:**")
-        lines.append("```json")
-        lines.append(json.dumps(tried, separators=(',',':'), ensure_ascii=False))
-        lines.append("```")
-    # Fix template
-    fix_args = dict(tried)
-    for m in (missing or []):
-        fix_args[m] = "<fill>"
-    if "width" in fix_args and isinstance(fix_args.get("width"), (int, float)):
-        fix_args["width"]  = int(fix_args["width"])//8*8
-    if "height" in fix_args and isinstance(fix_args.get("height"), (int, float)):
-        fix_args["height"] = int(fix_args["height"])//8*8
-    lines.append("**Try this and resend (the AI will fill the rest):**")
-    lines.append("```json")
-    lines.append(json.dumps({"tool": tool, "args": fix_args}, ensure_ascii=False))
-    lines.append("```")
-    auto: List[str] = []
-    if code in ("schema_validation","invalid_args","required_missing","type_mismatch","enum_mismatch"):
-        auto.append("re-validate once after you include the missing/invalid fields")
-    if code in ("workflow_invalid","workflow_binding_missing","missing_workflow"):
-        auto.append("coerce/inspect the workflow and bind required nodes once")
-    if auto:
-        lines.append("**System next:** " + "; ".join(auto) + ".")
-    if trace_id:
-        lines.append(f"_trace: `{trace_id}`_")
-    return "\n".join(lines)
-
 
 def _load_wrapper_config() -> None:
     global WRAPPER_CONFIG, WRAPPER_CONFIG_HASH
@@ -1158,7 +1095,7 @@ def _load_wrapper_config() -> None:
         parser = JSONParser()
         # Wrapper config is expected to be a dict; treat it as open, but
         # still coerce into a mapping shape.
-        cfg = parser.parse_superset(data.decode("utf-8"), {"profiles": list, "defaults": dict})["coerced"]
+        cfg = parser.parse(data.decode("utf-8"), {"profiles": list, "defaults": dict})
         if isinstance(cfg, dict):
             WRAPPER_CONFIG = cfg
         else:
@@ -1198,8 +1135,10 @@ def _get_music_acceptance_thresholds() -> Dict[str, float]:
 app = FastAPI(title="Void Orchestrator", version="0.1.0")
 # Mount canonical tool routes (validate/run) so /tool.run is served by the orchestrator
 from app.routes import toolrun as _toolrun_routes  # type: ignore
+from app.routes import tools as _tools_routes  # type: ignore
 from void_envelopes import ToolEnvelope  # canonical envelope (shared)
 app.include_router(_toolrun_routes.router)
+app.include_router(_tools_routes.router)
 # Middleware order matters: last added runs first.
 # We want Preflight to run FIRST, so add it LAST.
 from .middleware.ws_permissive import PermissiveWebSocketMiddleware
@@ -1226,6 +1165,11 @@ from .pipeline.executor_gateway import execute as gateway_execute  # type: ignor
 from .pipeline.catalog import build_allowed_tool_names as catalog_allowed, validate_tool_names as catalog_validate  # type: ignore
 from .pipeline.finalize import finalize_tool_phase as finalize_tool_phase, compose_openai_response as compose_openai_response  # type: ignore
 from .pipeline.request_shaping import shape_request as shape_request  # type: ignore
+
+# ICW + Planner live in their respective modules; chat completions only orchestrates.
+from .icw.assembler import pack_icw_system_frame_from_messages
+from .plan.committee import produce_tool_plan
+
 
 # ---- Single-exit helpers (state + finalization) ----
 class RunState(TypedDict, total=False):
@@ -1275,7 +1219,7 @@ def finalize_response(trace_id: str, messages: List[Dict[str, Any]], state: RunS
             meta_part = res_obj.get("meta") if isinstance(res_obj, dict) and isinstance(res_obj.get("meta"), dict) else {}
             cid_val = None
             if isinstance(meta_part, dict):
-                cid_val = meta_part.get("cid") or (meta_part.get("ids") or {}).get("client_id")
+                cid_val = meta_part.get("cid")
             if isinstance(cid_val, (str, int)):
                 cid = str(cid_val)
                 break
@@ -1456,7 +1400,7 @@ async def v1_image_generate(request: Request):
     raw = await request.body()
     # Accept any JSON object for this front-door image API; shape it manually
     # into image.dispatch args below.
-    body = JSONParser().parse_superset(raw.decode("utf-8", errors="replace"), dict)["coerced"]
+    body = JSONParser().parse(raw.decode("utf-8", errors="replace"), {})
     if not isinstance(body, dict):
         return ToolEnvelope.failure(
             "invalid_body_type",
@@ -1523,7 +1467,8 @@ async def v1_image_generate(request: Request):
                     paths.append(p)
         payload = {
             "prompt_id": result_obj.get("prompt_id") or (result_obj.get("ids") or {}).get("prompt_id"),
-            "cid": result_obj.get("cid") or (result_obj.get("ids") or {}).get("client_id"),
+            # cid is the conversation/client id; do not substitute ComfyUI client_id here.
+            "cid": result_obj.get("cid"),
             "paths": paths,
         }
         return ToolEnvelope.success(payload, request_id=rid)
@@ -1627,7 +1572,7 @@ async def post_image_dispatch(request: Request):
         "steps": (int),
         "cfg": (float),
     }
-    obj = parser.parse_superset(body_text, expected)["coerced"]
+    obj = parser.parse(body_text, expected)
     # core fields
     prompt = obj.get("prompt")
     negative = obj.get("negative")
@@ -1703,9 +1648,6 @@ def _write_json_atomic(path: str, obj: Any) -> Dict[str, Any]:
     return _write_text_atomic(path, json.dumps(obj, ensure_ascii=False, separators=(",", ":")))
 
 
-def get_builtin_tools_schema() -> List[Dict[str, Any]]:
-    return _ext()
-
 @app.get("/capabilities.json")
 async def capabilities():
     tools_schema = get_builtin_tools_schema()
@@ -1717,54 +1659,6 @@ async def capabilities():
             tool_names.append(nm)
     tools_sorted = sorted(list(dict.fromkeys(tool_names)))
     return {"openai_compat": True, "tools": tools_sorted, "config_hash": WRAPPER_CONFIG_HASH}
-
-
-def build_ollama_payload(messages: List[Dict[str, Any]], model: str, num_ctx: int, temperature: float) -> Dict[str, Any]:
-    rendered: List[str] = []
-    for m in messages:
-        role = m.get("role")
-        if role == "tool":
-            tool_name = m.get("name") or "tool"
-            rendered.append(f"tool[{tool_name}]: {m.get('content')}")
-        else:
-            content_val = m.get("content")
-            if isinstance(content_val, list):
-                text_parts: List[str] = []
-                for part in content_val:
-                    if isinstance(part, dict) and part.get("type") == "text":
-                        text_parts.append(str(part.get("text", "")))
-                content = "\n".join(text_parts)
-            else:
-                content = content_val if content_val is not None else ""
-            rendered.append(f"{role}: {content}")
-    prompt = "\n".join(rendered)
-    # Keep the prompt within a coarse character budget derived from the global
-    # DEFAULT_NUM_CTX so we do not blow past the backend's context window when
-    # ICW/CO get large. No try/except; DEFAULT_NUM_CTX is sourced from env at
-    # import time.
-    from .plan.committee import DEFAULT_NUM_CTX  # reuse the same env-derived cap
-
-    max_chars = DEFAULT_NUM_CTX * 4  # ≈4 characters per token
-    if len(prompt) > max_chars:
-        # Preserve the most recent content at the tail.
-        trimmed = prompt[-max_chars:]
-        logging.info(
-            "[wrapper] prompt.truncated model=%s num_ctx=%s orig_chars=%d kept_chars=%d",
-            model,
-            DEFAULT_NUM_CTX,
-            len(prompt),
-            len(trimmed),
-        )
-        prompt = trimmed
-    return {
-        "model": model,
-        "prompt": prompt,
-        "stream": False,
-        "options": {
-            "num_ctx": num_ctx,
-            "temperature": temperature,
-        },
-    }
 
 
 def estimate_tokens_from_text(text: str) -> int:
@@ -1832,11 +1726,14 @@ def _creative_alt_score(tr: Dict[str, Any], base_tool: str) -> float:
         a0 = arts[0]
         aid = a0.get("id")
         kind = a0.get("kind") or ""
-        cid = (res.get("meta") or {}).get("cid")
-        if aid and cid:
+        meta = (res.get("meta") or {}) if isinstance(res.get("meta"), dict) else {}
+        cid = meta.get("cid")
+        artifact_group_id = meta.get("artifact_group_id")
+        if aid and (artifact_group_id or cid):
             if kind.startswith("image") or base_tool.startswith("image"):
                 # Prefer full image score from the local artifact path
-                img_path = os.path.join(UPLOAD_DIR, "artifacts", "image", cid, aid)
+                group = artifact_group_id or cid
+                img_path = os.path.join(UPLOAD_DIR, "artifacts", "image", str(group), str(aid))
                 try:
                     ai = _analyze_image(img_path, prompt=None)
                     score_block = ai.get("score") or {}
@@ -1893,9 +1790,13 @@ def _video_draw_on(im: "Image.Image", spec: dict) -> "Image.Image":
     else:
         color = (255, 255, 255)
     size = int(spec.get("font_size") or 48)
+    font_name = spec.get("font") or "arial.ttf"
+    if not isinstance(font_name, str) or not font_name.strip():
+        font_name = "arial.ttf"
     try:
-        font = ImageFont.truetype(spec.get("font") or "arial.ttf", size)
-    except Exception:
+        font = ImageFont.truetype(font_name, size)
+    except (OSError, IOError) as ex:
+        logging.debug("video_draw_on.font_fallback: %s", ex, exc_info=True)
         font = ImageFont.load_default()
     x = int(spec.get("x") or im.width // 2)
     y = int(spec.get("y") or int(im.height * 0.9))
@@ -1962,82 +1863,7 @@ def _normalize_tool_calls(calls: Any) -> List[Dict[str, Any]]:
     return out
 
 
-def _tool_expected_from_jsonschema(js_schema: Any) -> Dict[str, Any]:
-    """
-    Convert a JSON Schema tool description into the simpler expected_schema
-    format used by committee_jsonify (field -> python_type).
-    """
-    expected: Dict[str, Any] = {}
-    if not isinstance(js_schema, dict):
-        return expected
-    props = js_schema.get("properties") or {}
-    if not isinstance(props, dict):
-        return expected
-    for key, spec in props.items():
-        t = spec.get("type") if isinstance(spec, dict) else None
-        # Normalize union types like [\"integer\",\"null\"] to a single primary type.
-        if isinstance(t, list):
-            # Prefer non-null, non-array/object/string if present.
-            if "integer" in t:
-                t = "integer"
-            elif "number" in t:
-                t = "number"
-            elif "string" in t:
-                t = "string"
-            elif "boolean" in t:
-                t = "boolean"
-            elif "object" in t:
-                t = "object"
-            elif "array" in t:
-                t = "array"
-            else:
-                t = t[0] if t else None
-        if t == "integer":
-            expected[key] = int
-        elif t == "number":
-            expected[key] = float
-        elif t == "boolean":
-            expected[key] = bool
-        elif t == "object":
-            expected[key] = dict
-        elif t == "array":
-            expected[key] = list
-        else:
-            # Default to string for unknown/nullable types.
-            expected[key] = str
-    return expected
-
-
-def _compute_tools_hash(body: Dict[str, Any], *, planner_visible_only: bool) -> str:
-    """
-    Compute a deterministic hash of the tool catalog visible to the planner or
-    executor, depending on planner_visible_only.
-    """
-    names: set[str] = set()
-    client_tools = body.get("tools") if isinstance(body.get("tools"), list) else []
-    for t in (client_tools or []):
-        if isinstance(t, dict):
-            nm = (t.get("function") or {}).get("name") or t.get("name")
-            if isinstance(nm, str):
-                nm_clean = nm.strip()
-                if not nm_clean:
-                    continue
-                if planner_visible_only and nm_clean not in PLANNER_VISIBLE_TOOLS:
-                    continue
-                names.add(nm_clean)
-    builtins = get_builtin_tools_schema()
-    for t in (builtins or []):
-        fn = (t.get("function") or {})
-        nm = fn.get("name")
-        if isinstance(nm, str):
-            nm_clean = nm.strip()
-            if not nm_clean:
-                continue
-            if planner_visible_only and nm_clean not in PLANNER_VISIBLE_TOOLS:
-                continue
-            names.add(nm_clean)
-    src = "|".join(sorted(list(names)))
-    return _hl.sha256(src.encode("utf-8")).hexdigest()[:16]
+_tool_expected_from_jsonschema = tool_expected_from_jsonschema
 
 
 # ---- Committee / composing helpers ----
@@ -2055,90 +1881,47 @@ def _is_trivial(s: str) -> bool:
     return not s.strip() or len(s.strip()) < 8
 
 
-def _asset_urls_walk(res: Any, urls: List[str]) -> None:
-    exts = (
-        ".mp4",
-        ".webm",
-        ".mov",
-        ".mkv",
-        ".png",
-        ".jpg",
-        ".jpeg",
-        ".gif",
-        ".webp",
-        ".wav",
-        ".mp3",
-        ".m4a",
-        ".ogg",
-        ".flac",
-        ".opus",
-        ".srt",
-    )
-    if isinstance(res, str):
-        s = res.strip()
-        if not s:
-            return
-        if s.startswith("http://") or s.startswith("https://"):
-            urls.append(s)
-            return
-        if "/workspace/uploads/" in s:
-            # Best-effort conversion from absolute /workspace path to /uploads-relative URL.
-            try:
-                tail = s.split("/workspace", 1)[1]
-                urls.append(tail)
-            except Exception as ex:
-                _log("assets.path.convert.fail", path=s, error=str(ex))
-                urls.append(s)
-            return
-        if s.startswith("/uploads/"):
-            urls.append(s)
-            return
-        low = s.lower()
-        if any(low.endswith(ext) for ext in exts) and ("/uploads/" in low or "/workspace/uploads/" in low):
-            if "/workspace/uploads/" in s:
-                try:
-                    tail = s.split("/workspace", 1)[1]
-                    urls.append(tail)
-                except Exception as ex:
-                    _log("assets.path.convert.fail", path=s, error=str(ex))
-                    urls.append(s)
-            else:
-                urls.append(s)
-    elif isinstance(res, list):
-        for it in res:
-            _asset_urls_walk(it, urls)
-    elif isinstance(res, dict):
-        for it in res.values():
-            _asset_urls_walk(it, urls)
-
-
-def _asset_urls_from_tools2(results: List[Dict[str, Any]]) -> List[str]:
-    urls: List[str] = []
-    for tr in results or []:
-        try:
-            name = (tr or {}).get("name") or ""
-            res = (tr or {}).get("result") or {}
-            meta = res.get("meta") if isinstance(res, dict) else None
-            arts = res.get("artifacts") if isinstance(res, dict) else None
-            if isinstance(meta, dict) and isinstance(arts, list):
-                cid = meta.get("cid")
-                for a in arts:
-                    aid = (a or {}).get("id")
-                    kind = (a or {}).get("kind") or ""
-                    if cid and aid:
-                        if kind.startswith("image") or name.startswith("image"):
-                            urls.append(f"/uploads/artifacts/image/{cid}/{aid}")
-                        elif kind.startswith("audio") and name.startswith("tts"):
-                            urls.append(f"/uploads/artifacts/audio/tts/{cid}/{aid}")
-                        elif kind.startswith("audio") and name.startswith("music"):
-                            urls.append(f"/uploads/artifacts/music/{cid}/{aid}")
-            if isinstance(res, dict):
-                _asset_urls_walk(res, urls)
-        except Exception as ex:
-            _log("asset_urls.walk.error", error=str(ex))
+def _collect_artifacts_payload(tool_results: List[Dict[str, Any]], abs_url_fn) -> Dict[str, Any]:
+    """
+    Collect a stable artifacts payload for responses:
+    - urls: list[str] (deduped)
+    - items: list[dict] (deduped, with tool join keys)
+    """
+    urls = assets_collect_urls(tool_results or [], abs_url_fn)
+    items: List[Dict[str, Any]] = []
+    for tr in tool_results or []:
+        if not isinstance(tr, dict):
             continue
-    # de-duplicate while preserving order
-    return list(dict.fromkeys(urls))
+        tool_name = str(tr.get("name") or tr.get("tool") or "")
+        res = tr.get("result")
+        if not isinstance(res, dict):
+            continue
+        meta = res.get("meta") if isinstance(res.get("meta"), dict) else {}
+        arts = res.get("artifacts") if isinstance(res.get("artifacts"), list) else []
+        for a in arts:
+            if not isinstance(a, dict):
+                continue
+            u = a.get("url") or a.get("view_url") or a.get("path")
+            it = dict(a)
+            it.setdefault("tool", tool_name)
+            if isinstance(meta, dict):
+                if "cid" in meta and isinstance(meta.get("cid"), (str, int)):
+                    it.setdefault("cid", str(meta.get("cid")))
+                if "artifact_group_id" in meta and isinstance(meta.get("artifact_group_id"), (str, int)):
+                    it.setdefault("artifact_group_id", str(meta.get("artifact_group_id")))
+            if isinstance(u, str) and u.strip():
+                it["url"] = abs_url_fn(u.strip())
+            items.append(it)
+    # stable dedupe
+    seen = set()
+    uniq: List[Dict[str, Any]] = []
+    for it in items:
+        k = (it.get("kind"), it.get("id"), it.get("url"), it.get("tool"))
+        if k in seen:
+            continue
+        seen.add(k)
+        uniq.append(it)
+    return {"urls": list(dict.fromkeys(urls or [])), "items": uniq}
 
 
 def _tb(s: str) -> str:
@@ -2168,6 +1951,7 @@ async def _datasets_runner(job_id: str, body: Dict[str, Any]) -> None:
         await _as.to_thread(_datasets_start, body or {}, emit)
         _orcjob_set_state(job_id, "done", phase="done", progress=1.0)
     except Exception as ex:
+        logging.error("datasets_runner failed for job_id=%s: %s", job_id, ex, exc_info=True)
         _orcjob_set_state(job_id, "failed", phase="error", progress=1.0, error=str(ex))
 
 
@@ -2259,7 +2043,7 @@ async def _jobs_stream_gen(job_id: str, interval_ms: Optional[int] = None):
             yield f"data: {snapshot}\n\n"
             last_snapshot = snapshot
         # Parse current job status safely via JSONParser. Never use json.loads.
-        parsed = JSONParser().parse_superset(snapshot or "", {"status": str})["coerced"]
+        parsed = JSONParser().parse(snapshot or "", {"status": str})
         state = parsed.get("status") if isinstance(parsed, dict) else None
         if state in ("succeeded", "failed", "cancelled"):
             yield "data: [DONE]\n\n"
@@ -2288,21 +2072,30 @@ async def _completions_stream_gen(payload: Dict[str, Any]):
                         yield "data: [DONE]\n\n"
                         break
                     parser = JSONParser()
-                    obj = parser.parse_superset(
+                    obj = parser.parse(
                         data_str,
                         {"id": str, "model": str, "choices": [{"delta": {"content": str}, "message": {"content": str}}]},
-                    )["coerced"]
+                    )
                     # Extract assistant text (final-only chunk in our impl)
                     txt = ""
                     if isinstance(obj, dict):
-                        try:
-                            choices = obj.get("choices") or [{}]
-                            ch0 = choices[0] if choices else {}
-                            delta = ch0.get("delta") or {}
-                            msg = ch0.get("message") or {}
-                            txt = (delta.get("content") or msg.get("content") or "") or ""
-                        except Exception:
+                        choices = obj.get("choices")
+                        ch0: Dict[str, Any] = {}
+                        if isinstance(choices, list) and choices:
+                            first = choices[0]
+                            if isinstance(first, dict):
+                                ch0 = first
+                        delta = ch0.get("delta") if isinstance(ch0.get("delta"), dict) else {}
+                        msg = ch0.get("message") if isinstance(ch0.get("message"), dict) else {}
+                        txt_val = (delta.get("content") or msg.get("content") or "")
+                        if txt_val is None:
                             txt = ""
+                        elif isinstance(txt_val, (bytes, bytearray, memoryview)):
+                            txt = bytes(txt_val).decode("utf-8", errors="replace")
+                        elif isinstance(txt_val, (dict, list)):
+                            txt = json.dumps(txt_val, ensure_ascii=False, default=str)
+                        else:
+                            txt = str(txt_val)
                     chunk = {
                         "id": obj.get("id") if isinstance(obj, dict) else "orc-1",
                         "object": "text_completion",
@@ -2412,11 +2205,8 @@ from .rag.core import rag_index_dir  # re-exported for backwards-compat
 from .rag.core import rag_search  # re-exported for backwards-compat
 from .pipeline.compression_orchestrator import co_pack as _co_pack, frames_to_messages as _co_frames_to_msgs
 from .committee_client import (
-    QWEN_BASE_URL,
     QWEN_MODEL_ID,
-    GLM_OLLAMA_BASE_URL,
     GLM_MODEL_ID,
-    DEEPSEEK_CODER_OLLAMA_BASE_URL,
     DEEPSEEK_CODER_MODEL_ID,
     DEFAULT_NUM_CTX,
     COMMITTEE_MODEL_ID,
@@ -2590,73 +2380,6 @@ def meta_prompt(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return head + policy_frames + tail
 
 
-def merge_responses(request: Dict[str, Any], qwen_text: str, glm_text: str) -> str:
-    return (
-        "Committee Synthesis:\n\n"
-        "Qwen perspective:\n" + qwen_text.strip() + "\n\n"
-        "GLM4-9B perspective:\n" + glm_text.strip() + "\n\n"
-        "Final answer (synthesize both; prefer correctness and specificity):\n"
-    )
-
-
-def build_tools_section(tools: Optional[List[Dict[str, Any]]]) -> str:
-    if not tools:
-        return ""
-    return "Available tools (JSON schema):\n" + json.dumps(tools, indent=2, default=str)
-
-
-def build_compact_tool_catalog() -> str:
-    # Build the catalog directly from the registered tool schemas so names are guaranteed valid
-    _TOOL_REG: dict = {}
-    builtins = get_builtin_tools_schema()
-    # Merge tool names + required args from both registries
-    merged: dict[str, dict] = {}
-    # From route registry
-    if isinstance(_TOOL_REG, dict):
-        for nm, spec in _TOOL_REG.items():
-            reqs: list[str] = []
-            inputs = spec.get("inputs") if isinstance(spec, dict) else None
-            if isinstance(inputs, dict):
-                for k, v in inputs.items():
-                    if isinstance(v, dict) and v.get("required") is True:
-                        reqs.append(k)
-            merged[nm] = {"name": nm, "required": reqs}
-    # From built-in OpenAI-style schema
-    for t in (builtins or []):
-        fn = (t.get("function") or {}) if isinstance(t, dict) else {}
-        nm = fn.get("name")
-        if not nm:
-            continue
-        params = (fn.get("parameters") or {})
-        reqs = list((params.get("required") or [])) if isinstance(params, dict) else []
-        if nm in merged:
-            prev = merged[nm].get("required") or []
-            merged[nm]["required"] = sorted(list(dict.fromkeys(list(prev) + list(reqs))))
-        else:
-            merged[nm] = {"name": nm, "required": reqs}
-    tools_list: list[dict] = list(merged.values())
-    tools_list.sort(key=lambda d: d.get("name", ""))
-    names_list = [t.get("name") for t in tools_list if isinstance(t, dict) and isinstance(t.get("name"), str)]
-    catalog = {
-        "names": names_list,
-        "tools": tools_list,
-        "constraints": {
-            "routing": "All tools run via executor→orchestrator /tool.run (no fast paths).",
-            "args": "Planner must emit all required args; snap sizes to /8.",
-            "sequence_examples": [
-                {"intent": "generate image", "steps": ["image.dispatch", "image.qa"]},
-                {"intent": "generate video", "steps": ["film2.run"]},
-                {"intent": "tts", "steps": ["tts.speak", "tts.eval"]},
-                {"intent": "music", "steps": ["music.infinite.windowed"]},
-                {"intent": "sfx", "steps": ["audio.sfx.compose"]},
-                {"intent": "deep research", "steps": ["research.run"]}
-            ],
-            "rules": [
-                "Use only tool names present in the catalog. If none apply, return steps: []."
-            ],
-        },
-    }
-    return "Tool catalog (strict, data-only):\n" + json.dumps(catalog, indent=2, default=str) + "\nValid tool names: " + ", ".join(names_list)
 
 
 def _detect_video_intent(text: str) -> bool:
@@ -2670,450 +2393,7 @@ def _detect_video_intent(text: str) -> bool:
     return any(k in s for k in keywords)
 
 
-def _derive_movie_prefs_from_text(text: str) -> Dict[str, Any]:
-    prefs: Dict[str, Any] = {}
-    s = (text or "").lower()
-    # resolution
-    if "4k" in s:
-        prefs["resolution"] = "3840x2160"
-    elif "8k" in s:
-        prefs["resolution"] = "7680x4320"
-    # fps
-    m_fps = _re.search(r"(\d{2,3})\s*fps", s)
-    if m_fps and m_fps.group(1):
-        num = m_fps.group(1)
-        if _re.fullmatch(r"[-+]?\d+(\.\d+)?", num):
-            prefs["fps"] = float(num)
-    elif "60fps" in s or "60 fps" in s:
-        prefs["fps"] = 60.0
-    # explicit duration in minutes/seconds
-    m_min = _re.search(r"(\d+)\s*minute", s)
-    m_sec = _re.search(r"(\d+)\s*sec", s)
-    if m_min and m_min.group(1) and m_min.group(1).isdigit():
-        prefs["duration_seconds"] = float(int(m_min.group(1)) * 60)
-    elif m_sec:
-        s_val = m_sec.group(1)
-        if s_val and s_val.isdigit():
-            prefs["duration_seconds"] = float(int(s_val))
-    # infer minimal coherent duration if not specified
-    if "duration_seconds" not in prefs:
-        words = len([w for w in s.replace("\n", " ").split(" ") if w.strip()])
-        # category heuristics (minimal coherent durations)
-        if any(k in s for k in ("meme", "clip", "gif")):
-            inferred = 10.0
-        elif any(k in s for k in ("trailer", "teaser")):
-            inferred = 60.0
-        elif any(k in s for k in ("ad", "advert", "commercial")):
-            inferred = 30.0
-        elif "music video" in s:
-            inferred = 210.0  # ~3.5 minutes
-        elif "short film" in s:
-            inferred = 300.0  # ~5 minutes
-        elif any(k in s for k in ("episode", "tv episode")):
-            inferred = 1500.0  # ~25 minutes
-        elif any(k in s for k in ("feature film",)):
-            inferred = 5400.0  # ~90 minutes (minimal feature)
-        elif "documentary" in s:
-            inferred = 900.0  # ~15 minutes minimal doc short
-        else:
-            # scale with description complexity
-            if words >= 1500:
-                inferred = 3600.0
-            elif words >= 600:
-                inferred = 600.0
-            elif words >= 150:
-                inferred = 60.0
-            else:
-                inferred = 20.0
-        prefs["duration_seconds"] = inferred
-    # sensible defaults
-    prefs.setdefault("resolution", "1920x1080")
-    prefs.setdefault("fps", 24.0)
-    return prefs
 
-def merge_tool_schemas(client_tools: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
-    builtins = get_builtin_tools_schema()
-    if not client_tools:
-        return builtins
-    # merge by function name
-    seen = {((t.get("function") or {}).get("name") or t.get("name")) for t in client_tools}
-    out = list(client_tools)
-    for t in builtins:
-        name = (t.get("function") or {}).get("name") or t.get("name")
-        if name not in seen:
-            out.append(t)
-    return out
-
-async def planner_produce_plan(
-    messages: List[Dict[str, Any]],
-    tools: Optional[List[Dict[str, Any]]],
-    temperature: float,
-    trace_id: Optional[str] = None,
-    mode: Optional[str] = None,
-) -> Tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
-    # Treat any 'qwen*' value as Qwen route (e.g., 'qwen3')
-    use_qwen = str(PLANNER_MODEL or "qwen").lower().startswith("qwen")
-    planner_id = QWEN_MODEL_ID if use_qwen else GLM_MODEL_ID
-    planner_base = QWEN_BASE_URL if use_qwen else GLM_OLLAMA_BASE_URL
-    # Resolve subject canon from latest user text
-    # subject canon and RoE digest now imported at module top
-    # Build CO frames with curated tool context (prompt-only; no gating)
-    all_tools = merge_tool_schemas(tools)
-    tool_names: List[str] = []
-    for t in all_tools or []:
-        fn = (t.get("function") or {})
-        nm = fn.get("name") or t.get("name")
-        if isinstance(nm, str):
-            nm_clean = nm.strip()
-            if nm_clean and (nm_clean in PLANNER_VISIBLE_TOOLS):
-                tool_names.append(nm_clean)
-    # Determine latest user message for subject_canon / CO, but do NOT use this
-    # for keyword-based tool routing; that is handled semantically in prompts.
-    last_user = ""
-    for m in reversed(messages or []):
-        if (
-            isinstance(m, dict)
-            and m.get("role") == "user"
-            and isinstance(m.get("content"), str)
-            and m.get("content").strip()
-        ):
-            last_user = m.get("content").strip()
-            break
-    # Effective mode is provided by the caller (chat_completions / router). Do
-    # not infer from keywords here; semantic routing is done in the prompts.
-    effective_mode = mode or "job"
-    # Normalize planner tool names; no mode-based filtering (fixed tool surface).
-    tool_names_mode: List[str] = _filter_tool_names_by_mode(tool_names, effective_mode)
-    # Allowed tool names for planner use (fixed front-door surface).
-    _allowed_for_mode = _allowed_tools_for_mode(effective_mode)
-    # Log tool palette and mode so we can see exactly what planner can choose from.
-    _log(
-        "planner.tools.palette",
-        trace_id=trace_id,
-        mode=effective_mode,
-        tool_names=tool_names_mode,
-        allowed_for_mode=_allowed_for_mode,
-    )
-    # Detect repair intent from messages
-    _is_repair = any(isinstance(m, dict) and isinstance(m.get("content"), str) and "repair mode" in m.get("content", "").lower() for m in (messages or []))
-    # Curate RAW schema blocks (TSL) for planner-visible tools using the canonical
-    # tool schemas. This is the primary way the committee sees the exact JSON
-    # args/contracts for image.dispatch, music.infinite.windowed, film2.run, tts.speak.
-    tsl_blocks: List[Dict[str, Any]] = []
-    for name in _allowed_for_mode:
-        meta = _TOOL_SCHEMAS.get(name, {})
-        schema = meta.get("schema")
-        if not isinstance(schema, dict):
-            continue
-        tsl_blocks.append(
-            {
-                "name": name,
-            "raw": {
-                    "name": name,
-                    "schema": schema,
-                    "schema_ref": f"{name}@builtin",
-                    "notes": meta.get("notes") or "",
-                },
-            }
-        )
-    # Evidence blocks (TEL): recent runs — filter to planner-visible and allowed-for-mode tools
-    tel_blocks: List[Dict[str, Any]] = []
-    # CO envelope
-    subject_canon = _resolve_subject_canon(last_user)
-    roe_prev = _roe_load(STATE_DIR, str(trace_id or ""))
-    # Load recent TEL evidence (failures/successes) to aid planner/repair (no try/except)
-    _tel_recent = _tel_load(STATE_DIR, str(trace_id or ""), limit=4)
-    # Apply planner-visible and mode-allowed filter to TEL
-    _allowed_for_mode_set = set(_allowed_for_mode)
-    if _tel_recent:
-        for b in _tel_recent:
-            if not isinstance(b, dict):
-                continue
-            name_raw = b.get("name")
-            if not isinstance(name_raw, str):
-                continue
-            name_clean = name_raw.strip()
-            if not name_clean:
-                continue
-            if (name_clean in PLANNER_VISIBLE_TOOLS) and (name_clean in _allowed_for_mode_set):
-                tel_blocks.append(b)
-    co_env = {
-        "schema_version": 1,
-        "trace_id": trace_id or "",
-        "call_kind": "repair" if _is_repair else "planner",
-        "model_caps": {"num_ctx": DEFAULT_NUM_CTX},
-        "user_turn": {"role": "user", "content": last_user},
-        "history": messages or [],
-        "attachments": [],
-        "tool_memory": [],
-        "rag_hints": [],
-        "roe_incoming_instructions": (roe_prev or []),
-        "subject_canon": subject_canon,
-        "percent_budget": {"icw_pct": [65, 70], "tools_pct": [18, 20], "roe_pct": [5, 10], "misc_pct": [3, 5], "buffer_pct": 5},
-        "sweep_plan": ["0-90", "30-120", "60-150+wrap"],
-        "tools_names": tool_names_mode,
-        "tools_recent_lines": [],
-        "tsl_blocks": tsl_blocks,
-        "tel_blocks": (_tel_recent or tel_blocks),
-    }
-    # Log full CO envelope before compression so we can see the exact planner context.
-    _log("planner.co_env", trace_id=trace_id, co_env=co_env)
-    try:
-        co_out = _co_pack(co_env)
-    except Exception as ex:
-        _log(
-            "planner.co_pack.error",
-            trace_id=trace_id,
-            error=str(ex),
-        )
-        co_out = {"frames": [], "ratio_telemetry": {}}
-
-    try:
-        frames_msgs = _co_frames_to_msgs(co_out.get("frames") or [])
-    except Exception as ex:
-        _log(
-            "planner.co_frames_to_msgs.error",
-            trace_id=trace_id,
-            error=str(ex),
-        )
-        # Fall back to raw messages if CO framing fails
-        frames_msgs = list(messages or [])
-
-    # Inject a real ICW window for planner context instead of relying solely on
-    # ICW meta-instructions. This window is built from the current conversation
-    # history and kept within the ICW byte budget derived from the CO allocator.
-    rt = co_out.get("ratio_telemetry") or {}
-    bb = rt.get("byte_budget") or {}
-    total_budget_bytes = int((bb.get("total_budget_bytes") or 0) or 0)
-    icw_bytes_nominal = int((bb.get("icw_bytes") or 0) or 0)
-    if icw_bytes_nominal <= 0 and total_budget_bytes > 0:
-        icw_budget_bytes = int(total_budget_bytes * 0.6)
-    elif icw_bytes_nominal > 0:
-        icw_budget_bytes = icw_bytes_nominal
-    else:
-        icw_budget_bytes = int(icw_byte_budget_for_model(DEFAULT_NUM_CTX) * 0.6)
-
-    try:
-        # Build lightweight ICW state from chat history for the planner.
-        icw_candidates: List[str] = []
-        for m in messages or []:
-            if not isinstance(m, dict):
-                continue
-            role = (m.get("role") or "").strip()
-            content = (m.get("content") or "").strip()
-            if role in ("user", "assistant") and content:
-                icw_candidates.append(f"{role}: {content}")
-        icw_state: Dict[str, Any] = {
-            "entities": [],
-            "goals": last_user,
-            "anchor_text": "",
-            "candidates": icw_candidates,
-            "retrieved": [],
-        }
-        icw_state["state_hash"] = icw_state_hash_from(icw_state)
-        icw_request = {"role": "user", "content": last_user}
-        icw_window = assemble_window(icw_request, icw_state, icw_budget_bytes, step_out_tokens=512)
-        icw_prompt = getattr(icw_window, "prompt", "") if icw_window is not None else ""
-        if isinstance(icw_prompt, str) and icw_prompt.strip():
-            icw_frame = {
-                "role": "system",
-                "content": "### [ICW CONTEXT]\n" + icw_prompt,
-            }
-            if frames_msgs:
-                # Insert ICW context immediately after the primary CO allocator frame.
-                frames_msgs = [frames_msgs[0], icw_frame] + frames_msgs[1:]
-            else:
-                frames_msgs = [icw_frame]
-    except Exception as ex:
-        # ICW assembly is best-effort for planner; log failures explicitly instead of
-        # swallowing them so they surface in traces.
-        _log(
-            "planner.icw_assemble.error",
-            trace_id=str(trace_id or ""),
-            error=str(ex),
-        )
-    # Minimal planner/committee frames
-    # Add Mode/Palette and allowed tools guidance
-    _mode_palette = (
-        "### [PLANNER MODE / SYSTEM]\n"
-        f"Mode:\n"
-        f"- mode: {effective_mode}\n"
-        "Tool surface (fixed):\n"
-        "- The planner can ONLY call these tools: "
-        + (", ".join(_allowed_for_mode) if _allowed_for_mode else "(none)")
-        + "\n"
-        "Rules:\n"
-        "- Do NOT invent or call any other tool names (no locks.*, no rag_search, no research.run, no web.smart_get, etc.).\n"
-        "- Internal helpers such as locks/QA/SFX/refine/http are invoked inside handlers, never directly by the planner.\n"
-        "- You may return an empty 'steps' list if a pure textual answer is sufficient.\n"
-    )
-    planner_meta = (
-        "### [PLANNER / SYSTEM]\n"
-        "All planner reasoning and any generated text MUST be in English only. Other languages are not allowed.\n"
-        "Honor CO ratios/RoE. Prefer tools over text when media is requested. Construct strict JSON steps with all required args; snap sizes to /8.\n"
-        "- Image edits: do NOT use image.edit. Always use image.dispatch for both generation and editing.\n"
-        "- When editing, include the input image via attachments (preferred) or set args.images to an array of objects containing absolute /uploads/... URLs.\n"
-        "- For denoise/inpaint style edits, include a strength field (0.0–1.0) when applicable; keep the prompt aligned with the edit intent.\n"
-        "- You MAY produce multiple steps in one plan in the 'steps' array; preserve the intended order. When the user requests media, choose one or more of the front-door tools (image.dispatch, music.infinite.windowed, film2.run, tts.speak) and do not reference any other tools.\n"
-        "- For purely textual questions with no media intent at all, returning an empty 'steps' list (i.e., no tools) is preferred.\n"
-        "- If the user asks for any images, video/film, music, audio, or TTS, you MUST include at least one tool step.\n"
-        "- Do NOT propose internal tools such as locks.*, rag_search, research.run, web.smart_get, or http.request."
-    )
-    committee_review = (
-        "### [COMMITTEE REVIEW / SYSTEM]\n"
-        "If plan conflicts with RoE/subject, apply a one-pass prompt revision (minimal) then proceed."
-    )
-    # Explicit tool catalog description for the committee: show each front-door
-    # tool with its core JSON schema so the planner can map semantics→tools.
-    catalog_lines: List[str] = [
-        "### [TOOL CATALOG / SYSTEM]",
-        "You must plan using ONLY these front-door tools. For each, the JSON args must follow the given schema.",
-    ]
-    for name in _allowed_for_mode:
-        meta = _TOOL_SCHEMAS.get(name, {})
-        notes = meta.get("notes") or ""
-        schema = meta.get("schema") or {}
-        catalog_lines.append(f"- tool: {name}")
-        if notes:
-            catalog_lines.append(f"  notes: {notes}")
-        catalog_lines.append(
-            "  json_schema: " + json.dumps(schema, ensure_ascii=False, sort_keys=True)
-        )
-    tool_catalog_frame = {"role": "system", "content": "\n".join(catalog_lines)}
-
-    contract_return = (
-        "Return ONLY strict JSON: {\"steps\":[{\"tool\":\"<name>\",\"args\":{...}}]} — no extra keys or commentary. "
-        "For pure chat answers with no tool use, you may return {\"steps\":[]}."
-    )
-    plan_messages = frames_msgs + [
-        tool_catalog_frame,
-        {"role": "system", "content": _mode_palette},
-        {"role": "system", "content": planner_meta},
-        {"role": "system", "content": committee_review},
-        {"role": "system", "content": contract_return},
-    ]
-    # Route planner through the central committee debate; models may respond in free text,
-    # and we coerce into the strict JSON planner schema via JSONParser.
-    # Log the full planner prompt (all messages) before sending to committee.
-    _log(
-        "planner.prompt.messages",
-        trace_id=trace_id,
-        messages=plan_messages,
-    )
-    try:
-        env = await committee_ai_text(
-            plan_messages,
-            trace_id=str(trace_id or "planner"),
-            temperature=temperature,
-        )
-    except Exception as ex:
-        # Planner committee call must never explode up to /v1/chat/completions;
-        # surface a structured planner_env instead.
-        _log(
-            "planner.committee_call.error",
-            trace_id=trace_id,
-            error=str(ex),
-        )
-        planner_env = {
-            "ok": False,
-            "error": {
-                "code": "planner_committee_exception",
-                "message": str(ex),
-            },
-        }
-        return "", [], planner_env
-    # Normalize planner env so callers can inspect ok/error without losing detail.
-    if isinstance(env, dict):
-        planner_env: Dict[str, Any] = env
-    else:
-        planner_env = {
-            "ok": False,
-            "error": {
-                "code": "planner_env_invalid",
-                "message": str(env),
-            },
-        }
-    # Default planner text + tool calls; populated when the committee call succeeds.
-    text: str = ""
-    res_env: Dict[str, Any] = {}
-    tool_calls: List[Dict[str, Any]] = []
-    if not isinstance(planner_env, dict) or not planner_env.get("ok"):
-        # Committee-level planner failure. Log and leave tool_calls empty,
-        # but preserve the error payload so callers can surface it.
-        _log(
-            "planner.error",
-            trace_id=trace_id,
-            error=(planner_env or {}).get("error") if isinstance(planner_env, dict) else {"code": "planner_env_invalid", "message": str(env)},
-        )
-    else:
-        res_env = planner_env.get("result") or {}
-        text = res_env.get("text") or ""
-    # Log the raw planner text response from the committee, before JSON fixing.
-    _log(
-        "planner.raw_text",
-        trace_id=trace_id,
-        text=text,
-        result=res_env,
-    )
-    schema_steps = {"steps": [{"tool": str, "args": dict}]}
-    # JSONFixer/JSONParser are allowed to be noisy but must not kill planning;
-    # if committee_jsonify ever raises, treat it as an empty plan and let the
-    # caller surface a structured planner error instead of returning a blank 500.
-    try:
-        parsed_steps = await committee_jsonify(
-            text or "{}",
-            expected_schema=schema_steps,
-            trace_id=str(trace_id or "planner"),
-            temperature=0.0,
-        )
-    except Exception as ex:
-        _log(
-            "planner.jsonify.error",
-            trace_id=trace_id,
-            error=str(ex),
-        )
-        parsed_steps = {"steps": []}
-    # Log raw planner steps before any normalization/cleanup so we can debug
-    # JSONFixer / parser behavior end-to-end.
-    _log(
-        "planner.steps.pre_normalize",
-        trace_id=trace_id,
-        steps=parsed_steps.get("steps"),
-    )
-    steps_raw = parsed_steps.get("steps") or []
-    # Enforce a strict tool whitelist at the planner layer so downstream
-    # executors never see fabricated or unknown tool names.
-    allowed_tools = {
-        "image.dispatch",
-        "music.infinite.windowed",
-        "film2.run",
-        "tts.speak",
-    }
-    steps: list[dict] = []
-    for st in steps_raw:
-        if not isinstance(st, dict):
-            continue
-        tool_name = (st.get("tool") or "").strip()
-        if tool_name not in allowed_tools:
-            _log("planner.step.dropped_disallowed_tool", trace_id=trace_id, step=st)
-            continue
-        steps.append({"tool": tool_name, "args": dict(st.get("args") or {})})
-    _log(
-        "planner.steps.post_normalize",
-        trace_id=trace_id,
-        steps=steps,
-    )
-    if not steps:
-        return "", [], planner_env
-    _log("planner.steps", trace_id=trace_id, steps=steps)
-    for st in steps:
-        if isinstance(st, dict) and st.get("tool") == "image.dispatch":
-            _log("planner.image.dispatch.args", trace_id=trace_id, args=st.get("args") or {})
-    tool_calls = [{"name": s.get("tool"), "arguments": (s.get("args") or {})} for s in steps if isinstance(s, dict)]
-    # Return the raw planner text, normalized tool_calls, and the raw planner env
-    # so callers can inspect ok/error and propagate failures instead of silently
-    # treating planner errors as empty plans.
-    return text, tool_calls, planner_env
 
 
 def _tool_cast_to_float(v: Any) -> Optional[float]:
@@ -3152,7 +2432,9 @@ def _tool_error(name: str, code: str, message: str, status: int = 422, **details
 
 async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
     name = call.get("name")
-    raw_args = call.get("arguments") or {}
+    # IMPORTANT: do not use `or {}` here; falsy values (e.g. "" or 0) should
+    # still be preserved and routed through normalization below.
+    raw_args = call.get("arguments")
     # Determine trace id for this tool call; always present in envelopes.
     call_trace_id: str
     if isinstance(call.get("trace_id"), str) and call.get("trace_id"):
@@ -3175,14 +2457,25 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
 
     # Generic HTTP API request tool (public APIs only; no internal SSRF)
     if name == "api.request":
+        # Normalize arguments for this tool without dropping payloads.
+        parser_req = JSONParser()
+        if isinstance(raw_args, dict):
+            args_req = dict(raw_args)
+        elif isinstance(raw_args, str):
+            parsed_req = parser_req.parse(raw_args, {})
+            args_req = dict(parsed_req) if isinstance(parsed_req, dict) else {"_raw": raw_args}
+        elif raw_args is None:
+            args_req = {}
+        else:
+            args_req = {"_raw": raw_args}
         # Backwards-compatible shim: route api.request to http.request implementation.
         http_config: HttpRequestConfig = {
-            "url": str(raw_args.get("url") or ""),
-            "method": str(raw_args.get("method") or "").upper() or "GET",
-            "headers": raw_args.get("headers") if isinstance(raw_args.get("headers"), dict) else {},
-            "query": raw_args.get("params") if isinstance(raw_args.get("params"), dict) else {},
-            "body": raw_args.get("body"),
-            "expect_json": (str(raw_args.get("expect") or "json")).lower() != "text",
+            "url": str(args_req.get("url") or ""),
+            "method": str(args_req.get("method") or "").upper() or "GET",
+            "headers": args_req.get("headers") if isinstance(args_req.get("headers"), dict) else {},
+            "query": args_req.get("params") if isinstance(args_req.get("params"), dict) else {},
+            "body": args_req.get("body"),
+            "expect_json": (str(args_req.get("expect") or "json")).lower() != "text",
         }
         ok, payload = await perform_http_request(http_config)
         if ok:
@@ -3207,17 +2500,20 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
     # coerce a small set of common, cross-tool keys when they are present.
     parser = JSONParser()
     if isinstance(raw_args, str):
-        sup = parser.parse_superset(raw_args, dict)
-        parsed = sup.get("coerced")
+        parsed = parser.parse(raw_args, {})
         if isinstance(parsed, dict) and parsed:
             args = dict(parsed)
         else:
-            # Shorthand: a bare string is treated as a synopsis-style payload.
-            args = {"synopsis": raw_args}
+            # Never drop arguments: preserve the raw string while also keeping
+            # backwards-compatible "synopsis" behavior.
+            args = {"_raw": raw_args, "synopsis": raw_args}
     elif isinstance(raw_args, dict):
         args = dict(raw_args)
-    else:
+    elif raw_args is None:
         args = {}
+    else:
+        # Never drop arguments: preserve any non-object payload under "_raw".
+        args = {"_raw": raw_args}
 
     # Always propagate trace id into args (critical for downstream trace wiring)
     if call_trace_id and isinstance(args, dict) and not args.get("trace_id"):
@@ -3250,7 +2546,9 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
     }
     expected_present = {k: t for k, t in expected_args_shape.items() if k in args}
     if expected_present:
-        coerced_common = parser.ensure_structure(args, expected_present)
+        # IMPORTANT: `ensure_structure` is an internal coercion implementation detail.
+        # Use the public parser API surface.
+        coerced_common = parser.parse(args, expected_present)
         if isinstance(coerced_common, dict):
             args.update(coerced_common)
     # Synonyms → canonical
@@ -3660,7 +2958,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 status=r.status_code,
             )
         parser = JSONParser()
-        js = parser.parse_superset(r.text or "", {"faces": list, "hands": list, "objects": list, "quality": dict})["coerced"]
+        js = parser.parse(r.text or "", {"faces": list, "hands": list, "objects": list, "quality": dict})
         return {"name": name, "result": js}
     if name == "image.repair" and VISION_REPAIR_API_URL and ALLOW_TOOL_EXECUTION:
         src = args.get("src") or args.get("image_path") or ""
@@ -3686,7 +2984,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 status=r.status_code,
             )
         parser = JSONParser()
-        js = parser.parse_superset(r.text or "", {"repaired_image_path": str, "regions": list, "mode": (str,)})["coerced"]
+        js = parser.parse(r.text or "", {"repaired_image_path": str, "regions": list, "mode": (str,)})
         return {"name": name, "result": js}
     if name == "video.refine.clip" and ALLOW_TOOL_EXECUTION:
         a = args if isinstance(args, dict) else {}
@@ -3949,10 +3247,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             id_min = min(clip_identity_scores)
             id_mean = sum(clip_identity_scores) / float(len(clip_identity_scores))
             preset_hero = LOCK_QUALITY_PRESETS.get("hero", LOCK_QUALITY_PRESETS["standard"])
-            try:
-                face_min = float(preset_hero.get("face_min", 0.9))
-            except Exception:
-                face_min = 0.9
+            face_min_raw = preset_hero.get("face_min", 0.9)
+            face_min = float(face_min_raw) if isinstance(face_min_raw, (int, float)) else 0.9
             weak_margin = 0.1 * face_min
             if id_min >= face_min and id_mean >= face_min:
                 identity_status = "ok"
@@ -4051,15 +3347,16 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         a = raw_args if isinstance(raw_args, dict) else {}
         prompt = (a.get("prompt") or "").strip()
         trace_id = a.get("trace_id") if isinstance(a.get("trace_id"), str) else None
-        # Ensure a stable film cid; do not rely on planner/LLM providing one.
+        # cid is the conversation/client id. film_id is a separate identifier for a film run.
         _cid_raw = a.get("cid")
-        if isinstance(_cid_raw, (str, int)):
-            cid = str(_cid_raw).strip()
+        cid = str(_cid_raw).strip() if isinstance(_cid_raw, (str, int)) and str(_cid_raw).strip() else ""
+
+        _film_id_raw = a.get("film_id")
+        if isinstance(_film_id_raw, (str, int)) and str(_film_id_raw).strip():
+            film_id = str(_film_id_raw).strip()
         else:
-            cid = ""
-        if not cid:
-            cid = f"film-{int(time.time())}"
-            a["cid"] = cid
+            film_id = uuid.uuid4().hex
+            a["film_id"] = film_id
         clips = a.get("clips") if isinstance(a.get("clips"), list) else []
         images = a.get("images") if isinstance(a.get("images"), list) else []
         do_interpolate = bool(a.get("interpolate") or False)
@@ -4068,7 +3365,9 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         fps_val = int(a.get("fps") or 60)
         width_val = int(a.get("width") or 1920)
         height_val = int(a.get("height") or 1080)
-        result: Dict[str, Any] = {"ids": {}, "meta": {"shots": []}}
+        result: Dict[str, Any] = {"ids": {"film_id": film_id}, "meta": {"shots": [], "film_id": film_id}}
+        if cid:
+            result["meta"]["cid"] = cid
         profile_name = (a.get("quality_profile") or "hero")
         result["meta"]["quality_profile"] = profile_name
         thresholds_lock = _lock_quality_thresholds(profile_name)
@@ -4750,7 +4049,6 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 result["meta"]["shots"].append(shot_meta)
         _film2_trace_event(trace_id, {"event": "film2.shot_finish"})
         # Build a simple segment hierarchy: film -> scenes -> shots -> clips (one clip per shot for now)
-        film_id = cid or f"film2_{str(trace_id or '')}"
         film_segment: Dict[str, Any] = {
             "segment_id": film_id,
             "level": "film",
@@ -4908,7 +4206,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                         "domain": "video",
                         "name": clip_id,
                         "index": clip_index,
-                        "parent_cid": cid,
+                        "trace_id": trace_id,
+                        "cid": cid,
                         "result": clip_result,
                         "meta": clip_result["meta"],
                         "qa": {"scores": {}},
@@ -5270,7 +4569,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
             r = await client.post(OCR_API_URL.rstrip("/") + "/ocr", json={"b64": b64, "ext": ext})
             parser = JSONParser()
-            js = parser.parse_superset(r.text or "", {"text": str})["coerced"]
+            js = parser.parse(r.text or "", {"text": str})
             text_val = js.get("text") or "" if isinstance(js, dict) else ""
             return {"name": name, "result": {"text": text_val, "ext": ext}}
     if name == "vlm.analyze" and ALLOW_TOOL_EXECUTION:
@@ -5326,7 +4625,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             r = await client.post(VLM_API_URL.rstrip("/") + "/analyze", json={"b64": b64, "ext": ext})
             parser = JSONParser()
             # VLM returns a free-form JSON object; keep it as a generic mapping.
-            js = parser.parse_superset(r.text or "", dict)["coerced"]
+            js = parser.parse(r.text or "", {})
             return {"name": name, "result": js if isinstance(js, dict) else {}}
     if name == "music.infinite.windowed" and ALLOW_TOOL_EXECUTION:
         if not MUSIC_API_URL:
@@ -5385,10 +4684,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         bpm_val = a.get("bpm")
         bpm_int: Optional[int] = None
         if isinstance(bpm_val, (int, float)):
-            try:
-                bpm_int = int(bpm_val)
-            except Exception:
-                bpm_int = None
+            bpm_int = int(bpm_val)
         key_val = a.get("key")
         key_txt: Optional[str] = None
         if isinstance(key_val, str) and key_val.strip():
@@ -5482,8 +4778,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                             "created_at": _now_ts(),
                         },
                     )
-                except Exception:
-                    logging.info("music_samples append failed:\n%s", traceback.format_exc())
+                except Exception as ex:
+                    logging.warning("music_samples.append_failed: %s", ex, exc_info=True)
                 # RAG: embed prompt text against the full track path
                 try:
                     pool = await get_pg_pool()
@@ -5502,8 +4798,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                                 txt,
                                 list(vec),
                             )
-                except Exception:
-                    logging.info("music RAG insert failed:\n%s", traceback.format_exc())
+                except Exception as ex:
+                    logging.warning("music_rag.insert_failed: %s", ex, exc_info=True)
 
         # Trace: standalone music.infinite.windowed finish
         if trace_val:
@@ -5837,14 +5133,19 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             try:
                 res = tr.get("result") or {}
                 arts = (res.get("artifacts") or []) if isinstance(res, dict) else []
-                cid = (res.get("meta") or {}).get("cid")
+                meta = (res.get("meta") or {}) if isinstance(res.get("meta"), dict) else {}
+                cid = meta.get("cid")
+                artifact_group_id = meta.get("artifact_group_id")
                 for a in arts:
                     aid = a.get("id"); kind = a.get("kind") or ""
-                    if aid and cid:
+                    if aid and (cid or artifact_group_id):
                         if kind.startswith("image") or base_tool.startswith("image"):
-                            urls.append(f"/uploads/artifacts/image/{cid}/{aid}")
+                            group = artifact_group_id or cid
+                            if group:
+                                urls.append(f"/uploads/artifacts/image/{group}/{aid}")
                         elif base_tool.startswith("music"):
-                            urls.append(f"/uploads/artifacts/music/{cid}/{aid}")
+                            if cid:
+                                urls.append(f"/uploads/artifacts/music/{cid}/{aid}")
             except Exception as ex:
                 logging.warning("creative.alts.asset_collect_failed: %s", ex, exc_info=True)
                 continue
@@ -5953,10 +5254,12 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
     if name == "scenegraph.plan" and ALLOW_TOOL_EXECUTION:
         prompt = args.get("prompt") or ""
         size = (args.get("size") or "1024x1024").lower()
-        try:
-            w,h = [int(x) for x in size.split("x")]
-        except Exception:
-            w,h = 1024,1024
+        w, h = 1024, 1024
+        if isinstance(size, str) and size:
+            m = _re.match(r"^\s*(\d{2,5})\s*x\s*(\d{2,5})\s*$", size)
+            if m:
+                w = int(m.group(1))
+                h = int(m.group(2))
         tokens = [t.strip(",. ") for t in prompt.replace(" and ", ",").split(",") if t.strip()]
         objs = []
         for t in tokens[:6]:
@@ -6045,7 +5348,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             }
             r = await client.post(MUSIC_API_URL.rstrip("/") + "/generate", json=payload)
             parser = JSONParser()
-            js = parser.parse_superset(r.text or "", dict)["coerced"]
+            js = parser.parse(r.text or "", {})
             return {"name": name, "result": js if isinstance(js, dict) else {}}
     if name == "music.timed.sao" and ALLOW_TOOL_EXECUTION:
         if not SAO_API_URL:
@@ -6061,7 +5364,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             }
             r = await client.post(SAO_API_URL.rstrip("/") + "/v1/music/timed", json=payload)
             parser = JSONParser()
-            js = parser.parse_superset(r.text or "", dict)["coerced"]
+            js = parser.parse(r.text or "", {})
             return {"name": name, "result": js if isinstance(js, dict) else {}}
     if name == "audio.stems.demucs" and ALLOW_TOOL_EXECUTION:
         if not DEMUCS_API_URL:
@@ -6071,7 +5374,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 payload = {"mix_wav": args.get("mix_wav") or args.get("src"), "stems": args.get("stems") or ["vocals","drums","bass","other"]}
                 r = await client.post(DEMUCS_API_URL.rstrip("/") + "/v1/audio/stems", json=payload)
                 parser = JSONParser()
-                js = parser.parse_superset(r.text or "", dict)["coerced"]
+                js = parser.parse(r.text or "", {})
                 # Persist stems if present
                 stems_obj = js.get("stems") if isinstance(js, dict) else None
                 if isinstance(stems_obj, dict):
@@ -6256,7 +5559,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
                         r_rvc = await client.post(RVC_API_URL.rstrip("/") + "/v1/audio/convert", json=payload_rvc)
                     parser = JSONParser()
-                    js_rvc = parser.parse_superset(r_rvc.text or "", {"ok": bool, "audio_wav_base64": str, "sample_rate": int})["coerced"]
+                    js_rvc = parser.parse(r_rvc.text or "", {"ok": bool, "audio_wav_base64": str, "sample_rate": int})
                     if not isinstance(js_rvc, dict) or not bool(js_rvc.get("ok")):
                         return {
                             "name": name,
@@ -6309,7 +5612,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
                     r_vf = await client.post(VOCAL_FIXER_API_URL.rstrip("/") + "/v1/vocal/fix", json=payload_vf)
                 parser = JSONParser()
-                js_vf = parser.parse_superset(
+                js_vf = parser.parse(
                     r_vf.text or "",
                     {
                         "ok": bool,
@@ -6451,7 +5754,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
             r = await client.post(RVC_API_URL.rstrip("/") + "/v1/audio/convert", json=payload)
         parser = JSONParser()
-        js = parser.parse_superset(r.text or "", {"ok": bool, "audio_wav_base64": str, "sample_rate": int})["coerced"]
+        js = parser.parse(r.text or "", {"ok": bool, "audio_wav_base64": str, "sample_rate": int})
         if not isinstance(js, dict) or not bool(js.get("ok")):
             return {
                 "name": name,
@@ -6476,7 +5779,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             }
             r = await client.post(DIFFSINGER_RVC_API_URL.rstrip("/") + "/v1/voice/sing", json=payload)
             parser = JSONParser()
-            js = parser.parse_superset(r.text or "", dict)["coerced"]
+            js = parser.parse(r.text or "", {})
             return {"name": name, "result": js if isinstance(js, dict) else {}}
     if name == "refs.music.build_profile" and ALLOW_TOOL_EXECUTION:
         try:
@@ -6604,7 +5907,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                                 MFA_API_URL.rstrip("/") + "/align",
                                 json={"lyrics": section_text, "wav_bytes": wav_b64},
                             )
-                        js = JSONParser().parse_superset(r.text, {"alignment": list})["coerced"] or {}
+                        js = JSONParser().parse(r.text, {"alignment": list}) or {}
                         raw_words = js.get("alignment")
                         if isinstance(raw_words, list):
                             for w in raw_words:
@@ -6624,7 +5927,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                             MFA_API_URL.rstrip("/") + "/align",
                             json={"lyrics": section_text, "wav_bytes": full_b64},
                         )
-                    js = JSONParser().parse_superset(r.text, {"alignment": list})["coerced"] or {}
+                    js = JSONParser().parse(r.text, {"alignment": list}) or {}
                     raw_words = js.get("alignment")
                     if isinstance(raw_words, list):
                         for w in raw_words:
@@ -6865,7 +6168,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             }
             r = await client.post(HUNYUAN_FOLEY_API_URL.rstrip("/") + "/v1/audio/foley", json=payload)
             parser = JSONParser()
-            js = parser.parse_superset(r.text or "", dict)["coerced"]
+            js = parser.parse(r.text or "", {})
             return {"name": name, "result": js if isinstance(js, dict) else {}}
     if name in ("image.edit", "image.upscale") and ALLOW_TOOL_EXECUTION:
         return {"name": name, "error": "disabled: use image.dispatch with full graph (no fallbacks)"}
@@ -6941,22 +6244,14 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         signage_keywords = ("sign", "stop sign", "billboard", "poster", "label", "street sign", "traffic sign")
         wants_signage = any(kw in prompt.lower() for kw in signage_keywords)
         exact_text = None
-        try:
-            quoted = _re.findall(r"\"([^\"]{2,})\"|'([^']{2,})'", prompt)
-            for a, b in quoted:
-                t = a or b
-                if len(t.split()) <= 4:
-                    exact_text = t
-                    break
-            if (not exact_text) and ("stop" in prompt.lower()):
-                exact_text = "STOP"
-        except Exception as ex:
-            _log(
-                "image.super_gen.text_extract_error",
-                error=str(ex),
-                stack="".join(traceback.format_exception(type(ex), ex, ex.__traceback__)),
-            )
-            exact_text = None
+        quoted = _re.findall(r"\"([^\"]{2,})\"|'([^']{2,})'", prompt)
+        for a, b in quoted:
+            t = a or b
+            if len(t.split()) <= 4:
+                exact_text = t
+                break
+        if (not exact_text) and ("stop" in prompt.lower()):
+            exact_text = "STOP"
         # 3) Optional web grounding for signage: fetch references and OCR for exact text
         web_sources = []
         if wants_signage and not exact_text:
@@ -6992,12 +6287,16 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         # 4) Base canvas
         base_args = {"prompt": base_style, "size": f"{w}x{h}", "seed": args.get("seed"), "refs": args.get("refs"), "cid": args.get("cid")}
         base = await execute_tool_call({"name": "legacy.image.gen", "arguments": base_args})
-        try:
-            cid = ((base.get("result") or {}).get("meta") or {}).get("cid")
-            rid = ((base.get("result") or {}).get("tool_calls") or [{}])[0].get("result_ref")
-            base_path = _os.path.join(UPLOAD_DIR, "artifacts", "image", cid, rid) if (cid and rid) else None
-        except Exception:
-            base_path = None
+        base_path = None
+        if isinstance(base, dict):
+            base_res = base.get("result") if isinstance(base.get("result"), dict) else {}
+            meta = base_res.get("meta") if isinstance(base_res.get("meta"), dict) else {}
+            cid = meta.get("cid")
+            tool_calls = base_res.get("tool_calls") if isinstance(base_res.get("tool_calls"), list) else []
+            tc0 = tool_calls[0] if tool_calls and isinstance(tool_calls[0], dict) else {}
+            rid = tc0.get("result_ref")
+            if isinstance(cid, str) and cid and isinstance(rid, str) and rid:
+                base_path = _os.path.join(UPLOAD_DIR, "artifacts", "image", cid, rid)
         if not base_path or not _os.path.exists(base_path):
             return {"name": name, "error": "base generation failed"}
         canvas = Image.open(base_path).convert("RGB")
@@ -7021,7 +6320,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                             ai = _analyze_image(sub_path, prompt=refined_prompt)
                             sem = ai.get("semantics") or {}
                             sc = float(sem.get("clip_score") or 0.0)
-                        except Exception:
+                        except Exception as ex:
+                            logging.debug("image.super_gen.clip_score_failed: %s", ex, exc_info=True)
                             sc = 1.0
                         best_tile = tile if (best_tile is None or sc >= 0.35) else best_tile
                         if sc >= 0.35:
@@ -7050,7 +6350,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 # Fallback font
                 try:
                     font = ImageFont.truetype("arial.ttf", max(24, (target_box[3] - target_box[1]) // 6))
-                except Exception:
+                except (OSError, IOError):
                     font = None
                 draw.text((tx, ty), str(exact_text), fill=(220, 220, 220), font=font)
             except Exception as ex:
@@ -7106,44 +6406,19 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
                 r = await client.post(base + "/research/run", json=args)
                 parser = JSONParser()
-                js = parser.parse_superset(r.text or "", dict)["coerced"]
+                js = parser.parse(r.text or "", {})
                 return {"name": name, "result": js if isinstance(js, dict) else {}}
     if name == "code.super_loop" and ALLOW_TOOL_EXECUTION:
         # Back code.super_loop with the central committee AI path only.
         repo_root = os.getenv("REPO_ROOT", "/workspace")
         step_tokens = int(os.getenv("CODE_LOOP_STEP_TOKENS", "900") or 900)
-
-        class _CommitteeProvider:
-            def chat(self, prompt: str, max_tokens: int):
-                # NOTE: run_super_loop expects a sync chat; we adapt by running
-                # committee_ai_text synchronously on the current event loop.
-                loop = _asyncio.get_event_loop()
-                env = loop.run_until_complete(
-                    committee_ai_text(
-                        [{"role": "user", "content": prompt}],
-                        trace_id="code_super_loop",
-                        temperature=DEFAULT_TEMPERATURE,
-                    )
-                )
-                txt = ""
-                if isinstance(env, dict) and env.get("ok"):
-                    res = env.get("result") or {}
-                    if isinstance(res, dict) and isinstance(res.get("text"), str):
-                        txt = res.get("text") or ""
-                else:
-                    # Log committee failure for code.super_loop instead of silently
-                    # returning an empty string; the super loop will still see a
-                    # valid text field, but traces capture the underlying error.
-                    _log(
-                        "code_super_loop.committee_error",
-                        trace_id="code_super_loop",
-                        error=(env or {}).get("error") if isinstance(env, dict) else {"code": "committee_invalid_env", "message": str(env)},
-                    )
-                return SimpleNamespace(text=str(txt), model_name="committee")
-
-        prov = _CommitteeProvider()
         task = args.get("task") or ""
-        env = run_super_loop(task=task, repo_root=repo_root, model=prov, step_tokens=step_tokens)
+        env = await run_super_loop(
+            task=str(task or ""),
+            repo_root=repo_root,
+            trace_id=str(trace_id or "code_super_loop"),
+            step_tokens=step_tokens,
+        )
         return {"name": name, "result": env}
     if name == "web_search" and ALLOW_TOOL_EXECUTION:
         # Robust multi-engine metasearch without external API keys
@@ -7188,7 +6463,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 payload["headers"] = args.get("headers")
             r = await client.post(base + "/web/smart_get", json=payload)
             parser = JSONParser()
-            js = parser.parse_superset(r.text or "", dict)["coerced"]
+            js = parser.parse(r.text or "", {})
             return {"name": name, "result": js if isinstance(js, dict) else {}}
     if name == "source_fetch" and ALLOW_TOOL_EXECUTION:
         url = args.get("url") or ""
@@ -7201,14 +6476,12 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             data = r.content or b""
             h = _hl.sha256(data).hexdigest()
             preview = None
-            try:
-                if ct.startswith("text/") or ct.find("json") >= 0:
-                    txt = data.decode("utf-8", errors="ignore")
-                    preview = txt[:2000]
-            except Exception:
-                preview = None
+            if ct.startswith("text/") or ct.find("json") >= 0:
+                txt = data.decode("utf-8", errors="ignore")
+                preview = txt[:2000]
             return {"name": name, "result": {"status": r.status_code, "content_type": ct, "sha256": h, "preview": preview}}
         except Exception as ex:
+            logging.warning("source_fetch.failed url=%s: %s", url, ex, exc_info=True)
             return {"name": name, "error": str(ex)}
     if name == "frame_interpolate":
         # Acknowledge and surface parameters; actual interpolation occurs during assembly if requested
@@ -7246,6 +6519,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     _log("video.interpolate.checkpoint.error", error=str(ex), path=dst)
             return {"name": name, "result": {"path": url}}
         except Exception as ex:
+            logging.error("ffmpeg.trim failed src=%s dst=%s cmd=%s: %s", src, dst, " ".join(ff), ex, exc_info=True)
             return {"name": name, "error": str(ex)}
     if name == "ffmpeg.concat":
         inputs = args.get("inputs") or []
@@ -7264,6 +6538,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             url = dst.replace("/workspace", "") if dst.startswith("/workspace/") else dst
             return {"name": name, "result": {"path": url}}
         except Exception as ex:
+            logging.error("ffmpeg.concat failed dst=%s cmd=%s: %s", dst, " ".join(ff), ex, exc_info=True)
             return {"name": name, "error": str(ex)}
     if name == "ffmpeg.audio_mix":
         a = args.get("a"); b = args.get("b"); vol_a = str(args.get("vol_a") or "1.0"); vol_b = str(args.get("vol_b") or "1.0")
@@ -7278,6 +6553,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             url = dst.replace("/workspace", "") if dst.startswith("/workspace/") else dst
             return {"name": name, "result": {"path": url}}
         except Exception as ex:
+            logging.error("ffmpeg.audio_mix failed dst=%s cmd=%s: %s", dst, " ".join(ff), ex, exc_info=True)
             return {"name": name, "error": str(ex)}
     if name == "image.cleanup":
         src = args.get("src") or ""
@@ -7351,6 +6627,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             trace_append("video", {"cid": cid_str, "tool": "video.cleanup", "src": src, "vf": vf, "path": dst})
             return {"name": name, "result": {"path": url}}
         except Exception as ex:
+            logging.error("video.cleanup failed src=%s dst=%s cmd=%s: %s", src, dst, " ".join(ff), ex, exc_info=True)
             return {"name": name, "error": str(ex)}
     if name == "image.artifact_fix":
         src = args.get("src") or ""; atype = (args.get("type") or "").strip().lower()
@@ -7369,10 +6646,12 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             if atype == "clock":
                 # Heuristic clock fix: detect circle and overlay canonical hands at target_time (default 10:10)
                 target_time = str(args.get("target_time") or "10:10")
-                try:
-                    parts = target_time.split(":"); hh = int(parts[0]) % 12; mm = int(parts[1]) % 60
-                except Exception:
-                    hh, mm = 10, 10
+                hh, mm = 10, 10
+                if isinstance(target_time, str) and target_time:
+                    m = _re.match(r"^\s*(\d{1,2})\s*:\s*(\d{1,2})\s*$", target_time)
+                    if m:
+                        hh = int(m.group(1)) % 12
+                        mm = int(m.group(2)) % 60
                 gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
                 gray = cv2.medianBlur(gray, 5)
                 circles = cv2.HoughCircles(gray, cv2.HOUGH_GRADIENT, 1.2, 30, param1=80, param2=30, minRadius=int(min(rw, rh) * 0.2), maxRadius=int(min(rw, rh) * 0.5))
@@ -7431,6 +6710,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             )
             return {"name": name, "result": {"path": url}}
         except Exception as ex:
+            logging.error("image.artifact_fix failed src=%s type=%s: %s", src, atype, ex, exc_info=True)
             return {"name": name, "error": str(ex)}
     if name == "video.artifact_fix":
         src = args.get("src") or ""; atype = (args.get("type") or "").strip().lower()
@@ -7470,6 +6750,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             )
             return {"name": name, "result": {"path": url}}
         except Exception as ex:
+            logging.error("video.flow.derive failed src=%s frame_a=%s frame_b=%s: %s", src, frame_a, frame_b, ex, exc_info=True)
             return {"name": name, "error": str(ex)}
     if name == "image.hands.fix":
         src = args.get("src") or ""
@@ -7630,7 +6911,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 emb = None
                 if er.status_code == 200:
                     parser = JSONParser()
-                    ej = parser.parse_superset(er.text or "", {"embedding": list, "vec": list})["coerced"]
+                    ej = parser.parse(er.text or "", {"embedding": list, "vec": list})
                     if isinstance(ej, dict):
                         emb = ej.get("embedding") or ej.get("vec")
             # 3) Per-frame InstantID apply with low denoise
@@ -7672,14 +6953,14 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                         pr = _c2.post(COMFYUI_API_URL.rstrip("/") + "/prompt", json={"prompt": g, "client_id": "wrapper-001"})
                         if pr.status_code == 200:
                             parser = JSONParser()
-                            pj = parser.parse_superset(pr.text or "", {"prompt_id": str, "uuid": str, "id": str})["coerced"]
+                            pj = parser.parse(pr.text or "", {"prompt_id": str, "uuid": str, "id": str})
                             pid = (pj.get("prompt_id") or pj.get("uuid") or pj.get("id")) if isinstance(pj, dict) else None
                             # poll for completion
                             while True:
                                 hr = _c2.get(COMFYUI_API_URL.rstrip("/") + f"/history/{pid}")
                                 if hr.status_code == 200:
                                     parser = JSONParser()
-                                    hj = parser.parse_superset(hr.text or "{}", dict)["coerced"]
+                                    hj = parser.parse(hr.text or "{}", {})
                                     h = _normalize_comfy_history_entry(hj if isinstance(hj, dict) else {}, str(pid))
                                     if h and _comfy_is_completed(h):
                                         assets = _extract_comfy_asset_urls(h, COMFYUI_API_URL or "http://comfyui:8188")
@@ -7748,7 +7029,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             try:
                 tvl1 = cv2.optflow.DualTVL1OpticalFlow_create()  # type: ignore
                 flow = tvl1.calc(a_gray, b_gray, None)
-            except Exception:
+            except (AttributeError, cv2.error) as ex:
+                logging.debug("video.flow.tvl1_unavailable: %s", ex, exc_info=True)
                 flow = cv2.calcOpticalFlowFarneback(a_gray, b_gray, None, 0.5, 3, 15, 3, 5, 1.2, 0)
             fx = flow[..., 0].astype(np.float32)
             fy = flow[..., 1].astype(np.float32)
@@ -7839,7 +7121,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 emb = None
                 if er.status_code == 200:
                     parser = JSONParser()
-                    ej = parser.parse_superset(er.text or "", {"embedding": list, "vec": list})["coerced"]
+                    ej = parser.parse(er.text or "", {"embedding": list, "vec": list})
                     if isinstance(ej, dict):
                         emb = ej.get("embedding") or ej.get("vec")
             if emb and isinstance(emb, list):
@@ -7878,13 +7160,13 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                         pr = _c2.post(COMFYUI_API_URL.rstrip("/") + "/prompt", json={"prompt": g, "client_id": "wrapper-001"})
                         if pr.status_code == 200:
                             parser = JSONParser()
-                            pj = parser.parse_superset(pr.text or "", {"prompt_id": str, "uuid": str, "id": str})["coerced"]
+                            pj = parser.parse(pr.text or "", {"prompt_id": str, "uuid": str, "id": str})
                             pid = (pj.get("prompt_id") or pj.get("uuid") or pj.get("id")) if isinstance(pj, dict) else None
                             while True:
                                 hr = _c2.get(COMFYUI_API_URL.rstrip("/") + f"/history/{pid}")
                                 if hr.status_code == 200:
                                     parser = JSONParser()
-                                    hj = parser.parse_superset(hr.text or "", {"history": dict})["coerced"]
+                                    hj = parser.parse(hr.text or "", {"history": dict})
                                     h = _normalize_comfy_history_entry(hj if isinstance(hj, dict) else {}, str(pid))
                                     if h and _comfy_is_completed(h):
                                         assets = _extract_comfy_asset_urls(h, COMFYUI_API_URL or "http://comfyui:8188")
@@ -7974,7 +7256,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 r = await client.post(HUNYUAN_VIDEO_API_URL.rstrip("/") + "/v1/video/hv/t2v", json=payload)
             parser = JSONParser()
             # Treat Hunyuan video responses as free-form mapping; callers inspect fields as needed.
-            js = parser.parse_superset(r.text or "{}", dict)["coerced"]
+            js = parser.parse(r.text or "{}", {})
             return {"name": name, "result": js if isinstance(js, dict) else {}}
         except Exception as ex:
             return {"name": name, "error": str(ex)}
@@ -7998,7 +7280,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
                 r = await client.post(HUNYUAN_VIDEO_API_URL.rstrip("/") + "/v1/video/hv/i2v", json=payload)
             parser = JSONParser()
-            js = parser.parse_superset(r.text or "{}", dict)["coerced"]
+            js = parser.parse(r.text or "{}", {})
             return {"name": name, "result": js if isinstance(js, dict) else {}}
         except Exception as ex:
             return {"name": name, "error": str(ex)}
@@ -8062,12 +7344,14 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     # Approximate evaluation is best-effort; preserve the exact result but surface telemetry.
                     logging.debug("sympy_approx_failed", exc_info=True)
                 return {"name": name, "result": res}
-            except Exception:
+            except Exception as ex:
+                logging.debug("sympy_parse_failed: %s", ex, exc_info=True)
                 allowed = {k: getattr(math, k) for k in dir(math) if not k.startswith("_")}
                 allowed.update({"__builtins__": {}})
                 val = eval(str(expr), allowed, {})  # noqa: S307 (safe namespace)
                 return {"name": name, "result": {"approx": float(val)}}
         except Exception as ex:
+            logging.error("math.sympy failed: %s", ex, exc_info=True)
             return {"name": name, "error": str(ex)}
     if name == "rag_index":
         res = await rag_index_dir(root=args.get("root", "/workspace"))
@@ -8086,7 +7370,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             r = await client.post(XTTS_API_URL.rstrip("/") + "/tts", json=payload)
             status = r.status_code
             parser = JSONParser()
-            js = parser.parse_superset(r.text or "", {})["coerced"]
+            js = parser.parse(r.text or "", {})
             if 200 <= status < 300:
                 return {"name": name, "result": js if isinstance(js, dict) else {}}
             # Non-2xx: surface a structured error rather than raising
@@ -8102,7 +7386,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
             r = await client.post(WHISPER_API_URL.rstrip("/") + "/transcribe", json={"audio_url": args.get("audio_url"), "language": args.get("language")})
             parser = JSONParser()
-            js = parser.parse_superset(r.text or "", {})["coerced"]
+            js = parser.parse(r.text or "", {})
             if 200 <= r.status_code < 300:
                 return {"name": name, "result": js if isinstance(js, dict) else {}}
             return {"name": name, "error": r.text}
@@ -8115,7 +7399,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             wf_payload = {**(wf_payload or {}), "client_id": "wrapper-001"}
             r = await client.post(COMFYUI_API_URL.rstrip("/") + "/prompt", json=wf_payload)
             parser = JSONParser()
-            js = parser.parse_superset(r.text or "", {})["coerced"]
+            js = parser.parse(r.text or "", {})
             if 200 <= r.status_code < 300:
                 return {"name": name, "result": js if isinstance(js, dict) else {}}
             return {"name": name, "error": r.text}
@@ -8127,7 +7411,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             wf_payload = {**(wf_payload or {}), "client_id": "wrapper-001"}
             r = await client.post(COMFYUI_API_URL.rstrip("/") + "/prompt", json=wf_payload)
             parser = JSONParser()
-            js = parser.parse_superset(r.text or "", {})["coerced"]
+            js = parser.parse(r.text or "", {})
             if 200 <= r.status_code < 300:
                 return {"name": name, "result": js if isinstance(js, dict) else {}}
             return {"name": name, "error": r.text}
@@ -8139,7 +7423,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             wf_payload = {**(wf_payload or {}), "client_id": "wrapper-001"}
             r = await client.post(COMFYUI_API_URL.rstrip("/") + "/prompt", json=wf_payload)
             parser = JSONParser()
-            js = parser.parse_superset(r.text or "", {})["coerced"]
+            js = parser.parse(r.text or "", {})
             if 200 <= r.status_code < 300:
                 return {"name": name, "result": js if isinstance(js, dict) else {}}
             return {"name": name, "error": r.text}
@@ -8147,7 +7431,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
             r = await client.post(FACEID_API_URL.rstrip("/") + "/embed", json={"image_url": args.get("image_url")})
             parser = JSONParser()
-            js = parser.parse_superset(r.text or "", {})["coerced"]
+            js = parser.parse(r.text or "", {})
             if 200 <= r.status_code < 300:
                 return {"name": name, "result": js if isinstance(js, dict) else {}}
             return {"name": name, "error": r.text}
@@ -8155,7 +7439,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
             r = await client.post(MUSIC_API_URL.rstrip("/") + "/generate", json=args)
             parser = JSONParser()
-            js = parser.parse_superset(r.text or "", {})["coerced"]
+            js = parser.parse(r.text or "", {})
             if 200 <= r.status_code < 300:
                 return {"name": name, "result": js if isinstance(js, dict) else {}}
             return {"name": name, "error": r.text}
@@ -8163,7 +7447,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
             r = await client.post(VLM_API_URL.rstrip("/") + "/analyze", json={"image_url": args.get("image_url"), "prompt": args.get("prompt")})
             parser = JSONParser()
-            js = parser.parse_superset(r.text or "", {})["coerced"]
+            js = parser.parse(r.text or "", {})
             if 200 <= r.status_code < 300:
                 return {"name": name, "result": js if isinstance(js, dict) else {}}
             return {"name": name, "error": r.text}
@@ -8172,7 +7456,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
             r = await client.post(EXECUTOR_BASE_URL.rstrip("/") + "/run_python", json={"code": args.get("code", "")})
             parser = JSONParser()
-            js = parser.parse_superset(r.text or "", {})["coerced"]
+            js = parser.parse(r.text or "", {})
             if 200 <= r.status_code < 300:
                 return {"name": name, "result": js if isinstance(js, dict) else {}}
             return {"name": name, "error": r.text}
@@ -8187,7 +7471,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
             r = await client.post(EXECUTOR_BASE_URL.rstrip("/") + "/write_file", json={"path": args.get("path"), "content": content_val})
             parser = JSONParser()
-            js = parser.parse_superset(r.text or "", {})["coerced"]
+            js = parser.parse(r.text or "", {})
             if 200 <= r.status_code < 300:
                 return {"name": name, "result": js if isinstance(js, dict) else {}}
             return {"name": name, "error": r.text}
@@ -8195,7 +7479,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
             r = await client.post(EXECUTOR_BASE_URL.rstrip("/") + "/read_file", json={"path": args.get("path")})
             parser = JSONParser()
-            js = parser.parse_superset(r.text or "", {})["coerced"]
+            js = parser.parse(r.text or "", {})
             if 200 <= r.status_code < 300:
                 return {"name": name, "result": js if isinstance(js, dict) else {}}
             return {"name": name, "error": r.text}
@@ -8207,119 +7491,46 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
     return {"name": name or "unknown", "skipped": True, "reason": "unsupported tool in orchestrator"}
 
 
-async def execute_tools(tool_calls: List[Dict[str, Any]], trace_id: str | None = None) -> List[Dict[str, Any]]:
-    # Route all tool execution through the executor only.
-    steps: List[Dict[str, Any]] = []
-    for idx, call in enumerate(tool_calls[:5]):
-        name = (call or {}).get("name")
-        args = (call or {}).get("arguments") or {}
-        if not isinstance(args, dict):
-            args = {}
-        step_id = f"s{idx+1}"
-        steps.append({"id": step_id, "tool": str(name or ""), "args": args})
-        if trace_id:
-            _trace_log_tool(
-                STATE_DIR,
-                str(trace_id),
-                {
-                    "request_id": str(trace_id),
-                    "step_id": step_id,
-                    "tool": str(name or ""),
-                    "phase": "pre",
-                    "args": args,
-                    "meta": {"retry_index": 0},
-                },
-            )
-    rid = str(trace_id or uuid.uuid4().hex)
-    payload = {"schema_version": 1, "request_id": rid, "trace_id": rid, "steps": steps}
-    # Trace executor calls explicitly so we can confirm that validated steps reach the executor
-    _log(
-        "executor.call",
-        trace_id=str(trace_id or rid),
-        base=EXECUTOR_BASE_URL,
-        steps_count=len(steps),
-    )
-    async with _hx.AsyncClient(timeout=None, trust_env=False) as client:
-        r = await client.post(EXECUTOR_BASE_URL.rstrip("/") + "/execute", json=payload)
-        parser = JSONParser()
-        env_schema = {"schema_version": int, "request_id": str, "ok": bool, "result": dict, "error": dict}
-        env = parser.parse_superset(r.text or "{}", env_schema)["coerced"]
-    results: List[Dict[str, Any]] = []
-    if isinstance(env, dict) and env.get("ok") and isinstance((env.get("result") or {}).get("produced"), dict):
-        for sid, step in (env.get("result") or {}).get("produced", {}).items():
-            if isinstance(step, dict):
-                res = step.get("result") if isinstance(step.get("result"), dict) else {}
-                results.append({"name": (res.get("name") or "tool") if isinstance(res, dict) else "tool", "result": res})
-                if trace_id:
-                    envelope = {
-                        "ok": True,
-                        "result": res,
-                        "error": None,
-                    }
-                    _trace_log_tool(
-                        STATE_DIR,
-                        str(trace_id),
-                        {
-                            "request_id": rid,
-                            "step_id": str(sid),
-                            "tool": str(step.get("name") or "tool"),
-                            "phase": "post",
-                            "envelope": envelope,
-                            "duration_ms": int(step.get("duration_ms") or 0),
-                            "meta": {"retry_index": 0},
-                        },
-                    )
-        return results
-    # Error path: surface a single executor error record
-    err = (env or {}).get("error") or (env.get("result") or {}).get("error") or {}
-    if trace_id:
-        envelope_err = {
-            "ok": False,
-            "result": None,
-            "error": err,
-        }
-        _trace_log_tool(
-            STATE_DIR,
-            str(trace_id),
-            {
-                "request_id": rid,
-                "step_id": "executor",
-                "tool": "executor",
-                "phase": "post",
-                "envelope": envelope_err,
-                "duration_ms": 0,
-                "meta": {"retry_index": 0},
-            },
-        )
-    # Surface full executor error; never truncate to a generic 'executor_failed'.
-    return [{
-        "name": "executor",
-        "error": {
-            "code": err.get("code") or "executor_error",
-            "message": err.get("message") or "executor_error",
-            "stack": err.get("stack") or "".join(traceback.format_stack()),
-        },
-    }]
-
-
 @app.post("/v1/chat/completions")
 async def chat_completions(body: Dict[str, Any], request: Request):
+    # Single-exit discipline: exactly one return at the bottom of this function.
+    response = None
+    usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    display_content = ""
+    trace_id = "tt_unknown"
+    master_seed = 0
+    run_id = None
+    _lock_token = None
+    abort_pipeline: bool = False
+    planner_error_payload: Optional[Dict[str, Any]] = None
+
+    # Always-defined downstream variables (no NameErrors, no fallthrough crashes).
+    qwen_result: Dict[str, Any] = {}
+    glm_result: Dict[str, Any] = {}
+    deepseek_result: Dict[str, Any] = {}
+    synth_result: Dict[str, Any] = {}
+    tool_results: List[Dict[str, Any]] = []
+    final_env: Dict[str, Any] = {}
+    artifacts_out: Dict[str, Any] = {"urls": [], "items": []}
+    # Required post-run features (artifacts ledger, ablation export, teacher tap).
+    tool_exec_meta: List[Dict[str, Any]] = []
+    _ledger_shard: Optional[dict] = None
+    _ledger_root: Optional[str] = None
+    _ledger_name: str = "ledger"
+    pack_hash: Optional[str] = None
+    # Absolutize helper must exist on all paths (including aborted requests).
+    base_url: str = (PUBLIC_BASE_URL or "").rstrip("/") or (str(request.base_url) or "").rstrip("/")
+    abs_url_fn = partial(_abs_url, request_base_url=base_url)
+    # Always-defined planner outputs (avoid fallthrough crashes on abort paths).
+    plan_text: str = ""
+    tool_calls: List[Dict[str, Any]] = []
+    planner_env: Dict[str, Any] = {}
+    # Executor routing knobs are used in multiple places; define once.
+    executor_endpoint: str = EXECUTOR_BASE_URL or "http://127.0.0.1:8081"
+    exec_temperature = (body.get("temperature") if isinstance(body, dict) else None) or DEFAULT_TEMPERATURE
+    _cat_hash: str = ""
     try:
-        # normalize and extract attachments (images/audio/video/files) for tools
         t0 = time.time()
-        # Single-exit accumulator for prebuilt final responses (avoid early returns)
-        response_prebuilt = None
-        # Planner hard error flag, e.g. media request with no tool calls.
-        planner_hard_error = False
-        # Optional planner error payload when the planner/committee path fails.
-        planner_error_payload: Optional[Dict[str, Any]] = None
-        # Initialize per-backend envelopes upfront so they are always defined,
-        # even if upstream committee calls fail early.
-        qwen_result: Dict[str, Any] = {}
-        glm_result: Dict[str, Any] = {}
-        deepseek_result: Dict[str, Any] = {}
-        synth_result: Dict[str, Any] = {}
-        # Request shaping (pure; no network)
         shaped = shape_request(
             body or {},
             request,
@@ -8333,132 +7544,113 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         attachments = shaped.get("attachments") or []
         last_user_text = shaped.get("last_user_text") or ""
         conv_cid = shaped.get("conv_cid")
-        mode = shaped.get("mode") or "job"
-        # Effective mode: no keyword heuristics; whatever the router/shape_request decided.
+        mode = shaped.get("mode") or "general"
         effective_mode = mode
         master_seed = int(shaped.get("master_seed") or 0)
+        request_id = shaped.get("request_id") or uuid.uuid4().hex
         trace_id = shaped.get("trace_id") or "tt_unknown"
-        # Body invalid → build a non-fatal envelope; do not return early
         problems = shaped.get("problems") or []
         if any((p.get("code") == "bad_request") for p in problems if isinstance(p, dict)):
-            msg = "Invalid request: 'messages' must be a list."
             usage0 = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-            env = _build_openai_envelope(
+            response = _build_openai_envelope(
                 ok=False,
-                text=msg,
+                text="Invalid request: 'messages' must be a list.",
                 error={"code": "bad_request", "message": "messages must be a list"},
                 usage=usage0,
                 model=COMMITTEE_MODEL_ID,
                 seed=0,
                 id_="orc-1",
             )
-            response_prebuilt = env
-        first_user_len = len((last_user_text or "")) if isinstance(last_user_text, str) else 0
-        # High-level request trace (distillation-friendly)
-        _trace_log_request(
-            STATE_DIR,
-            str(trace_id),
-            {
-                "request_id": str(trace_id),
-                "kind": "chat",
-                "route": str(request.url.path),
-                "payload": {"messages_count": len(normalized_msgs or []), "first_user_text_len": first_user_len},
-                "meta": {
-                    "mode": mode,
-                    "effective_mode": effective_mode,
-                    "schema_version": 1,
+            usage = usage0
+            abort_pipeline = True
+            plan_text = ""
+            tool_calls = []
+            planner_env = {}
+        else:
+            first_user_len = len((last_user_text or "")) if isinstance(last_user_text, str) else 0
+            # High-level request trace (distillation-friendly)
+            _trace_log_request(
+                STATE_DIR,
+                str(trace_id),
+                {
+                    "request_id": str(request_id),
+                    "kind": "chat",
+                    "route": str(request.url.path),
+                    "payload": {"messages_count": len(normalized_msgs or []), "first_user_text_len": first_user_len},
+                    "meta": {
+                        "mode": mode,
+                        "effective_mode": effective_mode,
+                        "schema_version": 1,
+                    },
                 },
-            },
-        )
-        checkpoints_append_event(STATE_DIR, trace_id, "request", {
-            "trace_id": trace_id,
-            "route": "/v1/chat/completions",
-            "body_summary": {"messages_count": len(normalized_msgs or []), "first_user_text_len": first_user_len},
-            "seed": int(master_seed),
-            "model_declared": (body.get("model") if isinstance(body.get("model"), str) else None),
-        })
-        _log("chat.start", trace_id=trace_id, mode=mode, effective_mode=effective_mode, stream=bool(body.get("stream")), cid=conv_cid)
-        # Acquire per-trace lock and record start event
-        _lock_token = trace_acquire_lock(STATE_DIR, trace_id, timeout_s=10)
-        checkpoints_append_event(STATE_DIR, trace_id, "start", {"seed": int(master_seed), "mode": mode, "effective_mode": effective_mode})
+            )
+            checkpoints_append_event(STATE_DIR, trace_id, "request", {
+                "trace_id": trace_id,
+                "route": "/v1/chat/completions",
+                "body_summary": {"messages_count": len(normalized_msgs or []), "first_user_text_len": first_user_len},
+                "seed": int(master_seed),
+                "model_declared": (body.get("model") if isinstance(body.get("model"), str) else None),
+            })
+            _log("chat.start", trace_id=trace_id, mode=mode, effective_mode=effective_mode, stream=bool(body.get("stream")), cid=conv_cid)
+            # Acquire per-trace lock and record start event
+            _lock_token = trace_acquire_lock(STATE_DIR, trace_id, timeout_s=10)
+            checkpoints_append_event(STATE_DIR, trace_id, "start", {"seed": int(master_seed), "mode": mode, "effective_mode": effective_mode})
 
-        # ICW context (canonical): build a real ICW window using orchestrator.icw.assembler.
-        # This replaces legacy inline/fake packers.
-        pack_hash = None
-        icw_prompt = ""
-        icw_budget_bytes = int(icw_byte_budget_for_model(DEFAULT_NUM_CTX) * 0.65)
-        try:
-            anchor_lines: List[str] = []
-            for m in (normalized_msgs or [])[-8:]:
-                if not isinstance(m, dict):
-                    continue
-                role = str(m.get("role") or "").strip()
-                content = str(m.get("content") or "").strip()
-                if role and content:
-                    anchor_lines.append(f"{role}: {content}")
-            anchor_text = "\n".join(anchor_lines)[:6000]
-
-            icw_candidates: List[str] = []
-            for m in (normalized_msgs or []):
-                if not isinstance(m, dict):
-                    continue
-                role = str(m.get("role") or "").strip()
-                content = str(m.get("content") or "").strip()
-                if role and content:
-                    icw_candidates.append(f"{role}: {content}")
-
-            icw_state: Dict[str, Any] = {
-                "cid": conv_cid,
-                "entities": [],
-                "goals": last_user_text,
-                "anchor_text": anchor_text,
-                "candidates": icw_candidates,
-                "retrieved": [],
-            }
-            icw_state["state_hash"] = icw_state_hash_from(icw_state)
-            icw_request = {"role": "user", "content": last_user_text}
-            icw_window = assemble_window(icw_request, icw_state, icw_budget_bytes, step_out_tokens=512)
-            icw_prompt = getattr(icw_window, "prompt", "") if icw_window is not None else ""
-        except Exception as ex:
-            _log("icw.assemble.error", trace_id=trace_id, error=str(ex))
-            icw_prompt = ""
-
-        if isinstance(icw_prompt, str) and icw_prompt.strip():
-            ph = _hl.sha256(icw_prompt.encode("utf-8")).hexdigest()
-            pack_hash = f"sha256:{ph}"
-            icw_frame = {"role": "system", "content": "### [ICW CONTEXT]\n" + icw_prompt}
-            if (
-                isinstance(messages, list)
-                and messages
-                and isinstance(messages[0], dict)
-                and messages[0].get("role") == "system"
-            ):
-                messages = [messages[0], icw_frame] + messages[1:]
-            else:
-                messages = [icw_frame] + (messages or [])
-        _trace_log_event(
-            STATE_DIR,
-            str(trace_id),
-            {
-                "kind": "co",
-                "stage": "pack",
-                "data": {
-                    "icw_budget_bytes": int(icw_budget_bytes),
-                    "approx_chars": len(icw_prompt) if isinstance(icw_prompt, str) else 0,
-                    "estimated_tokens": estimate_tokens_from_text(icw_prompt) if isinstance(icw_prompt, str) else 0,
+            # ICW packing: one call, one system frame (ICW owns compression).
+            icw_frame, pack_hash, icw_meta = pack_icw_system_frame_from_messages(
+                normalized_msgs,
+                cid=str(conv_cid) if conv_cid is not None else None,
+                goals=str(last_user_text or ""),
+                model_ctx_limit_tokens=int(DEFAULT_NUM_CTX),
+                pct_budget=0.65,
+                step_out_tokens=512,
+            )
+            if isinstance(icw_frame, dict) and icw_frame.get("content"):
+                if (
+                    isinstance(messages, list)
+                    and messages
+                    and isinstance(messages[0], dict)
+                    and messages[0].get("role") == "system"
+                ):
+                    messages = [messages[0], icw_frame] + messages[1:]
+                else:
+                    messages = [icw_frame] + (messages or [])
+                if (
+                    isinstance(normalized_msgs, list)
+                    and normalized_msgs
+                    and isinstance(normalized_msgs[0], dict)
+                    and normalized_msgs[0].get("role") == "system"
+                ):
+                    normalized_msgs = [normalized_msgs[0], icw_frame] + normalized_msgs[1:]
+                else:
+                    normalized_msgs = [icw_frame] + (normalized_msgs or [])
+            _trace_log_event(
+                STATE_DIR,
+                str(trace_id),
+                {
+                    "kind": "icw",
+                    "stage": "pack",
+                    "data": {
+                        "pack_hash": pack_hash,
+                        "meta": icw_meta,
+                    },
                 },
-            },
-        )
-        run_id = await _db_insert_run(trace_id=trace_id, mode=mode, seed=master_seed, pack_hash=pack_hash, request_json=body)
-        await _db_insert_icw_log(
-            run_id=run_id,
-            pack_hash=pack_hash or None,
-            budget_tokens=int(DEFAULT_NUM_CTX),
-            scores_json={
-                "icw_budget_bytes": int(icw_budget_bytes),
-                "estimated_tokens": estimate_tokens_from_text(icw_prompt) if isinstance(icw_prompt, str) else 0,
-            },
-        )
+            )
+            run_id = await _db_insert_run(trace_id=trace_id, mode=mode, seed=master_seed, pack_hash=pack_hash, request_json=body)
+            await _db_insert_icw_log(
+                run_id=run_id,
+                pack_hash=pack_hash or None,
+                budget_tokens=int(DEFAULT_NUM_CTX),
+                scores_json={
+                    "meta": icw_meta,
+                },
+            )
+            # Artifacts ledger shard (required): store step-level tool execution summaries.
+            try:
+                _ledger_root = os.path.join(UPLOAD_DIR, "artifacts", "runs", str(trace_id))
+                _ledger_shard = _art_open_shard(_ledger_root, _ledger_name, int(ARTIFACT_SHARD_BYTES))
+            except Exception as ex:
+                logging.warning("ledger.open.failed trace_id=%s: %s", str(trace_id), ex, exc_info=True)
 
         # If client supplies tool results (role=tool) we include them verbatim for the planner/executors
 
@@ -8466,256 +7658,69 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         route_mode = "committee"
         # No early returns: continue to planner/tools; responses emitted only after work completes
 
-        # 1) Planner proposes plan + tool calls
-        # Committee-governed pre-plan deliberation and gating
-        _log("committee.open", trace_id=trace_id, participants=["qwen", "glm", "deepseek", "planner", "executor"], topic="user_intent_summary")
-        _ev = []
-        if isinstance(messages, list):
-            _ev = [("msg", i) for i, _ in enumerate(messages[:3])]
-        _risks = ["string_args_without_json_parse", "missing_prompt_for_image_dispatch"]
-        _log("committee.context", trace_id=trace_id, evidence=_ev, risks=_risks)
-        # Pre-review checkpoint
-        checkpoints_append_event(STATE_DIR, trace_id, "committee.review.pre", {"evidence": _ev, "risks": _risks})
-
-        # Direct planner call: preplan removed. Planner prompt already includes tool
-        # catalog, mode, RoE, and routing rules; a single planner_produce_plan call
-        # governs tool selection.
-        _log("planner.call", trace_id=trace_id)
-        # Feed the planner the normalized chat history (without meta-prompt/ICW
-        # system frames) so the user's input and prior turns are preserved
-        # faithfully in the planning context.
-        plan_text, tool_calls, planner_env = await planner_produce_plan(
+        # 1) Planner proposes tool calls (planning lives under orchestrator/app/plan/*).
+        _log("planner.call", trace_id=trace_id, mode=effective_mode)
+        plan_text, tool_calls, planner_env = await produce_tool_plan(
             normalized_msgs,
-            body.get("tools"),
-            body.get("temperature") or DEFAULT_TEMPERATURE,
+            (body.get("tools") if isinstance(body, dict) else None),
+            float(body.get("temperature") or DEFAULT_TEMPERATURE),
             trace_id=trace_id,
-            mode=mode,
+            mode=effective_mode,
         )
-        # Detect planner/committee failures early so they do not silently degrade into
-        # an empty plan. This also flips pipeline_ok to False so the final envelope
-        # reflects that the tool pipeline did not fully succeed.
+        tool_calls = _normalize_tool_calls(tool_calls)
+        # Hardening: enforce tool argument contract (args must be an object) and fill minimal defaults.
+        tool_calls = args_ensure_object_args(tool_calls)
+        tool_calls = args_fill_min_defaults(tool_calls, str(last_user_text or ""), log_fn=_log, trace_id=str(trace_id))
+        # Hardening: filter unknown tools against runtime catalog (registry + builtins).
+        allowed_runtime = catalog_allowed(get_builtin_tools_schema)
+        # Restrict to planner-visible + mode-allowed tools (single source of truth; do not re-filter later).
+        allowed_runtime = {n for n in allowed_runtime if n in PLANNER_VISIBLE_TOOLS}
+        allowed_runtime = {n for n in allowed_runtime if n in set(_allowed_tools_for_mode(effective_mode))}
+        tool_calls, unknown_tools = catalog_validate(tool_calls or [], allowed_runtime)
+        if unknown_tools:
+            _log("tools.unknown.filtered", trace_id=trace_id, unknown=unknown_tools)
+        _log("planner.done", trace_id=trace_id, tool_count=len(tool_calls or []), ok=bool((planner_env or {}).get("ok")))
+        trace_append("decision", {"cid": conv_cid, "trace_id": trace_id, "plan": plan_text, "tool_calls": tool_calls})
+
         if not isinstance(planner_env, dict) or not planner_env.get("ok"):
-            planner_hard_error = True
-            # Derive a canonical error block from the planner env.
+            usage0 = estimate_usage(messages, "")
             err_block = planner_env.get("error") if isinstance(planner_env, dict) else None
             if not isinstance(err_block, dict):
-                err_block = {
-                    "code": "planner_committee_error",
-                    "message": str(planner_env) if planner_env is not None else "planner committee failed with unknown error",
-                }
-            planner_error_payload = err_block
-            _log("planner.env.error", trace_id=trace_id, error=err_block)
-        _log("planner.done", trace_id=trace_id, tool_count=len(tool_calls or []))
-        _log("flow.after_plan", trace_id=trace_id, tool_count=len(tool_calls or []))
-        # Normalize planner tool calls into orchestrator internal schema {name, arguments}
-        tool_calls = _normalize_tool_calls(tool_calls)
-        if (not tool_calls) and (effective_mode == "film"):
-            planner_hard_error = True
-            _log(
-                "planner.no_tool_calls_for_film",
-                trace_id=trace_id,
-                mode=effective_mode,
+                err_block = {"code": "planner_error", "message": str(planner_env)}
+            planner_error_payload = dict(err_block)
+            response = _build_openai_envelope(
+                ok=False,
+                text="Planner failed.",
+                error=err_block,
+                usage=usage0,
+                model=COMMITTEE_MODEL_ID,
+                seed=int(master_seed),
+                id_="orc-1",
             )
-        _log("planner.tools.normalized", trace_id=trace_id, tool_count=len(tool_calls))
-        # Emit planner.steps and catalog hash for traceability (derived from allowed tool names)
-        _cat_hash = _compute_tools_hash(body, planner_visible_only=True)
-        _log("planner.catalog", trace_id=trace_id, hash=_cat_hash)
-        _log("planner.steps", trace_id=trace_id, steps=[{"tool": (tc.get("name") or "")} for tc in (tool_calls or [])])
-        # No synthesized tool_calls: executors must propose exact tools to run
-        trace_append("decision", {"cid": conv_cid, "trace_id": trace_id, "plan": plan_text, "tool_calls": tool_calls})
-        # Deterministic router: if intent is recognized, override planner with a direct tool call
-        # No router overrides — the planner is solely responsible for tool choice
-        # Execute planner/router tool calls immediately when present
-        tool_results: List[Dict[str, Any]] = []
-        # Defer execution until after validate; execution happens below when tool_calls is non-empty.
-        # No heuristic upgrades; planner decides exact tools
-        # Surface attachments in tool arguments so downstream jobs can use user media,
-        # and ensure every planner-emitted tool call carries a cid when we have one.
-        if tool_calls:
-            enriched: List[Dict[str, Any]] = []
-            for tc in tool_calls:
-                args = tc.get("arguments") or {}
-                if not isinstance(args, dict):
-                    args = {"_raw": args}
-                if attachments:
-                    # Attachments by type for convenience
-                    imgs = [a for a in attachments if a.get("type") == "image"]
-                    auds = [a for a in attachments if a.get("type") == "audio"]
-                    vids = [a for a in attachments if a.get("type") == "video"]
-                    files = [a for a in attachments if a.get("type") == "file"]
-                    if imgs:
-                        args.setdefault("images", imgs)
-                    if auds:
-                        args.setdefault("audio", auds)
-                    if vids:
-                        args.setdefault("video", vids)
-                    if files:
-                        args.setdefault("files", files)
-                # Always inject a cid into tool args when we have a conversation id.
-                if conv_cid and isinstance(args, dict):
-                    args.setdefault("cid", conv_cid)
-                tc = {**tc, "arguments": args}
-                enriched.append(tc)
-            tool_calls = enriched
-        # Before filling defaults, ensure any string/\"_raw\" arguments are parsed into objects.
-        # For planner/committee outputs, run them through committee_jsonify with a compact
-        # schema derived from the tool's JSON schema so we are never feeding markdown/prose
-        # directly into JSONParser.
-        if tool_calls:
-            parser = JSONParser()
-            normalized_calls: List[Dict[str, Any]] = []
-            for tc in tool_calls:
-                if not isinstance(tc, dict):
-                    normalized_calls.append(tc)
-                    continue
-                name = (tc.get("name") or "").strip()
-                args_obj = tc.get("arguments")
-                raw_text: Optional[str] = None
-                if isinstance(args_obj, dict) and isinstance(args_obj.get("_raw"), str):
-                    raw_text = args_obj.get("_raw")  # type: ignore[assignment]
-                elif isinstance(args_obj, str):
-                    raw_text = args_obj
-                # If we have a raw string from the planner/committee, normalize it.
-                if isinstance(raw_text, str) and raw_text.strip():
-                    meta = _TOOL_SCHEMAS.get(name, {})
-                    js_schema = meta.get("schema") or {}
-                    expected_schema = _tool_expected_from_jsonschema(js_schema)
-                    # When we have a known schema (planner-visible tools), use committee_jsonify
-                    # to coerce the messy text into strict JSON.
-                    if expected_schema:
-                        try:
-                            fixed = await committee_jsonify(
-                                raw_text,
-                                expected_schema=expected_schema,
-                                trace_id=str(trace_id or f"{name or 'tool'}.args"),
-                                temperature=0.0,
-                            )
-                        except Exception as ex:
-                            _log(
-                                "planner.args_jsonify.error",
-                                trace_id=trace_id,
-                                tool=name,
-                                error=str(ex),
-                            )
-                            fixed = {}
-                        if isinstance(fixed, dict):
-                            args_obj = fixed
-                        else:
-                            args_obj = {}
-                    else:
-                        # For tools without a registered JSON schema, still route through
-                        # committee_jsonify so that LLM-originated JSON always passes
-                        # through the JSONFixer path before any JSONParser handling.
-                        generic_schema = {"data": dict}
-                        try:
-                            fixed = await committee_jsonify(
-                                raw_text,
-                                expected_schema=generic_schema,
-                                trace_id=str(trace_id or f"{name or 'tool'}.args"),
-                                temperature=0.0,
-                            )
-                        except Exception as ex:
-                            _log(
-                                "planner.args_jsonify.error",
-                                trace_id=trace_id,
-                                tool=name,
-                                error=str(ex),
-                            )
-                            fixed = {}
-                        if isinstance(fixed, dict) and isinstance(fixed.get("data"), dict):
-                            args_obj = fixed.get("data")  # type: ignore[assignment]
-                        else:
-                            args_obj = {}
-                if not isinstance(args_obj, dict):
-                    args_obj = {}  # ensure downstream sees an object
-                normalized_calls.append({**tc, "arguments": args_obj})
-            tool_calls = normalized_calls
-            # Inject minimal defaults for image.dispatch without overwriting provided args; also emit args snapshot
-            tool_calls = args_fill_min_defaults(tool_calls, last_user_text, log_fn=_log, trace_id=trace_id)
-        # Planner must fully fill args per contract; no auto-insertion of tools beyond minimal defaults above
-        # If planner returned no tools or unnamed tools, run a strict re-plan to force valid names from the catalog
-        # Build allowed tool names (registry + builtins) early, since we reference them in name-fix logic
-        builtins = get_builtin_tools_schema()
-        # Allow only built-ins + client-declared tools
-        allowed_tools = set()
-        client_tools = body.get("tools") if isinstance(body.get("tools"), list) else []
-        for t in (client_tools or []):
-            if isinstance(t, dict):
-                nm = (t.get("function") or {}).get("name") or t.get("name")
-                if isinstance(nm, str) and nm.strip():
-                    allowed_tools.add(nm.strip())
-        for t in (builtins or []):
-            fn = (t.get("function") or {})
-            nm = fn.get("name")
-            if nm:
-                allowed_tools.add(str(nm))
-        # Restrict to planner-visible tools first; semantic mapping of intent→tools
-        # is handled entirely inside the planner/committee prompts, not via keyword
-        # triggers here.
-        allowed_tools = {n for n in allowed_tools if n in PLANNER_VISIBLE_TOOLS}
-        # Intersect with mode-allowed palette for this planning pass
-        allowed_by_mode = set(_allowed_tools_for_mode(effective_mode))
-        allowed_tools = allowed_tools & allowed_by_mode
-        # If tool semantics are client-driven, return tool_calls instead of executing
-        if False:
-            tool_calls_openai = to_openai_tool_calls(tool_calls)
-            response = {
-                "id": "orc-1",
-                "object": "chat.completion",
-                "model": COMMITTEE_MODEL_ID,
-                "choices": [
-                    {
-                        "index": 0,
-                        "finish_reason": "tool_calls",
-                        "message": {
-                            "role": "assistant",
-                            "content": None,
-                            "tool_calls": tool_calls_openai,
-                        },
-                    }
-                ],
-            }
-            # Do not stream; always return a single complete response after the entire flow finishes
-            if _lock_token:
-                trace_release_lock(STATE_DIR, trace_id)
-            response_prebuilt = response
-            # Do not return early; finalize at unified tail
-            # include usage estimate even in tool_calls path (no completion tokens yet)
-            # (dead code; we returned above)
+            usage = usage0
+            abort_pipeline = True
+            # Hard abort: do not execute tools or run downstream synthesis on planner failure.
+            tool_calls = []
+            plan_text = ""
+            _cat_hash = ""
+        else:
+            _cat_hash = compute_tools_hash(body, planner_visible_only=False, planner_visible_tools=set(PLANNER_VISIBLE_TOOLS))
+        # Planner OK: continue into the full pipeline below (CO/RoE/RAG/QA/retry/compose),
+        # which owns tool execution and final response composition.
 
-        # Executor never parses string args; any non-object args must be repaired upstream
+        # response prepared; continue to unified finalization below.
 
-        # Pre-validate tool names against the registered catalog to avoid executor 404s
-        allowed_tools = catalog_allowed(get_builtin_tools_schema)
-        # Restrict catalog to planner-visible tools only
-        allowed_tools = {n for n in allowed_tools if n in PLANNER_VISIBLE_TOOLS}
-        # Intersect catalog with mode-based palette when constraining re-plans
-        _allowed_mode_set = set(_allowed_tools_for_mode(effective_mode))
-        _, unknown = catalog_validate(tool_calls or [], allowed_tools)
-        if unknown:
-            # No replans: log and drop unknown tools; execution will continue with valid ones only.
-            _log("tools.unknown.filtered", trace_id=trace_id, unknown=unknown)
-            tool_calls = [tc for tc in (tool_calls or []) if str((tc or {}).get("name") or "") not in unknown]
+        # Segment QA helpers accept a planner_callable for compatibility; wired to the unified planner entry point.
+        planner_callable = lambda msgs, tools, temp, tid: produce_tool_plan(
+            msgs,
+            (body.get("tools") if isinstance(body, dict) else None),
+            float(temp or DEFAULT_TEMPERATURE),
+            trace_id=str(tid or trace_id),
+            mode=effective_mode,
+        )
+        pipeline_ok: bool = not abort_pipeline
 
-        _cat_hash = _compute_tools_hash(body, planner_visible_only=False)
-
-        base_url = (PUBLIC_BASE_URL or "").rstrip("/") or (str(request.base_url) or "").rstrip("/")
-        executor_endpoint = EXECUTOR_BASE_URL or "http://127.0.0.1:8081"
-        exec_temperature = (body.get("temperature") or DEFAULT_TEMPERATURE)
-        planner_callable = lambda msgs, tools, temp, tid: planner_produce_plan(msgs, body.get("tools"), temp, tid, mode=effective_mode)
-
-        validation_failures: List[Dict[str, Any]] = []
-        tool_results: List[Dict[str, Any]] = []
-        tool_exec_meta: List[Dict[str, Any]] = []
-        # Pipeline success flag: flipped to False when any critical front-door tool fails,
-        # when the planner produced no tool calls for a media/film request, or when the
-        # planner/committee env itself reports a failure.
-        pipeline_ok: bool = not planner_hard_error
-        _ledger_shard = None
-        _ledger_root = os.path.join(UPLOAD_DIR, "artifacts", "runs", trace_id)
-        _ledger_name = "ledger"
-
-        if tool_calls:
+        if (not abort_pipeline) and tool_calls:
             _steps_preview0 = []
             for t in (tool_calls or [])[:5]:
                 name_preview = (t.get("name") or "").strip()
@@ -8724,51 +7729,6 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             if _steps_preview0:
                 _log("exec.payload", trace_id=trace_id, steps=_steps_preview0)
 
-            normalized_tool_calls: List[Dict[str, Any]] = []
-            for tc in tool_calls:
-                args_field = tc.get("arguments")
-                if not isinstance(args_field, dict):
-                    tool_name = str((tc.get("name") or "")).strip()
-                    err_env = {
-                        "schema_version": 1,
-                        "request_id": uuid.uuid4().hex,
-                        "ok": False,
-                        "error": {
-                            "code": "arguments_not_object",
-                            "message": "Tool arguments must be an object",
-                            "details": {"received_type": type(args_field).__name__},
-                            "status": 0,
-                        },
-                    }
-                    validation_failures.append(
-                        {"name": tool_name, "arguments": {}, "status": 0, "envelope": err_env}
-                    )
-                    _log(
-                        "validate.precheck.fail",
-                        trace_id=trace_id,
-                        tool=tool_name,
-                        reason="arguments_not_object",
-                        received_type=type(args_field).__name__,
-                    )
-                    _tel_append(
-                        STATE_DIR,
-                        trace_id,
-                        {
-                            "name": tool_name,
-                            "ok": False,
-                            "label": "failure",
-                            "raw": {
-                                "ts": None,
-                                "ok": False,
-                                "args": {},
-                                "error": err_env["error"],
-                            },
-                        },
-                    )
-                    continue
-                normalized_tool_calls.append(tc)
-            tool_calls = normalized_tool_calls
-
             if tool_calls:
                 # Validator removed: execute tool calls directly and rely on executor behavior.
                 _log("validate.skip", trace_id=trace_id, reason="validator_removed", tool_count=len(tool_calls or []))
@@ -8776,33 +7736,16 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 "validate.completed",
                 trace_id=trace_id,
                 validated_count=len(tool_calls or []),
-                failure_count=len(validation_failures or []),
             )
             _log(
                 "flow.after_validate",
                 trace_id=trace_id,
                 tool_count=len(tool_calls or []),
-                failures_count=len(validation_failures or []),
             )
         else:
             _log("validate.skip", trace_id=trace_id, reason="no_tool_calls")
 
-        if validation_failures:
-            for vf in validation_failures:
-                env = vf.get("envelope") if isinstance(vf.get("envelope"), dict) else {}
-                args_snapshot = vf.get("arguments") if isinstance(vf.get("arguments"), dict) else {}
-                name_snapshot = str((vf.get("name") or "")).strip() or "tool"
-                error_snapshot = env.get("error") if isinstance(env, dict) else {}
-                tool_results.append(
-                    {
-                        "name": name_snapshot,
-                        "result": env,
-                        "error": error_snapshot,
-                        "args": args_snapshot,
-                    }
-                )
-
-        if tool_calls:
+        if (not abort_pipeline) and tool_calls:
             _log("tools.exec.start", trace_id=trace_id, count=len(tool_calls or []))
             _inject_execution_context(tool_calls, trace_id, effective_mode)
             for tc in tool_calls:
@@ -8815,7 +7758,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 # prompt/story-driven generation instead of referencing non-existent assets.
                 if tn == "film2.run":
                     args_film = ta if isinstance(ta, dict) else {}
-                    urls_all = assets_collect_urls(tool_results or [], _abs_url)
+                    urls_all = assets_collect_urls(tool_results or [], abs_url_fn)
                     img_urls = [u for u in (urls_all or []) if isinstance(u, str) and "/artifacts/image/" in u]
                     if img_urls:
                         args_film["images"] = img_urls
@@ -8831,13 +7774,51 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 # Execute tools via the external executor so all heavy/remote work
                 # happens in the executor container instead of the orchestrator.
                 exec_batch = [tc]
-                exec_res = await gateway_execute(exec_batch, trace_id, executor_endpoint)
+                exec_res = await gateway_execute(exec_batch, trace_id, executor_endpoint, request_id=str(request_id))
                 tr = exec_res[0] if isinstance(exec_res, list) and exec_res else {}
                 tname = str((tr or {}).get("name") or "tool")
                 res = (tr or {}).get("result") if isinstance((tr or {}).get("result"), dict) else {}
                 err_obj = (tr or {}).get("error")
                 if not err_obj and isinstance(res, dict):
                     err_obj = res.get("error")
+                # Required: persist tool execution metadata (teacher + ledger + db)
+                try:
+                    arts_val = res.get("artifacts") if isinstance(res, dict) else None
+                    ok_step = not isinstance(err_obj, (str, dict))
+                    tool_exec_meta.append(
+                        {
+                            "name": tname,
+                            "args": (ta if isinstance(ta, dict) else {}),
+                            "ok": bool(ok_step),
+                            "result": (res if isinstance(res, dict) else {}),
+                            "error": (err_obj if isinstance(err_obj, (dict, str)) else None),
+                            "artifacts": arts_val,
+                        }
+                    )
+                    if run_id is not None:
+                        await _db_insert_tool_call(
+                            run_id,
+                            tname,
+                            int(master_seed),
+                            (ta if isinstance(ta, dict) else {}),
+                            (res if isinstance(res, dict) else None),
+                            None,
+                        )
+                    if _ledger_shard is not None and _ledger_root is not None:
+                        row = {
+                            "t": int(time.time() * 1000),
+                            "trace_id": str(trace_id),
+                            "run_id": int(run_id) if isinstance(run_id, int) else None,
+                            "name": tname,
+                            "ok": bool(ok_step),
+                            "args": (ta if isinstance(ta, dict) else {}),
+                            "result": (res if isinstance(res, dict) else {}),
+                            "error": err_obj,
+                            "artifacts": arts_val,
+                        }
+                        _ledger_shard = _art_append_jsonl(_ledger_shard, row)
+                except Exception as ex:
+                    logging.warning("tool_exec_meta.persist.failed trace_id=%s tool=%s: %s", str(trace_id), str(tname), ex, exc_info=True)
                 if isinstance(err_obj, (str, dict)):
                     code = (err_obj.get("code") if isinstance(err_obj, dict) else str(err_obj))
                     status = (err_obj.get("status") if isinstance(err_obj, dict) else None)
@@ -9119,8 +8100,10 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 _meta = _res.get("meta") if isinstance(_res, dict) else {}
                 _pid = (_meta or {}).get("prompt_id")
                 if isinstance(_pid, str) and _pid:
-                    _log("[comfy] POST /prompt", trace_id=trace_id, prompt_id=_pid, client_id=trace_id)
-                    _log("comfy.submit", trace_id=trace_id, prompt_id=_pid, client_id=trace_id)
+                    _ids = _res.get("ids") if isinstance(_res.get("ids"), dict) else {}
+                    _comfy_client_id = _ids.get("client_id") if isinstance(_ids.get("client_id"), str) else None
+                    _log("[comfy] POST /prompt", trace_id=trace_id, prompt_id=_pid, client_id=_comfy_client_id)
+                    _log("comfy.submit", trace_id=trace_id, prompt_id=_pid, client_id=_comfy_client_id)
                     _log("[comfy] polling /history/" + _pid)
 
         # Post-run QA checkpoint (lightweight) — run once after all tool results are collected.
@@ -9183,18 +8166,46 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                         }
                     )
                 exec_results: List[Dict[str, Any]] = []
-                # Advisory-only: always execute the patch plan once, with any arg
-                # adjustments from validator when present. Execute tools directly
-                # via local front doors so downstream services are actually hit.
+                # Advisory-only: execute the patch plan once via the executor path.
                 exec_batch = patch_validated or patch_calls
                 if exec_batch:
-                    _log("tool.run.start", trace_id=trace_id, executor="local", count=len(exec_batch or []))
-                    for tc in exec_batch:
-                        tn = (tc.get("name") or "tool")
-                        ta = tc.get("arguments") if isinstance(tc.get("arguments"), dict) else {}
-                        _log("tool.run.before", trace_id=trace_id, tool=str(tn), args_keys=list((ta or {}).keys()))
-                        res_tc = await execute_tool_call(tc)
-                        exec_results.append(res_tc)
+                    _log("exec.payload", trace_id=trace_id, steps=[{"tool": (c.get("name") or "")} for c in exec_batch[:5]])
+                    exec_results = await gateway_execute(exec_batch, trace_id, executor_endpoint, request_id=str(request_id))
+                    # Persist patch exec results (teacher + ledger + db)
+                    try:
+                        results_list = exec_results if isinstance(exec_results, list) else []
+                        for i, call in enumerate(exec_batch or []):
+                            nm = str((call or {}).get("name") or "tool")
+                            args_obj = (call or {}).get("arguments") if isinstance((call or {}).get("arguments"), dict) else {}
+                            tr: Dict[str, Any] = {}
+                            if i < len(results_list) and isinstance(results_list[i], dict):
+                                tr = results_list[i]
+                            else:
+                                for cand in results_list:
+                                    if isinstance(cand, dict) and str(cand.get("name") or "") == nm:
+                                        tr = cand
+                                        break
+                            res_obj = tr.get("result") if isinstance(tr.get("result"), dict) else {}
+                            err_obj = tr.get("error")
+                            if not err_obj and isinstance(res_obj, dict):
+                                err_obj = res_obj.get("error")
+                            arts_val = res_obj.get("artifacts") if isinstance(res_obj, dict) else None
+                            ok_step = not isinstance(err_obj, (str, dict))
+                            tool_exec_meta.append({"name": nm, "args": args_obj, "ok": bool(ok_step), "result": res_obj, "error": err_obj, "artifacts": arts_val})
+                            if run_id is not None:
+                                await _db_insert_tool_call(
+                                    run_id,
+                                    nm,
+                                    int(master_seed),
+                                    (args_obj if isinstance(args_obj, dict) else {}),
+                                    (res_obj if isinstance(res_obj, dict) else None),
+                                    None,
+                                )
+                            if _ledger_shard is not None and _ledger_root is not None:
+                                row = {"t": int(time.time() * 1000), "trace_id": str(trace_id), "run_id": int(run_id) if isinstance(run_id, int) else None, "name": nm, "ok": bool(ok_step), "args": args_obj, "result": res_obj, "error": err_obj, "artifacts": arts_val}
+                                _ledger_shard = _art_append_jsonl(_ledger_shard, row)
+                    except Exception as ex:
+                        logging.warning("patch_exec_meta.persist.failed trace_id=%s: %s", str(trace_id), ex, exc_info=True)
                 patch_results = list(patch_failure_results) + list(exec_results or [])
                 tool_results = (tool_results or []) + patch_results
                 _log("committee.revision.executed", trace_id=trace_id, steps=len(patch_validated or []), failures=len(patch_failures or []))
@@ -9298,9 +8309,16 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 },
             }
         # Synthesize per-backend result views from the unified committee envelope for fallback logic.
+        committee_critiques: List[Dict[str, Any]] = []
         if isinstance(llm_env, dict):
             err = llm_env.get("error")
             res = llm_env.get("result") or {}
+            if isinstance(res, dict):
+                raw_crits = res.get("critiques")
+                if isinstance(raw_crits, list):
+                    for it in raw_crits:
+                        if isinstance(it, dict):
+                            committee_critiques.append(it)
             txt = res.get("text")
             # Prefer structured per-backend envelopes surfaced by the committee when available.
             qwen_env = res.get("qwen") if isinstance(res, dict) else None
@@ -9377,98 +8395,6 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 + "\nUse film_status to track progress, and jobs endpoints for live status."
             )
             # Do not modify model texts here; the final composer will only append status
-
-        # Build per-model "other answers" context for cross-critique
-        other_for_qwen = ""
-        other_for_glm = ""
-        other_for_deepseek = ""
-
-        if glm_text:
-            other_for_qwen += "GLM4-9B answer:\n" + str(glm_text) + "\n\n"
-        if deepseek_text:
-            other_for_qwen += "DeepSeek Coder answer:\n" + str(deepseek_text) + "\n"
-
-        if qwen_text:
-            other_for_glm += "Qwen answer:\n" + str(qwen_text) + "\n\n"
-        if deepseek_text:
-            other_for_glm += "DeepSeek Coder answer:\n" + str(deepseek_text) + "\n"
-
-        if qwen_text:
-            other_for_deepseek += "Qwen answer:\n" + str(qwen_text) + "\n\n"
-        if glm_text:
-            other_for_deepseek += "GLM4-9B answer:\n" + str(glm_text) + "\n"
-
-        qcrit_text = ""
-        gcrit_text = ""
-        dcrit_text = ""
-
-        # 4) Optional brief debate (cross-critique)
-        if ENABLE_DEBATE and MAX_DEBATE_TURNS > 0:
-            critique_prompt = (
-                "Critique the other model(s) answers. Identify mistakes, missing considerations, or improvements. "
-                "Return a concise bullet list."
-            )
-
-            qwen_critique_msg = exec_messages + [
-                {"role": "user", "content": critique_prompt + "\n\nOther answers:\n" + other_for_qwen}
-            ]
-            glm_critique_msg = exec_messages + [
-                {"role": "user", "content": critique_prompt + "\n\nOther answers:\n" + other_for_glm}
-            ]
-            deepseek_critique_msg = exec_messages + [
-                {"role": "user", "content": critique_prompt + "\n\nOther answers:\n" + other_for_deepseek}
-            ]
-
-            # Route cross-critique through the committee path as well.
-            try:
-                qcrit_env = await committee_ai_text(
-                    qwen_critique_msg,
-                    trace_id=str(trace_id or "code_crit_qwen"),
-                    temperature=body.get("temperature") or DEFAULT_TEMPERATURE,
-                )
-            except Exception as ex:
-                _log(
-                    "debate.qwen_committee.error",
-                    trace_id=trace_id,
-                    error=str(ex),
-                )
-                qcrit_env = {"ok": False, "error": {"code": "debate_qwen_exception", "message": str(ex)}}
-
-            try:
-                gcrit_env = await committee_ai_text(
-                    glm_critique_msg,
-                    trace_id=str(trace_id or "code_crit_glm"),
-                    temperature=body.get("temperature") or DEFAULT_TEMPERATURE,
-                )
-            except Exception as ex:
-                _log(
-                    "debate.glm_committee.error",
-                    trace_id=trace_id,
-                    error=str(ex),
-                )
-                gcrit_env = {"ok": False, "error": {"code": "debate_glm_exception", "message": str(ex)}}
-
-            try:
-                dcrit_env = await committee_ai_text(
-                    deepseek_critique_msg,
-                    trace_id=str(trace_id or "code_crit_deepseek"),
-                    temperature=body.get("temperature") or DEFAULT_TEMPERATURE,
-                )
-            except Exception as ex:
-                _log(
-                    "debate.deepseek_committee.error",
-                    trace_id=trace_id,
-                    error=str(ex),
-                )
-                dcrit_env = {"ok": False, "error": {"code": "debate_deepseek_exception", "message": str(ex)}}
-            qcrit_text = _env_text(qcrit_env)
-            gcrit_text = _env_text(gcrit_env)
-            dcrit_text = _env_text(dcrit_env)
-            exec_messages = exec_messages + [
-                {"role": "system", "content": "Cross-critique from Qwen:\n" + qcrit_text},
-                {"role": "system", "content": "Cross-critique from GLM4-9B:\n" + gcrit_text},
-                {"role": "system", "content": "Cross-critique from DeepSeek Coder:\n" + dcrit_text},
-            ]
 
         # 5) Final synthesis via CO (compose). Build CO frames, insert FINALITY + LIGHT QA + COMPOSE before RoE tail.
         _compose_instruction = (
@@ -9547,37 +8473,14 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             "Also describe any artifacts that did succeed so the user understands partial progress. "
             "If minor issues only: add Warnings: lines; keep the answer helpful. Append Applied RoE: with 1–3 short items actually followed."
         )}
-        committee_summary_parts: List[str] = []
-        committee_summary_parts.append("You are the committee synthesizer. Merge the following model answers and critiques into a single best answer.\n")
-        committee_summary_parts.append("### Candidate Answers\n")
-        if (qwen_text or "").strip():
-            committee_summary_parts.append("#### Qwen\n" + str(qwen_text).strip() + "\n")
-        if (glm_text or "").strip():
-            committee_summary_parts.append("#### GLM4-9B\n" + str(glm_text).strip() + "\n")
-        if (deepseek_text or "").strip():
-            committee_summary_parts.append("#### DeepSeek Coder\n" + str(deepseek_text).strip() + "\n")
-        if (ENABLE_DEBATE and MAX_DEBATE_TURNS > 0) and ((qcrit_text or "").strip() or (gcrit_text or "").strip() or (dcrit_text or "").strip()):
-            committee_summary_parts.append("\n### Critiques\n")
-            if (qcrit_text or "").strip():
-                committee_summary_parts.append("#### Qwen's critique\n" + str(qcrit_text).strip() + "\n")
-            if (gcrit_text or "").strip():
-                committee_summary_parts.append("#### GLM4-9B's critique\n" + str(gcrit_text).strip() + "\n")
-            if (dcrit_text or "").strip():
-                committee_summary_parts.append("#### DeepSeek Coder's critique\n" + str(dcrit_text).strip() + "\n")
-        committee_summary_parts.append(
-            "\n### Task\n"
-            "Synthesize one final answer that is as correct, specific, and useful as possible. "
-            "Fix any mistakes that were identified, and prefer answers that are logically consistent and tool-correct. "
-            "Do not mention the existence of multiple models or the committee; just answer."
-        )
-        committee_summary = "\n".join(committee_summary_parts)
-        committee_frame = {"role": "system", "content": committee_summary}
         if frames_final:
             _head = frames_final[:-1]
             _tail = frames_final[-1:]
-            final_request = _head + [_finality, _light_qa, _compose, committee_frame] + _tail
+            # NOTE: synthesis prompt construction is owned by committee_client.
+            # chat_completions must NOT build "candidate answers" / "critiques" prompts.
+            final_request = _head + [_finality, _light_qa, _compose] + _tail
         else:
-            final_request = [_finality, _light_qa, _compose, committee_frame, {"role": "user", "content": _compose_instruction}]
+            final_request = [_finality, _light_qa, _compose, {"role": "user", "content": _compose_instruction}]
 
         # Final synthesis also goes through the committee path.
         try:
@@ -9619,10 +8522,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         # Append discovered asset URLs from tool results so users see concrete outputs inline.
         # Do NOT synthesize or reuse artifacts from unrelated runs; only attach URLs that
         # actually come from the current tool_results set.
-        asset_urls = assets_collect_urls(tool_results, _abs_url)
-        if asset_urls:
-            assets_block = "\n".join(["Assets:"] + [f"- {u}" for u in asset_urls])
-            final_text = (final_text + "\n\n" + assets_block).strip()
+        # NOTE: asset URLs are appended centrally at the end (single source of truth).
 
         if body.get("stream"):
             # Precompute usage and planned stage events for trace
@@ -9653,7 +8553,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             provided_seed3 = int(body.get("seed")) if isinstance(body.get("seed"), (int, float)) else None
             master_seed = provided_seed3 if provided_seed3 is not None else _derive_seed("chat", msgs_for_seed)
             seed_router = det_seed_router(trace_id, master_seed)
-            # Mirror planner routing decision from planner_produce_plan for trace metadata.
+            # Mirror planner routing decision from the unified planner entry point (plan.committee.produce_tool_plan) for trace metadata.
             _use_qwen = str(PLANNER_MODEL or "qwen").lower().startswith("qwen")
             planner_id = QWEN_MODEL_ID if _use_qwen else GLM_MODEL_ID
             label_cfg = (WRAPPER_CONFIG.get("teacher") or {}).get("default_label")
@@ -9672,7 +8572,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 "privacy": {"vault_refs": 0, "secrets_in": 0, "secrets_out": 0},
                 "events": planned_events[:64],
             }
-            _as.create_task(_send_trace_stream_async(trace_payload_stream))
+            await _send_trace_stream_async(trace_payload_stream)
             checkpoints_append_event(STATE_DIR, trace_id, "halt", {"kind": "committee", "chars": len(final_text)})
             # Do not stream; proceed to build the full final response below
 
@@ -9700,19 +8600,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 merged_main.append("### GLM4-9B\n" + glm_text.strip())
             if merged_main:
                 cleaned = "\n\n".join(merged_main)
-        # Ensure asset URLs are appended even if we fell back to merged model answers.
-        # Only attach URLs that come directly from the current tool_results; do not
-        # reach into multimodal memory to avoid hallucinated or stale artifacts.
-        try:
-            asset_urls2 = _asset_urls_from_tools2(tool_results)
-            if asset_urls2:
-                cleaned = (cleaned + "\n\n" + "\n".join(["Assets:"] + [f"- {u}" for u in asset_urls2])).strip()
-        except Exception as ex:
-            _log(
-                "final.assets_from_tools.error",
-                trace_id=str(trace_id or ""),
-                error=str(ex),
-            )
+        # NOTE: asset URLs are appended centrally at the end (single source of truth).
         # If tools/plan/critique exist, wrap them into a hidden metadata block and present a concise final answer
         meta_sections: List[str] = []
         if plan_text:
@@ -9738,7 +8626,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                         res_field = tr.get("result")
                         if isinstance(res_field, str):
                             try:
-                                res_field = JSONParser().parse_superset(
+                                res_field = JSONParser().parse(
                                     res_field,
                                     {
                                         "film_id": str,
@@ -9746,9 +8634,9 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                                         "prompt_id": str,
                                         "created": [{"result": dict, "job_id": str, "prompt_id": str}],
                                     },
-                                )["coerced"]
+                                )
                             except Exception as ex:
-                                logging.warning("tool_results.parse_superset.failed: %s", ex, exc_info=True)
+                                logging.warning("tool_results.parse.failed: %s", ex, exc_info=True)
                                 res_field = {}
                         if not isinstance(res_field, dict):
                             res_field = {}
@@ -9830,32 +8718,32 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         if looks_empty or looks_refusal:
             # For now, log detection without overriding the composed content.
             logging.info("final.response.empty_or_refusal_detected; no automatic fallback applied")
-        # Build artifacts block from tool_results (prefer film2.run)
-        artifacts: Dict[str, Any] = {}
+        # Canonical artifacts payload: urls + items, plus optional film export summary.
+        artifacts_payload: Dict[str, Any] = {}
         try:
-            film_run = None
-            for tr in (tool_results or []):
-                if isinstance(tr, dict) and tr.get("name") == "film2.run" and isinstance(tr.get("result"), dict):
-                    film_run = tr.get("result")
-            if film_run:
-                master_uri = film_run.get("master_uri") or (film_run.get("master") or {}).get("uri")
-                master_hash = film_run.get("hash") or (film_run.get("master") or {}).get("hash")
-                eff = film_run.get("effective") or {}
-                res_eff = eff.get("res")
-                fps_eff = eff.get("refresh")
-                edl = film_run.get("edl") or {}
-                nodes = film_run.get("nodes") or {}
-                qc = film_run.get("qc_report") or {}
-                export_pkg = {"uri": film_run.get("package_uri"), "hash": film_run.get("hash")}
-                artifacts = {
-                    "master": {"uri": master_uri, "hash": master_hash, "res": res_eff, "fps": fps_eff},
-                    "edl": {"uri": edl.get("uri"), "hash": edl.get("hash")},
-                    "nodes": {"uri": nodes.get("uri"), "hash": nodes.get("hash")},
-                    "qc": {"uri": qc.get("uri"), "hash": qc.get("hash")},
-                    "export": export_pkg,
-                }
+            artifacts_out = _collect_artifacts_payload(tool_results or [], abs_url_fn)
         except Exception:
-            artifacts = {}
+            artifacts_out = {"urls": [], "items": []}
+        if isinstance(artifacts_out, dict):
+            artifacts_payload = dict(artifacts_out)
+        film_run = None
+        for tr in (tool_results or []):
+            if isinstance(tr, dict) and tr.get("name") == "film2.run" and isinstance(tr.get("result"), dict):
+                film_run = tr.get("result")
+                break
+        if isinstance(film_run, dict) and film_run:
+            master = film_run.get("master") if isinstance(film_run.get("master"), dict) else {}
+            eff = film_run.get("effective") if isinstance(film_run.get("effective"), dict) else {}
+            edl = film_run.get("edl") if isinstance(film_run.get("edl"), dict) else {}
+            qc = film_run.get("qc_report") if isinstance(film_run.get("qc_report"), dict) else {}
+            nodes = film_run.get("nodes") if isinstance(film_run.get("nodes"), dict) else {}
+            artifacts_payload["film"] = {
+                "master": {"uri": (film_run.get("master_uri") or master.get("uri")), "hash": (film_run.get("hash") or master.get("hash")), "res": eff.get("res"), "fps": eff.get("refresh")},
+                "edl": {"uri": edl.get("uri"), "hash": edl.get("hash")},
+                "nodes": {"uri": nodes.get("uri"), "hash": nodes.get("hash")},
+                "qc": {"uri": qc.get("uri"), "hash": qc.get("hash")},
+                "export": {"uri": film_run.get("package_uri"), "hash": film_run.get("hash")},
+            }
 
         # Build canonical envelope (merged from steps) to attach to response for internal use
         try:
@@ -9877,26 +8765,20 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 step_texts.append(display_content)
             step_envs = [normalize_to_envelope(t) for t in step_texts]
             final_env = stitch_merge_envelopes(step_envs)
-            # Merge tool_calls and artifacts deterministically from tool_exec_meta
+            # Merge tool_calls deterministically from tool_exec_meta
             tc_merged: List[Dict[str, Any]] = []
-            arts: List[Dict[str, Any]] = []
-            seen_art_ids = set()
             for meta in (tool_exec_meta or []):
                 name = meta.get("name")
                 args = meta.get("args") if isinstance(meta.get("args"), dict) else {}
                 tc_merged.append({"tool": name, "args": args, "status": "done", "result_ref": None})
-                a = meta.get("artifacts") or {}
-                if isinstance(a, dict):
-                    for k, v in a.items():
-                        if isinstance(v, dict):
-                            aid = v.get("hash") or v.get("uri") or f"{name}:{k}"
-                            if aid in seen_art_ids:
-                                continue
-                            seen_art_ids.add(aid)
-                            arts.append({"id": aid, "kind": k, "summary": name or k, **{kk: vv for kk, vv in v.items() if kk in ("uri", "hash")}})
             if isinstance(final_env, dict):
                 final_env["tool_calls"] = tc_merged
-                final_env["artifacts"] = arts
+                final_env.setdefault("meta", {})
+                if isinstance(final_env.get("meta"), dict) and isinstance(artifacts_out, dict):
+                    final_env["meta"]["asset_urls"] = artifacts_out.get("urls") if isinstance(artifacts_out.get("urls"), list) else []
+                final_env.setdefault("artifacts", [])
+                if isinstance(final_env.get("artifacts"), list) and isinstance(artifacts_out, dict) and isinstance(artifacts_out.get("items"), list):
+                    final_env["artifacts"].extend(artifacts_out.get("items"))
         except Exception as ex:
             # Do not let final envelope stitching fail silently; log and fall back
             # to an empty envelope so the main /v1/chat/completions response still
@@ -9908,18 +8790,19 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         # whether the critical tool pipeline (image/music/tts/film) completed
         # without hard failures, even though the assistant still returns a useful
         # explanation and any partial artifacts.
-        response = compose_openai_response(
-            display_content,
-            usage_with_wall,
-            COMMITTEE_MODEL_ID,
-            master_seed,
-            "orc-1",
-            envelope_builder=_build_openai_envelope,
-            prebuilt=(response_prebuilt if 'response_prebuilt' in locals() else None),
-            artifacts=(artifacts if isinstance(artifacts, dict) else None),
-            final_env=None,  # will be attached below after bump/assert/stamp
-            ok=pipeline_ok,
-        )
+        if response is None:
+            response = compose_openai_response(
+                display_content,
+                usage_with_wall,
+                COMMITTEE_MODEL_ID,
+                master_seed,
+                "orc-1",
+                envelope_builder=_build_openai_envelope,
+                prebuilt=(response_prebuilt if 'response_prebuilt' in locals() else None),
+                artifacts=(artifacts_payload if isinstance(artifacts_payload, dict) else None),
+                final_env=None,  # will be attached below after bump/assert/stamp
+                ok=pipeline_ok,
+            )
         # Attach trace/cid metadata for clients that need stable ids on responses.
         response_meta = response.setdefault("_meta", {})
         if isinstance(response_meta, dict):
@@ -9981,7 +8864,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         label_cfg = (WRAPPER_CONFIG.get("teacher") or {}).get("default_label")
         # Normalize tool_calls shape for teacher (use args, not arguments)
         _tc2 = tool_exec_meta or []
-        # Mirror planner routing decision from planner_produce_plan for trace metadata.
+        # Mirror planner routing decision from the unified planner entry point (plan.committee.produce_tool_plan) for trace metadata.
         _use_qwen2 = str(PLANNER_MODEL or "qwen").lower().startswith("qwen")
         planner_id = QWEN_MODEL_ID if _use_qwen2 else GLM_MODEL_ID
         # Prefer the last assistant message from the final envelope's result.messages
@@ -10016,18 +8899,82 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             "env": {"public_base_url": PUBLIC_BASE_URL, "config_hash": WRAPPER_CONFIG_HASH},
             "privacy": {"vault_refs": 0, "secrets_in": 0, "secrets_out": 0},
         }
-        # Unified local trace only; no background network calls
-        emit_trace(STATE_DIR, trace_id, "chat.finish", {"ok": bool(response.get("ok")), "message_len": len(display_content or ""), "usage": usage or {}})
-        # Persist response & metrics
-        await _db_update_run_response(run_id, response, usage)
-        checkpoints_append_event(STATE_DIR, trace_id, "halt", {"kind": "committee", "chars": len(display_content)})
-        if _lock_token:
-            trace_release_lock(STATE_DIR, trace_id)
-        _trace_response(trace_id, response)
-        return _json_response(response)
+        await _send_trace_stream_async(trace_payload)
+
+        # response prepared; single return happens after the try/except.
     except Exception as ex:
         logging.error("chat.finish: %s", ex, exc_info=True)
-        return JSONResponse(status_code=500, content={"error": str(ex)})
+        response = _build_openai_envelope(
+            ok=False,
+            text="Internal error.",
+            error={"code": "internal_error", "message": str(ex)},
+            usage=usage,
+            model=COMMITTEE_MODEL_ID,
+            seed=0,
+            id_="orc-1",
+        )
+
+    if response is None:
+        response = _build_openai_envelope(
+            ok=False,
+            text="Internal error.",
+            error={"code": "internal_error", "message": "no response produced"},
+            usage=usage,
+            model=COMMITTEE_MODEL_ID,
+            seed=0,
+            id_="orc-1",
+        )
+
+    # Always attach assets/artifacts/ids to the outward response (even on abort paths).
+    try:
+        artifacts_out = _collect_artifacts_payload(tool_results or [], abs_url_fn)
+    except Exception:
+        artifacts_out = {"urls": [], "items": []}
+    try:
+        response_meta = response.setdefault("_meta", {})
+        if isinstance(response_meta, dict):
+            response_meta.setdefault("trace_id", str(trace_id))
+            if 'conv_cid' in locals() and isinstance(locals().get("conv_cid"), (str, int)):
+                response_meta.setdefault("cid", str(locals().get("conv_cid")))
+            if isinstance(artifacts_out, dict):
+                urls_out = artifacts_out.get("urls") if isinstance(artifacts_out.get("urls"), list) else []
+                response_meta.setdefault("assets", urls_out)
+        response_art = response.setdefault("artifacts", {})
+        if isinstance(response_art, dict) and isinstance(artifacts_out, dict):
+            urls_out = artifacts_out.get("urls") if isinstance(artifacts_out.get("urls"), list) else []
+            items_out = artifacts_out.get("items") if isinstance(artifacts_out.get("items"), list) else []
+            response_art.setdefault("assets", urls_out)
+            response_art.setdefault("items", items_out)
+    except Exception:
+        pass
+
+    # Always append assets URLs to the visible assistant content (avoid double-appends).
+    try:
+        urls_out = artifacts_out.get("urls") if isinstance(artifacts_out, dict) else []
+        if isinstance(urls_out, list) and urls_out:
+            msg0 = (((response.get("choices") or [{}])[0].get("message") or {}).get("content") or "")
+            if isinstance(msg0, str) and "Assets:" not in msg0:
+                msg0 = (msg0 + "\n\nAssets:\n" + "\n".join([f"- {u}" for u in urls_out])).strip()
+                try:
+                    response["choices"][0]["message"]["content"] = msg0
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    # Unified local trace only; no background network calls
+    try:
+        display_content = display_content or (((response.get("choices") or [{}])[0].get("message") or {}).get("content") or "")
+    except Exception:
+        display_content = display_content or ""
+    emit_trace(STATE_DIR, trace_id, "chat.finish", {"ok": bool(response.get("ok")), "message_len": len(display_content or ""), "usage": usage or {}})
+    if run_id is not None:
+        await _db_update_run_response(run_id, response, usage)
+        checkpoints_append_event(STATE_DIR, trace_id, "halt", {"kind": "committee", "chars": len(display_content)})
+    if _lock_token:
+        trace_release_lock(STATE_DIR, trace_id)
+    _trace_response(trace_id, response)
+    return _json_response(response)
 
 
 @app.get("/healthz")
@@ -10182,11 +9129,12 @@ async def http_tool_run(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     async with _hx.AsyncClient(trust_env=False, timeout=None) as client:
         # Best-effort propagation of a stable trace identifier to /tool.run so
         # inner tool execution and envelopes can correlate with the outer
-        # orchestrator trace. Prefer explicit trace_id, then tid, then cid from
-        # the arguments when present.
+        # orchestrator trace. Prefer explicit trace_id, then tid from the
+        # arguments when present. (cid is a different identifier and must not be
+        # used as a trace id fallback.)
         payload: Dict[str, Any] = {"name": name, "args": args}
         if isinstance(args, dict):
-            _trace_val = args.get("trace_id") or args.get("tid") or args.get("cid")
+            _trace_val = args.get("trace_id") or args.get("tid")
             if isinstance(_trace_val, (str, int)) and str(_trace_val).strip():
                 payload["trace_id"] = str(_trace_val).strip()
         r = await client.post(base + "/tool.run", json=payload)
@@ -10204,7 +9152,7 @@ async def http_tool_run(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
             "cid": str,
             "trace_id": str,
         }
-        env = parser.parse_superset(raw_body or "{}", env_schema)["coerced"]
+        env = parser.parse(raw_body or "{}", env_schema)
         # Canonical consumer: interpret ok/error from envelope; propagate full error object.
         if isinstance(env, dict) and env.get("ok") and isinstance(env.get("result"), dict):
             return {"name": name, "result": env["result"]}
@@ -10247,7 +9195,7 @@ async def tools_append(body: Dict[str, Any], request: Request):
     try:
         _append_jsonl(os.path.join(STATE_DIR, "tools", "tools.jsonl"), row)
         # Distillation trace routing (no stack traces)
-        trace_id = row.get("trace_id") or row.get("cid")
+        trace_id = row.get("trace_id")
         if trace_id:
             if row.get("event") == "exec_step_start":
                 checkpoints_append_event(STATE_DIR, str(trace_id), "exec_step_start", {"tool": row.get("tool"), "step_id": row.get("step_id")})
@@ -10283,8 +9231,8 @@ async def tools_append(body: Dict[str, Any], request: Request):
                         checkpoints_append_event(STATE_DIR, str(trace_id), "artifact_summary", {"kind": "video", "count": int(s.get("videos_count"))})
                     if isinstance(s.get("wav_bytes"), int) and s.get("wav_bytes") > 0:
                         checkpoints_append_event(STATE_DIR, str(trace_id), "artifact_summary", {"kind": "audio", "bytes": int(s.get("wav_bytes"))})
-                except Exception:
-                    logging.info("artifact summary distillation failed:\n%s", traceback.format_exc())
+                except Exception as ex:
+                    logging.warning("artifact summary distillation failed: %s", ex, exc_info=True)
             # Forward review WS events to connected client if present
             try:
                 app = request.app
@@ -10293,257 +9241,13 @@ async def tools_append(body: Dict[str, Any], request: Request):
                 if ws and isinstance(row.get("event"), str) and (row["event"].startswith("review.") or row["event"] == "edit.plan"):
                     payload = {"type": row["event"], "trace_id": str(trace_id), "step_id": row.get("step_id"), "notes": row.get("notes")}
                     await ws.send_json(payload)
-            except Exception:
-                logging.info("websocket forward failed:\n%s", traceback.format_exc())
-    except Exception:
+            except Exception as ex:
+                logging.warning("websocket forward failed: %s", ex, exc_info=True)
+    except Exception as ex:
+        logging.error("trace.append failed trace_id=%s: %s", str(trace_id), ex, exc_info=True)
         return JSONResponse(status_code=400, content={"error": "append_failed"})
     return {"ok": True}
 
-
-
-# ---------- Tool Introspection (UTC support) ----------
-_TOOL_SCHEMAS: Dict[str, Dict[str, Any]] = {
-    "image.dispatch": {
-        "name": "image.dispatch",
-        "version": "1",
-        "kind": "image",
-        "schema": {
-            "type": "object",
-            "properties": {
-                "prompt": {"type": "string"},
-                "negative": {"type": "string"},
-                "width": {"type": "integer"},
-                "height": {"type": "integer"},
-                "steps": {"type": "integer"},
-                "cfg": {"type": "number"},
-                "seed": {"type": "integer"},
-                "mode": {"type": "string", "enum": ["gen", "edit", "upscale"]},
-                "size": {"type": "string"},
-                "assets": {"type": "object"},
-                "trace_id": {"type": "string"},
-            },
-            "required": ["prompt"],
-            "additionalProperties": True,
-        },
-        "notes": "Comfy pipeline; requires either size or width/height. Returns ids.image_id and meta.{data_url,view_url,orch_view_url}.",
-    },
-    "image.refine.segment": {
-        "name": "image.refine.segment",
-        "version": "1",
-        "kind": "image",
-        "schema": {
-            "type": "object",
-            "properties": {
-                "segment_id": {"type": "string"},
-                "cid": {"type": "string"},
-                "prompt": {"type": "string"},
-                "lock_bundle": {"type": "object"},
-                "quality_profile": {"type": "string"},
-                "refine_mode": {"type": "string"},
-                "seed": {"type": "integer"},
-                "source_image": {"type": "string"},
-            },
-            "required": ["segment_id"],
-            "additionalProperties": True,
-        },
-        "notes": "Segment-level image refinement entrypoint; reuses image.dispatch path with lock-aware settings.",
-    },
-    "api.request": {
-        "name": "api.request",
-        "version": "1",
-        "kind": "utility",
-        "schema": {
-            "type": "object",
-            "properties": {
-                "url": {"type": "string"},
-                "method": {"type": "string", "enum": ["GET","POST","PUT","PATCH","DELETE","HEAD","OPTIONS"]},
-                "headers": {"type": "object"},
-                "params": {"type": "object"},
-                "body": {"type": ["string","object","array","null"]},
-                "expect": {"type": "string", "enum": ["json","text","bytes"]},
-                "follow_redirects": {"type": "boolean"},
-                "max_bytes": {"type": "integer"},
-            },
-            "required": ["url","method"],
-            "additionalProperties": True,
-        },
-        "notes": "Generic HTTP request for public APIs and metadata discovery for repair. Disallows internal service hosts.",
-        "examples": [
-            {"args": {"url": "https://httpbin.org/get", "method": "GET", "params": {"foo": "bar"}}}
-        ],
-    },
-    "film2.run": {
-        "name": "film2.run",
-        "version": "1",
-        "kind": "video",
-        "schema": {
-            "type": "object",
-            "properties": {
-                "prompt": {"type": "string"},
-                "clips": {"type": "array", "items": {"type": "string"}},
-                "images": {"type": "array", "items": {"type": "string"}},
-                "interpolate": {"type": "boolean"},
-                "scale": {"type": ["integer", "number"]},
-                "cid": {"type": "string"},
-                "trace_id": {"type": "string"},
-            },
-            "required": [],
-            "additionalProperties": True,
-        },
-        "notes": (
-            "Unified Film-2 front door for Void. Planner MUST treat this as the final assembly step in a film pipeline. "
-            "Do NOT fabricate or hard-code clip/image URLs in args; the orchestrator automatically wires real image "
-            "artifacts from prior image.dispatch (and related) tool results into args.images at execution time. "
-            "If no images exist yet for this trace, film2.run will operate in prompt/story-driven mode only. "
-            "Returns ids.video_id and meta.view_url."
-        ),
-    },
-    "music.infinite.windowed": {
-        "name": "music.infinite.windowed",
-        "version": "1",
-        "kind": "audio",
-        "schema": {
-            "type": "object",
-            "properties": {
-                "prompt": {"type": "string"},
-                "length_s": {"type": ["integer", "number"]},
-                "bpm": {"type": ["integer", "number", "null"]},
-                "key": {"type": ["string", "null"]},
-                "seed": {"type": ["integer", "null"]},
-                "cid": {"type": "string"},
-                "trace_id": {"type": "string"},
-                "instrumental_only": {"type": "boolean"},
-            },
-            "required": ["prompt", "length_s"],
-            "additionalProperties": True,
-        },
-        "notes": "Windowed music composition front door. Returns meta with song_graph, windows, and final mixed track artifact.",
-    },
-    "tts.speak": {
-        "name": "tts.speak",
-        "version": "1",
-        "kind": "audio",
-        "schema": {
-            "type": "object",
-            "properties": {
-                "text": {"type": "string"},
-                "voice_id": {"type": "string"},
-                "seed": {"type": "integer"},
-                "rate": {"type": ["integer", "number", "string"]},
-                "pitch": {"type": ["integer", "number", "string"]},
-                "trace_id": {"type": "string"},
-            },
-            "required": ["text"],
-            "additionalProperties": True,
-        },
-        "notes": "XTTS-v2 passthrough. Returns ids.audio_id and meta.{data_url,url,mime,duration_s}.",
-    },
-    "audio.sfx.compose": {
-        "name": "audio.sfx.compose",
-        "version": "1",
-        "kind": "audio",
-        "schema": {
-            "type": "object",
-            "properties": {
-                "prompt": {"type": "string"},
-                "length_s": {"type": ["integer", "number"]},
-                "trace_id": {"type": "string"},
-            },
-            "required": ["prompt"],
-            "additionalProperties": True,
-        },
-        "notes": "SFX compose. Returns ids.audio_id and meta.{data_url,url,mime}.",
-    },
-}
-
-
-def _schema_type_ok(value: Any, spec: Any) -> bool:
-    if spec == {"type": "string"}:
-        return isinstance(value, str)
-    if spec == {"type": "integer"}:
-        return isinstance(value, int)
-    if spec == {"type": "boolean"}:
-        return isinstance(value, bool)
-    if spec == {"type": "object"}:
-        return isinstance(value, dict)
-    if spec == {"type": "array"}:
-        return isinstance(value, list)
-    if isinstance(spec, dict) and spec.get("type") in ("number",):
-        return isinstance(value, (int, float))
-    if isinstance(spec, dict) and isinstance(spec.get("type"), list):
-        # union
-        types = spec.get("type")
-        for t in types:
-            if t == "string" and isinstance(value, str): return True
-            if t == "integer" and isinstance(value, int): return True
-            if t == "number" and isinstance(value, (int, float)): return True
-            if t == "boolean" and isinstance(value, bool): return True
-            if t == "object" and isinstance(value, dict): return True
-            if t == "array" and isinstance(value, list): return True
-        return False
-    # default permissive
-    return True
-
-
-@app.get("/tool.list")
-async def tool_list():
-    rid = uuid.uuid4().hex
-    tools = [
-        {
-            "name": n,
-            "version": s.get("version"),
-            "kind": (
-                s.get("kind")
-                or (
-                    "video"
-                    if n.startswith("film2")
-                    else "image"
-                    if n.startswith("image.")
-                    else "audio"
-                    if n.startswith("audio.") or n.startswith("tts.")
-                    else "utility"
-                )
-            ),
-            "describe_url": f"/tool.describe?name={n}",
-        }
-        for n, s in _TOOL_SCHEMAS.items()
-    ]
-    return ToolEnvelope.success({"tools": tools}, request_id=rid)
-
-
-from fastapi import Response  # type: ignore
-
-@app.get("/tool.describe")
-async def tool_describe(name: str, response: Response):
-    rid = uuid.uuid4().hex
-    meta = _TOOL_SCHEMAS.get((name or "").strip())
-    if not meta:
-        return ToolEnvelope.failure(
-            "unknown_tool",
-            f"{name}",
-            status=404,
-            request_id=rid,
-            details={},
-        )
-    sch = meta["schema"]
-    compact = json.dumps(sch, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    shash = _hl.sha256(compact).hexdigest()
-    try:
-        response.headers["ETag"] = f'W/"{shash}"'
-    except Exception as ex:
-        logging.debug("failed to set ETag header on /tool.describe: %s", ex, exc_info=True)
-    return ToolEnvelope.success(
-        {
-            "name": meta["name"],
-            "version": meta.get("version"),
-            "kind": meta.get("kind"),
-            "schema": sch,
-            "schema_hash": shash,
-            "notes": meta.get("notes"),
-            "examples": meta.get("examples", []),
-        },
-        request_id=rid,
-    )
 
 
 @app.post("/jobs/start")
@@ -10579,7 +9283,7 @@ async def datasets_start(body: Dict[str, Any]):
         jid = body.get("id") or f"ds-{uuid.uuid4().hex}"
         j = _orcjob_create(jid=jid, tool="datasets.export", args=body or {})
         _orcjob_set_state(j.id, "running", phase="start", progress=0.0)
-        _as.create_task(_datasets_runner(j.id, body or {}))
+        await _datasets_runner(j.id, body or {})
         return {"id": j.id}
     except Exception as ex:
         return JSONResponse(status_code=400, content={"error": str(ex)})
@@ -10661,11 +9365,9 @@ async def film2_qa(body: Dict[str, Any]):
         # Best-effort integration of per-shot image QA from image.dispatch when present.
         # This does not replace the existing Film2 QA heuristics; it augments them with
         # face_lock and entity_lock_score from the lock-aware image pipeline.
-        try:
-            preset = LOCK_QUALITY_PRESETS.get("hero", LOCK_QUALITY_PRESETS["standard"])
-            face_min_lock = float(preset.get("face_min", T_FACE))
-        except Exception:
-            face_min_lock = T_FACE
+        preset = LOCK_QUALITY_PRESETS.get("hero", LOCK_QUALITY_PRESETS["standard"])
+        face_min_raw = preset.get("face_min", T_FACE) if isinstance(preset, dict) else T_FACE
+        face_min_lock = float(face_min_raw) if isinstance(face_min_raw, (int, float)) else T_FACE
         for shot in shots:
             sid = shot.get("id") or shot.get("shot_id")
             if not sid:
@@ -10755,7 +9457,7 @@ async def v1_state_project(job_id: str):
 async def v1_review_score(body: Dict[str, Any]):
     expected = {"kind": str, "path": str, "prompt": str}
     parser = JSONParser()
-    payload = parser.parse_superset(json.dumps(body or {}), expected)["coerced"]
+    payload = parser.parse(json.dumps(body or {}), expected)
     kind = (payload.get("kind") or "").strip().lower()
     path = payload.get("path") or ""
     prompt = (payload.get("prompt") or "").strip()
@@ -10782,7 +9484,7 @@ async def v1_review_score(body: Dict[str, Any]):
 @app.post("/v1/review/plan")
 async def v1_review_plan(body: Dict[str, Any]):
     parser = JSONParser()
-    payload = parser.parse_superset(json.dumps(body or {}), {"scores": dict})["coerced"]
+    payload = parser.parse(json.dumps(body or {}), {"scores": dict})
     plan = _build_delta_plan(payload.get("scores") or {})
     return {"ok": True, "plan": plan}
 
@@ -10790,7 +9492,7 @@ async def v1_review_plan(body: Dict[str, Any]):
 async def v1_review_loop(body: Dict[str, Any]):
     expected = {"artifacts": list, "prompt": str}
     parser = JSONParser()
-    payload = parser.parse_superset(json.dumps(body or {}), expected)["coerced"]
+    payload = parser.parse(json.dumps(body or {}), expected)
     arts = payload.get("artifacts") or []
     prompt = (payload.get("prompt") or "").strip()
     loop_idx = 0
@@ -10881,7 +9583,7 @@ async def v1_video_generate(body: Dict[str, Any]):
         )
     expected = {"prompt": str, "refs": dict, "locks": dict, "duration_s": int, "fps": int, "size": list, "seed": int, "icw": dict}
     parser = JSONParser()
-    payload = parser.parse_superset(json.dumps(body or {}), expected)["coerced"]
+    payload = parser.parse(json.dumps(body or {}), expected)
     prompt = (payload.get("prompt") or "").strip()
     if not prompt:
         return ToolEnvelope.failure(
@@ -10891,12 +9593,11 @@ async def v1_video_generate(body: Dict[str, Any]):
             request_id=rid,
         )
     w,h = 1920,1080
-    try:
-        sz = payload.get("size") or [1920,1080]
-        if isinstance(sz, list) and len(sz) == 2:
-            w,h = int(sz[0]), int(sz[1])
-    except Exception:
-        w,h = 1920,1080
+    sz = payload.get("size") or [1920, 1080]
+    if isinstance(sz, list) and len(sz) == 2:
+        a0, a1 = sz[0], sz[1]
+        if isinstance(a0, (int, float)) and isinstance(a1, (int, float)):
+            w, h = int(a0), int(a1)
     fps = int(payload.get("fps") or 60)
     seconds = int(payload.get("duration_s") or 8)
     seed = payload.get("seed")
@@ -10933,7 +9634,7 @@ async def v1_video_edit(body: Dict[str, Any]):
         )
     expected = {"image_url": str, "instruction": str, "locks": dict, "fps": int, "size": list, "seconds": int, "seed": int}
     parser = JSONParser()
-    payload = parser.parse_superset(json.dumps(body or {}), expected)["coerced"]
+    payload = parser.parse(json.dumps(body or {}), expected)
     init_image = payload.get("image_url")
     if not init_image:
         return ToolEnvelope.failure(
@@ -10951,12 +9652,11 @@ async def v1_video_edit(body: Dict[str, Any]):
             request_id=rid,
         )
     w,h = 1024,1024
-    try:
-        sz = payload.get("size") or [1024,1024]
-        if isinstance(sz, list) and len(sz) == 2:
-            w,h = int(sz[0]), int(sz[1])
-    except Exception:
-        w,h = 1024,1024
+    sz = payload.get("size") or [1024, 1024]
+    if isinstance(sz, list) and len(sz) == 2:
+        a0, a1 = sz[0], sz[1]
+        if isinstance(a0, (int, float)) and isinstance(a1, (int, float)):
+            w, h = int(a0), int(a1)
     fps = int(payload.get("fps") or 60)
     seconds = int(payload.get("seconds") or 5)
     seed = payload.get("seed")
@@ -10982,7 +9682,7 @@ async def v1_audio_lyrics_to_song(body: Dict[str, Any]):
     rid = uuid.uuid4().hex
     expected = {"lyrics": str, "style_prompt": str, "ref_audio_ids": list, "lock_ids": list, "duration_s": int, "seed": int, "bpm": int, "key": str}
     parser = JSONParser()
-    payload = parser.parse_superset(json.dumps(body or {}), expected)["coerced"]
+    payload = parser.parse(json.dumps(body or {}), expected)
     lyrics = (payload.get("lyrics") or "").strip()
     style = (payload.get("style_prompt") or "").strip()
     duration_s = int(payload.get("duration_s") or 30)
@@ -11010,7 +9710,7 @@ async def v1_audio_edit(body: Dict[str, Any]):
     rid = uuid.uuid4().hex
     expected = {"audio_url": str, "ops": list}
     parser = JSONParser()
-    payload = parser.parse_superset(json.dumps(body or {}), expected)["coerced"]
+    payload = parser.parse(json.dumps(body or {}), expected)
     audio_url = payload.get("audio_url")
     ops = payload.get("ops") or []
     if not audio_url:
@@ -11037,7 +9737,7 @@ async def v1_audio_tts_sing(body: Dict[str, Any]):
     rid = uuid.uuid4().hex
     expected = {"script": list, "style_lock_id": str, "structure": dict}
     parser = JSONParser()
-    payload = parser.parse_superset(json.dumps(body or {}), expected)["coerced"]
+    payload = parser.parse(json.dumps(body or {}), expected)
     script = payload.get("script") or []
     if not isinstance(script, list) or not script:
         return ToolEnvelope.failure(
@@ -11072,7 +9772,7 @@ async def v1_audio_score_video(body: Dict[str, Any]):
     rid = uuid.uuid4().hex
     expected = {"video_url": str, "markers": list, "style_prompt": str, "voice_lock_id": str, "accept_edits": bool}
     parser = JSONParser()
-    payload = parser.parse_superset(json.dumps(body or {}), expected)["coerced"]
+    payload = parser.parse(json.dumps(body or {}), expected)
     video_url = payload.get("video_url")
     markers = payload.get("markers") or []
     style_prompt = payload.get("style_prompt") or ""
@@ -11091,12 +9791,19 @@ async def v1_audio_score_video(body: Dict[str, Any]):
             request_id=rid,
         )
     seconds = 30
-    try:
-        if isinstance(markers, list) and markers:
-            mx = max(float((m or {}).get("t") or 0.0) for m in markers)
+    if isinstance(markers, list) and markers:
+        ts: List[float] = []
+        for m in markers:
+            if not isinstance(m, dict):
+                continue
+            t = m.get("t")
+            if isinstance(t, (int, float)):
+                ts.append(float(t))
+            elif isinstance(t, str) and _re.match(r"^-?\d+(\.\d+)?$", t.strip()):
+                ts.append(float(t.strip()))
+        if ts:
+            mx = max(ts)
             seconds = max(8, int(mx) + 2)
-    except Exception:
-        seconds = 30
     text = (style_prompt or "").strip() or "video score"
     res = await execute_tool_call({"name": "music.timed.sao", "arguments": {"text": text, "seconds": seconds}})
     return ToolEnvelope.success(
@@ -11109,7 +9816,7 @@ async def v1_locks_create(body: Dict[str, Any]):
     rid = uuid.uuid4().hex
     expected = {"type": str, "refs": list, "tags": list}
     parser = JSONParser()
-    payload = parser.parse_superset(json.dumps(body or {}), expected)["coerced"]
+    payload = parser.parse(json.dumps(body or {}), expected)
     lk_type = (payload.get("type") or "").strip().lower()
     refs = payload.get("refs") or []
     tags = payload.get("tags") or []
@@ -11131,32 +9838,12 @@ async def v1_locks_create(body: Dict[str, Any]):
     saved = _refs_save({"kind": lk_type, "title": title, "files": files, "tags": tags, "compute_embeds": True})
     return ToolEnvelope.success({"lock": saved}, request_id=rid)
 
-# ---- Audio endpoints (local-first; JSON-only) ----
-@app.post("/v1/audio/lyrics-to-song")
-async def v1_audio_lyrics_to_song(body: Dict[str, Any]):
-    expected = {"lyrics": str, "style_prompt": str, "ref_audio_ids": list, "lock_ids": list, "duration_s": int, "seed": int, "bpm": int, "key": str}
-    parser = JSONParser()
-    payload = parser.parse_superset(json.dumps(body or {}), expected)["coerced"]
-    lyrics = (payload.get("lyrics") or "").strip()
-    style = (payload.get("style_prompt") or "").strip()
-    duration_s = int(payload.get("duration_s") or 30)
-    bpm = payload.get("bpm")
-    key = payload.get("key")
-    seed = payload.get("seed")
-    if not lyrics:
-        return JSONResponse(status_code=400, content={"error": "missing lyrics"})
-    # Always route lyrics-to-song via music.infinite.windowed now that music.song.* is removed.
-    prompt = ((style + ": ") if style else "") + lyrics
-    call = {"name": "music.infinite.windowed", "arguments": {"prompt": prompt, "length_s": duration_s, "bpm": bpm, "seed": seed}}
-    res = await execute_tool_call(call)
-    return {"ok": True, "result": res}
-
 @app.post("/v1/tts")
 async def v1_tts(body: Dict[str, Any]):
     rid = uuid.uuid4().hex
     expected = {"text": str, "voice_ref_url": str, "voice_id": str, "lang": str, "prosody": dict, "seed": int}
     parser = JSONParser()
-    payload = parser.parse_superset(json.dumps(body or {}), expected)["coerced"]
+    payload = parser.parse(json.dumps(body or {}), expected)
     text = (payload.get("text") or "").strip()
     if not text:
         return ToolEnvelope.failure(
@@ -11174,7 +9861,7 @@ async def v1_audio_sfx(body: Dict[str, Any]):
     rid = uuid.uuid4().hex
     expected = {"type": str, "length_s": float, "pitch": float, "seed": int}
     parser = JSONParser()
-    payload = parser.parse_superset(json.dumps(body or {}), expected)["coerced"]
+    payload = parser.parse(json.dumps(body or {}), expected)
     args = {"type": payload.get("type"), "length_s": payload.get("length_s"), "pitch": payload.get("pitch"), "seed": payload.get("seed")}
     manifest = {"items": []}
     env = run_sfx_compose(args, manifest)
@@ -11364,7 +10051,7 @@ async def completions_legacy(body: Dict[str, Any]):
         }
         return JSONResponse(content=out)
     parser = JSONParser()
-    obj = parser.parse_superset(rr.text or "", {"choices": [{"message": {"content": str}}], "usage": dict, "created": int, "system_fingerprint": str, "model": str, "id": str})["coerced"]
+    obj = parser.parse(rr.text or "", {"choices": [{"message": {"content": str}}], "usage": dict, "created": int, "system_fingerprint": str, "model": str, "id": str})
     content_txt = (((obj.get("choices") or [{}])[0].get("message") or {}).get("content") or obj.get("text") or "")
     out = {
         "id": obj.get("id") or "orc-1",
@@ -11404,49 +10091,50 @@ async def ws_tool(websocket: WebSocket):
     try:
         while True:
             raw = await websocket.receive_text()
-            req = JSONParser().parse_superset(raw, {"name": str, "arguments": dict})["coerced"]
+            # IMPORTANT: do not schema-coerce tool.ws requests into a narrow
+            # shape, or we will drop client-provided fields (including tool
+            # arguments when they arrive as non-dict).
+            # Correct approach: use the robust superset parser (repairs + heuristics)
+            # with a schema that includes all expected fields, while keeping
+            # args/arguments as passthrough (`object`) so we never coerce/drop them.
+            parser_ws = JSONParser()
+            schema_toolws_req = {
+                "name": str,
+                "args": object,
+                "arguments": object,
+                "request_id": str,
+                "trace_id": str,
+                "cid": str,
+                "tool_call_id": str,
+                "meta": dict,
+            }
+            req = (parser_ws.parse(raw, schema_toolws_req) or {})
+            if not isinstance(req, dict):
+                req = {}
             name = (req.get("name") or "").strip()
-            args = req.get("arguments") or {}
+            raw_args = req.get("arguments", req.get("args"))
+            if isinstance(raw_args, dict):
+                args = dict(raw_args)
+            elif isinstance(raw_args, str):
+                parsed = parser_ws.parse(raw_args, {})
+                args = dict(parsed) if isinstance(parsed, dict) else {"_raw": raw_args}
+            elif raw_args is None:
+                args = {}
+            else:
+                args = {"_raw": raw_args}
+            trace_id_in = req.get("trace_id")
+            trace_id_ws = str(trace_id_in).strip() if isinstance(trace_id_in, (str, int)) and str(trace_id_in).strip() else None
             if not name:
                 await websocket.send_text(json.dumps({"error": "missing tool name"}))
                 continue
             try:
-                # Keepalive while long tools run and stream start/result/done frames
-                ka_task = _as.create_task(_tool_ws_keepalive(websocket))
+                # Synchronous tool runner (no background tasks): emit start/result/done only.
                 await websocket.send_text(json.dumps({"event": "start", "name": name}))
-                # Progress queue wiring
-                q: _as.Queue = _as.Queue()
-                set_progress_queue(q)
-                exec_task = _as.create_task(execute_tool_call({"name": name, "arguments": args}))
-                while True:
-                    sent = False
-                    while not q.empty():
-                        ev = await q.get()
-                        await websocket.send_text(
-                            json.dumps(
-                                {"event": "progress", **(ev if isinstance(ev, dict) else {"msg": str(ev)})}
-                            )
-                        )
-                        sent = True
-                    if exec_task.done():
-                        res = await exec_task
-                        break
-                    if not sent:
-                        await _as.sleep(0.25)
-                try:
-                    ka_task.cancel()
-                except Exception as _e_cancel:
-                    _append_jsonl(
-                        os.path.join(STATE_DIR, "ws", "errors.jsonl"),
-                        {
-                            "t": int(time.time() * 1000),
-                            "route": "/tool.ws",
-                            "error": str(_e_cancel),
-                            "where": "cancel_keepalive",
-                        },
-                    )
+                call = {"name": name, "arguments": args}
+                if trace_id_ws:
+                    call["trace_id"] = trace_id_ws
+                res = await execute_tool_call(call)
                 await websocket.send_text(json.dumps({"event": "result", "ok": True, "result": res}))
-                set_progress_queue(None)
                 await websocket.send_text(json.dumps({"done": True}))
                 try:
                     await websocket.close(code=1000)
@@ -11579,7 +10267,7 @@ async def _comfy_submit_workflow(workflow: Dict[str, Any]) -> Dict[str, Any]:
                         r = await client.post(base.rstrip("/") + "/prompt", json=payload)
                     try:
                         parser = JSONParser()
-                        res = parser.parse_superset(r.text or "", {"prompt_id": str, "uuid": str, "id": str})["coerced"]
+                        res = parser.parse(r.text or "", {"prompt_id": str, "uuid": str, "id": str})
                         pid = res.get("prompt_id") or res.get("uuid") or res.get("id") if isinstance(res, dict) else None
                         if isinstance(pid, str):
                             _job_endpoint[pid] = base
@@ -11589,14 +10277,15 @@ async def _comfy_submit_workflow(workflow: Dict[str, Any]) -> Dict[str, Any]:
                                 # Drain until executed message for our pid
                                 while True:
                                     msg = await ws.recv()
-                                    jd = JSONParser().parse_superset(msg, {"type": str, "data": dict})["coerced"] if isinstance(msg, (str, bytes)) else {}
+                                    jd = JSONParser().parse(msg, {"type": str, "data": dict}) if isinstance(msg, (str, bytes)) else {}
                                     if isinstance(jd, dict) and jd.get("type") == "executed":
                                         d = jd.get("data") or {}
                                         if d.get("prompt_id") == pid:
                                             break
                             return res if isinstance(res, dict) else {}
-                    except Exception:
+                    except Exception as ex:
                         last_err = r.text
+                        logging.warning("comfy.wait_for_executed.error base=%s prompt_id=%s: %s", str(base), str(pid), ex, exc_info=True)
             except Exception as ex:
                 last_err = str(ex)
             finally:
@@ -11617,7 +10306,7 @@ async def _comfy_history(prompt_id: str) -> Dict[str, Any]:
     async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
         r = await client.get(base.rstrip("/") + f"/history/{prompt_id}")
         parser = JSONParser()
-        js = parser.parse_superset(r.text or "", {})["coerced"]
+        js = parser.parse(r.text or "", {})
         if 200 <= r.status_code < 300:
             return js if isinstance(js, dict) else {}
         return {"error": r.text}
@@ -11644,7 +10333,7 @@ async def get_film_preferences(film_id: str) -> Dict[str, Any]:
     if isinstance(meta, str):
         # Expect a preferences dict; coerce into mapping with open schema.
         parser = JSONParser()
-        parsed = parser.parse_superset(meta, {"preferences": dict})["coerced"]
+        parsed = parser.parse(meta, {"preferences": dict})
         return parsed if isinstance(parsed, dict) else {}
     return {}
 
@@ -11693,33 +10382,31 @@ def _parse_duration_seconds_dynamic(value: Any, default_seconds: float = 10.0) -
 
 
 def _parse_fps_dynamic(value: Any, default_fps: int = 60) -> int:
-    try:
-        if value is None:
-            return default_fps
-        if isinstance(value, (int, float)):
-            return max(1, min(240, int(round(float(value)))))
-        s = str(value).strip().lower()
-        m = _re.match(r"^(\d{1,3})\s*fps$", s)
-        if m:
-            return max(1, min(240, int(m.group(1))))
-        return max(1, min(240, int(round(float(s)))))
-    except Exception:
+    if value is None:
         return default_fps
+    if isinstance(value, (int, float)):
+        return max(1, min(240, int(round(float(value)))))
+    s = str(value).strip().lower()
+    if not s:
+        return default_fps
+    m = _re.match(r"^(\d{1,3})\s*fps$", s)
+    if m:
+        return max(1, min(240, int(m.group(1))))
+    if _re.match(r"^-?\d+(\.\d+)?$", s):
+        return max(1, min(240, int(round(float(s)))))
+    return default_fps
 
 
 def build_default_scene_workflow(prompt: str, characters: List[Dict[str, Any]], style: Optional[str] = None, *, width: int = 1024, height: int = 1024, steps: int = 25, seed: int = 0, filename_prefix: str = "scene") -> Dict[str, Any]:
     # Minimal SDXL image generation graph using CheckpointLoaderSimple (MODEL, CLIP, VAE)
+    if not isinstance(characters, list):
+        characters = []
     positive = prompt
     # Inject lightweight story context into the prompt to reduce drift
-    try:
-        # Fetch film synopsis and primary character names if available
-        # This function is used within film_add_scene where film_id context exists; callers pass characters list
-        if characters:
-            names = [c.get("name") for c in characters if isinstance(c, dict) and isinstance(c.get("name"), str)]
-            if names:
-                positive = f"{positive}. Characters: " + ", ".join([n for n in names[:3] if n])
-    except Exception as ex:
-        logging.debug("workflow.scene.context.inject.error: %s", str(ex), exc_info=True)
+    if characters:
+        names = [c.get("name") for c in characters if isinstance(c, dict) and isinstance(c.get("name"), str) and c.get("name")]
+        if names:
+            positive = f"{positive}. Characters: " + ", ".join([str(n) for n in names[:3] if n])
     if style:
         positive = f"{prompt} in {style} style"
     for ch in characters[:2]:
@@ -11745,17 +10432,29 @@ def _derive_seed(*parts: str) -> int:
 
 
 def _clamp_frames(frames: int) -> int:
-    try:
-        return max(1, min(int(frames), 120))
-    except Exception:
+    if frames is None:
         return 24
+    if isinstance(frames, bool):
+        return 24
+    if isinstance(frames, (int, float)):
+        return max(1, min(int(frames), 120))
+    s = str(frames).strip()
+    if _re.match(r"^-?\d+(\.\d+)?$", s):
+        return max(1, min(int(float(s)), 120))
+    return 24
 
 
 def _round_fps(fps: float) -> int:
-    try:
-        return max(1, min(int(round(float(fps))), 60))
-    except Exception:
+    if fps is None:
         return 24
+    if isinstance(fps, bool):
+        return 24
+    if isinstance(fps, (int, float)):
+        return max(1, min(int(round(float(fps))), 60))
+    s = str(fps).strip()
+    if _re.match(r"^-?\d+(\.\d+)?$", s):
+        return max(1, min(int(round(float(s))), 60))
+    return 24
 
 
 def build_animated_scene_workflow(
@@ -11775,17 +10474,16 @@ def build_animated_scene_workflow(
     interpolation_multiplier: int = 0,
 ) -> Dict[str, Any]:
     # Simple animation via chunked batch sampling using CheckpointLoaderSimple
+    if not isinstance(characters, list):
+        characters = []
     total_frames = int(max(1, duration_seconds) * fps)
     frames = _clamp_frames(total_frames)
     batch_frames = max(1, min(SCENE_MAX_BATCH_FRAMES, frames))
     positive = prompt
     # Inject lightweight story context into the prompt to reduce drift
-    try:
-        names = [c.get("name") for c in characters if isinstance(c, dict) and isinstance(c.get("name"), str)]
-        if names:
-            positive = f"{positive}. Characters: " + ", ".join([n for n in names[:3] if n])
-    except Exception as ex:
-        logging.debug("workflow.anim.context.inject.error: %s", str(ex), exc_info=True)
+    names = [c.get("name") for c in characters if isinstance(c, dict) and isinstance(c.get("name"), str) and c.get("name")]
+    if names:
+        positive = f"{positive}. Characters: " + ", ".join([str(n) for n in names[:3] if n])
     if style:
         positive = f"{prompt} in {style} style"
     # Build a graph that renders a smaller batch (batch_frames)
@@ -11907,7 +10605,7 @@ async def create_job(body: Dict[str, Any]):
         async with pool.acquire() as conn:
             await conn.execute("INSERT INTO jobs (id, prompt_id, status, workflow) VALUES ($1, $2, 'queued', $3)", job_id, prompt_id, json.dumps(workflow))
     _jobs_store[job_id] = {"id": job_id, "prompt_id": prompt_id, "state": "queued", "created_at": time.time(), "updated_at": time.time(), "result": None}
-    _as.create_task(_track_comfy_job(job_id, prompt_id))
+    await _track_comfy_job(job_id, prompt_id)
     return {"job_id": job_id, "prompt_id": prompt_id}
 
 
@@ -12027,16 +10725,12 @@ async def _update_scene_from_job(job_id: str, detail: Dict[str, Any] | str, fail
     if pool is None:
         return
     # Prefer the exact ComfyUI base that handled this job (per-job endpoint pinning)
-    try:
-        pid = (_jobs_store.get(job_id) or {}).get("prompt_id")
-        base = _job_endpoint.get(pid) if pid else None
-    except Exception:
-        base = None
+    job = _jobs_store.get(job_id) if isinstance(_jobs_store.get(job_id), dict) else {}
+    pid = job.get("prompt_id")
+    base = _job_endpoint.get(pid) if pid else None
     if isinstance(detail, str):
-        try:
-            detail = JSONParser().parse_superset(detail, {"outputs": dict, "status": dict})["coerced"]
-        except Exception:
-            detail = {}
+        parsed = JSONParser().parse(detail, {"outputs": dict, "status": dict})
+        detail = parsed if isinstance(parsed, dict) else {}
     assets = {
         "outputs": (detail or {}).get("outputs", {}),
         "status": (detail or {}).get("status"),
@@ -12096,7 +10790,7 @@ async def _update_scene_from_job(job_id: str, detail: Dict[str, Any] | str, fail
                                 rd = crow.get("reference_data")
                                 if isinstance(rd, str):
                                     parser = JSONParser()
-                                    rd_parsed = parser.parse_superset(rd, {"locks": dict, "style": dict, "qa": dict})["coerced"]
+                                    rd_parsed = parser.parse(rd, {"locks": dict, "style": dict, "qa": dict})
                                     rd = rd_parsed if isinstance(rd_parsed, dict) else {}
                                 if isinstance(rd, dict):
                                     v2 = rd.get("voice")
@@ -12123,13 +10817,13 @@ async def _update_scene_from_job(job_id: str, detail: Dict[str, Any] | str, fail
                     tr = await client.post(XTTS_API_URL.rstrip("/") + "/tts", json={"text": scene_text, "voice": voice, "language": language})
                     if tr.status_code == 200:
                         parser = JSONParser()
-                        scene_tts = parser.parse_superset(tr.text or "", {"audio_wav_base64": str, "sample_rate": int, "language": str})["coerced"]
+                        scene_tts = parser.parse(tr.text or "", {"audio_wav_base64": str, "sample_rate": int, "language": str})
             if MUSIC_API_URL and ALLOW_TOOL_EXECUTION and audio_enabled:
                 async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
                     mr = await client.post(MUSIC_API_URL.rstrip("/") + "/generate", json={"prompt": "cinematic background score", "duration": duration})
                     if mr.status_code == 200:
                         parser = JSONParser()
-                        scene_music = parser.parse_superset(mr.text or "", {"audio_wav_base64": str, "duration": float})["coerced"]
+                        scene_music = parser.parse(mr.text or "", {"audio_wav_base64": str, "duration": float})
             # simple SRT creation from scene_text if enabled
             if scene_text and subs_enabled:
                 srt = _text_to_simple_srt(scene_text, duration)
@@ -12186,17 +10880,19 @@ async def _maybe_compile_film(film_id: str) -> None:
             async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
                 r = await client.post(ASSEMBLER_API_URL.rstrip("/") + "/assemble", json=payload)
                 parser = JSONParser()
-                assembly_result = parser.parse_superset(r.text or "", {})["coerced"]
-        except Exception:
-            assembly_result = {"error": True}
+                assembly_result = parser.parse(r.text or "", {})
+        except Exception as ex:
+            logging.warning("film.compile.assembler.failed film_id=%s: %s", str(film_id), ex, exc_info=True)
+            assembly_result = {"error": True, "message": str(ex)}
     elif N8N_WEBHOOK_URL and ENABLE_N8N:
         try:
             async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
                 r = await client.post(N8N_WEBHOOK_URL, json=payload)
                 parser = JSONParser()
-                assembly_result = parser.parse_superset(r.text or "", {})["coerced"]
-        except Exception:
-            assembly_result = {"error": True}
+                assembly_result = parser.parse(r.text or "", {})
+        except Exception as ex:
+            logging.warning("film.compile.n8n.failed film_id=%s: %s", str(film_id), ex, exc_info=True)
+            assembly_result = {"error": True, "message": str(ex)}
     # Always write a manifest to uploads for convenience
     manifest_url = None
     try:
@@ -12204,12 +10900,11 @@ async def _maybe_compile_film(film_id: str) -> None:
         if EXECUTOR_BASE_URL:
             async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
                 res = await client.post(EXECUTOR_BASE_URL.rstrip("/") + "/write_file", json={"path": "uploads/film_" + film_id + "_manifest.json", "content": manifest})
-                res.raise_for_status()
                 # Build public URL
                 name = f"film_{film_id}_manifest.json"
                 manifest_url = (f"{PUBLIC_BASE_URL.rstrip('/')}/uploads/{name}" if PUBLIC_BASE_URL else f"/uploads/{name}")
-    except Exception:
-        logging.warning("film.compile.manifest_write.error film_id=%s", str(film_id), exc_info=True)
+    except Exception as ex:
+        logging.warning("film.compile.manifest_write.error film_id=%s err=%s", str(film_id), str(ex), exc_info=True)
     # persist compile artifact into films.metadata
     async with pool.acquire() as conn:
         meta_row = await conn.fetchrow("SELECT metadata FROM films WHERE id=$1", film_id)

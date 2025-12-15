@@ -73,6 +73,7 @@ def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
     provider: exposes .speak(args) -> {"wav_bytes": b"...", "duration_s": float, "model": "..."}
     """
     cid = job.get("cid") or f"tts-{now_ts()}"
+    trace_id = job.get("trace_id") if isinstance(job.get("trace_id"), str) else ""
     outdir = os.path.join("/workspace", "uploads", "artifacts", "audio", "tts", cid)
     ensure_dir(outdir)
     # If no explicit refs were provided, try to infer reference samples for the
@@ -230,7 +231,7 @@ def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
             r_reg = client.post(rvc_url_train.rstrip("/") + "/v1/voice/register", json=payload_reg)
             parser_reg = _TrainParser()
             raw_reg = r_reg.text or ""
-            reg_env = parser_reg.parse_superset(raw_reg or "{}", {"ok": bool, "error": dict})["coerced"]
+            reg_env = parser_reg.parse(raw_reg or "{}", {"ok": bool, "error": dict})
             if not isinstance(reg_env, dict) or not bool(reg_env.get("ok")):
                 import traceback as _tb_reg
                 err_obj = reg_env.get("error") if isinstance(reg_env, dict) else {}
@@ -251,7 +252,7 @@ def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
             )
             parser_train = _TrainParser()
             raw_train = r_train.text or ""
-            train_env = parser_train.parse_superset(raw_train or "{}", {"ok": bool, "error": dict})["coerced"]
+            train_env = parser_train.parse(raw_train or "{}", {"ok": bool, "error": dict})
             if not isinstance(train_env, dict) or not bool(train_env.get("ok")):
                 import traceback as _tb_train
                 err_obj = train_env.get("error") if isinstance(train_env, dict) else {}
@@ -287,7 +288,7 @@ def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
         "lock_bundle": lock_bundle,
         "quality_profile": quality_profile,
         "language": lang,
-        "trace_id": cid,
+        "trace_id": trace_id,
     }
     args = stamp_tool_args("tts.speak", args)
     res = provider.speak(args)
@@ -339,10 +340,10 @@ def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
     from ..json_parser import JSONParser  # type: ignore
 
     parser = JSONParser()
-    js_rvc = parser.parse_superset(
+    js_rvc = parser.parse(
         r_rvc.text or "",
         {"ok": bool, "audio_wav_base64": str, "sample_rate": int},
-    )["coerced"]
+    )
     if not isinstance(js_rvc, dict) or not bool(js_rvc.get("ok")):
         import traceback as _tb
         return {
@@ -392,7 +393,7 @@ def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
         try:
             from ..json_parser import JSONParser  # type: ignore
             parser = JSONParser()
-            js_vf = parser.parse_superset(
+            js_vf = parser.parse(
                 r_vf.text or "",
                 {
                     "ok": bool,
@@ -401,7 +402,7 @@ def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
                     "metrics_before": dict,
                     "metrics_after": dict,
                 },
-            )["coerced"]
+            )
         except Exception:
             js_vf = {}
         if not isinstance(js_vf, dict) or not bool(js_vf.get("ok")):

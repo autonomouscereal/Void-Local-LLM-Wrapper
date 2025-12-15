@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import io
 from typing import Dict, Any
 import numpy as np
@@ -23,11 +24,11 @@ def _silent_wav(seconds: int = 2, sr: int = 32000) -> bytes:
 
 @app.post("/sfx")
 async def sfx(body: Dict[str, Any]):
-    return {"audio_wav_base64": _silent_wav().hex(), "sample_rate": 32000}
+    return {"audio_wav_base64": base64.b64encode(_silent_wav()).decode("ascii"), "sample_rate": 32000}
 
 
 @app.post("/variation")
 async def variation(body: Dict[str, Any]):
-    return {"items": [{"audio_wav_base64": _silent_wav().hex(), "score": 0.0}]}
+    return {"items": [{"audio_wav_base64": base64.b64encode(_silent_wav()).decode("ascii"), "score": 0.0}]}
 
 

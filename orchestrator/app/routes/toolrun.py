@@ -9,6 +9,7 @@ import base64 as _b64
 from typing import Optional
 from void_envelopes import ToolEnvelope, _build_success_envelope, _build_error_envelope
 from app.state.checkpoints import append_event as checkpoints_append_event
+from app.state.ids import trace_id as _mint_trace_id
 from app.trace_utils import emit_trace as _emit_trace
 from app.comfy.assets import (
     normalize_history_entry as _normalize_comfy_history_entry,
@@ -45,7 +46,7 @@ async def _post_json(url: str, obj: dict) -> dict:
         # ComfyUI /prompt returns an object with at least prompt_id/client_id,
         # but we treat the entire JSON body as a free-form mapping so callers
         # can inspect any fields they care about.
-        data = parser.parse_superset(resp.text or "{}", dict)["coerced"]
+        data = parser.parse(resp.text or "{}", {})
         if 200 <= resp.status_code < 300 and isinstance(data, dict):
             return _ok_env(True, **data)
         return _ok_env(False, code="http_error", status=resp.status_code, detail=data)
@@ -57,7 +58,7 @@ async def _get_json(url: str) -> dict:
         parser = JSONParser()
         # ComfyUI /history/{id} returns a history object whose exact keys are
         # workflow-dependent; keep the response as an untyped mapping.
-        data = parser.parse_superset(resp.text or "{}", dict)["coerced"]
+        data = parser.parse(resp.text or "{}", {})
         if 200 <= resp.status_code < 300 and isinstance(data, dict):
             return _ok_env(True, **data)
         return _ok_env(False, code="http_error", status=resp.status_code, detail=data)
@@ -188,11 +189,8 @@ def _apply_overrides(graph: dict, bind: dict, args: dict) -> None:
             res = args.get("resolution")
             if isinstance(res, str) and "x" in res.lower():
                 w_str, h_str = res.lower().split("x", 1)
-                try:
-                    w_val = int(w_str.strip())
-                    h_val = int(h_str.strip())
-                except Exception:
-                    w_val = h_val = None
+                w_val = int(w_str.strip()) if w_str.strip().isdigit() else None
+                h_val = int(h_str.strip()) if h_str.strip().isdigit() else None
                 if isinstance(w_val, int) and isinstance(h_val, int) and w_val > 0 and h_val > 0:
                     li["width"] = w_val
                     li["height"] = h_val
@@ -291,17 +289,32 @@ def _append_jsonl(path: str, obj: dict) -> None:
 async def tool_run(req: Request):
     raw = await req.body()
     parser = JSONParser()
-    body = parser.parse_superset(
-        raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw or ""),
-        {"name": str, "args": dict, "trace_id": str, "cid": str},
-    )["coerced"]
-    trace_val = None
-    if isinstance(body, dict):
-        if isinstance(body.get("trace_id"), str) and body.get("trace_id"):
-            trace_val = str(body.get("trace_id"))
-        elif isinstance(body.get("cid"), str) and body.get("cid"):
-            trace_val = str(body.get("cid"))
-    rid = trace_val or "tool.run"
+    raw_text = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw or "")
+    # Parse request with an explicit schema that covers all expected fields,
+    # but keep args/arguments as passthrough (`object`) so we never coerce/drop
+    # LLM/tool-provided payloads (which may be dict OR JSON string OR other).
+    schema_toolrun_req = {
+        "name": str,
+        "args": object,
+        "arguments": object,
+        "request_id": str,
+        "trace_id": str,
+        "cid": str,
+        "tool_call_id": str,
+        "meta": dict,
+    }
+    body = parser.parse(raw_text, schema_toolrun_req)
+    # request_id (rid), trace_id, and cid are distinct identifiers.
+    rid = (
+        str(body.get("request_id")).strip()
+        if isinstance(body, dict) and isinstance(body.get("request_id"), str) and str(body.get("request_id")).strip()
+        else uuid.uuid4().hex
+    )
+    tid = (
+        str(body.get("trace_id")).strip()
+        if isinstance(body, dict) and isinstance(body.get("trace_id"), str) and str(body.get("trace_id")).strip()
+        else _mint_trace_id()
+    )
     if not isinstance(body, dict):
         return ToolEnvelope.failure(
             "invalid_body_type",
@@ -310,7 +323,17 @@ async def tool_run(req: Request):
             request_id=rid,
         )
     name = (body.get("name") or "").strip()
-    args = body.get("args") or {}
+    args_in = body.get("args") if ("args" in body) else body.get("arguments")
+    # Normalize args into an object while preserving any non-object payload under "_raw".
+    if isinstance(args_in, dict):
+        args = dict(args_in)
+    elif isinstance(args_in, str):
+        parsed = parser.parse(args_in, {})
+        args = dict(parsed) if isinstance(parsed, dict) else {"_raw": args_in}
+    elif args_in is None:
+        args = {}
+    else:
+        args = {"_raw": args_in}
 
     # For non-image tools, call the internal orchestrator tool implementation directly
     # instead of routing back through the executor. This avoids recursion
@@ -320,8 +343,8 @@ async def tool_run(req: Request):
 
         call = {
             "name": name,
-            "arguments": (args if isinstance(args, dict) else {}),
-            "trace_id": rid,
+            "arguments": args,
+            "trace_id": tid,
         }
         # Let execute_tool_call enforce its own invariants. Any unexpected exception
         # will naturally raise and surface as a 500 from FastAPI instead of being
@@ -336,10 +359,11 @@ async def tool_run(req: Request):
             code = str(err_obj.get("code") or "tool_error")
             raw_msg = err_obj.get("message")
             status_val = err_obj.get("status") or err_obj.get("_http_status") or 422
-            try:
+            status_int = 422
+            if isinstance(status_val, (int, float)):
                 status_int = int(status_val)
-            except Exception:
-                status_int = 422
+            elif isinstance(status_val, str) and status_val.strip().isdigit():
+                status_int = int(status_val.strip())
             message = (
                 str(raw_msg).strip()
                 if isinstance(raw_msg, str) and raw_msg.strip()
@@ -383,8 +407,8 @@ async def tool_run(req: Request):
             if os.path.exists(wf_path):
                 wf_text = _read_text(wf_path)
                 parser = JSONParser()
-                # Workflow graphs are open-ended; parse with open schema.
-                wf_obj = parser.parse_superset(wf_text, {})["coerced"]
+                # Workflow graphs are open-ended; parse with an open object schema (do not drop keys).
+                wf_obj = parser.parse(wf_text, {})
             else:
                 # Fallback: proceed without file; we'll synthesize a valid graph below
                 wf_obj = {}
@@ -511,22 +535,16 @@ async def tool_run(req: Request):
         _apply_overrides(prompt_graph, bind, args)
         # Ensure SaveImage nodes have a filename_prefix (required by newer ComfyUI)
         _client_id = uuid.uuid4().hex
-        # Always have a deterministic cid for artifact paths / prefixes; fall back to request id/client id.
-        _cid_raw = args.get("cid")
-        if isinstance(_cid_raw, (str, int)):
-            cid = str(_cid_raw).strip()
-        else:
-            cid = ""
-        if not cid:
-            cid = rid or _client_id
-            args["cid"] = cid
+        # Conversation cid (if provided) is distinct from request_id/trace_id.
+        conv_cid = str(args.get("cid")).strip() if isinstance(args.get("cid"), (str, int)) and str(args.get("cid")).strip() else ""
         trace = (args.get("trace_id") or "").strip() if isinstance(args.get("trace_id"), str) else ""
         step_id = (args.get("step_id") or "").strip() if isinstance(args.get("step_id"), str) else ""
         for nid, node in (prompt_graph or {}).items():
             if isinstance(node, dict) and (node.get("class_type") or "") == "SaveImage":
                 ins = node.setdefault("inputs", {})
                 if not isinstance(ins.get("filename_prefix"), str) or not (ins.get("filename_prefix") or "").strip():
-                    prefix = f"{cid}_{trace}_{step_id}" if (cid or trace or step_id) else f"void_{_client_id}"
+                    parts = [p for p in (conv_cid, trace, step_id) if isinstance(p, str) and p]
+                    prefix = "_".join(parts) if parts else f"void_{_client_id}"
                     ins["filename_prefix"] = prefix
 
         client_id = _client_id
@@ -656,6 +674,7 @@ async def tool_run(req: Request):
                 "image_count": len(images),
                 "prompt": str(args.get("prompt") or ""),
                 "negative": str(args.get("negative") or args.get("negative_prompt") or ""),
+                "trace_id": trace,
                 **eff,
             },
         }
@@ -665,9 +684,9 @@ async def tool_run(req: Request):
         from app.services.image.analysis.locks import compute_region_scores as _qa_region_scores, compute_face_lock_score as _qa_face_lock  # type: ignore
         import os as _os
 
-        # Use prompt_id as the canonical image cid for artifact paths
-        _cid = prompt_id or client_id
-        save_dir = _os.path.join(_UPLOAD_DIR, "artifacts", "image", _cid)
+        # Use a tool-specific artifact group id for artifact paths; do NOT overload conversation cid.
+        artifact_group_id = str(prompt_id or client_id)
+        save_dir = _os.path.join(_UPLOAD_DIR, "artifacts", "image", artifact_group_id)
         _os.makedirs(save_dir, exist_ok=True)
         orch_urls: list[str] = []
         saved_paths: list[str] = []
@@ -697,13 +716,15 @@ async def tool_run(req: Request):
         if orch_urls:
             # Attach orchestrator-served URLs and artifact descriptors for downstream consumers
             result["meta"]["orch_view_urls"] = orch_urls
-            result["meta"]["cid"] = _cid
+            result["meta"]["artifact_group_id"] = artifact_group_id
+            if conv_cid:
+                result["meta"]["cid"] = conv_cid
             arts: list[dict[str, object]] = []
             for im, url in zip(images, orch_urls):
                 fn = im.get("filename")
                 if not isinstance(fn, str) or not fn:
                     continue
-                arts.append({"id": fn, "kind": "image", "path": f"/uploads/artifacts/image/{_cid}/{fn}", "view_url": url})
+                arts.append({"id": fn, "kind": "image", "path": f"/uploads/artifacts/image/{artifact_group_id}/{fn}", "view_url": url})
             if arts:
                 result["artifacts"] = arts
         # Global + per-region QA for the first image (full-fat analyzer)
@@ -749,7 +770,7 @@ async def tool_run(req: Request):
                         # Expose full regions_info to the committee for region-aware patch planning
                         img_qa["regions_info"] = region_info
                     # Emit a distillation trace row for global + region QA
-                    trc = args.get("trace_id") or args.get("cid")
+                    trc = args.get("trace_id")
                     if isinstance(trc, str) and trc.strip():
                         _emit_trace(
                             STATE_DIR_LOCAL,
@@ -848,7 +869,7 @@ async def tool_run(req: Request):
                 # but we still log structured errors for observability.
                 log.error("[toolrun] image.dispatch face_lock QA failed: %s", str(ex), exc_info=True)
             # Trace for distillation: emit chat.append with media parts for this trace
-            trc = args.get("trace_id") or args.get("cid")
+            trc = args.get("trace_id")
             if isinstance(trc, str) and trc.strip():
                 parts = [{"image": u} for u in orch_urls if isinstance(u, str) and u.strip()]
                 _emit_trace(

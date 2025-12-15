@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List
+import hashlib
+import json
+from typing import Any, Dict, List, Optional, Iterable, Set
 
 
 def get_builtin_tools_schema() -> List[Dict[str, Any]]:
@@ -36,11 +38,13 @@ def get_builtin_tools_schema() -> List[Dict[str, Any]]:
                     "type": "object",
                     "properties": {
                         "url": {"type": "string"},
-                        "method": {"type": "string", "enum": ["GET", "POST", "PUT", "DELETE", "PATCH"]},
+                        "method": {"type": "string", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]},
                         "headers": {"type": "object"},
-                        "query": {"type": "object"},
-                        "body": {"oneOf": [{"type": "string"}, {"type": "object"}, {"type": "array"}]},
-                        "expect_json": {"type": "boolean"},
+                        "params": {"type": "object"},
+                        "body": {"oneOf": [{"type": "string"}, {"type": "object"}, {"type": "array"}, {"type": "null"}]},
+                        "expect": {"type": "string", "enum": ["json", "text", "bytes"]},
+                        "follow_redirects": {"type": "boolean"},
+                        "max_bytes": {"type": "integer"},
                     },
                     "required": ["url", "method"],
                 },
@@ -54,10 +58,20 @@ def get_builtin_tools_schema() -> List[Dict[str, Any]]:
                     "type": "object",
                     "properties": {
                         "prompt": {"type": "string"},
+                        "clips": {"type": "array", "items": {"type": "string"}},
+                        "images": {"type": "array", "items": {"type": "string"}},
                         "interpolate": {"type": "boolean"},
-                        "scale": {"type": "number"},
+                        "scale": {"oneOf": [{"type": "integer"}, {"type": "number"}]},
                         "quality_profile": {"type": "string"},
                         "locks": {"type": "object"},
+                        "cid": {"type": "string"},
+                        "trace_id": {"type": "string"},
+                        "film_id": {"type": "string"},
+                        "duration_seconds": {"oneOf": [{"type": "integer"}, {"type": "number"}]},
+                        "fps": {"type": "integer"},
+                        "width": {"type": "integer"},
+                        "height": {"type": "integer"},
+                        "character_ids": {"type": "array", "items": {"type": "string"}},
                     },
                     "required": [],
                 },
@@ -268,6 +282,35 @@ def get_builtin_tools_schema() -> List[Dict[str, Any]]:
         {
             "type": "function",
             "function": {
+                "name": "web_search",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "q": {"type": "string"},
+                        "query": {"type": "string"},
+                        "k": {"type": "integer"},
+                    },
+                    "required": [],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "metasearch.fuse",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "q": {"type": "string"},
+                        "k": {"type": "integer"},
+                    },
+                    "required": ["q"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "http.request",
                 "description": "Call an external HTTP API and normalize the response.",
                 "parameters": {
@@ -306,9 +349,15 @@ def get_builtin_tools_schema() -> List[Dict[str, Any]]:
                         "negative": {"type": "string"},
                         "width": {"type": "integer"},
                         "height": {"type": "integer"},
+                        "size": {"type": "string"},
                         "steps": {"type": "integer"},
                         "cfg": {"type": "number"},
                         "seed": {"type": "integer"},
+                        "mode": {"type": "string", "enum": ["gen", "edit", "upscale"]},
+                        "assets": {"type": "object"},
+                        "trace_id": {"type": "string"},
+                        "quality_profile": {"type": "string"},
+                        "lock_bundle": {"type": "object"},
                         "sampler": {"type": "string"},
                         "sampler_name": {"type": "string"},
                         "scheduler": {"type": "string"},
@@ -397,7 +446,54 @@ def get_builtin_tools_schema() -> List[Dict[str, Any]]:
         {"type": "function", "function": {"name": "video.artifact_fix", "parameters": {"type": "object", "properties": {"src": {"type": "string"}, "type": {"type": "string"}, "target_time": {"type": "string"}, "region": {"type": "array", "items": {"type": "integer"}}}, "required": ["src", "type"]}}},
         {"type": "function", "function": {"name": "image.hands.fix", "parameters": {"type": "object", "properties": {"src": {"type": "string"}}, "required": ["src"]}}},
         {"type": "function", "function": {"name": "video.hands.fix", "parameters": {"type": "object", "properties": {"src": {"type": "string"}}, "required": ["src"]}}},
-        {"type": "function", "function": {"name": "tts.speak", "parameters": {"type": "object", "properties": {"text": {"type": "string"}, "voice": {"type": "string"}}, "required": ["text"]}}},
+        {
+            "type": "function",
+            "function": {
+                "name": "tts.speak",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "text": {"type": "string"},
+                        "voice": {"type": "string"},
+                        "voice_id": {"type": "string"},
+                        "voice_refs": {"type": "object"},
+                        "rate": {"oneOf": [{"type": "integer"}, {"type": "number"}, {"type": "string"}]},
+                        "pitch": {"oneOf": [{"type": "integer"}, {"type": "number"}, {"type": "string"}]},
+                        "sample_rate": {"type": "integer"},
+                        "max_seconds": {"type": "integer"},
+                        "seed": {"type": "integer"},
+                        "cid": {"type": "string"},
+                        "edge": {"type": "boolean"},
+                        "language": {"type": "string"},
+                        "voice_gender": {"type": "string"},
+                        "trace_id": {"type": "string"},
+                        "lock_bundle": {"type": "object"},
+                        "quality_profile": {"type": "string"},
+                    },
+                    "required": ["text"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "audio.sfx.compose",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "type": {"type": "string"},
+                        "length_s": {"oneOf": [{"type": "integer"}, {"type": "number"}]},
+                        "pitch": {"oneOf": [{"type": "integer"}, {"type": "number"}]},
+                        "seed": {"type": "integer"},
+                        "cid": {"type": "string"},
+                        "trace_id": {"type": "string"},
+                        "lock_bundle": {"type": "object"},
+                        "sfx_event_ids": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": [],
+                },
+            },
+        },
         {"type": "function", "function": {"name": "research.run", "parameters": {"type": "object", "properties": {"query": {"type": "string"}, "scope": {"type": "string"}}, "required": ["query"]}}},
         {"type": "function", "function": {"name": "code.super_loop", "parameters": {"type": "object", "properties": {"task": {"type": "string"}, "repo_root": {"type": "string"}}, "required": ["task"]}}},
         {
@@ -519,3 +615,223 @@ def get_builtin_tools_schema() -> List[Dict[str, Any]]:
             },
         },
     ]
+
+
+# ---- Tool Introspection (data-only registry) ----
+_INTROSPECTION_DEFAULT_NAMES: List[str] = [
+    "image.dispatch",
+    "image.refine.segment",
+    "api.request",
+    "film2.run",
+    "music.infinite.windowed",
+    "tts.speak",
+    "audio.sfx.compose",
+]
+
+_INTROSPECTION_NOTES: Dict[str, str] = {
+    "image.dispatch": "Comfy pipeline; requires either size or width/height. Returns ids.image_id and meta.{data_url,view_url,orch_view_url}.",
+    "image.refine.segment": "Segment-level image refinement entrypoint; reuses image.dispatch path with lock-aware settings.",
+    "api.request": "Generic HTTP request for public APIs and metadata discovery for repair. Disallows internal service hosts.",
+    "film2.run": (
+        "Unified Film-2 front door for Void. Planner MUST treat this as the final assembly step in a film pipeline. "
+        "Do NOT fabricate or hard-code clip/image URLs in args; the orchestrator automatically wires real image "
+        "artifacts from prior image.dispatch (and related) tool results into args.images at execution time. "
+        "If no images exist yet for this trace, film2.run will operate in prompt/story-driven mode only. "
+        "Returns ids.film_id and meta with shots and view_url."
+    ),
+    "music.infinite.windowed": "Windowed music composition front door. Returns meta with song_graph, windows, and final mixed track artifact.",
+    "tts.speak": "TTS front door. Supports voice_id + optional voice_refs for matching/training. Returns ids.audio_id and meta.{data_url,url,mime,duration_s}.",
+    "audio.sfx.compose": "SFX generator (builtin). Produces a short WAV artifact based on type/length/pitch and optional lock hints.",
+}
+
+_INTROSPECTION_EXAMPLES: Dict[str, List[Dict[str, Any]]] = {
+    "api.request": [{"args": {"url": "https://httpbin.org/get", "method": "GET", "params": {"foo": "bar"}}}],
+}
+
+
+def _infer_tool_kind(name: str) -> str:
+    nm = str(name or "")
+    if nm.startswith("film2") or nm.startswith("video."):
+        return "video"
+    if nm.startswith("image."):
+        return "image"
+    if nm.startswith("music.") or nm.startswith("audio.") or nm.startswith("tts.") or nm.startswith("voice."):
+        return "audio"
+    return "utility"
+
+
+def get_tool_introspection_registry(tool_names: Optional[Iterable[str]] = None) -> Dict[str, Dict[str, Any]]:
+    """
+    Returns a stable metadata registry used by /tool.list, /tool.describe, and
+    planner TSL/catalog blocks.
+
+    IMPORTANT: This registry is derived from get_builtin_tools_schema() so the
+    JSON Schema contracts remain single-sourced.
+    """
+    names = list(tool_names) if tool_names is not None else list(_INTROSPECTION_DEFAULT_NAMES)
+    builtins = get_builtin_tools_schema() or []
+    by_name: Dict[str, Dict[str, Any]] = {}
+    for t in builtins:
+        if not isinstance(t, dict):
+            continue
+        fn = t.get("function") if isinstance(t.get("function"), dict) else {}
+        nm = fn.get("name") if isinstance(fn.get("name"), str) else ""
+        if nm:
+            by_name[nm] = t
+
+    out: Dict[str, Dict[str, Any]] = {}
+    for nm in names:
+        nm_clean = str(nm or "").strip()
+        if not nm_clean:
+            continue
+        t = by_name.get(nm_clean)
+        if not t:
+            continue
+        fn = t.get("function") if isinstance(t.get("function"), dict) else {}
+        params = fn.get("parameters") if isinstance(fn.get("parameters"), dict) else {}
+        out[nm_clean] = {
+            "name": nm_clean,
+            "version": "1",
+            "kind": _infer_tool_kind(nm_clean),
+            "schema": params,
+            "notes": _INTROSPECTION_NOTES.get(nm_clean, ""),
+            "examples": _INTROSPECTION_EXAMPLES.get(nm_clean, []),
+        }
+    return out
+
+
+# ---- Tool schema helpers (kept here so main.py doesn't duplicate logic) ----
+def tool_expected_from_jsonschema(js_schema: Any) -> Dict[str, Any]:
+    """
+    Convert a JSON Schema parameters block into the simpler expected_schema
+    format used by committee_jsonify (field -> python_type).
+    """
+    expected: Dict[str, Any] = {}
+    if not isinstance(js_schema, dict):
+        return expected
+    props = js_schema.get("properties") or {}
+    if not isinstance(props, dict):
+        return expected
+    for key, spec in props.items():
+        t = spec.get("type") if isinstance(spec, dict) else None
+        # Normalize union types like ["integer","null"] to a single primary type.
+        if isinstance(t, list):
+            # Prefer non-null, non-array/object/string if present.
+            if "integer" in t:
+                t = "integer"
+            elif "number" in t:
+                t = "number"
+            elif "string" in t:
+                t = "string"
+            elif "boolean" in t:
+                t = "boolean"
+            elif "object" in t:
+                t = "object"
+            elif "array" in t:
+                t = "array"
+            else:
+                t = t[0] if t else None
+        if t == "integer":
+            expected[key] = int
+        elif t == "number":
+            expected[key] = float
+        elif t == "boolean":
+            expected[key] = bool
+        elif t == "object":
+            expected[key] = dict
+        elif t == "array":
+            expected[key] = list
+        else:
+            # Default to string for unknown/nullable types.
+            expected[key] = str
+    return expected
+
+
+def compute_tools_hash(
+    body: Dict[str, Any],
+    *,
+    planner_visible_only: bool,
+    planner_visible_tools: Optional[Set[str]] = None,
+) -> str:
+    """
+    Compute a deterministic hash of tool names visible to the planner or executor.
+
+    planner_visible_tools is passed in by the caller (main.py) to avoid imports
+    that could create circular dependencies.
+    """
+    names: set[str] = set()
+    client_tools = body.get("tools") if isinstance(body.get("tools"), list) else []
+    for t in (client_tools or []):
+        if isinstance(t, dict):
+            nm = (t.get("function") or {}).get("name") or t.get("name")
+            if isinstance(nm, str):
+                nm_clean = nm.strip()
+                if not nm_clean:
+                    continue
+                if planner_visible_only and planner_visible_tools is not None and nm_clean not in planner_visible_tools:
+                    continue
+                names.add(nm_clean)
+    builtins = get_builtin_tools_schema()
+    for t in (builtins or []):
+        fn = (t.get("function") or {})
+        nm = fn.get("name")
+        if isinstance(nm, str):
+            nm_clean = nm.strip()
+            if not nm_clean:
+                continue
+            if planner_visible_only and planner_visible_tools is not None and nm_clean not in planner_visible_tools:
+                continue
+            names.add(nm_clean)
+    src = "|".join(sorted(list(names)))
+    return hashlib.sha256(src.encode("utf-8")).hexdigest()[:16]
+
+
+def build_tools_section(tools: Optional[List[Dict[str, Any]]]) -> str:
+    if not tools:
+        return ""
+    return "Available tools (JSON schema):\n" + json.dumps(tools, indent=2, default=str)
+
+
+def merge_tool_schemas(client_tools: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    """
+    Merge client-provided tool schemas with builtin schemas, keyed by function name.
+    """
+    builtins = get_builtin_tools_schema()
+    if not client_tools:
+        return builtins
+    seen = {((t.get("function") or {}).get("name") or t.get("name")) for t in client_tools if isinstance(t, dict)}
+    out = list(client_tools)
+    for t in builtins:
+        name = (t.get("function") or {}).get("name") or t.get("name")
+        if name not in seen:
+            out.append(t)
+    return out
+
+
+def build_compact_tool_catalog() -> str:
+    """
+    Build a strict, data-only catalog summarizing tool names and required args.
+    """
+    builtins = get_builtin_tools_schema()
+    merged: dict[str, dict] = {}
+    for t in (builtins or []):
+        fn = (t.get("function") or {}) if isinstance(t, dict) else {}
+        nm = fn.get("name")
+        if not nm:
+            continue
+        params = (fn.get("parameters") or {})
+        reqs = list((params.get("required") or [])) if isinstance(params, dict) else []
+        merged[nm] = {"name": nm, "required": reqs}
+    tools_list: list[dict] = list(merged.values())
+    tools_list.sort(key=lambda d: d.get("name", ""))
+    names_list = [t.get("name") for t in tools_list if isinstance(t, dict) and isinstance(t.get("name"), str)]
+    catalog = {
+        "names": names_list,
+        "tools": tools_list,
+        "constraints": {
+            "routing": "All tools run via executor→orchestrator /tool.run (no fast paths).",
+            "args": "Planner must emit all required args; snap sizes to /8.",
+            "rules": ["Use only tool names present in the catalog. If none apply, return steps: []."],
+        },
+    }
+    return "Tool catalog (strict, data-only):\n" + json.dumps(catalog, indent=2, default=str) + "\nValid tool names: " + ", ".join(names_list)

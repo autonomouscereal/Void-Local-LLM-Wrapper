@@ -5,8 +5,10 @@ import logging
 import os
 from types import SimpleNamespace
 from typing import Any
+import hashlib
 
 from .tokenizer import bytes_len
+from .tokenizer import byte_budget_for_model
 from .compress import (
     cleanup_lossless,
     compact_numbers_tables,
@@ -16,6 +18,7 @@ from .compress import (
 )
 from .relevance import score_chunk
 from .continuation import make_system_hint
+from .continuation import state_hash_from
 from ..rag.hygiene import rag_filter, evidence_binding_footer
 from ..artifacts.shard import newest_part, list_parts
 
@@ -139,4 +142,80 @@ def assemble_window(request_msg: dict, state: dict, in_limit_bytes: int, step_ou
         parts.append(footer)
     return SimpleNamespace(prompt=_joined(parts), target_output_tokens=step_out_tokens)
 
+
+def pack_icw_system_frame_from_messages(
+    messages: list[dict],
+    *,
+    cid: str | None,
+    goals: str,
+    model_ctx_limit_tokens: int,
+    pct_budget: float = 0.65,
+    step_out_tokens: int = 512,
+) -> tuple[dict | None, str | None, dict]:
+    """
+    Build a single ICW system frame for downstream prompts.
+
+    This is the one-call ICW interface: callers pass message history and a goal,
+    and ICW returns a compact system frame that fits a stable byte budget.
+
+    Returns: (system_frame_or_none, pack_hash_or_none, meta)
+    """
+    last_user = str(goals or "").strip()
+    if not last_user:
+        return None, None, {"ok": True, "reason": "empty_goals"}
+
+    msgs = messages or []
+    # Budget: token limit -> byte budget, then allocate pct_budget for ICW.
+    total_budget_bytes = int(byte_budget_for_model(int(model_ctx_limit_tokens)))
+    icw_budget_bytes = int(total_budget_bytes * float(pct_budget))
+    if icw_budget_bytes <= 0:
+        icw_budget_bytes = max(1024, int(total_budget_bytes * 0.5))
+
+    anchor_lines: list[str] = []
+    for m in (msgs or [])[-8:]:
+        if not isinstance(m, dict):
+            continue
+        role = str(m.get("role") or "").strip()
+        content = str(m.get("content") or "").strip()
+        if role and content:
+            anchor_lines.append(f"{role}: {content}")
+    anchor_text = "\n".join(anchor_lines)[:6000]
+
+    candidates: list[str] = []
+    for m in (msgs or []):
+        if not isinstance(m, dict):
+            continue
+        role = str(m.get("role") or "").strip()
+        content = str(m.get("content") or "").strip()
+        if role and content:
+            candidates.append(f"{role}: {content}")
+
+    icw_state: dict = {
+        "cid": cid,
+        "entities": [],
+        "goals": last_user,
+        "anchor_text": anchor_text,
+        "candidates": candidates,
+        "retrieved": [],
+    }
+    icw_state["state_hash"] = state_hash_from(icw_state)
+
+    req = {"role": "user", "content": last_user}
+    window = assemble_window(req, icw_state, int(icw_budget_bytes), int(step_out_tokens))
+    prompt = getattr(window, "prompt", "") if window is not None else ""
+    prompt = str(prompt or "").strip()
+    if not prompt:
+        return None, None, {"ok": False, "reason": "empty_prompt"}
+
+    pack_hash = "sha256:" + hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+    frame = {"role": "system", "content": "### [ICW CONTEXT]\n" + prompt}
+    meta = {
+        "ok": True,
+        "budget_bytes": int(icw_budget_bytes),
+        "total_budget_bytes": int(total_budget_bytes),
+        "pct_budget": float(pct_budget),
+        "approx_chars": len(prompt),
+        "state_hash": str(icw_state.get("state_hash") or ""),
+    }
+    return frame, pack_hash, meta
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from types import SimpleNamespace
 
@@ -15,6 +16,7 @@ from .tokenizer import byte_budget_for_model, bytes_len
 from .reframe import need_reframe, build_reframe_prompt
 from ..adapters.providers import model_chat_with_retry, ProviderError
 
+log = logging.getLogger("orchestrator.icw.windowed_solver")
 
 def solve(
     request: dict,
@@ -39,24 +41,47 @@ def solve(
     step_tokens = int(step_out_tokens)
     min_tokens = max(200, int(step_out_tokens * 0.4))
     max_tokens_soft = int(step_out_tokens * 1.8)
-    threshold = int(os.getenv("ICW_STALL_N", "3") or 3)
+    try:
+        threshold = int(str(os.getenv("ICW_STALL_N", "3") or "3").strip() or "3")
+    except Exception as exc:  # pragma: no cover - defensive logging
+        log.error("icw.windowed_solver bad ICW_STALL_N env: %s", exc, exc_info=True)
+        threshold = 3
     while step < max_steps:
         step += 1
         # Keep goals/state_hash aligned to the latest user request for stable CONT/HALT tags.
         global_state["goals"] = request.get("content", "")
-        global_state["state_hash"] = state_hash_from(global_state)
-        state_hashes.append(global_state["state_hash"])
+        try:
+            global_state["state_hash"] = state_hash_from(global_state)
+        except Exception as exc:  # pragma: no cover - defensive logging
+            log.error("icw.windowed_solver state_hash_from failed: %s", exc, exc_info=True)
+            partials.append("<HALT state=\"00000000\" outcome=\"error:state_hash\"/>")
+            return SimpleNamespace(kind="HALT", partials=partials, state=global_state)
+        state_hashes.append(str(global_state.get("state_hash") or ""))
         # Stall reframe
-        if need_reframe(state_hashes, step, threshold=threshold):
-            rf = build_reframe_prompt(
-                goal=request.get("content", ""),
-                constraints=["no caps", "json-only", "continuity-first"],
-                seen_blockers=["insufficient progress"],
-            )
-            global_state.setdefault("candidates", []).append(rf)
-        window = assemble_window(request, global_state, in_budget, step_tokens)
+        try:
+            if need_reframe(state_hashes, step, threshold=threshold):
+                rf = build_reframe_prompt(
+                    goal=request.get("content", ""),
+                    constraints=["no caps", "json-only", "continuity-first"],
+                    seen_blockers=["insufficient progress"],
+                )
+                global_state.setdefault("candidates", []).append(rf)
+        except Exception as exc:  # pragma: no cover - defensive logging
+            # ICW is best-effort; a reframe failure should not crash the solve loop.
+            log.error("icw.windowed_solver reframe failed: %s", exc, exc_info=True)
+        try:
+            window = assemble_window(request, global_state, in_budget, step_tokens)
+        except Exception as exc:
+            # ICW packing failure: halt deterministically with an explicit error outcome.
+            log.error("icw.windowed_solver assemble_window failed: %s", exc, exc_info=True)
+            partials.append(f"<HALT state=\"{global_state.get('state_hash') or '00000000'}\" outcome=\"error:assemble\"/>")
+            return SimpleNamespace(kind="HALT", partials=partials, state=global_state)
         if progress:
-            progress(step, "window", {"input_bytes": bytes_len(window.prompt), "step_tokens": step_tokens})
+            try:
+                progress(step, "window", {"input_bytes": bytes_len(window.prompt), "step_tokens": step_tokens})
+            except Exception as exc:  # pragma: no cover - defensive logging
+                # Progress is optional instrumentation; never allow it to break ICW.
+                log.error("icw.windowed_solver progress(window) failed: %s", exc, exc_info=True)
         # Provider call without wrapper timeouts; any failures surface via ProviderError.
         try:
             out = model_chat_with_retry(
@@ -65,9 +90,20 @@ def solve(
                 max_tokens=step_tokens,
             )
         except ProviderError as e:
-            partials.append(f"<HALT state=\"{global_state['state_hash']}\" outcome=\"error:{e.code or e.kind}\"/>")
+            partials.append(
+                f"<HALT state=\"{global_state.get('state_hash') or '00000000'}\" outcome=\"error:{e.code or e.kind}\"/>"
+            )
+            return SimpleNamespace(kind="HALT", partials=partials, state=global_state)
+        except Exception as exc:
+            # Unexpected provider exception: never allow it to bubble.
+            log.error("icw.windowed_solver provider call failed: %s", exc, exc_info=True)
+            partials.append(
+                f"<HALT state=\"{global_state.get('state_hash') or '00000000'}\" outcome=\"error:provider_exception\"/>"
+            )
             return SimpleNamespace(kind="HALT", partials=partials, state=global_state)
         text = getattr(out, "text", "")
+        if not isinstance(text, str):
+            text = str(text or "")
         kind, cont_hash = detect_cont_or_halt(text)
         if kind == "CONT" and cont_hash is None:
             # Synthesize CONT with tail fragment for seamless stitching
@@ -82,7 +118,10 @@ def solve(
             elif out_chars > (step_tokens * 6):
                 step_tokens = max(min_tokens, int(step_tokens * 0.8))
         if progress:
-            progress(step, "step", {"kind": kind, "out_len": out_chars, "step_tokens": step_tokens})
+            try:
+                progress(step, "step", {"kind": kind, "out_len": out_chars, "step_tokens": step_tokens})
+            except Exception as exc:  # pragma: no cover - defensive logging
+                log.error("icw.windowed_solver progress(step) failed: %s", exc, exc_info=True)
         # Update state (lightweight)
         global_state["model"] = getattr(out, "model_name", "unknown")
         global_state.setdefault("window_steps", 0)
@@ -91,7 +130,10 @@ def solve(
             return SimpleNamespace(kind="HALT", partials=partials, state=global_state)
         global_state["last_cont_hash"] = cont_hash or global_state["state_hash"]
     if progress:
-        progress(step, "halt", {"reason": "max_steps"})
+        try:
+            progress(step, "halt", {"reason": "max_steps"})
+        except Exception as exc:  # pragma: no cover - defensive logging
+            log.error("icw.windowed_solver progress(halt) failed: %s", exc, exc_info=True)
     return SimpleNamespace(kind="HALT", partials=partials, state=global_state)
 
 

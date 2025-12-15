@@ -133,7 +133,7 @@ def _run_ocr(path: str) -> Dict[str, Any]:
         r = requests.post(OCR_API_URL.rstrip("/") + "/ocr", json={"b64": b64, "ext": ext})
         from ..json_parser import JSONParser  # local import to avoid cycles at module import time
         parser = JSONParser()
-        js = parser.parse_superset(r.text or "{}", {"text": str})["coerced"]
+        js = parser.parse(r.text or "{}", {"text": str})
         txt = (js.get("text") or "").strip() if isinstance(js, dict) else ""
         out["ocr_text"] = txt
         out["has_text"] = bool(txt)
@@ -165,7 +165,7 @@ def _run_yolo(path: str) -> Dict[str, Any]:
         )
         from ..json_parser import JSONParser  # local import to avoid cycles at module import time
         parser = JSONParser()
-        js = parser.parse_superset(r.text or "{}", {"objects": list, "faces": list})["coerced"]
+        js = parser.parse(r.text or "{}", {"objects": list, "faces": list})
         objects = js.get("objects") or [] if isinstance(js, dict) else []
         yolo_list: List[Dict[str, Any]] = []
         entity_tags: List[str] = []
@@ -237,8 +237,11 @@ def _qwen_vl_analyze(path: str, prompt: Optional[str]) -> Dict[str, Any]:
     Use the VLM (Qwen-VL) service as a VL captioner + prompt-match scorer.
 
     The service is instructed to respond with a strict JSON payload containing
-    caption, keywords, and match_score in [0,1]. If parsing fails, we fall
-    back to treating the raw text as the caption and derive tags naively.
+    caption, keywords, and match_score in [0,1].
+
+    IMPORTANT: the model response itself may be messy (LLM-originated). We do
+    not rely on full strict JSON parsing for correctness, but we MUST populate
+    `match_score` because downstream semantic scoring depends on it.
     """
     res: Dict[str, Any] = {"caption": "", "tags": [], "match_score": None, "error": None}
     if not VLM_API_URL:
@@ -263,40 +266,107 @@ def _qwen_vl_analyze(path: str, prompt: Optional[str]) -> Dict[str, Any]:
         )
     else:
         base_instr += "No user description is provided; set match_score to 1.0."
+
+    def _extract_match_score_fallback(txt: str) -> Optional[float]:
+        """
+        Best-effort extraction of match_score from LLM-originated text without
+        requiring valid JSON.
+        """
+        if not isinstance(txt, str) or not txt:
+            return None
+        import re
+
+        # JSON-ish: "match_score": 0.73
+        m = re.search(r'"match_score"\s*:\s*([0-9]+(?:\.[0-9]+)?)', txt)
+        if not m:
+            # Plain-ish: match score: 0.73 / match_score = 0.73
+            m = re.search(r"\bmatch[_\s-]*score\b\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)", txt, flags=re.I)
+        if not m:
+            return None
+        try:
+            v = float(m.group(1))
+        except Exception:
+            return None
+        return float(_clamp01(v))
     try:
         r = requests.post(
             VLM_API_URL.rstrip("/") + "/analyze",
             json={"image_url": image_url, "prompt": base_instr},
             timeout=None,
         )
-        from ..json_parser import JSONParser  # local import to avoid cycles at module import time
         parser = JSONParser()
-        js = parser.parse_superset(r.text or "{}", {"text": str})["coerced"]
+        js = parser.parse(r.text or "{}", {"text": str})
         text = (js.get("text") or "").strip() if isinstance(js, dict) else ""
         if not text:
             res["error"] = "vlm_empty_text"
             return res
-        from ..json_parser import JSONParser  # local import to avoid cycles at module import time
-        parser = JSONParser()
-        # VLM JSON is free-form but expected to contain at least caption/keywords/tags.
-        parsed = parser.parse_superset(text, {"caption": str, "keywords": list, "tags": list})["coerced"]
-        caption = parsed.get("caption")
-        if isinstance(caption, str):
-            res["caption"] = caption.strip()
-        keywords = parsed.get("keywords") or parsed.get("tags")
-        if isinstance(keywords, list):
+
+        # Default: treat raw text as caption (robust).
+        res["caption"] = text.strip()
+
+        # Prefer extracting structured fields when the response looks JSON-ish.
+        text_l = text.lstrip()
+        if text_l.startswith("{") and ("match_score" in text or '"caption"' in text):
+            try:
+                parsed = JSONParser().parse(
+                    text,
+                    {"caption": str, "keywords": list, "tags": list, "match_score": float},
+                )
+                if isinstance(parsed, dict):
+                    cap = parsed.get("caption")
+                    if isinstance(cap, str) and cap.strip():
+                        res["caption"] = cap.strip()
+                    ms = parsed.get("match_score")
+                    if isinstance(ms, (int, float)):
+                        res["match_score"] = float(_clamp01(float(ms)))
+                    kw = parsed.get("keywords")
+                    if not isinstance(kw, list):
+                        kw = parsed.get("tags")
+                    if isinstance(kw, list):
+                        tags2: List[str] = []
+                        seen2 = set()
+                        for item in kw:
+                            if isinstance(item, str):
+                                t = item.strip()
+                                if len(t) >= 2 and t not in seen2:
+                                    seen2.add(t)
+                                    tags2.append(t)
+                        if tags2:
+                            res["tags"] = tags2[:64]
+            except Exception:
+                # Ignore structured parse failures; fall back below.
+                pass
+
+        # Ensure match_score is populated for downstream semantic scoring.
+        if res.get("match_score") is None:
+            ms2 = _extract_match_score_fallback(text)
+            if ms2 is not None:
+                res["match_score"] = ms2
+
+        # If no user description was provided, follow the contract: score is 1.0.
+        if res.get("match_score") is None and not user_prompt:
+            res["match_score"] = 1.0
+
+        # If a user description WAS provided but we still couldn't extract a score,
+        # we must still populate it (downstream semantic scoring depends on it).
+        # Use a neutral default instead of silently collapsing to 0.0.
+        if res.get("match_score") is None and user_prompt:
+            res["match_score"] = 0.5
+            if not res.get("error"):
+                res["error"] = "vlm_match_score_missing"
+
+        # If tags weren't set above, derive them from caption tokens.
+        if not isinstance(res.get("tags"), list) or not res.get("tags"):
             tags: List[str] = []
             seen = set()
-            for item in keywords:
-                if isinstance(item, str):
-                    t = item.strip()
-                    if len(t) >= 2 and t not in seen:
-                        seen.add(t)
-                        tags.append(t)
+            for tok in (res.get("caption") or "").replace("\n", " ").split():
+                t = tok.strip(" ,.;:()[]{}\"'").lower()
+                if len(t) >= 3 and t not in seen:
+                    seen.add(t)
+                    tags.append(t)
+                if len(tags) >= 24:
+                    break
             res["tags"] = tags
-        ms = parsed.get("match_score")
-        if isinstance(ms, (int, float)):
-            res["match_score"] = float(_clamp01(float(ms)))
     except Exception as ex:
         res["error"] = f"vlm_error:{ex}"
     return res

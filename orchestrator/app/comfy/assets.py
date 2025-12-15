@@ -63,7 +63,7 @@ def _ensure_detail_mapping(detail: Dict[str, Any] | str) -> Dict[str, Any]:
         return detail
     if isinstance(detail, str):
         try:
-            parsed = JSONParser().parse_superset(detail, {"outputs": dict, "status": dict})["coerced"]
+            parsed = JSONParser().parse(detail, {"outputs": dict, "status": dict})
             return parsed if isinstance(parsed, dict) else {}
         except Exception:
             return {}

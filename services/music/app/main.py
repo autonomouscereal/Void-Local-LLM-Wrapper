@@ -60,6 +60,11 @@ async def generate(body: Dict[str, Any]):
     seconds = int(body.get("seconds", 8))
     cid = str(body.get("cid") or "music")
     trace_id = body.get("trace_id") if isinstance(body.get("trace_id"), str) else "music_unknown"
+    request_id = (
+        str(body.get("request_id")).strip()
+        if isinstance(body.get("request_id"), (str, int)) and str(body.get("request_id")).strip()
+        else None
+    )
     seed = body.get("seed")
     logger.info(
         "music.generate.request prompt_preview=%r seconds=%s seed=%s cid=%r trace_id=%r",
@@ -85,7 +90,7 @@ async def generate(body: Dict[str, Any]):
                 "trace_id": trace_id,
                 "stack": "".join(traceback.format_stack()),
             },
-            request_id=trace_id,
+            request_id=request_id,
         )
     try:
         wav = generate_music(
@@ -138,7 +143,7 @@ async def generate(body: Dict[str, Any]):
             "path": path,
             "cid": cid,
         }
-        return ToolEnvelope.success(result, request_id=trace_id)
+        return ToolEnvelope.success(result, request_id=request_id)
     except Exception as ex:  # surface full error as structured JSON
         logger.exception("music.generate error cid=%r trace_id=%r", cid, trace_id)
         return ToolEnvelope.failure(
@@ -150,6 +155,6 @@ async def generate(body: Dict[str, Any]):
                 "trace_id": trace_id,
                 "stack": traceback.format_exc(),
             },
-            request_id=trace_id,
+            request_id=request_id,
         )
 

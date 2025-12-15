@@ -63,8 +63,7 @@ def maybe_load(ref_id: str, name: str) -> dict | None:
         with open(p, "r", encoding="utf-8") as f:
             parser = JSONParser()
             # Embedding files are arbitrary dicts; coerce to generic mapping.
-            sup = parser.parse_superset(f.read(), dict)
-            data = sup["coerced"]
+            data = parser.parse(f.read(), {})
             return data if isinstance(data, dict) else None
     except FileNotFoundError:
         return None

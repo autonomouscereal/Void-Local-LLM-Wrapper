@@ -174,9 +174,7 @@ def _post_json(url: str, payload: Dict[str, Any], expected: Optional[Dict[str, A
         raw = resp.read().decode("utf-8", errors="replace")
         parser = JSONParser()
         schema = expected if expected is not None else {}
-        # Always use the repairing superset parser with a dict schema; strict parse is forbidden.
-        sup = parser.parse_superset(raw, schema)
-        return sup["coerced"]
+        return parser.parse(raw, schema)
 
 
 def _distill_summary(result_obj: Any) -> Dict[str, Any]:
@@ -395,6 +393,18 @@ async def execute_plan(body: Dict[str, Any]):
         body_env = _build_executor_envelope(rid, False, {}, err_env)
         return JSONResponse(body_env, status_code=200)
 
+    # request_id (rid) and trace_id are distinct identifiers; never reuse one as the other.
+    request_id_val = (
+        str(plan_obj.get("request_id")).strip()
+        if isinstance(plan_obj.get("request_id"), str) and str(plan_obj.get("request_id")).strip()
+        else uuid.uuid4().hex
+    )
+    trace_id_val = (
+        str(plan_obj.get("trace_id")).strip()
+        if isinstance(plan_obj.get("trace_id"), str) and str(plan_obj.get("trace_id")).strip()
+        else uuid.uuid4().hex
+    )
+
     # Normalize steps: ids, needs, inputs
     norm_steps: Dict[str, Dict[str, Any]] = {}
     used_ids = set()
@@ -434,22 +444,20 @@ async def execute_plan(body: Dict[str, Any]):
                 inputs.update(produced[need])
         # Attach trace metadata for orchestrator tracing; overwrite any caller-
         # supplied values so ids remain fully server-controlled.
-        rid = plan_obj.get("request_id") if isinstance(plan_obj.get("request_id"), str) else None
-        if rid:
-            inputs["trace_id"] = rid
+        if trace_id_val:
+            inputs["trace_id"] = trace_id_val
         sid_local = (step.get("id") or "").strip()
         if sid_local:
             inputs["step_id"] = sid_local
         return inputs
 
     pending = set(norm_steps.keys())
-    trace_id = plan_obj.get("request_id") if isinstance(plan_obj.get("request_id"), str) else None
-    logging.info(f"[executor] plan_start trace_id={trace_id} steps={len(pending)}")
+    logging.info(f"[executor] plan_start trace_id={trace_id_val} steps={len(pending)}")
     while pending:
         satisfied = set(produced.keys())
         runnable = [sid for sid in pending if deps[sid].issubset(satisfied)]
         if not runnable:
-            rid = str(plan_obj.get("request_id") or trace_id or uuid.uuid4().hex)
+            rid = str(request_id_val)
             stk = _stack_str()
             err_env = {
                 "code": "deadlock_or_missing",
@@ -462,12 +470,12 @@ async def execute_plan(body: Dict[str, Any]):
             body_env = _build_executor_envelope(rid, False, produced, err_env)
             return JSONResponse(body_env, status_code=200)
         batch_tools = [{"step_id": sid, "tool": norm_steps[sid].get("tool")} for sid in runnable]
-        logging.info(f"[executor] batch_start trace_id={trace_id} runnable={batch_tools}")
+        logging.info(f"[executor] batch_start trace_id={trace_id_val} runnable={batch_tools}")
         for sid in runnable:
             step = norm_steps[sid]
             tool_name = (step.get("tool") or "").strip()
             if not tool_name:
-                rid = str(plan_obj.get("request_id") or trace_id or uuid.uuid4().hex)
+                rid = str(request_id_val)
                 stk = _stack_str()
                 err_env = {
                     "code": "missing_tool",
@@ -482,7 +490,7 @@ async def execute_plan(body: Dict[str, Any]):
             args = _merge_inputs(step)
             t0 = time.time()
             # Use UTC runner directly; any exceptions bubble to the global exception handler.
-            res = await utc_run_tool(trace_id, sid, tool_name, args)
+            res = await utc_run_tool(trace_id_val, sid, tool_name, args)
             ok = False
             if isinstance(res, dict) and bool(res.get("ok")) is True and res.get("result") is not None:
                 produced[sid] = res.get("result")
@@ -509,7 +517,7 @@ async def execute_plan(body: Dict[str, Any]):
                     "stack": tb,
                 }
                 body = _build_executor_envelope(
-                    str(plan_obj.get("request_id") or trace_id or "executor-plan"),
+                    str(request_id_val or "executor-plan"),
                     False,
                     produced,
                     err_env,
@@ -522,13 +530,12 @@ async def execute_plan(body: Dict[str, Any]):
             # Distilled executor step finish skipped to avoid network exceptions
         for sid in runnable:
             pending.remove(sid)
-        logging.info(f"[executor] batch_finish trace_id={trace_id} runnable={batch_tools}")
-    logging.info(f"[executor] plan_finish trace_id={trace_id} produced_keys={sorted(list(produced.keys()))}")
+        logging.info(f"[executor] batch_finish trace_id={trace_id_val} runnable={batch_tools}")
+    logging.info(f"[executor] plan_finish trace_id={trace_id_val} produced_keys={sorted(list(produced.keys()))}")
     # For legacy execute_plan, still return a canonical executor envelope so
     # callers can rely on a single shape. No error object here because all
     # steps completed without tool_error.
-    rid = str(plan_obj.get("request_id") or trace_id or "executor-plan")
-    body = _build_executor_envelope(rid, True, produced, None)
+    body = _build_executor_envelope(str(request_id_val), True, produced, None)
     return JSONResponse(body, status_code=200)
 
 
@@ -570,6 +577,11 @@ async def run_steps(trace_id: str, request_id: str, steps: list[dict]) -> Dict[s
 
     dependencies: Dict[str, set[str]] = {sid: set((norm_steps[sid].get("needs") or [])) for sid in norm_steps}
     produced: Dict[str, Any] = {}
+    # Correlation fallback: if trace_id is missing/falsy, fall back to request_id.
+    # This preserves downstream trace correlation and debugging.
+    trace_corr = (str(trace_id).strip() if isinstance(trace_id, str) and str(trace_id).strip() else "") or (
+        str(request_id).strip() if isinstance(request_id, str) and str(request_id).strip() else ""
+    )
 
     def merge_inputs(step: Dict[str, Any]) -> Dict[str, Any]:
         merged = dict(step.get("inputs") or {})
@@ -578,19 +590,19 @@ async def run_steps(trace_id: str, request_id: str, steps: list[dict]) -> Dict[s
                 merged.update(produced[need])
         # Trace id must be stable and come from the /execute payload.
         # CID should be taken from step args when present; do not fabricate one.
-        if trace_id:
-            merged["trace_id"] = trace_id
+        if trace_corr:
+            merged["trace_id"] = trace_corr
         sid_local = (step.get("id") or "").strip()
         if sid_local:
             merged["step_id"] = sid_local
         return merged
 
     pending = set(norm_steps.keys())
-    logging.info(f"[executor] steps_start trace_id={trace_id} steps={len(pending)}")
+    logging.info(f"[executor] steps_start trace_id={trace_corr} steps={len(pending)}")
     _post_json(ORCHESTRATOR_BASE_URL.rstrip("/") + "/logs/tools.append", {
         "t": int(time.time()*1000),
         "event": "exec_plan_start",
-        "trace_id": trace_id,
+        "trace_id": trace_corr,
         "steps": len(pending),
     }, expected={})
 
@@ -608,18 +620,18 @@ async def run_steps(trace_id: str, request_id: str, steps: list[dict]) -> Dict[s
                         "code": "deadlock_or_missing",
                         "message": "executor detected a dependency deadlock or missing dependency",
                         "stack": _stack_str(),
-                        "trace_id": trace_id or request_id,
+                        "trace_id": trace_corr,
                     },
                     "status": 422,
                 },
             }
             break
         batch_tools = [{"step_id": sid, "tool": norm_steps[sid].get("tool")} for sid in runnable]
-        logging.info(f"[executor] batch_start trace_id={trace_id} runnable={batch_tools}")
+        logging.info(f"[executor] batch_start trace_id={trace_corr} runnable={batch_tools}")
         _post_json(ORCHESTRATOR_BASE_URL.rstrip("/") + "/logs/tools.append", {
             "t": int(time.time()*1000),
             "event": "exec_batch_start",
-            "trace_id": trace_id,
+            "trace_id": trace_corr,
             "items": batch_tools,
         }, expected={})
         for sid in runnable:
@@ -635,7 +647,7 @@ async def run_steps(trace_id: str, request_id: str, steps: list[dict]) -> Dict[s
                             "code": "missing_tool",
                             "message": f"missing tool for step {sid}",
                             "stack": _stack_str(),
-                            "trace_id": trace_id or request_id,
+                            "trace_id": trace_corr,
                         },
                         "status": 422,
                     },
@@ -649,13 +661,13 @@ async def run_steps(trace_id: str, request_id: str, steps: list[dict]) -> Dict[s
                 "t": int(time.time() * 1000),
                 "event": "exec_step_start",
                 "tool": tool_name,
-                "trace_id": trace_id,
+                "trace_id": trace_corr,
                 "step_id": sid,
             }
             if cid_val:
                 step_start_payload["cid"] = cid_val
             _post_json(ORCHESTRATOR_BASE_URL.rstrip("/") + "/logs/tools.append", step_start_payload, expected={})
-            res = await utc_run_tool(trace_id, sid, tool_name, args)
+            res = await utc_run_tool(trace_corr, sid, tool_name, args)
             ok = False
             # Guard: utc_run_tool must never return None/non-dict; if it does, wrap in a result block
             # that matches existing executor result structure (ids/meta/error/status), with a stack.
@@ -669,7 +681,7 @@ async def run_steps(trace_id: str, request_id: str, steps: list[dict]) -> Dict[s
                             "code": "executor_non_dict_result",
                             "message": f"utc_run_tool returned {type(res).__name__} for tool {tool_name}",
                             "stack": _stack_str(),
-                            "trace_id": trace_id or request_id,
+                            "trace_id": trace_corr,
                         },
                         "status": 422,
                     },
@@ -735,7 +747,11 @@ async def run_steps(trace_id: str, request_id: str, steps: list[dict]) -> Dict[s
                         "meta": {},
                         "error": error_dict,
                         "status": status_val,
-                        "trace_id": (res.get("trace_id") if isinstance(res.get("trace_id"), str) else (trace_id or request_id)),
+                        "trace_id": (
+                            res.get("trace_id")
+                            if isinstance(res.get("trace_id"), str) and str(res.get("trace_id")).strip()
+                            else trace_corr
+                        ),
                     },
                 }
             else:
@@ -747,7 +763,7 @@ async def run_steps(trace_id: str, request_id: str, steps: list[dict]) -> Dict[s
                 "tool": tool_name,
                 "ok": bool(ok),
                 "duration_ms": int((time.time() - t0) * 1000.0),
-                "trace_id": trace_id,
+                "trace_id": trace_corr,
                 "step_id": sid,
                 "error": (None if ok else "tool_error"),
                 "traceback": None,
@@ -761,7 +777,7 @@ async def run_steps(trace_id: str, request_id: str, steps: list[dict]) -> Dict[s
                 "t": int(time.time()*1000),
                 "event": "exec_step_finish",
                 "tool": tool_name,
-                "trace_id": trace_id,
+                "trace_id": trace_corr,
                 "step_id": sid,
                 "ok": bool(ok),
             }
@@ -770,18 +786,18 @@ async def run_steps(trace_id: str, request_id: str, steps: list[dict]) -> Dict[s
             _post_json(ORCHESTRATOR_BASE_URL.rstrip("/") + "/logs/tools.append", step_finish_payload, expected={})
         for sid in runnable:
             pending.remove(sid)
-        logging.info(f"[executor] batch_finish trace_id={trace_id} runnable={batch_tools}")
+        logging.info(f"[executor] batch_finish trace_id={trace_corr} runnable={batch_tools}")
         _post_json(ORCHESTRATOR_BASE_URL.rstrip("/") + "/logs/tools.append", {
             "t": int(time.time()*1000),
             "event": "exec_batch_finish",
-            "trace_id": trace_id,
+            "trace_id": trace_corr,
             "items": batch_tools,
         }, expected={})
-    logging.info(f"[executor] steps_finish trace_id={trace_id} produced_keys={sorted(list(produced.keys()))}")
+    logging.info(f"[executor] steps_finish trace_id={trace_corr} produced_keys={sorted(list(produced.keys()))}")
     _post_json(ORCHESTRATOR_BASE_URL.rstrip("/") + "/logs/tools.append", {
         "t": int(time.time()*1000),
         "event": "exec_plan_finish",
-        "trace_id": trace_id,
+        "trace_id": trace_corr,
         "produced_keys": sorted(list(produced.keys())),
     }, expected={})
     return produced

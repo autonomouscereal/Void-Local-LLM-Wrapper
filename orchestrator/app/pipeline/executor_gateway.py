@@ -8,20 +8,43 @@ import traceback
 from ..json_parser import JSONParser
 
 
-async def execute(tool_calls: List[Dict[str, Any]], trace_id: Optional[str], executor_base_url: str) -> List[Dict[str, Any]]:
+async def execute(
+    tool_calls: List[Dict[str, Any]],
+    trace_id: Optional[str],
+    executor_base_url: str,
+    *,
+    request_id: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     """
     Execute tool calls via the external executor /execute endpoint.
     Returns a per-step list with either {"name":..., "result": {...}} or {"name":"executor","error":...}.
     Never raises; uses body.ok semantics from the executor envelope.
     """
     steps: List[Dict[str, Any]] = []
-    for call in (tool_calls or [])[:5]:
+    parser = JSONParser()
+    for call in (tool_calls or []):
         call_dict = call if isinstance(call, dict) else {}
         name_val = call_dict.get("name") if isinstance(call_dict.get("name"), str) else ""
-        args_val = call_dict.get("arguments") if isinstance(call_dict.get("arguments"), dict) else {}
+        raw_args = call_dict.get("arguments", call_dict.get("args"))
+        # IMPORTANT: never silently drop tool arguments. The executor expects an
+        # object for step.args, so when arguments isn't a dict we preserve it
+        # under "_raw" rather than coercing to {}.
+        args_val: Dict[str, Any]
+        if isinstance(raw_args, dict):
+            args_val = dict(raw_args)
+        elif isinstance(raw_args, str):
+            parsed = parser.parse(raw_args, {})
+            args_val = dict(parsed) if isinstance(parsed, dict) else {"_raw": raw_args}
+        elif raw_args is None:
+            args_val = {}
+        else:
+            args_val = {"_raw": raw_args}
         steps.append({"tool": str(name_val or ""), "args": args_val})
-    rid = str(trace_id or _uuid.uuid4().hex)
-    payload = {"schema_version": 1, "request_id": rid, "trace_id": rid, "steps": steps}
+
+    # request_id (rid) and trace_id are distinct identifiers; never reuse one as the other.
+    rid = str(request_id or _uuid.uuid4().hex)
+    tid = str(trace_id or _uuid.uuid4().hex)
+    payload = {"schema_version": 1, "request_id": rid, "trace_id": tid, "steps": steps}
     base = (executor_base_url or "").rstrip("/")
     if not base:
         return [
@@ -36,7 +59,6 @@ async def execute(tool_calls: List[Dict[str, Any]], trace_id: Optional[str], exe
         ]
     async with _hx.AsyncClient(timeout=None, trust_env=False) as client:
         r = await client.post(base + "/execute", json=payload)
-        parser = JSONParser()
         raw_body = r.text or ""
         # The executor is expected to return a JSON envelope of the form
         # {"ok": bool, "result": {"produced": {...}}, "error": {...}}. When the
@@ -44,7 +66,7 @@ async def execute(tool_calls: List[Dict[str, Any]], trace_id: Optional[str], exe
         # the raw response text and HTTP status instead of collapsing to a
         # generic executor_error.
         schema = {"ok": bool, "result": dict, "error": dict}
-        env = parser.parse_superset(raw_body or "{}", schema)["coerced"]
+        env = parser.parse(raw_body or "{}", schema)
         if not isinstance(env, dict):
             env = {
                 "ok": False,

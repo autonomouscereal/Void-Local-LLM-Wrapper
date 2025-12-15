@@ -3,6 +3,8 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Tuple, Callable
 import unicodedata
 
+from ..state.ids import trace_id as _mint_trace_id
+
 
 def unicode_normalize_messages(msgs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
@@ -45,7 +47,7 @@ def shape_request(
     - No early exits (returns problems[] if body invalid)
     Outputs:
       messages, normalized_msgs, attachments, last_user_text, conv_cid,
-      trace_id, master_seed, mode, problems[]
+      request_id, trace_id, master_seed, mode, problems[]
     """
     out: Dict[str, Any] = {
         "messages": [],
@@ -53,6 +55,7 @@ def shape_request(
         "attachments": [],
         "last_user_text": "",
         "conv_cid": None,
+        "request_id": "",
         "trace_id": "",
         "master_seed": 0,
         "mode": "general",
@@ -104,11 +107,27 @@ def shape_request(
     # Server-mint a stable conversation id when client does not provide one.
     if conv_cid is None:
         conv_cid = "chat_" + _hl.sha256(msgs_for_seed.encode("utf-8")).hexdigest()[:16]
-    trace_id = f"cid_{conv_cid}" if conv_cid else "tt_" + _hl.sha256(msgs_for_seed.encode("utf-8")).hexdigest()[:16]
-    # Allow client-provided idempotency key to override trace_id for deduplication
-    ikey = body.get("idempotency_key")
-    if isinstance(ikey, str) and len(ikey) >= 8:
-        trace_id = ikey.strip()
+
+    # Request id (rid) and trace id (trace_id) are distinct identifiers.
+    # - request_id: client-visible per-request envelope id; can be supplied by clients.
+    # - trace_id: server-minted tracing correlation id for internal logs/locks.
+    import uuid as _uuid
+
+    request_id = ""
+    if isinstance(body.get("request_id"), (str, int)) and str(body.get("request_id")).strip():
+        request_id = str(body.get("request_id")).strip()
+    else:
+        ikey = body.get("idempotency_key")
+        if isinstance(ikey, str) and ikey.strip():
+            request_id = ikey.strip()
+        else:
+            request_id = _uuid.uuid4().hex
+
+    trace_id = ""
+    if isinstance(body.get("trace_id"), (str, int)) and str(body.get("trace_id")).strip():
+        trace_id = str(body.get("trace_id")).strip()
+    else:
+        trace_id = _mint_trace_id()
     # Output
     out.update(
         {
@@ -117,6 +136,7 @@ def shape_request(
             "attachments": attachments,
             "last_user_text": last_user_text,
             "conv_cid": conv_cid,
+            "request_id": request_id,
             "trace_id": trace_id,
             "master_seed": master_seed,
             "mode": mode,

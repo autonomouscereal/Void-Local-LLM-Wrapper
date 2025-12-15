@@ -163,10 +163,7 @@ async def plan_song_graph(
     schema_wrapper = {"song": SONG_GRAPH_SCHEMA}
     profile_txt = ""
     if isinstance(music_profile, dict) and music_profile:
-        try:
-            profile_txt = json.dumps(music_profile, ensure_ascii=False)
-        except Exception:
-            profile_txt = ""
+        profile_txt = json.dumps(music_profile, ensure_ascii=False, default=str)
     prompt = (
         frames_text
         + "\n\n"

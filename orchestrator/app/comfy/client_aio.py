@@ -20,8 +20,8 @@ BASE = (
 
 
 async def comfy_submit(graph: Dict[str, Any], client_id: Optional[str] = None, ws=None) -> Dict[str, Any]:
-    cid = client_id or str(uuid.uuid4())
-    payload = {"prompt": graph.get("prompt") or graph, "client_id": cid}
+    comfy_client_id = client_id or str(uuid.uuid4())
+    payload = {"prompt": graph.get("prompt") or graph, "client_id": comfy_client_id}
     # Validate/shape payload with project JSON parser
     body_bytes = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     logging.info(f"[comfy.submit] bytes={len(body_bytes)}")
@@ -51,8 +51,7 @@ async def comfy_submit(graph: Dict[str, Any], client_id: Optional[str] = None, w
                 return err
             parser = JSONParser()
             schema = {"prompt_id": str, "uuid": str, "id": str}
-            sup = parser.parse_superset(text, schema)
-            return sup["coerced"]
+            return parser.parse(text, schema)
 
 
 async def comfy_history(prompt_id: str) -> Dict[str, Any]:
@@ -72,8 +71,7 @@ async def comfy_history(prompt_id: str) -> Dict[str, Any]:
                 }
             parser = JSONParser()
             schema = {"history": dict}
-            sup = parser.parse_superset(text, schema)
-            return sup["coerced"]
+            return parser.parse(text, schema)
 
 
 def comfy_is_completed(detail: Dict[str, Any]) -> bool:
@@ -108,8 +106,7 @@ async def comfy_upload_image(name_hint: str, b64_png: str) -> str:
                 return filename
         parser = JSONParser()
         schema = {"name": str}
-        sup = parser.parse_superset(text, schema)
-        obj = sup["coerced"]
+        obj = parser.parse(text, schema)
         stored = obj.get("name") or filename if isinstance(obj, dict) else filename
         return stored
 
@@ -127,8 +124,7 @@ async def comfy_upload_mask(name_hint: str, b64_png: str) -> str:
                 return filename
         parser = JSONParser()
         schema = {"name": str}
-        sup = parser.parse_superset(text, schema)
-        obj = sup["coerced"]
+        obj = parser.parse(text, schema)
         return obj.get("name") or filename if isinstance(obj, dict) else filename
 
 
@@ -150,8 +146,7 @@ async def comfy_object_info(session: aiohttp.ClientSession, node_class: str) -> 
             return {}
     parser = JSONParser()
     schema = {"inputs": dict}
-    sup = parser.parse_superset(text, schema)
-    obj = sup["coerced"]
+    obj = parser.parse(text, schema)
     return obj if isinstance(obj, dict) else {}
 
 

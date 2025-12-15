@@ -38,8 +38,7 @@ def list_prompts() -> List[Dict[str, Any]]:
                 with open(os.path.join(ROOT, f), "r", encoding="utf-8") as fh:
                     parser = JSONParser()
                     # Prompt records are arbitrary dicts; coerce to generic mapping.
-                    sup = parser.parse_superset(fh.read(), dict)
-                    data = sup["coerced"]
+                    data = parser.parse(fh.read(), {})
                     if isinstance(data, dict):
                         out.append(data)
             except Exception:

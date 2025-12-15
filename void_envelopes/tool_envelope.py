@@ -23,7 +23,7 @@ def _build_success_envelope(result: Dict[str, Any] | None, rid: str) -> Dict[str
         meta_part = res_obj.get("meta") if isinstance(res_obj.get("meta"), dict) else {}
         if isinstance(meta_part, dict):
             if not cid_val:
-                cid_val = meta_part.get("cid") or (meta_part.get("ids") or {}).get("client_id")
+                cid_val = meta_part.get("cid")
             if not trace_val:
                 trace_val = meta_part.get("trace_id") or (meta_part.get("ids") or {}).get("trace_id")
 

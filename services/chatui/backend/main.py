@@ -125,8 +125,7 @@ def _decode_json(value: Any) -> Dict[str, Any]:
         parser = JSONParser()
         try:
             expected = {"text": str}
-            sup = parser.parse_superset(value, expected)
-            obj = sup["coerced"]
+            obj = parser.parse(value, expected)
             if isinstance(obj, dict) and obj:
                 return obj
         except Exception:

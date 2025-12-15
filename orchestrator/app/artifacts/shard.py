@@ -34,8 +34,7 @@ def _read_json(path: str) -> Optional[dict]:
         with open(path, "r", encoding="utf-8") as f:
             parser = JSONParser()
             # Shard index metadata is arbitrary; coerce to generic mapping.
-            sup = parser.parse_superset(f.read(), dict)
-            data = sup["coerced"]
+            data = parser.parse(f.read(), {})
             return data if isinstance(data, dict) else None
     except FileNotFoundError:
         return None

@@ -21,12 +21,13 @@ Canonical segment schema and helpers for QA/committee wiring.
 SegmentResult is represented as a plain dict with the following expected keys:
 
 {
-    "id": str,                  # stable segment id (e.g. "<tool>:<parent_cid>:<index>")
+    "id": str,                  # stable segment id (e.g. "<tool>:<trace_id>:<index>")
     "tool": str,                # tool name, e.g. "image.dispatch"
     "domain": str,              # "image" | "music" | "tts" | "sfx" | "video" | "film2"
     "name": str | None,         # optional human label
     "index": int,               # 0-based index within parent result
-    "parent_cid": str | None,   # job cid / trace_id / clip id
+    "trace_id": str,            # parent trace identifier for correlation
+    "cid": str | None,          # conversation/client id (when available)
     "result": dict,             # raw segment-level tool result slice
     "meta": {
         "locks": dict | None,   # lock bundle snapshot or subset
@@ -133,11 +134,12 @@ def _extract_artifacts(result: Dict[str, Any]) -> List[Dict[str, Any]]:
 def _base_segment(
     tool_name: str,
     domain: str,
-    parent_cid: Optional[str],
+    trace_id: str,
+    cid: Optional[str],
     index: int,
     result: Dict[str, Any],
 ) -> SegmentResult:
-    seg_id = f"{tool_name}:{parent_cid or ''}:{index}"
+    seg_id = f"{tool_name}:{trace_id}:{index}"
     locks = _extract_locks_from_result(result)
     profile = _extract_profile_from_result(result)
     segment: SegmentResult = {
@@ -146,7 +148,8 @@ def _base_segment(
         "domain": domain,
         "name": None,
         "index": index,
-        "parent_cid": parent_cid,
+        "trace_id": trace_id,
+        "cid": cid,
         "result": result,
         "meta": {
             "locks": locks,
@@ -166,7 +169,8 @@ def _base_segment(
 
 def build_image_segments_from_result(
     tool_name: str,
-    parent_cid: Optional[str],
+    trace_id: str,
+    cid: Optional[str],
     result: Dict[str, Any],
 ) -> List[SegmentResult]:
     """
@@ -199,7 +203,7 @@ def build_image_segments_from_result(
                 image_arts.append(item)
     # Fallback: if no explicit image artifacts, treat the whole result as one segment.
     if not image_arts:
-        seg = _base_segment(tool_name, "image", parent_cid, 0, result)
+        seg = _base_segment(tool_name, "image", trace_id, cid, 0, result)
         return [seg]
     meta_src = result.get("meta") if isinstance(result.get("meta"), dict) else {}
     qa_src = result.get("qa") if isinstance(result.get("qa"), dict) else {}
@@ -219,14 +223,15 @@ def build_image_segments_from_result(
         if isinstance(ids_src, dict):
             img_result["ids"] = dict(ids_src)
         img_result["artifacts"] = [art]
-        seg = _base_segment(tool_name, "image", parent_cid, idx, img_result)
+        seg = _base_segment(tool_name, "image", trace_id, cid, idx, img_result)
         segments.append(seg)
     return segments
 
 
 def build_music_segments_from_result(
     tool_name: str,
-    parent_cid: Optional[str],
+    trace_id: str,
+    cid: Optional[str],
     result: Dict[str, Any],
 ) -> List[SegmentResult]:
     """
@@ -242,7 +247,7 @@ def build_music_segments_from_result(
     meta_obj = result.get("meta") if isinstance(result.get("meta"), dict) else {}
     windows = meta_obj.get("windows") if isinstance(meta_obj.get("windows"), list) else []
     if not windows:
-        seg = _base_segment(tool_name, "music", parent_cid, 0, result)
+        seg = _base_segment(tool_name, "music", trace_id, cid, 0, result)
         return [seg]
     segments: List[SegmentResult] = []
     for index, win in enumerate(windows):
@@ -275,72 +280,77 @@ def build_music_segments_from_result(
                     "extra": {"window_id": window_id, "section_id": section_id},
                 }
             ]
-        seg = _base_segment(tool_name, "music", parent_cid, index, seg_result)
-        seg["name"] = str(window_id)
+        seg = _base_segment(tool_name, "music", trace_id, cid, index, seg_result)
+        seg['name'] = str(window_id)
         segments.append(seg)
     if not segments:
-        seg = _base_segment(tool_name, "music", parent_cid, 0, result)
+        seg = _base_segment(tool_name, "music", trace_id, cid, 0, result)
         return [seg]
     return segments
 
 
 def build_tts_segments_from_result(
     tool_name: str,
-    parent_cid: Optional[str],
+    trace_id: str,
+    cid: Optional[str],
     result: Dict[str, Any],
 ) -> List[SegmentResult]:
     """Build SegmentResult list for TTS tools. For now: one segment per full utterance."""
     if not isinstance(result, dict):
         return []
-    seg = _base_segment(tool_name, "tts", parent_cid, 0, result)
+    seg = _base_segment(tool_name, "tts", trace_id, cid, 0, result)
     return [seg]
 
 
 def build_sfx_segments_from_result(
     tool_name: str,
-    parent_cid: Optional[str],
+    trace_id: str,
+    cid: Optional[str],
     result: Dict[str, Any],
 ) -> List[SegmentResult]:
     """Build SegmentResult list for SFX tools. For now: one segment per call."""
     if not isinstance(result, dict):
         return []
-    seg = _base_segment(tool_name, "sfx", parent_cid, 0, result)
+    seg = _base_segment(tool_name, "sfx", trace_id, cid, 0, result)
     return [seg]
 
 
 def build_video_segments_from_result(
     tool_name: str,
-    parent_cid: Optional[str],
+    trace_id: str,
+    cid: Optional[str],
     result: Dict[str, Any],
 ) -> List[SegmentResult]:
     """Build SegmentResult list for video/film2 tools. For now: one segment per call."""
     if not isinstance(result, dict):
         return []
     domain = "film2" if tool_name == "film2.run" else "video"
-    seg = _base_segment(tool_name, domain, parent_cid, 0, result)
+    seg = _base_segment(tool_name, domain, trace_id, cid, 0, result)
     return [seg]
 
 
 def build_segments_for_tool(
     tool_name: str,
-    parent_cid: Optional[str],
+    *,
+    trace_id: str,
+    cid: Optional[str],
     result: Dict[str, Any],
 ) -> List[SegmentResult]:
     """Dispatch to the appropriate builder based on tool name."""
     if not isinstance(tool_name, str):
         return []
     if tool_name.startswith("image."):
-        return build_image_segments_from_result(tool_name, parent_cid, result)
+        return build_image_segments_from_result(tool_name, trace_id, cid, result)
     if tool_name.startswith("music."):
-        return build_music_segments_from_result(tool_name, parent_cid, result)
+        return build_music_segments_from_result(tool_name, trace_id, cid, result)
     if tool_name == "tts.speak":
-        return build_tts_segments_from_result(tool_name, parent_cid, result)
+        return build_tts_segments_from_result(tool_name, trace_id, cid, result)
     if tool_name == "audio.sfx.compose":
-        return build_sfx_segments_from_result(tool_name, parent_cid, result)
+        return build_sfx_segments_from_result(tool_name, trace_id, cid, result)
     if tool_name.startswith("video.") or tool_name == "film2.run":
-        return build_video_segments_from_result(tool_name, parent_cid, result)
+        return build_video_segments_from_result(tool_name, trace_id, cid, result)
     # Fallback: treat as generic segment with unknown domain
-    return build_video_segments_from_result(tool_name, parent_cid, result)
+    return build_video_segments_from_result(tool_name, trace_id, cid, result)
 
 
 # Patch tool whitelist for committee patch plans.
@@ -610,9 +620,9 @@ def enrich_patch_plan_for_music_segments(
             if isinstance(locks_val, dict):
                 args["lock_bundle"] = locks_val
         if "cid" not in args:
-            parent_cid = seg.get("parent_cid")
-            if isinstance(parent_cid, str) and parent_cid:
-                args["cid"] = parent_cid
+            cid_val = seg.get("cid")
+            if isinstance(cid_val, str) and cid_val:
+                args["cid"] = cid_val
         enriched.append({"tool": tool_name, "segment_id": seg_id, "args": args})
     return enriched
 
@@ -677,7 +687,7 @@ async def apply_patch_plan(
                         seg_domain = target_segment.get("domain")
                         seg_meta = target_segment.get("meta") if isinstance(target_segment.get("meta"), dict) else {}
                         seg_locks = target_segment.get("locks") if isinstance(target_segment.get("locks"), dict) else None
-                        parent_cid = target_segment.get("parent_cid")
+                        cid_val = target_segment.get("cid")
                         new_artifacts = res_obj.get("artifacts") if isinstance(res_obj.get("artifacts"), list) else []
                         artifact_path: Optional[str] = None
                         artifact_view: Optional[str] = None
@@ -697,7 +707,7 @@ async def apply_patch_plan(
                             "patch_tool": tool_name,
                             "segment_id": seg_id,
                             "domain": seg_domain,
-                            "parent_cid": parent_cid,
+                            "cid": cid_val,
                             "args": args,
                             "locks": seg_locks,
                             "result_meta": res_obj.get("meta") if isinstance(res_obj.get("meta"), dict) else {},
