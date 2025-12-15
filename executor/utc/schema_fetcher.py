@@ -16,10 +16,11 @@ def _hash_schema(schema: Dict[str, Any]) -> str:
     return hashlib.sha256(compact).hexdigest()
 
 
-def _get(url: str) -> Dict[str, Any]:
+def _post(url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     import urllib.request
 
-    req = urllib.request.Request(url, headers={"Content-Type": "application/json"}, method="GET")
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
     with urllib.request.urlopen(req) as resp:
         raw = resp.read().decode("utf-8", errors="replace")
     try:
@@ -27,15 +28,15 @@ def _get(url: str) -> Dict[str, Any]:
         obj = parser.parse(raw, {}) or {}
         return obj if isinstance(obj, dict) else {}
     except Exception as e:
-        logging.error("schema_fetcher._get failed for url=%s: %s\n%s", url, e, traceback.format_exc())
+        logging.error("schema_fetcher._post failed for url=%s: %s\n%s", url, e, traceback.format_exc())
         return {}
 
 
 async def fetch(name: str) -> Dict[str, Any]:
     """Fetch tool describe and cache to Postgres (best-effort)."""
     base = os.getenv("ORCHESTRATOR_BASE_URL", "http://127.0.0.1:8000")
-    url = base.rstrip("/") + f"/tool.describe?name={name}"
-    obj = _get(url)
+    url = base.rstrip("/") + "/tool.describe"
+    obj = _post(url, {"name": name})
     res = (obj or {}).get("result") or {}
     schema = res.get("schema") or {}
     version = res.get("version") or "1"

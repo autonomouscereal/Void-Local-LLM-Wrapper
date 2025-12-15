@@ -366,7 +366,7 @@ class FetcherParser:
             out["og"] = og
             # JSON-LD
             jsonld_list: List[Dict[str, Any]] = []
-            from void_json.json_parser import JSONParser
+            from void_json import JSONParser
 
             parser = JSONParser()
             for sc in soup.select('script[type="application/ld+json"]'):

@@ -10,7 +10,7 @@ from typing import Dict, Any
 
 import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential
-from void_json.json_parser import JSONParser
+from void_json import JSONParser
 
 
 COOKIES_FILE = os.getenv("MEDIA_COOKIES_FILE", "")

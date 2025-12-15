@@ -1,83 +1,57 @@
 from __future__ import annotations
 
-import hashlib
-import json
-from fastapi import APIRouter, Query, Response
+from fastapi import FastAPI
 from typing import Any, Dict
 
 from ..tools_schema import get_tool_introspection_registry
 from .toolrun import ToolEnvelope  # canonical envelope
 
 
-router = APIRouter()
+def mount_tools_routes(app: FastAPI) -> None:
+    """
+    Mount tool schema introspection endpoints directly onto the FastAPI app.
 
+    Policy: JSON-in only. No query params. No headers/ETag behaviors.
+    """
 
-@router.get("/tool.list")
-async def tool_list():
-    tools = []
-    for n, meta in (get_tool_introspection_registry() or {}).items():
-        tools.append(
-            {
-                "name": n,
-                "version": meta.get("version"),
-                "kind": meta.get("kind"),
-                "describe_url": f"/tool.describe?name={n}",
-            }
-        )
-    return ToolEnvelope.success({"tools": tools}, request_id="tool.list")
+    async def tool_list(body: Dict[str, Any]) -> Dict[str, Any]:
+        # body is accepted for policy consistency; currently unused.
+        tools = []
+        for n, meta in (get_tool_introspection_registry() or {}).items():
+            tools.append(
+                {
+                    "name": n,
+                    "version": meta.get("version"),
+                    "kind": meta.get("kind"),
+                }
+            )
+        return ToolEnvelope.success({"tools": tools}, request_id="tool.list")
 
-
-@router.get("/tool.describe")
-async def tool_describe(name: str = Query(..., alias="name"), response: Response | None = None):
-    key = (name or "").strip()
-    # Prefer canonical schema derived from tools_schema.py (single source of truth).
-    meta = get_tool_introspection_registry([key]).get(key)
-    if isinstance(meta, dict) and isinstance(meta.get("schema"), dict):
-        schema = meta.get("schema") or {}
-        compact = json.dumps(schema, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        shash = hashlib.sha256(compact).hexdigest()
-        if response is not None:
-            try:
-                response.headers["ETag"] = f'W/"{shash}"'
-            except Exception:
-                pass
-        return ToolEnvelope.success(
-            {
-                "name": meta.get("name") or key,
-                "version": meta.get("version"),
-                "kind": meta.get("kind"),
-                "schema": schema,
-                "schema_hash": shash,
-                "notes": meta.get("notes"),
-                "examples": meta.get("examples", []),
-            },
+    async def tool_describe(body: Dict[str, Any]) -> Dict[str, Any]:
+        name = ((body or {}).get("name") or "").strip()
+        meta = get_tool_introspection_registry([name]).get(name)
+        if isinstance(meta, dict) and isinstance(meta.get("schema"), dict):
+            return ToolEnvelope.success(
+                {
+                    "name": meta.get("name") or name,
+                    "version": meta.get("version"),
+                    "kind": meta.get("kind"),
+                    "schema": meta.get("schema") or {},
+                    "notes": meta.get("notes"),
+                    "examples": meta.get("examples", []),
+                },
+                request_id="tool.describe",
+            )
+        return ToolEnvelope.failure(
+            "tool_not_found",
+            f"unknown tool '{name}'",
+            status=404,
             request_id="tool.describe",
+            details={},
         )
-    return ToolEnvelope.failure(
-        "tool_not_found",
-        f"unknown tool '{name}'",
-        status=404,
-        request_id="tool.describe",
-        details={},
-    )
 
-
-@router.post("/tool.describe")
-async def tool_describe_post(body: Dict[str, Any]):
-    name = ((body or {}).get("name") or "").strip()
-    meta = get_tool_introspection_registry([name]).get(name)
-    # Preferred: expose input_schema for executor auto-fix use.
-    if isinstance(meta, dict) and isinstance(meta.get("schema"), dict):
-        return ToolEnvelope.success(
-            {"input_schema": meta.get("schema")},
-            request_id="tool.describe",
-        )
-    return ToolEnvelope.failure(
-        "tool_not_found",
-        f"unknown tool '{name}'",
-        status=404,
-        request_id="tool.describe",
-        details={},
-    )
+    # JSON-only endpoints
+    app.add_api_route("/tool.list", tool_list, methods=["POST"])
+    app.add_api_route("/tool.describe", tool_describe, methods=["POST"])
 
 

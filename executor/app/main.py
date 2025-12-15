@@ -14,7 +14,7 @@ import urllib.error
 import traceback
 import logging, sys
 sys.path.append("/workspace")
-from orchestrator.app.json_parser import JSONParser  # use the same hardened JSON parser
+from void_json import JSONParser  # shared hardened JSON parser
 
 import psutil
 from fastapi import FastAPI

@@ -1135,10 +1135,10 @@ def _get_music_acceptance_thresholds() -> Dict[str, float]:
 app = FastAPI(title="Void Orchestrator", version="0.1.0")
 # Mount canonical tool routes (validate/run) so /tool.run is served by the orchestrator
 from app.routes import toolrun as _toolrun_routes  # type: ignore
-from app.routes import tools as _tools_routes  # type: ignore
+from app.routes.tools import mount_tools_routes as _mount_tools_routes  # type: ignore
 from void_envelopes import ToolEnvelope  # canonical envelope (shared)
 app.include_router(_toolrun_routes.router)
-app.include_router(_tools_routes.router)
+_mount_tools_routes(app)
 # Middleware order matters: last added runs first.
 # We want Preflight to run FIRST, so add it LAST.
 from .middleware.ws_permissive import PermissiveWebSocketMiddleware
@@ -2284,7 +2284,7 @@ async def propose_search_queries(messages: List[Dict[str, Any]]) -> List[str]:
 def meta_prompt(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     # Policy/system frames (treated as MISC; inserted before RoE tail)
     system_preface = (
-        "You are part of a two-model team with explicit roles: a Planner and Executors. "
+        "You are part of a model team with explicit roles: a Planner and Executors. "
         "Planner decomposes the task, chooses tools, and requests relevant evidence. Executors produce solutions and critiques. "
         "You execute tools yourself. Never ask the user to run code or call tools; do not output scripts for the user to execute. "
         "Be precise, show working when non-trivial, and when a tool can fulfill the request, invoke it directly. "

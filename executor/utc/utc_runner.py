@@ -8,7 +8,7 @@ import random
 import json
 
 import requests
-from orchestrator.app.json_parser import JSONParser  # type: ignore
+from void_json import JSONParser
 from .schema_fetcher import fetch as fetch_schema
 from .universal_adapter import repair as repair_args
 from .patch_store import preapply as preapply_patch, persist_success as persist_patch
