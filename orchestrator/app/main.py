@@ -7894,7 +7894,7 @@ def _as_float(v: Any, default: float = 0.0) -> float:
 
 @app.post("/v1/chat/completions")
 async def chat_completions(body: Dict[str, Any], request: Request):
-    env = await committee_ai_text(messages=(body.get("messages") or []), trace_id=uuid.uuid4().hex)
+    env = await committee_ai_text(messages=(body.get("messages")), trace_id=uuid.uuid4().hex)
     log.debug(f"chat_completions:env={env}")
     log.debug(f'''produce_tool_plan:env={await produce_tool_plan(messages=(body.get("messages") or []), trace_id=uuid.uuid4().hex)}''')
     return JSONResponse(content=env, status_code=200)
