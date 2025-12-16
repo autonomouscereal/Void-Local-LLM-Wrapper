@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any, Dict, List
+import os
 import logging
 import json
 
@@ -8,10 +9,18 @@ from ..pipeline.assets import collect_urls as assets_collect_urls
 from ..plan.catalog import PLANNER_VISIBLE_TOOLS
 from ..pipeline.catalog import build_allowed_tool_names as catalog_allowed
 from ..tools_schema import get_builtin_tools_schema
-from ..committee_client import committee_ai_text, committee_jsonify, STATE_DIR
+from ..committee_client import committee_ai_text, committee_jsonify
 from ..trace_utils import emit_trace
 
 log = logging.getLogger(__name__)
+
+# Trace storage root is sourced from environment to avoid importing runtime-heavy modules
+# (and to keep this module usable in isolation).
+_STATE_DIR_ENV = (os.getenv("STATE_DIR", "") or "").strip()
+if _STATE_DIR_ENV:
+    STATE_DIR = _STATE_DIR_ENV
+else:
+    STATE_DIR = os.path.join(os.getenv("UPLOAD_DIR", "/workspace/uploads"), "state")
 
 
 def build_delta_plan(scores: Dict[str, Any]) -> Dict[str, Any]:
