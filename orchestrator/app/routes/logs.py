@@ -10,7 +10,9 @@ from app.json_parser import JSONParser
 
 
 router = APIRouter()
-STATE_DIR = os.environ.get("STATE_DIR_LOCAL", "/workspace/state")
+UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/workspace/uploads")
+STATE_DIR = os.path.join(UPLOAD_DIR, "state")
+os.makedirs(STATE_DIR, exist_ok=True)
 
 
 @router.post("/logs/tools.append")

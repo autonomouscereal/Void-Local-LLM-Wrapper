@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import threading
 import json
 import time
 import logging
@@ -11,7 +10,6 @@ from ..json_parser import JSONParser
 
 
 _LOG = logging.getLogger(__name__)
-_LOCK = threading.RLock()
 _CTX: Dict[str, List[Dict[str, Any]]] = {}
 _GLOBAL_PATH = os.getenv("ARTIFACTS_INDEX_PATH", os.path.join("/workspace", "uploads", "artifacts", "index.jsonl"))
 _TEXT_EMB_MODEL = os.getenv("EMBEDDING_MODEL_NAME", "BAAI/bge-large-en-v1.5")
@@ -114,8 +112,7 @@ def add_artifact(cid: str, kind: str, path: str, url: Optional[str] = None, pare
         dc = _dominant_color(path)
         if dc:
             rec["dominant_rgb"] = dc
-    with _LOCK:
-        _CTX.setdefault(cid, []).append(rec)
+    _CTX.setdefault(cid, []).append(rec)
     # Append to global NDJSON for cross-conversation memory
     try:
         os.makedirs(os.path.dirname(_GLOBAL_PATH), exist_ok=True)
@@ -144,8 +141,7 @@ def add_artifact(cid: str, kind: str, path: str, url: Optional[str] = None, pare
 def resolve_reference(cid: str, text: str, kind_hint: Optional[str] = None) -> Optional[Dict[str, Any]]:
     if not isinstance(cid, str) or not cid:
         return None
-    with _LOCK:
-        items = list(_CTX.get(cid) or [])
+    items = list(_CTX.get(cid) or [])
     if not items:
         return None
     # Filter by kind hint if provided
@@ -189,8 +185,7 @@ def resolve_reference(cid: str, text: str, kind_hint: Optional[str] = None) -> O
 
 
 def list_recent(cid: str, limit: int = 10, kind_hint: Optional[str] = None) -> List[Dict[str, Any]]:
-    with _LOCK:
-        items = list(_CTX.get(cid) or [])
+    items = list(_CTX.get(cid) or [])
     if kind_hint:
         items = [it for it in items if it.get("kind", "").startswith(kind_hint)]
     return items[-limit:]

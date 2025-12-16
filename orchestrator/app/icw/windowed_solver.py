@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+import inspect
 from types import SimpleNamespace
 
 from .assembler import assemble_window
@@ -19,7 +20,7 @@ from ..adapters.providers import model_chat_with_retry, ProviderError
 
 log = logging.getLogger("orchestrator.icw.windowed_solver")
 
-def solve(
+async def solve(
     request: dict,
     global_state: dict,
     model,
@@ -45,7 +46,8 @@ def solve(
         return SimpleNamespace(kind="HALT", partials=["<HALT state=\"00000000\" outcome=\"error:model_none\"/>"], state=global_state)
     try:
         ctx_tokens = int(model_ctx_limit_tokens)
-    except Exception:
+    except Exception as exc:
+        log.warning("icw.windowed_solver bad model_ctx_limit_tokens=%r: %s", model_ctx_limit_tokens, exc, exc_info=True)
         ctx_tokens = 0
     if ctx_tokens <= 0:
         log.error("icw.windowed_solver invalid model_ctx_limit_tokens=%r", model_ctx_limit_tokens)
@@ -55,10 +57,18 @@ def solve(
     step = 0
     in_budget = byte_budget_for_model(ctx_tokens)
     state_hashes: list[str] = []
-    # Governor knobs
-    step_tokens = int(step_out_tokens)
-    min_tokens = max(200, int(step_out_tokens * 0.4))
-    max_tokens_soft = int(step_out_tokens * 1.8)
+    # Governor knobs (defensive: these may be str-ish from upstream config).
+    try:
+        _step_out = int(step_out_tokens)
+    except Exception as exc:  # pragma: no cover - defensive logging
+        log.error("icw.windowed_solver bad step_out_tokens=%r; defaulting to 900", step_out_tokens, exc_info=True)
+        _step_out = 900
+    if _step_out <= 0:
+        log.error("icw.windowed_solver invalid step_out_tokens=%r; defaulting to 900", step_out_tokens)
+        _step_out = 900
+    step_tokens = int(_step_out)
+    min_tokens = max(200, int(_step_out * 0.4))
+    max_tokens_soft = int(_step_out * 1.8)
     try:
         threshold = int(str(os.getenv("ICW_STALL_N", "3") or "3").strip() or "3")
     except Exception as exc:  # pragma: no cover - defensive logging
@@ -99,7 +109,10 @@ def solve(
         asm_ms = int((time.perf_counter() - t_asm) * 1000)
         if progress:
             try:
-                progress(step, "window", {"input_bytes": bytes_len(window.prompt), "step_tokens": step_tokens})
+                pr = progress(step, "window", {"input_bytes": bytes_len(window.prompt), "step_tokens": step_tokens})
+                # Explicit await only (no background scheduling). If a coroutine is returned, await it here.
+                if inspect.isawaitable(pr):
+                    await pr
             except Exception as exc:  # pragma: no cover - defensive logging
                 # Progress is optional instrumentation; never allow it to break ICW.
                 log.error("icw.windowed_solver progress(window) failed: %s", exc, exc_info=True)
@@ -168,7 +181,9 @@ def solve(
                 step_tokens = max(min_tokens, int(step_tokens * 0.8))
         if progress:
             try:
-                progress(step, "step", {"kind": kind, "out_len": out_chars, "step_tokens": step_tokens})
+                pr = progress(step, "step", {"kind": kind, "out_len": out_chars, "step_tokens": step_tokens})
+                if inspect.isawaitable(pr):
+                    await pr
             except Exception as exc:  # pragma: no cover - defensive logging
                 log.error("icw.windowed_solver progress(step) failed: %s", exc, exc_info=True)
         # Update state (lightweight)
@@ -180,7 +195,9 @@ def solve(
         global_state["last_cont_hash"] = cont_hash or global_state["state_hash"]
     if progress:
         try:
-            progress(step, "halt", {"reason": "max_steps"})
+            pr = progress(step, "halt", {"reason": "max_steps"})
+            if inspect.isawaitable(pr):
+                await pr
         except Exception as exc:  # pragma: no cover - defensive logging
             log.error("icw.windowed_solver progress(halt) failed: %s", exc, exc_info=True)
     return SimpleNamespace(kind="HALT", partials=partials, state=global_state)

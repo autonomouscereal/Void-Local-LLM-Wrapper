@@ -119,7 +119,7 @@ def plan_vocal_segments(song_graph: Dict[str, Any], windows: List[Dict[str, Any]
     return segments
 
 
-def render_vocal_stems_for_track(
+async def render_vocal_stems_for_track(
     job: Dict[str, Any],
     song_graph: Dict[str, Any],
     windows: List[Dict[str, Any]],
@@ -168,7 +168,7 @@ def render_vocal_stems_for_track(
             "lock_bundle": lock_bundle,
             "cid": cid,
         }
-        env = run_tts_speak(tts_job, tts_provider, manifest)
+        env = await run_tts_speak(tts_job, tts_provider, manifest)
         # run_tts_speak returns either an error envelope or a normal envelope.
         if not isinstance(env, dict):
             import traceback as _tb

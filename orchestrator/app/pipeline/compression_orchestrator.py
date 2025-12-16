@@ -118,7 +118,7 @@ def _co_frames_baseline() -> Dict[str, str]:
             "==================================================\n"
             "8) TRACING & LOGGING\n"
             "==================================================\n"
-            "- Every run produces deterministic traces: requests.jsonl, events.jsonl, tools.jsonl, artifacts.jsonl, responses.jsonl; errors.jsonl for verbose details.\n"
+            "- Every run produces deterministic traces in a single stream: traces/<trace_id>/trace.jsonl.\n"
             "- Include breadcrumbs: chat.start, planner.*, committee.*, exec.payload (pre & patched), validate.*, repair.*, tool.run.start, Comfy submit/poll, chat.finish.\n"
             "- Errors are explicit, never logged-and-forgotten.\n\n"
             "==================================================\n"

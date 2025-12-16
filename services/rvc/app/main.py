@@ -8,6 +8,7 @@ import json
 import base64
 import glob
 import io
+import shutil
 import logging
 import traceback
 import sys
@@ -57,6 +58,13 @@ RVC_MODEL_ROOT = os.getenv("RVC_MODEL_ROOT", "/opt/models/rvc_titan")
 
 # RVC models root (shared with rvc_python and rvc_trainer)
 RVC_MODELS_ROOT = os.getenv("RVC_MODELS_ROOT", "/srv/rvc_models")
+
+# Default voices (do NOT require env vars). For now, point both male/female at the
+# base Titan checkpoint directory set up by services/rvc_python/entrypoint.sh:
+#   /srv/rvc_models/TITAN/TITAN.pth
+_DEFAULT_TITAN_VOICE_ID = "TITAN"
+RVC_DEFAULT_MALE_VOICE_ID = (os.getenv("RVC_DEFAULT_MALE_VOICE_ID") or _DEFAULT_TITAN_VOICE_ID).strip() or _DEFAULT_TITAN_VOICE_ID
+RVC_DEFAULT_FEMALE_VOICE_ID = (os.getenv("RVC_DEFAULT_FEMALE_VOICE_ID") or _DEFAULT_TITAN_VOICE_ID).strip() or _DEFAULT_TITAN_VOICE_ID
 
 # External rvc-python engine base URL
 RVC_ENGINE_BASE = os.getenv("RVC_ENGINE_BASE", "http://127.0.0.1:5050")

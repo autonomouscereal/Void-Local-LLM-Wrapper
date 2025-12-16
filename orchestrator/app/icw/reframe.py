@@ -31,6 +31,8 @@ def need_reframe(history_hashes: list[str], window_steps: int, threshold: int = 
         n = int(threshold)
     except Exception:  # pragma: no cover
         n = 3
+    if n <= 0:
+        n = 3
     if window_steps < n:
         return False
     if not isinstance(history_hashes, list) or not history_hashes:

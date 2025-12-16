@@ -66,7 +66,12 @@ def summarize_block_extractive(text: str, target_ratio: float = 0.5) -> str:
     t = _coerce_text(text)
     try:
         sents = re.split(r"(?<=[\.\?\!])\s+", t or "")
-        keep = max(1, int(len(sents) * max(0.0, min(1.0, float(target_ratio)))))
+        # Defensive: target_ratio can be str-ish.
+        try:
+            tr = float(target_ratio)
+        except Exception:
+            tr = 0.5
+        keep = max(1, int(len(sents) * max(0.0, min(1.0, tr))))
         return " ".join(sents[:keep]).strip()
     except Exception as exc:  # pragma: no cover - defensive logging
         log.error("icw.compress summarize_block_extractive failed: %s", exc, exc_info=True)

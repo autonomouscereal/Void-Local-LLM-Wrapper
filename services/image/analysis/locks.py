@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import math
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -71,8 +70,8 @@ def _blocking_face_embedding(image_path: str) -> Optional[List[float]]:
 async def compute_face_lock_score(image_path: str, reference_embedding: Optional[List[float]]) -> Optional[float]:
     if not (isinstance(reference_embedding, list) and reference_embedding):
         return None
-    loop = asyncio.get_running_loop()
-    emb = await loop.run_in_executor(None, _blocking_face_embedding, image_path)
+    # Hard-blocking execution (no thread pool/executor allowed).
+    emb = _blocking_face_embedding(image_path)
     if not emb:
         return None
     score = _cosine(reference_embedding, emb)
@@ -121,11 +120,9 @@ async def compute_style_similarity(image_path: str, reference_palette: Optional[
         return None
     if not ref_colors:
         return None
-    loop = asyncio.get_running_loop()
-    def _palette_worker() -> List[Tuple[int, int, int]]:
-        image = Image.open(image_path).convert("RGB")
-        return _extract_palette(image)
-    palette = await loop.run_in_executor(None, _palette_worker)
+    # Hard-blocking execution (no thread pool/executor allowed).
+    image = Image.open(image_path).convert("RGB")
+    palette = _extract_palette(image)
     if not palette:
         return None
     dist = _palette_distance(palette, ref_colors)

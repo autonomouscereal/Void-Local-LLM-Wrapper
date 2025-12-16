@@ -5,6 +5,7 @@ import os
 from typing import Any, Dict, List
 import time
 import logging
+from datetime import datetime, timezone
 from .ids import step_id
 from ..json_parser import JSONParser
 
@@ -59,8 +60,59 @@ def read_tail(path: str, n: int = 10) -> List[Dict[str, Any]]:
 
 # ---- Step 8: append-only JSONL checkpoints ----
 
+def _iso_now() -> str:
+    # UTC ISO8601 with Z suffix (stable, human-readable).
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _normalize_root(root: str) -> str:
+    """
+    Unify trace root layout across the codebase.
+
+    Historically some callers used:
+      - <state>/traces/<trace_id>/trace.jsonl
+    while others used:
+      - <state>/<trace_id>/trace.jsonl
+
+    We standardize on <state>/traces/<trace_id>/trace.jsonl.
+    """
+    r = (root or "").rstrip("/\\")
+    if not r:
+        return root
+    base = os.path.basename(r).lower()
+    if base == "traces":
+        return r
+    return os.path.join(r, "traces")
+
+
+def _infer_domain(kind: str) -> str:
+    k = (kind or "").lower()
+    if k in ("request", "response"):
+        return "api"
+    if k.startswith("chat."):
+        return "chat"
+    if k.startswith("artifact"):
+        return "artifact"
+    if k.startswith("error"):
+        return "error"
+    if k.startswith("committee."):
+        return "committee"
+    if k.startswith("planner.") or k.startswith("replan."):
+        return "planner"
+    if k.startswith("comfy.") or "[comfy]" in k:
+        return "comfy"
+    if k.startswith("exec_") or k.startswith("exec.") or k.startswith("tools.exec") or k.startswith("tool.run"):
+        return "executor"
+    if k.startswith("tool"):
+        return "tool"
+    if k.startswith("memory"):
+        return "memory"
+    return "orchestrator"
+
+
 def _dir(root: str, key: str) -> str:
-    p = os.path.join(root, key)
+    root2 = _normalize_root(root)
+    p = os.path.join(root2, key)
     os.makedirs(p, exist_ok=True)
     return p
 
@@ -71,7 +123,13 @@ def _path(root: str, key: str) -> str:
 
 def append_event(root: str, key: str, kind: str, data: Dict[str, Any]) -> None:
     try:
-        rec = {"t": int(time.time() * 1000), "step_id": step_id(), "kind": kind, "data": data or {}}
+        # Normalize and enrich the payload so all trace writers converge on the
+        # same schema/layout regardless of call site.
+        d = dict(data or {})
+        d.setdefault("trace_id", str(key))
+        d.setdefault("ts_iso", _iso_now())
+        d.setdefault("domain", _infer_domain(kind))
+        rec = {"t": int(time.time() * 1000), "step_id": step_id(), "kind": kind, "data": d}
         path = _path(root, key)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "a", encoding="utf-8") as f:
@@ -91,7 +149,17 @@ def append_event(root: str, key: str, kind: str, data: Dict[str, Any]) -> None:
 def read_all(root: str, key: str) -> List[Dict[str, Any]]:
     path = _path(root, key)
     if not os.path.exists(path):
-        return []
+        # Back-compat: older traces were written under <state>/<trace_id>/trace.jsonl
+        # (without the intermediate "traces" directory).
+        legacy_root = (root or "").rstrip("/\\")
+        if legacy_root and os.path.basename(legacy_root).lower() != "traces":
+            legacy_path = os.path.join(legacy_root, key, "trace.jsonl")
+            if os.path.exists(legacy_path):
+                path = legacy_path
+            else:
+                return []
+        else:
+            return []
     parser = JSONParser()
     out: List[Dict[str, Any]] = []
     schema = {"t": int, "step_id": str, "kind": str, "data": dict}

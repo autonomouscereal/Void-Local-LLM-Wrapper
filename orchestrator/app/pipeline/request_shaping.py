@@ -100,7 +100,18 @@ def shape_request(
         ensure_ascii=False,
         separators=(",", ":"),
     )
-    provided_seed = int(body.get("seed")) if isinstance(body.get("seed"), (int, float)) else None
+    provided_seed = None
+    if isinstance(body.get("seed"), (int, float)):
+        try:
+            provided_seed = int(body.get("seed"))
+        except Exception as exc:
+            # Defensive: request shaping must never raise for bad optional knobs.
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "request_shaping: bad seed=%r; ignoring and deriving from messages",
+                body.get("seed"),
+                exc_info=True,
+            )
     master_seed = provided_seed if provided_seed is not None else derive_seed_fn("chat", msgs_for_seed)
     import hashlib as _hl
 

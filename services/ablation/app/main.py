@@ -149,7 +149,7 @@ async def _nli_contradiction(text_a: str, text_b: str) -> Tuple[bool, float, str
     try:
         async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
             r = await client.post(ABLCODER_URL.rstrip("/") + "/nli", json=payload)
-            r.raise_for_status()
+            
             data = r.json()
             return bool(data.get("contradiction")), float(data.get("overlap", 0.0)), str(data.get("reason", ""))
     except Exception:
@@ -361,7 +361,6 @@ async def ablate(body: Dict[str, Any]):
                 async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
                     payload = {"model_route": "qwen3-ablation-coder", "deterministic": True, "system": "Ablation Compressor. Output strict JSON only.", "seed": 0, "text": text, "citations": citations, "policy": comp_policy}
                     r = await client.post(ABLCODER_URL.rstrip("/") + "/compress", json=payload)
-                    r.raise_for_status()
                     js = r.json()
                     c["train_payload"] = {"input": js.get("input") or text[:2000], "output": js.get("output") or text[:2000], "metadata": {"mode": c.get("mode"), "seed": seed}}
                     comp_index[comp_key] = {"input": c["train_payload"]["input"], "output": c["train_payload"]["output"]}

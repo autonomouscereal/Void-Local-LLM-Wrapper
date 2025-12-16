@@ -136,7 +136,8 @@ async def produce_tool_plan(
     tools = _safe_tools_list(tools, trace_id=tid)
     try:
         temp = float(temperature)
-    except Exception:
+    except Exception as exc:
+        log.warning("planner bad temperature=%r trace_id=%s; defaulting to 0.2", temperature, tid, exc_info=True)
         temp = 0.2
     if temp < 0.0:
         temp = 0.0

@@ -55,7 +55,7 @@ def _augment_voice_refs_from_context(job: dict, cid: str) -> None:
         job["voice_refs"] = {"voice_samples": samples}
 
 
-def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
+async def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
     """
     job: {
       "text": str,
@@ -157,9 +157,23 @@ def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
         # Environment-level defaults for RVC/XTTS. Prefer gender-specific
         # defaults when a hint is available, otherwise fall back to a generic.
         gender_hint = str(job.get("voice_gender") or "").lower()
+        # NOTE: These env vars are optional; the project does not require users
+        # to set them. We also treat the legacy compose placeholders
+        # ("default_male"/"default_female") as unset so we don't route to
+        # nonexistent models.
         default_female = os.getenv("RVC_DEFAULT_FEMALE_VOICE_ID")
         default_male = os.getenv("RVC_DEFAULT_MALE_VOICE_ID")
         default_generic = os.getenv("RVC_DEFAULT_VOICE_ID")
+        if isinstance(default_female, str) and default_female.strip() in ("default_female", "default_male", "default_generic"):
+            default_female = ""
+        if isinstance(default_male, str) and default_male.strip() in ("default_female", "default_male", "default_generic"):
+            default_male = ""
+        if isinstance(default_generic, str) and default_generic.strip() in ("default_female", "default_male", "default_generic"):
+            default_generic = ""
+        # Hard fallback (no env required): use the base Titan checkpoint.
+        # This matches services/rvc_python/entrypoint.sh which materializes:
+        #   /srv/rvc_models/TITAN/TITAN.pth
+        titan_default = "TITAN"
         chosen = None
         if "female" in gender_hint and isinstance(default_female, str) and default_female.strip():
             chosen = default_female.strip()
@@ -176,6 +190,9 @@ def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
         elif isinstance(default_male, str) and default_male.strip():
             chosen = default_male.strip()
             voice_source = "env_default_male"
+        else:
+            chosen = titan_default
+            voice_source = "builtin_default_titan"
         logical_voice_id = chosen
     if logical_voice_id is None:
         # Final guardrail: if we still cannot resolve a voice, fail BEFORE
@@ -278,11 +295,12 @@ def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
         "voice": logical_voice_id,
         "voice_id": logical_voice_id,
         "segment_id": segment_id,
-        "rate": float(job.get("rate") or tts_global.get("default_speaking_rate") or 1.0),
-        "pitch": float(job.get("pitch") or tts_global.get("default_pitch_shift_semitones") or 0.0),
-        "sample_rate": int(params.get("sample_rate") or 22050),
+        # Defensive: user/planner supplied knobs must never raise.
+        "rate": (tts_global.get("default_speaking_rate") or 1.0),
+        "pitch": (tts_global.get("default_pitch_shift_semitones") or 0.0),
+        "sample_rate": (params.get("sample_rate") or 22050),
         "channels": 1,
-        "max_seconds": int(params.get("max_seconds") or 20),
+        "max_seconds": (params.get("max_seconds") or 20),
         "voice_lock": lock,
         "seed": job.get("seed"),
         "lock_bundle": lock_bundle,
@@ -290,6 +308,27 @@ def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
         "language": lang,
         "trace_id": trace_id,
     }
+    # Coerce numeric fields safely (in-line, no helper).
+    try:
+        args["rate"] = float(args.get("rate") or 1.0)
+    except Exception as exc:
+        log.warning("tts.speak: bad rate=%r; defaulting to 1.0 cid=%s", args.get("rate"), cid, exc_info=True)
+        args["rate"] = 1.0
+    try:
+        args["pitch"] = float(args.get("pitch") or 0.0)
+    except Exception as exc:
+        log.warning("tts.speak: bad pitch=%r; defaulting to 0.0 cid=%s", args.get("pitch"), cid, exc_info=True)
+        args["pitch"] = 0.0
+    try:
+        args["sample_rate"] = int(args.get("sample_rate") or 22050)
+    except Exception as exc:
+        log.warning("tts.speak: bad sample_rate=%r; defaulting to 22050 cid=%s", args.get("sample_rate"), cid, exc_info=True)
+        args["sample_rate"] = 22050
+    try:
+        args["max_seconds"] = int(args.get("max_seconds") or 20)
+    except Exception as exc:
+        log.warning("tts.speak: bad max_seconds=%r; defaulting to 20 cid=%s", args.get("max_seconds"), cid, exc_info=True)
+        args["max_seconds"] = 20
     args = stamp_tool_args("tts.speak", args)
     res = provider.speak(args)
     # Provider may return either a raw payload or an envelope; handle both safely.
@@ -300,11 +339,19 @@ def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
             return res
         inner = res.get("result") if isinstance(res.get("result"), dict) else {}
         wav_bytes = inner.get("wav_bytes") or b""
-        dur = float(inner.get("duration_s") or 0.0)
+        try:
+            dur = float(inner.get("duration_s") or 0.0)
+        except Exception as exc:
+            log.warning("tts.speak: bad duration_s=%r; defaulting to 0.0 cid=%s", inner.get("duration_s"), cid, exc_info=True)
+            dur = 0.0
         model = inner.get("model", "unknown")
     else:
         wav_bytes = res.get("wav_bytes") or b""
-        dur = float(res.get("duration_s") or 0.0)
+        try:
+            dur = float(res.get("duration_s") or 0.0)
+        except Exception as exc:
+            log.warning("tts.speak: bad duration_s=%r; defaulting to 0.0 cid=%s", res.get("duration_s"), cid, exc_info=True)
+            dur = 0.0
         model = res.get("model", "unknown")
     # Mandatory RVC voice conversion for all vocal segments; configuration and
     # reference locks must be present or this tool returns an error.
@@ -530,7 +577,7 @@ def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
     audio_section = lock_bundle.get("audio") if isinstance(lock_bundle.get("audio"), dict) else {}
     ref_voice = audio_section.get("voice_embedding")
     if isinstance(ref_voice, list):
-        voice_embed = voice_embedding_from_path(wav_path)
+        voice_embed = await voice_embedding_from_path(wav_path)
         if isinstance(voice_embed, list):
             sim = cosine_similarity(ref_voice, voice_embed)
             if sim is not None:
@@ -645,8 +692,16 @@ def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
             # Heuristic adjust rate/pitch to hit emotion
             if target_emotion == "excited" and cur != "excited":
                 adj = dict(args)
-                adj["rate"] = max(0.5, float(args.get("rate") or 1.0) * 1.15)
-                adj["pitch"] = float(args.get("pitch") or 0.0) + 1.0
+                try:
+                    adj["rate"] = max(0.5, float(args.get("rate") or 1.0) * 1.15)
+                except Exception as exc:
+                    log.warning("tts.speak: bad rate=%r during emotion adjust cid=%s", args.get("rate"), cid, exc_info=True)
+                    adj["rate"] = max(0.5, 1.0 * 1.15)
+                try:
+                    adj["pitch"] = float(args.get("pitch") or 0.0) + 1.0
+                except Exception as exc:
+                    log.warning("tts.speak: bad pitch=%r during emotion adjust cid=%s", args.get("pitch"), cid, exc_info=True)
+                    adj["pitch"] = 1.0
                 res2 = provider.speak(adj)
                 wb2 = res2.get("wav_bytes") or b""
                 if wb2:
@@ -658,8 +713,16 @@ def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
                     )
             if target_emotion == "calm" and cur != "calm":
                 adj = dict(args)
-                adj["rate"] = max(0.5, float(args.get("rate") or 1.0) * 0.9)
-                adj["pitch"] = float(args.get("pitch") or 0.0) - 1.0
+                try:
+                    adj["rate"] = max(0.5, float(args.get("rate") or 1.0) * 0.9)
+                except Exception as exc:
+                    log.warning("tts.speak: bad rate=%r during emotion adjust cid=%s", args.get("rate"), cid, exc_info=True)
+                    adj["rate"] = max(0.5, 1.0 * 0.9)
+                try:
+                    adj["pitch"] = float(args.get("pitch") or 0.0) - 1.0
+                except Exception as exc:
+                    log.warning("tts.speak: bad pitch=%r during emotion adjust cid=%s", args.get("pitch"), cid, exc_info=True)
+                    adj["pitch"] = -1.0
                 res2 = provider.speak(adj)
                 wb2 = res2.get("wav_bytes") or b""
                 if wb2:
@@ -672,6 +735,14 @@ def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
     except Exception:
         log.debug("tts.speak: committee emotion adjustment failed (non-fatal) cid=%s", cid, exc_info=True)
     try:
+        _seed_raw = args.get("seed")
+        seed_int = 0
+        try:
+            if _seed_raw is not None and not isinstance(_seed_raw, (dict, list)):
+                seed_int = int(_seed_raw)
+        except Exception as exc:
+            log.warning("tts.speak: bad seed=%r; defaulting to 0 cid=%s", _seed_raw, cid, exc_info=True)
+            seed_int = 0
         append_tts_sample(
             outdir,
             {
@@ -680,7 +751,7 @@ def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
                 "rate": args.get("rate"),
                 "pitch": args.get("pitch"),
                 "sample_rate": args.get("sample_rate"),
-                "seed": int(args.get("seed") or 0),
+                "seed": seed_int,
                 "voice_lock": bool(lock),
                 "audio_ref": wav_path,
                 "duration_s": dur,
@@ -694,7 +765,7 @@ def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
         if job.get("voice_id"):
             append_provenance(
                 job.get("voice_id"),
-                {"when": now_ts(), "tool": "tts.speak", "artifact": wav_path, "seed": int(args.get("seed") or 0)},
+                {"when": now_ts(), "tool": "tts.speak", "artifact": wav_path, "seed": seed_int},
             )
     except Exception:
         log.debug("tts.speak: append_provenance failed (non-fatal) cid=%s", cid, exc_info=True)

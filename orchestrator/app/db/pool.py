@@ -20,7 +20,13 @@ async def get_pg_pool() -> Optional[asyncpg.pool.Pool]:
     db = os.getenv("POSTGRES_DB")
     user = os.getenv("POSTGRES_USER")
     password = os.getenv("POSTGRES_PASSWORD")
-    port = int(os.getenv("POSTGRES_PORT", "5432") or 5432)
+    # Defensive: env parsing must never raise and break DB init.
+    port_raw = os.getenv("POSTGRES_PORT", "5432")
+    try:
+        port = int(str(port_raw).strip() or "5432")
+    except Exception as exc:
+        log.warning("db.pool: bad POSTGRES_PORT=%r; defaulting to 5432", port_raw, exc_info=True)
+        port = 5432
     if not (host and db and user and password):
         return None
     pg_pool = await asyncpg.create_pool(

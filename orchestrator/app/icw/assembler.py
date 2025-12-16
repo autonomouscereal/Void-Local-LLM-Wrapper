@@ -68,7 +68,8 @@ def compress_until_fit(parts: list[str], budget_bytes: int) -> list[str]:
     t0 = time.perf_counter()
     try:
         b = int(budget_bytes)
-    except Exception:  # pragma: no cover
+    except Exception as exc:  # pragma: no cover
+        log.warning("icw.assembler compress_until_fit bad budget_bytes=%r: %s", budget_bytes, exc, exc_info=True)
         b = 0
     if b <= 0:
         b = 4096
@@ -195,11 +196,13 @@ def assemble_window(request_msg: dict, state: dict, in_limit_bytes: int, step_ou
             root = os.path.join(os.getenv("UPLOAD_DIR", "/workspace/uploads"), "artifacts", "research", str(cid))
             latest = newest_part(root, "ledger")
             if latest:
-                parts.append(
-                    render_chunk(
-                        f"[Ledger newest] {latest.get('path')} ~{int(latest.get('bytes') or 0)} bytes"
-                    )
-                )
+                _bytes_raw = latest.get("bytes") if isinstance(latest, dict) else None
+                try:
+                    _bytes_int = int(_bytes_raw or 0)
+                except Exception as exc:
+                    log.warning("icw.assembler bad ledger bytes=%r; defaulting to 0", _bytes_raw, exc_info=True)
+                    _bytes_int = 0
+                parts.append(render_chunk(f"[Ledger newest] {latest.get('path')} ~{_bytes_int} bytes"))
                 # Summarize older shards as one-liners
                 older = list_parts(root, "ledger")[:-1]
                 for p in older[-5:]:  # cap summaries
@@ -271,14 +274,28 @@ def pack_icw_system_frame_from_messages(
         msgs = [msgs]  # type: ignore[list-item]
     # Budget: token limit -> byte budget, then allocate pct_budget for ICW.
     try:
-        total_budget_bytes = int(byte_budget_for_model(int(model_ctx_limit_tokens)))
+        _ctx_limit = int(model_ctx_limit_tokens)
+    except Exception as exc:
+        log.warning("icw.assembler pack bad model_ctx_limit_tokens=%r: %s", model_ctx_limit_tokens, exc, exc_info=True)
+        _ctx_limit = 2048
+    if _ctx_limit <= 0:
+        _ctx_limit = 2048
+    try:
+        total_budget_bytes = int(byte_budget_for_model(_ctx_limit))
     except Exception as exc:  # pragma: no cover - defensive logging
         log.error("icw.assembler pack budget calc failed: %s", exc, exc_info=True)
         total_budget_bytes = 8192
     try:
-        icw_budget_bytes = int(total_budget_bytes * float(pct_budget))
+        _pct = float(pct_budget)
     except Exception as exc:
         log.warning("icw.assembler pack bad pct_budget=%r: %s", pct_budget, exc, exc_info=True)
+        _pct = 0.65
+    if _pct <= 0.0 or _pct > 1.0:
+        _pct = 0.65
+    try:
+        icw_budget_bytes = int(total_budget_bytes * _pct)
+    except Exception as exc:
+        log.warning("icw.assembler pack budget multiply failed pct_budget=%r: %s", pct_budget, exc, exc_info=True)
         icw_budget_bytes = int(total_budget_bytes * 0.65)
     if icw_budget_bytes <= 0:
         icw_budget_bytes = max(1024, int(total_budget_bytes * 0.5))
@@ -317,8 +334,17 @@ def pack_icw_system_frame_from_messages(
         return None, None, {"ok": False, "reason": "state_hash_failed"}
 
     req = {"role": "user", "content": last_user}
+    # Defensive: step_out_tokens may be str-ish; default rather than failing the pack.
+    _step_out = 512
     try:
-        window = assemble_window(req, icw_state, int(icw_budget_bytes), int(step_out_tokens))
+        _step_out = int(step_out_tokens)
+    except Exception as exc:
+        log.warning("icw.assembler pack bad step_out_tokens=%r; defaulting to 512", step_out_tokens, exc_info=True)
+        _step_out = 512
+    if _step_out <= 0:
+        _step_out = 512
+    try:
+        window = assemble_window(req, icw_state, int(icw_budget_bytes), int(_step_out))
     except Exception as exc:
         log.error("icw.assembler pack assemble_window failed cid=%r: %s", cid, exc, exc_info=True)
         return None, None, {"ok": False, "reason": "assemble_window_failed"}
@@ -330,11 +356,16 @@ def pack_icw_system_frame_from_messages(
 
     pack_hash = "sha256:" + hashlib.sha256(prompt.encode("utf-8")).hexdigest()
     frame = {"role": "system", "content": "### [ICW CONTEXT]\n" + prompt}
+    # meta must never raise (pack is best-effort instrumentation).
+    try:
+        _pct_meta = float(_pct) if "_pct" in locals() else 0.65
+    except Exception:
+        _pct_meta = 0.65
     meta = {
         "ok": True,
         "budget_bytes": int(icw_budget_bytes),
         "total_budget_bytes": int(total_budget_bytes),
-        "pct_budget": float(pct_budget),
+        "pct_budget": float(_pct_meta),
         "approx_chars": len(prompt),
         "state_hash": str(icw_state.get("state_hash") or ""),
     }

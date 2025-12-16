@@ -15,7 +15,8 @@ CONT_RE = re.compile(r"<\s*CONT\b[^>]*state\s*=\s*\"([a-f0-9]{8,32})\"[^>]*\/\s*
 def make_system_hint(target_out: int, state_hash: str) -> str:
     try:
         to = int(target_out)
-    except Exception:  # pragma: no cover
+    except Exception as exc:  # pragma: no cover
+        log.warning("icw.continuation make_system_hint bad target_out=%r: %s", target_out, exc, exc_info=True)
         to = 0
     sh = str(state_hash or "")
     return (

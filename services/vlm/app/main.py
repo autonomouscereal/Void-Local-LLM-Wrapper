@@ -65,7 +65,6 @@ async def analyze(body: Dict[str, Any]):
     if not image_url:
         return JSONResponse(status_code=400, content={"error": "missing image_url"})
     r = requests.get(image_url)
-    r.raise_for_status()
     img = Image.open(io.BytesIO(r.content)).convert("RGB")
     model, proc = get_model()
     inputs = proc(images=img, text=prompt, return_tensors="pt")

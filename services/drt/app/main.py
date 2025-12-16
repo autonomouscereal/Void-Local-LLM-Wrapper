@@ -122,7 +122,6 @@ def _transcribe_with_whisper(wav_path: str) -> str:
     try:
         with open(wav_path, "rb") as f:
             r = httpx.post(WHISPER_URL, files={"file": ("a.wav", f, "audio/wav")})
-        r.raise_for_status()
         return (r.json() or {}).get("text", "")
     except Exception as ex:
         logging.warning("whisper.transcribe_failed path=%s: %s", wav_path, ex, exc_info=True)
@@ -310,7 +309,6 @@ class FetcherParser:
     async def fetch(url: str) -> Tuple[bytes, str]:
         async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
             r = await client.get(url)
-            r.raise_for_status()
             return r.content, r.headers.get("content-type", "application/octet-stream")
 
     @staticmethod

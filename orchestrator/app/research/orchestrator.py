@@ -22,8 +22,12 @@ from ..datasets.trace import append_sample as _trace_append
 
 log = logging.getLogger(__name__)
 
-
-RAG_TTL = int(os.getenv("RAG_TTL_SECONDS", "3600"))
+_rag_ttl_raw = os.getenv("RAG_TTL_SECONDS", "3600")
+try:
+    RAG_TTL = int(str(_rag_ttl_raw).strip() or "3600")
+except Exception as exc:
+    log.warning("research.orchestrator: bad RAG_TTL_SECONDS=%r; defaulting to 3600", _rag_ttl_raw, exc_info=True)
+    RAG_TTL = 3600
 
 
 async def run_research(job: Dict[str, Any]) -> Dict[str, Any]:
@@ -61,7 +65,13 @@ async def run_research(job: Dict[str, Any]) -> Dict[str, Any]:
 
     # Phase: normalize → Evidence Ledger (no explicit timeout wrapper)
     ledger_rows = normalize_sources(sources)
-    sh = open_shard(root, "ledger", max_bytes=int(os.getenv("ARTIFACT_SHARD_BYTES", "200000")))
+    _shard_raw = os.getenv("ARTIFACT_SHARD_BYTES", "200000")
+    try:
+        _max_bytes = int(str(_shard_raw).strip() or "200000")
+    except Exception as exc:
+        log.warning("research.orchestrator: bad ARTIFACT_SHARD_BYTES=%r; defaulting to 200000", _shard_raw, exc_info=True)
+        _max_bytes = 200000
+    sh = open_shard(root, "ledger", max_bytes=_max_bytes)
     for row in ledger_rows:
         if jid and (get_job(jid) and get_job(jid).cancel_flag):
             set_state(jid, "cancelled", phase="normalize", progress=0.0)

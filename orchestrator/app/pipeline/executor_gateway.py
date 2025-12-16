@@ -75,28 +75,83 @@ async def execute(
                 },
             }
         ]
-    async with _hx.AsyncClient(timeout=None, trust_env=False) as client:
-        log.info("executor_gateway.execute POST %s/execute trace_id=%s request_id=%s", base, tid, rid)
-        r = await client.post(base + "/execute", json=payload)
-        raw_body = r.text or ""
-        # The executor is expected to return a JSON envelope of the form
-        # {"ok": bool, "result": {"produced": {...}}, "error": {...}}. When the
-        # body is not valid JSON, or the shape drifts, we still want to surface
-        # the raw response text and HTTP status instead of collapsing to a
-        # generic executor_error.
+    # IMPORTANT: this function must never raise. Tool execution failures should
+    # be represented as per-step error objects so the caller can continue the run.
+    try:
+        async with _hx.AsyncClient(timeout=None, trust_env=False) as client:
+            log.info("executor_gateway.execute POST %s/execute trace_id=%s request_id=%s", base, tid, rid)
+            r = await client.post(base + "/execute", json=payload)
+            raw_body = r.text or ""
+    except _hx.TimeoutException as ex:  # type: ignore[attr-defined]
+        return [
+            {
+                "name": "executor",
+                "error": {
+                    "code": "executor_timeout",
+                    "message": str(ex),
+                    "status": 0,
+                    "stack": "".join(traceback.format_exc()),
+                    "executor_base_url": base,
+                },
+            }
+        ]
+    except _hx.RequestError as ex:  # type: ignore[attr-defined]
+        return [
+            {
+                "name": "executor",
+                "error": {
+                    "code": "executor_request_error",
+                    "message": str(ex),
+                    "status": 0,
+                    "stack": "".join(traceback.format_exc()),
+                    "executor_base_url": base,
+                },
+            }
+        ]
+    except Exception as ex:
+        return [
+            {
+                "name": "executor",
+                "error": {
+                    "code": "executor_exception",
+                    "message": str(ex),
+                    "status": 0,
+                    "stack": "".join(traceback.format_exc()),
+                    "executor_base_url": base,
+                },
+            }
+        ]
+
+    # The executor is expected to return a JSON envelope of the form
+    # {"ok": bool, "result": {"produced": {...}}, "error": {...}}. When the
+    # body is not valid JSON, or the shape drifts, we still want to surface
+    # the raw response text and HTTP status instead of collapsing to a
+    # generic executor_error.
+    try:
         schema = {"ok": bool, "result": dict, "error": dict}
         env = parser.parse(raw_body or "{}", schema)
-        if not isinstance(env, dict):
-            env = {
-                "ok": False,
-                "error": {
-                    "code": "executor_bad_json",
-                    "message": raw_body,
-                    "status": int(r.status_code),
-                    "stack": "".join(traceback.format_stack()),
-                },
-                "result": {"produced": {}},
-            }
+    except Exception:
+        env = {
+            "ok": False,
+            "error": {
+                "code": "executor_bad_json",
+                "message": raw_body,
+                "status": int(getattr(r, "status_code", 0) or 0),
+                "stack": "".join(traceback.format_exc()),
+            },
+            "result": {"produced": {}},
+        }
+    if not isinstance(env, dict):
+        env = {
+            "ok": False,
+            "error": {
+                "code": "executor_bad_json",
+                "message": raw_body,
+                "status": int(getattr(r, "status_code", 0) or 0),
+                "stack": "".join(traceback.format_stack()),
+            },
+            "result": {"produced": {}},
+        }
     try:
         ok_flag = bool(env.get("ok")) if isinstance(env, dict) else False
         produced_obj = (env.get("result") or {}).get("produced") if isinstance(env, dict) else None
@@ -160,6 +215,7 @@ async def execute(
                 "stack": err.get("stack") or "".join(traceback.format_stack()),
                 "env": env,
                 "body": raw_body,
+                "executor_base_url": base,
             },
         }
     ]

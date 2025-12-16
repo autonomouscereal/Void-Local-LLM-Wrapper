@@ -2,7 +2,6 @@ import os
 import sys
 import json
 import subprocess
-import threading
 import time
 from pathlib import Path
 
@@ -127,44 +126,6 @@ def human(n: float) -> str:
     return f"{v:.1f}PB"
 
 
-class SizeBeat:
-    def __init__(self, path: str, label: str, interval: float = 5.0) -> None:
-        self.path = path
-        self.label = label
-        self.interval = interval
-        self._stop = False
-        self._err_count = 0
-        self.t = threading.Thread(target=self._run, daemon=True)
-
-    def _run(self) -> None:
-        while not self._stop:
-            total = 0
-            for root, _, files in os.walk(self.path):
-                for f in files:
-                    fp = os.path.join(root, f)
-                    try:
-                        total += os.path.getsize(fp)
-                    except Exception as exc:
-                        # Non-fatal; progress reporting must never crash bootstrap.
-                        # But it must also not be silent; rate-limit warnings.
-                        self._err_count += 1
-                        if self._err_count <= 3 or (self._err_count % 100) == 0:
-                            log("WARN: SizeBeat getsize failed", fp, ":", exc)
-            log(f"PROGRESS {self.label}", human(total))
-            time.sleep(self.interval)
-
-    def start(self) -> None:
-        self.t.start()
-
-    def stop(self) -> None:
-        self._stop = True
-        try:
-            self.t.join()
-        except Exception as exc:
-            log("WARN: SizeBeat join failed", self.label, ":", exc)
-            return
-
-
 def ensure_pkg() -> None:
     try:
         import huggingface_hub  # noqa: F401
@@ -186,8 +147,6 @@ def snapshot(repo_id: str, local_key: str, allow_patterns: list[str] | None = No
     os.makedirs(tgt, exist_ok=True)
     STATUS.setdefault("hf", {})[local_key] = {"repo": repo_id, "state": "downloading"}
     write_status()
-    beat = SizeBeat(tgt, f"HF:{local_key}")
-    beat.start()
     try:
         kw = dict(
             repo_id=repo_id,
@@ -211,7 +170,7 @@ def snapshot(repo_id: str, local_key: str, allow_patterns: list[str] | None = No
                 kw["max_workers"] = 2
                 snapshot_download(**kw)
     finally:
-        beat.stop()
+        pass
     STATUS["hf"][local_key]["state"] = "done"
     write_status()
     log("DONE-HF", repo_id, "->", tgt)

@@ -5,7 +5,6 @@ import io
 import logging
 import os
 import traceback
-import sys
 from typing import Any, Dict, Optional, Tuple
 
 import json  # kept only for internal dumps; parsing goes via JSONParser
@@ -21,29 +20,6 @@ from void_json.json_parser import JSONParser
 MODEL_NAME = os.getenv("XTTS_MODEL_NAME", "tts_models/multilingual/multi-dataset/xtts_v2")
 
 app = FastAPI(title="XTTS TTS Service", version="0.3.0")
-
-# ---- Logging (stdout + shared log volume file) ----
-try:
-    from logging.handlers import RotatingFileHandler
-
-    _log_dir = os.getenv("LOG_DIR", "/workspace/logs").strip() or "/workspace/logs"
-    os.makedirs(_log_dir, exist_ok=True)
-    _log_file = os.getenv("LOG_FILE", "").strip() or os.path.join(_log_dir, "xtts.log")
-    _lvl = getattr(logging, (os.getenv("LOG_LEVEL", "INFO") or "INFO").upper(), logging.INFO)
-    logging.basicConfig(
-        level=_lvl,
-        format="%(asctime)s.%(msecs)03d %(levelname)s %(process)d/%(threadName)s %(name)s %(pathname)s:%(funcName)s:%(lineno)d - %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-        handlers=[
-            logging.StreamHandler(sys.stdout),
-            RotatingFileHandler(_log_file, maxBytes=50 * 1024 * 1024, backupCount=5, encoding="utf-8"),
-        ],
-        force=True,
-    )
-    logging.getLogger("xtts.logging").info("xtts logging configured file=%r level=%s", _log_file, logging.getLevelName(_lvl))
-except Exception as _ex:
-    logging.basicConfig(level=logging.INFO, stream=sys.stdout)
-    logging.getLogger("xtts.logging").warning("xtts file logging disabled: %s", _ex, exc_info=True)
 
 # Device selection is global for this container; individual engines are per-voice.
 _TTS_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -216,23 +192,9 @@ async def tts(body: Dict[str, Any]):
     raw_voice_id = body.get("voice_id") or body.get("voice") or ""
     voice_id = raw_voice_id.strip() if isinstance(raw_voice_id, str) else ""
     if not voice_id:
-        # Enforce explicit voice selection so upstream callers wire a concrete
-        # speaker profile; this avoids opaque RuntimeError messages like
-        # "Neither `speaker_wav` nor `speaker_id` was specified".
-        return JSONResponse(
-            status_code=200,
-            content={
-                "schema_version": 1,
-                "trace_id": trace_id,
-                "ok": False,
-                "result": None,
-                "error": {
-                    "code": "xtts_missing_voice",
-                    "message": "No voice_id/voice provided for XTTS request.",
-                    "stack": "".join(traceback.format_stack()),
-                },
-            },
-        )
+        # Soft default: upstream may omit voice_id; treat that as "default".
+        # This service will still select a safe speaker below.
+        voice_id = "default"
     if not text:
         # Always return a canonical envelope; do not rely on HTTP status codes or
         # raised exceptions for control flow. Include a synthetic stack trace so
@@ -270,11 +232,39 @@ async def tts(body: Dict[str, Any]):
             torch.manual_seed(seed)
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(seed)
-        # XTTS API supports language + speaker selection; interpret the logical
-        # voice_id as a speaker_id so multi-voice setups can route to distinct
-        # embeddings or base voices. Any mismatch or missing speaker mapping
-        # will be surfaced via the structured error envelope below.
-        wav = engine.tts(text=text, speaker_id=voice_id, language=language)  # type: ignore[call-arg]
+        # XTTS API supports language + speaker selection, but passing arbitrary
+        # speaker_id values will crash at generation time (e.g. "emerald" when
+        # the underlying model doesn't define that speaker). Make speaker
+        # selection consistent with engine capabilities:
+        # - If the engine exposes a speakers list and voice_id matches, use it.
+        # - Otherwise, use the first available speaker (if any).
+        # - Otherwise, omit speaker_id for single-speaker models.
+        speaker_id_to_use: Optional[str] = None
+        try:
+            speakers = getattr(engine, "speakers", None)
+            if isinstance(speakers, (list, tuple)) and speakers:
+                if voice_id in speakers:
+                    speaker_id_to_use = str(voice_id)
+                else:
+                    speaker_id_to_use = str(speakers[0])
+        except Exception:
+            speaker_id_to_use = None
+        try:
+            if speaker_id_to_use:
+                wav = engine.tts(text=text, speaker_id=speaker_id_to_use, language=language)  # type: ignore[call-arg]
+            else:
+                wav = engine.tts(text=text, language=language)  # type: ignore[call-arg]
+        except Exception:
+            # One more guard: if a speaker-related error occurs and we have
+            # speakers available, retry with the first speaker.
+            try:
+                speakers = getattr(engine, "speakers", None)
+                if isinstance(speakers, (list, tuple)) and speakers:
+                    wav = engine.tts(text=text, speaker_id=str(speakers[0]), language=language)  # type: ignore[call-arg]
+                else:
+                    raise
+            except Exception:
+                raise
         wav_arr = np.array(wav, dtype=np.float32)
         buf = io.BytesIO()
         sample_rate = 22050

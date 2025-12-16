@@ -130,7 +130,12 @@ def _match_existing_voice(sample_paths: List[str]) -> Optional[str]:
 
     best_id: Optional[str] = None
     best_score: float = -1.0
-    threshold = float(os.getenv("VOICE_MATCH_THRESHOLD", "0.80"))
+    threshold_raw = os.getenv("VOICE_MATCH_THRESHOLD", "0.80")
+    try:
+        threshold = float(str(threshold_raw).strip() or "0.80")
+    except Exception as exc:
+        log.warning("voice.match: bad VOICE_MATCH_THRESHOLD=%r; defaulting to 0.80", threshold_raw, exc_info=True)
+        threshold = 0.80
     for info in list_refs("voice"):
         rid = info.get("ref_id")
         if not isinstance(rid, str) or not rid:

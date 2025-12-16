@@ -73,7 +73,7 @@ Do NOT weaken, ignore, or interpret them.
 ==================================================
 8) TRACING & LOGGING
 ==================================================
-- Every run produces deterministic traces: requests.jsonl, events.jsonl, tools.jsonl, artifacts.jsonl, responses.jsonl; errors.jsonl for verbose details.
+- Every run produces deterministic traces in a single stream: traces/<trace_id>/trace.jsonl.
 - Include breadcrumbs: chat.start, planner.*, committee.*, exec.payload (pre & patched), validate.*, repair.*, tool.run.start, Comfy submit/poll, chat.finish.
 - Errors are explicit, never logged-and-forgotten.
 

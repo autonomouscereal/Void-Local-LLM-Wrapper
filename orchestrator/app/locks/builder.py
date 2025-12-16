@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import base64
 import io
 import json
@@ -124,8 +123,8 @@ def _blocking_face_embedding(image_path: str) -> Optional[List[float]]:
 
 
 async def _compute_face_embedding(image_path: str) -> Optional[List[float]]:
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, _blocking_face_embedding, image_path)
+    # Hard-blocking execution (no thread pool/executor allowed).
+    return _blocking_face_embedding(image_path)
 
 
 def _save_image_bytes(root: str, character_id: str, image_bytes: bytes, suffix: str) -> str:
@@ -287,8 +286,8 @@ def _blocking_voice_embedding(audio_path: str) -> Optional[List[float]]:
 
 
 async def _compute_voice_embedding(audio_path: str) -> Optional[List[float]]:
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, _blocking_voice_embedding, audio_path)
+    # Hard-blocking execution (no thread pool/executor allowed).
+    return _blocking_voice_embedding(audio_path)
 
 
 def _voice_tags_from_embedding(vec: Optional[List[float]]) -> List[str]:
@@ -351,6 +350,7 @@ async def build_audio_bundle(
 
 
 async def voice_embedding_from_path(audio_path: str) -> Optional[List[float]]:
+    # Must be awaited by callers. Hard-blocking only (no executors / no background tasks).
     return await _compute_voice_embedding(audio_path)
 
 

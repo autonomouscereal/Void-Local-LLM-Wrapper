@@ -55,7 +55,6 @@ def _write_temp_wav(b64: str | None, url: str | None) -> str:
     if isinstance(url, str) and url:
         with httpx.Client(timeout=None, trust_env=False) as c:
             r = c.get(url)
-            r.raise_for_status()
             with open(path, "wb") as f:
                 f.write(r.content)
         return path

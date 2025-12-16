@@ -305,8 +305,31 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str) -> 
         response_str = parsed.get("response") if isinstance(parsed.get("response"), str) else ""
         prompt_eval_val = parsed.get("prompt_eval_count")
         eval_count_val = parsed.get("eval_count")
-        prompt_eval = int(prompt_eval_val) if isinstance(prompt_eval_val, (int, float)) else 0
-        eval_count = int(eval_count_val) if isinstance(eval_count_val, (int, float)) else 0
+        # Defensive: Ollama may return weird numeric types (NaN/inf/str). Never raise here.
+        prompt_eval = 0
+        if isinstance(prompt_eval_val, (int, float)):
+            try:
+                prompt_eval = int(prompt_eval_val)
+            except Exception as exc:  # pragma: no cover - defensive logging
+                log.warning(
+                    "[committee] ollama.bad_prompt_eval_count trace_id=%s value=%r; defaulting to 0",
+                    trace_key,
+                    prompt_eval_val,
+                    exc_info=True,
+                )
+                prompt_eval = 0
+        eval_count = 0
+        if isinstance(eval_count_val, (int, float)):
+            try:
+                eval_count = int(eval_count_val)
+            except Exception as exc:  # pragma: no cover - defensive logging
+                log.warning(
+                    "[committee] ollama.bad_eval_count trace_id=%s value=%r; defaulting to 0",
+                    trace_key,
+                    eval_count_val,
+                    exc_info=True,
+                )
+                eval_count = 0
 
         data: Dict[str, Any] = {"ok": True, "response": response_str, "prompt_eval_count": prompt_eval, "eval_count": eval_count}
         usage: Dict[str, int] | None = None
@@ -365,11 +388,28 @@ def build_ollama_payload(messages: List[Dict[str, Any]], model: str, num_ctx: in
             else:
                 rendered.append(str(content_val or ""))
     prompt = "\n\n".join(rendered)
+    # Defensive: callers sometimes pass str-ish values; log should never raise.
+    _num_ctx_int = DEFAULT_NUM_CTX
+    try:
+        _num_ctx_int = int(num_ctx)
+    except Exception as exc:  # pragma: no cover - defensive logging
+        log.warning("[committee] bad num_ctx=%r; defaulting=%d", num_ctx, int(DEFAULT_NUM_CTX), exc_info=True)
+        _num_ctx_int = int(DEFAULT_NUM_CTX)
+    _temp_f = 0.3
+    try:
+        _temp_f = float(temperature)
+    except Exception as exc:  # pragma: no cover - defensive logging
+        log.warning("[committee] bad temperature=%r; defaulting=0.3", temperature, exc_info=True)
+        _temp_f = 0.3
+    if _temp_f < 0.0:
+        _temp_f = 0.0
+    if _temp_f > 2.0:
+        _temp_f = 2.0
     log.info(
         "[committee] ollama.payload.rendered model=%s num_ctx=%s temperature=%s messages=%d prompt_chars=%d dur_ms=%d",
         str(model),
-        int(num_ctx),
-        float(temperature),
+        int(_num_ctx_int),
+        float(_temp_f),
         len(messages or []),
         len(prompt),
         int((time.monotonic() - t0) * 1000.0),
@@ -406,8 +446,8 @@ def build_ollama_payload(messages: List[Dict[str, Any]], model: str, num_ctx: in
         # Ollama expects keep_alive at the top-level (not inside options).
         "keep_alive": "24h",
         "options": {
-            "num_ctx": int(num_ctx),
-            "temperature": float(temperature),
+            "num_ctx": int(_num_ctx_int),
+            "temperature": float(_temp_f),
         },
     }
 
@@ -513,7 +553,29 @@ async def committee_ai_text(
       times pretending it's "per member". Per-member calls are internal helpers.
     """
     trace_key = str(trace_id or "committee")
-    effective_rounds = max(1, int(rounds if rounds is not None else DEFAULT_COMMITTEE_ROUNDS))
+    # Defensive: rounds can be str-ish from callers; never raise.
+    try:
+        _rounds_raw = rounds if rounds is not None else DEFAULT_COMMITTEE_ROUNDS
+        effective_rounds = int(_rounds_raw)
+    except Exception as exc:  # pragma: no cover - defensive logging
+        log.warning(
+            "[committee] bad rounds=%r; defaulting=%r",
+            rounds,
+            DEFAULT_COMMITTEE_ROUNDS,
+            exc_info=True,
+        )
+        effective_rounds = int(DEFAULT_COMMITTEE_ROUNDS)
+    effective_rounds = max(1, int(effective_rounds))
+    # Defensive: temperature may be str-ish; clamp and never raise in logs.
+    try:
+        _temp_run = float(temperature)
+    except Exception as exc:  # pragma: no cover - defensive logging
+        log.warning("[committee] bad temperature=%r; defaulting=0.3", temperature, exc_info=True)
+        _temp_run = 0.3
+    if _temp_run < 0.0:
+        _temp_run = 0.0
+    if _temp_run > 2.0:
+        _temp_run = 2.0
     member_ids = [p.get("id") or "member" for p in COMMITTEE_PARTICIPANTS]
 
     answers: Dict[str, str] = {}
@@ -526,7 +588,7 @@ async def committee_ai_text(
         "[committee] run.start trace_id=%s rounds=%d temperature=%s participants=%s messages=%d",
         trace_key,
         int(effective_rounds),
-        float(temperature),
+        float(_temp_run),
         member_ids,
         len(messages or []),
     )
@@ -537,7 +599,7 @@ async def committee_ai_text(
         {
             "trace_id": trace_key,
             "rounds": int(effective_rounds),
-            "temperature": float(temperature),
+            "temperature": float(_temp_run),
             "participants": member_ids,
             "messages": messages or [],
         },
@@ -559,7 +621,7 @@ async def committee_ai_text(
                 "committee.member_draft",
                 {"trace_id": trace_key, "round": int(r + 1), "member": mid},
             )
-            res = await committee_member_text(mid, member_msgs, trace_id=trace_key, temperature=temperature)
+            res = await committee_member_text(mid, member_msgs, trace_id=trace_key, temperature=_temp_run)
             member_results[mid] = res if isinstance(res, dict) else {}
             txt = ""
             if isinstance(res, dict) and res.get("ok") is not False:
@@ -607,7 +669,7 @@ async def committee_ai_text(
                 "committee.member_critique",
                 {"trace_id": trace_key, "round": int(r + 1), "member": mid},
             )
-            res = await committee_member_text(mid, member_msgs, trace_id=trace_key, temperature=temperature)
+            res = await committee_member_text(mid, member_msgs, trace_id=trace_key, temperature=_temp_run)
             critique_results[mid] = res if isinstance(res, dict) else {}
             crit_txt = ""
             if isinstance(res, dict) and res.get("ok") is not False:
@@ -661,7 +723,7 @@ async def committee_ai_text(
                 "committee.member_revision",
                 {"trace_id": trace_key, "round": int(r + 1), "member": mid},
             )
-            res = await committee_member_text(mid, member_msgs, trace_id=trace_key, temperature=temperature)
+            res = await committee_member_text(mid, member_msgs, trace_id=trace_key, temperature=_temp_run)
             member_results[mid] = res if isinstance(res, dict) else {}
             txt = ""
             if isinstance(res, dict) and res.get("ok") is not False:

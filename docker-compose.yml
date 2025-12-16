@@ -121,8 +121,10 @@ services:
       - RVC_TRAIN_DATA_ROOT=/srv/data
       - RVC_MODELS_ROOT=/srv/rvc_models
       - RVC_WEBUI_ROOT=/srv/rvc_webui
-      - RVC_DEFAULT_MALE_VOICE_ID=${RVC_DEFAULT_MALE_VOICE_ID:-default_male}
-      - RVC_DEFAULT_FEMALE_VOICE_ID=${RVC_DEFAULT_FEMALE_VOICE_ID:-default_female}
+      # Default voices: do not require env vars. Point both male/female defaults
+      # to the base Titan checkpoint (/srv/rvc_models/TITAN/TITAN.pth).
+      - RVC_DEFAULT_MALE_VOICE_ID=${RVC_DEFAULT_MALE_VOICE_ID:-TITAN}
+      - RVC_DEFAULT_FEMALE_VOICE_ID=${RVC_DEFAULT_FEMALE_VOICE_ID:-TITAN}
     volumes:
       # Titan pretrain is already on the server; mount it read-only
       - film2_models:/opt/models:ro
@@ -161,8 +163,10 @@ services:
       - RVC_ENGINE_BASE=http://127.0.0.1:5050
       - RVC_TRAINER_BASE=http://127.0.0.1:7070
       - RVC_MODELS_ROOT=/srv/rvc_models
-      - RVC_DEFAULT_MALE_VOICE_ID=${RVC_DEFAULT_MALE_VOICE_ID:-default_male}
-      - RVC_DEFAULT_FEMALE_VOICE_ID=${RVC_DEFAULT_FEMALE_VOICE_ID:-default_female}
+      # Default voices: do not require env vars. Point both male/female defaults
+      # to the base Titan checkpoint (/srv/rvc_models/TITAN/TITAN.pth).
+      - RVC_DEFAULT_MALE_VOICE_ID=${RVC_DEFAULT_MALE_VOICE_ID:-TITAN}
+      - RVC_DEFAULT_FEMALE_VOICE_ID=${RVC_DEFAULT_FEMALE_VOICE_ID:-TITAN}
       # Service URLs for mining
       - DEMUCS_API_URL=http://127.0.0.1:9101
       - WHISPER_API_URL=http://127.0.0.1:7861

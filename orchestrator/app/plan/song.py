@@ -132,7 +132,18 @@ async def plan_song_graph(
     but targets a compact Song Graph JSON shape under {"song": SONG_GRAPH_SCHEMA}.
     """
     text = str(user_text or "").strip()
-    approx_len = int(length_s) if length_s and length_s > 0 else 30
+    approx_len = 30
+    try:
+        _ls = int(length_s) if length_s is not None else 0
+        approx_len = _ls if _ls > 0 else 30
+    except Exception as exc:
+        import logging
+        logging.getLogger("orchestrator.plan.song").warning(
+            "plan_song_graph: bad length_s=%r; defaulting to 30",
+            length_s,
+            exc_info=True,
+        )
+        approx_len = 30
     bpm_val = int(bpm) if isinstance(bpm, (int, float)) and bpm and bpm > 0 else 0
     key_txt = str(key or "").strip()
 

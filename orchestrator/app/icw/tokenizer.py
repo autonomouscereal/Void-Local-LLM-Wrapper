@@ -33,9 +33,17 @@ def byte_budget_for_model(model_ctx_limit_tokens: int, headroom_ratio: float = 0
 
     Heuristic: ~4 characters per token (consistent with other parts of the codebase).
     """
-    budget = int(model_ctx_limit_tokens) * 4
+    # Defensive: callers may pass str-ish limits. Never raise here.
     try:
-        budget = int(int(model_ctx_limit_tokens) * 4 * float(headroom_ratio))
+        _limit = int(model_ctx_limit_tokens)
+    except Exception as exc:  # pragma: no cover - defensive logging
+        log.error("icw.byte_budget_for_model bad model_ctx_limit_tokens=%r: %s", model_ctx_limit_tokens, exc, exc_info=True)
+        _limit = 0
+    if _limit <= 0:
+        _limit = 2048
+    budget = int(_limit) * 4
+    try:
+        budget = int(int(_limit) * 4 * float(headroom_ratio))
     except Exception as exc:  # pragma: no cover - defensive logging
         log.error(
             "icw.byte_budget_for_model failed for limit=%r, headroom=%r: %s",
@@ -44,5 +52,5 @@ def byte_budget_for_model(model_ctx_limit_tokens: int, headroom_ratio: float = 0
             exc,
             exc_info=True,
         )
-        budget = int(model_ctx_limit_tokens) * 4
+        budget = int(_limit) * 4
     return budget

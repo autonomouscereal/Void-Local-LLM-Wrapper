@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Dict, Any
 import os
+import logging
 import traceback
 import uuid
 
@@ -24,6 +25,7 @@ class _TTSProvider:
         self._base_url = url.rstrip("/") if isinstance(url, str) else ""
 
     def speak(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        log = logging.getLogger("orchestrator.tools_tts.provider")
         trace_id = payload.get("trace_id") if isinstance(payload.get("trace_id"), str) else "tt_xtts_unknown"
         request_id = payload.get("request_id") if isinstance(payload.get("request_id"), str) and payload.get("request_id") else None
         rid = request_id or uuid.uuid4().hex
@@ -79,20 +81,33 @@ class _TTSProvider:
 
                         wav = _b64local.b64decode(b64)
                     # Adapt to canonical internal envelope expected by run_tts_speak.
-                    sample_rate = int(inner.get("sample_rate") or payload.get("sample_rate") or 22050)
+                    # Defensive: XTTS service may return strings/None; never raise.
+                    _sr_raw = inner.get("sample_rate") or payload.get("sample_rate") or 22050
+                    try:
+                        sample_rate = int(_sr_raw)
+                    except Exception as exc:
+                        log.warning("tts.provider: bad sample_rate=%r; defaulting to 22050", _sr_raw, exc_info=True)
+                        sample_rate = 22050
                     language = inner.get("language") or payload.get("language") or "en"
                     voice_id = inner.get("voice_id") or payload.get("voice_id") or payload.get("voice")
-                    xtts_speaker = inner.get("xtts_speaker")
                     segment_id = inner.get("segment_id") or payload.get("segment_id")
+                    _dur_raw = inner.get("duration_s")
+                    duration_s = 0.0
+                    try:
+                        # Accept str/num; reject dict/list.
+                        if _dur_raw is not None and not isinstance(_dur_raw, (dict, list)):
+                            duration_s = float(_dur_raw)
+                    except Exception as exc:
+                        log.warning("tts.provider: bad duration_s=%r; defaulting to 0.0", _dur_raw, exc_info=True)
+                        duration_s = 0.0
                     result = {
                         "wav_bytes": wav,
-                        "duration_s": float(inner.get("duration_s") or 0.0),
+                        "duration_s": duration_s,
                         "model": inner.get("model") or "xtts",
                         "sample_rate": sample_rate,
                         "language": language,
                         "voice_id": voice_id,
                         "voice": payload.get("voice"),
-                        "xtts_speaker": xtts_speaker,
                         "segment_id": segment_id,
                         "trace_id": trace_id,
                     }

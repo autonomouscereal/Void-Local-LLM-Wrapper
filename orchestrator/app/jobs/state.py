@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Literal, Dict, Any, Optional
-import threading
 import time
 
 
@@ -24,51 +23,45 @@ class Job:
 
 
 _jobs: Dict[str, Job] = {}
-_lock = threading.RLock()
 
 
 def create_job(jid: str, tool: str, args: dict) -> Job:
-    with _lock:
-        j = Job(id=jid, tool=tool, args=args)
-        _jobs[jid] = j
-        return j
+    j = Job(id=jid, tool=tool, args=args)
+    _jobs[jid] = j
+    return j
 
 
 def get_job(jid: str) -> Optional[Job]:
-    with _lock:
-        return _jobs.get(jid)
+    return _jobs.get(jid)
 
 
 def set_state(jid: str, state: JobState, phase: Optional[str] = None, progress: Optional[float] = None, error: Optional[str] = None) -> Optional[Job]:
-    with _lock:
-        j = _jobs.get(jid)
-        if not j:
-            return None
-        if state:
-            j.state = state
-        if phase is not None:
-            j.phase = phase
-        if progress is not None:
-            j.progress = float(progress)
-        if error is not None:
-            j.error = error
-        j.updated_at = time.time()
-        return j
+    j = _jobs.get(jid)
+    if not j:
+        return None
+    if state:
+        j.state = state
+    if phase is not None:
+        j.phase = phase
+    if progress is not None:
+        j.progress = float(progress)
+    if error is not None:
+        j.error = error
+    j.updated_at = time.time()
+    return j
 
 
 def request_cancel(jid: str) -> Optional[Job]:
-    with _lock:
-        j = _jobs.get(jid)
-        if not j:
-            return None
-        j.cancel_flag = True
-        j.state = "cancelling"
-        j.updated_at = time.time()
-        return j
+    j = _jobs.get(jid)
+    if not j:
+        return None
+    j.cancel_flag = True
+    j.state = "cancelling"
+    j.updated_at = time.time()
+    return j
 
 
 def clear_job(jid: str) -> None:
-    with _lock:
-        _jobs.pop(jid, None)
+    _jobs.pop(jid, None)
 
 

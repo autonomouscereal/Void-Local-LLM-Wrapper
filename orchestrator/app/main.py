@@ -102,6 +102,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential  # type: ignore
 from fastapi.middleware.cors import CORSMiddleware  # type: ignore
 from .json_parser import JSONParser
 from .determinism import seed_router as det_seed_router, seed_tool as det_seed_tool, round6 as det_round6
+# NOTE: icw.windowed_solver.solve is async; keep the import name stable in case call sites are reintroduced.
 from .icw.windowed_solver import solve as windowed_solve
 from .icw.assembler import assemble_window
 from .icw.continuation import state_hash_from as icw_state_hash_from
@@ -305,36 +306,78 @@ def _allowed_tools_for_mode(mode: Optional[str]) -> List[str]:
     return sorted([n for n in allowed_set if isinstance(n, str) and n.strip() and n in PLANNER_VISIBLE_TOOLS])
 
 
-# Hard logging: always DEBUG, no env gating.
-LOG_LEVEL = "DEBUG"
-_level = logging.DEBUG
-_log_dir = os.getenv("ORCH_LOG_DIR", "").strip()
-if not _log_dir:
+def _configure_logging() -> str:
+    """
+    Single authoritative logging config for this service.
+
+    Requirements:
+    - Always log to stdout (container-friendly).
+    - Always log to a file on the void log volume when available (default /workspace/logs).
+    - Avoid competing/duplicate configs from uvicorn by forcing uvicorn loggers to propagate to root.
+    """
+    global LOG_LEVEL
+
+    # Default to DEBUG to match historical behavior, but allow env override for deployments.
+    LOG_LEVEL = (os.getenv("ORCH_LOG_LEVEL", "DEBUG") or "DEBUG").strip().upper()
+    _level = getattr(logging, LOG_LEVEL, logging.DEBUG)
+
+    _log_dir = (os.getenv("ORCH_LOG_DIR", "") or "").strip()
+    if not _log_dir:
+        # Prefer the compose-mounted void log volume if present.
+        if os.path.isdir("/workspace/logs"):
+            _log_dir = "/workspace/logs"
+        else:
+            try:
+                _state_dir_env = (os.getenv("STATE_DIR", "") or "").strip()
+                _log_dir = os.path.join(_state_dir_env, "logs") if _state_dir_env else "."
+            except Exception:
+                _log_dir = "."
+
     try:
-        _state_dir_env = os.getenv("STATE_DIR", "").strip()
-        _log_dir = os.path.join(_state_dir_env, "logs") if _state_dir_env else "."
+        os.makedirs(_log_dir, exist_ok=True)
     except Exception:
+        # If the logs dir can't be created (permissions), fall back to cwd.
         _log_dir = "."
-try:
-    os.makedirs(_log_dir, exist_ok=True)
-except Exception:
-    # If the logs dir can't be created (permissions), fall back to cwd.
-    _log_dir = "."
-_log_file = os.getenv("ORCH_LOG_FILE", "").strip() or os.path.join(_log_dir, "orchestrator.log")
-_handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
-try:
-    _handlers.append(logging.FileHandler(_log_file, encoding="utf-8"))
-except Exception as _ex:
-    # Never fail module import due to file handler issues.
-    logging.getLogger("orchestrator.logging").warning("file logging disabled: %s", _ex, exc_info=True)
-logging.basicConfig(
-    level=_level,
-    format="%(asctime)s.%(msecs)03d %(levelname)s %(process)d/%(threadName)s %(name)s %(pathname)s:%(funcName)s:%(lineno)d - %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-    handlers=_handlers,
-    force=True,
-)
-logging.getLogger("orchestrator.logging").debug("logging configured level=%s file=%r", LOG_LEVEL, _log_file)
+
+    _log_file = (os.getenv("ORCH_LOG_FILE", "") or "").strip() or os.path.join(_log_dir, "orchestrator.log")
+
+    _handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
+    try:
+        _handlers.append(logging.FileHandler(_log_file, encoding="utf-8"))
+    except Exception as _ex:
+        # Never fail module import due to file handler issues; stdout logging remains.
+        try:
+            sys.stderr.write(f"[orchestrator.logging] file logging disabled: {_ex}\n")
+        except Exception:
+            pass
+
+    logging.captureWarnings(True)
+    logging.basicConfig(
+        level=_level,
+        format="%(asctime)s.%(msecs)03d %(levelname)s %(process)d/%(threadName)s %(name)s %(pathname)s:%(funcName)s:%(lineno)d - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=_handlers,
+        force=True,
+    )
+
+    # Uvicorn installs its own handlers/formatters. basicConfig(force=True) only affects root,
+    # so we must explicitly normalize uvicorn loggers to avoid duplicates and ensure file logging.
+    for _name in ("uvicorn", "uvicorn.error", "uvicorn.access", "fastapi"):
+        _lg = logging.getLogger(_name)
+        try:
+            _lg.handlers.clear()
+        except Exception:
+            _lg.handlers = []
+        _lg.propagate = True
+        _lg.setLevel(_level)
+
+    logging.getLogger("orchestrator.logging").debug("logging configured level=%s file=%r", LOG_LEVEL, _log_file)
+    return _log_file
+
+
+# Hard logging: stdout + file, always configured at import.
+LOG_LEVEL = "DEBUG"
+ORCH_LOG_FILE = _configure_logging()
 
 def _log(event: str, **fields: Any) -> None:
     # Hard logging: only debug.
@@ -821,7 +864,11 @@ async def segment_qa_and_committee(
                 message = (err_obj.get("message") if isinstance(err_obj, dict) else "")
                 _log("tool.run.error", trace_id=trace_id, tool=tname, code=(code or ""), status=status, message=(message or ""), attempt=attempt)
                 # Increment failure counter for this tool to detect repeated failures.
-                failure_counts[tname] = int(failure_counts.get(tname, 0)) + 1
+                try:
+                    failure_counts[tname] = int(failure_counts.get(tname, 0) or 0) + 1
+                except Exception as ex:
+                    logging.warning("patch_exec: bad failure_counts[%s]=%r; resetting to 1", tname, failure_counts.get(tname), exc_info=True)
+                    failure_counts[tname] = 1
                 _tel_append(STATE_DIR, trace_id, {
                     "name": tname,
                     "ok": False,
@@ -939,9 +986,19 @@ def _append_jsonl(path: str, obj: dict) -> None:
 
 def trace_append(kind: str, obj: Dict[str, Any]) -> None:
     """
-    Unified trace appender: Chooses key from trace_id | tid | 'global'.
+    Unified trace appender: chooses key from trace_id | tid | cid | 'global'.
+    Also ensures payload includes trace_id for training/debugging consistency.
     """
-    key = str((obj.get("trace_id") or obj.get("tid") or "global"))
+    if not isinstance(obj, dict):
+        obj = {"_raw": obj}
+    # Prefer explicit trace identifiers; fall back to conversation/job ids when present.
+    raw_key = obj.get("trace_id") or obj.get("tid") or obj.get("cid") or "global"
+    key = str(raw_key).strip() if isinstance(raw_key, (str, int)) else "global"
+    if not key:
+        key = "global"
+    # Ensure trace_id is always present in event payload when we have a key.
+    if key != "global" and not (isinstance(obj.get("trace_id"), str) and obj.get("trace_id")):
+        obj["trace_id"] = key
     emit_trace(STATE_DIR, key, kind, obj)
 
 def _trace_response(trace_id: str, envelope: Dict[str, Any]) -> None:
@@ -1005,7 +1062,12 @@ DEFAULT_STEM_BANDS: Dict[str, Tuple[float, float]] = {
 
 
 # Committee configuration moved to committee_client; imports below keep back-compat.
-DEFAULT_TEMPERATURE = float(os.getenv("DEFAULT_TEMPERATURE", "0.3"))
+_default_temp_raw = os.getenv("DEFAULT_TEMPERATURE", "0.3")
+try:
+    DEFAULT_TEMPERATURE = float(str(_default_temp_raw).strip() or "0.3")
+except Exception as _exc:
+    logging.getLogger(__name__).warning("bad DEFAULT_TEMPERATURE=%r; defaulting to 0.3", _default_temp_raw, exc_info=True)
+    DEFAULT_TEMPERATURE = 0.3
 # Gates removed: defaults are always ON; API-key checks still apply where required
 ENABLE_WEBSEARCH = True
 MCP_HTTP_BRIDGE_URL = os.getenv("MCP_HTTP_BRIDGE_URL")  # e.g., http://host.docker.internal:9999
@@ -1015,30 +1077,69 @@ AUTO_EXECUTE_TOOLS = True
 # Always allow tool execution
 ALLOW_TOOL_EXECUTION = True
 TIMEOUTS_FORBIDDEN = True
-STREAM_CHUNK_SIZE_CHARS = int(os.getenv("STREAM_CHUNK_SIZE_CHARS", "0"))
-STREAM_CHUNK_INTERVAL_MS = int(os.getenv("STREAM_CHUNK_INTERVAL_MS", "50"))
+_stream_chunk_size_raw = os.getenv("STREAM_CHUNK_SIZE_CHARS", "0")
+try:
+    STREAM_CHUNK_SIZE_CHARS = int(str(_stream_chunk_size_raw).strip() or "0")
+except Exception:
+    logging.getLogger(__name__).warning("bad STREAM_CHUNK_SIZE_CHARS=%r; defaulting to 0", _stream_chunk_size_raw, exc_info=True)
+    STREAM_CHUNK_SIZE_CHARS = 0
+_stream_chunk_ms_raw = os.getenv("STREAM_CHUNK_INTERVAL_MS", "50")
+try:
+    STREAM_CHUNK_INTERVAL_MS = int(str(_stream_chunk_ms_raw).strip() or "50")
+except Exception:
+    logging.getLogger(__name__).warning("bad STREAM_CHUNK_INTERVAL_MS=%r; defaulting to 50", _stream_chunk_ms_raw, exc_info=True)
+    STREAM_CHUNK_INTERVAL_MS = 50
 JOBS_RAG_INDEX = os.getenv("JOBS_RAG_INDEX", "true").lower() == "true"
 # No caps — never enforce caps inline
 
 # RAG configuration (pgvector)
 POSTGRES_HOST = os.getenv("POSTGRES_HOST")
-POSTGRES_PORT = int(os.getenv("POSTGRES_PORT", "5432"))
+_pg_port_raw = os.getenv("POSTGRES_PORT", "5432")
+try:
+    POSTGRES_PORT = int(str(_pg_port_raw).strip() or "5432")
+except Exception:
+    logging.getLogger(__name__).warning("bad POSTGRES_PORT=%r; defaulting to 5432", _pg_port_raw, exc_info=True)
+    POSTGRES_PORT = 5432
 POSTGRES_DB = os.getenv("POSTGRES_DB")
 POSTGRES_USER = os.getenv("POSTGRES_USER")
 POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD")
 EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "BAAI/bge-large-en-v1.5")
-RAG_CACHE_TTL_SEC = int(os.getenv("RAG_CACHE_TTL_SEC", "300"))
 
 # Optional external tool services (set URLs to enable) —
 # except where explicitly required (XTTS, Whisper, Music, VocalFix, RVC, OCR, VLM, MFA, VisionRepair).
 COMFYUI_API_URL = os.getenv("COMFYUI_API_URL")  # e.g., http://comfyui:8188
 COMFYUI_API_URLS = [u.strip() for u in os.getenv("COMFYUI_API_URLS", "").split(",") if u.strip()]
-COMFYUI_REPLICAS = int(os.getenv("COMFYUI_REPLICAS", "1"))
-SCENE_SUBMIT_CONCURRENCY = int(os.getenv("SCENE_SUBMIT_CONCURRENCY", "4"))
-SCENE_MAX_BATCH_FRAMES = int(os.getenv("SCENE_MAX_BATCH_FRAMES", "2"))
-RESUME_MAX_RETRIES = int(os.getenv("RESUME_MAX_RETRIES", "3"))
+_comfy_repl_raw = os.getenv("COMFYUI_REPLICAS", "1")
+try:
+    COMFYUI_REPLICAS = int(str(_comfy_repl_raw).strip() or "1")
+except Exception:
+    logging.getLogger(__name__).warning("bad COMFYUI_REPLICAS=%r; defaulting to 1", _comfy_repl_raw, exc_info=True)
+    COMFYUI_REPLICAS = 1
+_scene_conc_raw = os.getenv("SCENE_SUBMIT_CONCURRENCY", "4")
+try:
+    SCENE_SUBMIT_CONCURRENCY = int(str(_scene_conc_raw).strip() or "4")
+except Exception:
+    logging.getLogger(__name__).warning("bad SCENE_SUBMIT_CONCURRENCY=%r; defaulting to 4", _scene_conc_raw, exc_info=True)
+    SCENE_SUBMIT_CONCURRENCY = 4
+_scene_batch_raw = os.getenv("SCENE_MAX_BATCH_FRAMES", "2")
+try:
+    SCENE_MAX_BATCH_FRAMES = int(str(_scene_batch_raw).strip() or "2")
+except Exception:
+    logging.getLogger(__name__).warning("bad SCENE_MAX_BATCH_FRAMES=%r; defaulting to 2", _scene_batch_raw, exc_info=True)
+    SCENE_MAX_BATCH_FRAMES = 2
+_resume_raw = os.getenv("RESUME_MAX_RETRIES", "3")
+try:
+    RESUME_MAX_RETRIES = int(str(_resume_raw).strip() or "3")
+except Exception:
+    logging.getLogger(__name__).warning("bad RESUME_MAX_RETRIES=%r; defaulting to 3", _resume_raw, exc_info=True)
+    RESUME_MAX_RETRIES = 3
 COMFYUI_API_URLS = [u.strip() for u in os.getenv("COMFYUI_API_URLS", "").split(",") if u.strip()]
-SCENE_SUBMIT_CONCURRENCY = int(os.getenv("SCENE_SUBMIT_CONCURRENCY", "4"))
+_scene_conc_raw2 = os.getenv("SCENE_SUBMIT_CONCURRENCY", "4")
+try:
+    SCENE_SUBMIT_CONCURRENCY = int(str(_scene_conc_raw2).strip() or "4")
+except Exception:
+    logging.getLogger(__name__).warning("bad SCENE_SUBMIT_CONCURRENCY=%r; defaulting to 4", _scene_conc_raw2, exc_info=True)
+    SCENE_SUBMIT_CONCURRENCY = 4
 XTTS_API_URL = os.getenv("XTTS_API_URL")       # e.g., http://127.0.0.1:8020
 WHISPER_API_URL = os.getenv("WHISPER_API_URL") # e.g., http://127.0.0.1:9090
 FACEID_API_URL = os.getenv("FACEID_API_URL")   # e.g., http://127.0.0.1:7000
@@ -1066,12 +1167,37 @@ WRAPPER_CONFIG_HASH: Optional[str] = None
 DRT_API_URL = os.getenv("DRT_API_URL", "http://drt:8086")
 STATE_DIR = os.path.join(UPLOAD_DIR, "state")
 os.makedirs(STATE_DIR, exist_ok=True)
-ARTIFACT_SHARD_BYTES = int(os.getenv("ARTIFACT_SHARD_BYTES", "200000"))
+_shard_bytes_raw = os.getenv("ARTIFACT_SHARD_BYTES", "200000")
+try:
+    ARTIFACT_SHARD_BYTES = int(str(_shard_bytes_raw).strip() or "200000")
+except Exception:
+    logging.getLogger(__name__).warning("bad ARTIFACT_SHARD_BYTES=%r; defaulting to 200000", _shard_bytes_raw, exc_info=True)
+    ARTIFACT_SHARD_BYTES = 200000
 ARTIFACT_LATEST_ONLY = os.getenv("ARTIFACT_LATEST_ONLY", "true").lower() == "true"
-SPOOL_RAM_LIMIT = int(os.getenv("SPOOL_RAM_LIMIT", "524288"))
-SPOOL_SPILL_THRESHOLD = int(os.getenv("SPOOL_SPILL_THRESHOLD", "262144"))
-EVENT_BUFFER_MAX = int(os.getenv("EVENT_BUFFER_MAX", "100"))
-ARTIFACT_SHARD_BYTES = int(os.getenv("ARTIFACT_SHARD_BYTES", "200000"))
+_spool_ram_raw = os.getenv("SPOOL_RAM_LIMIT", "524288")
+try:
+    SPOOL_RAM_LIMIT = int(str(_spool_ram_raw).strip() or "524288")
+except Exception:
+    logging.getLogger(__name__).warning("bad SPOOL_RAM_LIMIT=%r; defaulting to 524288", _spool_ram_raw, exc_info=True)
+    SPOOL_RAM_LIMIT = 524288
+_spill_raw = os.getenv("SPOOL_SPILL_THRESHOLD", "262144")
+try:
+    SPOOL_SPILL_THRESHOLD = int(str(_spill_raw).strip() or "262144")
+except Exception:
+    logging.getLogger(__name__).warning("bad SPOOL_SPILL_THRESHOLD=%r; defaulting to 262144", _spill_raw, exc_info=True)
+    SPOOL_SPILL_THRESHOLD = 262144
+_event_buf_raw = os.getenv("EVENT_BUFFER_MAX", "100")
+try:
+    EVENT_BUFFER_MAX = int(str(_event_buf_raw).strip() or "100")
+except Exception:
+    logging.getLogger(__name__).warning("bad EVENT_BUFFER_MAX=%r; defaulting to 100", _event_buf_raw, exc_info=True)
+    EVENT_BUFFER_MAX = 100
+_shard_bytes_raw2 = os.getenv("ARTIFACT_SHARD_BYTES", "200000")
+try:
+    ARTIFACT_SHARD_BYTES = int(str(_shard_bytes_raw2).strip() or "200000")
+except Exception:
+    logging.getLogger(__name__).warning("bad ARTIFACT_SHARD_BYTES=%r; defaulting to 200000", _shard_bytes_raw2, exc_info=True)
+    ARTIFACT_SHARD_BYTES = 200000
 ARTIFACT_LATEST_ONLY = os.getenv("ARTIFACT_LATEST_ONLY", "true").lower() == "true"
 
 # Music/Audio extended services (spec Step 18/Instruction Set)
@@ -1209,9 +1335,21 @@ def _get_music_acceptance_thresholds() -> Dict[str, float]:
     static review/acceptance_audio.json at most once per process.
     """
     th = get_music_acceptance_thresholds()
+    oq_raw = th.get("overall_quality_min", 0.6) if isinstance(th, dict) else 0.6
+    fs_raw = th.get("fit_score_min", 0.6) if isinstance(th, dict) else 0.6
+    try:
+        oq = float(oq_raw)
+    except Exception as exc:
+        logging.getLogger(__name__).warning("music.acceptance: bad overall_quality_min=%r; defaulting to 0.6", oq_raw, exc_info=True)
+        oq = 0.6
+    try:
+        fs = float(fs_raw)
+    except Exception as exc:
+        logging.getLogger(__name__).warning("music.acceptance: bad fit_score_min=%r; defaulting to 0.6", fs_raw, exc_info=True)
+        fs = 0.6
     return {
-        "overall_quality_min": float(th.get("overall_quality_min", 0.6)),
-        "fit_score_min": float(th.get("fit_score_min", 0.6)),
+        "overall_quality_min": oq,
+        "fit_score_min": fs,
     }
 
 
@@ -1501,10 +1639,30 @@ async def v1_image_generate(request: Request):
         args["lock_bundle"] = body.get("lock_bundle")
     if isinstance(body.get("quality_profile"), str):
         args["quality_profile"] = body.get("quality_profile")
-    if isinstance(body.get("steps"), int):
-        args["steps"] = int(body.get("steps"))
-    if isinstance(body.get("cfg"), (int, float)):
-        args["cfg"] = float(body.get("cfg"))
+    # Defensive: client-provided numeric knobs must never crash the request.
+    if "steps" in body:
+        raw_steps = body.get("steps")
+        try:
+            # Accept int/float/str-ish; default if invalid.
+            args["steps"] = int(raw_steps)
+        except Exception as exc:
+            logging.getLogger(__name__).warning(
+                "image.dispatch: bad steps=%r; using default=%r",
+                raw_steps,
+                args.get("steps"),
+                exc_info=True,
+            )
+    if "cfg" in body:
+        raw_cfg = body.get("cfg")
+        try:
+            args["cfg"] = float(raw_cfg)
+        except Exception as exc:
+            logging.getLogger(__name__).warning(
+                "image.dispatch: bad cfg=%r; using default=%r",
+                raw_cfg,
+                args.get("cfg"),
+                exc_info=True,
+            )
     # Route through canonical image.dispatch tool
     res = await http_tool_run("image.dispatch", args)
     if isinstance(res, dict) and isinstance(res.get("result"), dict):
@@ -1632,9 +1790,24 @@ async def global_cors_middleware(request: Request, call_next):
 _jobs_store: Dict[str, Dict[str, Any]] = {}
 _job_endpoint: Dict[str, str] = {}
 _comfy_load: Dict[str, int] = {}
-COMFYUI_BACKOFF_MS = int(os.getenv("COMFYUI_BACKOFF_MS", "250"))
-COMFYUI_BACKOFF_MAX_MS = int(os.getenv("COMFYUI_BACKOFF_MAX_MS", "4000"))
-COMFYUI_MAX_RETRIES = int(os.getenv("COMFYUI_MAX_RETRIES", "6"))
+_comfy_backoff_raw = os.getenv("COMFYUI_BACKOFF_MS", "250")
+try:
+    COMFYUI_BACKOFF_MS = int(str(_comfy_backoff_raw).strip() or "250")
+except Exception:
+    logging.getLogger(__name__).warning("bad COMFYUI_BACKOFF_MS=%r; defaulting to 250", _comfy_backoff_raw, exc_info=True)
+    COMFYUI_BACKOFF_MS = 250
+_comfy_backoff_max_raw = os.getenv("COMFYUI_BACKOFF_MAX_MS", "4000")
+try:
+    COMFYUI_BACKOFF_MAX_MS = int(str(_comfy_backoff_max_raw).strip() or "4000")
+except Exception:
+    logging.getLogger(__name__).warning("bad COMFYUI_BACKOFF_MAX_MS=%r; defaulting to 4000", _comfy_backoff_max_raw, exc_info=True)
+    COMFYUI_BACKOFF_MAX_MS = 4000
+_comfy_retries_raw = os.getenv("COMFYUI_MAX_RETRIES", "6")
+try:
+    COMFYUI_MAX_RETRIES = int(str(_comfy_retries_raw).strip() or "6")
+except Exception:
+    logging.getLogger(__name__).warning("bad COMFYUI_MAX_RETRIES=%r; defaulting to 6", _comfy_retries_raw, exc_info=True)
+    COMFYUI_MAX_RETRIES = 6
 _comfy_sem = _as.Semaphore(max(1, int(SCENE_SUBMIT_CONCURRENCY))) if isinstance(SCENE_SUBMIT_CONCURRENCY, int) else _as.Semaphore(1)
 _films_mem: Dict[str, Dict[str, Any]] = {}
 
@@ -1770,8 +1943,16 @@ def merge_usages(usages: List[Optional[Dict[str, int]]]) -> Dict[str, int]:
     for u in usages:
         if not u:
             continue
-        out["prompt_tokens"] += int(u.get("prompt_tokens", 0))
-        out["completion_tokens"] += int(u.get("completion_tokens", 0))
+        pt_raw = (u.get("prompt_tokens", 0) if isinstance(u, dict) else 0)
+        ct_raw = (u.get("completion_tokens", 0) if isinstance(u, dict) else 0)
+        try:
+            out["prompt_tokens"] += int(pt_raw or 0)
+        except Exception as exc:
+            logging.getLogger(__name__).warning("merge_usages: bad prompt_tokens=%r; ignoring", pt_raw, exc_info=True)
+        try:
+            out["completion_tokens"] += int(ct_raw or 0)
+        except Exception as exc:
+            logging.getLogger(__name__).warning("merge_usages: bad completion_tokens=%r; ignoring", ct_raw, exc_info=True)
     out["total_tokens"] = out["prompt_tokens"] + out["completion_tokens"]
     return out
 
@@ -2128,8 +2309,8 @@ def _datasets_emit(job_id: str, ev: Dict[str, Any]) -> None:
 async def _datasets_runner(job_id: str, body: Dict[str, Any]) -> None:
     try:
         emit = partial(_datasets_emit, job_id)
-        # Offload sync export to a thread to avoid blocking loop
-        await _as.to_thread(_datasets_start, body or {}, emit)
+        # Hard-blocking execution (no thread offloading allowed).
+        _datasets_start(body or {}, emit)
         _orcjob_set_state(job_id, "done", phase="done", progress=1.0)
     except Exception as ex:
         logging.error("datasets_runner failed for job_id=%s: %s", job_id, ex, exc_info=True)
@@ -2187,30 +2368,6 @@ async def _send_trace_stream_async(payload: Dict[str, Any]) -> None:
         dt_ms = int((time.time() - t0) * 1000.0)
         _log("teacher.trace.append.exception", trace_id=str(payload.get("trace_id") or ""), url=url, ms=dt_ms, error=str(ex))
         logging.warning("teacher.trace.append failed url=%s: %s", url, ex, exc_info=True)
-
-
-def _spawn_bg(coro, *, label: str, trace_id: str = "") -> None:
-    """
-    Run a coroutine in the background without blocking the request path.
-    Any exception is logged (and not silently dropped).
-    """
-    try:
-        task = _as.create_task(coro)
-    except Exception as ex:  # pragma: no cover - defensive logging
-        logging.warning("bg.spawn.failed label=%s trace_id=%s: %s", label, trace_id, ex, exc_info=True)
-        return
-
-    def _done(t) -> None:
-        try:
-            t.result()
-        except Exception as ex:  # pragma: no cover - defensive logging
-            logging.warning("bg.task.failed label=%s trace_id=%s: %s", label, trace_id, ex, exc_info=True)
-
-    try:
-        task.add_done_callback(_done)
-    except Exception:  # pragma: no cover
-        # add_done_callback should never fail, but if it does, at least avoid crashing the caller.
-        pass
 
 
 async def _orcjob_stream_gen(job_id: str, interval_ms: Optional[int] = None):
@@ -3864,7 +4021,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 music_branch = locks_arg.get("music") if isinstance(locks_arg.get("music"), dict) else {}
                 win_list_for_vocals = meta_obj.get("windows") if isinstance(meta_obj.get("windows"), list) else []
                 tts_manifest: Dict[str, Any] = {"items": []}
-                stems_result = render_vocal_stems_for_track(
+                stems_result = await render_vocal_stems_for_track(
                     job={"seed": a.get("seed")},
                     song_graph=music_branch,
                     windows=win_list_for_vocals,
@@ -4567,7 +4724,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             a["lock_bundle"] = lock_bundle
         a["quality_profile"] = quality_profile
 
-        env = run_tts_speak(a, provider, manifest)
+        env = await run_tts_speak(a, provider, manifest)
         # If run_tts_speak surfaced an error envelope from provider, forward it as a tool error.
         if isinstance(env, dict) and "ok" in env and not bool(env.get("ok")):
             return {"name": name, "error": env.get("error") or env}
@@ -6627,7 +6784,12 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
     if name == "code.super_loop" and ALLOW_TOOL_EXECUTION:
         # Back code.super_loop with the central committee AI path only.
         repo_root = os.getenv("REPO_ROOT", "/workspace")
-        step_tokens = int(os.getenv("CODE_LOOP_STEP_TOKENS", "900") or 900)
+        _step_tokens_raw = os.getenv("CODE_LOOP_STEP_TOKENS", "900") or "900"
+        try:
+            step_tokens = int(str(_step_tokens_raw).strip() or "900")
+        except Exception as ex:
+            logging.warning("code.super_loop: bad CODE_LOOP_STEP_TOKENS=%r; defaulting to 900", _step_tokens_raw, exc_info=True)
+            step_tokens = 900
         task = args.get("task") or ""
         env = await run_super_loop(
             task=str(task or ""),
@@ -6641,7 +6803,11 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         q = args.get("q") or args.get("query") or ""
         if not q:
             return {"name": name, "error": "missing query"}
-        k = int(args.get("k", 10))
+        try:
+            k = int(args.get("k", 10))
+        except Exception as ex:
+            logging.warning("web_search: bad k=%r; defaulting to 10", args.get("k"), exc_info=True)
+            k = 10
         # Reuse the metasearch fuse logic directly
         engines: Dict[str, List[Dict[str, Any]]] = {}
         for eng in ("google", "brave", "duckduckgo", "bing", "mojeek"):
@@ -6658,7 +6824,11 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         q = args.get("q") or ""
         if not q:
             return {"name": name, "error": "missing q"}
-        k = int(args.get("k", 10))
+        try:
+            k = int(args.get("k", 10))
+        except Exception as ex:
+            logging.warning("metasearch.fuse: bad k=%r; defaulting to 10", args.get("k"), exc_info=True)
+            k = 10
         # Deterministic multi-engine placeholder only; SERPAPI removed in favor of internal metasearch
         engines: Dict[str, List[Dict[str, Any]]] = {}
         # deterministic synthetic engines
@@ -7711,69 +7881,56 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
 async def chat_completions(body: Dict[str, Any], request: Request):
     # Single-exit discipline: exactly one return at the bottom of this function.
     response = None
-    logging.debug("chat_completions:init response=%r", response)
     usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-    logging.debug("chat_completions:init usage=%r", usage)
     display_content = ""
-    logging.debug("chat_completions:init display_content=%r", display_content)
     trace_id = "tt_unknown"
-    logging.debug("chat_completions:init trace_id=%r", trace_id)
     master_seed = 0
-    logging.debug("chat_completions:init master_seed=%r", master_seed)
     run_id = None
-    logging.debug("chat_completions:init run_id=%r", run_id)
     _lock_token = None
-    logging.debug("chat_completions:init _lock_token=%r", _lock_token)
     abort_pipeline: bool = False
-    logging.debug("chat_completions:init abort_pipeline=%r", abort_pipeline)
     planner_error_payload: Optional[Dict[str, Any]] = None
-    logging.debug("chat_completions:init planner_error_payload=%r", planner_error_payload)
-
+    
     # Always-defined downstream variables (no NameErrors, no fallthrough crashes).
     qwen_result: Dict[str, Any] = {}
-    logging.debug("chat_completions:init qwen_result=%r", qwen_result)
     glm_result: Dict[str, Any] = {}
-    logging.debug("chat_completions:init glm_result=%r", glm_result)
     deepseek_result: Dict[str, Any] = {}
-    logging.debug("chat_completions:init deepseek_result=%r", deepseek_result)
     synth_result: Dict[str, Any] = {}
-    logging.debug("chat_completions:init synth_result=%r", synth_result)
     tool_results: List[Dict[str, Any]] = []
-    logging.debug("chat_completions:init tool_results_len=%s", len(tool_results))
     final_env: Dict[str, Any] = {}
-    logging.debug("chat_completions:init final_env=%r", final_env)
     artifacts_out: Dict[str, Any] = {"urls": [], "items": []}
-    logging.debug("chat_completions:init artifacts_out=%r", artifacts_out)
     # Required post-run features (artifacts ledger, ablation export, teacher tap).
     tool_exec_meta: List[Dict[str, Any]] = []
-    logging.debug("chat_completions:init tool_exec_meta_len=%s", len(tool_exec_meta))
     _ledger_shard: Optional[dict] = None
-    logging.debug("chat_completions:init _ledger_shard=%r", _ledger_shard)
     _ledger_root: Optional[str] = None
-    logging.debug("chat_completions:init _ledger_root=%r", _ledger_root)
     _ledger_name: str = "ledger"
-    logging.debug("chat_completions:init _ledger_name=%r", _ledger_name)
     pack_hash: Optional[str] = None
-    logging.debug("chat_completions:init pack_hash=%r", pack_hash)
     # Absolutize helper must exist on all paths (including aborted requests).
     base_url: str = (PUBLIC_BASE_URL or "").rstrip("/") or (str(request.base_url) or "").rstrip("/")
-    logging.debug("chat_completions:init base_url=%r", base_url)
     abs_url_fn = partial(_abs_url, request_base_url=base_url)
-    logging.debug("chat_completions:init abs_url_fn=%r", abs_url_fn)
     # Always-defined planner outputs (avoid fallthrough crashes on abort paths).
     plan_text: str = ""
-    logging.debug("chat_completions:init plan_text=%r", plan_text)
     tool_calls: List[Dict[str, Any]] = []
-    logging.debug("chat_completions:init tool_calls_len=%s", len(tool_calls))
     planner_env: Dict[str, Any] = {}
-    logging.debug("chat_completions:init planner_env=%r", planner_env)
     # Executor routing knobs are used in multiple places; define once.
     executor_endpoint: str = EXECUTOR_BASE_URL or "http://127.0.0.1:8081"
-    logging.debug("chat_completions:init executor_endpoint=%r", executor_endpoint)
-    exec_temperature = (body.get("temperature") if isinstance(body, dict) else None) or DEFAULT_TEMPERATURE
-    logging.debug("chat_completions:init exec_temperature=%r", exec_temperature)
+    # Defensive: temperature may be str/None/NaN; must never raise.
+    _temp_raw = (body.get("temperature") if isinstance(body, dict) else None)
+    try:
+        exec_temperature = float(DEFAULT_TEMPERATURE if _temp_raw is None else _temp_raw)
+        # Clamp to OpenAI-compatible range.
+        if exec_temperature < 0.0:
+            exec_temperature = 0.0
+        if exec_temperature > 2.0:
+            exec_temperature = 2.0
+    except Exception as exc:
+        logging.warning(
+            "chat_completions: bad temperature=%r; defaulting to %r",
+            _temp_raw,
+            DEFAULT_TEMPERATURE,
+            exc_info=True,
+        )
+        exec_temperature = float(DEFAULT_TEMPERATURE)
     _cat_hash: str = ""
-    logging.debug("chat_completions:init _cat_hash=%r", _cat_hash)
     try:
         t0 = time.time()
         logging.debug("chat_completions:try t0=%r", t0)
@@ -7874,7 +8031,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             # ICW packing: one call, one system frame (ICW owns compression).
             icw_frame, pack_hash, icw_meta = pack_icw_system_frame_from_messages(
                 normalized_msgs,
-                cid=str(conv_cid) if conv_cid is not None else None,
+                cid=conv_cid,
                 goals=str(last_user_text or ""),
                 model_ctx_limit_tokens=int(DEFAULT_NUM_CTX),
                 pct_budget=0.65,
@@ -7954,7 +8111,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         plan_text, tool_calls, planner_env = await produce_tool_plan(
             normalized_msgs,
             (body.get("tools") if isinstance(body, dict) else None),
-            float(body.get("temperature") or DEFAULT_TEMPERATURE),
+            float(exec_temperature),
             trace_id=trace_id,
             mode=effective_mode,
         )
@@ -8037,13 +8194,25 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         # response prepared; continue to unified finalization below.
 
         # Segment QA helpers accept a planner_callable for compatibility; wired to the unified planner entry point.
-        planner_callable = lambda msgs, tools, temp, tid: produce_tool_plan(
-            msgs,
-            (body.get("tools") if isinstance(body, dict) else None),
-            float(temp or DEFAULT_TEMPERATURE),
-            trace_id=str(tid or trace_id),
-            mode=effective_mode,
-        )
+        # Defensive: temp may be str-ish; never raise in planner callback.
+        async def planner_callable(msgs, tools, temp, tid):
+            tmp = DEFAULT_TEMPERATURE
+            try:
+                tmp = float(tmp if temp is None else temp)
+            except Exception as exc:
+                logging.warning("planner_callable: bad temperature=%r; defaulting to %r", temp, DEFAULT_TEMPERATURE, exc_info=True)
+                tmp = float(DEFAULT_TEMPERATURE)
+            if tmp < 0.0:
+                tmp = 0.0
+            if tmp > 2.0:
+                tmp = 2.0
+            return await produce_tool_plan(
+                msgs,
+                (body.get("tools") if isinstance(body, dict) else None),
+                float(tmp),
+                trace_id=str(tid or trace_id),
+                mode=effective_mode,
+            )
         pipeline_ok: bool = not abort_pipeline
 
         if (not abort_pipeline) and tool_calls:
@@ -8126,7 +8295,24 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 # happens in the executor container instead of the orchestrator.
                 exec_batch = [tc]
                 logging.debug("chat_completions:tool_loop:exec_batch_len=%s", len(exec_batch))
-                exec_res = await gateway_execute(exec_batch, trace_id, executor_endpoint, request_id=str(request_id))
+                try:
+                    exec_res = await gateway_execute(exec_batch, trace_id, executor_endpoint, request_id=str(request_id))
+                except Exception as ex:
+                    # Hardening: a single tool execution failure must not crash the whole run.
+                    logging.error("chat_completions:tool_loop:gateway_execute raised tool=%r ex=%s", tn, ex, exc_info=True)
+                    exec_res = [
+                        {
+                            "name": str(tn or "tool"),
+                            "error": {
+                                "code": "executor_gateway_exception",
+                                "message": str(ex),
+                                "status": 0,
+                                "stack": _tb(ex),
+                            },
+                            "result": {},
+                            "args": (tc.get("arguments") if isinstance(tc.get("arguments"), dict) else {}),
+                        }
+                    ]
                 logging.debug("chat_completions:tool_loop:gateway_execute returned type=%s len=%s", type(exec_res).__name__, len(exec_res) if isinstance(exec_res, list) else -1)
                 tr = exec_res[0] if isinstance(exec_res, list) and exec_res else {}
                 logging.debug("chat_completions:tool_loop:tr_keys=%r", sorted(list(tr.keys())) if isinstance(tr, dict) else None)
@@ -8275,8 +8461,13 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                         logging.debug("chat_completions:tool_loop:film2.run profile_name=%r", profile_name)
                         preset = LOCK_QUALITY_PRESETS.get((profile_name or "standard").lower(), LOCK_QUALITY_PRESETS["standard"])
                         logging.debug("chat_completions:tool_loop:film2.run preset_keys=%r", sorted(list(preset.keys())) if isinstance(preset, dict) else None)
-                        # Clamp to a single refinement pass for segment-level film QA
-                        refine_budget = min(1, int(preset.get("max_refine_passes", 1)))
+                        # Clamp to a single refinement pass for segment-level film QA (defensive).
+                        _rb_raw = preset.get("max_refine_passes", 1) if isinstance(preset, dict) else 1
+                        try:
+                            refine_budget = min(1, int(_rb_raw))
+                        except Exception as exc:
+                            logging.warning("chat_completions: bad max_refine_passes=%r for film2.run; defaulting to 1", _rb_raw, exc_info=True)
+                            refine_budget = 1
                         logging.debug("chat_completions:tool_loop:film2.run refine_budget=%r", refine_budget)
                         segments_obj = meta_obj.get("segments") if isinstance(meta_obj, dict) else {}
                         logging.debug("chat_completions:tool_loop:film2.run segments_obj_type=%s", type(segments_obj).__name__)
@@ -8373,8 +8564,13 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                         logging.debug("chat_completions:tool_loop:music profile_name=%r", profile_name)
                         preset_music = LOCK_QUALITY_PRESETS.get((profile_name or "standard").lower(), LOCK_QUALITY_PRESETS["standard"])
                         logging.debug("chat_completions:tool_loop:music preset_keys=%r", sorted(list(preset_music.keys())) if isinstance(preset_music, dict) else None)
-                        # Clamp to a single refinement pass for music QA
-                        refine_budget_music = min(1, int(preset_music.get("max_refine_passes", 1)))
+                        # Clamp to a single refinement pass for music QA (defensive).
+                        _rbm_raw = preset_music.get("max_refine_passes", 1) if isinstance(preset_music, dict) else 1
+                        try:
+                            refine_budget_music = min(1, int(_rbm_raw))
+                        except Exception as exc:
+                            logging.warning("chat_completions: bad max_refine_passes=%r for music; defaulting to 1", _rbm_raw, exc_info=True)
+                            refine_budget_music = 1
                         logging.debug("chat_completions:tool_loop:music refine_budget_music=%r", refine_budget_music)
                         updated_seg, seg_outcome, seg_patch = await segment_qa_and_committee(
                             trace_id=trace_id,
@@ -8414,8 +8610,13 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                         logging.debug("chat_completions:tool_loop:image profile_name=%r", profile_name)
                         preset_img = LOCK_QUALITY_PRESETS.get((profile_name or "standard").lower(), LOCK_QUALITY_PRESETS["standard"])
                         logging.debug("chat_completions:tool_loop:image preset_keys=%r", sorted(list(preset_img.keys())) if isinstance(preset_img, dict) else None)
-                        # Clamp to a single refinement pass for image QA
-                        refine_budget_img = min(1, int(preset_img.get("max_refine_passes", 0)))
+                        # Clamp to a single refinement pass for image QA (defensive).
+                        _rbi_raw = preset_img.get("max_refine_passes", 0) if isinstance(preset_img, dict) else 0
+                        try:
+                            refine_budget_img = min(1, int(_rbi_raw))
+                        except Exception as exc:
+                            logging.warning("chat_completions: bad max_refine_passes=%r for image; defaulting to 0", _rbi_raw, exc_info=True)
+                            refine_budget_img = 0
                         logging.debug("chat_completions:tool_loop:image refine_budget_img=%r", refine_budget_img)
                         updated_seg, seg_outcome, seg_patch = await segment_qa_and_committee(
                             trace_id=trace_id,
@@ -8455,7 +8656,12 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                         logging.debug("chat_completions:tool_loop:tts profile_name=%r", profile_name)
                         preset_tts = LOCK_QUALITY_PRESETS.get((profile_name or "standard").lower(), LOCK_QUALITY_PRESETS["standard"])
                         logging.debug("chat_completions:tool_loop:tts preset_keys=%r", sorted(list(preset_tts.keys())) if isinstance(preset_tts, dict) else None)
-                        refine_budget_tts = min(1, int(preset_tts.get("max_refine_passes", 1)))
+                        _rbt_raw = preset_tts.get("max_refine_passes", 1) if isinstance(preset_tts, dict) else 1
+                        try:
+                            refine_budget_tts = min(1, int(_rbt_raw))
+                        except Exception as exc:
+                            logging.warning("chat_completions: bad max_refine_passes=%r for tts; defaulting to 1", _rbt_raw, exc_info=True)
+                            refine_budget_tts = 1
                         logging.debug("chat_completions:tool_loop:tts refine_budget_tts=%r", refine_budget_tts)
                         updated_seg, seg_outcome, seg_patch = await segment_qa_and_committee(
                             trace_id=trace_id,
@@ -8495,7 +8701,12 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                         logging.debug("chat_completions:tool_loop:sfx profile_name=%r", profile_name)
                         preset_sfx = LOCK_QUALITY_PRESETS.get((profile_name or "standard").lower(), LOCK_QUALITY_PRESETS["standard"])
                         logging.debug("chat_completions:tool_loop:sfx preset_keys=%r", sorted(list(preset_sfx.keys())) if isinstance(preset_sfx, dict) else None)
-                        refine_budget_sfx = min(1, int(preset_sfx.get("max_refine_passes", 0)))
+                        _rbs_raw = preset_sfx.get("max_refine_passes", 0) if isinstance(preset_sfx, dict) else 0
+                        try:
+                            refine_budget_sfx = min(1, int(_rbs_raw))
+                        except Exception as exc:
+                            logging.warning("chat_completions: bad max_refine_passes=%r for sfx; defaulting to 0", _rbs_raw, exc_info=True)
+                            refine_budget_sfx = 0
                         logging.debug("chat_completions:tool_loop:sfx refine_budget_sfx=%r", refine_budget_sfx)
                         updated_seg, seg_outcome, seg_patch = await segment_qa_and_committee(
                             trace_id=trace_id,
@@ -8558,7 +8769,23 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         logging.debug("chat_completions:postrun_qa _vid_count=%r", _vid_count)
         _aud_count = assets_count_audio(tool_results)
         logging.debug("chat_completions:postrun_qa _aud_count=%r", _aud_count)
-        counts_summary = {"images": int(_img_count), "videos": int(_vid_count), "audio": int(_aud_count)}
+        # Defensive: counts should be ints, but never allow logging/response to crash if not.
+        try:
+            _img_i = int(_img_count)
+        except Exception as exc:
+            logging.warning("chat_completions: bad images_count=%r; defaulting to 0", _img_count, exc_info=True)
+            _img_i = 0
+        try:
+            _vid_i = int(_vid_count)
+        except Exception as exc:
+            logging.warning("chat_completions: bad videos_count=%r; defaulting to 0", _vid_count, exc_info=True)
+            _vid_i = 0
+        try:
+            _aud_i = int(_aud_count)
+        except Exception as exc:
+            logging.warning("chat_completions: bad audio_count=%r; defaulting to 0", _aud_count, exc_info=True)
+            _aud_i = 0
+        counts_summary = {"images": _img_i, "videos": _vid_i, "audio": _aud_i}
         logging.debug("chat_completions:postrun_qa counts_summary=%r", counts_summary)
         domain_qa = assets_compute_domain_qa(tool_results)
         logging.debug("chat_completions:postrun_qa domain_qa_type=%s domain_qa=%r", type(domain_qa).__name__, domain_qa)
@@ -8660,7 +8887,23 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 if exec_batch:
                     _log("exec.payload", trace_id=trace_id, steps=[{"tool": (c.get("name") or "")} for c in exec_batch[:5]])
                     logging.debug("chat_completions:committee gateway_execute patch exec starting")
-                    exec_results = await gateway_execute(exec_batch, trace_id, executor_endpoint, request_id=str(request_id))
+                    try:
+                        exec_results = await gateway_execute(exec_batch, trace_id, executor_endpoint, request_id=str(request_id))
+                    except Exception as ex:
+                        # Hardening: patch-plan execution is advisory; never crash the main run.
+                        logging.error("chat_completions:committee:gateway_execute raised ex=%s", ex, exc_info=True)
+                        exec_results = [
+                            {
+                                "name": "executor",
+                                "error": {
+                                    "code": "executor_gateway_exception",
+                                    "message": str(ex),
+                                    "status": 0,
+                                    "stack": _tb(ex),
+                                },
+                                "result": {},
+                            }
+                        ]
                     logging.debug("chat_completions:committee gateway_execute patch exec returned len=%s", len(exec_results) if isinstance(exec_results, list) else -1)
                     # Persist patch exec results (teacher + ledger + db)
                     try:
@@ -8718,7 +8961,23 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 logging.debug("chat_completions:postrev_qa _vid_count=%r", _vid_count)
                 _aud_count = assets_count_audio(tool_results)
                 logging.debug("chat_completions:postrev_qa _aud_count=%r", _aud_count)
-                counts_summary = {"images": int(_img_count), "videos": int(_vid_count), "audio": int(_aud_count)}
+                # Defensive: counts should be ints, but never allow logging/response to crash if not.
+                try:
+                    _img_i = int(_img_count)
+                except Exception as exc:
+                    logging.warning("chat_completions: bad images_count=%r; defaulting to 0", _img_count, exc_info=True)
+                    _img_i = 0
+                try:
+                    _vid_i = int(_vid_count)
+                except Exception as exc:
+                    logging.warning("chat_completions: bad videos_count=%r; defaulting to 0", _vid_count, exc_info=True)
+                    _vid_i = 0
+                try:
+                    _aud_i = int(_aud_count)
+                except Exception as exc:
+                    logging.warning("chat_completions: bad audio_count=%r; defaulting to 0", _aud_count, exc_info=True)
+                    _aud_i = 0
+                counts_summary = {"images": _img_i, "videos": _vid_i, "audio": _aud_i}
                 logging.debug("chat_completions:postrev_qa counts_summary=%r", counts_summary)
                 domain_qa = assets_compute_domain_qa(tool_results)
                 logging.debug("chat_completions:postrev_qa domain_qa=%r", domain_qa)
@@ -9058,7 +9317,16 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             # Fire-and-forget teacher trace for streaming path as well (no try/except)
             req_dict = dict(body)
             msgs_for_seed = json.dumps(req_dict.get("messages", []), ensure_ascii=False, separators=(",", ":"))
-            provided_seed3 = int(body.get("seed")) if isinstance(body.get("seed"), (int, float)) else None
+            provided_seed3 = None
+            if isinstance(body.get("seed"), (int, float)):
+                try:
+                    provided_seed3 = int(body.get("seed"))
+                except Exception as exc:
+                    logging.warning(
+                        "chat_completions: bad seed=%r; ignoring and deriving from messages",
+                        body.get("seed"),
+                        exc_info=True,
+                    )
             master_seed = provided_seed3 if provided_seed3 is not None else _derive_seed("chat", msgs_for_seed)
             seed_router = det_seed_router(trace_id, master_seed)
             # Mirror planner routing decision from the unified planner entry point (plan.committee.produce_tool_plan) for trace metadata.
@@ -9081,7 +9349,8 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 "privacy": {"vault_refs": 0, "secrets_in": 0, "secrets_out": 0},
                 "events": planned_events[:64],
             }
-            _spawn_bg(_send_trace_stream_async(trace_payload_stream), label="teacher.trace.append.stream", trace_id=str(trace_id))
+            # Blocking trace emission (NO background tasks allowed).
+            await _send_trace_stream_async(trace_payload_stream)
             checkpoints_append_event(STATE_DIR, trace_id, "halt", {"kind": "committee", "chars": len(final_text)})
             # Do not stream; proceed to build the full final response below
 
@@ -9311,7 +9580,6 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 master_seed,
                 "orc-1",
                 envelope_builder=_build_openai_envelope,
-                prebuilt=(response_prebuilt if 'response_prebuilt' in locals() else None),
                 artifacts=(artifacts_payload if isinstance(artifacts_payload, dict) else None),
                 final_env=None,  # will be attached below after bump/assert/stamp
                 ok=pipeline_ok,
@@ -9372,7 +9640,16 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         else:
             req_dict = body.dict()
         msgs_for_seed = json.dumps(req_dict.get("messages", []), ensure_ascii=False, separators=(",", ":"))
-        provided_seed2 = int(req_dict.get("seed")) if isinstance(req_dict.get("seed"), (int, float)) else None
+        provided_seed2 = None
+        if isinstance(req_dict.get("seed"), (int, float)):
+            try:
+                provided_seed2 = int(req_dict.get("seed"))
+            except Exception as exc:
+                logging.warning(
+                    "chat_completions: bad seed=%r (teacher tap); deriving from messages",
+                    req_dict.get("seed"),
+                    exc_info=True,
+                )
         master_seed = provided_seed2 if provided_seed2 is not None else _derive_seed("chat", msgs_for_seed)
         label_cfg = (WRAPPER_CONFIG.get("teacher") or {}).get("default_label")
         # Normalize tool_calls shape for teacher (use args, not arguments)
@@ -9413,7 +9690,8 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             "env": {"public_base_url": PUBLIC_BASE_URL, "config_hash": WRAPPER_CONFIG_HASH},
             "privacy": {"vault_refs": 0, "secrets_in": 0, "secrets_out": 0},
         }
-        _spawn_bg(_send_trace_stream_async(trace_payload), label="teacher.trace.append", trace_id=str(trace_id))
+        # Blocking trace emission (NO background tasks allowed).
+        await _send_trace_stream_async(trace_payload)
 
         # response prepared; single return happens after the try/except.
     except Exception as ex:
@@ -9744,7 +10022,13 @@ async def http_tool_run(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
             # and add a local stack + raw body for additional debugging context.
             err_obj = env.get("error") or {}
             error_out: Dict[str, Any] = dict(err_obj)
-            error_out.setdefault("status", int(err_obj.get("status") or 0))
+            if "status" not in error_out:
+                _st_raw = err_obj.get("status")
+                try:
+                    error_out["status"] = int(_st_raw or 0)
+                except Exception as exc:
+                    logging.warning("toolrun.http.error: bad status=%r; defaulting to 0", _st_raw, exc_info=True)
+                    error_out["status"] = 0
             # Preserve any top-level cid/trace_id derived by /tool.run so callers
             # can join error telemetry back to conversation and trace identifiers.
             if isinstance(env.get("cid"), str) and env.get("cid"):
@@ -9801,14 +10085,33 @@ async def tools_append(body: Dict[str, Any], request: Request):
         # Distillation trace routing (no stack traces)
         trace_id = row.get("trace_id")
         if trace_id:
+            # Always persist the full executor event row into the unified trace stream.
+            # This is the highest-fidelity representation for training/debugging.
+            try:
+                trace_append(str(row.get("event") or "executor.event"), row)
+            except Exception:
+                # Never allow tracing to break ingestion.
+                pass
             if row.get("event") == "exec_step_start":
                 checkpoints_append_event(STATE_DIR, str(trace_id), "exec_step_start", {"tool": row.get("tool"), "step_id": row.get("step_id")})
             if row.get("event") == "exec_step_finish":
                 checkpoints_append_event(STATE_DIR, str(trace_id), "exec_step_finish", {"tool": row.get("tool"), "step_id": row.get("step_id"), "ok": bool(row.get("ok"))})
             if row.get("event") == "exec_step_attempt":
-                checkpoints_append_event(STATE_DIR, str(trace_id), "exec_step_attempt", {"tool": row.get("tool"), "step_id": row.get("step_id"), "attempt": int(row.get("attempt") or 0)})
+                _att_raw = row.get("attempt")
+                try:
+                    _att = int(_att_raw or 0)
+                except Exception as ex:
+                    logging.warning("trace.append: bad attempt=%r; defaulting to 0", _att_raw, exc_info=True)
+                    _att = 0
+                checkpoints_append_event(STATE_DIR, str(trace_id), "exec_step_attempt", {"tool": row.get("tool"), "step_id": row.get("step_id"), "attempt": _att})
             if row.get("event") == "exec_plan_start":
-                checkpoints_append_event(STATE_DIR, str(trace_id), "exec_plan_start", {"steps": int(row.get("steps") or 0)})
+                _steps_raw = row.get("steps")
+                try:
+                    _steps = int(_steps_raw or 0)
+                except Exception as ex:
+                    logging.warning("trace.append: bad steps=%r; defaulting to 0", _steps_raw, exc_info=True)
+                    _steps = 0
+                checkpoints_append_event(STATE_DIR, str(trace_id), "exec_plan_start", {"steps": _steps})
             if row.get("event") == "exec_plan_finish":
                 checkpoints_append_event(STATE_DIR, str(trace_id), "exec_plan_finish", {"produced_keys": (row.get("produced_keys") or [])})
             if row.get("event") == "exec_batch_start":
@@ -9817,24 +10120,55 @@ async def tools_append(body: Dict[str, Any], request: Request):
                 checkpoints_append_event(STATE_DIR, str(trace_id), "exec_batch_finish", {"items": (row.get("items") or [])})
             if bool(row.get("ok") is True) and row.get("event") == "end":
                 distilled = {
-                    "t": int(row.get("t") or 0),
+                    "t": 0,
                     "event": "tool_end",
                     "tool": row.get("tool"),
                     "step_id": row.get("step_id"),
-                    "duration_ms": int(row.get("duration_ms") or 0),
+                    "duration_ms": 0,
                 }
+                _t_raw = row.get("t")
+                try:
+                    distilled["t"] = int(_t_raw or 0)
+                except Exception as ex:
+                    logging.warning("trace.append: bad t=%r; defaulting to 0", _t_raw, exc_info=True)
+                    distilled["t"] = 0
+                _dur_raw = row.get("duration_ms")
+                try:
+                    distilled["duration_ms"] = int(_dur_raw or 0)
+                except Exception as ex:
+                    logging.warning("trace.append: bad duration_ms=%r; defaulting to 0", _dur_raw, exc_info=True)
+                    distilled["duration_ms"] = 0
                 if isinstance(row.get("summary"), dict):
                     distilled["summary"] = row.get("summary")
                 checkpoints_append_event(STATE_DIR, str(trace_id), "tool_summary", distilled)
                 # Compact artifact entries inferred from summary (no stack traces)
                 try:
                     s = row.get("summary") or {}
-                    if isinstance(s.get("images_count"), int) and s.get("images_count") > 0:
-                        checkpoints_append_event(STATE_DIR, str(trace_id), "artifact_summary", {"kind": "image", "count": int(s.get("images_count"))})
-                    if isinstance(s.get("videos_count"), int) and s.get("videos_count") > 0:
-                        checkpoints_append_event(STATE_DIR, str(trace_id), "artifact_summary", {"kind": "video", "count": int(s.get("videos_count"))})
-                    if isinstance(s.get("wav_bytes"), int) and s.get("wav_bytes") > 0:
-                        checkpoints_append_event(STATE_DIR, str(trace_id), "artifact_summary", {"kind": "audio", "bytes": int(s.get("wav_bytes"))})
+                    if isinstance(s, dict):
+                        _ic_raw = s.get("images_count")
+                        try:
+                            _ic = int(_ic_raw or 0)
+                        except Exception as ex:
+                            logging.warning("trace.append: bad images_count=%r; defaulting to 0", _ic_raw, exc_info=True)
+                            _ic = 0
+                        if _ic > 0:
+                            checkpoints_append_event(STATE_DIR, str(trace_id), "artifact_summary", {"kind": "image", "count": _ic})
+                        _vc_raw = s.get("videos_count")
+                        try:
+                            _vc = int(_vc_raw or 0)
+                        except Exception as ex:
+                            logging.warning("trace.append: bad videos_count=%r; defaulting to 0", _vc_raw, exc_info=True)
+                            _vc = 0
+                        if _vc > 0:
+                            checkpoints_append_event(STATE_DIR, str(trace_id), "artifact_summary", {"kind": "video", "count": _vc})
+                        _wb_raw = s.get("wav_bytes")
+                        try:
+                            _wb = int(_wb_raw or 0)
+                        except Exception as ex:
+                            logging.warning("trace.append: bad wav_bytes=%r; defaulting to 0", _wb_raw, exc_info=True)
+                            _wb = 0
+                        if _wb > 0:
+                            checkpoints_append_event(STATE_DIR, str(trace_id), "artifact_summary", {"kind": "audio", "bytes": _wb})
                 except Exception as ex:
                     logging.warning("artifact summary distillation failed: %s", ex, exc_info=True)
             # Forward review WS events to connected client if present
@@ -9929,9 +10263,24 @@ async def film2_qa(body: Dict[str, Any]):
         shots = body.get("shots") or []
         voice_lines = body.get("voice_lines") or []
         music_cues = body.get("music_cues") or []
-        T_FACE = float(os.getenv("FILM2_QA_T_FACE", "0.85"))
-        T_VOICE = float(os.getenv("FILM2_QA_T_VOICE", "0.85"))
-        T_MUSIC = float(os.getenv("FILM2_QA_T_MUSIC", "0.80"))
+        _t_face_raw = os.getenv("FILM2_QA_T_FACE", "0.85")
+        _t_voice_raw = os.getenv("FILM2_QA_T_VOICE", "0.85")
+        _t_music_raw = os.getenv("FILM2_QA_T_MUSIC", "0.80")
+        try:
+            T_FACE = float(str(_t_face_raw).strip() or "0.85")
+        except Exception:
+            logging.warning("film2.qa: bad FILM2_QA_T_FACE=%r; defaulting to 0.85", _t_face_raw, exc_info=True)
+            T_FACE = 0.85
+        try:
+            T_VOICE = float(str(_t_voice_raw).strip() or "0.85")
+        except Exception:
+            logging.warning("film2.qa: bad FILM2_QA_T_VOICE=%r; defaulting to 0.85", _t_voice_raw, exc_info=True)
+            T_VOICE = 0.85
+        try:
+            T_MUSIC = float(str(_t_music_raw).strip() or "0.80")
+        except Exception:
+            logging.warning("film2.qa: bad FILM2_QA_T_MUSIC=%r; defaulting to 0.80", _t_music_raw, exc_info=True)
+            T_MUSIC = 0.80
         issues = []
         for shot in shots:
             sid = shot.get("id") or shot.get("shot_id")
@@ -9942,7 +10291,13 @@ async def film2_qa(body: Dict[str, Any]):
             fin_meta = {"face_vec": None}
             score = _qa_face(sb_meta, fin_meta, face_ref_embed=None)
             if score < T_FACE:
-                args = {"name": "image.dispatch", "args": {"mode": "gen", "prompt": shot.get("prompt") or "", "size": shot.get("size", "1024x1024"), "refs": snap.get("refs", {}), "seed": int(snap.get("seed") or 0), "film_cid": cid, "shot_id": sid}}
+                _seed_raw = snap.get("seed") if isinstance(snap, dict) else None
+                try:
+                    _seed = int(_seed_raw or 0)
+                except Exception:
+                    logging.warning("film2.qa: bad snap.seed=%r; defaulting to 0", _seed_raw, exc_info=True)
+                    _seed = 0
+                args = {"name": "image.dispatch", "args": {"mode": "gen", "prompt": shot.get("prompt") or "", "size": shot.get("size", "1024x1024"), "refs": snap.get("refs", {}), "seed": _seed, "film_cid": cid, "shot_id": sid}}
                 _ = await http_tool_run(args.get("name") or "image.dispatch", args.get("args") or {})
                 issues.append({"shot": sid, "type": "image", "score": score})
         for ln in voice_lines:
@@ -9952,7 +10307,13 @@ async def film2_qa(body: Dict[str, Any]):
             snap = _film_load_snap(cid, f"vo_{lid}") or {}
             score = _qa_voice({"voice_vec": None}, voice_ref_embed=None)
             if score < T_VOICE:
-                args = {"name": "tts.speak", "args": {"text": ln.get("text") or "", "voice_id": ln.get("voice_ref_id"), "voice_refs": snap.get("refs", {}), "seed": int(snap.get("seed") or 0), "film_cid": cid, "line_id": lid}}
+                _seed_raw2 = snap.get("seed") if isinstance(snap, dict) else None
+                try:
+                    _seed2 = int(_seed_raw2 or 0)
+                except Exception:
+                    logging.warning("film2.qa: bad snap.seed=%r; defaulting to 0", _seed_raw2, exc_info=True)
+                    _seed2 = 0
+                args = {"name": "tts.speak", "args": {"text": ln.get("text") or "", "voice_id": ln.get("voice_ref_id"), "voice_refs": snap.get("refs", {}), "seed": _seed2, "film_cid": cid, "line_id": lid}}
                 _ = await http_tool_run(args.get("name") or "tts.speak", args.get("args") or {})
                 issues.append({"line": lid, "type": "voice", "score": score})
         for cue in music_cues:
@@ -10046,9 +10407,16 @@ async def logs_tools_tail(limit: int = 200):
 @app.get("/logs/trace.tail")
 async def logs_trace_tail(id: str, kind: str = "responses", limit: int = 200):
     try:
+        # Unified trace stream: <state>/traces/<trace_id>/trace.jsonl
+        # Keep the legacy query param `kind=responses|requests` as a best-effort filter.
         safe_kind = "responses" if kind not in ("responses", "requests") else kind
-        path = os.path.join(STATE_DIR, "traces", id, f"{safe_kind}.jsonl")
-        return {"id": id, "kind": safe_kind, "data": _read_tail(path, n=int(limit))}
+        path = os.path.join(STATE_DIR, "traces", id, "trace.jsonl")
+        rows = _read_tail(path, n=int(limit))
+        if safe_kind == "requests":
+            rows = [r for r in (rows or []) if isinstance(r, dict) and r.get("kind") == "request"]
+        elif safe_kind == "responses":
+            rows = [r for r in (rows or []) if isinstance(r, dict) and r.get("kind") == "response"]
+        return {"id": id, "kind": safe_kind, "data": rows}
     except Exception as ex:
         return JSONResponse(status_code=400, content={"error": str(ex)})
 
@@ -11125,7 +11493,12 @@ async def _track_comfy_job(job_id: str, prompt_id: str) -> None:
     last_outputs_count = -1
     last_error = None
     # Wait generously for history to appear; do not fail early just because history is temporarily missing
-    HISTORY_GRACE_SECONDS = int(os.getenv("HISTORY_GRACE_SECONDS", "86400"))  # default: 24h
+    _hist_grace_raw = os.getenv("HISTORY_GRACE_SECONDS", "86400")
+    try:
+        HISTORY_GRACE_SECONDS = int(str(_hist_grace_raw).strip() or "86400")  # default: 24h
+    except Exception:
+        logging.warning("comfy.track: bad HISTORY_GRACE_SECONDS=%r; defaulting to 86400", _hist_grace_raw, exc_info=True)
+        HISTORY_GRACE_SECONDS = 86400
     start_time = time.time()
     while True:
         data = await _comfy_history(prompt_id)

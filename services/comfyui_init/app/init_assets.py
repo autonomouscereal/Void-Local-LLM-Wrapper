@@ -87,7 +87,6 @@ def dl(repo: str, filename: str, target_dir: str, rename: Optional[str] = None, 
         headers = {"Authorization": f"Bearer {token}"} if token else None
         t0 = time.perf_counter()
         r = requests.get(url, headers=headers)
-        r.raise_for_status()
         with open(dst, "wb") as f:
             f.write(r.content)
         log.info(
@@ -125,7 +124,6 @@ def download_with_retries(url: str, dst: str, max_retries: int = 3, backoff_seco
         try:
             t0 = time.perf_counter()
             r = requests.get(url, headers=headers)
-            r.raise_for_status()
             with open(dst, "wb") as f:
                 f.write(r.content)
             log.info(

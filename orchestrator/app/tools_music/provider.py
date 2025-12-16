@@ -5,6 +5,7 @@ import os
 from typing import Any, Dict
 
 import httpx  # type: ignore
+import logging
 
 
 class RestMusicProvider:
@@ -45,10 +46,19 @@ class RestMusicProvider:
         self._base = (base_url or os.getenv("MUSIC_API_URL") or "").rstrip("/")
 
     def compose(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        log = logging.getLogger("orchestrator.tools_music.provider")
         if not self._base:
             # Never raise from tool providers; return empty audio with a structured error.
-            sample_rate = int(args.get("sample_rate") or 44100)
-            channels = int(args.get("channels") or 2)
+            try:
+                sample_rate = int(args.get("sample_rate") or 44100)
+            except Exception as exc:
+                log.warning("music.provider: bad sample_rate=%r; defaulting to 44100", args.get("sample_rate"), exc_info=True)
+                sample_rate = 44100
+            try:
+                channels = int(args.get("channels") or 2)
+            except Exception as exc:
+                log.warning("music.provider: bad channels=%r; defaulting to 2", args.get("channels"), exc_info=True)
+                channels = 2
             return {
                 "wav_bytes": b"",
                 "sample_rate": sample_rate,
@@ -59,9 +69,21 @@ class RestMusicProvider:
                 },
             }
 
-        seconds = int(args.get("length_s") or 30)
-        sample_rate = int(args.get("sample_rate") or 44100)
-        channels = int(args.get("channels") or 2)
+        try:
+            seconds = int(args.get("length_s") or 30)
+        except Exception as exc:
+            log.warning("music.provider: bad length_s=%r; defaulting to 30", args.get("length_s"), exc_info=True)
+            seconds = 30
+        try:
+            sample_rate = int(args.get("sample_rate") or 44100)
+        except Exception as exc:
+            log.warning("music.provider: bad sample_rate=%r; defaulting to 44100", args.get("sample_rate"), exc_info=True)
+            sample_rate = 44100
+        try:
+            channels = int(args.get("channels") or 2)
+        except Exception as exc:
+            log.warning("music.provider: bad channels=%r; defaulting to 2", args.get("channels"), exc_info=True)
+            channels = 2
         payload: Dict[str, Any] = {
             "prompt": str(args.get("prompt") or ""),
             "seconds": seconds,
@@ -108,10 +130,22 @@ class RestMusicProvider:
                     wav_bytes = b""
             else:
                 wav_bytes = b""
+            _sr_raw = inner.get("sample_rate") or sample_rate
+            _ch_raw = inner.get("channels") or channels
+            try:
+                out_sr = int(_sr_raw)
+            except Exception as exc:
+                log.warning("music.provider: bad inner.sample_rate=%r; using %d", _sr_raw, int(sample_rate), exc_info=True)
+                out_sr = int(sample_rate)
+            try:
+                out_ch = int(_ch_raw)
+            except Exception as exc:
+                log.warning("music.provider: bad inner.channels=%r; using %d", _ch_raw, int(channels), exc_info=True)
+                out_ch = int(channels)
             return {
                 "wav_bytes": wav_bytes,
-                "sample_rate": int(inner.get("sample_rate") or sample_rate),
-                "channels": int(inner.get("channels") or channels),
+                "sample_rate": out_sr,
+                "channels": out_ch,
                 "model": inner.get("model") or "music",
                 "stems": inner.get("stems") or [],
             }

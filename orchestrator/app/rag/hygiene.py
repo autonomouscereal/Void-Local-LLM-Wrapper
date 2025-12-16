@@ -5,6 +5,7 @@ import re
 import hashlib
 import os
 from typing import List, Dict
+import logging
 
 
 def _norm_title(t: str) -> str:
@@ -24,7 +25,8 @@ def rag_filter(chunks: List[Dict], ttl_s: int | None = None) -> List[Dict]:
     if ttl_s is None:
         try:
             ttl_s = int(os.getenv("RAG_TTL_SECONDS", "3600"))
-        except Exception:
+        except Exception as exc:
+            logging.getLogger(__name__).warning("rag.hygiene: bad RAG_TTL_SECONDS=%r; defaulting to 3600", os.getenv("RAG_TTL_SECONDS"), exc_info=True)
             ttl_s = 3600
     now = time.time()
     seen = set()
@@ -53,7 +55,8 @@ def evidence_binding_footer(distilled_chunks: List[Dict]) -> str:
     """
     try:
         max_items = int(os.getenv("RAG_EVIDENCE_MAX", "6"))
-    except Exception:
+    except Exception as exc:
+        logging.getLogger(__name__).warning("rag.hygiene: bad RAG_EVIDENCE_MAX=%r; defaulting to 6", os.getenv("RAG_EVIDENCE_MAX"), exc_info=True)
         max_items = 6
     lines = []
     for c in (distilled_chunks or [])[: max(1, max_items)]:
