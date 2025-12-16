@@ -2539,16 +2539,21 @@ from .rag.core import rag_index_dir  # re-exported for backwards-compat
 
 
 from .rag.core import rag_search  # re-exported for backwards-compat
-from .committee_client import (
-    QWEN_MODEL_ID,
-    GLM_MODEL_ID,
-    DEEPSEEK_CODER_MODEL_ID,
-    DEFAULT_NUM_CTX,
-    COMMITTEE_MODEL_ID,
-    COMMITTEE_PARTICIPANTS,
-    committee_ai_text,
-    committee_jsonify,
-)
+from .committee_client import committee_ai_text, committee_jsonify
+
+# committee_client import policy: only import committee call + jsonify.
+# All other config is sourced directly from environment here.
+QWEN_MODEL_ID = os.getenv("QWEN_MODEL_ID", "qwen3:30b-a3b-instruct-2507-q4_K_M")
+GLM_MODEL_ID = os.getenv("GLM_MODEL_ID", "glm4:9b")
+DEEPSEEK_CODER_MODEL_ID = os.getenv("DEEPSEEK_CODER_MODEL_ID", "deepseek-coder-v2:lite")
+
+_DEFAULT_NUM_CTX_RAW = os.getenv("DEFAULT_NUM_CTX", "8192")
+try:
+    DEFAULT_NUM_CTX = int(str(_DEFAULT_NUM_CTX_RAW).strip() or "8192")
+except Exception:
+    DEFAULT_NUM_CTX = 8192
+
+COMMITTEE_MODEL_ID = os.getenv("COMMITTEE_MODEL_ID") or f"committee:{QWEN_MODEL_ID}+{GLM_MODEL_ID}+{DEEPSEEK_CODER_MODEL_ID}"
 
 
 ## serpapi removed — use metasearch.fuse/web_search exclusively

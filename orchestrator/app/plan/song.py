@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional
 
 from ..json_parser import JSONParser
 from ..tracing.runtime import trace_event
-from ..committee_client import committee_ai_text, committee_jsonify, _schema_to_template
+from ..committee_client import committee_ai_text, committee_jsonify
 
 # Single logger per module (no custom logger names)
 log = logging.getLogger(__name__)
@@ -88,6 +88,35 @@ SONG_GRAPH_SCHEMA: Dict[str, Any] = {
         }
     ],
 }
+
+
+def _schema_to_template(expected: Any) -> Any:
+    """
+    Convert an expected-schema shape (dict/list/type primitives) into a JSON-serializable
+    template object. Kept local: committee_client is only allowed to export the committee
+    call + jsonify functions.
+    """
+    if isinstance(expected, dict):
+        return {k: _schema_to_template(v) for k, v in expected.items()}
+    if isinstance(expected, list):
+        if not expected:
+            return []
+        return [_schema_to_template(expected[0])]
+    if isinstance(expected, type):
+        if issubclass(expected, bool):
+            return False
+        if issubclass(expected, int):
+            return 0
+        if issubclass(expected, float):
+            return 0.0
+        if issubclass(expected, str):
+            return ""
+        if issubclass(expected, (list, tuple, set)):
+            return []
+        if issubclass(expected, dict):
+            return {}
+        return None
+    return expected
 
 
 def _fix_mojibake(s: str) -> str:
