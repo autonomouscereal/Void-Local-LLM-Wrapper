@@ -310,15 +310,18 @@ async def tool_run(req: Request):
         if isinstance(body, dict) and isinstance(body.get("request_id"), str) and str(body.get("request_id")).strip()
         else uuid.uuid4().hex
     )
-    tid = (
-        str(body.get("trace_id")).strip()
-        if isinstance(body, dict) and isinstance(body.get("trace_id"), str) and str(body.get("trace_id")).strip()
-        else _mint_trace_id()
-    )
     if not isinstance(body, dict):
         return ToolEnvelope.failure(
             "invalid_body_type",
             "Body must be a JSON object",
+            status=422,
+            request_id=rid,
+        )
+    trace_id = body.get("trace_id")
+    if not isinstance(trace_id, str) or not trace_id:
+        return ToolEnvelope.failure(
+            "missing_trace_id",
+            "trace_id is required",
             status=422,
             request_id=rid,
         )
@@ -344,7 +347,7 @@ async def tool_run(req: Request):
         call = {
             "name": name,
             "arguments": args,
-            "trace_id": tid,
+            "trace_id": trace_id,
         }
         # Let execute_tool_call enforce its own invariants. Any unexpected exception
         # will naturally raise and surface as a 500 from FastAPI instead of being

@@ -130,7 +130,7 @@ async def produce_tool_plan(
     """
     effective_mode = str(mode).strip() or "general"
     t0 = time.perf_counter()
-    trace_id = str(trace_id).strip()
+    # Use trace_id only (no derived/fallback trace keys, no normalization).
     messages = _safe_message_list(messages or [], trace_id=trace_id)
     tools = _safe_tools_list(tools, trace_id=trace_id)
     try:
@@ -189,7 +189,7 @@ async def produce_tool_plan(
     ]
     for name in allowed_tools:
         try:
-            schema = _tool_schema_by_name(name)
+            schema = _tool_schema_by_name(name=name)
             catalog_lines.append(f"- tool: {name}")
             catalog_lines.append("  json_schema: " + json.dumps(schema or {}, ensure_ascii=False, sort_keys=True))
         except Exception as exc:  # pragma: no cover - defensive logging
@@ -252,7 +252,7 @@ async def produce_tool_plan(
     t_parse = time.perf_counter()
     try:
         parsed = await committee_jsonify(
-            raw_text or "{}",
+            raw_text=raw_text or "{}",
             expected_schema=schema_steps,
             trace_id=trace_id,
             temperature=0.0,

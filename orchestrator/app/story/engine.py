@@ -334,7 +334,7 @@ async def ensure_tts_locks_and_dialogue_audio(
             continue
         args_tts: Dict[str, Any] = {
             "text": text,
-            "trace_id": trace_id or "",
+            "trace_id": trace_id,
             "quality_profile": profile_name,
         }
         if isinstance(updated_locks, dict) and updated_locks:

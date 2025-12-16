@@ -355,7 +355,7 @@ async def _call_music_eval_committee(summary: str) -> Dict[str, Any]:
         import logging
 
         client = CommitteeClient()
-        env = await client.run(messages, trace_id="music_eval")
+        env = await client.run(messages=messages, trace_id="music_eval")
         # Default error-shaped result; overwritten on success.
         result_payload: Dict[str, Any] = {
             "overall_quality_score": 0.0,
@@ -378,7 +378,7 @@ async def _call_music_eval_committee(summary: str) -> Dict[str, Any]:
             txt = committee_result.get("text") or ""
             # Then, pass the raw text through committee_jsonify to enforce the schema.
             parsed = await committee_jsonify(
-                txt or "{}",
+                raw_text=txt or "{}",
                 expected_schema=schema,
                 trace_id="music_eval",
                 temperature=0.0,

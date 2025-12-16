@@ -33,9 +33,9 @@ async def _parse_json(text: str, expected_schema: Any, *, trace_id: str) -> Dict
     - Always route through committee_jsonify BEFORE any JSONParser coercion.
     """
     parsed = await committee_jsonify(
-        text or "{}",
+        raw_text=text or "{}",
         expected_schema=expected_schema,
-        trace_id=str(trace_id or "code_super_loop"),
+        trace_id=trace_id,
         temperature=0.0,
     )
     return parsed if isinstance(parsed, dict) else {}
@@ -50,7 +50,7 @@ async def run_super_loop(task: str, repo_root: str, *, trace_id: str, step_token
     arch_in = build_architect_input(task, idx)
     arch_env = await committee_ai_text(
         messages=[{"role": "user", "content": arch_in}],
-        trace_id=str(trace_id or "code_super_loop") + ".architect",
+        trace_id=trace_id,
         temperature=0.3,
     )
     arch_txt = ""
@@ -58,7 +58,7 @@ async def run_super_loop(task: str, repo_root: str, *, trace_id: str, step_token
         arch_res = arch_env.get("result") or {}
         if isinstance(arch_res, dict) and isinstance(arch_res.get("text"), str):
             arch_txt = arch_res.get("text") or ""
-    plan = await _parse_json(arch_txt, ARCH_SCHEMA, trace_id=str(trace_id or "code_super_loop") + ".architect.json")
+    plan = await _parse_json(arch_txt, ARCH_SCHEMA, trace_id=trace_id)
     decisions = ["architect plan produced"]
     # Prepare excerpts
     excerpts = []
@@ -72,7 +72,7 @@ async def run_super_loop(task: str, repo_root: str, *, trace_id: str, step_token
     impl_in = build_implementer_input(plan, excerpts)
     impl_env = await committee_ai_text(
         messages=[{"role": "user", "content": impl_in}],
-        trace_id=str(trace_id or "code_super_loop") + ".implementer",
+        trace_id=trace_id,
         temperature=0.3,
     )
     impl_txt = ""
@@ -80,14 +80,14 @@ async def run_super_loop(task: str, repo_root: str, *, trace_id: str, step_token
         impl_res = impl_env.get("result") or {}
         if isinstance(impl_res, dict) and isinstance(impl_res.get("text"), str):
             impl_txt = impl_res.get("text") or ""
-    impl = await _parse_json(impl_txt, IMPL_SCHEMA, trace_id=str(trace_id or "code_super_loop") + ".implementer.json")
+    impl = await _parse_json(impl_txt, IMPL_SCHEMA, trace_id=trace_id)
     patch = impl.get("patch", "")
     decisions.append("implementer patch produced")
     # Phase 3: Reviewer
     rev_in = build_reviewer_input(task, plan, patch)
     rev_env = await committee_ai_text(
         messages=[{"role": "user", "content": rev_in}],
-        trace_id=str(trace_id or "code_super_loop") + ".reviewer",
+        trace_id=trace_id,
         temperature=0.3,
     )
     rev_txt = ""
@@ -95,7 +95,7 @@ async def run_super_loop(task: str, repo_root: str, *, trace_id: str, step_token
         rev_res = rev_env.get("result") or {}
         if isinstance(rev_res, dict) and isinstance(rev_res.get("text"), str):
             rev_txt = rev_res.get("text") or ""
-    rev = await _parse_json(rev_txt, REV_SCHEMA, trace_id=str(trace_id or "code_super_loop") + ".reviewer.json")
+    rev = await _parse_json(rev_txt, REV_SCHEMA, trace_id=trace_id)
     final_patch = rev.get("patch", patch)
     decisions += ["reviewer pass", "diff verified"]
     # In-memory verification

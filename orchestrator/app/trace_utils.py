@@ -41,7 +41,7 @@ class TraceEmitter:
     def emit(self, trace_id: str, kind: str, payload: Dict[str, Any]) -> None:
         data = dict(payload or {})
         data.setdefault("domain", self.infer_domain(kind, data))
-        checkpoints_append_event(self.state_dir, str(trace_id), kind, data)
+        checkpoints_append_event(self.state_dir, trace_id, kind, data)
 
 
 def infer_domain(kind: str, payload: Dict[str, Any] | None = None) -> str:

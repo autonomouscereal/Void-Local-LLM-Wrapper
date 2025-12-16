@@ -13,7 +13,7 @@ log = logging.getLogger(__name__)
 
 async def execute(
     tool_calls: List[Dict[str, Any]],
-    trace_id: Optional[str],
+    trace_id: str,
     executor_base_url: str,
     *,
     request_id: Optional[str] = None,
@@ -46,8 +46,7 @@ async def execute(
 
     # request_id (rid) and trace_id are distinct identifiers; never reuse one as the other.
     rid = str(request_id or _uuid.uuid4().hex)
-    tid = str(trace_id or _uuid.uuid4().hex)
-    payload = {"schema_version": 1, "request_id": rid, "trace_id": tid, "steps": steps}
+    payload = {"schema_version": 1, "request_id": rid, "trace_id": trace_id, "steps": steps}
     try:
         # Never log full args payloads (may contain long prompts/base64). Log keys + types only.
         steps_preview = []
@@ -60,7 +59,7 @@ async def execute(
                     "args_types": {str(k): type(v).__name__ for k, v in list(a.items())[:32]},
                 }
             )
-        log.info("executor_gateway.execute start trace_id=%s request_id=%s steps=%s preview=%s", tid, rid, len(steps), steps_preview)
+        log.info("executor_gateway.execute start trace_id=%s request_id=%s steps=%s preview=%s", trace_id, rid, len(steps), steps_preview)
     except Exception:
         log.debug("executor_gateway.execute: failed to emit start log preview", exc_info=True)
     base = (executor_base_url or "").rstrip("/")
@@ -79,7 +78,7 @@ async def execute(
     # be represented as per-step error objects so the caller can continue the run.
     try:
         async with _hx.AsyncClient(timeout=None, trust_env=False) as client:
-            log.info("executor_gateway.execute POST %s/execute trace_id=%s request_id=%s", base, tid, rid)
+            log.info("executor_gateway.execute POST %s/execute trace_id=%s request_id=%s", base, trace_id, rid)
             r = await client.post(base + "/execute", json=payload)
             raw_body = r.text or ""
     except _hx.TimeoutException as ex:  # type: ignore[attr-defined]
@@ -158,7 +157,7 @@ async def execute(
         produced_keys = sorted(list(produced_obj.keys()))[:32] if isinstance(produced_obj, dict) else []
         log.info(
             "executor_gateway.execute response trace_id=%s request_id=%s http_status=%s ok=%s produced_keys=%s",
-            tid,
+            trace_id,
             rid,
             int(r.status_code),
             ok_flag,

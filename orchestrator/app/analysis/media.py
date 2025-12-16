@@ -907,18 +907,30 @@ def analyze_audio(path: str) -> Dict[str, Any]:
     if not isinstance(path, str) or not os.path.exists(path):
         return out
     y, sr = _load_audio(path)
+    # Keep _load_audio()'s output as a plain list for wide compatibility across
+    # the codebase, but convert to a NumPy float array for libraries like
+    # pyloudnorm/librosa that require ndarray inputs.
+    y_np = None
+    if y and sr:
+        try:
+            y_np = np.asarray(y, dtype="float32")
+            # Defensive: if some decoder returns shape (n, ch), mix down.
+            if getattr(y_np, "ndim", 1) > 1:
+                y_np = y_np.mean(axis=1)
+        except Exception:
+            y_np = None
     # LUFS
     try:
-        if y and sr:
-            meter = pyln.Meter(sr)
-            out["lufs"] = float(meter.integrated_loudness(y))
+        if y_np is not None and sr:
+            meter = pyln.Meter(int(sr))
+            # pyloudnorm expects ndarray float input; lists can trigger datatype errors.
+            out["lufs"] = float(meter.integrated_loudness(y_np))
     except Exception as exc:
         # Non-fatal; keep default None values.
         log.debug("analysis.media.analyze_audio: LUFS compute failed path=%s: %s", path, exc, exc_info=True)
     # Tempo + Key + Emotion (heuristic)
     try:
-        if y and sr:
-            y_np = np.asarray(y, dtype=float)
+        if y_np is not None and sr:
             # For extremely short clips, skip spectral/tempo analysis to avoid
             # librosa warnings about n_fft being larger than the signal length.
             n_samples = int(getattr(y_np, "size", len(y_np)))

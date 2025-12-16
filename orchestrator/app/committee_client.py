@@ -132,8 +132,7 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str) -> 
     returned in a structured envelope so upstream planner/committee callers can
     surface them cleanly to HTTP responses instead of killing connections.
     """
-    # Use trace_id only (no derived/fallback trace keys). Empty string means "no explicit trace id".
-    trace_id = str(trace_id or "").strip()
+    # Use trace_id only (no derived/fallback trace keys, no normalization).
     t_all = time.monotonic()
     model = payload.get("model")
     prompt = payload.get("prompt")
@@ -219,14 +218,6 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str) -> 
             len(raw_text),
             headers.get("content-type"),
         )
-        log.info(
-            "[committee] ollama.http.raw trace_id=%s base=%s model=%s status=%d raw=%s",
-            trace_id,
-            base_url,
-            model,
-            status_code,
-            raw_text,
-        )
 
         parser = JSONParser()
         t_parse = time.monotonic()
@@ -236,21 +227,21 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str) -> 
         except Exception as exc:  # pragma: no cover - defensive logging
             msg = str(exc)
             log.error(
-                "[committee] ollama.response_parse_error trace_id=%s base=%s model=%s status=%d parse_dur_ms=%d error=%s raw=%s",
+                "[committee] ollama.response_parse_error trace_id=%s base=%s model=%s status=%d parse_dur_ms=%d error=%s raw_chars=%d",
                 trace_id,
                 base_url,
                 model,
                 status_code,
                 int((time.monotonic() - t_parse) * 1000.0),
                 msg,
-                raw_text,
+                len(raw_text or ""),
                 exc_info=True,
             )
             emit_trace(
                 STATE_DIR,
                 trace_id,
                 "committee.ollama.response_parse_error",
-                {"trace_id": trace_id, "base_url": base_url, "status_code": status_code, "error": msg, "raw": raw_text},
+                {"trace_id": trace_id, "base_url": base_url, "status_code": status_code, "error": msg, "raw_chars": len(raw_text or "")},
             )
             return {
                 "ok": False,
@@ -278,20 +269,21 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str) -> 
         )
 
         if not (200 <= status_code < 300):
+            err_text = parsed.get("error") if isinstance(parsed.get("error"), str) else ""
             emit_trace(
                 STATE_DIR,
                 trace_id,
                 "committee.ollama.http_error",
-                {"trace_id": trace_id, "base_url": base_url, "status_code": status_code, "body": parsed},
+                {"trace_id": trace_id, "base_url": base_url, "status_code": status_code, "error": err_text},
             )
             log.error(
-                "[committee] ollama.http_error trace_id=%s base=%s model=%s status=%d dur_ms=%d body=%s",
+                "[committee] ollama.http_error trace_id=%s base=%s model=%s status=%d dur_ms=%d error=%s",
                 trace_id,
                 base_url,
                 model,
                 status_code,
                 int((time.monotonic() - t_all) * 1000.0),
-                parsed,
+                err_text,
             )
             return {
                 "ok": False,
@@ -300,7 +292,7 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str) -> 
                     "message": f"ollama returned HTTP {status_code}",
                     "status": status_code,
                     "base_url": base_url,
-                    "details": {"body": parsed},
+                    "details": {"error": err_text},
                 },
             }
 
@@ -470,11 +462,11 @@ async def committee_member_text(
     Internal-only primitive: call exactly one committee participant.
     """
     t0 = time.monotonic()
-    cfg = _participant_for(member_id)
+    cfg = _participant_for(member_id=member_id)
     if not cfg:
         log.error(
             "[committee] member.finish trace_id=%s member=%s ok=false dur_ms=%d error=unknown_member",
-            str(trace_id or "committee"),
+            trace_id,
             str(member_id or ""),
             int((time.monotonic() - t0) * 1000.0),
         )
@@ -483,22 +475,22 @@ async def committee_member_text(
     model = cfg.get("model") or QWEN_MODEL_ID
     log.info(
         "[committee] member.start trace_id=%s member=%s base=%s model=%s messages=%d temperature=%s",
-        str(trace_id or "committee"),
+        trace_id,
         str(member_id or ""),
         str(base),
         str(model),
         len(messages or []),
         float(temperature),
     )
-    payload = build_ollama_payload(messages or [], model, DEFAULT_NUM_CTX, temperature)
-    res = await call_ollama(base, payload, trace_id=trace_id)
+    payload = build_ollama_payload(messages=messages or [], model=model, num_ctx=DEFAULT_NUM_CTX, temperature=temperature)
+    res = await call_ollama(base_url=base, payload=payload, trace_id=trace_id)
     if isinstance(res, dict):
         res["_base_url"] = base
         res["_model"] = model
         res["_member"] = str(member_id or "")
         log.info(
             "[committee] member.finish trace_id=%s member=%s ok=%s dur_ms=%d response_chars=%d has_error=%s",
-            str(trace_id or "committee"),
+            trace_id,
             str(member_id or ""),
             bool(res.get("ok", True)),
             int((time.monotonic() - t0) * 1000.0),
@@ -508,7 +500,7 @@ async def committee_member_text(
         return res
     log.error(
         "[committee] member.finish trace_id=%s member=%s ok=false dur_ms=%d error=invalid_member_response resp=%r",
-        str(trace_id or "committee"),
+        trace_id,
         str(member_id or ""),
         int((time.monotonic() - t0) * 1000.0),
         res,
@@ -528,12 +520,17 @@ async def committee_synth_text(
     """
     log.info(
         "[committee] synth.start trace_id=%s synth_member=%s messages=%d temperature=%s",
-        str(trace_id or "committee"),
+        trace_id,
         str(synth_member or "qwen"),
         len(messages or []),
         float(temperature),
     )
-    return await committee_member_text(synth_member, messages, trace_id=trace_id, temperature=temperature)
+    return await committee_member_text(
+        member_id=synth_member,
+        messages=messages,
+        trace_id=trace_id,
+        temperature=temperature,
+    )
 
 
 async def committee_ai_text(
@@ -555,8 +552,7 @@ async def committee_ai_text(
     - Callers MUST NOT implement cross-debate by calling this function multiple
       times pretending it's "per member". Per-member calls are internal helpers.
     """
-    # Use trace_id only (no derived/fallback trace keys). Empty string means "no explicit trace id".
-    trace_id = str(trace_id or "").strip()
+    # Use trace_id only (no derived/fallback trace keys, no normalization).
     # Defensive: rounds can be str-ish from callers; never raise.
     try:
         _rounds_raw = rounds if rounds is not None else DEFAULT_COMMITTEE_ROUNDS
@@ -625,7 +621,12 @@ async def committee_ai_text(
                 "committee.member_draft",
                 {"trace_id": trace_id, "round": int(r + 1), "member": mid},
             )
-            res = await committee_member_text(mid, member_msgs, trace_id=trace_id, temperature=_temp_run)
+            res = await committee_member_text(
+                member_id=mid,
+                messages=member_msgs,
+                trace_id=trace_id,
+                temperature=_temp_run,
+            )
             member_results[mid] = res if isinstance(res, dict) else {}
             txt = ""
             if isinstance(res, dict) and res.get("ok") is not False:
@@ -673,7 +674,12 @@ async def committee_ai_text(
                 "committee.member_critique",
                 {"trace_id": trace_id, "round": int(r + 1), "member": mid},
             )
-            res = await committee_member_text(mid, member_msgs, trace_id=trace_id, temperature=_temp_run)
+            res = await committee_member_text(
+                member_id=mid,
+                messages=member_msgs,
+                trace_id=trace_id,
+                temperature=_temp_run,
+            )
             critique_results[mid] = res if isinstance(res, dict) else {}
             crit_txt = ""
             if isinstance(res, dict) and res.get("ok") is not False:
@@ -727,7 +733,12 @@ async def committee_ai_text(
                 "committee.member_revision",
                 {"trace_id": trace_id, "round": int(r + 1), "member": mid},
             )
-            res = await committee_member_text(mid, member_msgs, trace_id=trace_id, temperature=_temp_run)
+            res = await committee_member_text(
+                member_id=mid,
+                messages=member_msgs,
+                trace_id=trace_id,
+                temperature=_temp_run,
+            )
             member_results[mid] = res if isinstance(res, dict) else {}
             txt = ""
             if isinstance(res, dict) and res.get("ok") is not False:
@@ -777,7 +788,12 @@ async def committee_ai_text(
         {"trace_id": trace_id, "synth_member": "qwen"},
     )
     t_synth = time.monotonic()
-    synth_env = await committee_synth_text(synth_messages, trace_id=f"{trace_id}.synth", temperature=0.0, synth_member="qwen")
+    synth_env = await committee_synth_text(
+        messages=synth_messages,
+        trace_id=trace_id,
+        temperature=0.0,
+        synth_member="qwen",
+    )
     synth_text = ""
     if isinstance(synth_env, dict) and synth_env.get("ok") is not False:
         synth_text = str(synth_env.get("response") or "").strip()
@@ -966,28 +982,25 @@ async def committee_jsonify(
       - committee.jsonify.candidates
       - committee.jsonify.merge
     """
-    trace_base = str(trace_id or "committee")
-    trace_full = f"{trace_base}.jsonify"
+    # Use trace_id only (no derived/fallback trace keys, no normalization).
     t0 = time.monotonic()
     log.info(
-        "[committee.jsonify] start trace_id=%s trace_id_full=%s rounds=%d temperature=%s raw_chars=%d schema_type=%s",
-        trace_base,
-        trace_full,
+        "[committee.jsonify] start trace_id=%s rounds=%d temperature=%s raw_chars=%d schema_type=%s",
+        trace_id,
         int(rounds if rounds is not None else DEFAULT_COMMITTEE_ROUNDS),
         float(temperature),
         len(raw_text or ""),
         str(type(expected_schema).__name__),
     )
-    schema_template = _schema_to_template(expected_schema)
+    schema_template = _schema_to_template(expected=expected_schema)
     schema_desc = json.dumps(schema_template, ensure_ascii=False)
     raw_preview = (raw_text or "")[:600] if isinstance(raw_text, str) else ""
     emit_trace(
         STATE_DIR,
-        trace_base,
+        trace_id,
         "committee.jsonify.start",
         {
-            "trace_id": trace_base,
-            "trace_id_full": trace_full,
+            "trace_id": trace_id,
             "schema_preview": schema_desc[:600],
             "schema_len": len(schema_desc),
             "raw_preview": raw_preview,
@@ -995,7 +1008,7 @@ async def committee_jsonify(
         },
     )
     # Log full raw_text and schema for debugging (no truncation).
-    log.info("[committee.jsonify] start trace_id=%s schema=%s raw_text=%s", trace_base, schema_desc, raw_text)
+    log.info("[committee.jsonify] start trace_id=%s schema=%s raw_text=%s", trace_id, schema_desc, raw_text)
     # Hard JSON contract: show the exact skeleton and forbid any deviation.
     # JSONFixer may receive arbitrary messy output (prose, partial JSON, mixed code).
     # It must always ignore refusals/prose and return a single valid JSON object.
@@ -1025,7 +1038,7 @@ async def committee_jsonify(
     ]
     env = await committee_ai_text(
         messages=messages,
-        trace_id=trace_full,
+        trace_id=trace_id,
         rounds=rounds,
         temperature=temperature,
     )
@@ -1038,11 +1051,10 @@ async def committee_jsonify(
             txt_main_preview = _txt[:600]
     emit_trace(
         STATE_DIR,
-        trace_base,
+        trace_id,
         "committee.jsonify.committee_result",
         {
-            "trace_id": trace_base,
-            "trace_id_full": trace_full,
+            "trace_id": trace_id,
             "ok": ok_env,
             "main_text_preview": txt_main_preview,
         },
@@ -1050,7 +1062,7 @@ async def committee_jsonify(
     # Log full committee result text and envelope (no truncation).
     log.info(
         "[committee.jsonify] committee_result trace_id=%s ok=%s text=%s env=%s",
-        trace_base,
+        trace_id,
         ok_env,
         result_block.get("text") if isinstance(result_block, dict) else None,
         result_block,
@@ -1074,10 +1086,10 @@ async def committee_jsonify(
 
     emit_trace(
         STATE_DIR,
-        trace_base,
+        trace_id,
         "committee.jsonify.candidates",
         {
-            "trace_id": trace_base,
+            "trace_id": trace_id,
             "count": len(candidates),
             "first_preview": (candidates[0][:400] if candidates else ""),
         },
@@ -1085,7 +1097,7 @@ async def committee_jsonify(
     # Log all candidate texts for JSON parsing.
     log.info(
         "[committee.jsonify] candidates trace_id=%s count=%d candidates=%s",
-        trace_base,
+        trace_id,
         len(candidates),
         candidates,
     )
@@ -1103,13 +1115,13 @@ async def committee_jsonify(
     for idx, txt in enumerate(candidates):
         log.info(
             "[committee.jsonify] parse_candidate.start trace_id=%s index=%d text_chars=%d",
-            trace_base,
+            trace_id,
             int(idx),
             len(txt or ""),
         )
         log.info(
             "[committee.jsonify] parse_candidate trace_id=%s index=%d text=%s",
-            trace_base,
+            trace_id,
             idx,
             txt,
         )
@@ -1122,7 +1134,7 @@ async def committee_jsonify(
         except Exception as ex:  # pragma: no cover - defensive logging
             log.info(
                 "[committee.jsonify] JSONParser exception trace_id=%s index=%d error=%s",
-                trace_base,
+                trace_id,
                 idx,
                 str(ex),
             )
@@ -1134,14 +1146,14 @@ async def committee_jsonify(
                 except Exception as ex2:
                     log.warning(
                         "[committee.jsonify] JSONParser exception on fallback trace_id=%s index=%d error=%s",
-                        trace_base,
+                        trace_id,
                         idx,
                         str(ex2),
                         exc_info=True,
                     )
                     log.error(
                         "[committee.jsonify] parse_candidate.finish trace_id=%s index=%d ok=false dur_ms=%d",
-                        trace_base,
+                        trace_id,
                         int(idx),
                         int((time.monotonic() - t_parse) * 1000.0),
                         exc_info=True,
@@ -1150,7 +1162,7 @@ async def committee_jsonify(
             else:
                 log.error(
                     "[committee.jsonify] parse_candidate.finish trace_id=%s index=%d ok=false dur_ms=%d",
-                    trace_base,
+                    trace_id,
                     int(idx),
                     int((time.monotonic() - t_parse) * 1000.0),
                     exc_info=True,
@@ -1164,14 +1176,14 @@ async def committee_jsonify(
         if errors:
             log.warning(
                 "[committee.jsonify] JSONParser reported errors trace_id=%s index=%d last_error=%s errors=%s",
-                trace_base,
+                trace_id,
                 idx,
                 last_error,
                 errors[:5],
             )
         log.info(
             "[committee.jsonify] parsed_candidate trace_id=%s index=%d obj=%s",
-            trace_base,
+            trace_id,
             idx,
             obj,
         )
@@ -1179,7 +1191,7 @@ async def committee_jsonify(
             parsed_candidates.append(obj)
             log.info(
                 "[committee.jsonify] parse_candidate.finish trace_id=%s index=%d ok=true dur_ms=%d keys=%s",
-                trace_base,
+                trace_id,
                 int(idx),
                 int((time.monotonic() - t_parse) * 1000.0),
                 sorted(list(obj.keys())),
@@ -1187,7 +1199,7 @@ async def committee_jsonify(
         else:
             log.warning(
                 "[committee.jsonify] parse_candidate.finish trace_id=%s index=%d ok=false dur_ms=%d non_dict_type=%s",
-                trace_base,
+                trace_id,
                 int(idx),
                 int((time.monotonic() - t_parse) * 1000.0),
                 str(type(obj).__name__),
@@ -1223,7 +1235,7 @@ async def committee_jsonify(
             best_idx = rich_sorted[0][0]
             log.info(
                 "[committee.jsonify] song_richness trace_id=%s chosen_index=%d top=%s",
-                trace_base,
+                trace_id,
                 int(best_idx),
                 [{"idx": i, "sections": s, "richness": r} for (i, s, r) in rich_sorted[:10]],
             )
@@ -1291,7 +1303,7 @@ async def committee_jsonify(
                 merged[key] = _default_for(expected_type)
             log.info(
                 "[committee.jsonify] merge.key trace_id=%s key=%s set=%s expected=%s chosen_type=%s",
-                trace_base,
+                trace_id,
                 str(key),
                 bool(value_set),
                 str(expected_type),
@@ -1315,7 +1327,7 @@ async def committee_jsonify(
                 # degrade the output shape (this can otherwise look like "the request died").
                 log.warning(
                     "[committee.jsonify] merge.seed_parse_failed trace_id=%s schema_type=%s seed_type=%s error=%s",
-                    trace_base,
+                    trace_id,
                     str(type(expected_schema).__name__),
                     str(type(seed).__name__),
                     str(exc),
@@ -1325,11 +1337,10 @@ async def committee_jsonify(
 
     emit_trace(
         STATE_DIR,
-        trace_base,
+        trace_id,
         "committee.jsonify.merge",
         {
-            "trace_id": trace_base,
-            "trace_id_full": trace_full,
+            "trace_id": trace_id,
             "candidates": len(candidates),
             "parsed_candidates": len(parsed_candidates),
             "merged_keys": sorted(list(merged.keys())) if isinstance(merged, dict) else [],
@@ -1337,15 +1348,14 @@ async def committee_jsonify(
     )
     log.info(
         "[committee.jsonify] merge trace_id=%s candidates=%d parsed=%d keys=%s",
-        trace_base,
+        trace_id,
         len(candidates),
         len(parsed_candidates),
         ",".join(sorted(list(merged.keys()))) if isinstance(merged, dict) else "",
     )
     log.info(
-        "[committee.jsonify] finish trace_id=%s trace_id_full=%s dur_ms=%d candidates=%d parsed_candidates=%d merged_is_dict=%s merged_keys=%s",
-        trace_base,
-        trace_full,
+        "[committee.jsonify] finish trace_id=%s dur_ms=%d candidates=%d parsed_candidates=%d merged_is_dict=%s merged_keys=%s",
+        trace_id,
         int((time.monotonic() - t0) * 1000.0),
         int(len(candidates)),
         int(len(parsed_candidates)),

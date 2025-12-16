@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import json
 import logging
+import time
 from typing import Any, Dict, List, Optional
 
 from ..json_parser import JSONParser
@@ -113,9 +114,9 @@ def _normalize_text_fields(obj: Any) -> Any:
     if isinstance(obj, dict):
         return {k: _normalize_text_fields(v) for k, v in obj.items()}
     if isinstance(obj, list):
-        return [_normalize_text_fields(v) for v in obj]
+        return [_normalize_text_fields(obj=v) for v in obj]
     if isinstance(obj, str):
-        return _fix_mojibake(obj)
+        return _fix_mojibake(s=obj)
     return obj
 
 
@@ -134,6 +135,7 @@ async def plan_song_graph(
     Targets a compact Song Graph JSON shape under {"song": SONG_GRAPH_SCHEMA}.
     """
     text = str(user_text or "").strip()
+    t0 = time.perf_counter()
     approx_len = 30
     try:
         _ls = int(length_s) if length_s is not None else 0
@@ -168,15 +170,29 @@ async def plan_song_graph(
         + "Use section_ids and motif_ids that are stable and reusable.\n"
     )
 
+    log.info(
+        "plan_song_graph.start trace_id=%s text_len=%d length_s=%d bpm=%s key=%s has_profile=%s",
+        trace_id,
+        len(text),
+        approx_len,
+        bpm_val if bpm_val else None,
+        key_txt if key_txt else None,
+        bool(profile_txt),
+    )
     # First, route song planner through the main committee to produce a Song Graph text.
     client = CommitteeClient()
-    env = await client.run(
-        [
-            {"role": "system", "content": "You are SongOps. Output ONLY JSON per the song schema."},
-            {"role": "user", "content": prompt},
-        ],
-        trace_id=trace_id or "song_plan",
-    )
+    try:
+        env = await client.run(
+            messages=[
+                {"role": "system", "content": "You are SongOps. Output ONLY JSON per the song schema."},
+                {"role": "user", "content": prompt},
+            ],
+            trace_id=trace_id,
+        )
+    except Exception as exc:
+        # This is a boundary: committee failures should not crash tool execution.
+        log.error("plan_song_graph committee exception trace_id=%s: %s", trace_id, exc, exc_info=True)
+        return {}
     song: Dict[str, Any] = {}
     if not isinstance(env, dict) or not env.get("ok"):
         # Log committee failure instead of silently returning an empty song graph.
@@ -190,17 +206,21 @@ async def plan_song_graph(
         txt = res_env.get("text") or ""
 
         # Then, run the Song Graph text through committee.jsonify to enforce strict JSON.
-        parsed = await committee_jsonify(
-            txt or "{}",
-            expected_schema=schema_wrapper,
-            trace_id=trace_id or "song_plan",
-            temperature=0.0,
-        )
+        try:
+            parsed = await committee_jsonify(
+                raw_text=txt or "{}",
+                expected_schema=schema_wrapper,
+                trace_id=trace_id,
+                temperature=0.0,
+            )
+        except Exception as exc:
+            log.error("plan_song_graph committee_jsonify exception trace_id=%s: %s", trace_id, exc, exc_info=True)
+            parsed = {}
         song_obj = parsed.get("song")
         if isinstance(song_obj, dict):
             # Normalize textual fields (lyrics, section names, motif descriptions, etc.)
             # to clean up common UTF-8 mojibake before downstream tools consume them.
-            song_obj = _normalize_text_fields(song_obj)
+            song_obj = _normalize_text_fields(obj=song_obj)
             sections = song_obj.get("sections") if isinstance(song_obj.get("sections"), list) else []
             lyrics_obj = song_obj.get("lyrics") if isinstance(song_obj.get("lyrics"), dict) else {}
             lyrics_sections = lyrics_obj.get("sections") if isinstance(lyrics_obj.get("sections"), list) else []
@@ -221,6 +241,13 @@ async def plan_song_graph(
                 },
             )
             song = song_obj
+        else:
+            log.warning(
+                "plan_song_graph parsed missing song trace_id=%s parsed_keys=%s",
+                trace_id,
+                sorted(list(parsed.keys())) if isinstance(parsed, dict) else type(parsed).__name__,
+            )
+    log.info("plan_song_graph.done trace_id=%s ok=%s dur_ms=%d keys=%s", trace_id, bool(song), int((time.perf_counter() - t0) * 1000), sorted(list(song.keys())) if isinstance(song, dict) else type(song).__name__)
     return song
 
 

@@ -20,6 +20,7 @@ WORKDIR /app
 # music app package and the shared envelopes package into /app.
 COPY services/music/app /app/app
 COPY void_envelopes /app/void_envelopes
+COPY void_json /app/void_json
 
 EXPOSE 7860
 

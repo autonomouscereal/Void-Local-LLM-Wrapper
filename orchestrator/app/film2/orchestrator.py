@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any, Dict
 
@@ -18,6 +19,8 @@ from .renderers import (
 )
 from .resume import Phase, is_shot_done, load_checkpoint, mark_shot_done, save_checkpoint
 from .timeline import build_timeline, export_edl, export_srt
+
+log = logging.getLogger(__name__)
 
 
 def _autofix_enabled() -> bool:
@@ -39,42 +42,54 @@ async def run_film(job: Dict[str, Any]) -> Dict[str, Any]:
     Deterministic, resumable state machine. Returns phase + artifacts list.
     """
     cid = str(job.get("cid") or "film_job")
+    log.info("film2.run start cid=%s job_keys=%s", cid, sorted(list(job.keys())) if isinstance(job, dict) else type(job).__name__)
     manifest = new_manifest(cid)
     cp = load_checkpoint(cid)
 
     # Phase 0: Clarifications (one-shot)
     if cp.phase < Phase.CLARIFY:
-        questions = collect_one_shot(job.get("prompt", ""), job.get("preset", {}))
+        prompt_txt = str(job.get("prompt", "") or "")
+        preset = job.get("preset") if isinstance(job.get("preset"), dict) else {}
+        questions = collect_one_shot(prompt_txt, preset)
         if questions and not job.get("answers"):
+            log.info("film2.run clarify_required cid=%s questions=%d", cid, len(questions))
             return {"phase": "clarify", "questions": questions, "artifacts": manifest.list()}
-        answers = job.get("answers", {})
+        answers = job.get("answers") if isinstance(job.get("answers"), dict) else {}
         save_checkpoint(cid, Phase.CLARIFY)
     else:
-        answers = job.get("answers", {})
+        answers = job.get("answers") if isinstance(job.get("answers"), dict) else {}
 
     # Phase 1: Bibles
     if cp.phase < Phase.BIBLES:
-        story_bible = write_story_bible(job.get("prompt", ""), job.get("preset", {}))
-        char_bible = write_character_bible(job.get("prompt", ""), job.get("preset", {}))
+        prompt_txt = str(job.get("prompt", "") or "")
+        preset = job.get("preset") if isinstance(job.get("preset"), dict) else {}
+        story_bible = write_story_bible(prompt_txt, preset)
+        char_bible = write_character_bible(prompt_txt, preset)
         merge_answers_into_bibles(story_bible, char_bible, answers)
         add_artifact(manifest, "story_bible.json", story_bible)
         add_artifact(manifest, "character_bible.json", char_bible)
         save_checkpoint(cid, Phase.BIBLES)
     else:
         # try to read prior artifacts; fallback to regenerating
-        story_bible = write_story_bible(job.get("prompt", ""), job.get("preset", {}))
-        char_bible = write_character_bible(job.get("prompt", ""), job.get("preset", {}))
+        prompt_txt = str(job.get("prompt", "") or "")
+        preset = job.get("preset") if isinstance(job.get("preset"), dict) else {}
+        story_bible = write_story_bible(prompt_txt, preset)
+        char_bible = write_character_bible(prompt_txt, preset)
 
     # Phase 2: Planner
     if cp.phase < Phase.PLANNER:
+        log.info("film2.run planner.start cid=%s", cid)
         scenes = build_scenes(story_bible)
-        shots = build_shots(scenes, char_bible, coverage=job.get("preset", {}).get("coverage", "basic"))
+        preset = job.get("preset") if isinstance(job.get("preset"), dict) else {}
+        shots = build_shots(scenes, char_bible, coverage=preset.get("coverage", "basic"))
         add_artifact(manifest, "scenes.json", scenes)
         add_artifact(manifest, "shots.json", shots)
         save_checkpoint(cid, Phase.PLANNER)
     else:
         scenes = build_scenes(story_bible)
-        shots = build_shots(scenes, char_bible, coverage=job.get("preset", {}).get("coverage", "basic"))
+        preset = job.get("preset") if isinstance(job.get("preset"), dict) else {}
+        shots = build_shots(scenes, char_bible, coverage=preset.get("coverage", "basic"))
+    log.info("film2.run planner.done cid=%s scenes=%d shots=%d", cid, len(scenes or []), len(shots or []))
 
     # Phase 3: Storyboards (with QA + single-pass autofix)
     if cp.phase < Phase.STORYBOARDS:

@@ -21,7 +21,6 @@ async def tools_append(req: Request):
     parser = JSONParser()
     schema = {
         "trace_id": str,
-        "tid": str,
         "event": str,
         "step_id": str,
         "tool": str,
@@ -31,7 +30,9 @@ async def tools_append(req: Request):
         raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw or ""),
         schema,
     )
-    trace_id = str(body.get("trace_id") or body.get("tid") or "unknown") if isinstance(body, dict) else "unknown"
+    trace_id = body.get("trace_id") if isinstance(body, dict) else None
+    if not isinstance(trace_id, str) or not trace_id:
+        return ToolEnvelope.failure("missing_trace_id", "trace_id is required", status=422, request_id="logs.tools.append")
     entry = {
         "t": int(time.time() * 1000),
         "trace_id": trace_id,

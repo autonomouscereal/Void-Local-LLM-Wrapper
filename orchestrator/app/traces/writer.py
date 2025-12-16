@@ -15,44 +15,44 @@ def _iso_now() -> str:
 
 def log_request(state_dir: str, trace_id: str, record: Dict[str, Any]) -> None:
     rec = dict(record or {})
-    rec.setdefault("trace_id", str(trace_id))
+    rec.setdefault("trace_id", trace_id)
     rec.setdefault("timestamp", _iso_now())
-    emit_trace(state_dir, str(trace_id), "request", rec)
+    emit_trace(state_dir, trace_id, "request", rec)
 
 
 def log_tool(state_dir: str, trace_id: str, record: Dict[str, Any]) -> None:
     rec = dict(record or {})
-    rec.setdefault("trace_id", str(trace_id))
+    rec.setdefault("trace_id", trace_id)
     rec.setdefault("timestamp", _iso_now())
     kind = str(rec.get("event") or "tool")
-    emit_trace(state_dir, str(trace_id), kind, rec)
+    emit_trace(state_dir, trace_id, kind, rec)
 
 
 def log_event(state_dir: str, trace_id: str, record: Dict[str, Any]) -> None:
     rec = dict(record or {})
-    rec.setdefault("trace_id", str(trace_id))
+    rec.setdefault("trace_id", trace_id)
     rec.setdefault("timestamp", _iso_now())
     kind = str(rec.get("kind") or rec.get("event") or "event")
-    emit_trace(state_dir, str(trace_id), kind, rec)
+    emit_trace(state_dir, trace_id, kind, rec)
 
 
 def log_artifact(state_dir: str, trace_id: str, record: Dict[str, Any]) -> None:
     rec = dict(record or {})
-    rec.setdefault("trace_id", str(trace_id))
+    rec.setdefault("trace_id", trace_id)
     rec.setdefault("timestamp", _iso_now())
-    emit_trace(state_dir, str(trace_id), "artifact", rec)
+    emit_trace(state_dir, trace_id, "artifact", rec)
 
 
 def log_response(state_dir: str, trace_id: str, record: Dict[str, Any]) -> None:
     rec = dict(record or {})
-    rec.setdefault("trace_id", str(trace_id))
+    rec.setdefault("trace_id", trace_id)
     rec.setdefault("timestamp", _iso_now())
-    emit_trace(state_dir, str(trace_id), "response", rec)
+    emit_trace(state_dir, trace_id, "response", rec)
 
 
 def log_error(state_dir: str, trace_id: str, record: Dict[str, Any]) -> None:
     rec = dict(record or {})
-    rec.setdefault("trace_id", str(trace_id))
+    rec.setdefault("trace_id", trace_id)
     rec.setdefault("timestamp", _iso_now())
     # For errors, ensure a basic error envelope exists
     if "error" not in rec:
@@ -62,6 +62,6 @@ def log_error(state_dir: str, trace_id: str, record: Dict[str, Any]) -> None:
             "status": int(rec.get("status") or 0),
             "details": rec.get("details") or {},
         }
-    emit_trace(state_dir, str(trace_id), "error", rec)
+    emit_trace(state_dir, trace_id, "error", rec)
 
 

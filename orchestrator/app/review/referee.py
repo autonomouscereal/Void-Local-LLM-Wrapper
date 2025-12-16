@@ -105,6 +105,14 @@ async def postrun_committee_decide(
     Reuses the same backend route as planner; strict JSON response required.
     """
     # Summarize tools used and artifact urls
+    log.info(
+        "postrun_committee_decide.start trace_id=%s mode=%s user_len=%d tool_results_type=%s qa_keys=%s",
+        trace_id,
+        mode,
+        len(user_text or ""),
+        type(tool_results).__name__,
+        sorted(list(qa_metrics.keys())) if isinstance(qa_metrics, dict) else type(qa_metrics).__name__,
+    )
     tools_used: List[str] = []
     for tr in (tool_results or []):
         if isinstance(tr, dict):
@@ -170,7 +178,11 @@ async def postrun_committee_decide(
     # Two-model postrun committee: gather decisions from all participants and merge.
     # Post-run decision is now derived from a single committee debate call.
     decisions: List[Dict[str, Any]] = []
-    env_decide = await committee_ai_text(messages=msgs, trace_id=str(trace_id or "committee_postrun"), temperature=0.0)
+    try:
+        env_decide = await committee_ai_text(messages=msgs, trace_id=trace_id, temperature=0.0)
+    except Exception as exc:
+        log.error("postrun_committee_decide committee_ai_text exception trace_id=%s: %s", trace_id, exc, exc_info=True)
+        env_decide = {"ok": False, "error": {"code": "postrun_committee_exception", "message": str(exc)}}
     if isinstance(env_decide, dict) and env_decide.get("ok"):
         res_decide = env_decide.get("result") or {}
         txt_decide = res_decide.get("text") or ""
@@ -190,12 +202,16 @@ async def postrun_committee_decide(
                 }
             ],
         }
-        obj = await committee_jsonify(
-            txt_decide or "{}",
-            expected_schema=schema_decide,
-            trace_id=str(trace_id or "committee_postrun"),
-            temperature=0.0,
-        )
+        try:
+            obj = await committee_jsonify(
+                raw_text=txt_decide or "{}",
+                expected_schema=schema_decide,
+                trace_id=trace_id,
+                temperature=0.0,
+            )
+        except Exception as exc:
+            log.error("postrun_committee_decide committee_jsonify exception trace_id=%s: %s", trace_id, exc, exc_info=True)
+            obj = {}
         action = (obj.get("action") or "").strip().lower() or "go"
         rationale = (obj.get("rationale") or "") if isinstance(obj.get("rationale"), str) else ""
         steps = obj.get("patch_plan") or []
@@ -209,7 +225,7 @@ async def postrun_committee_decide(
         )
         emit_trace(
             STATE_DIR,
-            str(trace_id or "committee_postrun"),
+            trace_id,
             "committee.postrun.member",
             {"member": "committee", "action": action},
         )
@@ -227,7 +243,7 @@ async def postrun_committee_decide(
         }
         log.error(
             "postrun_committee_decide failed (trace_id=%s): env=%r error=%r",
-            str(trace_id or "committee_postrun"),
+            trace_id,
             env_decide,
             err,
         )
@@ -239,7 +255,7 @@ async def postrun_committee_decide(
         }
         emit_trace(
             STATE_DIR,
-            str(trace_id or "committee_postrun"),
+            trace_id,
             "committee.postrun.ok",
             {"action": out.get("action"), "rationale": out.get("rationale"), "error": err},
         )
@@ -267,10 +283,16 @@ async def postrun_committee_decide(
         }
         emit_trace(
             STATE_DIR,
-            str(trace_id or "committee_postrun"),
+            trace_id,
             "committee.postrun.ok",
             {"action": out.get("action"), "rationale": out.get("rationale")},
         )
+    log.info(
+        "postrun_committee_decide.done trace_id=%s action=%s patch_steps=%d",
+        trace_id,
+        str(out.get("action") or ""),
+        len(out.get("patch_plan") or []) if isinstance(out.get("patch_plan"), list) else 0,
+    )
     return out
 
 

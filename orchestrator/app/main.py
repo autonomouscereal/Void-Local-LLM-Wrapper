@@ -553,7 +553,7 @@ async def segment_qa_and_committee(
             meta_part = result_obj.get("meta")
             if isinstance(meta_part, dict) and isinstance(meta_part.get("cid"), str):
                 parent_cid = meta_part.get("cid")
-            segs = build_segments_for_tool(tool_name, trace_id=str(trace_id), cid=parent_cid, result=result_obj)
+            segs = build_segments_for_tool(tool_name, trace_id=trace_id, cid=parent_cid, result=result_obj)
             for seg in (segs or []):
                 if not isinstance(seg, dict):
                     continue
@@ -652,7 +652,7 @@ async def segment_qa_and_committee(
         _log("qa.metrics.segment", trace_id=trace_id, tool=tool_name, phase="pre", attempt=attempt, metrics=qa_metrics_pre)
         _trace_log_event(
             STATE_DIR,
-            str(trace_id),
+            trace_id,
             {
                 "kind": "qa",
                 "stage": "segment_pre",
@@ -957,7 +957,7 @@ def _trace_response(trace_id: str, envelope: Dict[str, Any]) -> None:
         ok_flag = not bool(envelope.get("error"))
     out = {
         "t": tms,
-        "trace_id": str(trace_id),
+        "trace_id": trace_id,
         "ok": bool(ok_flag),
         "message_len": len(content),
         "assets_count": int(assets_count),
@@ -966,7 +966,7 @@ def _trace_response(trace_id: str, envelope: Dict[str, Any]) -> None:
         out["error"] = envelope.get("error")
     _log(
         "response",
-        trace_id=str(trace_id),
+        trace_id=trace_id,
         t=tms,
         ok=bool(ok_flag),
         message_len=len(content),
@@ -975,7 +975,7 @@ def _trace_response(trace_id: str, envelope: Dict[str, Any]) -> None:
     )
     _trace_log_response(
         STATE_DIR,
-        str(trace_id),
+        trace_id,
         {
             # request_id and trace_id are distinct; this trace log is keyed by trace_id.
             "request_id": str(envelope.get("id") or ""),
@@ -989,7 +989,7 @@ def _trace_response(trace_id: str, envelope: Dict[str, Any]) -> None:
     )
     _log(
         "chat.finish",
-        trace_id=str(trace_id),
+        trace_id=trace_id,
         ok=bool(ok_flag),
         assets_count=int(assets_count),
         message_len=int(len(content)),
@@ -1306,7 +1306,6 @@ from .middleware.ws_permissive import PermissiveWebSocketMiddleware
 app.add_middleware(PermissiveWebSocketMiddleware)
 from .middleware.cors_extra import AppendCommonHeadersMiddleware
 app.add_middleware(AppendCommonHeadersMiddleware)
-from .middleware.preflight import Preflight204Middleware
 
 
 def _json_response(obj: Dict[str, Any], status_code: int = 200) -> Response:
@@ -1420,112 +1419,19 @@ def finalize_response(trace_id: str, messages: List[Dict[str, Any]], state: RunS
         "errors": state.get("errors") or [],
         "warnings": state.get("warnings") or [],
         "assets": urls,
-        "trace_id": str(trace_id),
+        "trace_id": trace_id,
     }
     if isinstance(cid, (str, int)):
         meta_block["cid"] = str(cid)
     resp["_meta"] = meta_block
-    _log("response.preview", trace_id=str(trace_id), ok=bool(ok_flag), assets=int(len(urls)))
+    _log("response.preview", trace_id=trace_id, ok=bool(ok_flag), assets=int(len(urls)))
     return resp
 
-
-# Reflective CORS headers on all responses to satisfy browsers with credentials
-@app.middleware("http")
-async def _reflect_cors_headers(request: Request, call_next):
-    if request.method.upper() == "OPTIONS":
-        origin = request.headers.get("origin") or request.headers.get("Origin")
-        acrh = request.headers.get("access-control-request-headers") or request.headers.get("Access-Control-Request-Headers") or "*"
-        headers = {
-            "Access-Control-Allow-Origin": origin or "*",
-            "Vary": "Origin",
-            "Access-Control-Allow-Credentials": "true",
-            "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
-            "Access-Control-Allow-Headers": acrh or "*",
-            "Access-Control-Expose-Headers": "*",
-            "Access-Control-Allow-Private-Network": "true",
-            "Access-Control-Max-Age": "86400",
-            "Connection": "close",
-            "Content-Length": "0",
-        }
-        # Return 200 with an explicit zero-length body to avoid chunked 204s confusing some browsers/proxies
-        return Response(content=b"", status_code=200, headers=headers, media_type="text/plain")
-    try:
-        response = await call_next(request)
-    except Exception as ex:
-        # If anything raises inside the route stack, browsers often surface it as a CORS error because
-        # the connection closes before any CORS headers are applied. Always return a JSON body + CORS.
-        logging.error("http.exception (cors_reflect) path=%s: %s", str(request.url.path), ex, exc_info=True)
-        origin = request.headers.get("origin") or request.headers.get("Origin")
-        hdrs = {
-            "Access-Control-Allow-Origin": origin or "*",
-            "Vary": "Origin",
-            "Access-Control-Allow-Credentials": "true",
-            "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
-            "Access-Control-Allow-Headers": request.headers.get("access-control-request-headers") or "*",
-            "Access-Control-Expose-Headers": "*",
-            "Access-Control-Allow-Private-Network": "true",
-            "Cross-Origin-Resource-Policy": "cross-origin",
-            "Timing-Allow-Origin": "*",
-        }
-        body = {
-            "ok": False,
-            "error": {"code": "internal_error", "message": str(ex)},
-            "_meta": {"route": str(request.url.path), "method": str(request.method)},
-        }
-        return Response(content=json.dumps(body, ensure_ascii=False), status_code=500, media_type="application/json", headers=hdrs)
-    origin = request.headers.get("origin") or request.headers.get("Origin")
-    if origin:
-        response.headers["Access-Control-Allow-Origin"] = origin
-        response.headers["Vary"] = "Origin"
-        response.headers["Access-Control-Allow-Credentials"] = "true"
-        response.headers.setdefault("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
-        response.headers.setdefault("Access-Control-Allow-Headers", request.headers.get("access-control-request-headers") or "*")
-        response.headers.setdefault("Access-Control-Expose-Headers", "*")
-        response.headers.setdefault("Access-Control-Allow-Private-Network", "true")
-    # Ensure uploads can be fetched by the UI without CORP issues
-    if request.url.path.startswith("/uploads/"):
-        response.headers["Access-Control-Allow-Origin"] = origin or "*"
-    return response
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 os.makedirs(STATIC_DIR, exist_ok=True)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 # run_all router removed (deprecated /v1/run, /ws.run)
-
-# Stamp permissive headers on every HTTP response to avoid any CORS/CORP issues
-@app.middleware("http")
-async def _perm_headers(request: Request, call_next):
-    try:
-        resp = await call_next(request)
-    except Exception as ex:
-        logging.error("http.exception (perm_headers) path=%s: %s", str(request.url.path), ex, exc_info=True)
-        origin = request.headers.get("origin") or request.headers.get("Origin")
-        hdrs = {
-            "Access-Control-Allow-Origin": origin or "*",
-            "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
-            "Access-Control-Allow-Headers": "*",
-            "Access-Control-Expose-Headers": "*",
-            "Access-Control-Allow-Credentials": "false",
-            "Access-Control-Allow-Private-Network": "true",
-            "Cross-Origin-Resource-Policy": "cross-origin",
-            "Timing-Allow-Origin": "*",
-            "Vary": "Origin",
-        }
-        body = {
-            "ok": False,
-            "error": {"code": "internal_error", "message": str(ex)},
-            "_meta": {"route": str(request.url.path), "method": str(request.method)},
-        }
-        return Response(content=json.dumps(body, ensure_ascii=False), status_code=500, media_type="application/json", headers=hdrs)
-    resp.headers.setdefault("Access-Control-Allow-Origin", "*")
-    resp.headers.setdefault("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
-    resp.headers.setdefault("Access-Control-Allow-Headers", "*")
-    resp.headers.setdefault("Access-Control-Expose-Headers", "*")
-    resp.headers.setdefault("Access-Control-Allow-Credentials", "false")
-    resp.headers.setdefault("Access-Control-Allow-Private-Network", "true")
-    resp.headers.setdefault("Cross-Origin-Resource-Policy", "cross-origin")
-    resp.headers.setdefault("Timing-Allow-Origin", "*")
-    return resp
 
 @app.post("/v1/image.generate")
 async def v1_image_generate(request: Request):
@@ -1667,13 +1573,23 @@ def _allowed_cross(origin: str, request: Request) -> bool:
 
 @app.middleware("http")
 async def global_cors_middleware(request: Request, call_next):
-    origin = request.headers.get("origin") or ""
+    # Single source of truth for CORS on HTTP requests.
+    #
+    # Note: we intentionally avoid having multiple @app.middleware("http") functions
+    # all setting Access-Control-* headers, because that produces contradictory
+    # responses (e.g. Allow-Credentials true vs false) depending on middleware order.
+    origin = (request.headers.get("origin") or request.headers.get("Origin") or "").strip()
+    # "100% open always": reflect any Origin and always allow credentials.
+    # Browsers reject `Access-Control-Allow-Origin: *` when credentials are enabled,
+    # so we echo the origin when present; otherwise fall back to "*".
+    allowed_origin = origin or "*"
+    allow_credentials = "true"
     if request.method == "OPTIONS":
         hdrs = {
-            "Access-Control-Allow-Origin": (origin or "*"),
+            "Access-Control-Allow-Origin": (allowed_origin or "*"),
             "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
             "Access-Control-Allow-Headers": request.headers.get("access-control-request-headers") or "*",
-            "Access-Control-Allow-Credentials": "true",
+            "Access-Control-Allow-Credentials": allow_credentials,
             "Access-Control-Expose-Headers": "*",
             "Access-Control-Max-Age": "86400",
             "Access-Control-Allow-Private-Network": "true",
@@ -1688,10 +1604,10 @@ async def global_cors_middleware(request: Request, call_next):
     except Exception as ex:
         logging.error("http.exception (global_cors) path=%s: %s", str(request.url.path), ex, exc_info=True)
         hdrs = {
-            "Access-Control-Allow-Origin": (origin or "*"),
+            "Access-Control-Allow-Origin": (allowed_origin or "*"),
             "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
             "Access-Control-Allow-Headers": "*",
-            "Access-Control-Allow-Credentials": "true",
+            "Access-Control-Allow-Credentials": allow_credentials,
             "Access-Control-Expose-Headers": "*",
             "Access-Control-Max-Age": "86400",
             "Access-Control-Allow-Private-Network": "true",
@@ -1705,10 +1621,10 @@ async def global_cors_middleware(request: Request, call_next):
             "_meta": {"route": str(request.url.path), "method": str(request.method)},
         }
         return Response(content=json.dumps(body, ensure_ascii=False), status_code=500, media_type="application/json", headers=hdrs)
-    resp.headers["Access-Control-Allow-Origin"] = origin or "*"
+    resp.headers["Access-Control-Allow-Origin"] = allowed_origin or "*"
     resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
     resp.headers["Access-Control-Allow-Headers"] = "*"
-    resp.headers["Access-Control-Allow-Credentials"] = "true"
+    resp.headers["Access-Control-Allow-Credentials"] = allow_credentials
     resp.headers["Access-Control-Expose-Headers"] = "*"
     resp.headers["Access-Control-Max-Age"] = "86400"
     resp.headers["Access-Control-Allow-Private-Network"] = "true"
@@ -1910,14 +1826,14 @@ def _film2_trace_event(trace_id: Optional[str], e: Dict[str, Any]) -> None:
     row = {"t": int(time.time() * 1000), **e}
     ev = str(e.get("event") or "event")
     payload = {k: v for k, v in row.items() if k != "event"}
-    _log(ev, trace_id=str(trace_id), **payload)
+    _log(ev, trace_id=trace_id, **payload)
 
 
 def _film2_artifact_video(trace_id: Optional[str], path: str) -> None:
     if not (trace_id and isinstance(path, str) and path):
         return
     rel = os.path.relpath(path, UPLOAD_DIR).replace("\\", "/")
-    _log("artifact", trace_id=str(trace_id), kind="video", path=rel)
+    _log("artifact", trace_id=trace_id, kind="video", path=rel)
 
 
 # ---- Creative helpers ----
@@ -3550,8 +3466,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         a = raw_args if isinstance(raw_args, dict) else {}
         prompt = (a.get("prompt") or "").strip()
         trace_id = a.get("trace_id")
-        # Use trace_id only (no derived/fallback trace keys). Empty string means "no explicit trace id".
-        trace_id = str(trace_id).strip() if isinstance(trace_id, (str, int)) else ""
+        # Use trace_id only (no derived/fallback trace keys, no normalization).
         # cid is the conversation/client id. film_id is a separate identifier for a film run.
         _cid_raw = a.get("cid")
         cid = str(_cid_raw).strip() if isinstance(_cid_raw, (str, int)) and str(_cid_raw).strip() else ""
@@ -4465,7 +4380,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 rel = final_path
                 if os.path.isabs(final_path):
                     rel = os.path.relpath(final_path, UPLOAD_DIR).replace("\\", "/")
-                _log("artifact", trace_id=str(trace_id), kind="video", path=rel)
+                _log("artifact", trace_id=trace_id, kind="video", path=rel)
                 result.setdefault("ids", {})["video_id"] = rel
                 view_rel = rel if rel.startswith("uploads/") else f"uploads/{rel.lstrip('/')}"
                 result.setdefault("meta", {})["view_url"] = f"/{view_rel}"
@@ -6594,7 +6509,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         env = await run_super_loop(
             task=str(task or ""),
             repo_root=repo_root,
-            trace_id=(str(trace_id).strip() if str(trace_id).strip() else "code_super_loop"),
+            trace_id=trace_id,
             step_tokens=step_tokens,
         )
         return {"name": name, "result": env}
@@ -7885,13 +7800,16 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         # 1) Planner proposes tool calls (planning lives under orchestrator/app/plan/*).
         _log("planner.call", trace_id=trace_id, mode=effective_mode)
         logging.debug("chat_completions:planner.call trace_id=%s effective_mode=%s", trace_id, effective_mode)
-        plan_text, tool_calls, planner_env = await produce_tool_plan(
-            messages=messages,
-            tools=tools_spec,
-            temperature=exec_temperature,
-            trace_id=trace_id,
-            mode=effective_mode,
-        )
+        try:
+            plan_text, tool_calls, planner_env = await produce_tool_plan(
+                messages=messages,
+                tools=tools_spec,
+                temperature=exec_temperature,
+                trace_id=trace_id,
+                mode=effective_mode,
+            )
+        except Exception as e:
+            log.error("chat_completions:produce_tool_plan failed trace_id=%s ex=%s", trace_id, e, exc_info=True)
         logging.debug(
             "chat_completions:produce_tool_plan done plan_text_len=%s tool_calls_type=%s tool_calls_len=%s planner_env_keys=%r",
             len(plan_text) if isinstance(plan_text, str) else -1,
@@ -7913,7 +7831,11 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             if isinstance(raw_args, dict):
                 raw_inner = raw_args.get("_raw")
                 if isinstance(raw_inner, str):
-                    parsed_inner = parser_tc.parse(raw_inner or "", {})
+                    try:
+                        parsed_inner = parser_tc.parse(raw_inner or "", {})
+                    except Exception as ex:
+                        logging.warning("planner.tool_args._raw parse failed trace_id=%s tool=%s: %s", trace_id, nm, ex, exc_info=True)
+                        parsed_inner = {}
                     if isinstance(parsed_inner, dict):
                         args_obj = dict(parsed_inner)
                     else:
@@ -7926,7 +7848,11 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 else:
                     args_obj = dict(raw_args)
             elif isinstance(raw_args, str):
-                parsed = parser_tc.parse(raw_args or "", {})
+                try:
+                    parsed = parser_tc.parse(raw_args or "", {})
+                except Exception as ex:
+                    logging.warning("planner.tool_args parse failed trace_id=%s tool=%s: %s", trace_id, nm, ex, exc_info=True)
+                    parsed = {}
                 args_obj = dict(parsed) if isinstance(parsed, dict) else {"_raw": raw_args}
             elif raw_args is None:
                 args_obj = {}
@@ -7968,7 +7894,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 )
             _log("planner.tool_calls.normalized", trace_id=trace_id, count=len(tool_calls or []), preview=preview)
         except Exception as ex:
-            logging.warning("planner.tool_calls.normalized log failed trace_id=%s: %s", str(trace_id), ex, exc_info=True)
+            logging.warning("planner.tool_calls.normalized log failed trace_id=%s: %s", trace_id, ex, exc_info=True)
         # Hardening: filter unknown tools against runtime catalog (registry + builtins).
         allowed_runtime = catalog_allowed(get_builtin_tools_schema)
         logging.debug("chat_completions:catalog_allowed count=%s", len(allowed_runtime) if isinstance(allowed_runtime, (list, set, tuple)) else -1)
@@ -8175,7 +8101,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                         logging.debug("chat_completions:tool_loop:ledger append starting _ledger_root=%r", _ledger_root)
                         row = {
                             "t": int(time.time() * 1000),
-                            "trace_id": str(trace_id),
+                            "trace_id": trace_id,
                             "run_id": int(run_id) if isinstance(run_id, int) else None,
                             "name": tname,
                             "ok": bool(ok_step),
@@ -8188,7 +8114,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                         _ledger_shard = _art_append_jsonl(_ledger_shard, row)
                         logging.debug("chat_completions:tool_loop:ledger append done shard=%r", _ledger_shard)
                 except Exception as ex:
-                    logging.debug("chat_completions:tool_exec_meta.persist.failed trace_id=%s tool=%s ex=%s", str(trace_id), str(tname), ex, exc_info=True)
+                    logging.debug("chat_completions:tool_exec_meta.persist.failed trace_id=%s tool=%s ex=%s", trace_id, str(tname), ex, exc_info=True)
                 if isinstance(err_obj, (str, dict)):
                     logging.debug("chat_completions:tool_loop:error_branch entered")
                     code = (err_obj.get("code") if isinstance(err_obj, dict) else str(err_obj))
@@ -8558,8 +8484,8 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         logging.debug("chat_completions:committee patch_plan_type=%s patch_plan_len=%s", type(patch_plan).__name__, len(patch_plan) if isinstance(patch_plan, list) else -1)
         _log("committee.decision", trace_id=trace_id, action=committee_action, rationale=committee_rationale)
         _log("flow.after_committee", trace_id=trace_id, action=committee_action)
-        _log("committee.review.final", trace_id=str(trace_id), summary=qa_metrics)
-        _log("committee.decision.final", trace_id=str(trace_id), action=committee_action)
+        _log("committee.review.final", trace_id=trace_id, summary=qa_metrics)
+        _log("committee.decision.final", trace_id=trace_id, action=committee_action)
         # Optional one-pass revision
         if committee_action == "revise" and isinstance(patch_plan, list) and patch_plan:
             logging.debug("chat_completions:committee revise branch entered patch_plan_len=%s", len(patch_plan))
@@ -8688,11 +8614,11 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                                 )
                                 logging.debug("chat_completions:committee _db_insert_tool_call patch done")
                             if _ledger_shard is not None and _ledger_root is not None:
-                                row = {"t": int(time.time() * 1000), "trace_id": str(trace_id), "run_id": int(run_id) if isinstance(run_id, int) else None, "name": nm, "ok": bool(ok_step), "args": args_obj, "result": res_obj, "error": err_obj, "artifacts": arts_val}
+                                row = {"t": int(time.time() * 1000), "trace_id": trace_id, "run_id": int(run_id) if isinstance(run_id, int) else None, "name": nm, "ok": bool(ok_step), "args": args_obj, "result": res_obj, "error": err_obj, "artifacts": arts_val}
                                 _ledger_shard = _art_append_jsonl(_ledger_shard, row)
                                 logging.debug("chat_completions:committee ledger append patch done nm=%r", nm)
                     except Exception as ex:
-                        logging.debug("chat_completions:patch_exec_meta.persist.failed trace_id=%s ex=%s", str(trace_id), ex, exc_info=True)
+                        logging.debug("chat_completions:patch_exec_meta.persist.failed trace_id=%s ex=%s", trace_id, ex, exc_info=True)
                 patch_results = list(patch_failure_results) + list(exec_results or [])
                 logging.debug("chat_completions:committee patch_results_len=%s", len(patch_results))
                 tool_results = (tool_results or []) + patch_results
@@ -8745,7 +8671,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         try:
             llm_env = await committee_ai_text(
                 messages=exec_messages,
-                trace_id=f"{str(trace_id).strip() or 'tt_unknown'}.executor_summary",
+                trace_id=trace_id,
                 temperature=exec_temperature,
             )
         except Exception as ex:
@@ -8970,7 +8896,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         try:
             _log(
                 "response",
-                trace_id=str(trace_id),
+                trace_id=trace_id,
                 seed=int(master_seed),
                 pack_hash=pack_hash,
                 route_mode=route_mode,
@@ -9092,7 +9018,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         # Attach trace/cid metadata for clients that need stable ids on responses.
         response_meta = response.setdefault("_meta", {})
         if isinstance(response_meta, dict):
-            response_meta.setdefault("trace_id", str(trace_id))
+            response_meta.setdefault("trace_id", trace_id)
             if isinstance(conv_cid, (str, int)):
                 response_meta.setdefault("cid", str(conv_cid))
             # Surface planner failures explicitly in the response metadata so callers
@@ -9224,7 +9150,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     try:
         response_meta = response.setdefault("_meta", {})
         if isinstance(response_meta, dict):
-            response_meta.setdefault("trace_id", str(trace_id))
+            response_meta.setdefault("trace_id", trace_id)
             if 'conv_cid' in locals() and isinstance(locals().get("conv_cid"), (str, int)):
                 response_meta.setdefault("cid", str(locals().get("conv_cid")))
             if isinstance(artifacts_out, dict):
@@ -9261,7 +9187,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     emit_trace(STATE_DIR, trace_id, "chat.finish", {"ok": bool(response.get("ok")), "message_len": len(display_content or ""), "usage": usage or {}})
     if run_id is not None:
         await _db_update_run_response(run_id, response, usage)
-        _log("halt", trace_id=str(trace_id), kind="committee", chars=int(len(display_content)))
+        _log("halt", trace_id=trace_id, kind="committee", chars=int(len(display_content)))
     _trace_response(trace_id, response)
     return _json_response(response)
 
@@ -9417,17 +9343,13 @@ async def http_tool_run(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     base = (PUBLIC_BASE_URL or "http://127.0.0.1:8000").rstrip("/")
     url = base + "/tool.run"
     async with _hx.AsyncClient(trust_env=False, timeout=None) as client:
-        # Best-effort propagation of a stable trace identifier to /tool.run so
-        # inner tool execution and envelopes can correlate with the outer
-        # orchestrator trace. Prefer explicit trace_id, then tid from the
-        # arguments when present. (cid is a different identifier and must not be
-        # used as a trace id fallback.)
+        # Strict: only propagate explicit trace_id (no aliases, no fallbacks, no normalization).
         payload: Dict[str, Any] = {"name": name, "args": args}
         trace_id: str = ""
         if isinstance(args, dict):
-            _trace_val = args.get("trace_id") or args.get("tid")
-            if isinstance(_trace_val, (str, int)) and str(_trace_val).strip():
-                trace_id = str(_trace_val).strip()
+            _trace_val = args.get("trace_id")
+            if isinstance(_trace_val, str) and _trace_val:
+                trace_id = _trace_val
                 payload["trace_id"] = trace_id
 
         t0 = time.perf_counter()
@@ -9534,11 +9456,6 @@ async def http_tool_run(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
                 error_out.setdefault("trace_id", env.get("trace_id"))
             error_out.setdefault("body", raw_body)
             error_out.setdefault("stack_local", "".join(traceback.format_stack()))
-            trace_id = str(trace_id).strip()
-            if not trace_id:
-                trace_id = str(error_out.get("trace_id") or "").strip()
-            if not trace_id:
-                trace_id = "tt_unknown"
             _log(
                 "toolrun.http.error",
                 trace_id=trace_id,
@@ -9595,11 +9512,11 @@ async def tools_append(body: Dict[str, Any], request: Request):
                 # Never allow tracing to break ingestion.
                 pass
             if row.get("event") == "exec_step_start":
-                _log("exec_step_start", trace_id=str(trace_id), tool=row.get("tool"), step_id=row.get("step_id"))
+                _log("exec_step_start", trace_id=trace_id, tool=row.get("tool"), step_id=row.get("step_id"))
             if row.get("event") == "exec_step_finish":
                 _log(
                     "exec_step_finish",
-                    trace_id=str(trace_id),
+                    trace_id=trace_id,
                     tool=row.get("tool"),
                     step_id=row.get("step_id"),
                     ok=bool(row.get("ok")),
@@ -9611,7 +9528,7 @@ async def tools_append(body: Dict[str, Any], request: Request):
                 except Exception as ex:
                     logging.warning("trace.append: bad attempt=%r; defaulting to 0", _att_raw, exc_info=True)
                     _att = 0
-                _log("exec_step_attempt", trace_id=str(trace_id), tool=row.get("tool"), step_id=row.get("step_id"), attempt=_att)
+                _log("exec_step_attempt", trace_id=trace_id, tool=row.get("tool"), step_id=row.get("step_id"), attempt=_att)
             if row.get("event") == "exec_plan_start":
                 _steps_raw = row.get("steps")
                 try:
@@ -9619,13 +9536,13 @@ async def tools_append(body: Dict[str, Any], request: Request):
                 except Exception as ex:
                     logging.warning("trace.append: bad steps=%r; defaulting to 0", _steps_raw, exc_info=True)
                     _steps = 0
-                _log("exec_plan_start", trace_id=str(trace_id), steps=_steps)
+                _log("exec_plan_start", trace_id=trace_id, steps=_steps)
             if row.get("event") == "exec_plan_finish":
-                _log("exec_plan_finish", trace_id=str(trace_id), produced_keys=(row.get("produced_keys") or []))
+                _log("exec_plan_finish", trace_id=trace_id, produced_keys=(row.get("produced_keys") or []))
             if row.get("event") == "exec_batch_start":
-                _log("exec_batch_start", trace_id=str(trace_id), items=(row.get("items") or []))
+                _log("exec_batch_start", trace_id=trace_id, items=(row.get("items") or []))
             if row.get("event") == "exec_batch_finish":
-                _log("exec_batch_finish", trace_id=str(trace_id), items=(row.get("items") or []))
+                _log("exec_batch_finish", trace_id=trace_id, items=(row.get("items") or []))
             if bool(row.get("ok") is True) and row.get("event") == "end":
                 distilled = {
                     "t": 0,
@@ -9648,7 +9565,7 @@ async def tools_append(body: Dict[str, Any], request: Request):
                     distilled["duration_ms"] = 0
                 if isinstance(row.get("summary"), dict):
                     distilled["summary"] = row.get("summary")
-                _log("tool_summary", trace_id=str(trace_id), **distilled)
+                _log("tool_summary", trace_id=trace_id, **distilled)
                 # Compact artifact entries inferred from summary (no stack traces)
                 try:
                     s = row.get("summary") or {}
@@ -9660,7 +9577,7 @@ async def tools_append(body: Dict[str, Any], request: Request):
                             logging.warning("trace.append: bad images_count=%r; defaulting to 0", _ic_raw, exc_info=True)
                             _ic = 0
                         if _ic > 0:
-                            _log("artifact_summary", trace_id=str(trace_id), kind="image", count=_ic)
+                            _log("artifact_summary", trace_id=trace_id, kind="image", count=_ic)
                         _vc_raw = s.get("videos_count")
                         try:
                             _vc = int(_vc_raw or 0)
@@ -9668,7 +9585,7 @@ async def tools_append(body: Dict[str, Any], request: Request):
                             logging.warning("trace.append: bad videos_count=%r; defaulting to 0", _vc_raw, exc_info=True)
                             _vc = 0
                         if _vc > 0:
-                            _log("artifact_summary", trace_id=str(trace_id), kind="video", count=_vc)
+                            _log("artifact_summary", trace_id=trace_id, kind="video", count=_vc)
                         _wb_raw = s.get("wav_bytes")
                         try:
                             _wb = int(_wb_raw or 0)
@@ -9676,21 +9593,21 @@ async def tools_append(body: Dict[str, Any], request: Request):
                             logging.warning("trace.append: bad wav_bytes=%r; defaulting to 0", _wb_raw, exc_info=True)
                             _wb = 0
                         if _wb > 0:
-                            _log("artifact_summary", trace_id=str(trace_id), kind="audio", bytes=_wb)
+                            _log("artifact_summary", trace_id=trace_id, kind="audio", bytes=_wb)
                 except Exception as ex:
                     logging.warning("artifact summary distillation failed: %s", ex, exc_info=True)
             # Forward review WS events to connected client if present
             try:
                 app = request.app
                 ws_map = getattr(app.state, "ws_clients", {})
-                ws = ws_map.get(str(trace_id))
+                ws = ws_map.get(trace_id)
                 if ws and isinstance(row.get("event"), str) and (row["event"].startswith("review.") or row["event"] == "edit.plan"):
-                    payload = {"type": row["event"], "trace_id": str(trace_id), "step_id": row.get("step_id"), "notes": row.get("notes")}
+                    payload = {"type": row["event"], "trace_id": trace_id, "step_id": row.get("step_id"), "notes": row.get("notes")}
                     await ws.send_json(payload)
             except Exception as ex:
                 logging.warning("websocket forward failed: %s", ex, exc_info=True)
     except Exception as ex:
-        logging.error("trace.append failed trace_id=%s: %s", str(trace_id), ex, exc_info=True)
+        logging.error("trace.append failed trace_id=%s: %s", trace_id, ex, exc_info=True)
         return JSONResponse(status_code=400, content={"error": "append_failed"})
     return {"ok": True}
 
@@ -10599,7 +10516,7 @@ async def ws_tool(websocket: WebSocket):
             else:
                 args = {"_raw": raw_args}
             trace_id_in = req.get("trace_id")
-            trace_id_ws = str(trace_id_in).strip() if isinstance(trace_id_in, (str, int)) and str(trace_id_in).strip() else None
+            trace_id_ws = trace_id_in if isinstance(trace_id_in, str) and trace_id_in else None
             if not name:
                 await websocket.send_text(json.dumps({"error": "missing tool name"}))
                 continue
