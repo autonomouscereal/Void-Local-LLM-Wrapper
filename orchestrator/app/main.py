@@ -7707,7 +7707,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         # trace_id is not part of the OpenAI chat completions contract; generate one when missing
         # so all planner/executor logs and artifacts are correlated.
         trace_id = uuid.uuid4().hex
-        logging.debug("chat_completions:trace_id source=%s trace_id=%s", trace_src, trace_id)
+        logging.debug("chat_completions:trace_id source=%s trace_id=%s", trace_id, trace_id)
 
         # messages (verbatim)
         messages: List[Dict[str, Any]] = []
