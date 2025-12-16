@@ -241,3 +241,26 @@ async def committee_jsonify(
     parser = JSONParser()
     obj = parser.parse(txt or "{}", expected_schema)
     return obj if isinstance(obj, dict) else {}
+
+def _schema_to_template(expected: Any) -> Any:
+    if isinstance(expected, dict):
+        return {k: _schema_to_template(v) for k, v in expected.items()}
+    if isinstance(expected, list):
+        if not expected:
+            return []
+        return [_schema_to_template(expected[0])]
+    if isinstance(expected, type):
+        if issubclass(expected, bool):
+            return False
+        if issubclass(expected, int):
+            return 0
+        if issubclass(expected, float):
+            return 0.0
+        if issubclass(expected, str):
+            return ""
+        if issubclass(expected, (list, tuple, set)):
+            return []
+        if issubclass(expected, dict):
+            return {}
+        return None
+    return expected
