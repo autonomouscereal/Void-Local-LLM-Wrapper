@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Dict, Any
 
-from app.routes.toolrun import http_tool_run  # type: ignore
+from app.main import execute_tool_call  # type: ignore
 
 
 @dataclass
@@ -94,7 +94,7 @@ async def apply_autofix(
             dispatch_args["character_id"] = char_id
 
         try:
-            res = await http_tool_run("image.dispatch", dispatch_args)
+            res = await execute_tool_call({"name": "image.dispatch", "arguments": dispatch_args})
             result_block = res.get("result") or {}
             # Prefer canonical artifacts from image.dispatch, then fall back to
             # legacy single-image fields and meta view URLs.

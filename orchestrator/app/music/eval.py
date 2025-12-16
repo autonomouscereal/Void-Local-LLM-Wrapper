@@ -351,11 +351,9 @@ async def _call_music_eval_committee(summary: str) -> Dict[str, Any]:
 
     async def _run() -> Dict[str, Any]:
         # First, obtain the raw MusicEval text via the main committee path.
-        from ..committee_client import CommitteeClient  # type: ignore
-        import logging
+        from ..committee_client import committee_ai_text  # type: ignore
 
-        client = CommitteeClient()
-        env = await client.run(messages=messages, trace_id="music_eval")
+        env = await committee_ai_text(messages=messages, trace_id="music_eval")
         # Default error-shaped result; overwritten on success.
         result_payload: Dict[str, Any] = {
             "overall_quality_score": 0.0,

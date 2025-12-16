@@ -110,7 +110,7 @@ from .state.checkpoints import append_event as checkpoints_append_event
 from .trace_utils import emit_trace, append_jsonl_compat
 from .omni.context import build_omni_context
 from void_envelopes import merge_envelopes as stitch_merge_envelopes, stitch_openai as stitch_openai_final
-from .router.route import route_for_request
+# router layer removed; planner-only orchestration lives in this module now
 from .rag.core import get_embedder as _rag_get_embedder
 from .ablation.core import ablate as ablate_env
 from .ablation.export import write_facts_jsonl as ablate_write_facts
@@ -1335,12 +1335,73 @@ def _get_music_acceptance_thresholds() -> Dict[str, float]:
 
 
 app = FastAPI(title="Void Orchestrator", version="0.1.0")
-# Mount canonical tool routes (validate/run) so /tool.run is served by the orchestrator
-from app.routes import toolrun as _toolrun_routes  # type: ignore
-from app.routes.tools import mount_tools_routes as _mount_tools_routes  # type: ignore
-from void_envelopes import ToolEnvelope  # canonical envelope (shared)
-app.include_router(_toolrun_routes.router)
-_mount_tools_routes(app)
+# Canonical envelope (shared across services)
+from void_envelopes import ToolEnvelope  # type: ignore
+
+
+@app.post("/tool.run")
+async def tool_run(request: Request) -> Any:
+    """
+    Canonical tool execution endpoint.
+
+    Accepts either {name, args} or {name, arguments}. Returns ToolEnvelope with HTTP 200.
+    """
+    raw = await request.body()
+    raw_text = raw.decode("utf-8", errors="replace") if isinstance(raw, (bytes, bytearray)) else str(raw or "")
+    parser = JSONParser()
+    schema = {
+        "name": str,
+        "args": object,
+        "arguments": object,
+        "request_id": str,
+        "trace_id": str,
+        "cid": str,
+        "tool_call_id": str,
+        "meta": dict,
+    }
+    body = parser.parse(raw_text, schema)
+    if not isinstance(body, dict):
+        rid = uuid.uuid4().hex
+        return ToolEnvelope.failure("invalid_body_type", "Body must be a JSON object", status=422, request_id=rid, details={})
+    rid = (str(body.get("request_id") or "").strip()) or uuid.uuid4().hex
+    name = (body.get("name") or "").strip()
+    if not name:
+        return ToolEnvelope.failure("missing_name", "name is required", status=422, request_id=rid, details={})
+
+    args_in = body.get("args") if ("args" in body) else body.get("arguments")
+    if isinstance(args_in, dict):
+        args = dict(args_in)
+    elif isinstance(args_in, str):
+        parsed = parser.parse(args_in, {})
+        args = dict(parsed) if isinstance(parsed, dict) else {"_raw": args_in}
+    elif args_in is None:
+        args = {}
+    else:
+        args = {"_raw": args_in}
+
+    trace_id_val = body.get("trace_id")
+    trace_id = trace_id_val if isinstance(trace_id_val, str) and trace_id_val.strip() else None
+    if trace_id is None and isinstance(args.get("trace_id"), str) and str(args.get("trace_id")).strip():
+        trace_id = str(args.get("trace_id")).strip()
+
+    call: Dict[str, Any] = {"name": name, "arguments": args}
+    if trace_id:
+        call["trace_id"] = trace_id
+    res = await execute_tool_call(call)
+
+    if isinstance(res, dict) and isinstance(res.get("result"), dict):
+        return ToolEnvelope.success(res["result"], request_id=rid)
+    err_obj = res.get("error") if isinstance(res, dict) else None
+    if isinstance(err_obj, dict):
+        code = str(err_obj.get("code") or "tool_error")
+        msg = str(err_obj.get("message") or f"{name} failed")
+        st_raw = err_obj.get("status") or 422
+        try:
+            st = int(st_raw)  # type: ignore[arg-type]
+        except Exception:
+            st = 422
+        return ToolEnvelope.failure(code, msg, status=st, request_id=rid, details=dict(err_obj))
+    return ToolEnvelope.failure("tool_error", str(err_obj or "tool failed"), status=422, request_id=rid, details={"raw": res})
 # Middleware order matters: last added runs first.
 # We want Preflight to run FIRST, so add it LAST.
 from .middleware.ws_permissive import PermissiveWebSocketMiddleware
@@ -1544,8 +1605,8 @@ async def v1_image_generate(request: Request):
                 args.get("cfg"),
                 exc_info=True,
             )
-    # Route through canonical image.dispatch tool
-    res = await http_tool_run("image.dispatch", args)
+    # Execute in-process (no /tool.run HTTP recursion)
+    res = await execute_tool_call({"name": "image.dispatch", "arguments": args})
     if isinstance(res, dict) and isinstance(res.get("result"), dict):
         result_obj = res.get("result") or {}
         # Preserve existing shape: prompt_id, cid, paths for compatibility,
@@ -1763,7 +1824,7 @@ async def post_image_dispatch(request: Request):
     steps_val = obj.get("steps") if isinstance(obj.get("steps"), int) else None
     cfg_val = obj.get("cfg")
     cfg_num = float(cfg_val) if isinstance(cfg_val, (int, float)) else None
-    # For dispatcher, surface the raw tool result in the envelope result via the canonical tool.run path.
+    # Execute in-process (no /tool.run HTTP recursion).
     args = {
         "prompt": prompt,
         "negative": negative,
@@ -1777,7 +1838,7 @@ async def post_image_dispatch(request: Request):
         "steps": steps_val,
         "cfg": cfg_num,
     }
-    res = await http_tool_run("image.dispatch", args)
+    res = await execute_tool_call({"name": "image.dispatch", "arguments": args})
     return ToolEnvelope.success(
         res.get("result") if isinstance(res, dict) and isinstance(res.get("result"), dict) else res,
         request_id=rid,
@@ -3009,7 +3070,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         assets = dict(a.get("assets") if isinstance(a.get("assets"), dict) else {})
         if lock_bundle is not None:
             assets["lock_bundle"] = lock_bundle
-        args = {
+        dispatch_args = {
             "prompt": str(prompt),
             "negative": negative if isinstance(negative, str) else None,
             "seed": seed if isinstance(seed, int) else None,
@@ -3023,8 +3084,163 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             "cfg": cfg_num,
             "trace_id": a.get("trace_id") if isinstance(a.get("trace_id"), str) else None,
         }
-        res = await http_tool_run("image.dispatch", args)
-        return {"name": name, "result": res.get("result") if isinstance(res, dict) and isinstance(res.get("result"), dict) else res}
+        # Execute image generation in-process via ComfyUI (no /tool.run HTTP recursion).
+        try:
+            prompt_text = str(dispatch_args.get("prompt") or "")
+            negative_text = dispatch_args.get("negative") if isinstance(dispatch_args.get("negative"), str) else None
+            seed_int = dispatch_args.get("seed") if isinstance(dispatch_args.get("seed"), int) else None
+            width_int = dispatch_args.get("width") if isinstance(dispatch_args.get("width"), int) else None
+            height_int = dispatch_args.get("height") if isinstance(dispatch_args.get("height"), int) else None
+            # Parse "WxH" size when width/height not provided.
+            if (width_int is None or height_int is None) and isinstance(dispatch_args.get("size"), str) and "x" in str(dispatch_args.get("size")).lower():
+                try:
+                    w_str, h_str = str(dispatch_args.get("size")).lower().split("x", 1)
+                    if width_int is None and w_str.strip().isdigit():
+                        width_int = int(w_str.strip())
+                    if height_int is None and h_str.strip().isdigit():
+                        height_int = int(h_str.strip())
+                except Exception:
+                    pass
+
+            # Build a prompt graph. Prefer a configured workflow file if it already contains an API graph.
+            wf_path = os.getenv("COMFY_WORKFLOW_PATH") or "/workspace/services/image/workflows/stock_smoke.json"
+            prompt_graph: Dict[str, Any] | None = None
+            try:
+                if wf_path and os.path.exists(wf_path):
+                    with open(wf_path, "r", encoding="utf-8") as f:
+                        wf_obj = JSONParser().parse(f.read(), {})
+                else:
+                    wf_obj = {}
+            except Exception:
+                wf_obj = {}
+            if isinstance(wf_obj, dict) and isinstance(wf_obj.get("prompt"), dict):
+                prompt_graph = wf_obj.get("prompt")  # type: ignore[assignment]
+            elif isinstance(wf_obj, dict) and wf_obj:
+                # If it already looks like an API graph mapping, accept it.
+                looks_api = True
+                for _k, _v in wf_obj.items():
+                    if not (isinstance(_v, dict) and "class_type" in _v and "inputs" in _v):
+                        looks_api = False
+                        break
+                if looks_api:
+                    prompt_graph = wf_obj
+
+            if prompt_graph is None:
+                # Fallback: minimal SDXL graph.
+                w0, h0 = (width_int or 1024), (height_int or 1024)
+                steps0 = int(steps_val or 25)
+                seed0 = int(seed_int or 0)
+                prompt_graph = (build_default_scene_workflow(prompt_text, [], style=None, width=w0, height=h0, steps=steps0, seed=seed0, filename_prefix="void_image") or {}).get("prompt")  # type: ignore[name-defined]
+                if not isinstance(prompt_graph, dict):
+                    prompt_graph = {}
+
+            # Patch prompt / negative, seed, size, cfg/steps in common node types.
+            pos_set = False
+            for _nid, _node in (prompt_graph or {}).items():
+                if not isinstance(_node, dict):
+                    continue
+                ct = _node.get("class_type")
+                inp = _node.get("inputs") if isinstance(_node.get("inputs"), dict) else None
+                if not isinstance(inp, dict):
+                    continue
+                if ct == "CLIPTextEncode":
+                    # First CLIPTextEncode is positive, second is negative (common convention).
+                    if (not pos_set) and (prompt_text is not None):
+                        inp["text"] = str(prompt_text)
+                        pos_set = True
+                    elif negative_text is not None:
+                        inp["text"] = str(negative_text)
+                        negative_text = None
+                if ct in ("KSampler", "KSamplerAdvanced", "SamplerCustom"):
+                    if seed_int is not None and "seed" in inp:
+                        inp["seed"] = int(seed_int)
+                    if steps_val is not None and "steps" in inp:
+                        inp["steps"] = int(steps_val)
+                    if cfg_num is not None and "cfg" in inp:
+                        inp["cfg"] = float(cfg_num)
+                if ct in ("EmptyLatentImage", "LatentImage", "ImageResize", "LatentUpscale"):
+                    if width_int is not None and "width" in inp:
+                        inp["width"] = int(width_int)
+                    if height_int is not None and "height" in inp:
+                        inp["height"] = int(height_int)
+
+            workflow_payload: Dict[str, Any] = {"prompt": prompt_graph}
+            submit_res = await _comfy_submit_workflow(workflow_payload)  # type: ignore[name-defined]
+            if not isinstance(submit_res, dict) or submit_res.get("error"):
+                return _tool_error(name, "comfy_submit_failed", "comfy submit failed", status=502, details=submit_res)  # type: ignore[name-defined]
+            prompt_id = submit_res.get("prompt_id") or submit_res.get("uuid") or submit_res.get("id")
+            if not isinstance(prompt_id, str) or not prompt_id:
+                return _tool_error(name, "missing_prompt_id", "missing prompt_id from comfy", status=502, detail=submit_res)  # type: ignore[name-defined]
+
+            hist = await _comfy_history(prompt_id)  # type: ignore[name-defined]
+            detail = _normalize_comfy_history_entry(hist if isinstance(hist, dict) else {}, prompt_id)  # type: ignore[name-defined]
+            base = _job_endpoint.get(prompt_id) or (COMFYUI_API_URL or "")  # type: ignore[name-defined]
+            assets_list = _extract_comfy_asset_urls(detail if isinstance(detail, dict) else {}, base)  # type: ignore[name-defined]
+
+            # Download outputs into uploads/artifacts so downstream can serve them.
+            artifact_group_id = str(prompt_id)
+            save_dir = os.path.join(UPLOAD_DIR, "artifacts", "image", artifact_group_id)  # type: ignore[name-defined]
+            os.makedirs(save_dir, exist_ok=True)
+
+            orch_urls: List[str] = []
+            artifacts_out: List[Dict[str, Any]] = []
+            view_urls: List[str] = []
+
+            async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
+                for it in assets_list:
+                    if not isinstance(it, dict):
+                        continue
+                    fn = it.get("filename")
+                    url = it.get("url")
+                    if not isinstance(fn, str) or not fn:
+                        continue
+                    if not isinstance(url, str) or not url:
+                        continue
+                    view_urls.append(url)
+                    # Fetch and persist
+                    resp = await client.get(url)
+                    if int(getattr(resp, "status_code", 0) or 0) != 200:
+                        continue
+                    safe_fn = os.path.basename(fn)
+                    dst = os.path.join(save_dir, safe_fn)
+                    try:
+                        with open(dst, "wb") as f:
+                            f.write(resp.content)
+                    except Exception:
+                        continue
+                    rel = os.path.relpath(dst, UPLOAD_DIR).replace("\\", "/")  # type: ignore[name-defined]
+                    orch_url = (f"{PUBLIC_BASE_URL.rstrip('/')}/uploads/{rel}" if PUBLIC_BASE_URL else f"/uploads/{rel}")  # type: ignore[name-defined]
+                    orch_urls.append(orch_url)
+                    artifacts_out.append(
+                        {
+                            "id": safe_fn,
+                            "kind": "image",
+                            "path": f"/uploads/{rel}",
+                            "view_url": orch_url,
+                        }
+                    )
+
+            result_obj: Dict[str, Any] = {
+                "ids": {"prompt_id": prompt_id},
+                "meta": {
+                    "prompt": prompt_text,
+                    "negative": dispatch_args.get("negative"),
+                    "trace_id": dispatch_args.get("trace_id"),
+                    "artifact_group_id": artifact_group_id,
+                    "view_urls": view_urls,
+                    "orch_view_urls": orch_urls,
+                    "image_count": len(orch_urls) or len(view_urls),
+                    "steps": steps_val,
+                    "cfg": cfg_num,
+                    "width": width_int,
+                    "height": height_int,
+                },
+            }
+            if artifacts_out:
+                result_obj["artifacts"] = artifacts_out
+            return {"name": name, "result": result_obj}
+        except Exception as ex:
+            return _tool_error(name, "image_dispatch_exception", str(ex), status=500, stack=traceback.format_exc())  # type: ignore[name-defined]
     if name == "image.refine.segment" and ALLOW_TOOL_EXECUTION:
         a = args if isinstance(args, dict) else {}
         segment_id_raw = a.get("segment_id")
@@ -3077,7 +3293,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             lock_bundle = _lock_apply_profile(quality_profile, lock_bundle)
             lock_bundle = _lock_migrate_visual(lock_bundle)
         dispatch_args = build_image_refine_dispatch_args(a, lock_bundle, str(quality_profile or "standard"))
-        res = await http_tool_run("image.dispatch", dispatch_args)
+        # Execute in-process (no /tool.run recursion)
+        res = await execute_tool_call({"name": "image.dispatch", "arguments": dispatch_args, "trace_id": a.get("trace_id")})
         if isinstance(res, dict) and isinstance(res.get("result"), dict):
             env = res.get("result") or {}
         else:
@@ -7677,6 +7894,13 @@ def _as_float(v: Any, default: float = 0.0) -> float:
 
 @app.post("/v1/chat/completions")
 async def chat_completions(body: Dict[str, Any], request: Request):
+    env = await committee_ai_text(messages=(body.get("messages") or []), trace_id=uuid.uuid4().hex)
+    log.debug(f"chat_completions:env={env}")
+    log.debug(f"chat_completions:produce_tool_plan={await produce_tool_plan(messages=(body.get("messages") or []), tools=(body.get("tools") or []), temperature=body.get("temperature", 0.0), trace_id=uuid.uuid4().hex, mode="general")}")
+    return JSONResponse(content=env, status_code=200)
+
+
+async def chat_completions2(body: Dict[str, Any], request: Request):
     # Single-exit discipline: exactly one return at the bottom of this function.
     response = None
     usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
@@ -10576,60 +10800,6 @@ async def v1_replay(body: Dict[str, Any]):
     return {"ok": True, "file": fp, "sha256": h}
 
 
-@app.post("/v1/completions")
-async def completions_legacy(body: Dict[str, Any]):
-    # Adapter to OpenAI text completions using chat/completions under the hood
-    prompt = (body or {}).get("prompt")
-    stream = bool((body or {}).get("stream"))
-    temperature = (body or {}).get("temperature") or DEFAULT_TEMPERATURE
-    idempotency_key = (body or {}).get("idempotency_key")
-    # Normalize prompt(s) into messages
-    messages: List[Dict[str, Any]] = []
-    if isinstance(prompt, str):
-        messages = [{"role": "user", "content": prompt}]
-    elif isinstance(prompt, list):
-        parts: List[str] = []
-        for p in prompt:
-            if isinstance(p, str): parts.append(p)
-        messages = [{"role": "user", "content": "\n".join(parts)}] if parts else [{"role": "user", "content": ""}]
-    else:
-        messages = [{"role": "user", "content": str(prompt)}]
-    payload = {"messages": messages, "stream": bool(stream), "temperature": temperature}
-    if isinstance(idempotency_key, str):
-        payload["idempotency_key"] = idempotency_key
-    # Streaming: relay a single final chunk transformed to completions shape
-    if stream:
-        return StreamingResponse(_completions_stream_gen(payload), media_type="text/event-stream")
-
-    # Non-streaming: call locally and map envelope
-    async with _hx.AsyncClient(trust_env=False, timeout=None) as client:
-        rr = await client.post((PUBLIC_BASE_URL.rstrip("/") if PUBLIC_BASE_URL else "http://127.0.0.1:8000") + "/v1/chat/completions", json=payload)
-    ct = rr.headers.get("content-type") or "application/json"
-    if not ct.startswith("application/json"):
-        # Fallback: wrap text
-        txt = rr.text
-        out = {
-            "id": "orc-1",
-            "object": "text_completion",
-            "model": QWEN_MODEL_ID,
-            "choices": [{"index": 0, "finish_reason": "stop", "text": txt}],
-            "created": int(time.time()),
-        }
-        return JSONResponse(content=out)
-    parser = JSONParser()
-    obj = parser.parse(rr.text or "", {"choices": [{"message": {"content": str}}], "usage": dict, "created": int, "system_fingerprint": str, "model": str, "id": str})
-    content_txt = (((obj.get("choices") or [{}])[0].get("message") or {}).get("content") or obj.get("text") or "")
-    out = {
-        "id": obj.get("id") or "orc-1",
-        "object": "text_completion",
-        "model": obj.get("model") or QWEN_MODEL_ID,
-        "choices": [{"index": 0, "finish_reason": "stop", "text": content_txt}],
-        "usage": obj.get("usage") or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-        "created": obj.get("created") or int(time.time()),
-        "system_fingerprint": obj.get("system_fingerprint") or _hl.sha256((str(QWEN_MODEL_ID) + "+" + str(GLM_MODEL_ID) + "+" + str(DEEPSEEK_CODER_MODEL_ID)).encode("utf-8")).hexdigest()[:16],
-    }
-    return JSONResponse(content=out)
-
 @app.websocket("/ws")
 async def ws_alias(websocket: WebSocket):
     # Deprecated alias removed. Politely close to avoid client hangs.
@@ -11417,20 +11587,6 @@ async def _update_scene_from_job(job_id: str, detail: Dict[str, Any] | str, fail
             await _maybe_compile_film(row["film_id"])
         except Exception as ex:
             logging.warning(f"film.compile.maybe.error film_id={str(row.get('film_id'))} err={str(ex)}", exc_info=True)
-
-
-def _mean_normalize_embedding(embs: List[List[float]]) -> List[float]:
-    if not embs:
-        return []
-    dim = len(embs[0])
-    sums = [0.0] * dim
-    for v in embs:
-        for i in range(min(dim, len(v))):
-            sums[i] += float(v[i])
-    mean = [x / len(embs) for x in sums]
-    # L2 normalize
-    norm = math.sqrt(sum(x * x for x in mean)) or 1.0
-    return [x / norm for x in mean]
 
 
 async def _maybe_compile_film(film_id: str) -> None:

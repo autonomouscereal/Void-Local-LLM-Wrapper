@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional
 
 from ..json_parser import JSONParser
 from ..tracing.runtime import trace_event
-from ..committee_client import CommitteeClient, committee_jsonify, _schema_to_template
+from ..committee_client import committee_ai_text, committee_jsonify, _schema_to_template
 
 # Single logger per module (no custom logger names)
 log = logging.getLogger(__name__)
@@ -185,9 +185,8 @@ async def plan_song_graph(
         bool(profile_txt),
     )
     # First, route song planner through the main committee to produce a Song Graph text.
-    client = CommitteeClient()
     try:
-        env = await client.run(
+        env = await committee_ai_text(
             messages=[
                 {"role": "system", "content": "You are SongOps. Output ONLY JSON per the song schema."},
                 {"role": "user", "content": prompt},

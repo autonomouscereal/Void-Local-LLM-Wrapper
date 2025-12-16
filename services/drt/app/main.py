@@ -54,10 +54,12 @@ try:
         ],
         force=True,
     )
-    logging.getLogger(__name__).info("drt logging configured file=%r level=%s", _log_file, logging.getLevelName(_lvl))
+    logging.getLogger(__name__).info(
+        f"drt logging configured file={_log_file!r} level={logging.getLevelName(_lvl)}"
+    )
 except Exception as _ex:
     logging.basicConfig(level=logging.INFO, stream=sys.stdout)
-    logging.getLogger(__name__).warning("drt file logging disabled: %s", _ex, exc_info=True)
+    logging.getLogger(__name__).warning(f"drt file logging disabled: {_ex}", exc_info=True)
 
 
 app = FastAPI(title="Deep Research Tool", version=DRT_VERSION)
@@ -97,7 +99,7 @@ def _robots_allowed(url: str, ua: str = "VoidBot/1.0") -> bool:
                 rpp.set_url(robots_url)
                 rpp.read()
             except Exception as ex:
-                logging.debug("robots.read_failed url=%s: %s", robots_url, ex, exc_info=True)
+                logging.debug(f"robots.read_failed url={robots_url}: {ex}", exc_info=True)
                 rpp = None  # type: ignore
             if rpp is None:
                 _ROBOTS_CACHE[base] = (now, urllib.robotparser.RobotFileParser())
@@ -109,7 +111,7 @@ def _robots_allowed(url: str, ua: str = "VoidBot/1.0") -> bool:
             return True
         return rp.can_fetch(ua, url)
     except Exception as ex:
-        logging.debug("robots.allowed_failed url=%s: %s", url, ex, exc_info=True)
+        logging.debug(f"robots.allowed_failed url={url}: {ex}", exc_info=True)
         return True
 
 
@@ -124,7 +126,7 @@ def _transcribe_with_whisper(wav_path: str) -> str:
             r = httpx.post(WHISPER_URL, files={"file": ("a.wav", f, "audio/wav")})
         return (r.json() or {}).get("text", "")
     except Exception as ex:
-        logging.warning("whisper.transcribe_failed path=%s: %s", wav_path, ex, exc_info=True)
+        logging.warning(f"whisper.transcribe_failed path={wav_path}: {ex}", exc_info=True)
         return ""
 
 async def _ocr_images(paths: list[str]) -> list[dict]:
@@ -137,7 +139,7 @@ async def _ocr_images(paths: list[str]) -> list[dict]:
                 if r.status_code == 200:
                     out.append(r.json())
     except Exception as ex:
-        logging.warning("ocr.batch_failed count=%s: %s", len(paths or []), ex, exc_info=True)
+        logging.warning(f"ocr.batch_failed count={len(paths or [])}: {ex}", exc_info=True)
         return out
     return out
 
@@ -263,7 +265,7 @@ class Discoverer:
                         if isinstance(href, str) and href.startswith("http"):
                             urls.append(href)
         except httpx.HTTPError as ex:
-            logging.warning("discover.ddg_failed query=%s: %s", q, ex, exc_info=True)
+            logging.warning(f"discover.ddg_failed query={q}: {ex}", exc_info=True)
             urls = []
         # Deterministic truncation and domain enforcement
         allow = set([d.lower() for d in (domains_allow or [])])
@@ -335,7 +337,7 @@ class FetcherParser:
                         cw.writerow(r)
                     tables.append({"csv": buf.getvalue()})
         except Exception as ex:
-            logging.debug("parse_html.failed: %s", ex, exc_info=True)
+            logging.debug(f"parse_html.failed: {ex}", exc_info=True)
             text = ""
         return text, tables
 
@@ -349,7 +351,7 @@ class FetcherParser:
         except ImportError:
             return "", []
         except Exception as ex:
-            logging.warning("parse_pdf.failed: %s", ex, exc_info=True)
+            logging.warning(f"parse_pdf.failed: {ex}", exc_info=True)
             return "", []
 
     @staticmethod
@@ -401,7 +403,7 @@ class FetcherParser:
                             jsonld_list.append(it)
             out["jsonld"] = jsonld_list
         except Exception as ex:
-            logging.debug("extract_metadata.failed: %s", ex, exc_info=True)
+            logging.debug(f"extract_metadata.failed: {ex}", exc_info=True)
             return out
         return out
 
@@ -748,7 +750,7 @@ async def research_collect(body: Dict[str, Any]):
                 continue
         except Exception as ex:
             # If robots.txt lookup fails, treat as allowed but record telemetry.
-            logging.warning("robots_allowed_check_failed url=%s error=%s", url, ex, exc_info=True)
+            logging.warning(f"robots_allowed_check_failed url={url} error={ex}", exc_info=True)
         # Unified media-aware fetch: try media resolver first, fall back to HTTP fetch
         text = ""
         tables: List[Dict[str, str]] = []
@@ -778,7 +780,7 @@ async def research_collect(body: Dict[str, Any]):
                     ctype = "application/pdf"
                     text, tables = FetcherParser.parse_pdf(raw)
                 except (OSError, TypeError, ValueError) as ex:
-                    logging.debug("fetch.loop.pdf_local_read_failed url=%s: %s", url, ex, exc_info=True)
+                    logging.debug(f"fetch.loop.pdf_local_read_failed url={url}: {ex}", exc_info=True)
                     raw, ctype = await FetcherParser.fetch(url)
                 fetch_mode = "httpx"
             elif kind == "image":
@@ -792,7 +794,7 @@ async def research_collect(body: Dict[str, Any]):
                         o = await _ocr_images([mres.get("image_path")])
                         text = json.dumps(o) if o else ""
                 except (OSError, TypeError, ValueError) as ex:
-                    logging.debug("fetch.loop.image_local_read_failed url=%s: %s", url, ex, exc_info=True)
+                    logging.debug(f"fetch.loop.image_local_read_failed url={url}: {ex}", exc_info=True)
                     raw, ctype = await FetcherParser.fetch(url)
                 fetch_mode = "httpx"
             elif kind == "html":
@@ -806,12 +808,12 @@ async def research_collect(body: Dict[str, Any]):
                 raw, ctype = await FetcherParser.fetch(url)
                 fetch_mode = "httpx"
         except Exception as ex:
-            logging.warning("fetch.loop.primary_failed url=%s: %s", url, ex, exc_info=True)
+            logging.warning(f"fetch.loop.primary_failed url={url}: {ex}", exc_info=True)
             try:
                 raw, ctype = await FetcherParser.fetch(url)
                 fetch_mode = "httpx"
             except Exception as ex2:
-                logging.warning("fetch.loop.fallback_failed url=%s: %s", url, ex2, exc_info=True)
+                logging.warning(f"fetch.loop.fallback_failed url={url}: {ex2}", exc_info=True)
                 continue
         # Heuristics: escalate to browser render when HTML appears script-heavy or too small
         def _should_render_html(html_text: str) -> bool:
@@ -844,7 +846,7 @@ async def research_collect(body: Dict[str, Any]):
                             fetch_mode = "browser"
                             render_signals = rres.get("signals") or {}
                     except Exception as ex:
-                        logging.debug("fetch.loop.render_failed url=%s: %s", url, ex, exc_info=True)
+                        logging.debug(f"fetch.loop.render_failed url={url}: {ex}", exc_info=True)
                         did_render = False
                 if not did_render:
                     text, tables = FetcherParser.parse_html(raw)
@@ -903,10 +905,7 @@ async def research_collect(body: Dict[str, Any]):
             # Logging to stderr here so we don't lose visibility entirely, but never
             # fail the research run because of telemetry formatting.
             logging.warning(
-                "drt.fetch.log_failed url=%s mode=%s error=%s",
-                url,
-                fetch_mode,
-                ex,
+                f"drt.fetch.log_failed url={url} mode={fetch_mode} error={ex}",
                 exc_info=True,
             )
 
@@ -1114,7 +1113,7 @@ async def render_fetch(url: str, opts: Dict[str, Any] | None = None) -> Dict[str
                 try:
                     await ctx.set_extra_http_headers({str(k): str(v) for k, v in extra_headers.items()})
                 except Exception as ex:
-                    logging.debug("render_fetch.headers_failed url=%s: %s", url, ex, exc_info=True)
+                    logging.debug(f"render_fetch.headers_failed url={url}: {ex}", exc_info=True)
             page = await ctx.new_page()
             # TIMEOUTS FORBIDDEN: disable Playwright timeouts globally for this page.
             page.set_default_timeout(0)
@@ -1126,7 +1125,7 @@ async def render_fetch(url: str, opts: Dict[str, Any] | None = None) -> Dict[str
                 if btn:
                     await btn.click()
             except Exception as ex:
-                logging.debug("render_fetch.consent_click_failed url=%s: %s", url, ex, exc_info=True)
+                logging.debug(f"render_fetch.consent_click_failed url={url}: {ex}", exc_info=True)
             if scroll_max > 0:
                 signals["scrolled"] = True
                 for _ in range(max(0, scroll_max)):
@@ -1134,19 +1133,19 @@ async def render_fetch(url: str, opts: Dict[str, Any] | None = None) -> Dict[str
                         await page.evaluate("window.scrollBy(0, Math.max(400, window.innerHeight*0.8));")
                         await page.wait_for_timeout(scroll_sleep_ms)
                     except Exception as ex:
-                        logging.debug("render_fetch.scroll_failed url=%s: %s", url, ex, exc_info=True)
+                        logging.debug(f"render_fetch.scroll_failed url={url}: {ex}", exc_info=True)
                         break
             try:
                 await page.wait_for_load_state("networkidle")
             except Exception as ex:
-                logging.debug("render_fetch.networkidle_wait_failed url=%s: %s", url, ex, exc_info=True)
+                logging.debug(f"render_fetch.networkidle_wait_failed url={url}: {ex}", exc_info=True)
             html = await page.content()
             title = (await page.title()) or ""
             body_text = ""
             try:
                 body_text = await page.evaluate("document.body ? document.body.innerText : ''")
             except Exception as ex:
-                logging.debug("render_fetch.body_text_failed url=%s: %s", url, ex, exc_info=True)
+                logging.debug(f"render_fetch.body_text_failed url={url}: {ex}", exc_info=True)
                 body_text = ""
             # Challenge detection
             low = (title + " " + body_text).lower()
@@ -1161,7 +1160,7 @@ async def render_fetch(url: str, opts: Dict[str, Any] | None = None) -> Dict[str
                     name = f"render_{int(time.time())}_{_sha256_str(url)[:8]}.png"
                     screenshot_url = _save_bytes(name, png)
                 except Exception as ex:
-                    logging.debug("render_fetch.screenshot_failed url=%s: %s", url, ex, exc_info=True)
+                    logging.debug(f"render_fetch.screenshot_failed url={url}: {ex}", exc_info=True)
                     screenshot_url = None
             await ctx.close()
             await browser.close()
@@ -1290,7 +1289,7 @@ async def api_smart_get(body: Dict[str, Any]):
                 ctype = r.headers.get("content-type", ctype)
                 html = r.text if "html" in (ctype or "") else ""
         except httpx.HTTPError as ex:
-            logging.warning("smart_get.http_fetch_failed url=%s: %s", url, ex, exc_info=True)
+            logging.warning(f"smart_get.http_fetch_failed url={url}: {ex}", exc_info=True)
             html = ""
     # Decide to render
     def _should_render_html(html_text: str) -> bool:
