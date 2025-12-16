@@ -46,10 +46,10 @@ try:
         ],
         force=True,
     )
-    logging.getLogger("teacher.logging").info("teacher logging configured file=%r level=%s", _log_file, logging.getLevelName(_lvl))
+    logging.getLogger(__name__).info("teacher logging configured file=%r level=%s", _log_file, logging.getLevelName(_lvl))
 except Exception as _ex:
     logging.basicConfig(level=logging.INFO, stream=sys.stdout)
-    logging.getLogger("teacher.logging").warning("teacher file logging disabled: %s", _ex, exc_info=True)
+    logging.getLogger(__name__).warning("teacher file logging disabled: %s", _ex, exc_info=True)
 
 
 app = FastAPI(title="Wrapper-as-Teacher", version=TEACHER_VERSION)

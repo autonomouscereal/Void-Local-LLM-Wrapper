@@ -11,7 +11,7 @@ from ..json_parser import JSONParser
 from .catalog import PLANNER_VISIBLE_TOOLS
 from ..tools_schema import get_builtin_tools_schema
 
-log = logging.getLogger("orchestrator.plan.committee")
+log = logging.getLogger(__name__)
 
 SYSTEM_IMAGE = (
     "You are ImageOps. Output ONLY JSON per the schema. "
@@ -119,8 +119,8 @@ async def produce_tool_plan(
     messages: List[Dict[str, Any]],
     tools: Optional[List[Dict[str, Any]]],
     temperature: float,
-    trace_id: Optional[str] = None,
-    mode: Optional[str] = None,
+    trace_id: str,
+    mode: str,
 ) -> Tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
     """
     Central chat planner entry point.
@@ -129,9 +129,9 @@ async def produce_tool_plan(
     - Uses the committee layer for model calls.
     - Returns (raw_planner_text, normalized_tool_calls, planner_env).
     """
-    effective_mode = str(mode or "general").strip() or "general"
+    effective_mode = str(mode).strip() or "general"
     t0 = time.perf_counter()
-    tid = str(trace_id or "planner")
+    tid = str(trace_id).strip() or "planner"
     msgs = _safe_message_list(messages or [], trace_id=tid)
     tools = _safe_tools_list(tools, trace_id=tid)
     try:
@@ -180,7 +180,7 @@ async def produce_tool_plan(
     elif effective_mode == "audio":
         mode_system = SYSTEM_AUDIO
 
-    # CO frames (prompt-only) to provide compact guidance + tail-safe RoE.
+    # CO frames (prompt-only) to provide compact guidance.
     co_env = {
         "schema_version": 1,
         "trace_id": str(trace_id or ""),
@@ -191,9 +191,8 @@ async def produce_tool_plan(
         "attachments": [],
         "tool_memory": [],
         "rag_hints": [],
-        "roe_incoming_instructions": [],
         "subject_canon": {},
-        "percent_budget": {"icw_pct": [65, 70], "tools_pct": [18, 20], "roe_pct": [5, 10], "misc_pct": [3, 5], "buffer_pct": 5},
+        "percent_budget": {"icw_pct": [65, 70], "tools_pct": [18, 20], "misc_pct": [3, 5], "buffer_pct": 5},
         "sweep_plan": ["0-90", "30-120", "60-150+wrap"],
     }
     try:

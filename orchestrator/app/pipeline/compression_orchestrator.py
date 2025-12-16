@@ -17,7 +17,6 @@ def _pick_alloc_within_ranges(ranges: Dict[str, Any]) -> Dict[str, int]:
     """
     icw_lo, icw_hi = int(ranges.get("icw_pct", [65, 70])[0]), int(ranges.get("icw_pct", [65, 70])[1])
     tools_lo, tools_hi = int(ranges.get("tools_pct", [18, 20])[0]), int(ranges.get("tools_pct", [18, 20])[1])
-    roe_lo, roe_hi = int(ranges.get("roe_pct", [5, 10])[0]), int(ranges.get("roe_pct", [5, 10])[1])
     misc_lo, misc_hi = int(ranges.get("misc_pct", [3, 5])[0]), int(ranges.get("misc_pct", [3, 5])[1])
     buffer_pct = int(ranges.get("buffer_pct", 5))
 
@@ -27,7 +26,6 @@ def _pick_alloc_within_ranges(ranges: Dict[str, Any]) -> Dict[str, int]:
     alloc = {
         "icw": mid(icw_lo, icw_hi),
         "tools": mid(tools_lo, tools_hi),
-        "roe": mid(roe_lo, roe_hi),
         "misc": mid(misc_lo, misc_hi),
         "buffer": buffer_pct,
     }
@@ -148,10 +146,9 @@ def _co_frames_baseline() -> Dict[str, str]:
             "Build your working context by self-compression and self-trimming. Use this ratio of the model’s context C:\n"
             "- ICW (multimodal compressed): 65–70% of C\n"
             "- TOOLS (catalog names + recent tool outcomes): 18–20% of C\n"
-            "- RoE (Rules of Engagement): 5–10% of C (always include; tail-resilient)\n"
             "- MISC (identity/steer/tail): 3–5% of C\n"
             "- BUFFER: ~5% of C\n"
-            "If your assembled set exceeds 100% of C, trim in this exact order until you fit: MISC → TOOLS summaries → ICW history tail. Never trim RoE or the identity frame.\n"
+            "If your assembled set exceeds 100% of C, trim in this exact order until you fit: MISC → TOOLS summaries → ICW history tail.\n"
             "Build and plan in three sweeps over an oversized corpus (~150% of C): Sweep A 0–90%, Sweep B 30–120%, Sweep C 60–150% + wrap 0–30%. For each sweep, compress to these ratios, then plan. After all sweeps, merge notes into a single plan."
         ),
         "icw": (
@@ -184,47 +181,12 @@ def _co_frames_baseline() -> Dict[str, str]:
             "Last K=2–3 runs per selected tool: 1 success and 1–2 failures (RAW JSON, artifacts truncated)."
         ),
         "subject": (
-            "### [SUBJECT CANON / SYSTEM — tail with RoE]\n"
+            "### [SUBJECT CANON / SYSTEM — tail]\n"
             'If the user mentions Shadow (Sonic), treat the subject as "Shadow the Hedgehog" (SEGA) unless explicitly negated.\n'
             "In any image.dispatch prompt, include the literal name and ≥60% of: black hedgehog; red stripes on quills/arms; upward-swept quills; red eyes; white chest tuft; gold inhibitor rings (wrists/ankles); hover shoes (red/white/black, jet glow).\n"
             "Prefer futuristic/city/space-lab scenes unless requested otherwise. Add negatives to avoid generic silhouettes/forests."
         ),
-        "roe_capture": (
-            "### [RoE CAPTURE / SYSTEM]\n"
-            "When the user gives interaction rules, extract/update a concise RoE list.\n"
-            "Format: - {scope:user|global} {must|must_not|prefer|avoid}: <directive> (reason:<short>).\n"
-            "Deduplicate; most recent overrides. Keep within 5–10% by merging/abstracting."
-        ),
-        "roe_digest": (
-            "### [RoE DIGEST / SYSTEM — tail]\n"
-            "Rules of Engagement (5–10% of C; never omit). Self-check planned steps and wording against RoE; adjust voluntarily."
-        ),
     }
-
-
-def _build_roe_digest_lines(incoming: List[str], globals_: List[str]) -> List[str]:
-    lines: List[str] = []
-    for raw in (globals_ or []):
-        s = str(raw).strip()
-        if s:
-            lines.append(s)
-    for raw in (incoming or []):
-        s = str(raw).strip()
-        if not s:
-            continue
-        # Very light normalization to bullets if not already formatted
-        if not s.startswith("- "):
-            s = f"- {s}"
-        lines.append(s)
-    # Deduplicate preserving order
-    seen = set()
-    out: List[str] = []
-    for ln in lines:
-        if ln in seen:
-            continue
-        seen.add(ln)
-        out.append(ln)
-    return out[:16]
 
 
 def split_previous_and_last_user(messages: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, Any] | None]:
@@ -307,7 +269,6 @@ def co_pack(envelope: Dict[str, Any]) -> Dict[str, Any]:
     user_turn = envelope.get("user_turn") or {}
     history = envelope.get("history") or []
     subject_canon = envelope.get("subject_canon") or {}
-    roe_incoming = envelope.get("roe_incoming_instructions") or []
     call_kind = str(envelope.get("call_kind") or "planner")
     percent_budget = envelope.get("percent_budget") or {}
     sweeps = envelope.get("sweep_plan") or ["0-90", "30-120", "60-150+wrap"]
@@ -334,12 +295,11 @@ def co_pack(envelope: Dict[str, Any]) -> Dict[str, Any]:
         if alloc["icw"] > diff:
             alloc["icw"] -= diff
             alloc["tools"] = 30
-    used_pct = alloc["icw"] + alloc["tools"] + alloc["roe"] + alloc["misc"] + alloc["buffer"]
+    used_pct = alloc["icw"] + alloc["tools"] + alloc["misc"] + alloc["buffer"]
     free_pct = max(0, 100 - used_pct)
 
     icw_budget_bytes = int(total_budget_bytes * alloc["icw"] / 100.0)
     tools_budget_bytes = int(total_budget_bytes * alloc["tools"] / 100.0)
-    roe_budget_bytes = int(total_budget_bytes * alloc["roe"] / 100.0)
     misc_budget_bytes = int(total_budget_bytes * alloc["misc"] / 100.0)
     buffer_budget_bytes = int(total_budget_bytes * alloc["buffer"] / 100.0)
 
@@ -440,26 +400,13 @@ def co_pack(envelope: Dict[str, Any]) -> Dict[str, Any]:
     # last_user_message in that compression and instead add it as recent frames below.
     _ = previous_messages  # reserved for future explicit ICW integration
 
-    # Insert recency frames immediately before RoE tail
+    # Insert recency frames at the tail
     recent_summary_frame = build_recent_summary(last_user_message)
     recent_raw_frame = build_recent_raw(last_user_message)
     if recent_summary_frame is not None:
         frames.append(recent_summary_frame)
     if recent_raw_frame is not None:
         frames.append(recent_raw_frame)
-
-    # Tail-anchored RoE digest
-    # Keep RoE small and at the tail. Place capture/digest after recent frames.
-    frames.append({"role": "system", "content": blocks["roe_capture"]})
-    global_rules = [
-        "- scope:user must: one final answer only (reason:user policy)",
-        "- scope:user must: use image.dispatch for image requests (reason:tool-first)",
-        "- scope:user must_not: include Comfy /view or bare filenames; only absolute /uploads/artifacts/... (reason:URL hygiene)",
-        "- scope:global prefer: keep literal identity 'Shadow the Hedgehog' + ≥60% tokens (reason:subject fidelity)",
-        "- scope:global must: body content non-empty; surface warnings inline (reason:UX)",
-    ]
-    roe_digest_lines = _build_roe_digest_lines(roe_incoming, global_rules)
-    frames.append({"role": "system", "content": blocks["roe_digest"] + "\n" + "\n".join(roe_digest_lines)})
 
     # Enforce byte budget by trimming low-priority bands in order:
     # misc (TEL / extra schemas) → tools details → ICW tail (recent_raw).
@@ -536,7 +483,7 @@ def co_pack(envelope: Dict[str, Any]) -> Dict[str, Any]:
         total_bytes = frames_bytes(frames)
 
     if total_bytes > total_budget_bytes:
-        # Finally, drop recent_raw (ICW tail) but keep recent_summary and RoE.
+        # Finally, drop recent_raw (ICW tail) but keep recent_summary.
         before_count = len(frames)
         frames = [f for f in frames if f.get("name") != "recent_raw"]
         after_count = len(frames)
@@ -550,7 +497,7 @@ def co_pack(envelope: Dict[str, Any]) -> Dict[str, Any]:
         "free_pct": free_pct,
         "alloc": alloc,
         "call_kind": call_kind,
-        "kept": {"P0": True, "ICW": True, "Tools": True, "RoE": True},
+        "kept": {"P0": True, "ICW": True, "Tools": True},
         "evicted": {
             "misc": evicted_misc,
             "tools_trim_pct": tools_trim_pct,
@@ -566,7 +513,6 @@ def co_pack(envelope: Dict[str, Any]) -> Dict[str, Any]:
             "total_bytes": total_bytes,
             "icw_bytes": icw_budget_bytes,
             "tools_bytes": tools_budget_bytes,
-            "roe_bytes": roe_budget_bytes,
             "misc_bytes": misc_budget_bytes,
             "buffer_bytes": buffer_budget_bytes,
         },
@@ -576,7 +522,6 @@ def co_pack(envelope: Dict[str, Any]) -> Dict[str, Any]:
         "trace_id": trace_id,
         "frames": frames,
         "ratio_telemetry": ratio_telemetry,
-        "roe_digest": roe_digest_lines,
     }
 
 

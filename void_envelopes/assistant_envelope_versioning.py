@@ -29,6 +29,9 @@ def migrate_v0_to_v1(env: dict) -> None:
     env.setdefault("evidence", [])
     env.setdefault("tool_calls", [])
     env.setdefault("artifacts", [])
-    env.setdefault("telemetry", {"window": {"input_bytes": 0, "output_target_tokens": 0}, "compression_passes": [], "notes": []})
+    env.setdefault(
+        "telemetry",
+        {"window": {"input_bytes": 0, "output_target_tokens": 0}, "compression_passes": [], "notes": []},
+    )
 
 

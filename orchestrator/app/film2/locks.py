@@ -11,7 +11,7 @@ from ..locks.runtime import (
     migrate_film2_bundle as _lock_migrate_film2,
     ensure_visual_lock_bundle as _lock_ensure_visual,
 )
-from ..datasets.trace import append_sample as _trace_append
+from ..tracing.runtime import trace_event
 
 
 def _apply_ref(ref_id: str | None) -> Dict[str, Any]:
@@ -226,10 +226,9 @@ async def ensure_visual_locks_for_story(
         project.setdefault("scenes_count", scenes_count)
         project.setdefault("beats_count", beats_count)
         if trace_id:
-            _trace_append(
-                "film2",
+            trace_event(
+                "film2.locks_story_project_enriched",
                 {
-                    "event": "locks_story_project_enriched",
                     "trace_id": trace_id,
                     "quality_profile": profile_name,
                     "acts_count": project.get("acts_count"),
@@ -279,10 +278,10 @@ async def generate_scene_storyboards(
                     path_val = first.get("path") or first.get("view_url") or first.get("url")
                     if isinstance(path_val, str) and path_val:
                         storyboard_path = path_val
-                        _trace_append(
-                            "film2",
+                        trace_event(
+                            "film2.scene_storyboard_generated",
                             {
-                                "event": "scene_storyboard_generated",
+                                "trace_id": trace_id,
                                 "scene_id": scene_id,
                                 "image_path": path_val,
                                 "prompt": prompt,
@@ -346,10 +345,10 @@ async def generate_shot_storyboards(
                     path_val = first.get("path") or first.get("view_url") or first.get("url")
                     if isinstance(path_val, str) and path_val:
                         storyboard_path = path_val
-                        _trace_append(
-                            "film2",
+                        trace_event(
+                            "film2.shot_storyboard_generated",
                             {
-                                "event": "shot_storyboard_generated",
+                                "trace_id": trace_id,
                                 "shot_id": shot_id,
                                 "image_path": path_val,
                                 "prompt": prompt,

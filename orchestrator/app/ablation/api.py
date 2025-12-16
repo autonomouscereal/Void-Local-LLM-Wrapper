@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Dict, Any
 from .core import ablate
-from ..jsonio.normalize import normalize_to_envelope
+from void_envelopes import normalize_to_envelope
 
 
 def post_ablate(raw_text: str, scope: str = "chat") -> Dict[str, Any]:

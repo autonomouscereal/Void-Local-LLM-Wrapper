@@ -13,6 +13,9 @@ from .json_parser import JSONParser
 from .pipeline.compression_orchestrator import co_pack, frames_to_messages
 from .trace_utils import emit_trace
 
+# Single logger per module (no custom logger names)
+log = logging.getLogger(__name__)
+
 
 def _env_int(name: str, default: int, *, min_val: int | None = None, max_val: int | None = None) -> int:
     """
@@ -25,7 +28,7 @@ def _env_int(name: str, default: int, *, min_val: int | None = None, max_val: in
     try:
         val = int(str(raw).strip()) if raw is not None else int(default)
     except Exception as exc:  # pragma: no cover - defensive logging
-        logging.getLogger("orchestrator.committee").error("bad env %s=%r: %s", name, raw, exc, exc_info=True)
+        log.error("bad env %s=%r: %s", name, raw, exc, exc_info=True)
         val = int(default)
     if min_val is not None and val < min_val:
         val = min_val
@@ -117,7 +120,6 @@ os.makedirs(STATE_DIR, exist_ok=True)
 
 # Use orchestrator-wide logging; no per-module basicConfig. All committee logs
 # go through the same handlers configured in app.main.
-log = logging.getLogger("orchestrator.committee")
 
 
 async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str) -> Dict[str, Any]:
@@ -131,14 +133,15 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str) -> 
     returned in a structured envelope so upstream planner/committee callers can
     surface them cleanly to HTTP responses instead of killing connections.
     """
-    trace_key = str(trace_id or "committee")
+    # Use trace_id only (no derived/fallback trace keys). Empty string means "no explicit trace id".
+    trace_id = str(trace_id or "").strip()
     t_all = time.monotonic()
     model = payload.get("model")
     prompt = payload.get("prompt")
     options = payload.get("options") if isinstance(payload.get("options"), dict) else {}
     log.info(
         "[committee] ollama.call.start trace_id=%s base=%s model=%s stream=%s options=%s prompt_chars=%d",
-        trace_key,
+        trace_id,
         base_url,
         model,
         bool(payload.get("stream", False)),
@@ -148,15 +151,15 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str) -> 
 
     async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
         # Log full prompt and model for complete visibility.
-        log.info("[committee] ollama.request base=%s model=%s trace_id=%s prompt=%s", base_url, model, trace_key, prompt)
+        log.info("[committee] ollama.request base=%s model=%s trace_id=%s prompt=%s", base_url, model, trace_id, prompt)
 
         # Trace request (keep it lean; logging carries the huge bits).
         emit_trace(
             STATE_DIR,
-            trace_key,
+            trace_id,
             "committee.ollama.request",
             {
-                "trace_id": trace_key,
+                "trace_id": trace_id,
                 "base_url": base_url,
                 "model": model,
                 "options": options,
@@ -171,7 +174,7 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str) -> 
             msg = str(exc)
             log.error(
                 "[committee] ollama.connect_error trace_id=%s base=%s model=%s dur_ms=%d error=%s",
-                trace_key,
+                trace_id,
                 base_url,
                 model,
                 int((time.monotonic() - t_http) * 1000.0),
@@ -179,16 +182,16 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str) -> 
             )
             emit_trace(
                 STATE_DIR,
-                trace_key,
+                trace_id,
                 "committee.ollama.connect_error",
-                {"trace_id": trace_key, "base_url": base_url, "error": msg},
+                {"trace_id": trace_id, "base_url": base_url, "error": msg},
             )
             return {"ok": False, "error": {"code": "ollama_connect_error", "message": msg, "base_url": base_url}}
         except Exception as exc:  # pragma: no cover - defensive logging
             msg = str(exc)
             log.error(
                 "[committee] ollama.request_error trace_id=%s base=%s model=%s dur_ms=%d error=%s",
-                trace_key,
+                trace_id,
                 base_url,
                 model,
                 int((time.monotonic() - t_http) * 1000.0),
@@ -197,9 +200,9 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str) -> 
             )
             emit_trace(
                 STATE_DIR,
-                trace_key,
+                trace_id,
                 "committee.ollama.request_error",
-                {"trace_id": trace_key, "base_url": base_url, "error": msg},
+                {"trace_id": trace_id, "base_url": base_url, "error": msg},
             )
             return {"ok": False, "error": {"code": "ollama_request_error", "message": msg, "base_url": base_url}}
 
@@ -209,7 +212,7 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str) -> 
 
         log.info(
             "[committee] ollama.http.response trace_id=%s base=%s model=%s status=%d http_dur_ms=%d raw_chars=%d content_type=%s",
-            trace_key,
+            trace_id,
             base_url,
             model,
             status_code,
@@ -219,7 +222,7 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str) -> 
         )
         log.info(
             "[committee] ollama.http.raw trace_id=%s base=%s model=%s status=%d raw=%s",
-            trace_key,
+            trace_id,
             base_url,
             model,
             status_code,
@@ -235,7 +238,7 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str) -> 
             msg = str(exc)
             log.error(
                 "[committee] ollama.response_parse_error trace_id=%s base=%s model=%s status=%d parse_dur_ms=%d error=%s raw=%s",
-                trace_key,
+                trace_id,
                 base_url,
                 model,
                 status_code,
@@ -246,9 +249,9 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str) -> 
             )
             emit_trace(
                 STATE_DIR,
-                trace_key,
+                trace_id,
                 "committee.ollama.response_parse_error",
-                {"trace_id": trace_key, "base_url": base_url, "status_code": status_code, "error": msg, "raw": raw_text},
+                {"trace_id": trace_id, "base_url": base_url, "status_code": status_code, "error": msg, "raw": raw_text},
             )
             return {
                 "ok": False,
@@ -258,7 +261,7 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str) -> 
         if parser.errors:
             log.warning(
                 "[committee] ollama.parser_errors trace_id=%s base=%s model=%s status=%d last_error=%s errors=%s",
-                trace_key,
+                trace_id,
                 base_url,
                 model,
                 status_code,
@@ -267,7 +270,7 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str) -> 
             )
         log.info(
             "[committee] ollama.parsed trace_id=%s base=%s model=%s status=%d parse_dur_ms=%d keys=%s",
-            trace_key,
+            trace_id,
             base_url,
             model,
             status_code,
@@ -278,13 +281,13 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str) -> 
         if not (200 <= status_code < 300):
             emit_trace(
                 STATE_DIR,
-                trace_key,
+                trace_id,
                 "committee.ollama.http_error",
-                {"trace_id": trace_key, "base_url": base_url, "status_code": status_code, "body": parsed},
+                {"trace_id": trace_id, "base_url": base_url, "status_code": status_code, "body": parsed},
             )
             log.error(
                 "[committee] ollama.http_error trace_id=%s base=%s model=%s status=%d dur_ms=%d body=%s",
-                trace_key,
+                trace_id,
                 base_url,
                 model,
                 status_code,
@@ -313,7 +316,7 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str) -> 
             except Exception as exc:  # pragma: no cover - defensive logging
                 log.warning(
                     "[committee] ollama.bad_prompt_eval_count trace_id=%s value=%r; defaulting to 0",
-                    trace_key,
+                    trace_id,
                     prompt_eval_val,
                     exc_info=True,
                 )
@@ -325,7 +328,7 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str) -> 
             except Exception as exc:  # pragma: no cover - defensive logging
                 log.warning(
                     "[committee] ollama.bad_eval_count trace_id=%s value=%r; defaulting to 0",
-                    trace_key,
+                    trace_id,
                     eval_count_val,
                     exc_info=True,
                 )
@@ -342,14 +345,14 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str) -> 
             "[committee] ollama.response base=%s model=%s trace_id=%s status=%s response=%s usage=%s",
             base_url,
             model,
-            trace_key,
+            trace_id,
             status_code,
             response_str,
             usage,
         )
         log.info(
             "[committee] ollama.call.finish trace_id=%s ok=true dur_ms=%d status=%d response_chars=%d usage=%s",
-            trace_key,
+            trace_id,
             int((time.monotonic() - t_all) * 1000.0),
             status_code,
             len(response_str or ""),
@@ -358,9 +361,9 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str) -> 
 
         emit_trace(
             STATE_DIR,
-            trace_key,
+            trace_id,
             "committee.ollama.response",
-            {"trace_id": trace_key, "status_code": status_code, "usage": usage or {}, "response": data},
+            {"trace_id": trace_id, "status_code": status_code, "usage": usage or {}, "response": data},
         )
         return data
 
@@ -552,7 +555,8 @@ async def committee_ai_text(
     - Callers MUST NOT implement cross-debate by calling this function multiple
       times pretending it's "per member". Per-member calls are internal helpers.
     """
-    trace_key = str(trace_id or "committee")
+    # Use trace_id only (no derived/fallback trace keys). Empty string means "no explicit trace id".
+    trace_id = str(trace_id or "").strip()
     # Defensive: rounds can be str-ish from callers; never raise.
     try:
         _rounds_raw = rounds if rounds is not None else DEFAULT_COMMITTEE_ROUNDS
@@ -586,7 +590,7 @@ async def committee_ai_text(
     t0 = time.monotonic()
     log.info(
         "[committee] run.start trace_id=%s rounds=%d temperature=%s participants=%s messages=%d",
-        trace_key,
+        trace_id,
         int(effective_rounds),
         float(_temp_run),
         member_ids,
@@ -594,10 +598,10 @@ async def committee_ai_text(
     )
     emit_trace(
         STATE_DIR,
-        trace_key,
+        trace_id,
         "committee.start",
         {
-            "trace_id": trace_key,
+            "trace_id": trace_id,
             "rounds": int(effective_rounds),
             "temperature": float(_temp_run),
             "participants": member_ids,
@@ -607,9 +611,9 @@ async def committee_ai_text(
 
     for r in range(effective_rounds):
         # Phase 1: Draft answers
-        log.info("[committee] round.start trace_id=%s round=%d", trace_key, int(r + 1))
+        log.info("[committee] round.start trace_id=%s round=%d", trace_id, int(r + 1))
         for mid in member_ids:
-            log.info("[committee] member_draft.start trace_id=%s round=%d member=%s", trace_key, int(r + 1), mid)
+            log.info("[committee] member_draft.start trace_id=%s round=%d member=%s", trace_id, int(r + 1), mid)
             draft_lines = [
                 f"You are committee member {mid}. Provide your best answer to the user.",
                 "All content must be written in English only. Do NOT respond in any other language.",
@@ -617,11 +621,11 @@ async def committee_ai_text(
             member_msgs = list(messages or []) + [{"role": "system", "content": "\n\n".join(draft_lines)}]
             emit_trace(
                 STATE_DIR,
-                trace_key,
+                trace_id,
                 "committee.member_draft",
-                {"trace_id": trace_key, "round": int(r + 1), "member": mid},
+                {"trace_id": trace_id, "round": int(r + 1), "member": mid},
             )
-            res = await committee_member_text(mid, member_msgs, trace_id=trace_key, temperature=_temp_run)
+            res = await committee_member_text(mid, member_msgs, trace_id=trace_id, temperature=_temp_run)
             member_results[mid] = res if isinstance(res, dict) else {}
             txt = ""
             if isinstance(res, dict) and res.get("ok") is not False:
@@ -629,7 +633,7 @@ async def committee_ai_text(
             answers[mid] = txt
             log.info(
                 "[committee] member_draft.finish trace_id=%s round=%d member=%s ok=%s answer_chars=%d has_error=%s",
-                trace_key,
+                trace_id,
                 int(r + 1),
                 mid,
                 bool(isinstance(res, dict) and res.get("ok", True)),
@@ -640,13 +644,13 @@ async def committee_ai_text(
         # Phase 2: Cross-critique
         log.info(
             "[committee] round.critique.start trace_id=%s round=%d answers_chars=%s",
-            trace_key,
+            trace_id,
             int(r + 1),
             {mid: len(answers.get(mid) or "") for mid in member_ids},
         )
         critiques = {}
         for mid in member_ids:
-            log.info("[committee] member_critique.start trace_id=%s round=%d member=%s", trace_key, int(r + 1), mid)
+            log.info("[committee] member_critique.start trace_id=%s round=%d member=%s", trace_id, int(r + 1), mid)
             other_blocks: List[str] = []
             for oid in member_ids:
                 if oid == mid:
@@ -665,11 +669,11 @@ async def committee_ai_text(
             member_msgs = list(messages or []) + [{"role": "system", "content": "\n\n".join(critique_lines)}]
             emit_trace(
                 STATE_DIR,
-                trace_key,
+                trace_id,
                 "committee.member_critique",
-                {"trace_id": trace_key, "round": int(r + 1), "member": mid},
+                {"trace_id": trace_id, "round": int(r + 1), "member": mid},
             )
-            res = await committee_member_text(mid, member_msgs, trace_id=trace_key, temperature=_temp_run)
+            res = await committee_member_text(mid, member_msgs, trace_id=trace_id, temperature=_temp_run)
             critique_results[mid] = res if isinstance(res, dict) else {}
             crit_txt = ""
             if isinstance(res, dict) and res.get("ok") is not False:
@@ -677,7 +681,7 @@ async def committee_ai_text(
             critiques[mid] = crit_txt
             log.info(
                 "[committee] member_critique.finish trace_id=%s round=%d member=%s ok=%s critique_chars=%d has_error=%s others_count=%d",
-                trace_key,
+                trace_id,
                 int(r + 1),
                 mid,
                 bool(isinstance(res, dict) and res.get("ok", True)),
@@ -689,12 +693,12 @@ async def committee_ai_text(
         # Phase 3: Revision
         log.info(
             "[committee] round.revision.start trace_id=%s round=%d critiques_chars=%s",
-            trace_key,
+            trace_id,
             int(r + 1),
             {mid: len(critiques.get(mid) or "") for mid in member_ids},
         )
         for mid in member_ids:
-            log.info("[committee] member_revision.start trace_id=%s round=%d member=%s", trace_key, int(r + 1), mid)
+            log.info("[committee] member_revision.start trace_id=%s round=%d member=%s", trace_id, int(r + 1), mid)
             ctx_lines: List[str] = [
                 f"You are committee member {mid}. This is revision for debate round {r + 1}.",
                 "Revise your answer using the critiques. Output ONLY your full final answer.",
@@ -719,11 +723,11 @@ async def committee_ai_text(
             member_msgs = list(messages or []) + [{"role": "system", "content": "\n\n".join(ctx_lines)}]
             emit_trace(
                 STATE_DIR,
-                trace_key,
+                trace_id,
                 "committee.member_revision",
-                {"trace_id": trace_key, "round": int(r + 1), "member": mid},
+                {"trace_id": trace_id, "round": int(r + 1), "member": mid},
             )
-            res = await committee_member_text(mid, member_msgs, trace_id=trace_key, temperature=_temp_run)
+            res = await committee_member_text(mid, member_msgs, trace_id=trace_id, temperature=_temp_run)
             member_results[mid] = res if isinstance(res, dict) else {}
             txt = ""
             if isinstance(res, dict) and res.get("ok") is not False:
@@ -731,7 +735,7 @@ async def committee_ai_text(
             answers[mid] = txt
             log.info(
                 "[committee] member_revision.finish trace_id=%s round=%d member=%s ok=%s answer_chars=%d has_error=%s",
-                trace_key,
+                trace_id,
                 int(r + 1),
                 mid,
                 bool(isinstance(res, dict) and res.get("ok", True)),
@@ -745,7 +749,7 @@ async def committee_ai_text(
     # Deterministic synthesis (single member)
     log.info(
         "[committee] synth.build trace_id=%s answers_chars=%s critiques_present=%s",
-        trace_key,
+        trace_id,
         {mid: len(answers.get(mid) or "") for mid in member_ids},
         bool(any((critiques.get(mid) or "").strip() for mid in member_ids)),
     )
@@ -768,18 +772,18 @@ async def committee_ai_text(
 
     emit_trace(
         STATE_DIR,
-        trace_key,
+        trace_id,
         "committee.synth.request",
-        {"trace_id": trace_key, "synth_member": "qwen"},
+        {"trace_id": trace_id, "synth_member": "qwen"},
     )
     t_synth = time.monotonic()
-    synth_env = await committee_synth_text(synth_messages, trace_id=f"{trace_key}.synth", temperature=0.0, synth_member="qwen")
+    synth_env = await committee_synth_text(synth_messages, trace_id=f"{trace_id}.synth", temperature=0.0, synth_member="qwen")
     synth_text = ""
     if isinstance(synth_env, dict) and synth_env.get("ok") is not False:
         synth_text = str(synth_env.get("response") or "").strip()
     log.info(
         "[committee] synth.finish trace_id=%s ok=%s dur_ms=%d synth_chars=%d has_error=%s",
-        trace_key,
+        trace_id,
         bool(isinstance(synth_env, dict) and synth_env.get("ok", True)),
         int((time.monotonic() - t_synth) * 1000.0),
         len(synth_text),
@@ -803,7 +807,7 @@ async def committee_ai_text(
             final_text = (answers.get(best_mid) or "").strip()
             log.warning(
                 "[committee] synth.fallback trace_id=%s chosen_member=%s chosen_chars=%d",
-                trace_key,
+                trace_id,
                 str(best_mid),
                 len(final_text),
             )
@@ -819,13 +823,13 @@ async def committee_ai_text(
 
     emit_trace(
         STATE_DIR,
-        trace_key,
+        trace_id,
         "committee.finish",
-        {"trace_id": trace_key, "ok": ok, "final_text": final_text, "members": member_summaries, "critiques": critique_summaries},
+        {"trace_id": trace_id, "ok": ok, "final_text": final_text, "members": member_summaries, "critiques": critique_summaries},
     )
     log.info(
         "[committee] run.finish trace_id=%s ok=%s dur_ms=%d final_chars=%d backend_errors=%s",
-        trace_key,
+        trace_id,
         ok,
         int((time.monotonic() - t0) * 1000.0),
         len(final_text or ""),
@@ -843,7 +847,7 @@ async def committee_ai_text(
         }
         log.error(
             "[committee] no_answer trace_id=%s backend_errors=%s members=%s",
-            trace_key,
+            trace_id,
             backend_errors,
             members_status,
         )
@@ -861,7 +865,7 @@ async def committee_ai_text(
 
     return {
         "schema_version": 1,
-        "trace_id": trace_id or "committee",
+        "trace_id": trace_id,
         "ok": ok,
         "result": result_payload if ok else None,
         "error": None

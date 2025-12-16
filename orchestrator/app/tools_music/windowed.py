@@ -11,9 +11,8 @@ from ..music.style_pack import style_score_for_track  # type: ignore
 from ..music.eval import compute_music_eval  # type: ignore
 from ..artifacts.manifest import add_manifest_row
 from ..context.index import add_artifact as _ctx_add
-from ..datasets.trace import append_sample as _trace_append
-from ..jsonio.normalize import normalize_to_envelope, normalize_envelope
-from ..jsonio.versioning import bump_envelope, assert_envelope
+from ..tracing.training import append_training_sample
+from void_envelopes import normalize_to_envelope, normalize_envelope, bump_envelope, assert_envelope
 
 
 log = logging.getLogger(__name__)
@@ -68,10 +67,9 @@ async def _eval_window_clip(
     win["eval"] = eval_out
     win["quality_score"] = overall.get("overall_quality_score")
     win["fit_score"] = overall.get("fit_score")
-    _trace_append(
+    append_training_sample(
         "music",
         {
-            "event": "music.window.eval",
             "cid": cid,
             "tool": "music.infinite.windowed",
             "window_id": win.get("window_id"),
@@ -1020,10 +1018,9 @@ async def run_music_infinite_windowed(job: Dict[str, Any], provider, manifest: D
         # dataset logging can reuse it without re-running CLAP.
         locks_meta["style_score"] = style_score
 
-    _trace_append(
+    append_training_sample(
         "music",
         {
-            "event": "music.infinite.windowed",
             "cid": cid,
             "tool": "music.infinite.windowed",
             "mode": mode,

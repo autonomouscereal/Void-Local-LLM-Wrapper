@@ -23,7 +23,7 @@ from .continuation import state_hash_from
 from ..rag.hygiene import rag_filter, evidence_binding_footer
 from ..artifacts.shard import newest_part, list_parts
 
-log = logging.getLogger("orchestrator.icw.assembler")
+log = logging.getLogger(__name__)
 
 
 def render_header(entity_header: str) -> str:

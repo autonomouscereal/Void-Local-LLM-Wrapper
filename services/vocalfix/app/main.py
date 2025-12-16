@@ -28,10 +28,10 @@ try:
         ],
         force=True,
     )
-    logging.getLogger("vocalfix.logging").info("vocalfix logging configured file=%r level=%s", _log_file, logging.getLevelName(_lvl))
+    logging.getLogger(__name__).info("vocalfix logging configured file=%r level=%s", _log_file, logging.getLevelName(_lvl))
 except Exception as _ex:
     logging.basicConfig(level=logging.INFO, stream=sys.stdout, format="%(levelname)s:%(name)s:%(message)s")
-    logging.getLogger("vocalfix.logging").warning("vocalfix file logging disabled: %s", _ex, exc_info=True)
+    logging.getLogger(__name__).warning("vocalfix file logging disabled: %s", _ex, exc_info=True)
 
 try:
     import crepe  # type: ignore

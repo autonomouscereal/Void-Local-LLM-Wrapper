@@ -21,7 +21,7 @@ import httpx
 
 
 router = APIRouter()
-log = logging.getLogger("orchestrator.toolrun")
+log = logging.getLogger(__name__)
 
 
 def _ok_response(result: dict | None, rid: str) -> JSONResponse:

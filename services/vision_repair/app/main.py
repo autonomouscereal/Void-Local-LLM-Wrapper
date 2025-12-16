@@ -36,10 +36,10 @@ try:
         ],
         force=True,
     )
-    logging.getLogger("vision_repair.logging").info("vision_repair logging configured file=%r level=%s", _log_file, logging.getLevelName(_lvl))
+    logging.getLogger(__name__).info("vision_repair logging configured file=%r level=%s", _log_file, logging.getLevelName(_lvl))
 except Exception as _ex:
     logging.basicConfig(level=logging.INFO, stream=sys.stdout)
-    logging.getLogger("vision_repair.logging").warning("vision_repair file logging disabled: %s", _ex, exc_info=True)
+    logging.getLogger(__name__).warning("vision_repair file logging disabled: %s", _ex, exc_info=True)
 
 _detector: Optional[Any] = None
 
@@ -122,7 +122,7 @@ async def image_analyze(body: Dict[str, Any]):
         quality["sharpness"] = float(fm)
     except Exception as exc:
         # Non-fatal; return faces/objects even if quality computation fails.
-        logging.getLogger("vision_repair").debug("quality sharpness compute failed: %s", exc, exc_info=True)
+        logging.getLogger(__name__).debug("quality sharpness compute failed: %s", exc, exc_info=True)
         quality["sharpness"] = None
     return {
         "faces": faces,

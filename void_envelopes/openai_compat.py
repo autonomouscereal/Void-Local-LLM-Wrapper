@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import time
-from typing import List, Dict, Any
 import re
+import time
+from typing import Any, Dict, List
 
 
 _TAG_RE = re.compile(r"</?(CONT|HALT)\b[^>]*>", re.I)
@@ -75,5 +75,42 @@ def merge_envelopes(step_envs: List[Dict[str, Any]]) -> Dict[str, Any]:
     final.setdefault("reasoning", {})
     final["reasoning"]["decisions"] = decs[-50:]
     return final
+
+
+def build_openai_envelope(
+    *,
+    ok: bool,
+    text: str,
+    error: Dict[str, Any] | None,
+    usage: Dict[str, Any],
+    model: str,
+    seed: int,
+    id_: str,
+) -> Dict[str, Any]:
+    """
+    Canonical OpenAI-style chat.completion envelope builder.
+
+    Used by orchestrator endpoints that expose OpenAI-compatible responses on
+    top of the internal assistant envelope / committee pipeline.
+    """
+    env: Dict[str, Any] = {
+        "id": id_ or "orc-1",
+        "object": "chat.completion",
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": (text or "(no content)")},
+            }
+        ],
+        "usage": usage,
+        "ok": bool(ok),
+        "error": (error or None),
+        "seed": seed,
+    }
+    # cid/trace_id are injected by orchestrator callers (e.g., finalize_response)
+    # via an out-of-band _meta block to keep the OpenAI schema surface stable.
+    return env
 
 

@@ -29,14 +29,14 @@ try:
         ],
         force=True,
     )
-    logging.getLogger("comfyui_init.logging").info(
+    logging.getLogger(__name__).info(
         "comfyui_init logging configured file=%r level=%s", _log_file, logging.getLevelName(_lvl)
     )
 except Exception as _ex:
     logging.basicConfig(level=logging.INFO, stream=sys.stdout)
-    logging.getLogger("comfyui_init.logging").warning("comfyui_init file logging disabled: %s", _ex, exc_info=True)
+    logging.getLogger(__name__).warning("comfyui_init file logging disabled: %s", _ex, exc_info=True)
 
-log = logging.getLogger("comfyui_init")
+log = logging.getLogger(__name__)
 
 
 def ensure_dir(path: str) -> None:

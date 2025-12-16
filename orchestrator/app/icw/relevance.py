@@ -4,7 +4,7 @@ import logging
 import math
 import re
 
-log = logging.getLogger("orchestrator.icw")
+log = logging.getLogger(__name__)
 
 
 def score_chunk(chunk_text: str, query_text: str) -> float:

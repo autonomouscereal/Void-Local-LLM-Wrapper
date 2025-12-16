@@ -30,10 +30,10 @@ try:
         ],
         force=True,
     )
-    logging.getLogger("sfx.logging").info("sfx logging configured file=%r level=%s", _log_file, logging.getLevelName(_lvl))
+    logging.getLogger(__name__).info("sfx logging configured file=%r level=%s", _log_file, logging.getLevelName(_lvl))
 except Exception as _ex:
     logging.basicConfig(level=logging.INFO, stream=sys.stdout)
-    logging.getLogger("sfx.logging").warning("sfx file logging disabled: %s", _ex, exc_info=True)
+    logging.getLogger(__name__).warning("sfx file logging disabled: %s", _ex, exc_info=True)
 
 
 @app.get("/healthz")

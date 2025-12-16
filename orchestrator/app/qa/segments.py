@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional, Tuple, Callable
 import logging
 
 from ..json_parser import JSONParser
-from ..datasets.trace import append_sample as _trace_append
+from ..tracing.runtime import trace_event
 from ..locks.runtime import quality_thresholds as _lock_quality_thresholds
 from ..pipeline.assets import (
     compute_domain_qa,
@@ -917,10 +917,10 @@ async def apply_patch_plan(
                             row["artifact_path"] = artifact_path
                         if artifact_view is not None:
                             row["artifact_view_url"] = artifact_view
-                        _trace_append("segments", row)
+                        trace_event("qa.segments.refine", row)
                 except Exception:
                     # Tracing must not break patch execution
-                    log.debug("qa.segments: failed to append refine trace row (non-fatal)", exc_info=True)
+                    log.debug("qa.segments: failed to emit refine trace row (non-fatal)", exc_info=True)
     return updated_segments, patch_results
 
 

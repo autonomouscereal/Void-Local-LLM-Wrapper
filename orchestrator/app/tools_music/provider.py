@@ -7,6 +7,9 @@ from typing import Any, Dict
 import httpx  # type: ignore
 import logging
 
+# Single logger per module (no custom logger names)
+log = logging.getLogger(__name__)
+
 
 class RestMusicProvider:
     """
@@ -46,7 +49,6 @@ class RestMusicProvider:
         self._base = (base_url or os.getenv("MUSIC_API_URL") or "").rstrip("/")
 
     def compose(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        log = logging.getLogger("orchestrator.tools_music.provider")
         if not self._base:
             # Never raise from tool providers; return empty audio with a structured error.
             try:

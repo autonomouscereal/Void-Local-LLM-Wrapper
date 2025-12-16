@@ -39,11 +39,11 @@ try:
         ],
         force=True,
     )
-    logger = logging.getLogger("music")
+    logger = logging.getLogger(__name__)
     logger.info("music logging configured file=%r level=%s", _log_file, logging.getLevelName(_lvl))
 except Exception as _ex:
     logging.basicConfig(level=logging.INFO, stream=sys.stdout)
-    logger = logging.getLogger("music")
+    logger = logging.getLogger(__name__)
     logger.warning("music file logging disabled: %s", _ex, exc_info=True)
 
 

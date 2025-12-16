@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 
-log = logging.getLogger("orchestrator.icw.reframe")
+log = logging.getLogger(__name__)
 
 
 def _as_str_list(value) -> list[str]:

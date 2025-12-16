@@ -12,6 +12,9 @@ from ..json_parser import JSONParser
 from ..tools import emit_progress
 from void_envelopes import _build_success_envelope, _build_error_envelope
 
+# Single logger per module (no custom logger names)
+log = logging.getLogger(__name__)
+
 
 class _TTSProvider:
     """
@@ -25,7 +28,6 @@ class _TTSProvider:
         self._base_url = url.rstrip("/") if isinstance(url, str) else ""
 
     def speak(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        log = logging.getLogger("orchestrator.tools_tts.provider")
         trace_id = payload.get("trace_id") if isinstance(payload.get("trace_id"), str) else "tt_xtts_unknown"
         request_id = payload.get("request_id") if isinstance(payload.get("request_id"), str) and payload.get("request_id") else None
         rid = request_id or uuid.uuid4().hex

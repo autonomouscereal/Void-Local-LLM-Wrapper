@@ -4,7 +4,7 @@ import logging
 import re
 import hashlib
 
-log = logging.getLogger("orchestrator.icw.continuation")
+log = logging.getLogger(__name__)
 
 
 # Accept vendor variations and stray whitespace/newlines

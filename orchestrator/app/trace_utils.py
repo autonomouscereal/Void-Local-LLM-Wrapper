@@ -38,18 +38,18 @@ class TraceEmitter:
             return "memory"
         return "orchestrator"
 
-    def emit(self, trace_key: str, kind: str, payload: Dict[str, Any]) -> None:
+    def emit(self, trace_id: str, kind: str, payload: Dict[str, Any]) -> None:
         data = dict(payload or {})
         data.setdefault("domain", self.infer_domain(kind, data))
-        checkpoints_append_event(self.state_dir, str(trace_key), kind, data)
+        checkpoints_append_event(self.state_dir, str(trace_id), kind, data)
 
 
 def infer_domain(kind: str, payload: Dict[str, Any] | None = None) -> str:
     return TraceEmitter.infer_domain(kind, payload)
 
 
-def emit_trace(state_dir: str, trace_key: str, kind: str, payload: Dict[str, Any]) -> None:
-    TraceEmitter(state_dir).emit(trace_key, kind, payload or {})
+def emit_trace(state_dir: str, trace_id: str, kind: str, payload: Dict[str, Any]) -> None:
+    TraceEmitter(state_dir).emit(trace_id, kind, payload or {})
 
 
 def append_jsonl_compat(state_dir: str, path: str, obj: Dict[str, Any]) -> None:

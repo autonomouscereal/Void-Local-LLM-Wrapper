@@ -53,10 +53,10 @@ try:
         ],
         force=True,
     )
-    logging.getLogger("icw.logging").info("icw logging configured file=%r level=%s", _log_file, logging.getLevelName(_lvl))
+    logging.getLogger(__name__).info("icw logging configured file=%r level=%s", _log_file, logging.getLevelName(_lvl))
 except Exception as _ex:
     logging.basicConfig(level=logging.INFO, stream=sys.stdout)
-    logging.getLogger("icw.logging").warning("icw file logging disabled: %s", _ex, exc_info=True)
+    logging.getLogger(__name__).warning("icw file logging disabled: %s", _ex, exc_info=True)
 
 
 # -------------------- Utilities --------------------
@@ -659,7 +659,7 @@ async def context_pack(body: Dict[str, Any]):
     except Exception as exc:
         # Non-fatal; if citation parsing fails we proceed (citations are a UI feature),
         # but we must not be silent.
-        logging.getLogger("icw").warning("citation validation failed (non-fatal): %s", exc, exc_info=True)
+        logging.getLogger(__name__).warning("citation validation failed (non-fatal): %s", exc, exc_info=True)
     if not evidence:
         return JSONResponse(status_code=409, content={
             "run_id": run_id,

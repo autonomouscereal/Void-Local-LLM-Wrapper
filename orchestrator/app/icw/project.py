@@ -6,7 +6,7 @@ import os
 import hashlib
 from typing import Any, Dict
 
-log = logging.getLogger("orchestrator.icw.project")
+log = logging.getLogger(__name__)
 
 FILM2_DATA_DIR = os.getenv("FILM2_DATA", "/srv/film2")
 

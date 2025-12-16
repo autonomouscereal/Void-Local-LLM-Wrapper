@@ -50,11 +50,11 @@ try:
         ],
         force=True,
     )
-    logging.getLogger("executor.logging").info("executor logging configured file=%r level=%s", _log_file, logging.getLevelName(_lvl))
+    logging.getLogger(__name__).info("executor logging configured file=%r level=%s", _log_file, logging.getLevelName(_lvl))
 except Exception as _ex:
     logging.basicConfig(level=logging.INFO, stream=sys.stdout)
-    logging.getLogger("executor.logging").warning("executor file logging disabled: %s", _ex, exc_info=True)
-log = logging.getLogger("executor")
+    logging.getLogger(__name__).warning("executor file logging disabled: %s", _ex, exc_info=True)
+log = logging.getLogger(__name__)
 
 
 def _stack_str() -> str:

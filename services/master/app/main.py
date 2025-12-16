@@ -27,10 +27,10 @@ try:
         ],
         force=True,
     )
-    logging.getLogger("master.logging").info("master logging configured file=%r level=%s", _log_file, logging.getLevelName(_lvl))
+    logging.getLogger(__name__).info("master logging configured file=%r level=%s", _log_file, logging.getLevelName(_lvl))
 except Exception as _ex:
     logging.basicConfig(level=logging.INFO, stream=sys.stdout, format="%(levelname)s:%(name)s:%(message)s")
-    logging.getLogger("master.logging").warning("master file logging disabled: %s", _ex, exc_info=True)
+    logging.getLogger(__name__).warning("master file logging disabled: %s", _ex, exc_info=True)
 
 
 def lufs(y: np.ndarray, sr: int) -> float:

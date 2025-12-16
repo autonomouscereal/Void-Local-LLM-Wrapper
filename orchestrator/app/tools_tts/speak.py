@@ -12,15 +12,14 @@ from .common import now_ts, ensure_dir, tts_edge_defaults, sidecar, stamp_env
 from ..locks import voice_embedding_from_path, tts_get_global, tts_get_voices
 from ..determinism.seeds import stamp_tool_args
 from ..artifacts.manifest import add_manifest_row
-from ..jsonio.normalize import normalize_to_envelope
-from ..jsonio.versioning import bump_envelope, assert_envelope
+from void_envelopes import normalize_to_envelope, bump_envelope, assert_envelope
 from ..refs.voice import resolve_voice_lock, resolve_voice_identity
 from ..refs.registry import append_provenance
 from .export import append_tts_sample
 from ..context.index import add_artifact as _ctx_add
 from ..context.index import list_recent as _ctx_list
 from ..analysis.media import analyze_audio, normalize_lufs, cosine_similarity
-from ..datasets.trace import append_sample as _trace_append
+from ..tracing.training import append_training_sample
 import httpx  # type: ignore
 
 
@@ -833,7 +832,7 @@ async def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
         }
         if locks_meta:
             trace_row["locks"] = locks_meta
-        _trace_append("tts", trace_row)
+        append_training_sample("tts", trace_row)
     except Exception:
         log.debug("tts.speak: trace append failed (non-fatal) cid=%s", cid, exc_info=True)
     return env

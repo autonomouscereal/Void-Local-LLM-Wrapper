@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
+import logging
 import json
 import os
 import traceback
@@ -9,6 +10,8 @@ from ..analysis.media import analyze_audio, _load_audio  # type: ignore
 from ..json_parser import JSONParser
 from ..committee_client import committee_jsonify  # type: ignore
 from .style_pack import _embed_music_clap, _cos_sim, MusicEvalError
+
+log = logging.getLogger(__name__)
 
 
 MUSIC_HERO_QUALITY_MIN = 0.85
@@ -364,9 +367,7 @@ async def _call_music_eval_committee(summary: str) -> Dict[str, Any]:
         if not isinstance(env, dict) or not env.get("ok"):
             # Committee-level failure: log and return a minimal, explicit error payload
             # instead of silently falling back to an empty dict.
-            logging.getLogger("orchestrator.music.eval").error(
-                "music_eval committee failed: env=%r", env
-            )
+            log.error("music_eval committee failed: env=%r", env)
             err = (env or {}).get("error") if isinstance(env, dict) else {
                 "code": "music_eval_env_invalid",
                 "message": str(env),

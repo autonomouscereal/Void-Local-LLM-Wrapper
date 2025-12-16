@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple, Callable, Awaitable
 
-from ..datasets.trace import append_sample as _trace_append
+from ..tracing.runtime import trace_event
 
 
 def draft_story_graph(user_prompt: str, duration_hint_s: Optional[float]) -> Dict[str, Any]:
@@ -354,10 +354,10 @@ async def ensure_tts_locks_and_dialogue_audio(
             dur = meta_audio.get("full_duration_s")
             if isinstance(dur, (int, float)):
                 entry["duration_s"] = float(dur)
-            _trace_append(
-                "film2",
+            trace_event(
+                "film2.tts_dialogue_generated",
                 {
-                    "event": "tts_dialogue_generated",
+                    "trace_id": trace_id,
                     "line_id": line_id,
                     "char_id": speaker,
                     "text": (text[:128] if isinstance(text, str) else ""),
@@ -368,10 +368,10 @@ async def ensure_tts_locks_and_dialogue_audio(
             )
         elif isinstance(res, Dict) and res.get("error") is not None:
             entry["error"] = str(res.get("error"))
-            _trace_append(
-                "film2",
+            trace_event(
+                "film2.tts_dialogue_failed",
                 {
-                    "event": "tts_dialogue_failed",
+                    "trace_id": trace_id,
                     "line_id": line_id,
                     "char_id": speaker,
                     "error": str(res.get("error")),

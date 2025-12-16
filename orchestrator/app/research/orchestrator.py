@@ -18,7 +18,7 @@ from .report import make_report
 from ..jobs.state import create_job, set_state, get_job
 from ..jobs.progress import event as progress_event
 from ..jobs.partials import emit_partial
-from ..datasets.trace import append_sample as _trace_append
+from ..tracing.runtime import trace_event
 
 log = logging.getLogger(__name__)
 
@@ -160,9 +160,18 @@ async def run_research(job: Dict[str, Any]) -> Dict[str, Any]:
         sources = []
         summary_text = ""
     try:
-        _trace_append("research", {"cid": cid, "query": q, "summary": summary_text, "sources": sources, "artifacts": manifest.get("items", [])})
+        trace_event(
+            "research.summary",
+            {
+                "cid": cid,
+                "query": q,
+                "summary": summary_text,
+                "sources": sources,
+                "artifacts": manifest.get("items", []),
+            },
+        )
     except Exception as exc:
-        log.debug("research.run: trace append failed (non-fatal) cid=%s: %s", cid, exc, exc_info=True)
+        log.debug("research.run: runtime trace emit failed (non-fatal) cid=%s: %s", cid, exc, exc_info=True)
     return {"phase": "done", "artifacts": manifest.get("items", []), "cid": cid, "report": report, "summary_text": summary_text, "sources": sources}
 
 

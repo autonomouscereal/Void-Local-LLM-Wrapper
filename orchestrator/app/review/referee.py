@@ -11,6 +11,8 @@ from ..tools_schema import get_builtin_tools_schema
 from ..committee_client import committee_ai_text, committee_jsonify, STATE_DIR
 from ..trace_utils import emit_trace
 
+log = logging.getLogger(__name__)
+
 
 def build_delta_plan(scores: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -227,7 +229,7 @@ async def postrun_committee_decide(
             "code": "committee_postrun_invalid_env",
             "message": str(env_decide),
         }
-        logging.getLogger("orchestrator.committee.postrun").error(
+        log.error(
             "postrun_committee_decide failed (trace_id=%s): env=%r error=%r",
             str(trace_id or "committee_postrun"),
             env_decide,

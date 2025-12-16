@@ -8,7 +8,7 @@ import uuid as _uuid
 import traceback
 from ..json_parser import JSONParser
 
-log = logging.getLogger("orchestrator.executor_gateway")
+log = logging.getLogger(__name__)
 
 
 async def execute(

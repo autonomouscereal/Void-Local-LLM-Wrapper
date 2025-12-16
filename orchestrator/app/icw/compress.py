@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import re
 
-log = logging.getLogger("orchestrator.icw.compress")
+log = logging.getLogger(__name__)
 
 
 def _coerce_text(value) -> str:

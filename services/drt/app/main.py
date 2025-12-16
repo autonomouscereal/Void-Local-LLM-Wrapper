@@ -54,10 +54,10 @@ try:
         ],
         force=True,
     )
-    logging.getLogger("drt.logging").info("drt logging configured file=%r level=%s", _log_file, logging.getLevelName(_lvl))
+    logging.getLogger(__name__).info("drt logging configured file=%r level=%s", _log_file, logging.getLevelName(_lvl))
 except Exception as _ex:
     logging.basicConfig(level=logging.INFO, stream=sys.stdout)
-    logging.getLogger("drt.logging").warning("drt file logging disabled: %s", _ex, exc_info=True)
+    logging.getLogger(__name__).warning("drt file logging disabled: %s", _ex, exc_info=True)
 
 
 app = FastAPI(title="Deep Research Tool", version=DRT_VERSION)

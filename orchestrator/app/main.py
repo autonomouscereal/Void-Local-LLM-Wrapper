@@ -102,32 +102,26 @@ from tenacity import retry, stop_after_attempt, wait_exponential  # type: ignore
 from fastapi.middleware.cors import CORSMiddleware  # type: ignore
 from .json_parser import JSONParser
 from .determinism import seed_router as det_seed_router, seed_tool as det_seed_tool, round6 as det_round6
-# NOTE: icw.windowed_solver.solve is async; keep the import name stable in case call sites are reintroduced.
-from .icw.windowed_solver import solve as windowed_solve
-from .icw.assembler import assemble_window
-from .icw.continuation import state_hash_from as icw_state_hash_from
-from .icw.tokenizer import byte_budget_for_model as icw_byte_budget_for_model
-from .jsonio.normalize import normalize_to_envelope
+from void_envelopes import normalize_to_envelope
 from .search.meta import rrf_fuse as _rrf_fuse
 from .tools.progress import emit_progress, set_progress_queue, get_progress_queue
 from .tools.mcp_bridge import call_mcp_tool as _call_mcp_tool
 from .state.checkpoints import append_event as checkpoints_append_event
 from .trace_utils import emit_trace, append_jsonl_compat
 from .omni.context import build_omni_context
-from .jsonio.stitch import merge_envelopes as stitch_merge_envelopes, stitch_openai as stitch_openai_final
+from void_envelopes import merge_envelopes as stitch_merge_envelopes, stitch_openai as stitch_openai_final
 from .router.route import route_for_request
 from .rag.core import get_embedder as _rag_get_embedder
 from .ablation.core import ablate as ablate_env
 from .ablation.export import write_facts_jsonl as ablate_write_facts
 from .code_loop.super_loop import run_super_loop
 from .state.checkpoints import append_event as _append_event
-from .state.lock import acquire_lock as _acquire_lock, release_lock as _release_lock
 # manifest helpers imported below as _art_manifest_add/_art_manifest_write
 from .state.ids import step_id as _step_id
 from .research.orchestrator import run_research
 from .jobs.state import get_job as _get_orcjob, request_cancel as _orcjob_cancel
-from .jsonio.versioning import bump_envelope as _env_bump, assert_envelope as _env_assert
-from .jsonio.openai_env import build_openai_envelope as _build_openai_envelope
+from void_envelopes import bump_envelope as _env_bump, assert_envelope as _env_assert
+from void_envelopes import build_openai_envelope as _build_openai_envelope
 from .determinism.seeds import stamp_envelope as _env_stamp, stamp_tool_args as _tool_stamp
 from .refs.api import (
     post_refs_save as _refs_save,
@@ -166,7 +160,7 @@ from .context.index import add_artifact as _ctx_add
 from .artifacts.shard import open_shard as _art_open_shard, append_jsonl as _art_append_jsonl, _finalize_shard as _art_finalize
 from .artifacts.shard import newest_part as _art_newest_part, list_parts as _art_list_parts
 from .artifacts.manifest import add_manifest_row as _art_manifest_add, write_manifest_atomic as _art_manifest_write
-from .datasets.trace import append_sample as _trace_append
+from .tracing.runtime import trace_event as trace_append
 from .embeddings.core import build_embeddings_response as _build_embeddings_response
 from .traces.writer import (
     log_request as _trace_log_request,
@@ -272,9 +266,6 @@ from .story import (
     derive_scenes_and_shots as _story_derive,
     ensure_tts_locks_and_dialogue_audio as _story_ensure_tts_locks_and_dialogue_audio,
 )
-from .pipeline.subject_resolver import resolve_subject_canon as _resolve_subject_canon  # type: ignore
-from .pipeline.roe_store import load_roe_digest as _roe_load, save_roe_digest as _roe_save  # type: ignore
-from .pipeline.tool_evidence_store import load_recent_tool_evidence as _tel_load, append_tool_evidence as _tel_append  # type: ignore
 from .http.client import HttpRequestConfig, perform_http_request, validate_remote_host  # type: ignore
 # Lightweight tool kind overlay for planner mode (reuses existing catalog/builtins)
 # Treat all tools as analysis by default; explicitly tag action/asset-creating tools.
@@ -360,28 +351,20 @@ def _configure_logging() -> str:
         force=True,
     )
 
-    # Uvicorn installs its own handlers/formatters. basicConfig(force=True) only affects root,
-    # so we must explicitly normalize uvicorn loggers to avoid duplicates and ensure file logging.
-    for _name in ("uvicorn", "uvicorn.error", "uvicorn.access", "fastapi"):
-        _lg = logging.getLogger(_name)
-        try:
-            _lg.handlers.clear()
-        except Exception:
-            _lg.handlers = []
-        _lg.propagate = True
-        _lg.setLevel(_level)
-
-    logging.getLogger("orchestrator.logging").debug("logging configured level=%s file=%r", LOG_LEVEL, _log_file)
+    
+    logging.getLogger(__name__).debug("logging configured level=%s file=%r", LOG_LEVEL, _log_file)
     return _log_file
 
 
 # Hard logging: stdout + file, always configured at import.
 LOG_LEVEL = "DEBUG"
 ORCH_LOG_FILE = _configure_logging()
+# Single logger per module (no custom logger names)
+log = logging.getLogger(__name__)
 
 def _log(event: str, **fields: Any) -> None:
     # Hard logging: only debug.
-    logging.debug(f"{event} " + json.dumps(fields, ensure_ascii=False, default=str))
+    log.debug(f"{event} " + json.dumps(fields, ensure_ascii=False, default=str))
     # Emit distillation-grade event row when a trace_id is provided
     tr = fields.get("trace_id")
     if isinstance(tr, str) and tr:
@@ -537,14 +520,6 @@ async def segment_qa_and_committee(
     *,
     base_url: str,
     executor_base_url: str,
-    temperature: float,
-    last_user_text: str,
-    tool_catalog_hash: str,
-    planner_callable: Callable[
-        [List[Dict[str, Any]], Optional[List[Dict[str, Any]]], float, Optional[str]],
-        Tuple[str, List[Dict[str, Any]], Dict[str, Any]],
-    ],
-    normalize_fn: Callable[[Any], List[Dict[str, Any]]],
     absolutize_url: Callable[[str], str],
     quality_profile: Optional[str] = None,
     max_refine_passes: int = 1,
@@ -627,8 +602,8 @@ async def segment_qa_and_committee(
             profile_val = seg_meta.get("profile") if isinstance(seg_meta.get("profile"), str) else None
             locks_val = seg.get("locks") if isinstance(seg.get("locks"), dict) else None
             cid_val = seg.get("cid")
-            _trace_append(
-                "segments",
+            trace_append(
+                "qa.segment.qa",
                 {
                     "trace_id": trace_id,
                     "tool": tool_name,
@@ -636,7 +611,6 @@ async def segment_qa_and_committee(
                     "domain": seg.get("domain"),
                     "profile": profile_val,
                     "attempt": attempt,
-                    "event": "qa",
                     "cid": cid_val,
                     "locks": locks_val,
                     "qa_scores": scores,
@@ -780,7 +754,13 @@ async def segment_qa_and_committee(
                         seg_id_to_mode[sid] = mode_val
                 plan_summary["segment_ids"] = list(seg_id_to_mode.keys())
                 plan_summary["refine_modes"] = seg_id_to_mode
-                _trace_append("film2", plan_summary)
+                trace_append(
+                    "film2.clip_refine_plan",
+                    {
+                        "trace_id": trace_id,
+                        **(plan_summary or {}),
+                    },
+                )
         if action != "revise":
             break
         allowed_mode_set = set(_allowed_tools_for_mode(mode))
@@ -869,17 +849,6 @@ async def segment_qa_and_committee(
                 except Exception as ex:
                     logging.warning("patch_exec: bad failure_counts[%s]=%r; resetting to 1", tname, failure_counts.get(tname), exc_info=True)
                     failure_counts[tname] = 1
-                _tel_append(STATE_DIR, trace_id, {
-                    "name": tname,
-                    "ok": False,
-                    "label": "failure",
-                    "raw": {
-                        "ts": None,
-                        "ok": False,
-                        "args": (pr.get("args") if isinstance(pr.get("args"), dict) else {}),
-                        "error": (err_obj if isinstance(err_obj, dict) else {"code": "error", "message": str(err_obj)}),
-                    }
-                })
             else:
                 artifacts_summary: List[Dict[str, Any]] = []
                 arts = result_obj.get("artifacts") if isinstance(result_obj, dict) else None
@@ -894,20 +863,6 @@ async def segment_qa_and_committee(
                 _log("tool.run.after", trace_id=trace_id, tool=tname, artifacts=artifacts_summary, urls_count=len(urls_local or []), attempt=attempt)
                 meta_local = result_obj.get("meta") if isinstance(result_obj, dict) else {}
                 first_url = (urls_local[0] if isinstance(urls_local, list) and urls_local else None)
-                _tel_append(STATE_DIR, trace_id, {
-                    "name": tname,
-                    "ok": True,
-                    "label": "success",
-                    "raw": {
-                        "ts": None,
-                        "ok": True,
-                        "args": (pr.get("args") if isinstance(pr.get("args"), dict) else {}),
-                        "result": {
-                            "meta": (meta_local if isinstance(meta_local, dict) else {}),
-                            "artifact_url": first_url,
-                        }
-                    }
-                })
         if filtered_patch_plan:
             _log("committee.revision.segment", trace_id=trace_id, tool=tool_name, steps=len(filtered_patch_plan), failures=0, attempt=attempt)
         if patch_results:
@@ -964,10 +919,10 @@ async def _generate_scene_storyboards(
                     path_val = first.get("path") or first.get("view_url") or first.get("url")
                     if isinstance(path_val, str) and path_val:
                         storyboard_path = path_val
-                        _trace_append(
-                            "film2",
+                        trace_append(
+                            "film2.scene_storyboard_generated",
                             {
-                                "event": "scene_storyboard_generated",
+                                "trace_id": trace_id,
                                 "scene_id": scene_id,
                                 "image_path": path_val,
                                 "prompt": prompt,
@@ -984,22 +939,7 @@ async def _generate_scene_storyboards(
 def _append_jsonl(path: str, obj: dict) -> None:
     append_jsonl_compat(STATE_DIR, path, obj)
 
-def trace_append(kind: str, obj: Dict[str, Any]) -> None:
-    """
-    Unified trace appender: chooses key from trace_id | tid | cid | 'global'.
-    Also ensures payload includes trace_id for training/debugging consistency.
-    """
-    if not isinstance(obj, dict):
-        obj = {"_raw": obj}
-    # Prefer explicit trace identifiers; fall back to conversation/job ids when present.
-    raw_key = obj.get("trace_id") or obj.get("tid") or obj.get("cid") or "global"
-    key = str(raw_key).strip() if isinstance(raw_key, (str, int)) else "global"
-    if not key:
-        key = "global"
-    # Ensure trace_id is always present in event payload when we have a key.
-    if key != "global" and not (isinstance(obj.get("trace_id"), str) and obj.get("trace_id")):
-        obj["trace_id"] = key
-    emit_trace(STATE_DIR, key, kind, obj)
+## trace_append imported from .tracing.runtime (single runtime tracing API)
 
 def _trace_response(trace_id: str, envelope: Dict[str, Any]) -> None:
     tms = int(time.time() * 1000)
@@ -1024,7 +964,15 @@ def _trace_response(trace_id: str, envelope: Dict[str, Any]) -> None:
     }
     if isinstance(envelope.get("error"), dict):
         out["error"] = envelope.get("error")
-    checkpoints_append_event(STATE_DIR, str(trace_id), "response", out)
+    _log(
+        "response",
+        trace_id=str(trace_id),
+        t=tms,
+        ok=bool(ok_flag),
+        message_len=len(content),
+        assets_count=int(assets_count),
+        error=(envelope.get("error") if isinstance(envelope.get("error"), dict) else None),
+    )
     _trace_log_response(
         STATE_DIR,
         str(trace_id),
@@ -1049,7 +997,7 @@ def _trace_response(trace_id: str, envelope: Dict[str, Any]) -> None:
 # CPU/GPU adaptive mode for ComfyUI graphs
 COMFY_CPU_MODE = (os.getenv("COMFY_CPU_MODE", "").strip().lower() in ("1", "true", "yes", "on"))
 from .db.pool import get_pg_pool
-from .db.tracing import db_insert_run as _db_insert_run, db_update_run_response as _db_update_run_response, db_insert_icw_log as _db_insert_icw_log, db_insert_tool_call as _db_insert_tool_call
+from .db.tracing import db_insert_run as _db_insert_run, db_update_run_response as _db_update_run_response, db_insert_tool_call as _db_insert_tool_call
 
 
 DEFAULT_STEM_BANDS: Dict[str, Tuple[float, float]] = {
@@ -1160,8 +1108,6 @@ ENABLE_N8N = os.getenv("ENABLE_N8N", "false").lower() == "true"
 ASSEMBLER_API_URL = os.getenv("ASSEMBLER_API_URL")  # http://assembler:9095
 TEACHER_API_URL = os.getenv("TEACHER_API_URL", "http://127.0.0.1:8097")
 WRAPPER_CONFIG_PATH = os.getenv("WRAPPER_CONFIG_PATH", "/workspace/configs/wrapper_config.json")
-ICW_API_URL = os.getenv("ICW_API_URL", "http://icw:8085")
-ICW_DISABLE = False
 WRAPPER_CONFIG: Dict[str, Any] = {}
 WRAPPER_CONFIG_HASH: Optional[str] = None
 DRT_API_URL = os.getenv("DRT_API_URL", "http://drt:8086")
@@ -1174,18 +1120,6 @@ except Exception:
     logging.getLogger(__name__).warning("bad ARTIFACT_SHARD_BYTES=%r; defaulting to 200000", _shard_bytes_raw, exc_info=True)
     ARTIFACT_SHARD_BYTES = 200000
 ARTIFACT_LATEST_ONLY = os.getenv("ARTIFACT_LATEST_ONLY", "true").lower() == "true"
-_spool_ram_raw = os.getenv("SPOOL_RAM_LIMIT", "524288")
-try:
-    SPOOL_RAM_LIMIT = int(str(_spool_ram_raw).strip() or "524288")
-except Exception:
-    logging.getLogger(__name__).warning("bad SPOOL_RAM_LIMIT=%r; defaulting to 524288", _spool_ram_raw, exc_info=True)
-    SPOOL_RAM_LIMIT = 524288
-_spill_raw = os.getenv("SPOOL_SPILL_THRESHOLD", "262144")
-try:
-    SPOOL_SPILL_THRESHOLD = int(str(_spill_raw).strip() or "262144")
-except Exception:
-    logging.getLogger(__name__).warning("bad SPOOL_SPILL_THRESHOLD=%r; defaulting to 262144", _spill_raw, exc_info=True)
-    SPOOL_SPILL_THRESHOLD = 262144
 _event_buf_raw = os.getenv("EVENT_BUFFER_MAX", "100")
 try:
     EVENT_BUFFER_MAX = int(str(_event_buf_raw).strip() or "100")
@@ -1385,16 +1319,16 @@ def _json_response(obj: Dict[str, Any], status_code: int = 200) -> Response:
     return Response(content=body, status_code=status_code, media_type="application/json", headers=headers)
 
 # ---- Pipeline imports (extracted helpers) ----
-from .pipeline.trace_locks import acquire_lock as trace_acquire_lock, release_lock as trace_release_lock  # type: ignore
-from .pipeline.args_prep import ensure_object_args as args_ensure_object_args, fill_min_defaults as args_fill_min_defaults  # type: ignore
 from .pipeline.assets import collect_urls as assets_collect_urls, count_images as assets_count_images, count_video as assets_count_video, count_audio as assets_count_audio, compute_domain_qa as assets_compute_domain_qa  # type: ignore
 from .pipeline.executor_gateway import execute as gateway_execute  # type: ignore
 from .pipeline.catalog import build_allowed_tool_names as catalog_allowed, validate_tool_names as catalog_validate  # type: ignore
 from .pipeline.finalize import finalize_tool_phase as finalize_tool_phase, compose_openai_response as compose_openai_response  # type: ignore
-from .pipeline.request_shaping import shape_request as shape_request  # type: ignore
+#
+# NOTE: request shaping intentionally removed. We pass the user's original request body/messages
+# through unchanged (other than minimal type validation) to avoid hidden truncation/normalization.
+#
 
-# ICW + Planner live in their respective modules; chat completions only orchestrates.
-from .icw.assembler import pack_icw_system_frame_from_messages
+# Planner lives in its module; chat completions only orchestrates.
 from .plan.committee import produce_tool_plan
 
 
@@ -1491,7 +1425,7 @@ def finalize_response(trace_id: str, messages: List[Dict[str, Any]], state: RunS
     if isinstance(cid, (str, int)):
         meta_block["cid"] = str(cid)
     resp["_meta"] = meta_block
-    checkpoints_append_event(STATE_DIR, str(trace_id), "response.preview", {"ok": ok_flag, "assets": len(urls)})
+    _log("response.preview", trace_id=str(trace_id), ok=bool(ok_flag), assets=int(len(urls)))
     return resp
 
 
@@ -1974,14 +1908,16 @@ def _film2_trace_event(trace_id: Optional[str], e: Dict[str, Any]) -> None:
     if not trace_id:
         return
     row = {"t": int(time.time() * 1000), **e}
-    checkpoints_append_event(STATE_DIR, trace_id, str(e.get("event") or "event"), row)
+    ev = str(e.get("event") or "event")
+    payload = {k: v for k, v in row.items() if k != "event"}
+    _log(ev, trace_id=str(trace_id), **payload)
 
 
 def _film2_artifact_video(trace_id: Optional[str], path: str) -> None:
     if not (trace_id and isinstance(path, str) and path):
         return
     rel = os.path.relpath(path, UPLOAD_DIR).replace("\\", "/")
-    checkpoints_append_event(STATE_DIR, trace_id, "artifact", {"kind": "video", "path": rel})
+    _log("artifact", trace_id=str(trace_id), kind="video", path=rel)
 
 
 # ---- Creative helpers ----
@@ -2144,9 +2080,6 @@ def _env_text(env: Dict[str, Any]) -> str:
     return text
 
 
-def _is_trivial(s: str) -> bool:
-    return not s.strip() or len(s.strip()) < 8
-
 
 def _collect_artifacts_payload(tool_results: List[Dict[str, Any]], abs_url_fn) -> Dict[str, Any]:
     """
@@ -2276,14 +2209,14 @@ def _warn_double_wrapped_tool_results(tool_results: List[Dict[str, Any]] | None)
             inner = res.get("result")
             # Heuristic: nested envelope usually contains ok/result/error keys
             if isinstance(inner, dict) and ("ok" in res or "error" in res) and ("result" in res):
-                logging.getLogger("orchestrator.tools").warning(
+                log.warning(
                     "double_wrapped_tool_result detected name=%r keys=%s inner_keys=%s",
                     tr.get("name") or tr.get("tool"),
                     sorted(list(res.keys()))[:24],
                     sorted(list(inner.keys()))[:24],
                 )
     except Exception:
-        logging.getLogger("orchestrator.tools").debug("_warn_double_wrapped_tool_results failed (non-fatal)", exc_info=True)
+        log.debug("_warn_double_wrapped_tool_results failed (non-fatal)", exc_info=True)
 
 
 def _tb(s: str) -> str:
@@ -2576,7 +2509,6 @@ from .rag.core import rag_index_dir  # re-exported for backwards-compat
 
 
 from .rag.core import rag_search  # re-exported for backwards-compat
-from .pipeline.compression_orchestrator import co_pack as _co_pack, frames_to_messages as _co_frames_to_msgs
 from .committee_client import (
     QWEN_MODEL_ID,
     GLM_MODEL_ID,
@@ -2654,118 +2586,6 @@ async def propose_search_queries(messages: List[Dict[str, Any]]) -> List[str]:
     return queries
 
 
-def meta_prompt(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    # Policy/system frames (treated as MISC; inserted before RoE tail)
-    system_preface = (
-        "You are part of a model team with explicit roles: a Planner and Executors. "
-        "Planner decomposes the task, chooses tools, and requests relevant evidence. Executors produce solutions and critiques. "
-        "You execute tools yourself. Never ask the user to run code or call tools; do not output scripts for the user to execute. "
-        "Be precise, show working when non-trivial, and when a tool can fulfill the request, invoke it directly. "
-        "Absolute rule: Never use SQLAlchemy; use asyncpg with pooling and raw SQL for PostgreSQL. "
-        "Absolute rule: Do NOT use Pydantic (no models). Use plain dicts and the project JSONParser. "
-        "Absolute rule: Do NOT add try/except blocks unless the user explicitly requests it or an external API contract strictly requires it. Let errors surface. "
-        "Absolute rule: Do NOT set client timeouts in generated code unless the user explicitly requests it. "
-        "Absolute rule: Do NOT design or implement HTTP proxies, reverse proxies, pass-through/relay endpoints, or WebSocket relays under ANY circumstances unless the user explicitly grants permission in the current prompt. Always call direct service endpoints. "
-        "Absolute rule: Do NOT introduce or use any new library without: (1) performing a LIVE web search to the OFFICIAL documentation for the latest stable version (no memory/RAG), (2) reviewing constraints/APIs, and (3) obtaining explicit user permission to add the dependency (this applies to uvicorn/fastapi/etc.). Include the doc URL. "
-        "Critically: choose tools SEMANTICALLY by mapping the user's requested outcome to tool capabilities (no keyword triggers). "
-        "If any available tool can directly produce the requested artifact, invoke that tool; otherwise provide a concrete solution or plan. "
-        "Never refuse actionable requests. Do not apologize, do not say you can't or that it's not supported. If something seems constrained, state constraints briefly and proceed with best-effort steps using reasonable defaults. "
-        "Ask at most one concise clarifying message if a blocking parameter is missing; include up to three targeted questions in that single message, then proceed. "
-        "When the user provides reference media (audio, images, video, files), treat them as style/constraint references. "
-        "Do NOT reuse source media as-is unless explicitly instructed; transform or condition on them to match style, timing/beat, or visual attributes (e.g., hair/face), respecting the user's constraints. "
-        "Always surface IDs and errors produced by tools: include film_id, job_id(s), prompt_id(s) when available, and concise error/traceback summaries. "
-        "Return the complete Markdown answer; do not omit the main body when tools are used. "
-        "If you clearly see a small, relevant fix or improvement (e.g., a failing tool parameter or obvious config issue), you may add a short 'Suggestions' section with up to 2 concise bullet points at the end. Do not scope creep. "
-        "MANDATORY CODE EDIT POLICY: Before making any code change or fix, ALWAYS re-read the entire target file from disk in this session. Do not rely on memory or cached content; perform a 100% fresh read every time."
-    )
-    policy_frames = [
-        {"role": "system", "content": "### [FINALITY / SYSTEM]\nDo not output assistant content until committee consensus. Output one final answer only."},
-        {"role": "system", "content": "### [INVARIANTS / SYSTEM]\nPrompt-only discipline: honor constraints via instruction, not enforcement. Use percent budgets, not token counts; self-compress to fit."},
-        {"role": "system", "content": system_preface + "\nHARD BAN: Never import or recommend pydantic, sqlalchemy, or any ORM/CSV/Parquet libs; use asyncpg + JSON/NDJSON only."},
-        {"role": "system", "content": (
-            "### [CODING STYLE / SYSTEM]\n"
-            "[PYTHON INDENTATION RULES]\n\n"
-            "- For all Python code, you MUST use exactly 4 spaces per indentation level.\n"
-            "- Tabs (\"\\t\") are FORBIDDEN in Python code. Do not emit tab characters anywhere.\n"
-            "- Do NOT mix tabs and spaces. Indentation must be consistent 4-space blocks.\n"
-            "- When refactoring or editing existing Python code, normalize indentation to 4-space blocks, removing any tabs."
-        )},
-        {"role": "system", "content": (
-            "### [CYRIL — GLOBAL PYTHON & ENGINEERING RULES / SYSTEM]\n"
-            "Hard, global rules for ALL Python and orchestration logic. Do NOT weaken, ignore, or reinterpret them.\n\n"
-            "- INDENTATION: 4 spaces only; tabs are forbidden; never mix tabs and spaces.\n"
-            "- IMPORTS: All imports at module top; no function/method/conditional imports; no import-time I/O except main logger setup.\n"
-            "- TIMEOUTS/RETRIES: No client timeouts by default; only when absolutely required and never with hidden retries; never retry on timeouts.\n"
-            "- ERROR HANDLING: In hot paths (planner/executor/orchestrator), avoid try/except; elsewhere, catch specific errors, log structured events, and surface them; never swallow failures.\n"
-            "- DEPENDENCIES/DB: Pydantic/SQLAlchemy/ANY ORM/SQLite are forbidden; use PostgreSQL via asyncpg + raw SQL only.\n"
-            "- JSON & CONTRACTS: Public APIs use JSON envelopes; /v1/chat/completions must always return OpenAI-compatible JSON; tool args MUST be JSON objects at execution time.\n"
-            "- TOOL FLOW: Public routes never call /tool.run directly; valid path is Planner → Executor (/execute) → Orchestrator /tool.run; no separate validator that hides failures.\n"
-            "- TRACING/LOGGING: Always emit deterministic traces (chat.start, planner.*, committee.*, exec.payload, tool.run.start, chat.finish); errors are explicit, never logged-and-forgotten.\n"
-            "- ARCHITECTURE: No in-method imports, no hidden side effects, no background gateways/proxies unless explicitly requested; prefer deterministic behavior and expose seeds when using randomness.\n"
-            "- FUNCTIONS: No nested functions; all helpers are top-level or class methods; no closures that depend on outer locals—use explicit params/returns instead.\n"
-            "Summary: 4 spaces; no tabs; no function-level imports; no default timeouts; no retries on timeouts; no silent fails; no ORMs/Pydantic/SQLite; Postgres+asyncpg only; strict JSON envelopes; Planner→Executor→Orchestrator tool flow; full traceability."
-        )},
-        {"role": "system", "content": (
-            "When generating videos, reasonable defaults are: duration<=10s, resolution=1920x1080, 24fps, language=en, neutral voice, audio ON, subtitles OFF. "
-            "If user implies higher fidelity (e.g., 4K/60fps), set resolution=3840x2160 and fps=60, enable interpolation and upscale accordingly."
-        )},
-    ]
-    # Build CO frames from current messages (history-based; attachments/tool memory not available here)
-    last_user = ""
-    for m in reversed(messages or []):
-        if isinstance(m, dict) and m.get("role") == "user" and isinstance(m.get("content"), str) and m.get("content").strip():
-            last_user = m.get("content").strip()
-            break
-    co_env = {
-        "schema_version": 1,
-        "trace_id": "",
-        "call_kind": "committee",
-        "model_caps": {"num_ctx": DEFAULT_NUM_CTX},
-        "user_turn": {"role": "user", "content": last_user or ""},
-        "history": messages or [],
-        "attachments": [],
-        "tool_memory": [],
-        "rag_hints": [],
-        "roe_incoming_instructions": [],
-        "subject_canon": {},
-        "percent_budget": {"icw_pct": [65, 70], "tools_pct": [18, 20], "roe_pct": [5, 10], "misc_pct": [3, 5], "buffer_pct": 5},
-        "sweep_plan": ["0-90", "30-120", "60-150+wrap"],
-    }
-    # Fail-soft: if CO packing fails, log and fall back to original messages
-    try:
-        co_out = _co_pack(co_env)
-    except Exception as ex:
-        _log("meta_prompt.co_pack.error", error=str(ex))
-        return messages
-    _rt = co_out.get("ratio_telemetry") or {}
-    _log("co.pack", call_kind="committee", alloc=_rt.get("alloc"), used_pct=_rt.get("used_pct"), free_pct=_rt.get("free_pct"))
-    try:
-        frames = _co_frames_to_msgs(co_out.get("frames") or [])
-    except Exception as ex:
-        _log("meta_prompt.co_frames_to_msgs.error", error=str(ex))
-        return messages
-    _log("co.frames", call_kind="committee", count=len(frames or []))
-    if not frames:
-        return messages
-    # Insert policy/system frames just before the RoE tail (keep tail anchor)
-    head = frames[:-1]
-    tail = frames[-1:]
-    return head + policy_frames + tail
-
-
-
-
-def _detect_video_intent(text: str) -> bool:
-    if not text:
-        return False
-    s = text.lower()
-    keywords = (
-        "video", "film", "movie", "scene", "4k", "8k", "60fps", "fps", "frame rate",
-        "minute", "minutes", "sec", "second", "seconds"
-    )
-    return any(k in s for k in keywords)
-
-
 
 
 
@@ -2809,15 +2629,15 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
     # still be preserved and routed through normalization below.
     raw_args = call.get("arguments")
     # Determine trace id for this tool call; always present in envelopes.
-    call_trace_id: str
+    trace_id: str
     if isinstance(call.get("trace_id"), str) and call.get("trace_id"):
-        call_trace_id = str(call.get("trace_id"))
+        trace_id = str(call.get("trace_id"))
     else:
         meta_val = call.get("meta")
         if isinstance(meta_val, dict) and isinstance(meta_val.get("trace_id"), str) and meta_val.get("trace_id"):
-            call_trace_id = str(meta_val.get("trace_id"))
+            trace_id = str(meta_val.get("trace_id"))
         else:
-            call_trace_id = "tt_unknown"
+            trace_id = "tt_unknown"
     # The executor is not a callable tool; it is invoked only via
     # the external executor service (pipeline.executor_gateway).
     if name == "executor":
@@ -2872,7 +2692,21 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
     # We still do best-effort parsing for string arguments, and we optionally
     # coerce a small set of common, cross-tool keys when they are present.
     parser = JSONParser()
-    if isinstance(raw_args, str):
+    if isinstance(raw_args, dict) and isinstance(raw_args.get("_raw"), str):
+        raw_inner = str(raw_args.get("_raw") or "")
+        parsed_inner = parser.parse(raw_inner, {})
+        if isinstance(parsed_inner, dict) and parsed_inner:
+            args = dict(parsed_inner)
+            # Overlay any explicit keys provided alongside _raw without dropping them.
+            for k, v in raw_args.items():
+                if k == "_raw":
+                    continue
+                args[k] = v
+        else:
+            # Never drop arguments: preserve the original dict and keep synopsis.
+            args = dict(raw_args)
+            args.setdefault("synopsis", raw_inner)
+    elif isinstance(raw_args, str):
         parsed = parser.parse(raw_args, {})
         if isinstance(parsed, dict) and parsed:
             args = dict(parsed)
@@ -2889,8 +2723,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         args = {"_raw": raw_args}
 
     # Always propagate trace id into args (critical for downstream trace wiring)
-    if call_trace_id and isinstance(args, dict) and not args.get("trace_id"):
-        args["trace_id"] = call_trace_id
+    if trace_id and isinstance(args, dict) and not args.get("trace_id"):
+        args["trace_id"] = trace_id
 
     # Light, additive coercion for common keys (only when present).
     expected_args_shape = {
@@ -3396,10 +3230,10 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         scene_id = a.get("scene_id")
         shot_id = a.get("shot_id")
 
-        _trace_append(
-            "film2",
+        trace_append(
+            "film2.clip_refine_start",
             {
-                "event": "clip_refine_start",
+                "trace_id": trace_id,
                 "segment_id": segment_id,
                 "film_id": film_id,
                 "scene_id": scene_id,
@@ -3509,10 +3343,10 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                                 regions.append({"type": "object", "bbox": bbox})
 
                 if regions:
-                    _trace_append(
-                        "film2",
+                    trace_append(
+                        "film2.frame_detect",
                         {
-                            "event": "frame_detect",
+                            "trace_id": trace_id,
                             "segment_id": segment_id,
                             "film_id": film_id,
                             "scene_id": scene_id,
@@ -3547,10 +3381,10 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 if isinstance(score, (int, float)):
                     clip_identity_scores.append(float(score))
 
-            _trace_append(
-                "film2",
+            trace_append(
+                "film2.frame_fix",
                 {
-                    "event": "frame_fix",
+                    "trace_id": trace_id,
                     "segment_id": segment_id,
                     "film_id": film_id,
                     "scene_id": scene_id,
@@ -3595,11 +3429,11 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     },
                 }
             refined_video_path = rebuilt_path
-            _film2_artifact_video(call_trace_id, rebuilt_path)
-            _trace_append(
-                "film2",
+            _film2_artifact_video(trace_id, rebuilt_path)
+            trace_append(
+                "film2.clip_rebuild_success",
                 {
-                    "event": "clip_rebuild_success",
+                    "trace_id": trace_id,
                     "segment_id": segment_id,
                     "film_id": film_id,
                     "scene_id": scene_id,
@@ -3634,10 +3468,10 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 "identity_mean": id_mean,
                 "identity_status": identity_status,
             }
-            _trace_append(
-                "film2",
+            trace_append(
+                "film2.clip_identity_qa",
                 {
-                    "event": "clip_identity_qa",
+                    "trace_id": trace_id,
                     "segment_id": segment_id,
                     "film_id": film_id,
                     "scene_id": scene_id,
@@ -3694,10 +3528,10 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         if qa_video:
             out["qa"] = {"video": qa_video}
 
-        _trace_append(
-            "film2",
+        trace_append(
+            "film2.clip_refine_success",
             {
-                "event": "clip_refine_success",
+                "trace_id": trace_id,
                 "segment_id": segment_id,
                 "film_id": film_id,
                 "scene_id": scene_id,
@@ -3719,7 +3553,9 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             }
         a = raw_args if isinstance(raw_args, dict) else {}
         prompt = (a.get("prompt") or "").strip()
-        trace_id = a.get("trace_id") if isinstance(a.get("trace_id"), str) else None
+        trace_id = a.get("trace_id")
+        # Use trace_id only (no derived/fallback trace keys). Empty string means "no explicit trace id".
+        trace_id = str(trace_id).strip() if isinstance(trace_id, (str, int)) else ""
         # cid is the conversation/client id. film_id is a separate identifier for a film run.
         _cid_raw = a.get("cid")
         cid = str(_cid_raw).strip() if isinstance(_cid_raw, (str, int)) and str(_cid_raw).strip() else ""
@@ -3771,10 +3607,10 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             ]
         if prompt:
             story_obj = _story_draft(prompt, duration_s)
-            _trace_append(
-                "film2",
+            trace_append(
+                "film2.story_draft",
                 {
-                    "event": "story_draft",
+                    "trace_id": trace_id,
                     "prompt": prompt,
                     "duration_hint_s": duration_s,
                 },
@@ -3784,10 +3620,10 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             for pass_index in range(max_story_passes):
                 last_issues = _story_check(story_obj, prompt)
                 issue_codes = [iss.get("code") for iss in last_issues if isinstance(iss, dict)]
-                _trace_append(
-                    "film2",
+                trace_append(
+                    "film2.story_consistency_pass",
                     {
-                        "event": "story_consistency_pass",
+                        "trace_id": trace_id,
                         "pass_index": pass_index,
                         "issue_codes": issue_codes,
                     },
@@ -3797,10 +3633,10 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 story_obj = _story_fix(story_obj, last_issues)
             if last_issues:
                 warnings.append("story_consistency_unresolved")
-                _trace_append(
-                    "film2",
+                trace_append(
+                    "film2.story_consistency_unresolved",
                     {
-                        "event": "story_consistency_unresolved",
+                        "trace_id": trace_id,
                         "issues": last_issues,
                         "prompt": prompt,
                     },
@@ -3835,10 +3671,10 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                                 continue
                             target = ev.get("target")
                             state_delta = ev.get("state_delta") if isinstance(ev.get("state_delta"), dict) else {}
-                            _trace_append(
-                                "film2",
+                            trace_append(
+                                "film2.character_state_change",
                                 {
-                                    "event": "character_state_change",
+                                    "trace_id": trace_id,
                                     "char_id": target,
                                     "event_id": ev.get("event_id"),
                                     "state_delta": state_delta,
@@ -3855,10 +3691,10 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 scene_id = shot.get("scene_id")
                 act_id = shot.get("act_id")
                 state_map = shot.get("character_states") if isinstance(shot.get("character_states"), dict) else {}
-                _trace_append(
-                    "film2",
+                trace_append(
+                    "film2.shot_character_state_snapshot",
                     {
-                        "event": "shot_character_state_snapshot",
+                        "trace_id": trace_id,
                         "shot_id": shot_id,
                         "scene_id": scene_id,
                         "act_id": act_id,
@@ -3920,12 +3756,14 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             if character_ids:
                 music_args["character_id"] = character_ids[0]
             # Trace: Film2 → music front-door call start
-            if trace_id:
-                trace_append("film2.music.start", {
+            trace_append(
+                "film2.music.start",
+                {
                     "trace_id": trace_id,
                     "tool": "music.infinite.windowed",
                     "args": {k: v for k, v in music_args.items() if k not in ("lock_bundle",)},
-                })
+                },
+            )
             # Call the infinite/windowed engine directly to avoid nested /tool.run recursion.
             provider = RestMusicProvider(MUSIC_API_URL)
             manifest_music: Dict[str, Any] = {"items": []}
@@ -3936,12 +3774,14 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         final_music_eval: Dict[str, Any] | None = None
         if music_meta and isinstance(result.get("meta"), dict):
             # Trace: Film2 → music completion summary
-            if trace_id:
-                trace_append("film2.music.finish", {
+            trace_append(
+                "film2.music.finish",
+                {
                     "trace_id": trace_id,
                     "tool": "music.infinite.windowed",
                     "meta": music_meta.get("meta") if isinstance(music_meta.get("meta"), dict) else {},
-                })
+                },
+            )
             # Tag music windows with scene/shot ids using simple time slicing.
             meta_obj = music_meta.get("meta") if isinstance(music_meta.get("meta"), dict) else {}
             win_list = meta_obj.get("windows") if isinstance(meta_obj.get("windows"), list) else []
@@ -4032,10 +3872,10 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     tts_provider=_TTSProvider(),
                 )
                 if isinstance(stems_result, dict) and stems_result.get("error"):
-                    _trace_append(
-                        "film2",
+                    trace_append(
+                        "film2.music.vocal_stems_error",
                         {
-                            "event": "film2.music.vocal_stems_error",
+                            "trace_id": trace_id,
                             "film_cid": cid,
                             "error": stems_result.get("error"),
                         },
@@ -4111,10 +3951,10 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                         accepted = (oq >= th_music.get("overall_quality_min", 0.0) and fs >= th_music.get("fit_score_min", 0.0))
                         # Hero thresholds: stricter than acceptance
                         hero = (oq >= MUSIC_HERO_QUALITY_MIN and fs >= MUSIC_HERO_FIT_MIN)
-                        _trace_append(
-                            "film2",
+                        trace_append(
+                            "film2.music.final_eval",
                             {
-                                "event": "film2.music.final_eval",
+                                "trace_id": trace_id,
                                 "film_cid": cid,
                                 "music_path": final_music_mix_path,
                                 "music_eval": final_music_eval,
@@ -4123,10 +3963,10 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                                 "hero": hero,
                             },
                         )
-                        _trace_append(
-                            "film2",
+                        trace_append(
+                            "film2.music.acceptance",
                             {
-                                "event": "film2.music.acceptance",
+                                "trace_id": trace_id,
                                 "film_cid": cid,
                                 "music_path": final_music_mix_path,
                                 "overall_quality_score": oq,
@@ -4142,10 +3982,10 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                             meta_music_block["final_eval"] = final_music_eval
                             meta_music_block["accepted"] = accepted
                             meta_music_block["hero"] = hero
-            _trace_append(
-                "film2",
+            trace_append(
+                "film2.music.attach",
                 {
-                    "event": "film2.music.attach",
+                    "trace_id": trace_id,
                     "film_cid": cid,
                     "music_cid": music_meta_obj.get("cid"),
                     "num_scenes": len(scenes_for_music),
@@ -4304,10 +4144,10 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     }
                     segment_log = []
                     _film2_trace_event(trace_id, {"event": "film2.pass_gen_start", "adapter": adapter, "shot_id": shot_id})
-                    _trace_append(
-                        "film2",
+                    trace_append(
+                        "film2.hv_call_start",
                         {
-                            "event": "hv_call_start",
+                            "trace_id": trace_id,
                             "adapter": hv_name,
                             "shot_id": shot_id,
                             "scene_id": scene_id,
@@ -4333,10 +4173,10 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     if isinstance(gen_path, str):
                         _film2_artifact_video(trace_id, gen_path)
                         shot_meta["gen_path"] = gen_path
-                        _trace_append(
-                            "film2",
+                        trace_append(
+                            "film2.hv_call_success",
                             {
-                                "event": "hv_call_success",
+                                "trace_id": trace_id,
                                 "adapter": hv_name,
                                 "shot_id": shot_id,
                                 "scene_id": scene_id,
@@ -4590,10 +4430,10 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     clip_seg["qa"]["scores"]["lipsync"] = lipsync_score
                     clip_segments[clip_id] = clip_seg
                     shot_seg["children"].append(clip_id)
-                    _trace_append(
-                        "film2",
+                    trace_append(
+                        "film2.segment_clip_built",
                         {
-                            "event": "segment_clip_built",
+                            "trace_id": trace_id,
                             "film_id": film_id,
                             "scene_id": scene_id,
                             "shot_id": shot_id,
@@ -4629,7 +4469,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 rel = final_path
                 if os.path.isabs(final_path):
                     rel = os.path.relpath(final_path, UPLOAD_DIR).replace("\\", "/")
-                checkpoints_append_event(STATE_DIR, trace_id, "artifact", {"kind": "video", "path": rel})
+                _log("artifact", trace_id=str(trace_id), kind="video", path=rel)
                 result.setdefault("ids", {})["video_id"] = rel
                 view_rel = rel if rel.startswith("uploads/") else f"uploads/{rel.lstrip('/')}"
                 result.setdefault("meta", {})["view_url"] = f"/{view_rel}"
@@ -4661,10 +4501,10 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     cmeta["degraded"] = True
                     cmeta["degraded_reasons"] = degraded_reasons
                     clip["meta"] = cmeta
-                    _trace_append(
-                        "film2",
+                    trace_append(
+                        "film2.clip_refine_exhausted",
                         {
-                            "event": "clip_refine_exhausted",
+                            "trace_id": trace_id,
                             "segment_id": clip.get("id"),
                             "film_id": segments_container.get("film", {}).get("segment_id") if isinstance(segments_container.get("film"), dict) else None,
                             "scene_id": cmeta.get("scene_id"),
@@ -4763,16 +4603,13 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             tr = (a.get("trace_id") if isinstance(a.get("trace_id"), str) else None)
             if tr:
                 rel = os.path.relpath(wav_path, UPLOAD_DIR).replace("\\", "/")
-                checkpoints_append_event(
-                    STATE_DIR,
-                    tr,
+                _log(
                     "artifact",
-                    {
-                        "kind": "audio",
-                        "path": rel,
-                        "bytes": int(len(wav)),
-                        "duration_s": float(env.get("duration_s") or 0.0),
-                    },
+                    trace_id=str(tr),
+                    kind="audio",
+                    path=rel,
+                    bytes=int(len(wav)),
+                    duration_s=float(env.get("duration_s") or 0.0),
                 )
             # Optional: embed transcript text into RAG
             pool = await get_pg_pool()
@@ -4856,7 +4693,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 tr = (a.get("trace_id") if isinstance(a.get("trace_id"), str) else None)
                 if tr:
                     rel = os.path.relpath(wav_path, UPLOAD_DIR).replace("\\", "/")
-                    checkpoints_append_event(STATE_DIR, tr, "artifact", {"kind": "audio", "path": rel, "bytes": int(len(wav))})
+                    _log("artifact", trace_id=str(tr), kind="audio", path=rel, bytes=int(len(wav)))
             # Shape result with ids/meta when file persisted
             out_res = dict(env or {})
             if isinstance(wav, (bytes, bytearray)) and len(wav) > 0:
@@ -5079,7 +4916,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 music_profile = prof.get("profile")
 
         # Propagate the tool-level trace_id into Song Graph planning and tracing.
-        trace_val = a.get("trace_id") if isinstance(a.get("trace_id"), str) else None
+        trace_val = str(a.get("trace_id") or "").strip() or "tt_unknown"
 
         if needs_song_graph:
             song_graph = await plan_song_graph(
@@ -5087,7 +4924,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 length_s=length_s,
                 bpm=bpm_int,
                 key=key_txt,
-                trace_id=str(trace_val or ""),
+                trace_id=trace_val,
                 music_profile=music_profile,
             )
             if isinstance(song_graph, dict) and song_graph:
@@ -5212,7 +5049,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 tr = (a.get("trace_id") if isinstance(a.get("trace_id"), str) else None)
                 if tr:
                     rel = os.path.relpath(wav_path, UPLOAD_DIR).replace("\\", "/")
-                    checkpoints_append_event(STATE_DIR, tr, "artifact", {"kind": "audio", "path": rel, "bytes": int(len(wav))})
+                    _log("artifact", trace_id=str(tr), kind="audio", path=rel, bytes=int(len(wav)))
                 if isinstance(env, dict):
                     meta_env = env.setdefault("meta", {})
                     if isinstance(meta_env, dict):
@@ -5365,10 +5202,10 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             assert_envelope(env)
             env = stamp_env(env, "music.refine.window", env.get("meta", {}).get("model"))
             # Trace before/after metrics for training/distillation.
-            _trace_append(
-                "music",
+            trace_append(
+                "music.window.refine",
                 {
-                    "event": "music.window.refine",
+                    "trace_id": a.get("trace_id"),
                     "cid": cid,
                     "segment_id": a.get("segment_id"),
                     "window_id": a.get("window_id"),
@@ -5468,7 +5305,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 tr = (a.get("trace_id") if isinstance(a.get("trace_id"), str) else None)
                 if tr:
                     rel = os.path.relpath(wav_path, UPLOAD_DIR).replace("\\", "/")
-                    checkpoints_append_event(STATE_DIR, tr, "artifact", {"kind": "audio", "path": rel, "bytes": int(len(wav))})
+                    _log("artifact", trace_id=str(tr), kind="audio", path=rel, bytes=int(len(wav)))
                 if isinstance(env, dict):
                     meta_env = env.setdefault("meta", {})
                     if isinstance(meta_env, dict) and quality_profile:
@@ -5615,14 +5452,16 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             logging.error(_tb)
             return {"name": name, "error": str(ex), "traceback": _tb}
     if name == "director.mode" and ALLOW_TOOL_EXECUTION:
-        t = (args.get("prompt") or "").lower()
-        qs = []
-        if any(k in t for k in ["film", "video", "shot", "scene"]):
-            qs += ["Confirm duration and fps?", "Any specific camera moves or LUT?", "Lock characters/voices?"]
-        if any(k in t for k in ["image", "picture", "draw", "render"]):
-            qs += ["Exact size/aspect?", "Any style/artist lock?", "Provide refs or colors?"]
-        if any(k in t for k in ["song", "music", "instrumental", "lyrics", "tts"]):
-            qs += ["Target BPM/key?", "Female/male vocal or timbre ref?", "Length or infinite?"]
+        # No keyword-based intent detection here; return generic clarifying questions.
+        p = str(args.get("prompt") or "").strip()
+        qs: List[str] = []
+        if not p:
+            qs.append("What would you like to make, and what should it contain?")
+        qs += [
+            "What output format do you want (text/image/video/audio) and any required size/length?",
+            "Any references, style constraints, or assets to use?",
+            "Any hard requirements (must/avoid) or quality targets?",
+        ]
         return {"name": name, "result": {"questions": qs[:5]}}
     if name == "scenegraph.plan" and ALLOW_TOOL_EXECUTION:
         prompt = args.get("prompt") or ""
@@ -5776,7 +5615,14 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                                 if tr:
                                     try:
                                         rel = os.path.relpath(path, UPLOAD_DIR).replace("\\", "/")
-                                        checkpoints_append_event(STATE_DIR, tr, "artifact", {"kind": "audio", "path": rel, "bytes": int(len(wav_bytes)), "stem": stem_name})
+                                        _log(
+                                            "artifact",
+                                            trace_id=str(tr),
+                                            kind="audio",
+                                            path=rel,
+                                            bytes=int(len(wav_bytes)),
+                                            stem=stem_name,
+                                        )
                                     except Exception as ex:
                                         _log("audio.stems.demucs.trace.error", stem=stem_name, error=str(ex))
                         except Exception as ex:
@@ -5871,10 +5717,10 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                         if isinstance(locks_meta, dict):
                             locks_meta["music"] = music_branch
             # Trace stems adjustment usage for distillation.
-            _trace_append(
-                "music",
+            trace_append(
+                "audio.stems.adjust",
                 {
-                    "event": "audio.stems.adjust",
+                    "trace_id": (args.get("trace_id") if isinstance(args, dict) else None),
                     "mix_path": mix_path,
                     "stems_count": len(adjusted_stems),
                     "stem_gains": stem_gains,
@@ -6023,10 +5869,10 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     _wf2.write(out_vf)
                 transformed_vocals = vf_path
                 # Attach VocalFix metrics to trace for distillation.
-                _trace_append(
-                    "music",
+                trace_append(
+                    "audio.vocals.vocalfix",
                     {
-                        "event": "audio.vocals.vocalfix",
+                        "trace_id": (args.get("trace_id") if isinstance(args, dict) else None),
                         "mix_path": mix_path,
                         "vocals_path": vocals_path,
                         "transformed_path": transformed_vocals,
@@ -6095,10 +5941,10 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                         if isinstance(locks_meta, dict):
                             locks_meta["music"] = music_branch
             # Trace vocal transform usage.
-            _trace_append(
-                "music",
+            trace_append(
+                "audio.vocals.transform",
                 {
-                    "event": "audio.vocals.transform",
+                    "trace_id": (args.get("trace_id") if isinstance(args, dict) else None),
                     "mix_path": mix_path,
                     "pitch_shift_semitones": float(pitch_shift) if isinstance(pitch_shift, (int, float)) else None,
                     "voice_lock_id": voice_lock_id if isinstance(voice_lock_id, str) else None,
@@ -6513,10 +6359,10 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             if isinstance(meta_block, dict):
                 meta_block["refined_windows"] = refined_windows
         # Trace alignment usage for distillation.
-        _trace_append(
-            "music",
+        trace_append(
+            "music.lyrics.align",
             {
-                "event": "music.lyrics.align",
+                "trace_id": (args.get("trace_id") if isinstance(args, dict) else None),
                 "cid": cid_val,
                 "alignment_method": alignment_method,
                 "num_sections": len(alignment_sections),
@@ -6613,9 +6459,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             x0 = min(w - cell_w, c * cell_w)
             y0 = min(h - cell_h, r * cell_h)
             boxes.append((x0, y0, x0 + cell_w, y0 + cell_h))
-        # Heuristic signage/text extraction to prevent drift (e.g., STOP signs)
-        signage_keywords = ("sign", "stop sign", "billboard", "poster", "label", "street sign", "traffic sign")
-        wants_signage = any(kw in prompt.lower() for kw in signage_keywords)
+        # Best-effort extraction of exact text when the user explicitly quotes it.
         exact_text = None
         quoted = _re.findall(r"\"([^\"]{2,})\"|'([^']{2,})'", prompt)
         for a, b in quoted:
@@ -6623,40 +6467,6 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             if len(t.split()) <= 4:
                 exact_text = t
                 break
-        if (not exact_text) and ("stop" in prompt.lower()):
-            exact_text = "STOP"
-        # 3) Optional web grounding for signage: fetch references and OCR for exact text
-        web_sources = []
-        if wants_signage and not exact_text:
-            try:
-                qsig = f"{prompt} traffic signage locale"
-                fused = await execute_tool_call({"name": "metasearch.fuse", "arguments": {"q": qsig, "k": 5}})
-                web_sources = list(((fused.get("result") or {}).get("results") or [])[:3])
-                # OCR first 2 links if they look like images
-                for it in web_sources[:2]:
-                    link = it.get("link") or ""
-                    if link and (link.lower().endswith(('.png','.jpg','.jpeg','.webp'))):
-                        try:
-                            ocr = await execute_tool_call({"name": "ocr.read", "arguments": {"url": link}})
-                            txt = ((ocr.get("result") or {}).get("text") or "").strip()
-                            if txt and len(txt) <= 16:
-                                exact_text = txt
-                                break
-                        except Exception as ex:
-                            _log(
-                                "image.super_gen.ocr_error",
-                                link=link,
-                                error=str(ex),
-                                stack="".join(traceback.format_exception(type(ex), ex, ex.__traceback__)),
-                            )
-                            continue
-            except Exception as ex:
-                _log(
-                    "image.super_gen.web_signage_error",
-                    error=str(ex),
-                    stack="".join(traceback.format_exception(type(ex), ex, ex.__traceback__)),
-                )
-                web_sources = []
         # 4) Base canvas
         base_args = {"prompt": base_style, "size": f"{w}x{h}", "seed": args.get("seed"), "refs": args.get("refs"), "cid": args.get("cid")}
         base = await execute_tool_call({"name": "legacy.image.gen", "arguments": base_args})
@@ -6677,8 +6487,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         for (obj_prompt, box) in zip(objs, boxes):
             try:
                 refined_prompt = obj_prompt
-                if wants_signage and exact_text and any(kw in obj_prompt.lower() for kw in ("sign", "poster", "label", "billboard", "traffic sign")):
-                    refined_prompt = f"{obj_prompt}, exact signage text: {exact_text}"
+                if exact_text:
+                    refined_prompt = f"{obj_prompt}, exact text: {exact_text}"
                 sub_args = {"prompt": refined_prompt, "size": f"{box[2]-box[0]}x{box[3]-box[1]}", "seed": args.get("seed"), "refs": args.get("refs"), "cid": args.get("cid")}
                 best_tile = None
                 for attempt in range(0, 3):
@@ -6708,17 +6518,11 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 continue
         # 6) Final signage overlay (safety net) to strictly enforce text if requested
         # This is best-effort: failures are logged but do not abort image generation.
-        if wants_signage and exact_text:
+        if exact_text:
             try:
                 draw = ImageDraw.Draw(canvas)
-                # Choose a region likely to contain signage: first box with keyword, else center
-                target_box = None
-                for (obj_prompt, box) in zip(objs, boxes):
-                    if any(kw in obj_prompt.lower() for kw in ("sign", "poster", "label", "billboard", "traffic sign")):
-                        target_box = box
-                        break
-                if not target_box:
-                    target_box = (w // 4, h // 4, 3 * w // 4, 3 * h // 4)
+                # Choose a reasonable target region without keyword heuristics.
+                target_box = boxes[0] if boxes else (w // 4, h // 4, 3 * w // 4, 3 * h // 4)
                 tx, ty = (target_box[0] + 10, target_box[1] + 10)
                 # Fallback font
                 try:
@@ -6794,7 +6598,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         env = await run_super_loop(
             task=str(task or ""),
             repo_root=repo_root,
-            trace_id=str(trace_id or "code_super_loop"),
+            trace_id=(str(trace_id).strip() if str(trace_id).strip() else "code_super_loop"),
             step_tokens=step_tokens,
         )
         return {"name": name, "result": env}
@@ -6900,7 +6704,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             if tr:
                 try:
                     rel = os.path.relpath(dst, UPLOAD_DIR).replace("\\", "/")
-                    checkpoints_append_event(STATE_DIR, tr, "artifact", {"kind": "video", "path": rel})
+                    _log("artifact", trace_id=str(tr), kind="video", path=rel)
                 except Exception as ex:
                     _log("video.interpolate.checkpoint.error", error=str(ex), path=dst)
             return {"name": name, "result": {"path": url}}
@@ -7876,6 +7680,36 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
     # Unknown tool - return as unexecuted
     return {"name": name or "unknown", "skipped": True, "reason": "unsupported tool in orchestrator"}
 
+# ---- One-pass input coercion (avoid repeated typecasting throughout the function) ----
+def _as_str(v: Any, default: str = "") -> str:
+    if v is None:
+        return default
+    if isinstance(v, str):
+        s = v
+    else:
+        try:
+            s = str(v)
+        except Exception:
+            return default
+    s = s.strip()
+    return s if s else default
+
+def _as_int(v: Any, default: int = 0) -> int:
+    try:
+        return int(v)
+    except Exception:
+        return int(default)
+
+def _as_float(v: Any, default: float = 0.0) -> float:
+    try:
+        x = float(v)
+        # NaN guard without importing math
+        if x != x:
+            return float(default)
+        return float(x)
+    except Exception:
+        return float(default)
+
 
 @app.post("/v1/chat/completions")
 async def chat_completions(body: Dict[str, Any], request: Request):
@@ -7886,7 +7720,6 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     trace_id = "tt_unknown"
     master_seed = 0
     run_id = None
-    _lock_token = None
     abort_pipeline: bool = False
     planner_error_payload: Optional[Dict[str, Any]] = None
     
@@ -7913,65 +7746,64 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     planner_env: Dict[str, Any] = {}
     # Executor routing knobs are used in multiple places; define once.
     executor_endpoint: str = EXECUTOR_BASE_URL or "http://127.0.0.1:8081"
-    # Defensive: temperature may be str/None/NaN; must never raise.
-    _temp_raw = (body.get("temperature") if isinstance(body, dict) else None)
-    try:
-        exec_temperature = float(DEFAULT_TEMPERATURE if _temp_raw is None else _temp_raw)
-        # Clamp to OpenAI-compatible range.
-        if exec_temperature < 0.0:
-            exec_temperature = 0.0
-        if exec_temperature > 2.0:
-            exec_temperature = 2.0
-    except Exception as exc:
-        logging.warning(
-            "chat_completions: bad temperature=%r; defaulting to %r",
-            _temp_raw,
-            DEFAULT_TEMPERATURE,
-            exc_info=True,
-        )
-        exec_temperature = float(DEFAULT_TEMPERATURE)
+    
+
+    # Normalize request shapes once (avoid repeated isinstance checks throughout chat_completions)
+    body0: Dict[str, Any] = body if isinstance(body, dict) else {}
+    tools_spec_raw = body0.get("tools")
+    tools_spec: List[Dict[str, Any]] = [t for t in tools_spec_raw if isinstance(t, dict)] if isinstance(tools_spec_raw, list) else []
+    tools_allowed: List[str] = []
+    for t in tools_spec:
+        fn = t.get("function") if isinstance(t.get("function"), dict) else {}
+        nm = fn.get("name") if isinstance(fn.get("name"), str) else ""
+        if nm:
+            tools_allowed.append(nm)
+    _temp_raw = body0.get("temperature")
+    exec_temperature = _as_float(DEFAULT_TEMPERATURE if _temp_raw is None else _temp_raw, float(DEFAULT_TEMPERATURE))
+    # Clamp to OpenAI-compatible range.
+    if exec_temperature < 0.0:
+        exec_temperature = 0.0
+    if exec_temperature > 2.0:
+        exec_temperature = 2.0
     _cat_hash: str = ""
     try:
         t0 = time.time()
         logging.debug("chat_completions:try t0=%r", t0)
-        shaped = shape_request(
-            body or {},
-            request,
-            extract_attachments_fn=extract_attachments_from_messages,
-            meta_prompt_fn=meta_prompt,
-            derive_seed_fn=_derive_seed,
-            detect_video_intent_fn=_detect_video_intent,
-        )
-        logging.debug("chat_completions:shape_request done shaped_keys=%r", sorted(list((shaped or {}).keys())) if isinstance(shaped, dict) else type(shaped).__name__)
-        messages = shaped.get("messages") or []
-        logging.debug("chat_completions:messages len=%s type=%s", len(messages) if isinstance(messages, list) else -1, type(messages).__name__)
-        normalized_msgs = shaped.get("normalized_msgs") or []
-        logging.debug("chat_completions:normalized_msgs len=%s type=%s", len(normalized_msgs) if isinstance(normalized_msgs, list) else -1, type(normalized_msgs).__name__)
-        attachments = shaped.get("attachments") or []
-        logging.debug("chat_completions:attachments len=%s", len(attachments) if isinstance(attachments, list) else -1)
-        last_user_text = shaped.get("last_user_text") or ""
-        logging.debug("chat_completions:last_user_text len=%s", len(last_user_text) if isinstance(last_user_text, str) else -1)
-        conv_cid = shaped.get("conv_cid")
-        logging.debug("chat_completions:conv_cid=%r", conv_cid)
-        mode = shaped.get("mode") or "general"
-        logging.debug("chat_completions:mode=%r", mode)
+        # ---- NO request shaping: use original body/messages as provided ----
+        # ids / mode / seed
+        conv_cid = None
+        if isinstance(body0.get("cid"), (int, str)) and str(body0.get("cid")).strip():
+            conv_cid = str(body0.get("cid")).strip()
+        elif isinstance(body0.get("conversation_id"), (int, str)) and str(body0.get("conversation_id")).strip():
+            conv_cid = str(body0.get("conversation_id")).strip()
+
+        mode = _as_str(body0.get("mode"), "general")
         effective_mode = mode
-        logging.debug("chat_completions:effective_mode=%r", effective_mode)
-        try:
-            master_seed = int(shaped.get("master_seed") or 0)
-            logging.debug("chat_completions:master_seed parsed=%r", master_seed)
-        except Exception as ex:
-            logging.debug("chat_completions:master_seed conversion failed ex=%s", ex, exc_info=True)
-            master_seed = 0
-            logging.debug("chat_completions:master_seed fallback=%r", master_seed)
-        request_id = shaped.get("request_id") or uuid.uuid4().hex
-        logging.debug("chat_completions:request_id=%r", request_id)
-        trace_id = shaped.get("trace_id") or "tt_unknown"
-        logging.debug("chat_completions:trace_id=%r", trace_id)
-        problems = shaped.get("problems") or []
-        logging.debug("chat_completions:problems len=%s", len(problems) if isinstance(problems, list) else -1)
-        if any((p.get("code") == "bad_request") for p in problems if isinstance(p, dict)):
-            logging.debug("chat_completions:bad_request detected")
+
+        master_seed = _as_int(body0.get("seed"), 0)
+
+        # Request id (client-visible) and trace id (internal correlation id)
+        request_id = ""
+        if isinstance(body0.get("request_id"), (str, int)) and str(body0.get("request_id")).strip():
+            request_id = str(body0.get("request_id")).strip()
+        else:
+            ikey = body0.get("idempotency_key")
+            if isinstance(ikey, str) and ikey.strip():
+                request_id = ikey.strip()
+            else:
+                request_id = uuid.uuid4().hex
+
+        trace_id = ""
+        if isinstance(body0.get("trace_id"), (str, int)) and str(body0.get("trace_id")).strip():
+            trace_id = str(body0.get("trace_id")).strip()
+        else:
+            trace_id = trace_id
+
+        # messages (verbatim)
+        messages: List[Dict[str, Any]] = []
+        last_user_text: str = ""
+        messages_raw = body0.get("messages")
+        if not isinstance(messages_raw, list):
             usage0 = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
             logging.debug("chat_completions:usage0=%r", usage0)
             response = _build_openai_envelope(
@@ -7995,17 +7827,25 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             planner_env = {}
             logging.debug("chat_completions:set planner_env=%r", planner_env)
         else:
+            messages = [m for m in messages_raw if isinstance(m, dict)]
+            # last user text (no normalization)
+            for m in reversed(messages):
+                if m.get("role") == "user":
+                    cv = m.get("content")
+                    if isinstance(cv, str) and cv.strip():
+                        last_user_text = cv.strip()
+                        break
             first_user_len = len((last_user_text or "")) if isinstance(last_user_text, str) else 0
             logging.debug("chat_completions:first_user_len=%r", first_user_len)
             # High-level request trace (distillation-friendly)
             _trace_log_request(
                 STATE_DIR,
-                str(trace_id),
+                trace_id,
                 {
-                    "request_id": str(request_id),
+                    "request_id": request_id,
                     "kind": "chat",
                     "route": str(request.url.path),
-                    "payload": {"messages_count": len(normalized_msgs or []), "first_user_text_len": first_user_len},
+                    "payload": {"messages_count": len(messages or []), "first_user_text_len": first_user_len},
                     "meta": {
                         "mode": mode,
                         "effective_mode": effective_mode,
@@ -8013,91 +7853,32 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                     },
                 },
             )
-            checkpoints_append_event(STATE_DIR, trace_id, "request", {
-                "trace_id": trace_id,
-                "route": "/v1/chat/completions",
-                "body_summary": {"messages_count": len(normalized_msgs or []), "first_user_text_len": first_user_len},
-                "seed": int(master_seed),
-                "model_declared": (body.get("model") if isinstance(body.get("model"), str) else None),
-            })
-            logging.debug("chat_completions:chat.start trace_id=%s mode=%s effective_mode=%s stream=%s cid=%r", trace_id, mode, effective_mode, bool(body.get("stream")), conv_cid)
-            _log("chat.start", trace_id=trace_id, mode=mode, effective_mode=effective_mode, stream=bool(body.get("stream")), cid=conv_cid)
-            # Acquire per-trace lock and record start event
-            _lock_token = trace_acquire_lock(STATE_DIR, trace_id, timeout_s=10)
-            logging.debug("chat_completions:trace_acquire_lock _lock_token=%r", _lock_token)
-            checkpoints_append_event(STATE_DIR, trace_id, "start", {"seed": int(master_seed), "mode": mode, "effective_mode": effective_mode})
-            logging.debug("chat_completions:checkpoints_append_event start done")
+            _log(
+                "request",
+                trace_id=trace_id,
+                route="/v1/chat/completions",
+                body_summary={"messages_count": len(messages or []), "first_user_text_len": first_user_len},
+                seed=master_seed,
+            )
+            logging.debug("chat_completions:chat.start trace_id=%s mode=%s effective_mode=%s cid=%r", trace_id, mode, effective_mode, conv_cid)
+            _log("chat.start", trace_id=trace_id, mode=mode, effective_mode=effective_mode, cid=conv_cid)
+            _log("start", trace_id=trace_id, seed=master_seed, mode=mode, effective_mode=effective_mode)
 
-            # ICW packing: one call, one system frame (ICW owns compression).
-            icw_frame, pack_hash, icw_meta = pack_icw_system_frame_from_messages(
-                normalized_msgs,
-                cid=conv_cid,
-                goals=str(last_user_text or ""),
-                model_ctx_limit_tokens=int(DEFAULT_NUM_CTX),
-                pct_budget=0.65,
-                step_out_tokens=512,
-            )
-            if isinstance(icw_meta, dict) and not bool(icw_meta.get("ok", True)):
-                logging.warning("chat_completions:icw.pack_failed trace_id=%s cid=%r meta=%r", str(trace_id), conv_cid, icw_meta)
-            logging.debug(
-                "chat_completions:icw packed icw_frame_type=%s pack_hash=%r icw_meta_keys=%r",
-                type(icw_frame).__name__,
-                pack_hash,
-                sorted(list(icw_meta.keys())) if isinstance(icw_meta, dict) else type(icw_meta).__name__,
-            )
-            if isinstance(icw_frame, dict) and icw_frame.get("content"):
-                logging.debug("chat_completions:icw_frame has content; injecting into messages/normalized")
-                if (
-                    isinstance(messages, list)
-                    and messages
-                    and isinstance(messages[0], dict)
-                    and messages[0].get("role") == "system"
-                ):
-                    messages = [messages[0], icw_frame] + messages[1:]
-                else:
-                    messages = [icw_frame] + (messages or [])
-                logging.debug("chat_completions:messages injected len=%s", len(messages) if isinstance(messages, list) else -1)
-                if (
-                    isinstance(normalized_msgs, list)
-                    and normalized_msgs
-                    and isinstance(normalized_msgs[0], dict)
-                    and normalized_msgs[0].get("role") == "system"
-                ):
-                    normalized_msgs = [normalized_msgs[0], icw_frame] + normalized_msgs[1:]
-                else:
-                    normalized_msgs = [icw_frame] + (normalized_msgs or [])
-                logging.debug("chat_completions:normalized_msgs injected len=%s", len(normalized_msgs) if isinstance(normalized_msgs, list) else -1)
-            _trace_log_event(
-                STATE_DIR,
-                str(trace_id),
-                {
-                    "kind": "icw",
-                    "stage": "pack",
-                    "data": {
-                        "pack_hash": pack_hash,
-                        "meta": icw_meta,
-                    },
-                },
-            )
-            run_id = await _db_insert_run(trace_id=trace_id, mode=mode, seed=master_seed, pack_hash=pack_hash, request_json=body)
-            logging.debug("chat_completions:_db_insert_run run_id=%r", run_id)
-            await _db_insert_icw_log(
-                run_id=run_id,
-                pack_hash=pack_hash or None,
-                budget_tokens=int(DEFAULT_NUM_CTX),
-                scores_json={
-                    "meta": icw_meta,
-                },
-            )
-            logging.debug("chat_completions:_db_insert_icw_log done")
+
+            try:
+                run_id = await _db_insert_run(trace_id=trace_id, mode=mode, seed=master_seed, pack_hash=pack_hash, request_json=body0)
+                logging.debug("chat_completions:_db_insert_run run_id=%r", run_id)            
+            except Exception as ex:
+                log.error("chat_completions:_db_insert_run failed trace_id=%s ex=%s", trace_id, ex, exc_info=True)
+                run_id = None
             # Artifacts ledger shard (required): store step-level tool execution summaries.
             try:
-                _ledger_root = os.path.join(UPLOAD_DIR, "artifacts", "runs", str(trace_id))
+                _ledger_root = os.path.join(UPLOAD_DIR, "artifacts", "runs", trace_id)
                 logging.debug("chat_completions:ledger _ledger_root=%r", _ledger_root)
                 _ledger_shard = _art_open_shard(_ledger_root, _ledger_name, int(ARTIFACT_SHARD_BYTES))
                 logging.debug("chat_completions:ledger _art_open_shard ok shard=%r", _ledger_shard)
             except Exception as ex:
-                logging.debug("chat_completions:ledger.open.failed trace_id=%s ex=%s", str(trace_id), ex, exc_info=True)
+                logging.debug("chat_completions:ledger.open.failed trace_id=%s ex=%s", trace_id, ex, exc_info=True)
 
         # If client supplies tool results (role=tool) we include them verbatim for the planner/executors
 
@@ -8109,9 +7890,9 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         _log("planner.call", trace_id=trace_id, mode=effective_mode)
         logging.debug("chat_completions:planner.call trace_id=%s effective_mode=%s", trace_id, effective_mode)
         plan_text, tool_calls, planner_env = await produce_tool_plan(
-            normalized_msgs,
-            (body.get("tools") if isinstance(body, dict) else None),
-            float(exec_temperature),
+            messages,
+            tools_spec,
+            exec_temperature,
             trace_id=trace_id,
             mode=effective_mode,
         )
@@ -8124,11 +7905,56 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         )
         tool_calls = _normalize_tool_calls(tool_calls)
         logging.debug("chat_completions:_normalize_tool_calls len=%s", len(tool_calls) if isinstance(tool_calls, list) else -1)
-        # Hardening: enforce tool argument contract (args must be an object) and fill minimal defaults.
-        tool_calls = args_ensure_object_args(tool_calls)
-        logging.debug("chat_completions:args_ensure_object_args done len=%s", len(tool_calls) if isinstance(tool_calls, list) else -1)
-        tool_calls = args_fill_min_defaults(tool_calls, str(last_user_text or ""), log_fn=_log, trace_id=str(trace_id))
-        logging.debug("chat_completions:args_fill_min_defaults done len=%s", len(tool_calls) if isinstance(tool_calls, list) else -1)
+        # Hardening: ensure tool arguments are objects (parse JSON strings / {"_raw": "..."}), and fill minimal defaults.
+        parser_tc = JSONParser()
+        hardened_tool_calls: List[Dict[str, Any]] = []
+        for tc in tool_calls or []:
+            if not isinstance(tc, dict):
+                continue
+            nm = str(tc.get("name") or "").strip()
+            raw_args = tc.get("arguments")
+            args_obj: Dict[str, Any]
+            if isinstance(raw_args, dict):
+                raw_inner = raw_args.get("_raw")
+                if isinstance(raw_inner, str):
+                    parsed_inner = parser_tc.parse(raw_inner or "", {})
+                    if isinstance(parsed_inner, dict):
+                        args_obj = dict(parsed_inner)
+                    else:
+                        args_obj = {"_raw": raw_inner}
+                    # Overlay any explicit keys alongside _raw (do not drop them).
+                    for k, v in raw_args.items():
+                        if k == "_raw":
+                            continue
+                        args_obj[k] = v
+                else:
+                    args_obj = dict(raw_args)
+            elif isinstance(raw_args, str):
+                parsed = parser_tc.parse(raw_args or "", {})
+                args_obj = dict(parsed) if isinstance(parsed, dict) else {"_raw": raw_args}
+            elif raw_args is None:
+                args_obj = {}
+            else:
+                args_obj = {"_raw": raw_args}
+
+            if nm == "image.dispatch":
+                # Defaults-first, then overlay any provided values.
+                merged = {"negative": "", "width": 1024, "height": 1024, "steps": 32, "cfg": 5.5}
+                merged.update(args_obj or {})
+                if (not isinstance(merged.get("prompt"), str)) or not (merged.get("prompt") or "").strip():
+                    if isinstance(last_user_text, str) and last_user_text.strip():
+                        merged["prompt"] = last_user_text.strip()
+                args_obj = merged
+                _log(
+                    "planner.image.dispatch.args",
+                    trace_id=trace_id,
+                    args={k: args_obj.get(k) for k in ("prompt", "width", "height", "steps", "cfg", "negative")},
+                )
+
+            hardened_tool_calls.append({**tc, "name": nm, "arguments": args_obj})
+
+        tool_calls = hardened_tool_calls
+        logging.debug("chat_completions:tool_calls.hardened len=%s", len(tool_calls) if isinstance(tool_calls, list) else -1)
         try:
             # Deep planner/tool-call visibility: log the *shape* of tool args without dumping full prompts.
             preview: List[Dict[str, Any]] = []
@@ -8188,31 +8014,11 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             _cat_hash = ""
         else:
             _cat_hash = compute_tools_hash(body, planner_visible_only=False, planner_visible_tools=set(PLANNER_VISIBLE_TOOLS))
-        # Planner OK: continue into the full pipeline below (CO/RoE/RAG/QA/retry/compose),
+        # Planner OK: continue into the full pipeline below (CO/RAG/QA/retry/compose),
         # which owns tool execution and final response composition.
 
         # response prepared; continue to unified finalization below.
 
-        # Segment QA helpers accept a planner_callable for compatibility; wired to the unified planner entry point.
-        # Defensive: temp may be str-ish; never raise in planner callback.
-        async def planner_callable(msgs, tools, temp, tid):
-            tmp = DEFAULT_TEMPERATURE
-            try:
-                tmp = float(tmp if temp is None else temp)
-            except Exception as exc:
-                logging.warning("planner_callable: bad temperature=%r; defaulting to %r", temp, DEFAULT_TEMPERATURE, exc_info=True)
-                tmp = float(DEFAULT_TEMPERATURE)
-            if tmp < 0.0:
-                tmp = 0.0
-            if tmp > 2.0:
-                tmp = 2.0
-            return await produce_tool_plan(
-                msgs,
-                (body.get("tools") if isinstance(body, dict) else None),
-                float(tmp),
-                trace_id=str(tid or trace_id),
-                mode=effective_mode,
-            )
         pipeline_ok: bool = not abort_pipeline
 
         if (not abort_pipeline) and tool_calls:
@@ -8400,21 +8206,6 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                     if tname in ("image.dispatch", "music.infinite.windowed", "film2.run", "tts.speak"):
                         pipeline_ok = False
                         logging.debug("chat_completions:tool_loop:pipeline_ok flipped to False due_to=%r", tname)
-                    _tel_append(
-                        STATE_DIR,
-                        trace_id,
-                        {
-                            "name": tname,
-                            "ok": False,
-                            "label": "failure",
-                            "raw": {
-                                "ts": None,
-                                "ok": False,
-                                "args": (args_echo if isinstance(args_echo, dict) else {}),
-                                "error": (err_obj if isinstance(err_obj, dict) else {"code": "error", "message": str(err_obj)}),
-                            },
-                        },
-                    )
                 else:
                     logging.debug("chat_completions:tool_loop:success_branch entered")
                     arts_summary: List[Dict[str, Any]] = []
@@ -8436,21 +8227,6 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                     logging.debug("chat_completions:tool_loop:meta_type=%s", type(meta).__name__)
                     first_url = urls_this[0] if isinstance(urls_this, list) and urls_this else None
                     logging.debug("chat_completions:tool_loop:first_url=%r", first_url)
-                    _tel_append(
-                        STATE_DIR,
-                        trace_id,
-                        {
-                            "name": tname,
-                            "ok": True,
-                            "label": "success",
-                            "raw": {
-                                "ts": None,
-                                "ok": True,
-                                "args": (args_echo if isinstance(args_echo, dict) else {}),
-                                "result": {"meta": (meta if isinstance(meta, dict) else {}), "artifact_url": first_url},
-                            },
-                        },
-                    )
                     extra_results: List[Dict[str, Any]] = []
                     logging.debug("chat_completions:tool_loop:extra_results init len=%s", len(extra_results))
                     if tname == "film2.run":
@@ -8485,10 +8261,10 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                                     logging.debug("chat_completions:tool_loop:film2.run seg_results_payload append seg_id=%r len=%s", seg_id, len(seg_results_payload))
                             if seg_results_payload:
                                 logging.debug("chat_completions:tool_loop:film2.run segment_qa_and_committee call len=%s", len(seg_results_payload))
-                                _trace_append(
-                                    "film2",
+                                trace_append(
+                                    "film2.segment_qa_start",
                                     {
-                                        "event": "segment_qa_start",
+                                        "trace_id": trace_id,
                                         "tool": "film2.run",
                                         "segment_ids": [s.get("name") for s in seg_results_payload if isinstance(s, dict)],
                                         "quality_profile": profile_name,
@@ -8502,11 +8278,6 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                                     mode=effective_mode,
                                     base_url=base_url,
                                     executor_base_url=executor_endpoint,
-                                    temperature=exec_temperature,
-                                    last_user_text=last_user_text,
-                                    tool_catalog_hash=_cat_hash,
-                                    planner_callable=planner_callable,
-                                    normalize_fn=_normalize_tool_calls,
                                     absolutize_url=_abs_url,
                                     quality_profile=profile_name,
                                     max_refine_passes=refine_budget,
@@ -8548,10 +8319,10 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                                                                 if isinstance(refine_mode_val, str) and refine_mode_val:
                                                                     clip_meta["refine_mode"] = refine_mode_val
                                                                 logging.debug("chat_completions:tool_loop:film2.run marked refined sid=%r refine_mode=%r", sid, refine_mode_val)
-                                _trace_append(
-                                    "film2",
+                                trace_append(
+                                    "film2.segment_qa_result",
                                     {
-                                        "event": "segment_qa_result",
+                                        "trace_id": trace_id,
                                         "tool": "film2.run",
                                         "segment_ids": [s.get("name") for s in seg_results_payload if isinstance(s, dict)],
                                         "action": seg_outcome.get("action"),
@@ -8580,11 +8351,6 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                             mode=effective_mode,
                             base_url=base_url,
                             executor_base_url=executor_endpoint,
-                            temperature=exec_temperature,
-                            last_user_text=last_user_text,
-                            tool_catalog_hash=_cat_hash,
-                            planner_callable=planner_callable,
-                            normalize_fn=_normalize_tool_calls,
                             absolutize_url=_abs_url,
                             quality_profile=profile_name,
                             max_refine_passes=refine_budget_music,
@@ -8626,11 +8392,6 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                             mode=effective_mode,
                             base_url=base_url,
                             executor_base_url=executor_endpoint,
-                            temperature=exec_temperature,
-                            last_user_text=last_user_text,
-                            tool_catalog_hash=_cat_hash,
-                            planner_callable=planner_callable,
-                            normalize_fn=_normalize_tool_calls,
                             absolutize_url=_abs_url,
                             quality_profile=profile_name,
                             max_refine_passes=refine_budget_img,
@@ -8671,11 +8432,6 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                             mode=effective_mode,
                             base_url=base_url,
                             executor_base_url=executor_endpoint,
-                            temperature=exec_temperature,
-                            last_user_text=last_user_text,
-                            tool_catalog_hash=_cat_hash,
-                            planner_callable=planner_callable,
-                            normalize_fn=_normalize_tool_calls,
                             absolutize_url=_abs_url,
                             quality_profile=profile_name,
                             max_refine_passes=refine_budget_tts,
@@ -8716,11 +8472,6 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                             mode=effective_mode,
                             base_url=base_url,
                             executor_base_url=executor_endpoint,
-                            temperature=exec_temperature,
-                            last_user_text=last_user_text,
-                            tool_catalog_hash=_cat_hash,
-                            planner_callable=planner_callable,
-                            normalize_fn=_normalize_tool_calls,
                             absolutize_url=_abs_url,
                             quality_profile=profile_name,
                             max_refine_passes=refine_budget_sfx,
@@ -8811,10 +8562,8 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         logging.debug("chat_completions:committee patch_plan_type=%s patch_plan_len=%s", type(patch_plan).__name__, len(patch_plan) if isinstance(patch_plan, list) else -1)
         _log("committee.decision", trace_id=trace_id, action=committee_action, rationale=committee_rationale)
         _log("flow.after_committee", trace_id=trace_id, action=committee_action)
-        checkpoints_append_event(STATE_DIR, trace_id, "committee.review.final", {"summary": qa_metrics})
-        logging.debug("chat_completions:committee checkpoints_append_event review.final done")
-        checkpoints_append_event(STATE_DIR, trace_id, "committee.decision.final", {"action": committee_action})
-        logging.debug("chat_completions:committee checkpoints_append_event decision.final done")
+        _log("committee.review.final", trace_id=str(trace_id), summary=qa_metrics)
+        _log("committee.decision.final", trace_id=str(trace_id), action=committee_action)
         # Optional one-pass revision
         if committee_action == "revise" and isinstance(patch_plan, list) and patch_plan:
             logging.debug("chat_completions:committee revise branch entered patch_plan_len=%s", len(patch_plan))
@@ -8990,66 +8739,9 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         if tool_results:
             messages = [{"role": "system", "content": "Tool results:\n" + json.dumps(tool_results, indent=2)}] + messages
 
-        # 3) Executors respond independently using plan + evidence
-        evidence_blocks: List[Dict[str, Any]] = [
-            {"role": "system", "content": (
-                "Policy: Do NOT use try/except unless explicitly requested or required by an external API; let errors surface. "
-                "Do NOT set client timeouts unless explicitly requested. Do NOT use Pydantic. Do NOT use SQLAlchemy/ORM; use asyncpg + raw SQL. "
-                "Do NOT introduce or use any new library (including uvicorn/fastapi/etc.) without a LIVE web search of the OFFICIAL docs for the latest stable version (no memory/RAG), and explicit user permission. Include the doc URL."
-            )}
-        ]
-        if plan_text:
-            evidence_blocks.append({"role": "system", "content": f"Planner plan:\n{plan_text}"})
-        if tool_results:
-            evidence_blocks.append({"role": "system", "content": "Tool results:\n" + json.dumps(tool_results, indent=2)})
-        if attachments:
-            evidence_blocks.append({"role": "system", "content": "User attachments (for tools):\n" + json.dumps(attachments, indent=2)})
-        # Prompt-only lanes for executors
-        evidence_blocks.append({"role": "system", "content": (
-            "### [COMMITTEE REVIEW / SYSTEM]\n"
-            "Review the proposed plan against RoE and SUBJECT CANON. If off-subject or violating RoE, propose a one-pass prompt revision (minimal change), then proceed."
-        )})
-        evidence_blocks.append({"role": "system", "content": (
-            "### [FINALITY / SYSTEM]\n"
-            "Do not output assistant content until committee consensus. Output one final answer only."
-        )})
-        evidence_blocks.append({"role": "system", "content": (
-            "### [TOOLS CONTEXT / SYSTEM]\n"
-            "Fit tools into 18–20% of C. Summarize valid tool NAMES only and the most recent outcomes in one-liners."
-        )})
-        evidence_blocks.append({"role": "system", "content": (
-            "### [LIGHT QA / SYSTEM]\n"
-            "After artifacts, briefly self-check: Subject fidelity (≥60% tokens present when applicable) and RoE hygiene (URLs only /uploads/artifacts/...; no local Comfy links). "
-            "If mismatches are minor, list Warnings: lines and optionally propose a one-line re-prompt for next time."
-        )})
-        evidence_blocks.append({"role": "system", "content": (
-            "### [PYTHON INDENTATION SELF-CHECK / SYSTEM]\n"
-            "Before finalizing any Python code:\n"
-            "- Scan your answer mentally for any \"\\t\" characters and remove them.\n"
-            "- Ensure all indentation is in 4-space blocks."
-        )})
-        evidence_blocks.append({"role": "system", "content": (
-            "### [COMPOSE / SYSTEM]\n"
-            "Produce the final assistant message in English only. Do NOT output JSON, logs, traces, or an Assets: block; the system will append asset URLs automatically when available. "
-            "If minor issues: add Warnings:. Append Applied RoE: with 1–3 short items actually followed. Keep output concise and useful."
-        )})
-        evidence_blocks.append({"role": "system", "content": (
-            "### [SUBJECT CANON / SYSTEM — tail with RoE]\n"
-            "If the user mentions Shadow (Sonic), treat subject as \"Shadow the Hedgehog\" (SEGA) unless explicitly negated. "
-            "In any image.dispatch prompt, include the literal name and ≥60% of these tokens: black hedgehog; red stripes on quills/arms; upward-swept quills; red eyes; white chest tuft; gold inhibitor rings (wrists/ankles); hover shoes (red/white/black, jet glow). "
-            "Prefer futuristic/city/space-lab scenes unless the user requests otherwise. Add negatives to avoid off-topic silhouettes/forests."
-        )})
-        evidence_blocks.append({"role": "system", "content": (
-            "### [RoE DIGEST / SYSTEM — tail]\n"
-            "Rules of Engagement (5–10% of C; never omit). Self-check against RoE during planning/execution/answering."
-        )})
-        # If tool results include errors, nudge executors to include brief, on-topic suggestions
-        exec_messages = evidence_blocks + messages
+        # No context orchestration: pass messages directly to committee.
+        exec_messages = list(messages or [])
         exec_messages_current = exec_messages
-        if any(isinstance(r, dict) and r.get("error") for r in tool_results or []):
-            exec_messages = exec_messages + [{"role": "system", "content": (
-                "If the tool results above contain errors that block the user's goal, include a short 'Suggestions' section (max 2 bullets) with specific, on-topic fixes (e.g., missing parameter defaults, retry guidance). Keep it brief and avoid scope creep."
-            )}]
 
         # Idempotency fast-path disabled to prevent early returns; defer any cached reuse to finalization if desired
 
@@ -9057,8 +8749,8 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         try:
             llm_env = await committee_ai_text(
                 exec_messages,
-                trace_id=str(trace_id or "executor_summary"),
-                temperature=body.get("temperature") or DEFAULT_TEMPERATURE,
+                trace_id=f"{str(trace_id).strip() or 'tt_unknown'}.executor_summary",
+                temperature=exec_temperature,
             )
         except Exception as ex:
             _log(
@@ -9163,197 +8855,14 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             )
             # Do not modify model texts here; the final composer will only append status
 
-        # 5) Final synthesis via CO (compose). Build CO frames, insert FINALITY + LIGHT QA + COMPOSE before RoE tail.
-        _compose_instruction = (
-            "Produce the final, corrected answer, incorporating critiques and evidence. "
-            "Be unambiguous, include runnable code when requested, and prefer specific citations to tool results."
-        )
-        # subject canon and RoE digest now imported at module top
-        _subject_canon_final = _resolve_subject_canon(last_user_text)
-        _roe_prev = _roe_load(STATE_DIR, trace_id)
-        co_env_final = {
-            "schema_version": 1,
-            "trace_id": trace_id,
-            "call_kind": "compose",
-            "model_caps": {"num_ctx": DEFAULT_NUM_CTX},
-            "user_turn": {"role": "user", "content": _compose_instruction},
-            "history": exec_messages_current,
-            "attachments": [],
-            "tool_memory": [],
-            "rag_hints": [],
-            "roe_incoming_instructions": (_roe_prev or []),
-            "subject_canon": _subject_canon_final,
-            "percent_budget": {"icw_pct": [65, 70], "tools_pct": [18, 20], "roe_pct": [5, 10], "misc_pct": [3, 5], "buffer_pct": 5},
-            "sweep_plan": ["0-90", "30-120", "60-150+wrap"],
-            "tools_names": [],
-            "tools_recent_lines": [],
-            "tsl_blocks": [],
-            "tel_blocks": [],
-        }
-        _log("compose.start", trace_id=trace_id, tool_results_count=len(tool_results or []))
-        try:
-            co_out_final = _co_pack(co_env_final)
-        except Exception as ex:
-            _log(
-                "compose.co_pack.error",
-                trace_id=trace_id,
-                error=str(ex),
-            )
-            co_out_final = {"frames": [], "ratio_telemetry": {}, "roe_digest": []}
-
-        # Persist updated RoE digest for continuity across turns
-        try:
-            _roe_save(STATE_DIR, trace_id, co_out_final.get("roe_digest") or [])
-        except Exception as ex:
-            _log(
-                "compose.roe_save.error",
-                trace_id=trace_id,
-                error=str(ex),
-            )
-
-        try:
-            frames_final = _co_frames_to_msgs(co_out_final.get("frames") or [])
-        except Exception as ex:
-            _log(
-                "compose.co_frames_to_msgs.error",
-                trace_id=trace_id,
-                error=str(ex),
-            )
-            frames_final = []
-
-        _rtf = co_out_final.get("ratio_telemetry") or {}
-        _log("co.pack", trace_id=trace_id, call_kind="compose", alloc=_rtf.get("alloc"), used_pct=_rtf.get("used_pct"), free_pct=_rtf.get("free_pct"))
-        _finality = {"role": "system", "content": (
-            "### [FINALITY / SYSTEM]\n"
-            "Return exactly one final assistant message only, written in English. No other languages are allowed."
-        )}
-        _light_qa = {"role": "system", "content": (
-            "### [LIGHT QA / SYSTEM]\n"
-            "After artifacts, briefly self-check: subject fidelity (≥60% tokens present?), RoE hygiene (URLs only /uploads/artifacts/...; no local links). "
-            "If mismatches are minor, list Warnings: in the final text and optionally propose a one-line re-prompt."
-        )}
-        _compose = {"role": "system", "content": (
-            "### [COMPOSE / SYSTEM]\n"
-            "Produce the final, corrected answer in English only. Do NOT output JSON, logs, or traces (no chat.start, exec.payload.pre, Comfy.submit, Comfy.poll, or similar). "
-            "Do NOT invent or include any Assets: block or /uploads/artifacts/... URLs; the system will append asset URLs automatically when available. "
-            "If any tools in the Tool results block failed (ok:false or with an error object), clearly explain which tool(s) failed, show their error codes and status values, and include a short (possibly truncated) stack-trace snippet when available. "
-            "Also describe any artifacts that did succeed so the user understands partial progress. "
-            "If minor issues only: add Warnings: lines; keep the answer helpful. Append Applied RoE: with 1–3 short items actually followed."
-        )}
-        if frames_final:
-            _head = frames_final[:-1]
-            _tail = frames_final[-1:]
-            # NOTE: synthesis prompt construction is owned by committee_client.
-            # chat_completions must NOT build "candidate answers" / "critiques" prompts.
-            final_request = _head + [_finality, _light_qa, _compose] + _tail
-        else:
-            final_request = [_finality, _light_qa, _compose, {"role": "user", "content": _compose_instruction}]
-
-        # Final synthesis also goes through the committee path.
-        try:
-            synth_env = await committee_ai_text(
-                final_request,
-                trace_id=str(trace_id or "compose_final"),
-                temperature=body.get("temperature") or DEFAULT_TEMPERATURE,
-            )
-        except Exception as ex:
-            _log(
-                "compose.committee_call.error",
-                trace_id=trace_id,
-                error=str(ex),
-            )
-            pipeline_ok = False
-            synth_env = {
-                "ok": False,
-                "error": {
-                    "code": "compose_committee_exception",
-                    "message": str(ex),
-                },
-            }
-        final_text = ""
-        # Prefer the structured synth result when available.
-        if isinstance(synth_env, dict) and synth_env.get("ok"):
-            res_syn = synth_env.get("result") or {}
-            if isinstance(res_syn, dict):
-                synth_struct = res_syn.get("synth")
-                if isinstance(synth_struct, dict):
-                    # Keep the full synth envelope (including usage) for downstream accounting.
-                    synth_result = dict(synth_struct)
-                    text_candidate = synth_result.get("response") or res_syn.get("text")
-                else:
-                    text_candidate = res_syn.get("text")
-                if isinstance(text_candidate, str):
-                    final_text = text_candidate or ""
-        if not final_text:
-            final_text = qwen_text or glm_text or deepseek_text or ""
+        # No CO compose step: take the committee result directly as the final text.
+        final_text = qwen_text or glm_text or deepseek_text or ""
         # Append discovered asset URLs from tool results so users see concrete outputs inline.
         # Do NOT synthesize or reuse artifacts from unrelated runs; only attach URLs that
         # actually come from the current tool_results set.
         # NOTE: asset URLs are appended centrally at the end (single source of truth).
 
-        if body.get("stream"):
-            # Precompute usage and planned stage events for trace
-            usage_stream = estimate_usage(messages, final_text)
-            planned_events: List[Dict[str, Any]] = []
-            planned_events.append({"stage": "plan", "ok": True})
-            has_film = any(isinstance(tc, dict) and str(tc.get("name", "")).startswith("film_") for tc in (tool_calls or []))
-            if has_film:
-                for st in ("breakdown", "storyboard", "animatic"):
-                    planned_events.append({"stage": st})
-            for tc in (tool_calls or [])[:20]:
-                name = tc.get("name") or tc.get("function", {}).get("name")
-                args = tc.get("arguments") or tc.get("args") or {}
-                if name == "film_add_scene":
-                    planned_events.append({"stage": "final", "shot_id": args.get("index_num") or args.get("scene_id")})
-                if name == "frame_interpolate":
-                    planned_events.append({"stage": "post", "op": "frame_interpolate", "factor": args.get("factor")})
-                if name == "upscale":
-                    planned_events.append({"stage": "post", "op": "upscale", "scale": args.get("scale")})
-                if name == "film_compile":
-                    planned_events.append({"stage": "export"})
-            if isinstance(plan_text, str) and ("qc" in plan_text.lower() or "quality" in plan_text.lower()):
-                planned_events.append({"stage": "qc"})
-
-            # Fire-and-forget teacher trace for streaming path as well (no try/except)
-            req_dict = dict(body)
-            msgs_for_seed = json.dumps(req_dict.get("messages", []), ensure_ascii=False, separators=(",", ":"))
-            provided_seed3 = None
-            if isinstance(body.get("seed"), (int, float)):
-                try:
-                    provided_seed3 = int(body.get("seed"))
-                except Exception as exc:
-                    logging.warning(
-                        "chat_completions: bad seed=%r; ignoring and deriving from messages",
-                        body.get("seed"),
-                        exc_info=True,
-                    )
-            master_seed = provided_seed3 if provided_seed3 is not None else _derive_seed("chat", msgs_for_seed)
-            seed_router = det_seed_router(trace_id, master_seed)
-            # Mirror planner routing decision from the unified planner entry point (plan.committee.produce_tool_plan) for trace metadata.
-            _use_qwen = str(PLANNER_MODEL or "qwen").lower().startswith("qwen")
-            planner_id = QWEN_MODEL_ID if _use_qwen else GLM_MODEL_ID
-            label_cfg = (WRAPPER_CONFIG.get("teacher") or {}).get("default_label")
-            # Normalize tool_calls shape for teacher (use args, not arguments)
-            _warn_double_wrapped_tool_results(tool_results or [])
-            _tc = _merge_tool_exec_meta_from_tool_results(tool_exec_meta, tool_results)
-            trace_payload_stream = {
-                "label": label_cfg or "exp_default",
-                "seed": master_seed,
-                "request": {"messages": req_dict.get("messages", []), "tools_allowed": [t.get("function", {}).get("name") for t in (body.get("tools") or []) if isinstance(t, dict)]},
-                "context": ({"pack_hash": pack_hash} if ("pack_hash" in locals() and pack_hash) else {}),
-                "routing": {"planner_model": planner_id, "executors": [QWEN_MODEL_ID, GLM_MODEL_ID, DEEPSEEK_CODER_MODEL_ID], "seed_router": seed_router},
-                "tool_calls": _tc,
-                "response": {"text": (final_text or "")[:4000]},
-                "metrics": usage_stream,
-                "env": {"public_base_url": PUBLIC_BASE_URL, "config_hash": WRAPPER_CONFIG_HASH},
-                "privacy": {"vault_refs": 0, "secrets_in": 0, "secrets_out": 0},
-                "events": planned_events[:64],
-            }
-            # Blocking trace emission (NO background tasks allowed).
-            await _send_trace_stream_async(trace_payload_stream)
-            checkpoints_append_event(STATE_DIR, trace_id, "halt", {"kind": "committee", "chars": len(final_text)})
-            # Do not stream; proceed to build the full final response below
-
+        
         # Merge exact usages if available, else approximate
         usage = merge_usages([
             qwen_result.get("_usage"),
@@ -9369,15 +8878,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
 
         # Ensure clean markdown content: collapse excessive whitespace but keep newlines
         cleaned = final_text.replace('\r\n', '\n')
-        # If the planner synthesis is empty or trivially short, fall back to merged model answers as the main body
-        if _is_trivial(cleaned):
-            merged_main = []
-            if (qwen_text or '').strip():
-                merged_main.append("### Qwen\n" + qwen_text.strip())
-            if (glm_text or '').strip():
-                merged_main.append("### GLM4-9B\n" + glm_text.strip())
-            if merged_main:
-                cleaned = "\n\n".join(merged_main)
+        
         # NOTE: asset URLs are appended centrally at the end (single source of truth).
         # If tools/plan/critique exist, wrap them into a hidden metadata block and present a concise final answer
         meta_sections: List[str] = []
@@ -9471,7 +8972,15 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         looks_refusal = any(tok in text_lower for tok in refusal_markers)
         display_content = f"{cleaned}{footer}"
         try:
-            checkpoints_append_event(STATE_DIR, trace_id, "response", {"trace_id": trace_id, "seed": int(master_seed), "pack_hash": pack_hash, "route_mode": route_mode, "tool_results_count": len(tool_results or []), "content_preview": (display_content or "")[:800]})
+            _log(
+                "response",
+                trace_id=str(trace_id),
+                seed=int(master_seed),
+                pack_hash=pack_hash,
+                route_mode=route_mode,
+                tool_results_count=int(len(tool_results or [])),
+                content_preview=(display_content or "")[:800],
+            )
         except Exception as ex:
             logging.warning("final.response.checkpoint_failed: %s", ex, exc_info=True)
         # Provide an appendix with raw model answers to avoid any perception of truncation
@@ -9635,19 +9144,15 @@ async def chat_completions(body: Dict[str, Any], request: Request):
 
         # Fire-and-forget: Teacher trace tap (if reachable)
         # Build trace payload (errors here will surface)
-        if isinstance(body, dict):
-            req_dict = dict(body)
-        else:
-            req_dict = body.dict()
-        msgs_for_seed = json.dumps(req_dict.get("messages", []), ensure_ascii=False, separators=(",", ":"))
+        msgs_for_seed = json.dumps(messages, ensure_ascii=False, separators=(",", ":"))
         provided_seed2 = None
-        if isinstance(req_dict.get("seed"), (int, float)):
+        if isinstance(body0.get("seed"), (int, float)):
             try:
-                provided_seed2 = int(req_dict.get("seed"))
+                provided_seed2 = int(body0.get("seed"))
             except Exception as exc:
                 logging.warning(
                     "chat_completions: bad seed=%r (teacher tap); deriving from messages",
-                    req_dict.get("seed"),
+                    body0.get("seed"),
                     exc_info=True,
                 )
         master_seed = provided_seed2 if provided_seed2 is not None else _derive_seed("chat", msgs_for_seed)
@@ -9659,29 +9164,27 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         _use_qwen2 = str(PLANNER_MODEL or "qwen").lower().startswith("qwen")
         planner_id = QWEN_MODEL_ID if _use_qwen2 else GLM_MODEL_ID
         # Prefer the last assistant message from the final envelope's result.messages
-        # (excludes RoE/system tails) when available; otherwise fall back to the
+        # (excludes system tails) when available; otherwise fall back to the
         # composed display_content used for the OpenAI response.
         response_text_for_teacher = display_content or ""
-        if isinstance(final_env, dict):
-            res_block = final_env.get("result")
-            msgs_block = res_block.get("messages") if isinstance(res_block, dict) else None
-            if isinstance(msgs_block, list):
-                last_assistant: str | None = None
-                for m in msgs_block:
-                    if not isinstance(m, dict):
-                        continue
-                    if m.get("role") != "assistant":
-                        continue
-                    content = m.get("content")
-                    if isinstance(content, str) and content.strip():
-                        last_assistant = content
-                if isinstance(last_assistant, str) and last_assistant.strip():
-                    response_text_for_teacher = last_assistant
+        res_block = final_env.get("result") if isinstance(final_env.get("result"), dict) else {}
+        msgs_block = res_block.get("messages") if isinstance(res_block.get("messages"), list) else []
+        last_assistant: str | None = None
+        for m in msgs_block:
+            if not isinstance(m, dict):
+                continue
+            if m.get("role") != "assistant":
+                continue
+            content = m.get("content")
+            if isinstance(content, str) and content.strip():
+                last_assistant = content
+        if isinstance(last_assistant, str) and last_assistant.strip():
+            response_text_for_teacher = last_assistant
 
         trace_payload = {
             "label": label_cfg or "exp_default",
             "seed": master_seed,
-            "request": {"messages": req_dict.get("messages", []), "tools_allowed": [t.get("function", {}).get("name") for t in (body.get("tools") or []) if isinstance(t, dict)]},
+            "request": {"messages": messages, "tools_allowed": tools_allowed},
             "context": ({"pack_hash": pack_hash} if pack_hash else {}),
             "routing": {"planner_model": planner_id, "executors": [QWEN_MODEL_ID, GLM_MODEL_ID, DEEPSEEK_CODER_MODEL_ID], "seed_router": det_seed_router(trace_id, master_seed)},
             "tool_calls": _tc2,
@@ -9738,7 +9241,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             response_art.setdefault("assets", urls_out)
             response_art.setdefault("items", items_out)
     except Exception:
-        logging.getLogger("orchestrator.api").debug("failed to attach artifacts to response (non-fatal)", exc_info=True)
+        log.debug("failed to attach artifacts to response (non-fatal)", exc_info=True)
 
     # Always append assets URLs to the visible assistant content (avoid double-appends).
     try:
@@ -9750,9 +9253,9 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 try:
                     response["choices"][0]["message"]["content"] = msg0
                 except Exception:
-                    logging.getLogger("orchestrator.api").debug("failed to mutate response message content for assets (non-fatal)", exc_info=True)
+                    log.debug("failed to mutate response message content for assets (non-fatal)", exc_info=True)
     except Exception:
-        logging.getLogger("orchestrator.api").debug("failed to append assets to visible content (non-fatal)", exc_info=True)
+        log.debug("failed to append assets to visible content (non-fatal)", exc_info=True)
 
     # Unified local trace only; no background network calls
     try:
@@ -9762,9 +9265,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     emit_trace(STATE_DIR, trace_id, "chat.finish", {"ok": bool(response.get("ok")), "message_len": len(display_content or ""), "usage": usage or {}})
     if run_id is not None:
         await _db_update_run_response(run_id, response, usage)
-        checkpoints_append_event(STATE_DIR, trace_id, "halt", {"kind": "committee", "chars": len(display_content)})
-    if _lock_token:
-        trace_release_lock(STATE_DIR, trace_id)
+        _log("halt", trace_id=str(trace_id), kind="committee", chars=int(len(display_content)))
     _trace_response(trace_id, response)
     return _json_response(response)
 
@@ -10037,9 +9538,14 @@ async def http_tool_run(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
                 error_out.setdefault("trace_id", env.get("trace_id"))
             error_out.setdefault("body", raw_body)
             error_out.setdefault("stack_local", "".join(traceback.format_stack()))
+            trace_id = str(trace_id).strip()
+            if not trace_id:
+                trace_id = str(error_out.get("trace_id") or "").strip()
+            if not trace_id:
+                trace_id = "tt_unknown"
             _log(
                 "toolrun.http.error",
-                trace_id=trace_id or str(error_out.get("trace_id") or ""),
+                trace_id=trace_id,
                 tool=str(name),
                 url=str(url),
                 status_code=int(r.status_code),
@@ -10093,9 +9599,15 @@ async def tools_append(body: Dict[str, Any], request: Request):
                 # Never allow tracing to break ingestion.
                 pass
             if row.get("event") == "exec_step_start":
-                checkpoints_append_event(STATE_DIR, str(trace_id), "exec_step_start", {"tool": row.get("tool"), "step_id": row.get("step_id")})
+                _log("exec_step_start", trace_id=str(trace_id), tool=row.get("tool"), step_id=row.get("step_id"))
             if row.get("event") == "exec_step_finish":
-                checkpoints_append_event(STATE_DIR, str(trace_id), "exec_step_finish", {"tool": row.get("tool"), "step_id": row.get("step_id"), "ok": bool(row.get("ok"))})
+                _log(
+                    "exec_step_finish",
+                    trace_id=str(trace_id),
+                    tool=row.get("tool"),
+                    step_id=row.get("step_id"),
+                    ok=bool(row.get("ok")),
+                )
             if row.get("event") == "exec_step_attempt":
                 _att_raw = row.get("attempt")
                 try:
@@ -10103,7 +9615,7 @@ async def tools_append(body: Dict[str, Any], request: Request):
                 except Exception as ex:
                     logging.warning("trace.append: bad attempt=%r; defaulting to 0", _att_raw, exc_info=True)
                     _att = 0
-                checkpoints_append_event(STATE_DIR, str(trace_id), "exec_step_attempt", {"tool": row.get("tool"), "step_id": row.get("step_id"), "attempt": _att})
+                _log("exec_step_attempt", trace_id=str(trace_id), tool=row.get("tool"), step_id=row.get("step_id"), attempt=_att)
             if row.get("event") == "exec_plan_start":
                 _steps_raw = row.get("steps")
                 try:
@@ -10111,13 +9623,13 @@ async def tools_append(body: Dict[str, Any], request: Request):
                 except Exception as ex:
                     logging.warning("trace.append: bad steps=%r; defaulting to 0", _steps_raw, exc_info=True)
                     _steps = 0
-                checkpoints_append_event(STATE_DIR, str(trace_id), "exec_plan_start", {"steps": _steps})
+                _log("exec_plan_start", trace_id=str(trace_id), steps=_steps)
             if row.get("event") == "exec_plan_finish":
-                checkpoints_append_event(STATE_DIR, str(trace_id), "exec_plan_finish", {"produced_keys": (row.get("produced_keys") or [])})
+                _log("exec_plan_finish", trace_id=str(trace_id), produced_keys=(row.get("produced_keys") or []))
             if row.get("event") == "exec_batch_start":
-                checkpoints_append_event(STATE_DIR, str(trace_id), "exec_batch_start", {"items": (row.get("items") or [])})
+                _log("exec_batch_start", trace_id=str(trace_id), items=(row.get("items") or []))
             if row.get("event") == "exec_batch_finish":
-                checkpoints_append_event(STATE_DIR, str(trace_id), "exec_batch_finish", {"items": (row.get("items") or [])})
+                _log("exec_batch_finish", trace_id=str(trace_id), items=(row.get("items") or []))
             if bool(row.get("ok") is True) and row.get("event") == "end":
                 distilled = {
                     "t": 0,
@@ -10140,7 +9652,7 @@ async def tools_append(body: Dict[str, Any], request: Request):
                     distilled["duration_ms"] = 0
                 if isinstance(row.get("summary"), dict):
                     distilled["summary"] = row.get("summary")
-                checkpoints_append_event(STATE_DIR, str(trace_id), "tool_summary", distilled)
+                _log("tool_summary", trace_id=str(trace_id), **distilled)
                 # Compact artifact entries inferred from summary (no stack traces)
                 try:
                     s = row.get("summary") or {}
@@ -10152,7 +9664,7 @@ async def tools_append(body: Dict[str, Any], request: Request):
                             logging.warning("trace.append: bad images_count=%r; defaulting to 0", _ic_raw, exc_info=True)
                             _ic = 0
                         if _ic > 0:
-                            checkpoints_append_event(STATE_DIR, str(trace_id), "artifact_summary", {"kind": "image", "count": _ic})
+                            _log("artifact_summary", trace_id=str(trace_id), kind="image", count=_ic)
                         _vc_raw = s.get("videos_count")
                         try:
                             _vc = int(_vc_raw or 0)
@@ -10160,7 +9672,7 @@ async def tools_append(body: Dict[str, Any], request: Request):
                             logging.warning("trace.append: bad videos_count=%r; defaulting to 0", _vc_raw, exc_info=True)
                             _vc = 0
                         if _vc > 0:
-                            checkpoints_append_event(STATE_DIR, str(trace_id), "artifact_summary", {"kind": "video", "count": _vc})
+                            _log("artifact_summary", trace_id=str(trace_id), kind="video", count=_vc)
                         _wb_raw = s.get("wav_bytes")
                         try:
                             _wb = int(_wb_raw or 0)
@@ -10168,7 +9680,7 @@ async def tools_append(body: Dict[str, Any], request: Request):
                             logging.warning("trace.append: bad wav_bytes=%r; defaulting to 0", _wb_raw, exc_info=True)
                             _wb = 0
                         if _wb > 0:
-                            checkpoints_append_event(STATE_DIR, str(trace_id), "artifact_summary", {"kind": "audio", "bytes": _wb})
+                            _log("artifact_summary", trace_id=str(trace_id), kind="audio", bytes=_wb)
                 except Exception as ex:
                     logging.warning("artifact summary distillation failed: %s", ex, exc_info=True)
             # Forward review WS events to connected client if present

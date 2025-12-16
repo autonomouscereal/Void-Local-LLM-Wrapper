@@ -8,8 +8,7 @@ from io import BytesIO
 from .common import now_ts, ensure_dir, sidecar, stamp_env
 from ..determinism.seeds import stamp_tool_args
 from ..artifacts.manifest import add_manifest_row
-from ..jsonio.normalize import normalize_to_envelope
-from ..jsonio.versioning import bump_envelope, assert_envelope
+from void_envelopes import normalize_to_envelope, bump_envelope, assert_envelope
 
 
 def _sine_wav_bytes(freq: float, length_s: float, sample_rate: int = 22050) -> bytes:

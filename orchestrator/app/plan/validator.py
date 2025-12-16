@@ -5,7 +5,7 @@ from typing import Dict, Any, List
 
 from .catalog import REQUIRED_INPUTS
 
-log = logging.getLogger("orchestrator.plan.validator")
+log = logging.getLogger(__name__)
 
 def validate_plan(plan: Dict[str, Any]) -> List[Dict[str, Any]]:
     errors: List[Dict[str, Any]] = []

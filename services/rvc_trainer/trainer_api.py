@@ -38,14 +38,14 @@ try:
         ],
         force=True,
     )
-    logging.getLogger("rvc_trainer.logging").info(
+    logging.getLogger(__name__).info(
         "rvc_trainer logging configured file=%r level=%s", _log_file, logging.getLevelName(_lvl)
     )
 except Exception as _ex:
     logging.basicConfig(level=logging.INFO, stream=sys.stdout)
-    logging.getLogger("rvc_trainer.logging").warning("rvc_trainer file logging disabled: %s", _ex, exc_info=True)
+    logging.getLogger(__name__).warning("rvc_trainer file logging disabled: %s", _ex, exc_info=True)
 
-log = logging.getLogger("rvc_trainer")
+log = logging.getLogger(__name__)
 
 try:
     from speechbrain.pretrained import EncoderClassifier

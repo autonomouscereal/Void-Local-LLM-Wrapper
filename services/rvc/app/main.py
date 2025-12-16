@@ -45,10 +45,10 @@ try:
         ],
         force=True,
     )
-    logging.getLogger("rvc.logging").info("rvc logging configured file=%r level=%s", _log_file, logging.getLevelName(_lvl))
+    logging.getLogger(__name__).info("rvc logging configured file=%r level=%s", _log_file, logging.getLevelName(_lvl))
 except Exception as _ex:
     logging.basicConfig(level=logging.INFO, stream=sys.stdout)
-    logging.getLogger("rvc.logging").warning("rvc file logging disabled: %s", _ex, exc_info=True)
+    logging.getLogger(__name__).warning("rvc file logging disabled: %s", _ex, exc_info=True)
 
 REGISTRY_PATH = os.getenv("RVC_REGISTRY_PATH", "/rvc/assets/registry.json")
 os.makedirs(os.path.dirname(REGISTRY_PATH), exist_ok=True)

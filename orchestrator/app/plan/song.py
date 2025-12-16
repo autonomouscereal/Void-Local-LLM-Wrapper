@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import os
 import json
+import logging
 from typing import Any, Dict, List, Optional
 
 from ..json_parser import JSONParser
 from ..pipeline.compression_orchestrator import co_pack, frames_to_string
-from ..datasets.trace import append_sample as _trace_append
+from ..tracing.runtime import trace_event
 from ..committee_client import CommitteeClient, committee_jsonify, _schema_to_template
+
+# Single logger per module (no custom logger names)
+log = logging.getLogger(__name__)
 
 
 # Expected Song Graph shape for coercion. This is intentionally minimal and
@@ -122,7 +126,7 @@ async def plan_song_graph(
     bpm: Optional[int],
     key: Optional[str],
     *,
-    trace_id: Optional[str] = None,
+    trace_id: str,
     music_profile: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
@@ -137,8 +141,7 @@ async def plan_song_graph(
         _ls = int(length_s) if length_s is not None else 0
         approx_len = _ls if _ls > 0 else 30
     except Exception as exc:
-        import logging
-        logging.getLogger("orchestrator.plan.song").warning(
+        log.warning(
             "plan_song_graph: bad length_s=%r; defaulting to 30",
             length_s,
             exc_info=True,
@@ -149,7 +152,7 @@ async def plan_song_graph(
 
     co_env = {
         "schema_version": 1,
-        "trace_id": str(trace_id or ""),
+        "trace_id": str(trace_id).strip(),
         "call_kind": "planner",
         "model_caps": {"num_ctx": 8192},
         "user_turn": {"role": "user", "content": text},
@@ -157,12 +160,10 @@ async def plan_song_graph(
         "attachments": [],
         "tool_memory": [],
         "rag_hints": [],
-        "roe_incoming_instructions": [],
         "subject_canon": {},
         "percent_budget": {
             "icw_pct": [65, 70],
             "tools_pct": [18, 20],
-            "roe_pct": [5, 10],
             "misc_pct": [3, 5],
             "buffer_pct": 5,
         },
@@ -205,9 +206,7 @@ async def plan_song_graph(
     song: Dict[str, Any] = {}
     if not isinstance(env, dict) or not env.get("ok"):
         # Log committee failure instead of silently returning an empty song graph.
-        import logging
-
-        logging.getLogger("orchestrator.plan.song").error(
+        log.error(
             "plan_song_graph committee failed (trace_id=%s): env=%r",
             trace_id,
             env,
@@ -233,10 +232,9 @@ async def plan_song_graph(
             lyrics_sections = lyrics_obj.get("sections") if isinstance(lyrics_obj.get("sections"), list) else []
             motifs = song_obj.get("motifs") if isinstance(song_obj.get("motifs"), list) else []
             voices = song_obj.get("voices") if isinstance(song_obj.get("voices"), list) else []
-            _trace_append(
-                "music",
+            trace_event(
+                "planner.song_graph.plan",
                 {
-                    "event": "music.song_graph.plan",
                     "trace_id": trace_id,
                     "length_s": approx_len,
                     "bpm": bpm_val,

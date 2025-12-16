@@ -6,7 +6,7 @@ import logging
 from .registry import create_ref, refine_ref, list_refs, load_manifest
 from .embeds import compute_face_embeddings, compute_voice_embedding, compute_music_embedding
 from ..analysis.media import analyze_audio
-from ..datasets.trace import append_sample as _trace_append
+from ..tracing.runtime import trace_event
 
 log = logging.getLogger(__name__)
 
@@ -174,10 +174,9 @@ def post_refs_music_profile(body: Dict[str, Any]) -> Dict[str, Any]:
         "keys": key_histogram,
         "tracks": metrics,
     }
-    _trace_append(
-        "music",
+    trace_event(
+        "refs.music.build_profile",
         {
-            "event": "refs.music.build_profile",
             "ref_ids": ref_ids,
             "tracks_count": len(tracks),
             "bpm_range": bpm_range,
