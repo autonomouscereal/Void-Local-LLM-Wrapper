@@ -7896,7 +7896,7 @@ def _as_float(v: Any, default: float = 0.0) -> float:
 async def chat_completions(body: Dict[str, Any], request: Request):
     env = await committee_ai_text(messages=(body.get("messages") or []), trace_id=uuid.uuid4().hex)
     log.debug(f"chat_completions:env={env}")
-    log.debug(f"chat_completions:produce_tool_plan={await produce_tool_plan(messages=(body.get("messages") or []), tools=(body.get("tools") or []), temperature=body.get("temperature", 0.0), trace_id=uuid.uuid4().hex, mode="general")}")
+    log.debug(f"produce_tool_plan:env={produce_tool_plan(messages=(body.get("messages") or []), trace_id=uuid.uuid4().hex)}")
     return JSONResponse(content=env, status_code=200)
 
 
@@ -7938,14 +7938,10 @@ async def chat_completions2(body: Dict[str, Any], request: Request):
 
     # Normalize request shapes once (avoid repeated isinstance checks throughout chat_completions)
     body0: Dict[str, Any] = body if isinstance(body, dict) else {}
-    tools_spec_raw = body0.get("tools")
-    tools_spec: List[Dict[str, Any]] = [t for t in tools_spec_raw if isinstance(t, dict)] if isinstance(tools_spec_raw, list) else []
-    tools_allowed: List[str] = []
-    for t in tools_spec:
-        fn = t.get("function") if isinstance(t.get("function"), dict) else {}
-        nm = fn.get("name") if isinstance(fn.get("name"), str) else ""
-        if nm:
-            tools_allowed.append(nm)
+    # Tools are NOT accepted from the client request body in this project.
+    # The planner always uses the internal, fixed tool catalog.
+    tools_spec: Optional[List[Dict[str, Any]]] = None
+    tools_allowed: List[str] = sorted(list(catalog_allowed(get_builtin_tools_schema)))
     _temp_raw = body0.get("temperature")
     exec_temperature = _as_float(DEFAULT_TEMPERATURE if _temp_raw is None else _temp_raw, float(DEFAULT_TEMPERATURE))
     # Clamp to OpenAI-compatible range.
@@ -8089,7 +8085,7 @@ async def chat_completions2(body: Dict[str, Any], request: Request):
         try:
             plan_text, tool_calls, planner_env = await produce_tool_plan(
                 messages=messages,
-                tools=tools_spec,
+                tools=None,
                 temperature=exec_temperature,
                 trace_id=trace_id,
                 mode=effective_mode,
