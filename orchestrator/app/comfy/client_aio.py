@@ -18,6 +18,8 @@ BASE = (
     or "http://comfyui:8188"
 ).rstrip("/")
 
+log = logging.getLogger(__name__)
+
 
 async def comfy_submit(graph: Dict[str, Any], client_id: Optional[str] = None, ws=None) -> Dict[str, Any]:
     comfy_client_id = client_id or str(uuid.uuid4())
@@ -28,7 +30,7 @@ async def comfy_submit(graph: Dict[str, Any], client_id: Optional[str] = None, w
     try:
         Path("/tmp/last_comfy_payload.json").write_bytes(body_bytes)
     except Exception:
-        pass
+        log.debug("[comfy.submit] failed to persist /tmp/last_comfy_payload.json (non-fatal)", exc_info=True)
     async with aiohttp.ClientSession(trust_env=False) as s:
         async with s.post(f"{BASE}/prompt", data=body_bytes, headers={"Content-Type": "application/json"}) as r:
             text = await r.text()
@@ -47,7 +49,7 @@ async def comfy_submit(graph: Dict[str, Any], client_id: Optional[str] = None, w
                         await ws.send_json({"type": "error", "source": "comfy", "body": text[:500]})
                         await ws.close(code=1000)
                     except Exception:
-                        pass
+                        log.debug("[comfy.submit] ws error reporting failed (non-fatal)", exc_info=True)
                 return err
             parser = JSONParser()
             schema = {"prompt_id": str, "uuid": str, "id": str}

@@ -41,11 +41,13 @@ services:
     environment:
       - NVIDIA_VISIBLE_DEVICES=${MUSIC_GPU:-all}
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - LOG_DIR=/workspace/logs
     network_mode: host
     expose:
       - "7861"
     volumes:
       - void_artifacts:/workspace/uploads
+      - void_logs:/workspace/logs
     
 
   dsinger:
@@ -62,11 +64,13 @@ services:
     environment:
       - NVIDIA_VISIBLE_DEVICES=${MUSIC_GPU:-all}
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - LOG_DIR=/workspace/logs
     network_mode: host
     expose:
       - "7862"
     volumes:
       - void_artifacts:/workspace/uploads
+      - void_logs:/workspace/logs
     
 
   rvc_python:
@@ -85,12 +89,14 @@ services:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - PYTHONUNBUFFERED=1
+      - LOG_DIR=/workspace/logs
     volumes:
       # RVC models live here; one subdir per model (trained voice models)
       - rvc_models:/srv/rvc_models
       # Access to Titan pretrained weights from bootstrap (read-only)
       - film2_models:/opt/models:ro
       - void_artifacts:/workspace/uploads
+      - void_logs:/workspace/logs
     network_mode: host
     expose:
       - "5050"
@@ -111,6 +117,7 @@ services:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - PYTHONUNBUFFERED=1
+      - LOG_DIR=/workspace/logs
       - RVC_TRAIN_DATA_ROOT=/srv/data
       - RVC_MODELS_ROOT=/srv/rvc_models
       - RVC_WEBUI_ROOT=/srv/rvc_webui
@@ -125,6 +132,7 @@ services:
       - rvc_train_data:/srv/data
       - rvc_logs:/srv/logs
       - void_artifacts:/workspace/uploads
+      - void_logs:/workspace/logs
     network_mode: host
     expose:
       - "7070"
@@ -159,6 +167,7 @@ services:
       - DEMUCS_API_URL=http://127.0.0.1:9101
       - WHISPER_API_URL=http://127.0.0.1:7861
       - VOCALFIX_API_URL=http://127.0.0.1:7866
+      - LOG_DIR=/workspace/logs
     network_mode: host
     expose:
       - "7863"
@@ -172,6 +181,7 @@ services:
       # Training data access
       - rvc_train_data:/srv/data
       - void_artifacts:/workspace/uploads
+      - void_logs:/workspace/logs
     
 
   vocalfix:
@@ -188,11 +198,13 @@ services:
     environment:
       - NVIDIA_VISIBLE_DEVICES=${MUSIC_GPU:-all}
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - LOG_DIR=/workspace/logs
     network_mode: host
     expose:
       - "7864"
     volumes:
       - void_artifacts:/workspace/uploads
+      - void_logs:/workspace/logs
     
 
   master:
@@ -206,6 +218,7 @@ services:
       - "7865"
     volumes:
       - void_artifacts:/workspace/uploads
+      - void_logs:/workspace/logs
     
 
   mfa:
@@ -219,6 +232,7 @@ services:
       - "7867"
     volumes:
       - void_artifacts:/workspace/uploads
+      - void_logs:/workspace/logs
     
     
 
@@ -233,6 +247,7 @@ services:
       - "7868"
     volumes:
       - void_artifacts:/workspace/uploads
+      - void_logs:/workspace/logs
     
       
   sfx:
@@ -249,11 +264,13 @@ services:
     environment:
       - NVIDIA_VISIBLE_DEVICES=${MUSIC_GPU:-all}
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - LOG_DIR=/workspace/logs
     network_mode: host
     expose:
       - "7866"
     volumes:
       - void_artifacts:/workspace/uploads
+      - void_logs:/workspace/logs
     
       
   nvidia_init:
@@ -274,6 +291,7 @@ services:
       - /run/systemd/resolve:/host/run/systemd/resolve:ro
       - ./docker/nvidia-init/nvidia-init-safe.sh:/init.sh:ro
       - void_artifacts:/workspace/uploads
+      - void_logs:/workspace/logs
     entrypoint: ["/bin/bash","-lc","cp /init.sh /tmp/init.sh; chmod +x /tmp/init.sh; sed -i 's/\\r$//' /tmp/init.sh || true; bash /tmp/init.sh || true"]
 
   
@@ -288,10 +306,14 @@ services:
       - POSTGRES_DB=ragdb
       - POSTGRES_USER=rag
       - POSTGRES_PASSWORD=ragpass
+      - LOG_DIR=/workspace/logs
     # host networking: no ports mapping needed
     volumes:
       - pgvector_data:/var/lib/postgresql/data
       - void_artifacts:/workspace/uploads
+      - void_logs:/workspace/logs
+    # Duplicate postgres logs to file while still streaming to stdout.
+    command: ["sh","-lc","docker-entrypoint.sh postgres 2>&1 | tee -a /workspace/logs/pgvector.log"]
     
   ollama_qwen:
     network_mode: host
@@ -309,9 +331,13 @@ services:
       - OLLAMA_KEEP_ALIVE=24h
       - NVIDIA_VISIBLE_DEVICES=${OLLAMA_QWEN_GPU:-all}
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - LOG_DIR=/workspace/logs
     volumes:
       - ollama_qwen_data:/root/.ollama
       - void_artifacts:/workspace/uploads
+      - void_logs:/workspace/logs
+    # Duplicate logs to file while still streaming to stdout.
+    command: ["sh","-lc","ollama serve 2>&1 | tee -a /workspace/logs/ollama_qwen.log"]
     
 
   init_qwen:
@@ -322,7 +348,11 @@ services:
       - ollama_qwen
     environment:
       - QWEN_MODEL_ID=${QWEN_MODEL_ID:-qwen3:30b-a3b-instruct-2507-q4_K_M}
-    command: ["sh","-lc","until curl -sf http://127.0.0.1:11435/api/tags >/dev/null; do sleep 2; done; echo Pulling $QWEN_MODEL_ID; curl -sf -X POST http://127.0.0.1:11435/api/pull -H 'Content-Type: application/json' -d '{\"name\":\"${QWEN_MODEL_ID}\"}'; echo Pulled $QWEN_MODEL_ID"]
+      - LOG_DIR=/workspace/logs
+    volumes:
+      - void_artifacts:/workspace/uploads
+      - void_logs:/workspace/logs
+    command: ["sh","-lc","(until curl -sf http://127.0.0.1:11435/api/tags >/dev/null; do sleep 2; done; echo Pulling $QWEN_MODEL_ID; curl -sf -X POST http://127.0.0.1:11435/api/pull -H 'Content-Type: application/json' -d '{\"name\":\"${QWEN_MODEL_ID}\"}'; echo Pulled $QWEN_MODEL_ID) 2>&1 | tee -a /workspace/logs/init_qwen.log"]
 
   glm_ollama:
     network_mode: host
@@ -340,9 +370,12 @@ services:
       - OLLAMA_KEEP_ALIVE=24h
       - NVIDIA_VISIBLE_DEVICES=${OLLAMA_GLM_GPU:-all}
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - LOG_DIR=/workspace/logs
     volumes:
       - ollama_glm_data:/root/.ollama
       - void_artifacts:/workspace/uploads
+      - void_logs:/workspace/logs
+    command: ["sh","-lc","ollama serve 2>&1 | tee -a /workspace/logs/ollama_glm.log"]
 
 
   deepseek_ollama:
@@ -361,9 +394,12 @@ services:
       - OLLAMA_KEEP_ALIVE=24h
       - NVIDIA_VISIBLE_DEVICES=${OLLAMA_DEEPSEEK_GPU:-all}
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - LOG_DIR=/workspace/logs
     volumes:
       - ollama_deepseek_data:/root/.ollama
       - void_artifacts:/workspace/uploads
+      - void_logs:/workspace/logs
+    command: ["sh","-lc","ollama serve 2>&1 | tee -a /workspace/logs/ollama_deepseek.log"]
 
   init_glm:
     image: curlimages/curl:8.7.1
@@ -373,7 +409,11 @@ services:
       - glm_ollama
     environment:
       - GLM_MODEL_ID=${GLM_MODEL_ID:-glm4:9b}
-    command: ["sh","-lc","until curl -s http://127.0.0.1:11433/api/tags >/dev/null; do sleep 2; done; echo Pulling $GLM_MODEL_ID; curl -s -X POST http://127.0.0.1:11433/api/pull -H 'Content-Type: application/json' -d '{\"name\":\"${GLM_MODEL_ID:-glm4:9b}\"}'; echo Pulled $GLM_MODEL_ID"]
+      - LOG_DIR=/workspace/logs
+    volumes:
+      - void_artifacts:/workspace/uploads
+      - void_logs:/workspace/logs
+    command: ["sh","-lc","(until curl -s http://127.0.0.1:11433/api/tags >/dev/null; do sleep 2; done; echo Pulling $GLM_MODEL_ID; curl -s -X POST http://127.0.0.1:11433/api/pull -H 'Content-Type: application/json' -d '{\"name\":\"${GLM_MODEL_ID:-glm4:9b}\"}'; echo Pulled $GLM_MODEL_ID) 2>&1 | tee -a /workspace/logs/init_glm.log"]
 
 
   init_deepseek:
@@ -384,7 +424,11 @@ services:
       - deepseek_ollama
     environment:
       - DEEPSEEK_CODER_MODEL_ID=${DEEPSEEK_CODER_MODEL_ID:-deepseek-coder-v2:lite}
-    command: ["sh","-lc","until curl -s http://127.0.0.1:11436/api/tags >/dev/null; do sleep 2; done; echo Pulling $DEEPSEEK_CODER_MODEL_ID; curl -s -X POST http://127.0.0.1:11436/api/pull -H 'Content-Type: application/json' -d '{\"name\":\"${DEEPSEEK_CODER_MODEL_ID:-deepseek-coder-v2:lite}\"}'; echo Pulled $DEEPSEEK_CODER_MODEL_ID"]
+      - LOG_DIR=/workspace/logs
+    volumes:
+      - void_artifacts:/workspace/uploads
+      - void_logs:/workspace/logs
+    command: ["sh","-lc","(until curl -s http://127.0.0.1:11436/api/tags >/dev/null; do sleep 2; done; echo Pulling $DEEPSEEK_CODER_MODEL_ID; curl -s -X POST http://127.0.0.1:11436/api/pull -H 'Content-Type: application/json' -d '{\"name\":\"${DEEPSEEK_CODER_MODEL_ID:-deepseek-coder-v2:lite}\"}'; echo Pulled $DEEPSEEK_CODER_MODEL_ID) 2>&1 | tee -a /workspace/logs/init_deepseek.log"]
 
   init_qwen_vl:
     image: curlimages/curl:8.7.1
@@ -394,7 +438,11 @@ services:
       - ollama_qwen
     environment:
       - QWEN_VL_MODEL_ID=${QWEN_VL_MODEL_ID:-qwen3-vl:8b}
-    command: ["sh","-lc","until curl -sf http://127.0.0.1:11435/api/tags >/dev/null; do sleep 2; done; echo Pulling $QWEN_VL_MODEL_ID; curl -sf -X POST http://127.0.0.1:11435/api/pull -H 'Content-Type: application/json' -d '{\"name\":\"${QWEN_VL_MODEL_ID:-qwen3-vl:8b}\"}'; echo Pulled $QWEN_VL_MODEL_ID"]
+      - LOG_DIR=/workspace/logs
+    volumes:
+      - void_artifacts:/workspace/uploads
+      - void_logs:/workspace/logs
+    command: ["sh","-lc","(until curl -sf http://127.0.0.1:11435/api/tags >/dev/null; do sleep 2; done; echo Pulling $QWEN_VL_MODEL_ID; curl -sf -X POST http://127.0.0.1:11435/api/pull -H 'Content-Type: application/json' -d '{\"name\":\"${QWEN_VL_MODEL_ID:-qwen3-vl:8b}\"}'; echo Pulled $QWEN_VL_MODEL_ID) 2>&1 | tee -a /workspace/logs/init_qwen_vl.log"]
 
   orchestrator:
     build:
@@ -445,7 +493,7 @@ services:
       - N8N_WEBHOOK_URL=${N8N_WEBHOOK_URL:-}
       - ASSEMBLER_API_URL=http://127.0.0.1:9095
       - DRT_API_URL=http://127.0.0.1:8086
-      - TEACHER_API_URL=http://teacher:8097
+      - ORCH_LOG_DIR=/workspace/logs
       - POSTGRES_HOST=127.0.0.1
       - POSTGRES_PORT=5432
       - POSTGRES_DB=ragdb
@@ -476,6 +524,7 @@ services:
     volumes:
       - ./:/workspace
       - void_artifacts:/workspace/uploads
+      - void_logs:/workspace/logs
       - film2_models:/opt/models
       - film2_data:/srv/film2
       - ./assets/comfyui/input:/comfyui/input
@@ -495,6 +544,7 @@ services:
       - film2_bootstrap
     environment:
       - PYTHONUNBUFFERED=1
+      - LOG_DIR=/workspace/logs
       - NVIDIA_VISIBLE_DEVICES=${MUSIC_GPU:-all}
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - UPLOAD_DIR=/workspace/uploads
@@ -503,12 +553,15 @@ services:
       - "7860"
     volumes:
       - void_artifacts:/workspace/uploads
+      - void_logs:/workspace/logs
 
 
   xtts:
     build:
-      context: ./services/xtts
-      dockerfile: Dockerfile
+      # Build from repo root so we can COPY shared packages like `void_json/`
+      # into the image (xtts does not mount the whole repo at runtime).
+      context: .
+      dockerfile: services/xtts/Dockerfile
       args:
         <<: *cu118_args
     container_name: xtts_service
@@ -523,6 +576,7 @@ services:
     network_mode: host
     environment:
       - XTTS_MODEL_NAME=tts_models/multilingual/multi-dataset/xtts_v2
+      - LOG_DIR=/workspace/logs
       # Persistent per-voice model map; lives on tts_cache volume.
       # Normally you don't need to override this.
       - XTTS_VOICE_MODEL_MAP_PATH=/root/.local/share/tts/voice_model_map.json
@@ -543,6 +597,7 @@ services:
       # Persist XTTS cache and voice_model_map.json on a named volume.
       - tts_cache:/root/.local/share/tts
       - void_artifacts:/workspace/uploads
+      - void_logs:/workspace/logs
       - film2_models:/opt/models:ro
       - film2_data:/srv/film2
     
@@ -561,12 +616,14 @@ services:
     environment:
       - WHISPER_MODEL_NAME=large-v3
       - WHISPER_CPU_THREADS=8
+      - LOG_DIR=/workspace/logs
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     expose:
       - "9090"
     volumes:
       - void_artifacts:/workspace/uploads
+      - void_logs:/workspace/logs
 
   faceid:
     build:
@@ -582,12 +639,14 @@ services:
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - LOG_DIR=/workspace/logs
     expose:
       - "7000"
     volumes:
       # Share the same antelopev2 ONNX pack used by ComfyUI/InstantID.
       - comfyui_models:/opt/models
       - void_artifacts:/workspace/uploads
+      - void_logs:/workspace/logs
 
   vision_repair:
     build:
@@ -604,11 +663,13 @@ services:
     environment:
       - NVIDIA_VISIBLE_DEVICES=${VISION_REPAIR_GPU:-all}
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - LOG_DIR=/workspace/logs
     network_mode: host
     expose:
       - "8095"
     volumes:
       - void_artifacts:/workspace/uploads
+      - void_logs:/workspace/logs
 
   comfyui:
     build:
@@ -636,6 +697,7 @@ services:
       - ./assets/comfyui/input:/comfyui/input
       # Share void_artifacts with orchestrator/executor so Comfy outputs are visible under /uploads
       - void_artifacts:/comfyui/output
+      - void_logs:/workspace/logs
     # For GPU deployments, create additional comfyui-* services and set COMFYUI_API_URLS accordingly
 
   # Optional additional ComfyUI replicas for dynamic distribution
@@ -668,6 +730,7 @@ services:
       - ./assets/comfyui/input:/comfyui/input
       # Share void_artifacts with orchestrator/executor so Comfy outputs are visible under /uploads
       - void_artifacts:/comfyui/output
+      - void_logs:/workspace/logs
 
   comfyui-2:
     build:
@@ -695,6 +758,7 @@ services:
       - ./assets/comfyui/input:/comfyui/input
       # Share void_artifacts with orchestrator/executor so Comfy outputs are visible under /uploads
       - void_artifacts:/comfyui/output
+      - void_logs:/workspace/logs
 
   comfyui_init:
     build:
@@ -706,10 +770,12 @@ services:
       - HUGGINGFACE_TOKEN=${HUGGINGFACE_TOKEN:-}
       - COMFYUI_REPLICAS=${COMFYUI_REPLICAS:-1}
       - COMFYUI_GPU_DEVICES=${COMFYUI_GPU_DEVICES:-}
+      - LOG_DIR=/workspace/logs
     volumes:
       - comfyui_models:/comfyui/models
       # Do not mount host or named custom_nodes to avoid resurrecting Real-ESRGAN
       - void_artifacts:/workspace/uploads
+      - void_logs:/workspace/logs
     command: ["python", "/app/init_assets.py"]
 
   n8n:
@@ -724,6 +790,7 @@ services:
       - N8N_DIAGNOSTICS_ENABLED=false
       - N8N_VERSION_NOTIFICATIONS_ENABLED=false
       - NODE_ENV=production
+      - LOG_DIR=/workspace/logs
       # Recommended settings to silence warnings and enable runners
       - N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS=true
       - DB_SQLITE_POOL_SIZE=5
@@ -736,6 +803,8 @@ services:
     volumes:
       - n8n_data:/home/node/.n8n
       - void_artifacts:/workspace/uploads
+      - void_logs:/workspace/logs
+    command: sh -lc "n8n start 2>&1 | tee -a /workspace/logs/n8n.log"
     
 
   n8n_init:
@@ -753,6 +822,7 @@ services:
       - n8n_data:/home/node/.n8n
       - ./services/n8n/workflows:/workflows:ro
       - void_artifacts:/workspace/uploads
+      - void_logs:/workspace/logs
     command: sh -lc "n8n import:workflow --input /workflows/film_assemble.json --separate"
 
 
@@ -774,6 +844,7 @@ services:
       - NVIDIA_VISIBLE_DEVICES=${MUSIC_GPU:-all}
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - TORCH_HOME=/models/torch
+      - LOG_DIR=/workspace/logs
     expose:
       - "9101"
     
@@ -783,6 +854,7 @@ services:
       - film2_models:/opt/models:ro
       - film2_data:/srv/film2
       - void_artifacts:/workspace/uploads
+      - void_logs:/workspace/logs
 
   
 
@@ -803,6 +875,7 @@ services:
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - LOG_DIR=/workspace/logs
       
       - HF_HOME=/models/hf
       - TRANSFORMERS_CACHE=/models/hf
@@ -817,6 +890,7 @@ services:
       - film2_models:/opt/models:ro
       - film2_data:/srv/film2
       - void_artifacts:/workspace/uploads
+      - void_logs:/workspace/logs
     
 
   ocr:
@@ -829,6 +903,7 @@ services:
       - "8070"
     volumes:
       - void_artifacts:/workspace/uploads
+      - void_logs:/workspace/logs
 
   executor:
     
@@ -840,6 +915,7 @@ services:
     network_mode: host
     environment:
       - WORKSPACE_DIR=/workspace
+      - LOG_DIR=/workspace/logs
       - EXEC_TIMEOUT_SEC=${EXEC_TIMEOUT_SEC:-30}
       - EXEC_MEMORY_MB=${EXEC_MEMORY_MB:-2048}
       - ALLOW_SHELL=${ALLOW_SHELL:-false}
@@ -848,6 +924,7 @@ services:
     volumes:
       - ./:/workspace
       - void_artifacts:/workspace/uploads
+      - void_logs:/workspace/logs
 
   drt:
     build:
@@ -858,6 +935,7 @@ services:
     shm_size: "1gb"
     environment:
       - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-}
+      - LOG_DIR=/workspace/logs
       - DRT_RESPECT_ROBOTS=${DRT_RESPECT_ROBOTS:-true}
       - DRT_ROBOTS_TTL_S=${DRT_ROBOTS_TTL_S:-900}
       - DRT_RATE_MIN_GAP_MS=${DRT_RATE_MIN_GAP_MS:-200}
@@ -866,6 +944,7 @@ services:
     volumes:
       - ./:/workspace
       - void_artifacts:/workspace/uploads
+      - void_logs:/workspace/logs
 
   film2:
     build:
@@ -881,6 +960,7 @@ services:
       - film2_bootstrap
     environment:
       - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-}
+      - LOG_DIR=/workspace/logs
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - FILM2_MODELS=/opt/models
@@ -894,6 +974,7 @@ services:
       - film2_models:/opt/models:ro
       - film2_data:/srv/film2
       - void_artifacts:/workspace/uploads
+      - void_logs:/workspace/logs
 
   ablation:
     build:
@@ -901,14 +982,17 @@ services:
       dockerfile: Dockerfile
     container_name: ablation_layer
     restart: unless-stopped
+    network_mode: host
     environment:
       - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-}
       - ABLCODER_URL=${ABLCODER_URL:-}
+      - LOG_DIR=/workspace/logs
     expose:
       - "8095"
     volumes:
       - ./:/workspace
       - void_artifacts:/workspace/uploads
+      - void_logs:/workspace/logs
 
   teacher:
     build:
@@ -916,13 +1000,16 @@ services:
       dockerfile: Dockerfile
     container_name: teacher_service
     restart: unless-stopped
+    network_mode: host
     environment:
       - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-}
+      - LOG_DIR=/workspace/logs
     expose:
       - "8097"
     volumes:
       - ./:/workspace
       - void_artifacts:/workspace/uploads
+      - void_logs:/workspace/logs
 
   chatui:
     build:
@@ -942,6 +1029,7 @@ services:
     # host networking exposes 3000 directly; no ports mapping needed
     volumes:
       - void_artifacts:/workspace/uploads
+      - void_logs:/workspace/logs
 
 volumes:
   ollama_qwen_data: {}
@@ -959,6 +1047,7 @@ volumes:
   film2_data: {}
   comfyui_input: {}
   void_artifacts: {}
+  void_logs: {}
   rvc_models: {}
   rvc_assets: {}
   rvc_train_data: {}

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import json
+import logging
 from .common import ensure_dir, sidecar, make_outpaths, normalize_size, stamp_env, now_ts
 from ..determinism.seeds import stamp_tool_args
 from ..artifacts.manifest import add_manifest_row
@@ -13,6 +14,8 @@ from .export import append_image_sample
 from ..context.index import add_artifact as _ctx_add
 from ..context.index import resolve_reference as _ctx_resolve, resolve_global as _glob_resolve
 from ..datasets.trace import append_sample as _trace_append
+
+log = logging.getLogger(__name__)
 
 
 def run_image_edit(job: dict, provider, manifest: dict) -> dict:
@@ -35,8 +38,8 @@ def run_image_edit(job: dict, provider, manifest: dict) -> dict:
                 gre = _glob_resolve(str(job.get("prompt") or ""), "image")
                 if gre and isinstance(gre.get("path"), str):
                     args["image_ref"] = gre.get("path")
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("image.edit: failed to resolve image_ref from context (non-fatal) cid=%s: %s", cid, exc, exc_info=True)
     args.update({"size": size, "refs": refs, "seed": job.get("seed")})
     args = stamp_tool_args("image.edit", args)
     res = provider.edit(args)
@@ -49,17 +52,17 @@ def run_image_edit(job: dict, provider, manifest: dict) -> dict:
     try:
         for rid in (job.get("ref_ids") or []):
             append_provenance(rid, {"when": now_ts(), "tool": "image.edit", "artifact": png_path, "seed": int(args.get("seed") or 0)})
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("image.edit: append_provenance failed (non-fatal) cid=%s: %s", cid, exc, exc_info=True)
     add_manifest_row(manifest, png_path, step_id="image.edit")
     try:
         append_image_sample(outdir, {"tool": "image.edit", "prompt": args.get("prompt"), "negative": args.get("negative"), "size": args.get("size"), "seed": int(args.get("seed") or 0), "model": model, "path": png_path, "ts": now_ts()})
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("image.edit: append_image_sample failed (non-fatal) cid=%s: %s", cid, exc, exc_info=True)
     try:
         _ctx_add(cid, "image", png_path, None, args.get("image_ref"), [], {"prompt": args.get("prompt")})
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("image.edit: context add failed (non-fatal) cid=%s: %s", cid, exc, exc_info=True)
     try:
         _trace_append("image", {
             "cid": cid,
@@ -72,8 +75,8 @@ def run_image_edit(job: dict, provider, manifest: dict) -> dict:
             "path": png_path,
             "parent": args.get("image_ref") or None,
         })
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("image.edit: trace append failed (non-fatal) cid=%s: %s", cid, exc, exc_info=True)
     env = {
         "meta": {"model": model, "ts": now_ts(), "cid": cid, "step": 0, "state": "halt", "cont": {"present": False, "state_hash": None, "reason": None}},
         "reasoning": {"goal": "image edit", "constraints": ["json-only"], "decisions": ["image.edit done"]},

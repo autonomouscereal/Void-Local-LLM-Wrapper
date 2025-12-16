@@ -161,7 +161,7 @@ def _match_existing_voice(sample_paths: List[str]) -> Optional[str]:
         try:
             log.info("voice.match: matched samples to voice_id=%s score=%.3f", best_id, best_score)
         except Exception:
-            pass
+            log.debug("voice.match: failed to log match result (non-fatal)", exc_info=True)
         return best_id
     return None
 
@@ -193,8 +193,8 @@ def resolve_voice_identity(
             try:
                 paths = [f.get("path") for f in (man.get("files", {}) or {}).get("voice_samples", []) or []]
                 compute_voice_embedding(man.get("ref_id") or str(voice_id), [p for p in paths if isinstance(p, str) and p])
-            except Exception:
-                pass
+            except Exception as exc:
+                log.warning("resolve_voice_identity: compute_voice_embedding failed voice_id=%s: %s", voice_id, exc, exc_info=True)
         meta["new_samples"] = new_samples
         meta["is_new_voice"] = bool(man and man.get("ref_id") and man.get("ref_id") != voice_id)
         # Inline lock wins to preserve exact per-call sample set.
@@ -221,8 +221,8 @@ def resolve_voice_identity(
             try:
                 paths = [f.get("path") for f in (man.get("files", {}) or {}).get("voice_samples", []) or []] if man else []
                 compute_voice_embedding(canonical_id or "", [p for p in paths if isinstance(p, str) and p])
-            except Exception:
-                pass
+            except Exception as exc:
+                log.warning("resolve_voice_identity: compute_voice_embedding failed new_voice_id=%s: %s", canonical_id, exc, exc_info=True)
             meta["new_samples"] = list(samples)
         meta["is_new_voice"] = is_new
         # Lock is just the inline bundle (which contains the concrete sample paths).

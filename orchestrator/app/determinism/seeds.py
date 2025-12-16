@@ -15,7 +15,8 @@ def _seed_from_tag(tag: str) -> int:
         try:
             return int(xxh64(tag).intdigest()) & ((1 << 31) - 1)
         except Exception:
-            pass
+            # Fall back to sha256 below.
+            return int(hashlib.sha256(tag.encode("utf-8")).hexdigest()[:8], 16) & ((1 << 31) - 1)
     # Fallback: sha256 first 8 hex chars
     return int(hashlib.sha256(tag.encode("utf-8")).hexdigest()[:8], 16) & ((1 << 31) - 1)
 

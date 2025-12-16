@@ -84,7 +84,7 @@ def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
     except Exception:
         # Context augmentation is strictly best-effort; failures should not
         # interfere with the main TTS path.
-        pass
+        log.debug("tts.speak: _augment_voice_refs_from_context failed (non-fatal) cid=%s", cid, exc_info=True)
     # Resolve canonical voice identity and lock from any provided voice_id / refs
     raw_voice_id = job.get("voice_id")
     raw_voice_refs = job.get("voice_refs") if isinstance(job.get("voice_refs"), dict) else None
@@ -200,7 +200,7 @@ def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
             voice_source,
         )
     except Exception:
-        pass
+        log.debug("tts.speak: failed to log resolved voice (non-fatal) cid=%s", cid, exc_info=True)
     # If new reference samples were attached for this voice, register and train
     # the corresponding RVC model *before* conversion so this call benefits
     # from updated weights. Training is mandatory when refs are provided.
@@ -670,7 +670,7 @@ def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
                         {"tool": "tts.speak.committee", "target_emotion": target_emotion, "adjusted": True},
                     )
     except Exception:
-        pass
+        log.debug("tts.speak: committee emotion adjustment failed (non-fatal) cid=%s", cid, exc_info=True)
     try:
         append_tts_sample(
             outdir,
@@ -689,7 +689,7 @@ def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
             },
         )
     except Exception:
-        pass
+        log.debug("tts.speak: append_tts_sample failed (non-fatal) cid=%s", cid, exc_info=True)
     try:
         if job.get("voice_id"):
             append_provenance(
@@ -697,7 +697,7 @@ def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
                 {"when": now_ts(), "tool": "tts.speak", "artifact": wav_path, "seed": int(args.get("seed") or 0)},
             )
     except Exception:
-        pass
+        log.debug("tts.speak: append_provenance failed (non-fatal) cid=%s", cid, exc_info=True)
     add_manifest_row(manifest, wav_path, step_id="tts.speak")
     try:
         _ctx_add(
@@ -710,7 +710,7 @@ def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
             {"model": model},
         )
     except Exception:
-        pass
+        log.debug("tts.speak: failed to add context artifact (non-fatal) cid=%s", cid, exc_info=True)
     env = {
         "meta": {
             "model": model,
@@ -764,7 +764,7 @@ def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
             trace_row["locks"] = locks_meta
         _trace_append("tts", trace_row)
     except Exception:
-        pass
+        log.debug("tts.speak: trace append failed (non-fatal) cid=%s", cid, exc_info=True)
     return env
 
 

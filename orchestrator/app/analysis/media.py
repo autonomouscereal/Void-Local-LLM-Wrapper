@@ -4,6 +4,7 @@ import base64
 import os
 from typing import Any, Dict, Optional, List, Tuple, Sequence
 import uuid
+import logging
 
 import cv2  # type: ignore
 import numpy as np  # type: ignore
@@ -15,6 +16,8 @@ import soundfile as sf  # type: ignore
 import pyloudnorm as pyln  # type: ignore
 import librosa  # type: ignore
 from ..json_parser import JSONParser
+
+log = logging.getLogger(__name__)
 
 
 VLM_API_URL = os.getenv("VLM_API_URL")  # e.g., http://vlm:8050
@@ -333,9 +336,9 @@ def _qwen_vl_analyze(path: str, prompt: Optional[str]) -> Dict[str, Any]:
                                     tags2.append(t)
                         if tags2:
                             res["tags"] = tags2[:64]
-            except Exception:
+            except Exception as exc:
                 # Ignore structured parse failures; fall back below.
-                pass
+                log.debug("analysis.media: structured VLM parse failed (non-fatal): %s", exc, exc_info=True)
 
         # Ensure match_score is populated for downstream semantic scoring.
         if res.get("match_score") is None:
@@ -909,8 +912,9 @@ def analyze_audio(path: str) -> Dict[str, Any]:
         if y and sr:
             meter = pyln.Meter(sr)
             out["lufs"] = float(meter.integrated_loudness(y))
-    except Exception:
-        pass
+    except Exception as exc:
+        # Non-fatal; keep default None values.
+        log.debug("analysis.media.analyze_audio: LUFS compute failed path=%s: %s", path, exc, exc_info=True)
     # Tempo + Key + Emotion (heuristic)
     try:
         if y and sr:
@@ -957,7 +961,8 @@ def analyze_audio(path: str) -> Dict[str, Any]:
             else:
                 out["genre"] = "pop"
     except Exception:
-        pass
+        # Non-fatal; keep defaults.
+        log.debug("analysis.media.analyze_audio: feature extraction failed path=%s", path, exc_info=True)
     return out
 
 

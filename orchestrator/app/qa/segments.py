@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple, Callable
 
+import logging
+
+from ..json_parser import JSONParser
 from ..datasets.trace import append_sample as _trace_append
 from ..locks.runtime import quality_thresholds as _lock_quality_thresholds
 from ..pipeline.assets import (
@@ -13,6 +16,8 @@ from ..pipeline.assets import (
 )
 from ..review.referee import postrun_committee_decide
 from ..plan.catalog import PLANNER_VISIBLE_TOOLS
+
+log = logging.getLogger(__name__)
 
 
 """
@@ -128,6 +133,36 @@ def _extract_artifacts(result: Dict[str, Any]) -> List[Dict[str, Any]]:
                         "extra": a,
                     }
                 )
+    # Fallback: synthesize a single artifact when tools don't emit an explicit list.
+    if not artifacts:
+        meta = result.get("meta") if isinstance(result.get("meta"), dict) else {}
+        candidates = [
+            result.get("url"),
+            result.get("view_url"),
+            result.get("relative_url"),
+            result.get("path"),
+            meta.get("url"),
+            meta.get("view_url"),
+            meta.get("relative_url"),
+            meta.get("path"),
+            result.get("master_uri"),
+            result.get("reel_mp4"),
+        ]
+        best: Optional[str] = None
+        for c in candidates:
+            if isinstance(c, str) and c.strip():
+                best = c.strip()
+                break
+        if best:
+            low = best.lower()
+            kind = "file"
+            if any(low.endswith(e) for e in (".png", ".jpg", ".jpeg", ".webp", ".gif")):
+                kind = "image"
+            elif any(low.endswith(e) for e in (".mp4", ".mov", ".mkv", ".webm")):
+                kind = "video"
+            elif any(low.endswith(e) for e in (".wav", ".mp3", ".flac", ".aac", ".ogg")):
+                kind = "audio"
+            artifacts.append({"kind": kind, "path": best, "extra": {"synthetic": True}})
     return artifacts
 
 
@@ -381,11 +416,140 @@ def filter_patch_plan(
             continue
         if seg_id not in segment_ids:
             continue
-        args = step.get("args")
-        if not isinstance(args, dict):
-            continue
+        args_val = step.get("args")
+        if args_val is None and ("arguments" in step):
+            args_val = step.get("arguments")
+        # IMPORTANT: Do not drop args if they arrive as a JSON string.
+        # Normalize into a dict; if parsing fails, preserve under "_raw".
+        args: Dict[str, Any]
+        if isinstance(args_val, dict):
+            args = dict(args_val)
+        elif isinstance(args_val, str):
+            parsed = JSONParser().parse(args_val or "", dict)
+            args = dict(parsed) if isinstance(parsed, dict) else {"_raw": args_val}
+        elif args_val is None:
+            args = {}
+        else:
+            args = {"_raw": args_val}
         filtered.append({"tool": step_tool, "segment_id": seg_id, "args": args})
     return filtered
+
+
+def enrich_patch_plan_for_tts_segments(
+    patch_plan: List[Dict[str, Any]],
+    segments: List[SegmentResult],
+) -> List[Dict[str, Any]]:
+    """
+    Enrich tts.refine.segment steps with src/source audio + lock_bundle derived from TTS segments.
+    """
+    index_by_id: Dict[str, SegmentResult] = {}
+    for seg in segments:
+        if not isinstance(seg, dict):
+            continue
+        seg_id = seg.get("id")
+        domain = seg.get("domain")
+        if isinstance(seg_id, str) and seg_id and isinstance(domain, str) and domain == "tts":
+            index_by_id[seg_id] = seg
+    enriched: List[Dict[str, Any]] = []
+    for step in patch_plan or []:
+        if not isinstance(step, dict):
+            enriched.append(step)
+            continue
+        tool_name = (step.get("tool") or "").strip()
+        seg_id = step.get("segment_id")
+        args_obj = step.get("args") if isinstance(step.get("args"), dict) else {}
+        if tool_name != "tts.refine.segment":
+            enriched.append(step)
+            continue
+        if not isinstance(seg_id, str) or not seg_id:
+            enriched.append(step)
+            continue
+        seg = index_by_id.get(seg_id)
+        if not isinstance(seg, dict):
+            enriched.append(step)
+            continue
+        args: Dict[str, Any] = dict(args_obj)
+        if "segment_id" not in args:
+            args["segment_id"] = seg_id
+        seg_result = seg.get("result") if isinstance(seg.get("result"), dict) else {}
+        meta = seg_result.get("meta") if isinstance(seg_result.get("meta"), dict) else {}
+        artifacts = seg_result.get("artifacts") if isinstance(seg_result.get("artifacts"), list) else []
+        if "src" not in args and "source_audio" not in args:
+            src_val: Optional[str] = None
+            if artifacts:
+                first_art = artifacts[0]
+                if isinstance(first_art, dict):
+                    path_val = first_art.get("path")
+                    view_val = first_art.get("view_url")
+                    if isinstance(path_val, str) and path_val.strip():
+                        src_val = path_val
+                    elif isinstance(view_val, str) and view_val.strip():
+                        src_val = view_val
+            if isinstance(src_val, str) and src_val:
+                args["src"] = src_val
+        if "lock_bundle" not in args:
+            locks_val = meta.get("locks")
+            if isinstance(locks_val, dict):
+                inner = locks_val.get("bundle")
+                args["lock_bundle"] = inner if isinstance(inner, dict) else locks_val
+            elif isinstance(seg.get("locks"), dict):
+                args["lock_bundle"] = seg.get("locks")
+        if "cid" not in args:
+            cid_val = seg.get("cid")
+            if isinstance(cid_val, str) and cid_val:
+                args["cid"] = cid_val
+        enriched.append({"tool": tool_name, "segment_id": seg_id, "args": args})
+    return enriched
+
+
+def enrich_patch_plan_for_sfx_segments(
+    patch_plan: List[Dict[str, Any]],
+    segments: List[SegmentResult],
+) -> List[Dict[str, Any]]:
+    """
+    Enrich audio.sfx.compose patch steps (if ever used) with src + lock_bundle.
+    """
+    index_by_id: Dict[str, SegmentResult] = {}
+    for seg in segments:
+        if not isinstance(seg, dict):
+            continue
+        seg_id = seg.get("id")
+        domain = seg.get("domain")
+        if isinstance(seg_id, str) and seg_id and isinstance(domain, str) and domain == "sfx":
+            index_by_id[seg_id] = seg
+    enriched: List[Dict[str, Any]] = []
+    for step in patch_plan or []:
+        if not isinstance(step, dict):
+            enriched.append(step)
+            continue
+        tool_name = (step.get("tool") or "").strip()
+        seg_id = step.get("segment_id")
+        args_obj = step.get("args") if isinstance(step.get("args"), dict) else {}
+        if tool_name != "audio.sfx.compose":
+            enriched.append(step)
+            continue
+        if not isinstance(seg_id, str) or not seg_id:
+            enriched.append(step)
+            continue
+        seg = index_by_id.get(seg_id)
+        if not isinstance(seg, dict):
+            enriched.append(step)
+            continue
+        args: Dict[str, Any] = dict(args_obj)
+        if "segment_id" not in args:
+            args["segment_id"] = seg_id
+        seg_result = seg.get("result") if isinstance(seg.get("result"), dict) else {}
+        meta = seg_result.get("meta") if isinstance(seg_result.get("meta"), dict) else {}
+        if "lock_bundle" not in args and isinstance(meta.get("locks"), dict):
+            locks_val = meta.get("locks")
+            inner = locks_val.get("bundle")
+            args["lock_bundle"] = inner if isinstance(inner, dict) else locks_val
+        if "cid" not in args:
+            cid_val = seg.get("cid")
+            if isinstance(cid_val, str) and cid_val:
+                args["cid"] = cid_val
+        enriched.append({"tool": tool_name, "segment_id": seg_id, "args": args})
+    return enriched
 
 
 def enrich_patch_plan_for_image_segments(
@@ -645,6 +809,10 @@ async def apply_patch_plan(
         if isinstance(seg, dict) and isinstance(seg.get("id"), str):
             index_by_id[seg["id"]] = idx
     updated_segments: List[SegmentResult] = list(segments)
+    # IMPORTANT:
+    # `patch_results` must be shaped like normal tool results so downstream code
+    # (QA aggregation, asset URL collection, finalize) can treat them uniformly:
+    #   {"name": str, "result": dict, "args": dict, "error": dict|str|None, ...}
     patch_results: List[Dict[str, Any]] = []
     for step in patch_plan or []:
         tool_name = step.get("tool")
@@ -659,28 +827,61 @@ async def apply_patch_plan(
         if isinstance(seg_index, int) and 0 <= seg_index < len(updated_segments):
             target_segment = updated_segments[seg_index]
         tool_call = {"name": tool_name, "arguments": args}
-        result = await tool_runner(tool_call)
+        # tool_runner returns a tool-result shaped dict (typically via executor_gateway):
+        # {"name":..., "result": {...}, "args": {...}, "error": {...}|None, "step_id": ...}
+        tool_env = await tool_runner(tool_call)
         error_obj: Any = None
-        if isinstance(result, dict):
-            error_obj = result.get("error")
+        res_obj: Dict[str, Any] = {}
+        step_id_val: Optional[str] = None
+        args_echo: Dict[str, Any] = dict(args)
+        if isinstance(tool_env, dict):
+            error_obj = tool_env.get("error")
+            step_id_val = tool_env.get("step_id") if isinstance(tool_env.get("step_id"), str) else None
+            args_in = tool_env.get("args")
+            if isinstance(args_in, dict) and args_in:
+                args_echo = dict(args_in)
+            inner = tool_env.get("result")
+            if isinstance(inner, dict):
+                res_obj = inner
         patch_entry: Dict[str, Any] = {
+            # Tool-result canonical shape
+            "name": str(tool_name),
+            "result": res_obj,
+            "args": args_echo,
+            "error": error_obj,
+            "step_id": step_id_val,
+            # Patch metadata (extra fields are tolerated throughout the pipeline)
             "segment_id": seg_id,
             "tool": tool_name,
-            "name": tool_name,
-            "args": args,
-            "result": result,
+            "parent_tool": parent_tool,
         }
-        if error_obj is not None:
-            patch_entry["error"] = error_obj
         patch_results.append(patch_entry)
         if (
             target_segment is not None
-            and isinstance(result, dict)
-            and not bool(result.get("error"))
+            and isinstance(tool_env, dict)
+            and not bool(error_obj)
         ):
-            res_obj = result.get("result")
             if isinstance(res_obj, dict):
                 target_segment["result"] = res_obj
+                # Re-hydrate derived segment fields so later enrich/QA phases see the new artifacts/locks.
+                try:
+                    target_segment["artifacts"] = _extract_artifacts(res_obj)
+                    new_locks = _extract_locks_from_result(res_obj)
+                    if isinstance(new_locks, dict):
+                        target_segment["locks"] = new_locks
+                        meta_obj = target_segment.get("meta") if isinstance(target_segment.get("meta"), dict) else {}
+                        if isinstance(meta_obj, dict):
+                            meta_obj["locks"] = new_locks
+                            target_segment["meta"] = meta_obj
+                    new_profile = _extract_profile_from_result(res_obj)
+                    if isinstance(new_profile, str) and new_profile:
+                        meta_obj = target_segment.get("meta") if isinstance(target_segment.get("meta"), dict) else {}
+                        if isinstance(meta_obj, dict):
+                            meta_obj["profile"] = new_profile
+                            target_segment["meta"] = meta_obj
+                except Exception:
+                    # Never allow hydration to break patch execution
+                    log.debug("qa.segments: failed to hydrate derived segment fields (non-fatal)", exc_info=True)
                 # Emit a refine trace row for successful segment updates
                 try:
                     if isinstance(trace_id, str) and trace_id.strip():
@@ -708,7 +909,7 @@ async def apply_patch_plan(
                             "segment_id": seg_id,
                             "domain": seg_domain,
                             "cid": cid_val,
-                            "args": args,
+                            "args": args_echo,
                             "locks": seg_locks,
                             "result_meta": res_obj.get("meta") if isinstance(res_obj.get("meta"), dict) else {},
                         }
@@ -719,7 +920,7 @@ async def apply_patch_plan(
                         _trace_append("segments", row)
                 except Exception:
                     # Tracing must not break patch execution
-                    pass
+                    log.debug("qa.segments: failed to append refine trace row (non-fatal)", exc_info=True)
     return updated_segments, patch_results
 
 

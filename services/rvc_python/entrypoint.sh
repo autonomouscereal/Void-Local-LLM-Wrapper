@@ -1,6 +1,13 @@
 #!/bin/bash
 set -euo pipefail
 
+# Duplicate all stdout/stderr to shared log volume while still streaming realtime.
+LOG_DIR="${LOG_DIR:-/workspace/logs}"
+mkdir -p "$LOG_DIR" || true
+LOG_FILE="${LOG_FILE:-$LOG_DIR/rvc_python_entrypoint.log}"
+exec > >(tee -a "$LOG_FILE") 2>&1
+echo "[rvc_python] entrypoint logging to $LOG_FILE"
+
 # Create rvc_models directory if it doesn't exist
 mkdir -p /srv/rvc_models
 

@@ -749,7 +749,8 @@ class JSONParser:
             if chars[i] == "-":
                 dash += 1
             elif chars[i] == ":":
-                pass
+                # Alignment marker is allowed in markdown separators (e.g. :---:)
+                dash += 0
             else:
                 return False
             i += 1
@@ -1090,8 +1091,9 @@ class JSONParser:
                 import dataclasses
                 if dataclasses.is_dataclass(obj):
                     return dataclasses.asdict(obj)
-            except Exception:
-                pass
+            except Exception as exc:
+                # Non-fatal; fall back to __dict__ below.
+                self._err(f"object_to_dict_safe:dataclasses:{type(exc).__name__}:{exc}")
             # __dict__
             if hasattr(obj, "__dict__"):
                 d = getattr(obj, "__dict__", None)

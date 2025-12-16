@@ -5,7 +5,7 @@ import time
 
 
 class LockError(Exception):
-    pass
+    """Lock subsystem error."""
 
 
 def _lock_path(root: str, key: str) -> str:
@@ -35,6 +35,6 @@ def release_lock(root: str, key: str):
     try:
         os.unlink(_lock_path(root, key))
     except FileNotFoundError:
-        pass
+        return
 
 

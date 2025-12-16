@@ -10,6 +10,7 @@ import glob
 import io
 import logging
 import traceback
+import sys
 from typing import Dict, Any, Tuple, List
 
 import numpy as np  # type: ignore
@@ -24,6 +25,29 @@ from . import voice_miner
 
 
 app = FastAPI(title="RVC Voice Conversion Service", version="1.2.0")
+
+# ---- Logging (stdout + shared log volume file) ----
+try:
+    from logging.handlers import RotatingFileHandler
+
+    _log_dir = os.getenv("LOG_DIR", "/workspace/logs").strip() or "/workspace/logs"
+    os.makedirs(_log_dir, exist_ok=True)
+    _log_file = os.getenv("LOG_FILE", "").strip() or os.path.join(_log_dir, "rvc.log")
+    _lvl = getattr(logging, (os.getenv("LOG_LEVEL", "INFO") or "INFO").upper(), logging.INFO)
+    logging.basicConfig(
+        level=_lvl,
+        format="%(asctime)s.%(msecs)03d %(levelname)s %(process)d/%(threadName)s %(name)s %(pathname)s:%(funcName)s:%(lineno)d - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+            RotatingFileHandler(_log_file, maxBytes=50 * 1024 * 1024, backupCount=5, encoding="utf-8"),
+        ],
+        force=True,
+    )
+    logging.getLogger("rvc.logging").info("rvc logging configured file=%r level=%s", _log_file, logging.getLevelName(_lvl))
+except Exception as _ex:
+    logging.basicConfig(level=logging.INFO, stream=sys.stdout)
+    logging.getLogger("rvc.logging").warning("rvc file logging disabled: %s", _ex, exc_info=True)
 
 REGISTRY_PATH = os.getenv("RVC_REGISTRY_PATH", "/rvc/assets/registry.json")
 os.makedirs(os.path.dirname(REGISTRY_PATH), exist_ok=True)
@@ -657,9 +681,9 @@ async def voice_rename(body: Dict[str, Any]):
                         total = old_count + new_count
                         merged = (old_emb * old_count + new_emb * new_count) / float(total)
                         spk_index[new_voice_id] = {"embedding": merged.tolist(), "count": total}
-                except Exception:
-                    # If merge fails, just keep new_entry
-                    pass
+                except Exception as ex:
+                    # If merge fails, just keep new_entry, but do not be silent.
+                    logging.warning("speaker_index merge failed old=%s new=%s: %s", old_voice_id, new_voice_id, str(ex), exc_info=True)
             elif old_entry and not new_entry:
                 # Move old entry to new key
                 spk_index[new_voice_id] = old_entry

@@ -9,8 +9,18 @@ def bytes_len(text: str) -> int:
     if not text:
         return 0
     if not isinstance(text, str):
-        text = str(text)
-    return len(text.encode("utf-8"))
+        orig_type = type(text).__name__
+        try:
+            text = str(text)
+            log.debug("icw.bytes_len coerced_non_str type=%s", orig_type)
+        except Exception as exc:  # pragma: no cover - defensive logging
+            log.error("icw.bytes_len str() failed type=%s: %s", type(text), exc, exc_info=True)
+            return 0
+    try:
+        return len(text.encode("utf-8"))
+    except Exception as exc:  # pragma: no cover - defensive logging
+        log.error("icw.bytes_len utf-8 encode failed: %s", exc, exc_info=True)
+        return 0
 
 
 def byte_budget_for_model(model_ctx_limit_tokens: int, headroom_ratio: float = 0.95) -> int:

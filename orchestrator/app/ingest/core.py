@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import base64
 import mimetypes
+import logging
 from typing import Dict, Any, List
 from ..json_parser import JSONParser
 
@@ -12,6 +13,8 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp", ".tif", ".tiff",
 AUDIO_EXTS = {".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac", ".wma", ".opus"}
 VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".flv", ".mpeg", ".mpg", ".m4v"}
 DOC_EXTS = {".pdf", ".doc", ".docx", ".rtf", ".odt"}
+
+log = logging.getLogger(__name__)
 
 
 def _read_text(path: str, max_bytes: int = 300_000) -> str:
@@ -59,8 +62,9 @@ def ingest_file(path: str, vlm_url: str | None = None, whisper_url: str | None =
                     txt = (js.get("text") or "").strip() if isinstance(js, dict) else ""
                     if txt:
                         texts.append(txt)
-            except Exception:
-                pass
+            except Exception as ex:
+                # Non-fatal; fall back to plain text read below.
+                log.warning("ingest_file: OCR failed for doc path=%s ext=%s: %s", path, ext, ex, exc_info=True)
         if not texts:
             txt = _read_text(path)
             if txt and len(txt.split()) >= 5:
@@ -94,8 +98,9 @@ def ingest_file(path: str, vlm_url: str | None = None, whisper_url: str | None =
                     tx = (js.get("text") or "").strip() if isinstance(js, dict) else ""
                     if tx:
                         texts.append(f"[ocr] {tx}")
-            except Exception:
-                pass
+            except Exception as ex:
+                # Non-fatal; keep image fallback caption/placeholder.
+                log.warning("ingest_file: OCR failed for image path=%s ext=%s: %s", path, ext, ex, exc_info=True)
         if not texts:
             texts.append(f"[image] {os.path.basename(path)}")
     elif ext in AUDIO_EXTS:

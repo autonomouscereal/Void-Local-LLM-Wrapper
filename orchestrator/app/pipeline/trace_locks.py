@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from typing import Optional
+import logging
 
 from app.state.lock import acquire_lock as _acquire_lock
 from app.state.lock import release_lock as _release_lock
 from app.state.checkpoints import append_event as checkpoints_append_event
+
+log = logging.getLogger(__name__)
 
 
 def acquire_lock(state_dir: str, trace_id: str, timeout_s: int = 10) -> Optional[str]:
@@ -29,4 +32,5 @@ def release_lock(state_dir: str, trace_id: str, token: Optional[str] = None) -> 
     try:
         _release_lock(state_dir, trace_id)
     except Exception:
-        pass
+        # Non-fatal; lock release failures shouldn't break request handling.
+        log.debug("trace_locks.release_lock failed for trace_id=%s token=%s", trace_id, token, exc_info=True)

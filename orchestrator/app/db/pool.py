@@ -4,6 +4,9 @@ import os
 from typing import Optional
 
 import asyncpg  # type: ignore
+import logging
+
+log = logging.getLogger(__name__)
 
 
 pg_pool: Optional[asyncpg.pool.Pool] = None
@@ -101,15 +104,17 @@ async def get_pg_pool() -> Optional[asyncpg.pool.Pool]:
         )
         try:
             await conn.execute("CREATE EXTENSION IF NOT EXISTS vector;")
-        except Exception:
-            pass
+        except Exception as ex:
+            # Non-fatal: vector extension may not be available in all Postgres builds.
+            log.warning("db.pool: failed to create EXTENSION vector: %s", ex, exc_info=True)
         try:
             await conn.execute("CREATE INDEX IF NOT EXISTS rag_docs_embedding_idx ON rag_docs USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);")
-        except Exception:
+        except Exception as ex:
+            log.warning("db.pool: failed to create ivfflat index (will try hnsw): %s", ex, exc_info=True)
             try:
                 await conn.execute("CREATE INDEX IF NOT EXISTS rag_docs_embedding_hnsw_idx ON rag_docs USING hnsw (embedding vector_l2_ops);")
-            except Exception:
-                pass
+            except Exception as ex2:
+                log.warning("db.pool: failed to create hnsw index: %s", ex2, exc_info=True)
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS jobs (

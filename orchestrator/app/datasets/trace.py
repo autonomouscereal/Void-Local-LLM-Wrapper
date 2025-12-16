@@ -4,10 +4,13 @@ import os
 import json
 import time
 from typing import Dict, Any, Optional
+import logging
 
 
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/workspace/uploads")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")
+
+log = logging.getLogger(__name__)
 
 
 def _public_url(path: str) -> str:
@@ -47,8 +50,9 @@ def append_sample(kind: str, row: Dict[str, Any]) -> str:
     try:
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
-    except Exception:
-        pass
+    except Exception as ex:
+        # Non-fatal: tracing is best-effort.
+        log.warning("datasets.trace.append_sample failed kind=%s path=%s: %s", kind, path, ex, exc_info=True)
     # Maintain a tiny index of file sizes for convenience
     idx_path = os.path.join(root, "index.json")
     idx: Dict[str, Any] = {}

@@ -2,10 +2,13 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
+import logging
 import httpx as _hx  # type: ignore
 import uuid as _uuid
 import traceback
 from ..json_parser import JSONParser
+
+log = logging.getLogger("orchestrator.executor_gateway")
 
 
 async def execute(
@@ -45,6 +48,21 @@ async def execute(
     rid = str(request_id or _uuid.uuid4().hex)
     tid = str(trace_id or _uuid.uuid4().hex)
     payload = {"schema_version": 1, "request_id": rid, "trace_id": tid, "steps": steps}
+    try:
+        # Never log full args payloads (may contain long prompts/base64). Log keys + types only.
+        steps_preview = []
+        for st in steps[:5]:
+            a = st.get("args") if isinstance(st.get("args"), dict) else {}
+            steps_preview.append(
+                {
+                    "tool": st.get("tool"),
+                    "args_keys": sorted([str(k) for k in a.keys()])[:64],
+                    "args_types": {str(k): type(v).__name__ for k, v in list(a.items())[:32]},
+                }
+            )
+        log.info("executor_gateway.execute start trace_id=%s request_id=%s steps=%s preview=%s", tid, rid, len(steps), steps_preview)
+    except Exception:
+        log.debug("executor_gateway.execute: failed to emit start log preview", exc_info=True)
     base = (executor_base_url or "").rstrip("/")
     if not base:
         return [
@@ -58,6 +76,7 @@ async def execute(
             }
         ]
     async with _hx.AsyncClient(timeout=None, trust_env=False) as client:
+        log.info("executor_gateway.execute POST %s/execute trace_id=%s request_id=%s", base, tid, rid)
         r = await client.post(base + "/execute", json=payload)
         raw_body = r.text or ""
         # The executor is expected to return a JSON envelope of the form
@@ -78,15 +97,54 @@ async def execute(
                 },
                 "result": {"produced": {}},
             }
+    try:
+        ok_flag = bool(env.get("ok")) if isinstance(env, dict) else False
+        produced_obj = (env.get("result") or {}).get("produced") if isinstance(env, dict) else None
+        produced_keys = sorted(list(produced_obj.keys()))[:32] if isinstance(produced_obj, dict) else []
+        log.info(
+            "executor_gateway.execute response trace_id=%s request_id=%s http_status=%s ok=%s produced_keys=%s",
+            tid,
+            rid,
+            int(r.status_code),
+            ok_flag,
+            produced_keys,
+        )
+    except Exception:
+        log.debug("executor_gateway.execute: failed to emit response log summary", exc_info=True)
     results: List[Dict[str, Any]] = []
     if isinstance(env, dict) and env.get("ok") and isinstance((env.get("result") or {}).get("produced"), dict):
         produced = (env.get("result") or {}).get("produced", {}) or {}
-        for _, step in produced.items():
+        # Attach args back to results (executor does not echo args).
+        #
+        # IMPORTANT: Do NOT sort produced and then match by enumerate index.
+        # produced is a dict keyed by step id (e.g. "s1", "s2", ...), and dict
+        # iteration order may not match the input tool-calls order. Index-based
+        # matching can therefore attach the wrong args to a result.
+        #
+        # Instead, build a step-id -> input-step map using the implicit "s{i}"
+        # convention used by the executor for list-ordered steps.
+        input_step_by_sid: Dict[str, Dict[str, Any]] = {}
+        for i, st in enumerate(steps):
+            if isinstance(st, dict):
+                input_step_by_sid[f"s{i + 1}"] = st
+        for sid, step in produced.items():
             if not isinstance(step, dict):
                 continue
+            sid_str = str(sid)
+            input_step = input_step_by_sid.get(sid_str, {})
+            args_out = input_step.get("args") if isinstance(input_step.get("args"), dict) else {}
+            input_tool = input_step.get("tool") if isinstance(input_step.get("tool"), str) else None
+            tool_name = step.get("name") if isinstance(step.get("name"), str) else (input_tool or "tool")
             res = step.get("result") if isinstance(step.get("result"), dict) else {}
-            tool_name = step.get("name") if isinstance(step.get("name"), str) else "tool"
-            results.append({"name": tool_name, "result": res})
+
+            # Preserve all executor-provided fields (e.g. artifacts/meta/timing),
+            # but ensure the canonical tool-result keys are present/normalized.
+            out: Dict[str, Any] = dict(step)
+            out["name"] = tool_name
+            out["result"] = res
+            out["args"] = args_out
+            out["step_id"] = sid_str
+            results.append(out)
         return results
     err = (env or {}).get("error") or (env.get("result") or {}).get("error") or {}
     # Surface full structured error; never truncate to a generic 'executor_failed'.

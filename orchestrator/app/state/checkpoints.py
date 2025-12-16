@@ -26,7 +26,7 @@ def _append_atomic(path: str, text: str) -> None:
                 os.remove(tmp)
         except Exception:
             # Best-effort cleanup; never raise from trace persistence.
-            pass
+            log.debug("checkpoints._append_atomic: failed to cleanup tmp=%s", tmp, exc_info=True)
 
 
 def append_ndjson(path: str, obj: Dict[str, Any]) -> None:

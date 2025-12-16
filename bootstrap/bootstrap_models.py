@@ -133,6 +133,7 @@ class SizeBeat:
         self.label = label
         self.interval = interval
         self._stop = False
+        self._err_count = 0
         self.t = threading.Thread(target=self._run, daemon=True)
 
     def _run(self) -> None:
@@ -143,8 +144,12 @@ class SizeBeat:
                     fp = os.path.join(root, f)
                     try:
                         total += os.path.getsize(fp)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        # Non-fatal; progress reporting must never crash bootstrap.
+                        # But it must also not be silent; rate-limit warnings.
+                        self._err_count += 1
+                        if self._err_count <= 3 or (self._err_count % 100) == 0:
+                            log("WARN: SizeBeat getsize failed", fp, ":", exc)
             log(f"PROGRESS {self.label}", human(total))
             time.sleep(self.interval)
 
@@ -155,8 +160,9 @@ class SizeBeat:
         self._stop = True
         try:
             self.t.join()
-        except Exception:
-            pass
+        except Exception as exc:
+            log("WARN: SizeBeat join failed", self.label, ":", exc)
+            return
 
 
 def ensure_pkg() -> None:
@@ -319,7 +325,7 @@ def main() -> None:
         with open(done_marker, "w", encoding="utf-8") as f:
             f.write(str(int(time.time())))
     except Exception:
-        pass
+        log("WARN: failed to write done marker", done_marker)
     log("✅ bootstrap complete into", MODELS_DIR)
 
 

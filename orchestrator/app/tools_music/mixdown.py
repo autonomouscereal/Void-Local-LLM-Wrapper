@@ -4,6 +4,7 @@ import os
 import json
 import wave
 import struct
+import logging
 from .common import now_ts, ensure_dir, sidecar, stamp_env
 from ..determinism.seeds import stamp_tool_args
 from ..artifacts.manifest import add_manifest_row
@@ -12,6 +13,8 @@ from ..jsonio.versioning import bump_envelope, assert_envelope
 from ..refs.registry import append_provenance
 from ..context.index import add_artifact as _ctx_add
 from ..datasets.trace import append_sample as _trace_append
+
+log = logging.getLogger(__name__)
 
 
 def _read_wav(path: str):
@@ -91,13 +94,13 @@ def run_music_mixdown(job: dict, manifest: dict) -> dict:
             mid = (job.get("music_id") if isinstance(job, dict) else None)
             if mid:
                 append_provenance(mid, {"when": now_ts(), "tool": "music.mixdown", "artifact": path, "seed": int(args.get("seed") or 0)})
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("music.mixdown: append_provenance failed (non-fatal) cid=%s: %s", cid, exc, exc_info=True)
     add_manifest_row(manifest, path, step_id="music.mixdown")
     try:
         _ctx_add(cid, "audio", path, None, None, ["music", "mixdown"], {})
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("music.mixdown: context add failed (non-fatal) cid=%s: %s", cid, exc, exc_info=True)
     try:
         _trace_append("music", {
             "cid": cid,
@@ -106,8 +109,8 @@ def run_music_mixdown(job: dict, manifest: dict) -> dict:
             "seed": int(args.get("seed") or 0),
             "path": path,
         })
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("music.mixdown: trace append failed (non-fatal) cid=%s: %s", cid, exc, exc_info=True)
     env = {
         "meta": {"model": "mix-local", "ts": now_ts(), "cid": cid, "step": 0, "state": "halt", "cont": {"present": False, "state_hash": None, "reason": None}},
         "reasoning": {"goal": "music mixdown", "constraints": ["json-only"], "decisions": ["music.mixdown done"]},

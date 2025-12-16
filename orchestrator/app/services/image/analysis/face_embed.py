@@ -2,6 +2,7 @@ import os
 import numpy as np
 from PIL import Image
 from typing import Optional, List
+import logging
 
 try:
     import insightface  # type: ignore
@@ -13,6 +14,8 @@ except ImportError:
 _INSIGHTFACE_ROOT = os.environ.get("INSIGHTFACE_HOME", "/models/insightface")
 _APP = None
 
+log = logging.getLogger(__name__)
+
 def _get_app():
     global _APP
     if _APP is not None:
@@ -23,7 +26,10 @@ def _get_app():
         # Ensure root exists or fallback
         if not os.path.exists(_INSIGHTFACE_ROOT):
             # If running locally without docker volume, might fail or default to ~/.insightface
-            pass
+            try:
+                os.makedirs(_INSIGHTFACE_ROOT, exist_ok=True)
+            except Exception:
+                log.debug("face_embed: failed to create INSIGHTFACE_HOME=%s", _INSIGHTFACE_ROOT, exc_info=True)
         app = FaceAnalysis(name="buffalo_l", root=_INSIGHTFACE_ROOT)
         app.prepare(ctx_id=0, det_size=(640, 640))
         _APP = app

@@ -10,13 +10,18 @@ ENV PIP_EXTRA_INDEX_URL=${PIP_EXTRA_INDEX_URL}
 
 WORKDIR /app
 
-COPY requirements.txt /app/requirements.txt
+# Repo-root build context: copy the xtts service requirements from its subdir.
+COPY services/xtts/requirements.txt /app/requirements.txt
 # Pre-install CUDA torch cu118 compatible with P40 and RTX 8000
 RUN pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cu118 \
     "torch==2.7.1+cu118" "torchvision==0.22.1+cu118" "torchaudio==2.7.1+cu118"
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-COPY app /app/app
+# Service code
+COPY services/xtts/app /app/app
+
+# Shared repo packages required at runtime (xtts does not mount the repo).
+COPY void_json /app/void_json
 
 EXPOSE 8020
 

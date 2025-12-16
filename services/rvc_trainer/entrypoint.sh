@@ -1,6 +1,13 @@
 #!/bin/bash
 set -euo pipefail
 
+# Duplicate all stdout/stderr to shared log volume while still streaming realtime.
+LOG_DIR="${LOG_DIR:-/workspace/logs}"
+mkdir -p "$LOG_DIR" || true
+LOG_FILE="${LOG_FILE:-$LOG_DIR/rvc_trainer_entrypoint.log}"
+exec > >(tee -a "$LOG_FILE") 2>&1
+echo "[rvc_trainer] entrypoint logging to $LOG_FILE"
+
 # Set up Titan pretrain symlinks at runtime (files are available via volume mount)
 TITAN_SOURCE="/opt/models/rvc_titan"
 PRETRAINED_DIR="/srv/rvc_webui/pretrained"

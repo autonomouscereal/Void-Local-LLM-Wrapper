@@ -4,6 +4,8 @@ import math
 import os
 from typing import Any, Dict, List
 
+import logging
+
 import numpy as np  # type: ignore
 import torch  # type: ignore
 
@@ -54,7 +56,6 @@ class MusicEvalError(Exception):
     "style eval unavailable for this track/clip" and degrade gracefully,
     rather than letting it crash the entire tool call.
     """
-    pass
 
 
 _CLAP_MODEL = None
@@ -86,8 +87,8 @@ def _embed_music_clap(path: str) -> List[float]:
         if hasattr(emb, "__len__") and len(emb) == 0:
             return []
     except Exception:
-        # If len() is not supported, fall through and let indexing fail loudly.
-        pass
+        # If len() is not supported, raise explicitly (callers expect this to fail loudly).
+        logging.error("CLAP embedding object does not support len(); cannot validate empty embedding")
     e0 = emb[0]
     # Support both torch tensors and numpy arrays (and generic list-like) without
     # assuming .detach() is available.

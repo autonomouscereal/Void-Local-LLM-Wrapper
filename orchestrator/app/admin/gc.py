@@ -4,6 +4,9 @@ import os
 import time
 import shutil
 from typing import Dict, Any
+import logging
+
+log = logging.getLogger(__name__)
 
 
 DEFAULTS = {
@@ -83,12 +86,13 @@ def run_gc(plan: Dict[str, Any], dryrun: bool = True) -> Dict[str, Any]:
             try:
                 shutil.rmtree(p)
                 deleted.append({"path": p, "bytes": 0})
-            except Exception:
-                pass
+            except Exception as ex:
+                log.warning("gc: failed to rmtree path=%s: %s", p, ex, exc_info=True)
         except FileNotFoundError:
-            pass
-        except Exception:
-            pass
+            # Already gone; treat as deleted.
+            continue
+        except Exception as ex:
+            log.warning("gc: failed to delete path=%s: %s", p, ex, exc_info=True)
     return {"deleted": deleted, "dryrun": False}
 
 

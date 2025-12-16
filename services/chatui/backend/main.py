@@ -128,9 +128,9 @@ def _decode_json(value: Any) -> Dict[str, Any]:
             obj = parser.parse(value, expected)
             if isinstance(obj, dict) and obj:
                 return obj
-        except Exception:
-            # Fall through to plain-text wrapper below
-            pass
+        except Exception as exc:
+            # Fall through to plain-text wrapper below, but do not be silent.
+            logging.getLogger("chatui").warning("decode_json failed; falling back to text wrapper: %s", exc, exc_info=True)
         return {"text": value}
     return {"text": str(value or "")}
 

@@ -119,7 +119,8 @@ def validate_remote_host(url: str) -> Optional[str]:
             if ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local:
                 return "host_not_allowed"
     except Exception:
-        pass
+        # If we cannot resolve the host, we cannot safely SSRF-screen it.
+        return "dns_lookup_failed"
     return None
 
 

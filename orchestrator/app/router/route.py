@@ -22,7 +22,7 @@ def _last_user_text(req: Dict[str, Any]) -> str:
             if (m.get("role") == "user") and isinstance(m.get("content"), str) and m.get("content").strip():
                 return m.get("content").strip()
     except Exception:
-        pass
+        return ""
     return ""
 
 

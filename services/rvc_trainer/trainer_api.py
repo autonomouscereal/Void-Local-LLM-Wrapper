@@ -8,6 +8,7 @@ import shutil
 import glob
 import uuid
 import logging
+import sys
 import soundfile as sf
 import numpy as np
 import torch
@@ -17,6 +18,34 @@ from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
+
+
+# ---- Logging (stdout + shared log volume file) ----
+try:
+    from logging.handlers import RotatingFileHandler
+
+    _log_dir = os.getenv("LOG_DIR", "/workspace/logs").strip() or "/workspace/logs"
+    os.makedirs(_log_dir, exist_ok=True)
+    _log_file = os.getenv("LOG_FILE", "").strip() or os.path.join(_log_dir, "rvc_trainer.log")
+    _lvl = getattr(logging, (os.getenv("LOG_LEVEL", "INFO") or "INFO").upper(), logging.INFO)
+    logging.basicConfig(
+        level=_lvl,
+        format="%(asctime)s.%(msecs)03d %(levelname)s %(process)d/%(threadName)s %(name)s %(pathname)s:%(funcName)s:%(lineno)d - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+            RotatingFileHandler(_log_file, maxBytes=50 * 1024 * 1024, backupCount=5, encoding="utf-8"),
+        ],
+        force=True,
+    )
+    logging.getLogger("rvc_trainer.logging").info(
+        "rvc_trainer logging configured file=%r level=%s", _log_file, logging.getLevelName(_lvl)
+    )
+except Exception as _ex:
+    logging.basicConfig(level=logging.INFO, stream=sys.stdout)
+    logging.getLogger("rvc_trainer.logging").warning("rvc_trainer file logging disabled: %s", _ex, exc_info=True)
+
+log = logging.getLogger("rvc_trainer")
 
 try:
     from speechbrain.pretrained import EncoderClassifier
@@ -49,10 +78,13 @@ def get_speaker_encoder() -> Any:
     global _SPKREC_MODEL
     
     if _SPKREC_MODEL is None:
+        log.info("speaker_encoder loading model_id=%r device=%s", SPKREC_MODEL_ID, SPK_DEVICE)
+        t0 = time.perf_counter()
         _SPKREC_MODEL = EncoderClassifier.from_hparams(
             source=SPKREC_MODEL_ID,
             run_opts={"device": SPK_DEVICE},
         )
+        log.info("speaker_encoder loaded duration_ms=%s", int((time.perf_counter() - t0) * 1000))
     return _SPKREC_MODEL
 
 
@@ -61,6 +93,7 @@ def compute_speaker_embedding(wav_path: str) -> np.ndarray:
     Compute a speaker embedding for a single WAV file using the ECAPA encoder.
     """
     encoder = get_speaker_encoder()
+    t0 = time.perf_counter()
     waveform, sample_rate = torchaudio.load(wav_path)
     target_sr = 16000
     if sample_rate != target_sr:
@@ -72,6 +105,15 @@ def compute_speaker_embedding(wav_path: str) -> np.ndarray:
     norm = np.linalg.norm(emb_np)
     if norm > 0:
         emb_np = emb_np / float(norm)
+    log.info(
+        "speaker_embedding computed wav=%r in_sr=%s target_sr=%s frames=%s emb_dim=%s duration_ms=%s",
+        wav_path,
+        int(sample_rate),
+        int(target_sr),
+        int(waveform.shape[-1]) if hasattr(waveform, "shape") else -1,
+        int(emb_np.shape[-1]) if hasattr(emb_np, "shape") else -1,
+        int((time.perf_counter() - t0) * 1000),
+    )
     return emb_np
 
 
@@ -80,14 +122,18 @@ def load_speaker_index() -> Dict[str, Any]:
     Load the speaker index mapping speaker_id -> {"embedding": [...], "count": int}.
     """
     if not os.path.exists(SPK_INDEX_PATH):
+        log.info("speaker_index missing path=%r", SPK_INDEX_PATH)
         return {}
     try:
         with open(SPK_INDEX_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
         if not isinstance(data, dict):
+            log.warning("speaker_index invalid_type path=%r type=%s", SPK_INDEX_PATH, type(data).__name__)
             return {}
+        log.info("speaker_index loaded path=%r speakers=%s", SPK_INDEX_PATH, len(data))
         return data
-    except Exception:
+    except Exception as ex:
+        log.warning("speaker_index load_failed path=%r err=%s", SPK_INDEX_PATH, ex, exc_info=True)
         return {}
 
 
@@ -98,6 +144,7 @@ def save_speaker_index(index: Dict[str, Any]) -> None:
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(index, f, indent=2)
     os.replace(tmp_path, SPK_INDEX_PATH)
+    log.info("speaker_index saved path=%r speakers=%s", SPK_INDEX_PATH, len(index))
 
 
 def update_speaker_embedding(index: Dict[str, Any], speaker_id: str, new_emb: np.ndarray) -> Dict[str, Any]:
@@ -156,22 +203,27 @@ def setup_dataset(speaker_id: str, ref_paths: List[str]) -> str:
     dataset_root = os.path.join(RVC_TRAIN_DATA_ROOT, "speakers", speaker_id)
     wavs_dir = os.path.join(dataset_root, "wavs")
     os.makedirs(wavs_dir, exist_ok=True)
+    log.info("dataset setup start speaker_id=%s refs=%s dataset_root=%r", speaker_id, len(ref_paths or []), dataset_root)
     
     # Copy or symlink reference files to wavs directory
     wav_abs_paths = []
     for ref_path in ref_paths:
         if not os.path.exists(ref_path):
+            log.warning("dataset ref missing ref_path=%r", ref_path)
             continue
         basename = os.path.basename(ref_path)
         target_path = os.path.join(wavs_dir, basename)
         if not os.path.exists(target_path):
             try:
                 shutil.copy2(ref_path, target_path)
+                log.info("dataset copied ref=%r -> %r", ref_path, target_path)
             except Exception:
                 # If copy fails, try symlink
                 try:
                     os.symlink(ref_path, target_path)
+                    log.info("dataset symlinked ref=%r -> %r", ref_path, target_path)
                 except Exception:
+                    log.warning("dataset copy+symlink failed ref=%r target=%r", ref_path, target_path, exc_info=True)
                     continue
         # Store absolute path for train.list/val.list
         wav_abs_paths.append(os.path.abspath(target_path))
@@ -202,6 +254,15 @@ def setup_dataset(speaker_id: str, ref_paths: List[str]) -> str:
             dummy_id = os.path.splitext(os.path.basename(wav_path))[0]
             f.write(f"{wav_path}\t{dummy_id}\n")
     
+    log.info(
+        "dataset setup done speaker_id=%s wavs=%s train=%s val=%s train_list=%r val_list=%r",
+        speaker_id,
+        len(wav_abs_paths),
+        len(train_paths),
+        len(val_paths),
+        train_list_path,
+        val_list_path,
+    )
     return dataset_root
 
 
@@ -278,6 +339,16 @@ async def train_now(body: Dict[str, Any]):
     requested_speaker_id = (body.get("speaker_id") or "").strip()
     requested_model_name = (body.get("rvc_model_name") or "").strip()
     refs = body.get("refs") or []
+    req_id = uuid.uuid4().hex[:12]
+    log.info(
+        "train_now start req_id=%s speaker_id=%r model_name=%r refs=%s train_steps=%r spkrec=%s",
+        req_id,
+        requested_speaker_id,
+        requested_model_name,
+        len(refs) if isinstance(refs, list) else -1,
+        body.get("train_steps"),
+        bool(SPKREC_AVAILABLE),
+    )
     
     # train_steps will be computed later if not provided
     train_steps = body.get("train_steps")
@@ -293,6 +364,7 @@ async def train_now(body: Dict[str, Any]):
     # Choose primary ref for embedding (first one)
     primary_ref = refs[0]
     if not isinstance(primary_ref, str) or not os.path.exists(primary_ref):
+        log.warning("train_now invalid_primary_ref req_id=%s primary_ref=%r", req_id, primary_ref)
         return JSONResponse(
             status_code=400,
             content={"ok": False, "error": {"code": "invalid_primary_ref", "message": f"Primary reference not found: {primary_ref}"}},
@@ -307,9 +379,11 @@ async def train_now(body: Dict[str, Any]):
         # Caller provided explicit speaker_id; use as-is
         speaker_id = requested_speaker_id.strip()
         model_name = requested_model_name.strip() if requested_model_name.strip() else speaker_id
+        log.info("train_now explicit_speaker req_id=%s speaker_id=%s model_name=%s", req_id, speaker_id, model_name)
     else:
         # No speaker_id provided: run speaker detection
         if not SPKREC_AVAILABLE:
+            log.error("train_now speaker_detection_unavailable req_id=%s", req_id)
             return JSONResponse(
                 status_code=500,
                 content={"ok": False, "error": {"code": "speaker_detection_unavailable", "message": "speechbrain not available; speaker_id is required"}},
@@ -321,6 +395,13 @@ async def train_now(body: Dict[str, Any]):
             best_id, best_score = find_best_matching_speaker(new_emb, index)
             matched_speaker_id = best_id
             match_score = best_score
+            log.info(
+                "train_now speaker_match req_id=%s best_id=%r score=%.4f speakers_in_index=%s",
+                req_id,
+                best_id,
+                float(best_score),
+                len(index),
+            )
             
             if best_id and best_score >= 0.80:
                 # Reuse existing speaker/model (always merge)
@@ -332,7 +413,17 @@ async def train_now(body: Dict[str, Any]):
                 speaker_id = f"spk-{new_id}"
                 model_name = speaker_id
                 is_new_speaker = True
+            log.info(
+                "train_now speaker_resolved req_id=%s speaker_id=%s model_name=%s is_new=%s matched=%r score=%.4f",
+                req_id,
+                speaker_id,
+                model_name,
+                bool(is_new_speaker),
+                matched_speaker_id,
+                float(match_score),
+            )
         except Exception as ex:
+            log.error("train_now speaker_detection_failed req_id=%s err=%s", req_id, ex, exc_info=True)
             return JSONResponse(
                 status_code=500,
                 content={"ok": False, "error": {"code": "speaker_detection_failed", "message": str(ex)}},
@@ -348,6 +439,7 @@ async def train_now(body: Dict[str, Any]):
         )
     
     start_time = time.time()
+    log.info("train_now run_start req_id=%s speaker_id=%s model_name=%s primary_ref=%r", req_id, speaker_id, model_name, primary_ref)
     
     try:
         # Compute train_steps if not provided (estimate from total duration)
@@ -355,12 +447,22 @@ async def train_now(body: Dict[str, Any]):
             total_sec = 0.0
             for ref_path in refs:
                 if not os.path.exists(ref_path):
+                    log.warning("train_now duration missing req_id=%s ref=%r", req_id, ref_path)
                     continue
                 try:
                     audio, sr = sf.read(ref_path, always_2d=False)
                     duration = len(audio) / float(sr) if sr > 0 else 0.0
                     total_sec += duration
+                    log.info(
+                        "train_now duration req_id=%s ref=%r sr=%s samples=%s seconds=%.3f",
+                        req_id,
+                        ref_path,
+                        int(sr),
+                        int(len(audio)) if hasattr(audio, "__len__") else -1,
+                        float(duration),
+                    )
                 except Exception:
+                    log.warning("train_now duration read_failed req_id=%s ref=%r", req_id, ref_path, exc_info=True)
                     continue
             # Simple heuristic: estimate steps from duration
             minutes = total_sec / 60.0
@@ -376,14 +478,29 @@ async def train_now(body: Dict[str, Any]):
                 train_steps = 8000
             else:
                 train_steps = 12000
+
+            log.info(
+                "train_now train_steps estimated req_id=%s total_sec=%.3f minutes=%.3f train_steps=%s",
+                req_id,
+                float(total_sec),
+                float(minutes),
+                int(train_steps),
+            )
         
         # Set up dataset
         dataset_root = setup_dataset(speaker_id, refs)
+        log.info("train_now dataset_ready req_id=%s dataset_root=%r", req_id, dataset_root)
         
         # Check if this is fine-tuning (model already exists) or first training
         model_dir = os.path.join(RVC_MODELS_ROOT, model_name)
         existing_model = os.path.join(model_dir, f"{model_name}.pth")
         is_finetune = os.path.exists(existing_model)
+        log.info(
+            "train_now finetune_check req_id=%s is_finetune=%s existing_model=%r",
+            req_id,
+            bool(is_finetune),
+            existing_model,
+        )
         
         # Determine pretrain path
         pretrain_path = None
@@ -403,6 +520,12 @@ async def train_now(body: Dict[str, Any]):
             train_steps=train_steps,
             is_finetune=is_finetune,
             pretrain_path=pretrain_path,
+        )
+        log.info(
+            "train_now config_ready req_id=%s config_path=%r pretrain_path=%r",
+            req_id,
+            config_path,
+            pretrain_path,
         )
         
         # Build training command
@@ -427,6 +550,8 @@ async def train_now(body: Dict[str, Any]):
         # Set working directory and environment
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = "0"
+
+        log.info("train_now subprocess_start req_id=%s cwd=%r cmd=%r", req_id, RVC_WEBUI_ROOT, cmd)
         
         # Run training (blocking)
         proc = subprocess.run(
@@ -440,8 +565,23 @@ async def train_now(body: Dict[str, Any]):
         )
         
         duration = time.time() - start_time
+        log.info(
+            "train_now subprocess_done req_id=%s returncode=%s duration_s=%.3f stdout_len=%s stderr_len=%s",
+            req_id,
+            int(proc.returncode),
+            float(duration),
+            int(len(proc.stdout or "")),
+            int(len(proc.stderr or "")),
+        )
         
         if proc.returncode != 0:
+            log.error(
+                "train_now nonzero_exit req_id=%s returncode=%s stdout_tail=%r stderr_tail=%r",
+                req_id,
+                int(proc.returncode),
+                (proc.stdout or "")[-2000:],
+                (proc.stderr or "")[-2000:],
+            )
             return JSONResponse(
                 status_code=500,
                 content={
@@ -460,6 +600,7 @@ async def train_now(body: Dict[str, Any]):
         # Find and copy the trained model
         latest_model = find_latest_model(model_name)
         if not latest_model:
+            log.error("train_now model_not_found req_id=%s model_name=%s", req_id, model_name)
             return JSONResponse(
                 status_code=500,
                 content={
@@ -477,6 +618,7 @@ async def train_now(body: Dict[str, Any]):
         os.makedirs(model_dir, exist_ok=True)
         target_model = os.path.join(model_dir, f"{model_name}.pth")
         shutil.copy2(latest_model, target_model)
+        log.info("train_now model_copied req_id=%s src=%r dst=%r", req_id, latest_model, target_model)
         
         # Optional: Try to find and copy index file if it exists
         logs_dir = os.path.join(RVC_WEBUI_ROOT, "logs", model_name)
@@ -486,6 +628,7 @@ async def train_now(body: Dict[str, Any]):
             index_files.sort(key=os.path.getmtime, reverse=True)
             target_index = os.path.join(model_dir, f"{model_name}.index")
             shutil.copy2(index_files[0], target_index)
+            log.info("train_now index_copied req_id=%s src=%r dst=%r", req_id, index_files[0], target_index)
         
         # Update speaker index after successful training
         try:
@@ -495,7 +638,9 @@ async def train_now(body: Dict[str, Any]):
                 index = update_speaker_embedding(index, speaker_id, new_emb)
                 save_speaker_index(index)
         except Exception as exc:
-            logging.warning("speaker_index_update_failed speaker_id=%s error=%s", speaker_id, str(exc))
+            log.warning("speaker_index_update_failed req_id=%s speaker_id=%s error=%s", req_id, speaker_id, str(exc), exc_info=True)
+
+        log.info("train_now success req_id=%s speaker_id=%s model_name=%s duration_s=%.3f", req_id, speaker_id, model_name, float(duration))
         
         return JSONResponse(
             status_code=200,

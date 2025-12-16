@@ -1,6 +1,11 @@
 #!/bin/sh
 set -e
 
+# Duplicate all stdout/stderr to shared log volume while still streaming realtime.
+LOG_DIR="${LOG_DIR:-/workspace/logs}"
+mkdir -p "$LOG_DIR" || true
+LOG_FILE="${LOG_FILE:-$LOG_DIR/comfyui.log}"
+
 # Ensure AnimateDiff motion models exist (mounted via shared volume or fetch fallback)
 MODELS_DIR="/comfyui/models/animatediff_models"
 ALT_DIR="/comfyui/custom_nodes/ComfyUI-AnimateDiff-Evolved/models"
@@ -16,5 +21,7 @@ for fn in mm_sd_v15_v2.ckpt mm_sdxl_v10.ckpt; do
   fi
 done
 
-exec python main.py --listen 0.0.0.0 --port 8188 --cpu
+echo "[comfyui] starting main.py (logging to $LOG_FILE)" >&2
+# Keep realtime logs to stdout while also persisting them.
+python main.py --listen 0.0.0.0 --port 8188 --cpu 2>&1 | tee -a "$LOG_FILE"
 

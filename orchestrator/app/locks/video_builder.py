@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import os
 from typing import Any, Dict, List, Optional
+import logging
 
 import cv2  # type: ignore
 
 from .builder import _save_image_bytes, _compute_face_embedding, _now_ts
+
+log = logging.getLogger(__name__)
 
 
 async def build_video_bundle(
@@ -57,7 +60,7 @@ async def build_video_bundle(
         try:
             cap.release()
         except Exception:
-            pass
+            log.debug("video_builder: failed to release cv2.VideoCapture (non-fatal) video_path=%s", video_path, exc_info=True)
 
     # If no frames were saved, downstream indexing into saved_paths will fail
     # naturally instead of being guarded by an explicit ValueError here.

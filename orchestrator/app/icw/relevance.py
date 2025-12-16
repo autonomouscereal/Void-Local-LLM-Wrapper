@@ -15,8 +15,10 @@ def score_chunk(chunk_text: str, query_text: str) -> float:
     the underlying problem in logs.
     """
     try:
-        qt = set(re.findall(r"\w+", (query_text or "").lower()))
-        ct = set(re.findall(r"\w+", (chunk_text or "").lower()))
+        q = query_text if isinstance(query_text, str) else str(query_text or "")
+        c = chunk_text if isinstance(chunk_text, str) else str(chunk_text or "")
+        qt = set(re.findall(r"\w+", (q or "").lower()))
+        ct = set(re.findall(r"\w+", (c or "").lower()))
         denom = 1.0 + math.log(1.0 + len(ct))
         return float(len(qt & ct)) / denom if denom > 0 else 0.0
     except Exception as exc:  # pragma: no cover - defensive logging

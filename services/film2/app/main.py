@@ -5,6 +5,7 @@ import json
 import os
 import hashlib
 import logging
+import sys
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -26,6 +27,29 @@ UPLOAD_ROOT = "/workspace/uploads"
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")
 os.makedirs(UPLOAD_ROOT, exist_ok=True)
 PROJECTS_PREFIX = "projects"
+
+# ---- Logging (stdout + shared log volume file) ----
+try:
+    from logging.handlers import RotatingFileHandler
+
+    _log_dir = os.getenv("LOG_DIR", "/workspace/logs").strip() or "/workspace/logs"
+    os.makedirs(_log_dir, exist_ok=True)
+    _log_file = os.getenv("LOG_FILE", "").strip() or os.path.join(_log_dir, "film2.log")
+    _lvl = getattr(logging, (os.getenv("LOG_LEVEL", "INFO") or "INFO").upper(), logging.INFO)
+    logging.basicConfig(
+        level=_lvl,
+        format="%(asctime)s.%(msecs)03d %(levelname)s %(process)d/%(threadName)s %(name)s %(pathname)s:%(funcName)s:%(lineno)d - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+            RotatingFileHandler(_log_file, maxBytes=50 * 1024 * 1024, backupCount=5, encoding="utf-8"),
+        ],
+        force=True,
+    )
+    logging.getLogger("film2.logging").info("film2 logging configured file=%r level=%s", _log_file, logging.getLevelName(_lvl))
+except Exception as _ex:
+    logging.basicConfig(level=logging.INFO, stream=sys.stdout)
+    logging.getLogger("film2.logging").warning("film2 file logging disabled: %s", _ex, exc_info=True)
 
 
 app = FastAPI(title="Film 2.0", version=FILM_VERSION)
@@ -274,8 +298,13 @@ async def film_plan(body: Dict[str, Any]):
                 per_scene = max(1.0, float(cfg.get("duration_s")) / max(1, len(scenes)))
                 for i, s in enumerate(scenes):
                     s["duration_s"] = round(per_scene, 2)
-        except Exception:
-            pass
+        except Exception as exc:
+            logging.getLogger("film2").warning(
+                "film_plan: failed to apply locked duration_s to scenes (non-fatal) project_id=%s: %s",
+                project_id,
+                exc,
+                exc_info=True,
+            )
         # Characters locked: load from manifest if present
         locked_chars = (await _get_manifest(project_id, "characters")) or []
         characters = locked_chars if isinstance(locked_chars, list) and locked_chars else characters
@@ -330,8 +359,8 @@ async def film_plan(body: Dict[str, Any]):
         locks = body.get("locks") or {}
         if isinstance(locks, dict) and locks:
             _write_json(project_id, "locks.json", locks)
-    except Exception:
-        pass
+    except Exception as exc:
+        logging.getLogger("film2").warning("film_plan: failed to write locks.json (non-fatal) project_id=%s: %s", project_id, exc, exc_info=True)
     _log_run(project_id, "plan", [{"type": "json", "uri": _proj_uri(project_id, "plan.json") }], {"seed": seed})
 
     # DB upserts: enforce lock-on-first-plan semantics
@@ -352,7 +381,11 @@ async def film_plan(body: Dict[str, Any]):
                     try:
                         duration_s = float(ex_cfg.get("duration_s") or duration_s)
                     except Exception:
-                        pass
+                        logging.getLogger("film2").warning(
+                            "film_plan: locked duration_s is not numeric; keeping prior duration project_id=%s",
+                            project_id,
+                            exc_info=True,
+                        )
             cfg = {"outputs": outputs, "style_refs": style_refs, "character_images": character_images, "duration_s": int(round(duration_s)), "locked": True}
             if not existing:
                 await db_execute(
@@ -371,8 +404,8 @@ async def film_plan(body: Dict[str, Any]):
                 await db_execute("INSERT INTO film_manifest(project_id, kind, json) VALUES($1,$2,$3)", pid, "characters", chars_json)
                 for sc in scenes:
                     await db_execute("INSERT INTO film_scene(project_id, scene_uid, meta_json) VALUES($1,$2,$3) ON CONFLICT (project_id, scene_uid) DO NOTHING", pid, sc.get("id"), sc)
-    except Exception:
-        pass
+    except Exception as exc:
+        logging.getLogger("film2").error("film_plan: DB upsert failed (non-fatal) project_id=%s: %s", project_id, exc, exc_info=True)
 
     result = {
         "project_id": project_id,
@@ -386,8 +419,8 @@ async def film_plan(body: Dict[str, Any]):
     }
     try:
         _trace_append("film", {"stage": "plan", "project_id": project_id, "seed": seed, "outputs": outputs, "style_refs": style_refs, "character_images": character_images})
-    except Exception:
-        pass
+    except Exception as exc:
+        logging.getLogger("film2").debug("film_plan: trace append failed (non-fatal) project_id=%s: %s", project_id, exc, exc_info=True)
     return result
 
 
@@ -461,12 +494,12 @@ async def film_breakdown(body: Dict[str, Any]):
                         "INSERT INTO film_shot(project_id, shot_uid, scene_uid, dsl_json, seeds_json, status) VALUES($1,$2,$3,$4,$5,'planned') ON CONFLICT (project_id, shot_uid) DO NOTHING",
                         pid, sh.get("id"), sh.get("scene_id"), sh.get("dsl", {}), seeds_json,
                     )
-    except Exception:
-        pass
+    except Exception as exc:
+        logging.getLogger("film2").error("film_breakdown: DB upsert failed (non-fatal) project_id=%s: %s", project_id, exc, exc_info=True)
     try:
         _trace_append("film", {"stage": "breakdown", "project_id": project_id, "shots": shots})
-    except Exception:
-        pass
+    except Exception as exc:
+        logging.getLogger("film2").debug("film_breakdown: trace append failed (non-fatal) project_id=%s: %s", project_id, exc, exc_info=True)
     return {"shots": shots}
 
 
@@ -499,8 +532,8 @@ async def film_storyboard(body: Dict[str, Any]):
     _log_run(project_id, "storyboard", [{"type": "json", "uri": _proj_uri(project_id, "shots", shots[0], "storyboard.json")}], {"seed": seed})
     try:
         _trace_append("film", {"stage": "storyboard", "project_id": project_id, "count": len(storyboards)})
-    except Exception:
-        pass
+    except Exception as exc:
+        logging.getLogger("film2").debug("film_storyboard: trace append failed (non-fatal) project_id=%s: %s", project_id, exc, exc_info=True)
     return {"storyboards": storyboards}
 
 
@@ -525,7 +558,7 @@ async def film_animatic(body: Dict[str, Any]):
     try:
         _trace_append("film", {"stage": "animatic", "project_id": project_id, "count": len(animatics)})
     except Exception:
-        pass
+        logging.getLogger("film2").debug("film_animatic: trace append failed (non-fatal) project_id=%s", project_id, exc_info=True)
     return {"animatics": animatics}
 
 
@@ -620,8 +653,8 @@ async def film_final(body: Dict[str, Any]):
                                 durations_map[sid] = d
                         except Exception:
                             continue
-    except Exception:
-        pass
+    except Exception as exc:
+        logging.getLogger("film2").warning("film_final: failed to read shots.jsonl durations (non-fatal) project_id=%s: %s", project_id, exc, exc_info=True)
     # If a total target is locked, scale shot durations deterministically
     target_total = None
     try:
@@ -733,9 +766,9 @@ async def film_final(body: Dict[str, Any]):
                         # Overwrite reel with stabilized output
                         reel = {"uri": new_path, "hash": reel.get("hash")}
                 except Exception:
-                    pass
-    except Exception:
-        pass
+                    logging.getLogger("film2").warning("film_final: failed to parse orchestrator stabilization response (non-fatal) project_id=%s", project_id, exc_info=True)
+    except Exception as exc:
+        logging.getLogger("film2").warning("film_final: stabilization call failed (non-fatal) project_id=%s: %s", project_id, exc, exc_info=True)
     _log_run(project_id, "final", [{"type": "json", "uri": edl_meta["uri"]}, {"type": "json", "uri": nodes_meta["uri"]}, {"type": "mp4", "uri": reel["uri"], "hash": reel["hash"]}], {"seed": seed})
     # Optionally persist nodes manifest to DB
     try:
@@ -746,11 +779,11 @@ async def film_final(body: Dict[str, Any]):
                 pid = int(row[0])
                 await db_execute("INSERT INTO film_manifest(project_id, kind, json) VALUES($1,$2,$3)", pid, "nodes", nodes_obj)
     except Exception:
-        pass
+        logging.getLogger("film2").error("film_final: DB persist nodes failed (non-fatal) project_id=%s", project_id, exc_info=True)
     try:
         _trace_append("film", {"stage": "final", "project_id": project_id, "shots": final_shots, "cache": ("hit" if cache_hits else "miss")})
     except Exception:
-        pass
+        logging.getLogger("film2").debug("film_final: trace append failed (non-fatal) project_id=%s", project_id, exc_info=True)
     return {"final_shots": final_shots, "assembly": {"timeline_json": edl_meta["uri"], "nodes_json": nodes_meta["uri"], "reel_mp4": reel["uri"], "hash": reel["hash"], **({"cache": "hit"} if cache_hits else {})}}
 
 
@@ -828,7 +861,7 @@ async def film_qc(body: Dict[str, Any]):
                 await db_execute("INSERT INTO film_qc(project_id, report_json) VALUES($1,$2)", pid, {**qc_report, "suggested_fixes": suggested})
                 await db_execute("UPDATE film_project SET state='qc' WHERE id=$1", pid)
     except Exception:
-        pass
+        logging.getLogger("film2").error("film_qc: DB persist failed (non-fatal) project_id=%s", project_id, exc_info=True)
     return {"qc_report": qc_report, "suggested_fixes": suggested}
 
 
@@ -897,11 +930,11 @@ async def film_export(body: Dict[str, Any]):
                 await db_execute("INSERT INTO film_manifest(project_id, kind, json) VALUES($1,$2,$3)", pid, "export", export)
                 await db_execute("UPDATE film_project SET state='exported' WHERE id=$1", pid)
     except Exception:
-        pass
+        logging.getLogger("film2").error("film_export: DB persist failed (non-fatal) project_id=%s", project_id, exc_info=True)
     try:
         _trace_append("film", {"stage": "export", "project_id": project_id, "export": export})
     except Exception:
-        pass
+        logging.getLogger("film2").debug("film_export: trace append failed (non-fatal) project_id=%s", project_id, exc_info=True)
     return export
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from types import SimpleNamespace
 
 from .assembler import assemble_window
@@ -33,9 +34,26 @@ def solve(
     model: object exposing .chat(prompt, max_tokens) -> SimpleNamespace(text=..., model_name=...)
     progress: optional callback(step, kind, info)
     """
+    if not isinstance(request, dict):
+        log.error("icw.windowed_solver request not dict type=%s", type(request).__name__)
+        request = {}
+    if not isinstance(global_state, dict):
+        log.error("icw.windowed_solver global_state not dict type=%s", type(global_state).__name__)
+        global_state = {}
+    if model is None:
+        log.error("icw.windowed_solver model is None")
+        return SimpleNamespace(kind="HALT", partials=["<HALT state=\"00000000\" outcome=\"error:model_none\"/>"], state=global_state)
+    try:
+        ctx_tokens = int(model_ctx_limit_tokens)
+    except Exception:
+        ctx_tokens = 0
+    if ctx_tokens <= 0:
+        log.error("icw.windowed_solver invalid model_ctx_limit_tokens=%r", model_ctx_limit_tokens)
+        ctx_tokens = 2048
+
     partials: list[str] = []
     step = 0
-    in_budget = byte_budget_for_model(model_ctx_limit_tokens)
+    in_budget = byte_budget_for_model(ctx_tokens)
     state_hashes: list[str] = []
     # Governor knobs
     step_tokens = int(step_out_tokens)
@@ -49,7 +67,7 @@ def solve(
     while step < max_steps:
         step += 1
         # Keep goals/state_hash aligned to the latest user request for stable CONT/HALT tags.
-        global_state["goals"] = request.get("content", "")
+        global_state["goals"] = str(request.get("content", "") or "")
         try:
             global_state["state_hash"] = state_hash_from(global_state)
         except Exception as exc:  # pragma: no cover - defensive logging
@@ -69,6 +87,8 @@ def solve(
         except Exception as exc:  # pragma: no cover - defensive logging
             # ICW is best-effort; a reframe failure should not crash the solve loop.
             log.error("icw.windowed_solver reframe failed: %s", exc, exc_info=True)
+        # Assemble the next window (log timings and invariants, but never log the full prompt).
+        t_asm = time.perf_counter()
         try:
             window = assemble_window(request, global_state, in_budget, step_tokens)
         except Exception as exc:
@@ -76,13 +96,25 @@ def solve(
             log.error("icw.windowed_solver assemble_window failed: %s", exc, exc_info=True)
             partials.append(f"<HALT state=\"{global_state.get('state_hash') or '00000000'}\" outcome=\"error:assemble\"/>")
             return SimpleNamespace(kind="HALT", partials=partials, state=global_state)
+        asm_ms = int((time.perf_counter() - t_asm) * 1000)
         if progress:
             try:
                 progress(step, "window", {"input_bytes": bytes_len(window.prompt), "step_tokens": step_tokens})
             except Exception as exc:  # pragma: no cover - defensive logging
                 # Progress is optional instrumentation; never allow it to break ICW.
                 log.error("icw.windowed_solver progress(window) failed: %s", exc, exc_info=True)
+        log.info(
+            "icw.windowed_solver step=%s state=%s in_bytes=%s in_budget=%s step_tokens=%s asm_ms=%s cand=%s",
+            step,
+            str(global_state.get("state_hash") or "")[:8],
+            bytes_len(window.prompt),
+            int(in_budget),
+            int(step_tokens),
+            asm_ms,
+            len(global_state.get("candidates") or []) if isinstance(global_state.get("candidates"), list) else -1,
+        )
         # Provider call without wrapper timeouts; any failures surface via ProviderError.
+        t_call = time.perf_counter()
         try:
             out = model_chat_with_retry(
                 model,
@@ -90,6 +122,14 @@ def solve(
                 max_tokens=step_tokens,
             )
         except ProviderError as e:
+            log.warning(
+                "icw.windowed_solver provider error step=%s state=%s code=%r kind=%r msg=%r",
+                step,
+                str(global_state.get("state_hash") or "")[:8],
+                getattr(e, "code", None),
+                getattr(e, "kind", None),
+                str(e),
+            )
             partials.append(
                 f"<HALT state=\"{global_state.get('state_hash') or '00000000'}\" outcome=\"error:{e.code or e.kind}\"/>"
             )
@@ -101,6 +141,7 @@ def solve(
                 f"<HALT state=\"{global_state.get('state_hash') or '00000000'}\" outcome=\"error:provider_exception\"/>"
             )
             return SimpleNamespace(kind="HALT", partials=partials, state=global_state)
+        call_ms = int((time.perf_counter() - t_call) * 1000)
         text = getattr(out, "text", "")
         if not isinstance(text, str):
             text = str(text or "")
@@ -110,8 +151,16 @@ def solve(
             frag = last_sentence_fragment(strip_tags(text))
             text = synthesize_cont(text, global_state["state_hash"], frag)
         partials.append(text)
-        # Governor: adjust step size gently
         out_chars = len(strip_tags(text))
+        log.info(
+            "icw.windowed_solver step=%s done kind=%s out_chars=%s call_ms=%s cont_hash=%s",
+            step,
+            kind,
+            out_chars,
+            call_ms,
+            (str(cont_hash)[:8] if cont_hash else ""),
+        )
+        # Governor: adjust step size gently
         if kind == "CONT":
             if out_chars < 200 and step_tokens < max_tokens_soft:
                 step_tokens = int(step_tokens * 1.2)

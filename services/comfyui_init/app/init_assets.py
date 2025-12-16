@@ -1,13 +1,42 @@
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
+import sys
 import zipfile
 from typing import Optional
 import time
 
 from huggingface_hub import hf_hub_download
 import requests
+
+
+try:
+    from logging.handlers import RotatingFileHandler
+
+    _log_dir = os.getenv("LOG_DIR", "/workspace/logs").strip() or "/workspace/logs"
+    os.makedirs(_log_dir, exist_ok=True)
+    _log_file = os.getenv("LOG_FILE", "").strip() or os.path.join(_log_dir, "comfyui_init.log")
+    _lvl = getattr(logging, (os.getenv("LOG_LEVEL", "INFO") or "INFO").upper(), logging.INFO)
+    logging.basicConfig(
+        level=_lvl,
+        format="%(asctime)s.%(msecs)03d %(levelname)s %(process)d/%(threadName)s %(name)s %(pathname)s:%(funcName)s:%(lineno)d - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+            RotatingFileHandler(_log_file, maxBytes=50 * 1024 * 1024, backupCount=5, encoding="utf-8"),
+        ],
+        force=True,
+    )
+    logging.getLogger("comfyui_init.logging").info(
+        "comfyui_init logging configured file=%r level=%s", _log_file, logging.getLevelName(_lvl)
+    )
+except Exception as _ex:
+    logging.basicConfig(level=logging.INFO, stream=sys.stdout)
+    logging.getLogger("comfyui_init.logging").warning("comfyui_init file logging disabled: %s", _ex, exc_info=True)
+
+log = logging.getLogger("comfyui_init")
 
 
 def ensure_dir(path: str) -> None:
@@ -25,10 +54,10 @@ def copy_to_dir(src: str, target_dir: str, rename: Optional[str] = None) -> None
     ensure_dir(target_dir)
     dst = os.path.join(target_dir, rename or os.path.basename(src))
     if file_exists_nonempty(dst):
-        print("Exists, skipping:", dst)
+        log.info("copy_to_dir exists skipping dst=%r", dst)
         return
     os.system(f'cp -f "{src}" "{dst}"')
-    print("Copied", src, "->", dst)
+    log.info("copy_to_dir copied src=%r dst=%r", src, dst)
 
 
 def dl(repo: str, filename: str, target_dir: str, rename: Optional[str] = None, token: Optional[str] = None) -> None:
@@ -36,25 +65,41 @@ def dl(repo: str, filename: str, target_dir: str, rename: Optional[str] = None, 
     ensure_dir(target_dir)
     dst = os.path.join(target_dir, rename or os.path.basename(filename))
     if file_exists_nonempty(dst):
-        print("Exists, skipping:", dst)
+        log.info("dl exists skipping dst=%r repo=%r filename=%r", dst, repo, filename)
         return
     try:
+        t0 = time.perf_counter()
         p = hf_hub_download(repo_id=repo, filename=filename, token=token)
         copy_to_dir(p, target_dir, rename)
+        log.info(
+            "dl hf_hub_download ok repo=%r filename=%r dst=%r duration_ms=%s",
+            repo,
+            filename,
+            dst,
+            int((time.perf_counter() - t0) * 1000),
+        )
         return
     except Exception as ex:
-        print("hf_hub_download failed:", repo, filename, ex)
+        log.warning("dl hf_hub_download failed repo=%r filename=%r err=%s", repo, filename, ex, exc_info=True)
     # Fallback: try raw URL
     try:
         url = f"https://huggingface.co/{repo}/resolve/main/{filename}"
         headers = {"Authorization": f"Bearer {token}"} if token else None
+        t0 = time.perf_counter()
         r = requests.get(url, headers=headers)
         r.raise_for_status()
         with open(dst, "wb") as f:
             f.write(r.content)
-        print("Fetched via raw URL:", url, "->", dst)
+        log.info(
+            "dl raw_url ok url=%r dst=%r status=%s bytes=%s duration_ms=%s",
+            url,
+            dst,
+            int(getattr(r, "status_code", 0) or 0),
+            int(len(getattr(r, "content", b"") or b"")),
+            int((time.perf_counter() - t0) * 1000),
+        )
     except Exception as ex:
-        print("Raw URL fallback failed:", repo, filename, ex)
+        log.error("dl raw_url failed repo=%r filename=%r err=%s", repo, filename, ex, exc_info=True)
 
 
 def dl_candidates(repo: str, filenames: list[str], target_dir: str, rename: Optional[str] = None, token: Optional[str] = None) -> None:
@@ -63,43 +108,64 @@ def dl_candidates(repo: str, filenames: list[str], target_dir: str, rename: Opti
     for fn in filenames:
         try:
             dst = os.path.join(target_dir, rename or os.path.basename(fn))
+            log.info("dl_candidates try repo=%r fn=%r dst=%r", repo, fn, dst)
             dl(repo, fn, target_dir, rename, token)
             if file_exists_nonempty(dst):
+                log.info("dl_candidates success repo=%r chosen_fn=%r dst=%r", repo, fn, dst)
                 return
         except Exception as ex:
-            print("Candidate failed:", repo, fn, ex)
+            log.warning("dl_candidates candidate failed repo=%r fn=%r err=%s", repo, fn, ex, exc_info=True)
             continue
-    print("All candidates failed for", repo, filenames)
+    log.error("dl_candidates all candidates failed repo=%r filenames=%r", repo, filenames)
 
 
 def download_with_retries(url: str, dst: str, max_retries: int = 3, backoff_seconds: int = 2, headers: Optional[dict] = None) -> None:
     last_err: Optional[Exception] = None
     for attempt in range(1, max_retries + 1):
         try:
+            t0 = time.perf_counter()
             r = requests.get(url, headers=headers)
             r.raise_for_status()
             with open(dst, "wb") as f:
                 f.write(r.content)
-            print(f"Downloaded ({attempt}/{max_retries}):", url, "->", dst)
+            log.info(
+                "download ok attempt=%s/%s url=%r dst=%r status=%s bytes=%s duration_ms=%s",
+                attempt,
+                max_retries,
+                url,
+                dst,
+                int(getattr(r, "status_code", 0) or 0),
+                int(len(getattr(r, "content", b"") or b"")),
+                int((time.perf_counter() - t0) * 1000),
+            )
             return
         except Exception as ex:
             last_err = ex
-            print(f"Download failed (attempt {attempt}/{max_retries}):", url, ex)
+            log.warning(
+                "download failed attempt=%s/%s url=%r err=%s",
+                attempt,
+                max_retries,
+                url,
+                ex,
+                exc_info=True,
+            )
             if attempt < max_retries:
                 time.sleep(backoff_seconds * attempt)
+    log.error("download failed exhausted url=%r dst=%r last_err=%s", url, dst, last_err)
 
 
 def download_url(url: str, target_dir: str, filename: str) -> None:
     ensure_dir(target_dir)
     dst = os.path.join(target_dir, filename)
     if file_exists_nonempty(dst):
-        print("Exists, skipping:", dst)
+        log.info("download_url exists skipping dst=%r", dst)
         return
     download_with_retries(url, dst)
 
 
 def main() -> None:
     token = os.environ.get("HUGGINGFACE_TOKEN")
+    log.info("comfyui_init start token_present=%s", bool(token))
     # Root paths aligned with docker-compose volume mounts
     MODELS_ROOT = "/comfyui/models"
     CUSTOM_ROOT = "/comfyui/custom_nodes"
@@ -153,7 +219,7 @@ def main() -> None:
             token,
         )
     except Exception as ex:
-        print("InstantID assets (controlnet/ip-adapter) optional, continuing:", ex)
+        log.warning("InstantID assets optional; continuing err=%s", ex, exc_info=True)
 
     # Canonical InsightFace antelopev2 ONNX pack for InstantID / FaceID.
     # Use LPDoctor/insightface, which exposes the full antelopev2 directory.
@@ -173,7 +239,7 @@ def main() -> None:
             download_url(url, antel_dir, name)
     except Exception as ex:
         # Antelopev2 is strongly recommended for InstantID; log loudly but do not abort container init.
-        print("Failed to fetch antelopev2 ONNX pack:", ex)
+        log.error("Failed to fetch antelopev2 ONNX pack err=%s", ex, exc_info=True)
 
     # AnimateDiff motion modules (public stabilized alternatives)
     try:
@@ -188,7 +254,7 @@ def main() -> None:
             "mm-Stabilized_high.pth",
         )
     except Exception as ex:
-        print("Failed to fetch stabilized Animatediff modules:", ex)
+        log.warning("Failed to fetch stabilized Animatediff modules err=%s", ex, exc_info=True)
 
     # Also mirror all AnimateDiff motion modules (.ckpt/.pth) to the custom node path so Evolved finds them
     try:
@@ -201,7 +267,7 @@ def main() -> None:
                     p = os.path.join(src_dir, name)
                     copy_to_dir(p, dst_dir)
     except Exception as ex:
-        print("Failed to mirror AnimateDiff models to custom_nodes path:", ex)
+        log.warning("Failed to mirror AnimateDiff models err=%s", ex, exc_info=True)
 
     # Clone commonly used custom nodes (idempotent)
     nodes = [
@@ -215,12 +281,12 @@ def main() -> None:
     for url, path in nodes:
         try:
             if not os.path.exists(path):
-                print("Cloning", url, "->", path)
+                log.info("git clone start url=%r path=%r", url, path)
                 subprocess.run(["git", "clone", "--depth", "1", url, path], check=False)
             else:
-                print("Exists, skipping clone:", path)
+                log.info("git clone exists skipping path=%r", path)
         except Exception as ex:
-            print("Failed to clone", url, ex)
+            log.warning("git clone failed url=%r err=%s", url, ex, exc_info=True)
 
     # Attempt to fetch popular Real-ESRGAN model (direct GitHub release avoids HF 401)
     try:
@@ -230,7 +296,7 @@ def main() -> None:
             "realesr-general-x4v3.pth",
         )
     except Exception as ex:
-        print("Failed to fetch Real-ESRGAN model via GitHub:", ex)
+        log.warning("Failed to fetch Real-ESRGAN model via GitHub err=%s", ex, exc_info=True)
 
     # InsightFace antelopev2 (public zip -> extract); satisfies face embeddings without gated InstantID
     try:
@@ -238,7 +304,7 @@ def main() -> None:
         m2 = os.path.join(dest_dir, "m2.0.onnx")
         ga = os.path.join(dest_dir, "genderage.onnx")
         if file_exists_nonempty(m2) and file_exists_nonempty(ga):
-            print("InsightFace antelopev2 exists, skipping download")
+            log.info("InsightFace antelopev2 exists, skipping download dest_dir=%r", dest_dir)
         else:
             ensure_dir(dest_dir)
             tmp_zip = "/tmp/antelopev2.zip"
@@ -252,15 +318,17 @@ def main() -> None:
             )
             with zipfile.ZipFile(tmp_zip, 'r') as z:
                 z.extractall(path=f"{MODELS_ROOT}/insightface/models/")
-            print("Extracted antelopev2.zip to", f"{MODELS_ROOT}/insightface/models/")
+            log.info("Extracted antelopev2.zip to %r", f"{MODELS_ROOT}/insightface/models/")
     except Exception as ex:
-        print("Failed to fetch/extract InsightFace antelopev2:", ex)
+        log.warning("Failed to fetch/extract InsightFace antelopev2 err=%s", ex, exc_info=True)
 
     # Prepare directory for VideoHelperSuite RIFE models (download is optional; VHS can auto-download)
     try:
         ensure_dir(f"{MODELS_ROOT}/VideoHelperSuite/RIFE")
     except Exception as ex:
-        print("Failed to prepare VHS RIFE dir:", ex)
+        log.warning("Failed to prepare VHS RIFE dir err=%s", ex, exc_info=True)
+
+    log.info("comfyui_init finished")
 
 
 if __name__ == "__main__":

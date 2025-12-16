@@ -1048,10 +1048,7 @@ def migrate_film2_bundle(bundle: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(legacy_film, dict) and "film2" not in bundle:
         bundle["film2"] = legacy_film
         # Do not keep the legacy film key around
-        try:
-            del bundle["film"]
-        except Exception:
-            pass
+        bundle.pop("film", None)
     film2 = bundle.get("film2")
     if not isinstance(film2, dict):
         film2 = {
@@ -1309,7 +1306,7 @@ def apply_quality_profile(
             try:
                 updated["strength"] = max(float(updated["strength"]), preset["lock_strength"])
             except Exception:
-                pass
+                updated["strength"] = float(preset["lock_strength"])
         new_regions[region_id] = updated
     if new_regions:
         adjusted["regions"] = new_regions

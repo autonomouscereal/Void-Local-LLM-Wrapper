@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from typing import Optional, Dict, Any
 import asyncio
+import logging
 
 _progress_q: Optional[asyncio.Queue] = None
+
+log = logging.getLogger(__name__)
 
 
 def set_progress_queue(q: Optional[asyncio.Queue]) -> None:
@@ -21,6 +24,8 @@ def emit_progress(event: Dict[str, Any]) -> None:
         try:
             q.put_nowait(event)
         except Exception:
-            pass
+            # Non-fatal; progress is best-effort.
+            log.debug("emit_progress: failed to enqueue event=%s", list(event.keys())[:16], exc_info=True)
+            return
 
 

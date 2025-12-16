@@ -49,10 +49,7 @@ class AppendCommonHeadersMiddleware:
                 # Cache/key vary on Origin
                 # If Vary already present, avoid duplicating; else add
                 vary_idx = lower.get(b"vary")
-                if vary_idx is not None:
-                    # no normalization; rely on upstream value
-                    pass
-                else:
+                if vary_idx is None:
                     headers.append((b"vary", b"Origin"))
 
                 if method == "OPTIONS":

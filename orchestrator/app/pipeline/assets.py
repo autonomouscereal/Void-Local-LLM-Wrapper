@@ -25,6 +25,11 @@ def collect_urls(tool_results: List[Dict[str, Any]], absolutize_url: Callable[[s
             for a in arts:
                 aid = (a or {}).get("id")
                 kind = (a or {}).get("kind") or ""
+                # Always collect explicit URLs/paths when present; some tools
+                # emit view_url/url/path without a stable (cid,id) pair.
+                direct = (a or {}).get("view_url") or (a or {}).get("url") or (a or {}).get("path")
+                if isinstance(direct, str) and direct.strip():
+                    urls.append(direct.strip())
                 if cid and aid:
                     if kind.startswith("image"):
                         urls.append(f"/uploads/artifacts/image/{cid}/{aid}")
@@ -53,6 +58,13 @@ def count_images(tool_results: List[Dict[str, Any]]) -> int:
         # flat images array
         if isinstance(res.get("images"), list):
             count += len(res.get("images") or [])
+        # canonical artifacts array
+        arts = res.get("artifacts")
+        if isinstance(arts, list):
+            for a in arts:
+                kind = (a or {}).get("kind")
+                if isinstance(kind, str) and kind.startswith("image"):
+                    count += 1
         # ids.images from Comfy bridge
         ids_obj = res.get("ids") if isinstance(res, dict) else {}
         if isinstance(ids_obj, dict) and isinstance(ids_obj.get("images"), list):

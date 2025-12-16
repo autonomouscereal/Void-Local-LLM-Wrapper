@@ -8,6 +8,8 @@ from .embeds import compute_face_embeddings, compute_voice_embedding, compute_mu
 from ..analysis.media import analyze_audio
 from ..datasets.trace import append_sample as _trace_append
 
+log = logging.getLogger(__name__)
+
 
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/workspace/uploads")
 
@@ -49,8 +51,9 @@ def post_refs_save(body: Dict[str, Any]):
                 tr = (ref.get("files", {}).get("track") or {}).get("path")
                 st = [f.get("path") for f in ref.get("files", {}).get("stems", [])]
                 compute_music_embedding(ref["ref_id"], tr, st)
-        except Exception:
-            pass
+        except Exception as ex:
+            # Non-fatal: embed computation is best-effort
+            log.warning("post_refs_save: compute_embeds failed for ref_id=%s kind=%s: %s", ref.get("ref_id"), ref.get("kind"), ex, exc_info=True)
     return {"ok": True, "ref": ref}
 
 
@@ -60,8 +63,8 @@ def post_refs_refine(body: Dict[str, Any]):
     try:
         man = load_manifest(body.get("parent_id"))
         kind = (man or {}).get("kind")
-    except Exception:
-        pass
+    except Exception as ex:
+        log.warning("post_refs_refine: load_manifest failed for parent_id=%s: %s", body.get("parent_id"), ex, exc_info=True)
     if isinstance(files_delta, dict) and kind:
         files_delta = _normalize_files(kind, files_delta)
     ref = refine_ref(body.get("parent_id"), body.get("title", ""), files_delta, body.get("meta_delta"))
@@ -75,8 +78,9 @@ def post_refs_refine(body: Dict[str, Any]):
                 tr = (ref.get("files", {}).get("track") or {}).get("path")
                 st = [f.get("path") for f in ref.get("files", {}).get("stems", [])]
                 compute_music_embedding(ref["ref_id"], tr, st)
-        except Exception:
-            pass
+        except Exception as ex:
+            # Non-fatal: embed computation is best-effort
+            log.warning("post_refs_refine: compute_embeds failed for ref_id=%s kind=%s: %s", ref.get("ref_id"), ref.get("kind"), ex, exc_info=True)
     return {"ok": True, "ref": ref}
 
 

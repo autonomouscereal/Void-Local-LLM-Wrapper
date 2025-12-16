@@ -4,6 +4,7 @@ from typing import Dict, Any, List
 import os
 import time
 import json
+import logging
 from ..rag.hygiene import rag_filter
 from ..artifacts.shard import open_shard, append_jsonl, _finalize_shard
 from ..artifacts.manifest import add_manifest_row, write_manifest_atomic
@@ -18,6 +19,8 @@ from ..jobs.state import create_job, set_state, get_job
 from ..jobs.progress import event as progress_event
 from ..jobs.partials import emit_partial
 from ..datasets.trace import append_sample as _trace_append
+
+log = logging.getLogger(__name__)
 
 
 RAG_TTL = int(os.getenv("RAG_TTL_SECONDS", "3600"))
@@ -43,8 +46,8 @@ async def run_research(job: Dict[str, Any]) -> Dict[str, Any]:
         try:
             create_job(jid, "research.run", job)
             set_state(jid, "running", phase="discover", progress=0.0)
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("research.run: failed to init job state jid=%s: %s", jid, exc, exc_info=True)
 
     # Phase: discover + collect
     sources = await discover_sources(q, job.get("scope", "public"), job.get("since"), job.get("until"))
@@ -53,8 +56,8 @@ async def run_research(job: Dict[str, Any]) -> Dict[str, Any]:
         try:
             set_state(jid, "running", phase="normalize", progress=0.2)
             _append_job_event(jid, progress_event("running", "discover", 0.2, artifacts=[]))
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("research.run: failed to update job state jid=%s phase=normalize: %s", jid, exc, exc_info=True)
 
     # Phase: normalize → Evidence Ledger (no explicit timeout wrapper)
     ledger_rows = normalize_sources(sources)
@@ -72,8 +75,8 @@ async def run_research(job: Dict[str, Any]) -> Dict[str, Any]:
         try:
             set_state(jid, "running", phase="analyze", progress=0.4)
             _append_job_event(jid, progress_event("running", "normalize", 0.4, artifacts=[{"path": os.path.join(root, "ledger.index.json")}]))
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("research.run: failed to update job state jid=%s phase=analyze: %s", jid, exc, exc_info=True)
 
     # Phase: analyze → Money Map (no explicit timeout wrapper)
     edges = extract_edges(ledger_rows=ledger_rows, query=q)
@@ -84,8 +87,8 @@ async def run_research(job: Dict[str, Any]) -> Dict[str, Any]:
         try:
             set_state(jid, "running", phase="timeline", progress=0.6)
             _append_job_event(jid, progress_event("running", "analyze", 0.6, artifacts=[{"path": os.path.join(root, "money_map.json")}]))
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("research.run: failed to update job state jid=%s phase=timeline: %s", jid, exc, exc_info=True)
 
     # Phase: timeline
     timeline = build_timeline(ledger_rows)
@@ -95,8 +98,8 @@ async def run_research(job: Dict[str, Any]) -> Dict[str, Any]:
         try:
             set_state(jid, "running", phase="judge", progress=0.75)
             _append_job_event(jid, progress_event("running", "timeline", 0.75, artifacts=[{"path": os.path.join(root, "timeline.json")}]))
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("research.run: failed to update job state jid=%s phase=judge: %s", jid, exc, exc_info=True)
 
     # Phase: judge
     judge_o = judge_findings(money_map, timeline)
@@ -106,8 +109,8 @@ async def run_research(job: Dict[str, Any]) -> Dict[str, Any]:
         try:
             set_state(jid, "running", phase="report", progress=0.9)
             _append_job_event(jid, progress_event("running", "judge", 0.9, artifacts=[{"path": os.path.join(root, "judge.json")}]))
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("research.run: failed to update job state jid=%s phase=report: %s", jid, exc, exc_info=True)
 
     # Phase: report
     report = make_report(q, ledger_rows, money_map, timeline, judge_o)
@@ -119,8 +122,8 @@ async def run_research(job: Dict[str, Any]) -> Dict[str, Any]:
         try:
             set_state(jid, "done", phase="done", progress=1.0)
             _append_job_event(jid, progress_event("done", "done", 1.0, artifacts=[{"path": os.path.join(root, "report.json")}]))
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("research.run: failed to finalize job state jid=%s: %s", jid, exc, exc_info=True)
     # Inline summary for chat surfaces
     try:
         # Top sources by frequency
@@ -148,8 +151,8 @@ async def run_research(job: Dict[str, Any]) -> Dict[str, Any]:
         summary_text = ""
     try:
         _trace_append("research", {"cid": cid, "query": q, "summary": summary_text, "sources": sources, "artifacts": manifest.get("items", [])})
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("research.run: trace append failed (non-fatal) cid=%s: %s", cid, exc, exc_info=True)
     return {"phase": "done", "artifacts": manifest.get("items", []), "cid": cid, "report": report, "summary_text": summary_text, "sources": sources}
 
 

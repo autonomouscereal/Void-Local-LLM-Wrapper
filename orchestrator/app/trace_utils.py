@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import os
 from typing import Any, Dict
+import logging
 
 from .state.checkpoints import append_event as checkpoints_append_event
+
+log = logging.getLogger(__name__)
 
 
 class TraceEmitter:
@@ -91,7 +94,8 @@ def append_jsonl_compat(state_dir: str, path: str, obj: Dict[str, Any]) -> None:
                 emit_trace(state_dir, key, kind, payload or {})
                 return
         except Exception:
-            pass
+            # If normalization fails, fall back to direct append below.
+            log.debug("append_jsonl_compat: normalization failed for path=%s", path, exc_info=True)
     # Fallback: direct append without normalization
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "a", encoding="utf-8") as f:

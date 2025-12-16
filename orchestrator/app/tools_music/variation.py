@@ -4,6 +4,7 @@ import os
 import json
 import wave
 import struct
+import logging
 from .common import now_ts, ensure_dir, sidecar, stamp_env
 from ..determinism.seeds import stamp_tool_args
 from ..artifacts.manifest import add_manifest_row
@@ -14,6 +15,8 @@ from ..refs.registry import append_provenance
 from ..context.index import add_artifact as _ctx_add
 from ..context.index import resolve_reference as _ctx_resolve, resolve_global as _glob_resolve
 from ..datasets.trace import append_sample as _trace_append
+
+log = logging.getLogger(__name__)
 
 
 def _read_wav(path: str):
@@ -54,7 +57,8 @@ def run_music_variation(job: dict, manifest: dict) -> dict:
                 gre = _glob_resolve(base_hint, "audio")
                 if gre and isinstance(gre.get("path"), str):
                     base_path = gre.get("path")
-        except Exception:
+        except Exception as exc:
+            log.debug("music.variation: failed to resolve base audio from context (non-fatal) cid=%s: %s", cid, exc, exc_info=True)
             base_path = None
     args = {
         "variation_of": base_path,
@@ -80,8 +84,8 @@ def run_music_variation(job: dict, manifest: dict) -> dict:
         artifacts.append({"id": os.path.basename(path), "kind": "audio-ref", "summary": stem})
         try:
             _ctx_add(cid, "audio", path, None, args.get("variation_of"), ["music", "variant"], {})
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("music.variation: context add failed (non-fatal) cid=%s: %s", cid, exc, exc_info=True)
         try:
             _trace_append("music", {
                 "cid": cid,
@@ -91,13 +95,13 @@ def run_music_variation(job: dict, manifest: dict) -> dict:
                 "seed": int(args.get("seed") or 0),
                 "path": path,
             })
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("music.variation: trace append failed (non-fatal) cid=%s: %s", cid, exc, exc_info=True)
         try:
             if job.get("music_id"):
                 append_provenance(job.get("music_id"), {"when": now_ts(), "tool": "music.variation", "artifact": path, "seed": int(args.get("seed") or 0)})
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("music.variation: append_provenance failed (non-fatal) cid=%s: %s", cid, exc, exc_info=True)
     env = {
         "meta": {"model": "variation-local", "ts": now_ts(), "cid": cid, "step": 0, "state": "halt", "cont": {"present": False, "state_hash": None, "reason": None}},
         "reasoning": {"goal": "music variation", "constraints": ["json-only"], "decisions": [f"music.variation x{len(artifacts)} done"]},

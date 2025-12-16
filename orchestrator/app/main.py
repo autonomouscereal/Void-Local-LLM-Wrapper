@@ -255,6 +255,8 @@ from .qa.segments import (
     enrich_patch_plan_for_image_segments,
     enrich_patch_plan_for_video_segments,
     enrich_patch_plan_for_music_segments,
+    enrich_patch_plan_for_tts_segments,
+    enrich_patch_plan_for_sfx_segments,
 )
 from .plan.song import plan_song_graph
 from .tools_music.windowed import run_music_infinite_windowed, restitch_music_from_windows
@@ -303,18 +305,40 @@ def _allowed_tools_for_mode(mode: Optional[str]) -> List[str]:
     return sorted([n for n in allowed_set if isinstance(n, str) and n.strip() and n in PLANNER_VISIBLE_TOOLS])
 
 
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-_level = getattr(logging, LOG_LEVEL, logging.INFO)
+# Hard logging: always DEBUG, no env gating.
+LOG_LEVEL = "DEBUG"
+_level = logging.DEBUG
+_log_dir = os.getenv("ORCH_LOG_DIR", "").strip()
+if not _log_dir:
+    try:
+        _state_dir_env = os.getenv("STATE_DIR", "").strip()
+        _log_dir = os.path.join(_state_dir_env, "logs") if _state_dir_env else "."
+    except Exception:
+        _log_dir = "."
+try:
+    os.makedirs(_log_dir, exist_ok=True)
+except Exception:
+    # If the logs dir can't be created (permissions), fall back to cwd.
+    _log_dir = "."
+_log_file = os.getenv("ORCH_LOG_FILE", "").strip() or os.path.join(_log_dir, "orchestrator.log")
+_handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
+try:
+    _handlers.append(logging.FileHandler(_log_file, encoding="utf-8"))
+except Exception as _ex:
+    # Never fail module import due to file handler issues.
+    logging.getLogger("orchestrator.logging").warning("file logging disabled: %s", _ex, exc_info=True)
 logging.basicConfig(
     level=_level,
     format="%(asctime)s.%(msecs)03d %(levelname)s %(process)d/%(threadName)s %(name)s %(pathname)s:%(funcName)s:%(lineno)d - %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
-    handlers=[logging.StreamHandler(sys.stdout)],
+    handlers=_handlers,
     force=True,
 )
+logging.getLogger("orchestrator.logging").debug("logging configured level=%s file=%r", LOG_LEVEL, _log_file)
 
 def _log(event: str, **fields: Any) -> None:
-    logging.info(f"{event} " + json.dumps(fields, ensure_ascii=False, default=str))
+    # Hard logging: only debug.
+    logging.debug(f"{event} " + json.dumps(fields, ensure_ascii=False, default=str))
     # Emit distillation-grade event row when a trace_id is provided
     tr = fields.get("trace_id")
     if isinstance(tr, str) and tr:
@@ -336,6 +360,63 @@ def _inject_execution_context(tool_calls: List[Dict[str, Any]], trace_id: str, e
             if trace_id and not args_tc.get("trace_id"):
                 args_tc["trace_id"] = trace_id
             args_tc.setdefault("_effective_mode", effective_mode)
+
+
+def _args_preview_for_log(args: Any, *, max_keys: int = 64) -> Dict[str, Any]:
+    """
+    Compact, safe-to-log snapshot of tool args.
+    Never includes full long prompts or binary; focuses on shape and key fields.
+    """
+    if not isinstance(args, dict):
+        return {"type": type(args).__name__}
+    keys = sorted([str(k) for k in args.keys()])
+    out: Dict[str, Any] = {"keys": keys[:max_keys], "has_raw": bool("_raw" in args)}
+    # Common fields (trim long strings)
+    for k in ("prompt", "text", "negative", "src", "url", "image_url", "video_url", "audio_url", "segment_id", "quality_profile", "profile"):
+        v = args.get(k)
+        if isinstance(v, str):
+            out[k] = (v[:240] + "…") if len(v) > 240 else v
+        elif isinstance(v, (int, float, bool)) or v is None:
+            out[k] = v
+    return out
+
+
+def _tool_step_eval_user_text(tool_name: str, tool_args: Any, last_user_text: str) -> str:
+    """
+    Committee/QA prompt seed that is scoped to a SINGLE tool execution step.
+    """
+    a = tool_args if isinstance(tool_args, dict) else {"_raw": tool_args}
+    # Build a minimal, tool-specific "goal" hint using args rather than full chat context.
+    goal_hint = ""
+    if tool_name.startswith("image."):
+        p = a.get("prompt") or a.get("text") or ""
+        if isinstance(p, str) and p.strip():
+            goal_hint = f"Generate/refine image(s) to match prompt={p.strip()!r}."
+    elif tool_name.startswith("video."):
+        src = a.get("src") or a.get("video") or a.get("url") or ""
+        if isinstance(src, str) and src.strip():
+            goal_hint = f"Process video src={src.strip()!r}."
+    elif tool_name.startswith("music.") or tool_name.startswith("tts.") or tool_name.startswith("sfx."):
+        p = a.get("prompt") or a.get("text") or a.get("lyrics") or ""
+        if isinstance(p, str) and p.strip():
+            goal_hint = f"Generate/refine audio to match prompt/text={p.strip()!r}."
+    elif tool_name == "film2.run":
+        syn = a.get("synopsis") or a.get("prompt") or ""
+        if isinstance(syn, str) and syn.strip():
+            goal_hint = f"Generate film output to match synopsis/prompt={syn.strip()!r}."
+    blob = {
+        "scope": "tool_step_only",
+        "instruction": (
+            "Evaluate ONLY whether THIS SINGLE tool call executed correctly and whether its output matches the tool args. "
+            "Do NOT evaluate whether the entire user request has been completed. "
+            "Do NOT propose unrelated tools; only revise if this tool's own outputs/QA/locks are below thresholds."
+        ),
+        "tool": tool_name,
+        "tool_goal_hint": goal_hint,
+        "tool_args_preview": _args_preview_for_log(a),
+        "original_user_request_preview": (str(last_user_text or "")[:600] + "…") if isinstance(last_user_text, str) and len(last_user_text) > 600 else str(last_user_text or ""),
+    }
+    return json.dumps(blob, ensure_ascii=False, default=str)
 
 
 async def _run_patch_call(
@@ -706,6 +787,14 @@ async def segment_qa_and_committee(
             enriched_patch_plan,
             segments_for_committee,
         )
+        enriched_patch_plan = enrich_patch_plan_for_tts_segments(
+            enriched_patch_plan,
+            segments_for_committee,
+        )
+        enriched_patch_plan = enrich_patch_plan_for_sfx_segments(
+            enriched_patch_plan,
+            segments_for_committee,
+        )
         # Execute enriched patch plan via central patch executor.
         tool_runner = partial(
             _run_patch_call,
@@ -968,7 +1057,7 @@ FILM2_DATA_DIR = os.getenv("FILM2_DATA", "/srv/film2")
 N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL")  # optional external workflow orchestration
 ENABLE_N8N = os.getenv("ENABLE_N8N", "false").lower() == "true"
 ASSEMBLER_API_URL = os.getenv("ASSEMBLER_API_URL")  # http://assembler:9095
-TEACHER_API_URL = os.getenv("TEACHER_API_URL", "http://teacher:8097")
+TEACHER_API_URL = os.getenv("TEACHER_API_URL", "http://127.0.0.1:8097")
 WRAPPER_CONFIG_PATH = os.getenv("WRAPPER_CONFIG_PATH", "/workspace/configs/wrapper_config.json")
 ICW_API_URL = os.getenv("ICW_API_URL", "http://icw:8085")
 ICW_DISABLE = False
@@ -1924,6 +2013,101 @@ def _collect_artifacts_payload(tool_results: List[Dict[str, Any]], abs_url_fn) -
     return {"urls": list(dict.fromkeys(urls or [])), "items": uniq}
 
 
+def _merge_tool_exec_meta_from_tool_results(
+    tool_exec_meta: List[Dict[str, Any]] | None,
+    tool_results: List[Dict[str, Any]] | None,
+) -> List[Dict[str, Any]]:
+    """
+    Ensure we never "lose" tool args/artifacts for downstream consumers (final_env stitching,
+    teacher trace, logs), even when additional tool runs are produced inside QA loops
+    (segment-level refinements) and appended directly to tool_results.
+
+    - tool_exec_meta: existing persisted entries (typically top-level tool runs + postrun revision)
+    - tool_results: the final list of tool result dicts (may include internal patch runs)
+
+    Returns a merged list shaped like tool_exec_meta entries:
+      {"name": str, "args": dict, "ok": bool, "result": dict, "error": Any, "artifacts": Any}
+    """
+    base: List[Dict[str, Any]] = list(tool_exec_meta or [])
+    seen: set[tuple[str, str]] = set()
+    for e in base:
+        if not isinstance(e, dict):
+            continue
+        nm = str(e.get("name") or "")
+        # allow either explicit step_id or fallback signature
+        sid = str(e.get("step_id") or "")
+        if not sid:
+            a = e.get("args") if isinstance(e.get("args"), dict) else {}
+            sid = str(a.get("trace_id") or "") + "|" + str(a.get("segment_id") or "")
+        seen.add((nm, sid))
+
+    for tr in (tool_results or []):
+        if not isinstance(tr, dict):
+            continue
+        nm = str(tr.get("name") or tr.get("tool") or "").strip()
+        if not nm:
+            continue
+        sid = str(tr.get("step_id") or "").strip()
+        # fall back to (trace_id, segment_id) signature when no step id exists
+        if not sid:
+            args_obj = tr.get("args") if isinstance(tr.get("args"), dict) else {}
+            sid = str(args_obj.get("trace_id") or "") + "|" + str(args_obj.get("segment_id") or tr.get("segment_id") or "")
+        key = (nm, sid)
+        if key in seen:
+            continue
+
+        res_obj = tr.get("result") if isinstance(tr.get("result"), dict) else {}
+        err_obj = tr.get("error")
+        if err_obj is None and isinstance(res_obj, dict):
+            err_obj = res_obj.get("error")
+        ok_step = not isinstance(err_obj, (str, dict))
+
+        args_obj = tr.get("args")
+        if not isinstance(args_obj, dict):
+            # tolerate OpenAI-style tool call shape
+            args_obj = tr.get("arguments") if isinstance(tr.get("arguments"), dict) else {}
+        arts_val = res_obj.get("artifacts") if isinstance(res_obj, dict) else None
+
+        base.append(
+            {
+                "name": nm,
+                "args": (args_obj if isinstance(args_obj, dict) else {}),
+                "ok": bool(ok_step),
+                "result": res_obj,
+                "error": err_obj,
+                "artifacts": arts_val,
+                "step_id": (sid or None),
+            }
+        )
+        seen.add(key)
+    return base
+
+
+def _warn_double_wrapped_tool_results(tool_results: List[Dict[str, Any]] | None) -> None:
+    """
+    Defensive guard: warn when a tool result accidentally carries a nested tool envelope
+    under result["result"] (common shape drift that causes artifacts/args to "disappear").
+    """
+    try:
+        for tr in (tool_results or [])[:200]:
+            if not isinstance(tr, dict):
+                continue
+            res = tr.get("result")
+            if not isinstance(res, dict):
+                continue
+            inner = res.get("result")
+            # Heuristic: nested envelope usually contains ok/result/error keys
+            if isinstance(inner, dict) and ("ok" in res or "error" in res) and ("result" in res):
+                logging.getLogger("orchestrator.tools").warning(
+                    "double_wrapped_tool_result detected name=%r keys=%s inner_keys=%s",
+                    tr.get("name") or tr.get("tool"),
+                    sorted(list(res.keys()))[:24],
+                    sorted(list(inner.keys()))[:24],
+                )
+    except Exception:
+        logging.getLogger("orchestrator.tools").debug("_warn_double_wrapped_tool_results failed (non-fatal)", exc_info=True)
+
+
 def _tb(s: str) -> str:
     return s if len(s) <= 16000 else (s[:16000] + "\n... [traceback truncated]")
 
@@ -1993,8 +2177,19 @@ def _normalize_job(js: Dict[str, Any]) -> Dict[str, Any]:
 # ---- Teacher / streaming helpers ----
 
 async def _send_trace_stream_async(payload: Dict[str, Any]) -> None:
-    async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
-        await client.post(TEACHER_API_URL.rstrip("/") + "/teacher/trace.append", json=payload)
+    url = TEACHER_API_URL.rstrip("/") + "/teacher/trace.append"
+    t0 = time.time()
+    try:
+        async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
+            r = await client.post(url, json=payload)
+            dt_ms = int((time.time() - t0) * 1000.0)
+            _log("teacher.trace.append", trace_id=str(payload.get("trace_id") or ""), url=url, http_status=int(r.status_code), ms=dt_ms)
+            if not (200 <= int(r.status_code) < 300):
+                _log("teacher.trace.append.error", trace_id=str(payload.get("trace_id") or ""), url=url, http_status=int(r.status_code), body=(r.text or "")[:1000])
+    except Exception as ex:
+        dt_ms = int((time.time() - t0) * 1000.0)
+        _log("teacher.trace.append.exception", trace_id=str(payload.get("trace_id") or ""), url=url, ms=dt_ms, error=str(ex))
+        logging.warning("teacher.trace.append failed url=%s: %s", url, ex, exc_info=True)
 
 
 async def _orcjob_stream_gen(job_id: str, interval_ms: Optional[int] = None):
@@ -7495,42 +7690,72 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
 async def chat_completions(body: Dict[str, Any], request: Request):
     # Single-exit discipline: exactly one return at the bottom of this function.
     response = None
+    logging.debug("chat_completions:init response=%r", response)
     usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    logging.debug("chat_completions:init usage=%r", usage)
     display_content = ""
+    logging.debug("chat_completions:init display_content=%r", display_content)
     trace_id = "tt_unknown"
+    logging.debug("chat_completions:init trace_id=%r", trace_id)
     master_seed = 0
+    logging.debug("chat_completions:init master_seed=%r", master_seed)
     run_id = None
+    logging.debug("chat_completions:init run_id=%r", run_id)
     _lock_token = None
+    logging.debug("chat_completions:init _lock_token=%r", _lock_token)
     abort_pipeline: bool = False
+    logging.debug("chat_completions:init abort_pipeline=%r", abort_pipeline)
     planner_error_payload: Optional[Dict[str, Any]] = None
+    logging.debug("chat_completions:init planner_error_payload=%r", planner_error_payload)
 
     # Always-defined downstream variables (no NameErrors, no fallthrough crashes).
     qwen_result: Dict[str, Any] = {}
+    logging.debug("chat_completions:init qwen_result=%r", qwen_result)
     glm_result: Dict[str, Any] = {}
+    logging.debug("chat_completions:init glm_result=%r", glm_result)
     deepseek_result: Dict[str, Any] = {}
+    logging.debug("chat_completions:init deepseek_result=%r", deepseek_result)
     synth_result: Dict[str, Any] = {}
+    logging.debug("chat_completions:init synth_result=%r", synth_result)
     tool_results: List[Dict[str, Any]] = []
+    logging.debug("chat_completions:init tool_results_len=%s", len(tool_results))
     final_env: Dict[str, Any] = {}
+    logging.debug("chat_completions:init final_env=%r", final_env)
     artifacts_out: Dict[str, Any] = {"urls": [], "items": []}
+    logging.debug("chat_completions:init artifacts_out=%r", artifacts_out)
     # Required post-run features (artifacts ledger, ablation export, teacher tap).
     tool_exec_meta: List[Dict[str, Any]] = []
+    logging.debug("chat_completions:init tool_exec_meta_len=%s", len(tool_exec_meta))
     _ledger_shard: Optional[dict] = None
+    logging.debug("chat_completions:init _ledger_shard=%r", _ledger_shard)
     _ledger_root: Optional[str] = None
+    logging.debug("chat_completions:init _ledger_root=%r", _ledger_root)
     _ledger_name: str = "ledger"
+    logging.debug("chat_completions:init _ledger_name=%r", _ledger_name)
     pack_hash: Optional[str] = None
+    logging.debug("chat_completions:init pack_hash=%r", pack_hash)
     # Absolutize helper must exist on all paths (including aborted requests).
     base_url: str = (PUBLIC_BASE_URL or "").rstrip("/") or (str(request.base_url) or "").rstrip("/")
+    logging.debug("chat_completions:init base_url=%r", base_url)
     abs_url_fn = partial(_abs_url, request_base_url=base_url)
+    logging.debug("chat_completions:init abs_url_fn=%r", abs_url_fn)
     # Always-defined planner outputs (avoid fallthrough crashes on abort paths).
     plan_text: str = ""
+    logging.debug("chat_completions:init plan_text=%r", plan_text)
     tool_calls: List[Dict[str, Any]] = []
+    logging.debug("chat_completions:init tool_calls_len=%s", len(tool_calls))
     planner_env: Dict[str, Any] = {}
+    logging.debug("chat_completions:init planner_env=%r", planner_env)
     # Executor routing knobs are used in multiple places; define once.
     executor_endpoint: str = EXECUTOR_BASE_URL or "http://127.0.0.1:8081"
+    logging.debug("chat_completions:init executor_endpoint=%r", executor_endpoint)
     exec_temperature = (body.get("temperature") if isinstance(body, dict) else None) or DEFAULT_TEMPERATURE
+    logging.debug("chat_completions:init exec_temperature=%r", exec_temperature)
     _cat_hash: str = ""
+    logging.debug("chat_completions:init _cat_hash=%r", _cat_hash)
     try:
         t0 = time.time()
+        logging.debug("chat_completions:try t0=%r", t0)
         shaped = shape_request(
             body or {},
             request,
@@ -7539,19 +7764,38 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             derive_seed_fn=_derive_seed,
             detect_video_intent_fn=_detect_video_intent,
         )
+        logging.debug("chat_completions:shape_request done shaped_keys=%r", sorted(list((shaped or {}).keys())) if isinstance(shaped, dict) else type(shaped).__name__)
         messages = shaped.get("messages") or []
+        logging.debug("chat_completions:messages len=%s type=%s", len(messages) if isinstance(messages, list) else -1, type(messages).__name__)
         normalized_msgs = shaped.get("normalized_msgs") or []
+        logging.debug("chat_completions:normalized_msgs len=%s type=%s", len(normalized_msgs) if isinstance(normalized_msgs, list) else -1, type(normalized_msgs).__name__)
         attachments = shaped.get("attachments") or []
+        logging.debug("chat_completions:attachments len=%s", len(attachments) if isinstance(attachments, list) else -1)
         last_user_text = shaped.get("last_user_text") or ""
+        logging.debug("chat_completions:last_user_text len=%s", len(last_user_text) if isinstance(last_user_text, str) else -1)
         conv_cid = shaped.get("conv_cid")
+        logging.debug("chat_completions:conv_cid=%r", conv_cid)
         mode = shaped.get("mode") or "general"
+        logging.debug("chat_completions:mode=%r", mode)
         effective_mode = mode
-        master_seed = int(shaped.get("master_seed") or 0)
+        logging.debug("chat_completions:effective_mode=%r", effective_mode)
+        try:
+            master_seed = int(shaped.get("master_seed") or 0)
+            logging.debug("chat_completions:master_seed parsed=%r", master_seed)
+        except Exception as ex:
+            logging.debug("chat_completions:master_seed conversion failed ex=%s", ex, exc_info=True)
+            master_seed = 0
+            logging.debug("chat_completions:master_seed fallback=%r", master_seed)
         request_id = shaped.get("request_id") or uuid.uuid4().hex
+        logging.debug("chat_completions:request_id=%r", request_id)
         trace_id = shaped.get("trace_id") or "tt_unknown"
+        logging.debug("chat_completions:trace_id=%r", trace_id)
         problems = shaped.get("problems") or []
+        logging.debug("chat_completions:problems len=%s", len(problems) if isinstance(problems, list) else -1)
         if any((p.get("code") == "bad_request") for p in problems if isinstance(p, dict)):
+            logging.debug("chat_completions:bad_request detected")
             usage0 = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+            logging.debug("chat_completions:usage0=%r", usage0)
             response = _build_openai_envelope(
                 ok=False,
                 text="Invalid request: 'messages' must be a list.",
@@ -7561,13 +7805,20 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 seed=0,
                 id_="orc-1",
             )
+            logging.debug("chat_completions:built bad_request response keys=%r", sorted(list(response.keys())) if isinstance(response, dict) else type(response).__name__)
             usage = usage0
+            logging.debug("chat_completions:set usage=%r", usage)
             abort_pipeline = True
+            logging.debug("chat_completions:set abort_pipeline=%r", abort_pipeline)
             plan_text = ""
+            logging.debug("chat_completions:set plan_text=%r", plan_text)
             tool_calls = []
+            logging.debug("chat_completions:set tool_calls_len=%s", len(tool_calls))
             planner_env = {}
+            logging.debug("chat_completions:set planner_env=%r", planner_env)
         else:
             first_user_len = len((last_user_text or "")) if isinstance(last_user_text, str) else 0
+            logging.debug("chat_completions:first_user_len=%r", first_user_len)
             # High-level request trace (distillation-friendly)
             _trace_log_request(
                 STATE_DIR,
@@ -7591,10 +7842,13 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 "seed": int(master_seed),
                 "model_declared": (body.get("model") if isinstance(body.get("model"), str) else None),
             })
+            logging.debug("chat_completions:chat.start trace_id=%s mode=%s effective_mode=%s stream=%s cid=%r", trace_id, mode, effective_mode, bool(body.get("stream")), conv_cid)
             _log("chat.start", trace_id=trace_id, mode=mode, effective_mode=effective_mode, stream=bool(body.get("stream")), cid=conv_cid)
             # Acquire per-trace lock and record start event
             _lock_token = trace_acquire_lock(STATE_DIR, trace_id, timeout_s=10)
+            logging.debug("chat_completions:trace_acquire_lock _lock_token=%r", _lock_token)
             checkpoints_append_event(STATE_DIR, trace_id, "start", {"seed": int(master_seed), "mode": mode, "effective_mode": effective_mode})
+            logging.debug("chat_completions:checkpoints_append_event start done")
 
             # ICW packing: one call, one system frame (ICW owns compression).
             icw_frame, pack_hash, icw_meta = pack_icw_system_frame_from_messages(
@@ -7605,7 +7859,14 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 pct_budget=0.65,
                 step_out_tokens=512,
             )
+            logging.debug(
+                "chat_completions:icw packed icw_frame_type=%s pack_hash=%r icw_meta_keys=%r",
+                type(icw_frame).__name__,
+                pack_hash,
+                sorted(list(icw_meta.keys())) if isinstance(icw_meta, dict) else type(icw_meta).__name__,
+            )
             if isinstance(icw_frame, dict) and icw_frame.get("content"):
+                logging.debug("chat_completions:icw_frame has content; injecting into messages/normalized")
                 if (
                     isinstance(messages, list)
                     and messages
@@ -7615,6 +7876,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                     messages = [messages[0], icw_frame] + messages[1:]
                 else:
                     messages = [icw_frame] + (messages or [])
+                logging.debug("chat_completions:messages injected len=%s", len(messages) if isinstance(messages, list) else -1)
                 if (
                     isinstance(normalized_msgs, list)
                     and normalized_msgs
@@ -7624,6 +7886,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                     normalized_msgs = [normalized_msgs[0], icw_frame] + normalized_msgs[1:]
                 else:
                     normalized_msgs = [icw_frame] + (normalized_msgs or [])
+                logging.debug("chat_completions:normalized_msgs injected len=%s", len(normalized_msgs) if isinstance(normalized_msgs, list) else -1)
             _trace_log_event(
                 STATE_DIR,
                 str(trace_id),
@@ -7637,6 +7900,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 },
             )
             run_id = await _db_insert_run(trace_id=trace_id, mode=mode, seed=master_seed, pack_hash=pack_hash, request_json=body)
+            logging.debug("chat_completions:_db_insert_run run_id=%r", run_id)
             await _db_insert_icw_log(
                 run_id=run_id,
                 pack_hash=pack_hash or None,
@@ -7645,12 +7909,15 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                     "meta": icw_meta,
                 },
             )
+            logging.debug("chat_completions:_db_insert_icw_log done")
             # Artifacts ledger shard (required): store step-level tool execution summaries.
             try:
                 _ledger_root = os.path.join(UPLOAD_DIR, "artifacts", "runs", str(trace_id))
+                logging.debug("chat_completions:ledger _ledger_root=%r", _ledger_root)
                 _ledger_shard = _art_open_shard(_ledger_root, _ledger_name, int(ARTIFACT_SHARD_BYTES))
+                logging.debug("chat_completions:ledger _art_open_shard ok shard=%r", _ledger_shard)
             except Exception as ex:
-                logging.warning("ledger.open.failed trace_id=%s: %s", str(trace_id), ex, exc_info=True)
+                logging.debug("chat_completions:ledger.open.failed trace_id=%s ex=%s", str(trace_id), ex, exc_info=True)
 
         # If client supplies tool results (role=tool) we include them verbatim for the planner/executors
 
@@ -7660,6 +7927,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
 
         # 1) Planner proposes tool calls (planning lives under orchestrator/app/plan/*).
         _log("planner.call", trace_id=trace_id, mode=effective_mode)
+        logging.debug("chat_completions:planner.call trace_id=%s effective_mode=%s", trace_id, effective_mode)
         plan_text, tool_calls, planner_env = await produce_tool_plan(
             normalized_msgs,
             (body.get("tools") if isinstance(body, dict) else None),
@@ -7667,20 +7935,55 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             trace_id=trace_id,
             mode=effective_mode,
         )
+        logging.debug(
+            "chat_completions:produce_tool_plan done plan_text_len=%s tool_calls_type=%s tool_calls_len=%s planner_env_keys=%r",
+            len(plan_text) if isinstance(plan_text, str) else -1,
+            type(tool_calls).__name__,
+            len(tool_calls) if isinstance(tool_calls, list) else -1,
+            sorted(list(planner_env.keys())) if isinstance(planner_env, dict) else type(planner_env).__name__,
+        )
         tool_calls = _normalize_tool_calls(tool_calls)
+        logging.debug("chat_completions:_normalize_tool_calls len=%s", len(tool_calls) if isinstance(tool_calls, list) else -1)
         # Hardening: enforce tool argument contract (args must be an object) and fill minimal defaults.
         tool_calls = args_ensure_object_args(tool_calls)
+        logging.debug("chat_completions:args_ensure_object_args done len=%s", len(tool_calls) if isinstance(tool_calls, list) else -1)
         tool_calls = args_fill_min_defaults(tool_calls, str(last_user_text or ""), log_fn=_log, trace_id=str(trace_id))
+        logging.debug("chat_completions:args_fill_min_defaults done len=%s", len(tool_calls) if isinstance(tool_calls, list) else -1)
+        try:
+            # Deep planner/tool-call visibility: log the *shape* of tool args without dumping full prompts.
+            preview: List[Dict[str, Any]] = []
+            for c in (tool_calls or [])[:20]:
+                if not isinstance(c, dict):
+                    continue
+                nm = str(c.get("name") or "")
+                av = c.get("arguments")
+                preview.append(
+                    {
+                        "tool": nm,
+                        "arguments_type": type(av).__name__,
+                        "arguments_preview": _args_preview_for_log(av),
+                    }
+                )
+            _log("planner.tool_calls.normalized", trace_id=trace_id, count=len(tool_calls or []), preview=preview)
+        except Exception as ex:
+            logging.warning("planner.tool_calls.normalized log failed trace_id=%s: %s", str(trace_id), ex, exc_info=True)
         # Hardening: filter unknown tools against runtime catalog (registry + builtins).
         allowed_runtime = catalog_allowed(get_builtin_tools_schema)
+        logging.debug("chat_completions:catalog_allowed count=%s", len(allowed_runtime) if isinstance(allowed_runtime, (list, set, tuple)) else -1)
         # Restrict to planner-visible + mode-allowed tools (single source of truth; do not re-filter later).
         allowed_runtime = {n for n in allowed_runtime if n in PLANNER_VISIBLE_TOOLS}
+        logging.debug("chat_completions:allowed_runtime after planner_visible count=%s", len(allowed_runtime))
         allowed_runtime = {n for n in allowed_runtime if n in set(_allowed_tools_for_mode(effective_mode))}
+        logging.debug("chat_completions:allowed_runtime after mode filter count=%s", len(allowed_runtime))
         tool_calls, unknown_tools = catalog_validate(tool_calls or [], allowed_runtime)
+        logging.debug("chat_completions:catalog_validate tool_calls_len=%s unknown_tools=%r", len(tool_calls or []), unknown_tools)
         if unknown_tools:
             _log("tools.unknown.filtered", trace_id=trace_id, unknown=unknown_tools)
+            logging.debug("chat_completions:tools.unknown.filtered unknown_tools=%r", unknown_tools)
         _log("planner.done", trace_id=trace_id, tool_count=len(tool_calls or []), ok=bool((planner_env or {}).get("ok")))
+        logging.debug("chat_completions:planner.done tool_count=%s ok=%s", len(tool_calls or []), bool((planner_env or {}).get("ok")))
         trace_append("decision", {"cid": conv_cid, "trace_id": trace_id, "plan": plan_text, "tool_calls": tool_calls})
+        logging.debug("chat_completions:trace_append decision done")
 
         if not isinstance(planner_env, dict) or not planner_env.get("ok"):
             usage0 = estimate_usage(messages, "")
@@ -7747,19 +8050,36 @@ async def chat_completions(body: Dict[str, Any], request: Request):
 
         if (not abort_pipeline) and tool_calls:
             _log("tools.exec.start", trace_id=trace_id, count=len(tool_calls or []))
+            logging.debug("chat_completions:tools.exec.start abort_pipeline=%r tool_calls_len=%s", abort_pipeline, len(tool_calls or []))
             _inject_execution_context(tool_calls, trace_id, effective_mode)
+            logging.debug("chat_completions:_inject_execution_context done trace_id=%r effective_mode=%r", trace_id, effective_mode)
             for tc in tool_calls:
+                logging.debug("chat_completions:tool_loop:iter tc_type=%s tc_keys=%r", type(tc).__name__, sorted(list(tc.keys())) if isinstance(tc, dict) else None)
                 tn = (tc.get("name") or "tool")
-                ta = tc.get("arguments") if isinstance(tc.get("arguments"), dict) else {}
+                logging.debug("chat_completions:tool_loop:tn=%r", tn)
+                raw_args = tc.get("arguments")
+                logging.debug("chat_completions:tool_loop:raw_args_type=%s", type(raw_args).__name__)
+                if isinstance(raw_args, dict):
+                    ta = raw_args
+                elif raw_args is None:
+                    ta = {}
+                else:
+                    # Never drop args: preserve non-dict payloads under _raw.
+                    ta = {"_raw": raw_args}
+                logging.debug("chat_completions:tool_loop:ta_type=%s ta_keys=%r", type(ta).__name__, sorted(list(ta.keys())) if isinstance(ta, dict) else None)
                 # For film2.run, never rely on planner-fabricated clip/image URLs. Instead,
                 # automatically wire in real image artifacts from any prior image.dispatch
                 # (or other image-producing) tool results in this trace. If no real images
                 # exist yet, drop any planner-provided images/clips so film2 falls back to
                 # prompt/story-driven generation instead of referencing non-existent assets.
                 if tn == "film2.run":
+                    logging.debug("chat_completions:tool_loop:film2.run branch entered")
                     args_film = ta if isinstance(ta, dict) else {}
+                    logging.debug("chat_completions:tool_loop:film2.run args_film_keys_pre=%r", sorted(list(args_film.keys())) if isinstance(args_film, dict) else None)
                     urls_all = assets_collect_urls(tool_results or [], abs_url_fn)
+                    logging.debug("chat_completions:tool_loop:film2.run urls_all_len=%s", len(urls_all or []))
                     img_urls = [u for u in (urls_all or []) if isinstance(u, str) and "/artifacts/image/" in u]
+                    logging.debug("chat_completions:tool_loop:film2.run img_urls_len=%s", len(img_urls or []))
                     if img_urls:
                         args_film["images"] = img_urls
                         # Ensure we do not carry over any stale clip references from the planner.
@@ -7770,63 +8090,107 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                         args_film.pop("clips", None)
                     tc["arguments"] = args_film
                     ta = args_film
-                _log("tool.run.before", trace_id=trace_id, tool=str(tn), args_keys=list((ta or {}).keys()))
+                    logging.debug("chat_completions:tool_loop:film2.run args_film_keys_post=%r", sorted(list(args_film.keys())) if isinstance(args_film, dict) else None)
+                _log(
+                    "tool.run.before",
+                    trace_id=trace_id,
+                    tool=str(tn),
+                    args_type=type(raw_args).__name__,
+                    args_preview=_args_preview_for_log(ta),
+                )
+                logging.debug("chat_completions:tool_loop:before_execute tn=%r executor_endpoint=%r request_id=%r", tn, executor_endpoint, request_id)
                 # Execute tools via the external executor so all heavy/remote work
                 # happens in the executor container instead of the orchestrator.
                 exec_batch = [tc]
+                logging.debug("chat_completions:tool_loop:exec_batch_len=%s", len(exec_batch))
                 exec_res = await gateway_execute(exec_batch, trace_id, executor_endpoint, request_id=str(request_id))
+                logging.debug("chat_completions:tool_loop:gateway_execute returned type=%s len=%s", type(exec_res).__name__, len(exec_res) if isinstance(exec_res, list) else -1)
                 tr = exec_res[0] if isinstance(exec_res, list) and exec_res else {}
+                logging.debug("chat_completions:tool_loop:tr_keys=%r", sorted(list(tr.keys())) if isinstance(tr, dict) else None)
                 tname = str((tr or {}).get("name") or "tool")
+                logging.debug("chat_completions:tool_loop:tname=%r", tname)
                 res = (tr or {}).get("result") if isinstance((tr or {}).get("result"), dict) else {}
+                logging.debug("chat_completions:tool_loop:res_keys=%r", sorted(list(res.keys())) if isinstance(res, dict) else None)
                 err_obj = (tr or {}).get("error")
+                logging.debug("chat_completions:tool_loop:err_obj_type=%s", type(err_obj).__name__)
                 if not err_obj and isinstance(res, dict):
                     err_obj = res.get("error")
+                    logging.debug("chat_completions:tool_loop:err_obj_from_res type=%s", type(err_obj).__name__)
+                # Executor does not echo args; executor_gateway attaches them back. Fall back to our input args.
+                args_echo = tr.get("args") if isinstance(tr.get("args"), dict) else {}
+                logging.debug("chat_completions:tool_loop:args_echo_keys=%r", sorted(list(args_echo.keys())) if isinstance(args_echo, dict) else None)
+                if not args_echo and isinstance(ta, dict):
+                    args_echo = ta
+                    logging.debug("chat_completions:tool_loop:args_echo fallback to ta keys=%r", sorted(list(args_echo.keys())) if isinstance(args_echo, dict) else None)
+                _log(
+                    "tool.run.after_exec",
+                    trace_id=trace_id,
+                    tool=tname,
+                    ok=not isinstance(err_obj, (str, dict)),
+                    result_keys=(sorted(list(res.keys()))[:64] if isinstance(res, dict) else []),
+                    args_preview=_args_preview_for_log(args_echo),
+                    step_id=(tr.get("step_id") if isinstance(tr.get("step_id"), str) else None),
+                )
+                logging.debug("chat_completions:tool_loop:after_exec ok=%s", not isinstance(err_obj, (str, dict)))
                 # Required: persist tool execution metadata (teacher + ledger + db)
                 try:
                     arts_val = res.get("artifacts") if isinstance(res, dict) else None
+                    logging.debug("chat_completions:tool_loop:arts_val_type=%s", type(arts_val).__name__)
                     ok_step = not isinstance(err_obj, (str, dict))
+                    logging.debug("chat_completions:tool_loop:ok_step=%r", ok_step)
                     tool_exec_meta.append(
                         {
                             "name": tname,
-                            "args": (ta if isinstance(ta, dict) else {}),
+                            "args": (args_echo if isinstance(args_echo, dict) else (ta if isinstance(ta, dict) else {})),
                             "ok": bool(ok_step),
                             "result": (res if isinstance(res, dict) else {}),
                             "error": (err_obj if isinstance(err_obj, (dict, str)) else None),
                             "artifacts": arts_val,
                         }
                     )
+                    logging.debug("chat_completions:tool_loop:tool_exec_meta appended len=%s", len(tool_exec_meta))
                     if run_id is not None:
+                        logging.debug("chat_completions:tool_loop:_db_insert_tool_call starting run_id=%r tool=%r", run_id, tname)
                         await _db_insert_tool_call(
                             run_id,
                             tname,
                             int(master_seed),
-                            (ta if isinstance(ta, dict) else {}),
+                            (args_echo if isinstance(args_echo, dict) else (ta if isinstance(ta, dict) else {})),
                             (res if isinstance(res, dict) else None),
                             None,
                         )
+                        logging.debug("chat_completions:tool_loop:_db_insert_tool_call done")
                     if _ledger_shard is not None and _ledger_root is not None:
+                        logging.debug("chat_completions:tool_loop:ledger append starting _ledger_root=%r", _ledger_root)
                         row = {
                             "t": int(time.time() * 1000),
                             "trace_id": str(trace_id),
                             "run_id": int(run_id) if isinstance(run_id, int) else None,
                             "name": tname,
                             "ok": bool(ok_step),
-                            "args": (ta if isinstance(ta, dict) else {}),
+                            "args": (args_echo if isinstance(args_echo, dict) else (ta if isinstance(ta, dict) else {})),
                             "result": (res if isinstance(res, dict) else {}),
                             "error": err_obj,
                             "artifacts": arts_val,
                         }
+                        logging.debug("chat_completions:tool_loop:ledger row_keys=%r", sorted(list(row.keys())))
                         _ledger_shard = _art_append_jsonl(_ledger_shard, row)
+                        logging.debug("chat_completions:tool_loop:ledger append done shard=%r", _ledger_shard)
                 except Exception as ex:
-                    logging.warning("tool_exec_meta.persist.failed trace_id=%s tool=%s: %s", str(trace_id), str(tname), ex, exc_info=True)
+                    logging.debug("chat_completions:tool_exec_meta.persist.failed trace_id=%s tool=%s ex=%s", str(trace_id), str(tname), ex, exc_info=True)
                 if isinstance(err_obj, (str, dict)):
+                    logging.debug("chat_completions:tool_loop:error_branch entered")
                     code = (err_obj.get("code") if isinstance(err_obj, dict) else str(err_obj))
+                    logging.debug("chat_completions:tool_loop:error_branch code=%r", code)
                     status = (err_obj.get("status") if isinstance(err_obj, dict) else None)
+                    logging.debug("chat_completions:tool_loop:error_branch status=%r", status)
                     message = (err_obj.get("message") if isinstance(err_obj, dict) else "")
+                    logging.debug("chat_completions:tool_loop:error_branch message_len=%s", len(message) if isinstance(message, str) else -1)
                     _log("tool.run.error", trace_id=trace_id, tool=tname, code=(code or ""), status=status, message=(message or ""))
                     # Flip pipeline_ok to False when a critical front-door tool fails.
                     if tname in ("image.dispatch", "music.infinite.windowed", "film2.run", "tts.speak"):
                         pipeline_ok = False
+                        logging.debug("chat_completions:tool_loop:pipeline_ok flipped to False due_to=%r", tname)
                     _tel_append(
                         STATE_DIR,
                         trace_id,
@@ -7837,14 +8201,17 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                             "raw": {
                                 "ts": None,
                                 "ok": False,
-                                "args": (tr.get("args") if isinstance(tr.get("args"), dict) else {}),
+                                "args": (args_echo if isinstance(args_echo, dict) else {}),
                                 "error": (err_obj if isinstance(err_obj, dict) else {"code": "error", "message": str(err_obj)}),
                             },
                         },
                     )
                 else:
+                    logging.debug("chat_completions:tool_loop:success_branch entered")
                     arts_summary: List[Dict[str, Any]] = []
+                    logging.debug("chat_completions:tool_loop:arts_summary init len=%s", len(arts_summary))
                     arts = res.get("artifacts") if isinstance(res, dict) else None
+                    logging.debug("chat_completions:tool_loop:arts_type=%s", type(arts).__name__)
                     if isinstance(arts, list):
                         for a in arts:
                             if isinstance(a, dict):
@@ -7852,10 +8219,14 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                                 kind = a.get("kind")
                                 if isinstance(aid, str) and isinstance(kind, str):
                                     arts_summary.append({"id": aid, "kind": kind})
+                                    logging.debug("chat_completions:tool_loop:arts_summary append id=%r kind=%r len=%s", aid, kind, len(arts_summary))
                     urls_this = assets_collect_urls([tr], _abs_url)
+                    logging.debug("chat_completions:tool_loop:urls_this_len=%s", len(urls_this or []))
                     _log("tool.run.after", trace_id=trace_id, tool=tname, artifacts=arts_summary, urls_count=len(urls_this or []))
                     meta = res.get("meta") if isinstance(res, dict) else {}
+                    logging.debug("chat_completions:tool_loop:meta_type=%s", type(meta).__name__)
                     first_url = urls_this[0] if isinstance(urls_this, list) and urls_this else None
+                    logging.debug("chat_completions:tool_loop:first_url=%r", first_url)
                     _tel_append(
                         STATE_DIR,
                         trace_id,
@@ -7866,20 +8237,28 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                             "raw": {
                                 "ts": None,
                                 "ok": True,
-                                "args": (tr.get("args") if isinstance(tr.get("args"), dict) else {}),
+                                "args": (args_echo if isinstance(args_echo, dict) else {}),
                                 "result": {"meta": (meta if isinstance(meta, dict) else {}), "artifact_url": first_url},
                             },
                         },
                     )
                     extra_results: List[Dict[str, Any]] = []
+                    logging.debug("chat_completions:tool_loop:extra_results init len=%s", len(extra_results))
                     if tname == "film2.run":
+                        logging.debug("chat_completions:tool_loop:film2.run qa branch entered")
                         meta_obj = res.get("meta") if isinstance(res, dict) else {}
+                        logging.debug("chat_completions:tool_loop:film2.run meta_obj_type=%s", type(meta_obj).__name__)
                         profile_name = meta_obj.get("quality_profile") if isinstance(meta_obj, dict) and isinstance(meta_obj.get("quality_profile"), str) else None
+                        logging.debug("chat_completions:tool_loop:film2.run profile_name=%r", profile_name)
                         preset = LOCK_QUALITY_PRESETS.get((profile_name or "standard").lower(), LOCK_QUALITY_PRESETS["standard"])
+                        logging.debug("chat_completions:tool_loop:film2.run preset_keys=%r", sorted(list(preset.keys())) if isinstance(preset, dict) else None)
                         # Clamp to a single refinement pass for segment-level film QA
                         refine_budget = min(1, int(preset.get("max_refine_passes", 1)))
+                        logging.debug("chat_completions:tool_loop:film2.run refine_budget=%r", refine_budget)
                         segments_obj = meta_obj.get("segments") if isinstance(meta_obj, dict) else {}
+                        logging.debug("chat_completions:tool_loop:film2.run segments_obj_type=%s", type(segments_obj).__name__)
                         clips_for_committee = segments_obj.get("clips") if isinstance(segments_obj, dict) else None
+                        logging.debug("chat_completions:tool_loop:film2.run clips_for_committee_type=%s", type(clips_for_committee).__name__)
                         if isinstance(clips_for_committee, list) and clips_for_committee:
                             seg_results_payload: List[Dict[str, Any]] = []
                             for seg in clips_for_committee:
@@ -7889,7 +8268,9 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                                 res_obj = seg.get("result")
                                 if isinstance(seg_id, str) and seg_id and isinstance(res_obj, dict):
                                     seg_results_payload.append({"name": seg_id, "result": res_obj})
+                                    logging.debug("chat_completions:tool_loop:film2.run seg_results_payload append seg_id=%r len=%s", seg_id, len(seg_results_payload))
                             if seg_results_payload:
+                                logging.debug("chat_completions:tool_loop:film2.run segment_qa_and_committee call len=%s", len(seg_results_payload))
                                 _trace_append(
                                     "film2",
                                     {
@@ -7901,7 +8282,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                                 )
                                 updated_seg, seg_outcome, seg_patch = await segment_qa_and_committee(
                                     trace_id=trace_id,
-                                    user_text=last_user_text,
+                                    user_text=_tool_step_eval_user_text("film2.run", args_echo, last_user_text),
                                     tool_name="film2.run",
                                     segment_results=seg_results_payload,
                                     mode=effective_mode,
@@ -7916,11 +8297,18 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                                     quality_profile=profile_name,
                                     max_refine_passes=refine_budget,
                                 )
+                                logging.debug(
+                                    "chat_completions:tool_loop:film2.run segment_qa_and_committee returned updated_seg_type=%s seg_outcome_keys=%r seg_patch_len=%s",
+                                    type(updated_seg).__name__,
+                                    sorted(list(seg_outcome.keys())) if isinstance(seg_outcome, dict) else None,
+                                    len(seg_patch) if isinstance(seg_patch, list) else -1,
+                                )
                                 if isinstance(meta_obj, dict):
                                     meta_obj["segment_committee"] = seg_outcome
                                     if seg_patch:
                                         meta_obj["segment_patch_results"] = seg_patch
                                         extra_results.extend(seg_patch)
+                                        logging.debug("chat_completions:tool_loop:film2.run extra_results extended len=%s", len(extra_results))
                                         # Mark refined clips in segments metadata.
                                         segments_container = meta_obj.get("segments")
                                         if isinstance(segments_container, dict):
@@ -7945,6 +8333,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                                                                 clip_meta["refined"] = True
                                                                 if isinstance(refine_mode_val, str) and refine_mode_val:
                                                                     clip_meta["refine_mode"] = refine_mode_val
+                                                                logging.debug("chat_completions:tool_loop:film2.run marked refined sid=%r refine_mode=%r", sid, refine_mode_val)
                                 _trace_append(
                                     "film2",
                                     {
@@ -7955,14 +8344,18 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                                     },
                                 )
                     elif tname in ("music.infinite.windowed", "music.dispatch", "music.variation", "music.mixdown"):
+                        logging.debug("chat_completions:tool_loop:music qa branch entered tname=%r", tname)
                         meta_block = res.get("meta") if isinstance(res, dict) else {}
                         profile_name = meta_block.get("quality_profile") if isinstance(meta_block, dict) and isinstance(meta_block.get("quality_profile"), str) else None
+                        logging.debug("chat_completions:tool_loop:music profile_name=%r", profile_name)
                         preset_music = LOCK_QUALITY_PRESETS.get((profile_name or "standard").lower(), LOCK_QUALITY_PRESETS["standard"])
+                        logging.debug("chat_completions:tool_loop:music preset_keys=%r", sorted(list(preset_music.keys())) if isinstance(preset_music, dict) else None)
                         # Clamp to a single refinement pass for music QA
                         refine_budget_music = min(1, int(preset_music.get("max_refine_passes", 1)))
+                        logging.debug("chat_completions:tool_loop:music refine_budget_music=%r", refine_budget_music)
                         updated_seg, seg_outcome, seg_patch = await segment_qa_and_committee(
                             trace_id=trace_id,
-                            user_text=last_user_text,
+                            user_text=_tool_step_eval_user_text(tname, args_echo, last_user_text),
                             tool_name=tname,
                             segment_results=[tr],
                             mode=effective_mode,
@@ -7977,6 +8370,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                             quality_profile=profile_name,
                             max_refine_passes=refine_budget_music,
                         )
+                        logging.debug("chat_completions:tool_loop:music segment_qa returned outcome_keys=%r patch_len=%s", sorted(list(seg_outcome.keys())) if isinstance(seg_outcome, dict) else None, len(seg_patch) if isinstance(seg_patch, list) else -1)
                         if isinstance(res, dict):
                             meta_music = res.setdefault("meta", {})
                             if isinstance(meta_music, dict):
@@ -7985,19 +8379,24 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                                     meta_music["segment_patch_results"] = seg_patch
                         if seg_patch:
                             extra_results.extend(seg_patch)
+                            logging.debug("chat_completions:tool_loop:music extra_results extended len=%s", len(extra_results))
                     elif tname.startswith("image."):
+                        logging.debug("chat_completions:tool_loop:image qa branch entered tname=%r", tname)
                         # Optional: run segment-level QA/committee for image tools as well.
                         profile_name = None
                         if isinstance(res, dict):
                             meta_block = res.get("meta")
                             if isinstance(meta_block, dict) and isinstance(meta_block.get("quality_profile"), str):
                                 profile_name = meta_block.get("quality_profile")
+                        logging.debug("chat_completions:tool_loop:image profile_name=%r", profile_name)
                         preset_img = LOCK_QUALITY_PRESETS.get((profile_name or "standard").lower(), LOCK_QUALITY_PRESETS["standard"])
+                        logging.debug("chat_completions:tool_loop:image preset_keys=%r", sorted(list(preset_img.keys())) if isinstance(preset_img, dict) else None)
                         # Clamp to a single refinement pass for image QA
                         refine_budget_img = min(1, int(preset_img.get("max_refine_passes", 0)))
+                        logging.debug("chat_completions:tool_loop:image refine_budget_img=%r", refine_budget_img)
                         updated_seg, seg_outcome, seg_patch = await segment_qa_and_committee(
                             trace_id=trace_id,
-                            user_text=last_user_text,
+                            user_text=_tool_step_eval_user_text(tname, args_echo, last_user_text),
                             tool_name=tname,
                             segment_results=[tr],
                             mode=effective_mode,
@@ -8012,6 +8411,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                             quality_profile=profile_name,
                             max_refine_passes=refine_budget_img,
                         )
+                        logging.debug("chat_completions:tool_loop:image segment_qa returned outcome_keys=%r patch_len=%s", sorted(list(seg_outcome.keys())) if isinstance(seg_outcome, dict) else None, len(seg_patch) if isinstance(seg_patch, list) else -1)
                         if isinstance(res, dict):
                             meta_img = res.setdefault("meta", {})
                             if isinstance(meta_img, dict):
@@ -8020,18 +8420,23 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                                     meta_img["segment_patch_results"] = seg_patch
                         if seg_patch:
                             extra_results.extend(seg_patch)
+                            logging.debug("chat_completions:tool_loop:image extra_results extended len=%s", len(extra_results))
                     elif tname == "tts.speak":
+                        logging.debug("chat_completions:tool_loop:tts qa branch entered")
                         # Segment-level QA/committee for TTS segments
                         profile_name = None
                         if isinstance(res, dict):
                             meta_block = res.get("meta")
                             if isinstance(meta_block, dict) and isinstance(meta_block.get("quality_profile"), str):
                                 profile_name = meta_block.get("quality_profile")
+                        logging.debug("chat_completions:tool_loop:tts profile_name=%r", profile_name)
                         preset_tts = LOCK_QUALITY_PRESETS.get((profile_name or "standard").lower(), LOCK_QUALITY_PRESETS["standard"])
+                        logging.debug("chat_completions:tool_loop:tts preset_keys=%r", sorted(list(preset_tts.keys())) if isinstance(preset_tts, dict) else None)
                         refine_budget_tts = min(1, int(preset_tts.get("max_refine_passes", 1)))
+                        logging.debug("chat_completions:tool_loop:tts refine_budget_tts=%r", refine_budget_tts)
                         updated_seg, seg_outcome, seg_patch = await segment_qa_and_committee(
                             trace_id=trace_id,
-                            user_text=last_user_text,
+                            user_text=_tool_step_eval_user_text(tname, args_echo, last_user_text),
                             tool_name=tname,
                             segment_results=[tr],
                             mode=effective_mode,
@@ -8046,6 +8451,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                             quality_profile=profile_name,
                             max_refine_passes=refine_budget_tts,
                         )
+                        logging.debug("chat_completions:tool_loop:tts segment_qa returned outcome_keys=%r patch_len=%s", sorted(list(seg_outcome.keys())) if isinstance(seg_outcome, dict) else None, len(seg_patch) if isinstance(seg_patch, list) else -1)
                         if isinstance(res, dict):
                             meta_tts = res.setdefault("meta", {})
                             if isinstance(meta_tts, dict):
@@ -8054,18 +8460,23 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                                     meta_tts["segment_patch_results"] = seg_patch
                         if seg_patch:
                             extra_results.extend(seg_patch)
+                            logging.debug("chat_completions:tool_loop:tts extra_results extended len=%s", len(extra_results))
                     elif tname == "audio.sfx.compose":
+                        logging.debug("chat_completions:tool_loop:sfx qa branch entered")
                         # Optional: SFX QA/committee wiring (currently metrics are sparse)
                         profile_name = None
                         if isinstance(res, dict):
                             meta_block = res.get("meta")
                             if isinstance(meta_block, dict) and isinstance(meta_block.get("quality_profile"), str):
                                 profile_name = meta_block.get("quality_profile")
+                        logging.debug("chat_completions:tool_loop:sfx profile_name=%r", profile_name)
                         preset_sfx = LOCK_QUALITY_PRESETS.get((profile_name or "standard").lower(), LOCK_QUALITY_PRESETS["standard"])
+                        logging.debug("chat_completions:tool_loop:sfx preset_keys=%r", sorted(list(preset_sfx.keys())) if isinstance(preset_sfx, dict) else None)
                         refine_budget_sfx = min(1, int(preset_sfx.get("max_refine_passes", 0)))
+                        logging.debug("chat_completions:tool_loop:sfx refine_budget_sfx=%r", refine_budget_sfx)
                         updated_seg, seg_outcome, seg_patch = await segment_qa_and_committee(
                             trace_id=trace_id,
-                            user_text=last_user_text,
+                            user_text=_tool_step_eval_user_text(tname, args_echo, last_user_text),
                             tool_name=tname,
                             segment_results=[tr],
                             mode=effective_mode,
@@ -8080,6 +8491,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                             quality_profile=profile_name,
                             max_refine_passes=refine_budget_sfx,
                         )
+                        logging.debug("chat_completions:tool_loop:sfx segment_qa returned outcome_keys=%r patch_len=%s", sorted(list(seg_outcome.keys())) if isinstance(seg_outcome, dict) else None, len(seg_patch) if isinstance(seg_patch, list) else -1)
                         if isinstance(res, dict):
                             meta_sfx = res.setdefault("meta", {})
                             if isinstance(meta_sfx, dict):
@@ -8088,34 +8500,51 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                                     meta_sfx["segment_patch_results"] = seg_patch
                         if seg_patch:
                             extra_results.extend(seg_patch)
+                            logging.debug("chat_completions:tool_loop:sfx extra_results extended len=%s", len(extra_results))
                     tool_results.append(tr)
+                    logging.debug("chat_completions:tool_loop:tool_results appended len=%s", len(tool_results))
                     if extra_results:
                         tool_results.extend(extra_results)
+                        logging.debug("chat_completions:tool_loop:tool_results extended with extra_results len=%s", len(tool_results))
 
         _log("flow.after_execute", trace_id=trace_id, tool_results_count=len(tool_results or []))
+        logging.debug("chat_completions:flow.after_execute tool_results_count=%s pipeline_ok=%r", len(tool_results or []), pipeline_ok)
 
         for _tr in tool_results or []:
+            logging.debug("chat_completions:post_tool_scan:iter _tr_type=%s _tr_keys=%r", type(_tr).__name__, sorted(list(_tr.keys())) if isinstance(_tr, dict) else None)
             _res = (_tr or {}).get("result") or {}
+            logging.debug("chat_completions:post_tool_scan:_res_type=%s _res_keys=%r", type(_res).__name__, sorted(list(_res.keys())) if isinstance(_res, dict) else None)
             if isinstance(_res, dict):
                 _meta = _res.get("meta") if isinstance(_res, dict) else {}
+                logging.debug("chat_completions:post_tool_scan:_meta_type=%s", type(_meta).__name__)
                 _pid = (_meta or {}).get("prompt_id")
+                logging.debug("chat_completions:post_tool_scan:_pid=%r", _pid)
                 if isinstance(_pid, str) and _pid:
                     _ids = _res.get("ids") if isinstance(_res.get("ids"), dict) else {}
+                    logging.debug("chat_completions:post_tool_scan:_ids_type=%s", type(_ids).__name__)
                     _comfy_client_id = _ids.get("client_id") if isinstance(_ids.get("client_id"), str) else None
+                    logging.debug("chat_completions:post_tool_scan:_comfy_client_id=%r", _comfy_client_id)
                     _log("[comfy] POST /prompt", trace_id=trace_id, prompt_id=_pid, client_id=_comfy_client_id)
                     _log("comfy.submit", trace_id=trace_id, prompt_id=_pid, client_id=_comfy_client_id)
                     _log("[comfy] polling /history/" + _pid)
 
         # Post-run QA checkpoint (lightweight) — run once after all tool results are collected.
         _img_count = assets_count_images(tool_results)
+        logging.debug("chat_completions:postrun_qa _img_count=%r", _img_count)
         _vid_count = assets_count_video(tool_results)
+        logging.debug("chat_completions:postrun_qa _vid_count=%r", _vid_count)
         _aud_count = assets_count_audio(tool_results)
+        logging.debug("chat_completions:postrun_qa _aud_count=%r", _aud_count)
         counts_summary = {"images": int(_img_count), "videos": int(_vid_count), "audio": int(_aud_count)}
+        logging.debug("chat_completions:postrun_qa counts_summary=%r", counts_summary)
         domain_qa = assets_compute_domain_qa(tool_results)
+        logging.debug("chat_completions:postrun_qa domain_qa_type=%s domain_qa=%r", type(domain_qa).__name__, domain_qa)
         qa_metrics = {"counts": counts_summary, "domain": domain_qa}
+        logging.debug("chat_completions:postrun_qa qa_metrics_keys=%r", sorted(list(qa_metrics.keys())))
         _log("qa.metrics", trace_id=trace_id, tool="postrun", metrics=qa_metrics)
         _log("committee.postrun.review", trace_id=trace_id, summary=qa_metrics)
         # Committee decision with optional single revision
+        logging.debug("chat_completions:committee postrun_committee_decide call trace_id=%r", trace_id)
         committee_outcome = await postrun_committee_decide(
             trace_id=trace_id,
             user_text=last_user_text,
@@ -8123,35 +8552,69 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             qa_metrics=qa_metrics,
             mode=effective_mode,
         )
+        logging.debug("chat_completions:committee postrun_committee_decide returned keys=%r", sorted(list(committee_outcome.keys())) if isinstance(committee_outcome, dict) else None)
         committee_action = str((committee_outcome.get("action") or "go")).strip().lower()
+        logging.debug("chat_completions:committee committee_action=%r", committee_action)
         committee_rationale = str(committee_outcome.get("rationale") or "")
+        logging.debug("chat_completions:committee committee_rationale_len=%s", len(committee_rationale))
         patch_plan = committee_outcome.get("patch_plan") or []
+        logging.debug("chat_completions:committee patch_plan_type=%s patch_plan_len=%s", type(patch_plan).__name__, len(patch_plan) if isinstance(patch_plan, list) else -1)
         _log("committee.decision", trace_id=trace_id, action=committee_action, rationale=committee_rationale)
         _log("flow.after_committee", trace_id=trace_id, action=committee_action)
         checkpoints_append_event(STATE_DIR, trace_id, "committee.review.final", {"summary": qa_metrics})
+        logging.debug("chat_completions:committee checkpoints_append_event review.final done")
         checkpoints_append_event(STATE_DIR, trace_id, "committee.decision.final", {"action": committee_action})
+        logging.debug("chat_completions:committee checkpoints_append_event decision.final done")
         # Optional one-pass revision
         if committee_action == "revise" and isinstance(patch_plan, list) and patch_plan:
+            logging.debug("chat_completions:committee revise branch entered patch_plan_len=%s", len(patch_plan))
             # Filter patch plan by front-door + mode rules
             _allowed_mode_set = set(_allowed_tools_for_mode(effective_mode))
+            logging.debug("chat_completions:committee _allowed_mode_set_len=%s", len(_allowed_mode_set))
             filtered_patch_plan: List[Dict[str, Any]] = []
+            logging.debug("chat_completions:committee filtered_patch_plan init len=%s", len(filtered_patch_plan))
             for st in patch_plan:
+                logging.debug("chat_completions:committee patch_plan_iter st_type=%s st_keys=%r", type(st).__name__, sorted(list(st.keys())) if isinstance(st, dict) else None)
                 if not isinstance(st, dict):
                     continue
                 tl = (st.get("tool") or "").strip() if isinstance(st.get("tool"), str) else ""
+                logging.debug("chat_completions:committee patch_plan_iter tl=%r", tl)
                 if not tl or tl not in PLANNER_VISIBLE_TOOLS or tl not in _allowed_mode_set:
+                    logging.debug("chat_completions:committee patch_plan_iter skipped tl=%r", tl)
                     continue
-                args_st = st.get("args") if isinstance(st.get("args"), dict) else {}
+                # IMPORTANT: do not drop args when the committee returns args as a JSON string.
+                args_raw = st.get("args") if ("args" in st) else st.get("arguments")
+                logging.debug("chat_completions:committee patch_plan_iter args_raw_type=%s", type(args_raw).__name__)
+                args_st: Dict[str, Any]
+                if isinstance(args_raw, dict):
+                    args_st = dict(args_raw)
+                elif isinstance(args_raw, str):
+                    parser_patch = JSONParser()
+                    logging.debug("chat_completions:committee patch_plan_iter parsing args_raw_json_len=%s", len(args_raw))
+                    parsed = parser_patch.parse(args_raw or "", dict)
+                    logging.debug("chat_completions:committee patch_plan_iter parsed_type=%s", type(parsed).__name__)
+                    args_st = dict(parsed) if isinstance(parsed, dict) else {"_raw": args_raw}
+                elif args_raw is None:
+                    args_st = {}
+                else:
+                    args_st = {"_raw": args_raw}
                 filtered_patch_plan.append({"tool": tl, "args": args_st})
+                logging.debug("chat_completions:committee filtered_patch_plan append tool=%r args_keys=%r len=%s", tl, sorted(list(args_st.keys())) if isinstance(args_st, dict) else None, len(filtered_patch_plan))
             if filtered_patch_plan:
+                logging.debug("chat_completions:committee filtered_patch_plan nonempty len=%s", len(filtered_patch_plan))
                 # Normalize to internal tool_calls schema
                 patch_calls: List[Dict[str, Any]] = [{"name": s.get("tool"), "arguments": (s.get("args") or {})} for s in filtered_patch_plan]
+                logging.debug("chat_completions:committee patch_calls_len=%s first=%r", len(patch_calls), patch_calls[0] if patch_calls else None)
                 _inject_execution_context(patch_calls, trace_id, effective_mode)
+                logging.debug("chat_completions:committee _inject_execution_context patch_calls done")
                 # Validator disabled: execute patch plan directly without pre-validation.
                 patch_validated = list(patch_calls)
+                logging.debug("chat_completions:committee patch_validated_len=%s", len(patch_validated))
                 patch_failures: List[Dict[str, Any]] = []
+                logging.debug("chat_completions:committee patch_failures_len=%s", len(patch_failures))
                 # Execute validated patch steps
                 patch_failure_results: List[Dict[str, Any]] = []
+                logging.debug("chat_completions:committee patch_failure_results init len=%s", len(patch_failure_results))
                 for failure in patch_failures or []:
                     env = failure.get("envelope") if isinstance(failure.get("envelope"), dict) else {}
                     args_snapshot = failure.get("arguments") if isinstance(failure.get("arguments"), dict) else {}
@@ -8165,18 +8628,25 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                             "args": args_snapshot,
                         }
                     )
+                    logging.debug("chat_completions:committee patch_failure_results append name=%r len=%s", name_snapshot, len(patch_failure_results))
                 exec_results: List[Dict[str, Any]] = []
+                logging.debug("chat_completions:committee exec_results init len=%s", len(exec_results))
                 # Advisory-only: execute the patch plan once via the executor path.
                 exec_batch = patch_validated or patch_calls
+                logging.debug("chat_completions:committee exec_batch_len=%s", len(exec_batch) if isinstance(exec_batch, list) else -1)
                 if exec_batch:
                     _log("exec.payload", trace_id=trace_id, steps=[{"tool": (c.get("name") or "")} for c in exec_batch[:5]])
+                    logging.debug("chat_completions:committee gateway_execute patch exec starting")
                     exec_results = await gateway_execute(exec_batch, trace_id, executor_endpoint, request_id=str(request_id))
+                    logging.debug("chat_completions:committee gateway_execute patch exec returned len=%s", len(exec_results) if isinstance(exec_results, list) else -1)
                     # Persist patch exec results (teacher + ledger + db)
                     try:
                         results_list = exec_results if isinstance(exec_results, list) else []
+                        logging.debug("chat_completions:committee results_list_len=%s", len(results_list))
                         for i, call in enumerate(exec_batch or []):
                             nm = str((call or {}).get("name") or "tool")
                             args_obj = (call or {}).get("arguments") if isinstance((call or {}).get("arguments"), dict) else {}
+                            logging.debug("chat_completions:committee patch_result_iter i=%s nm=%r args_keys=%r", i, nm, sorted(list(args_obj.keys())) if isinstance(args_obj, dict) else None)
                             tr: Dict[str, Any] = {}
                             if i < len(results_list) and isinstance(results_list[i], dict):
                                 tr = results_list[i]
@@ -8185,14 +8655,18 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                                     if isinstance(cand, dict) and str(cand.get("name") or "") == nm:
                                         tr = cand
                                         break
+                            logging.debug("chat_completions:committee patch_result_iter tr_keys=%r", sorted(list(tr.keys())) if isinstance(tr, dict) else None)
                             res_obj = tr.get("result") if isinstance(tr.get("result"), dict) else {}
                             err_obj = tr.get("error")
                             if not err_obj and isinstance(res_obj, dict):
                                 err_obj = res_obj.get("error")
                             arts_val = res_obj.get("artifacts") if isinstance(res_obj, dict) else None
                             ok_step = not isinstance(err_obj, (str, dict))
+                            logging.debug("chat_completions:committee patch_result_iter ok_step=%r err_type=%s", ok_step, type(err_obj).__name__)
                             tool_exec_meta.append({"name": nm, "args": args_obj, "ok": bool(ok_step), "result": res_obj, "error": err_obj, "artifacts": arts_val})
+                            logging.debug("chat_completions:committee tool_exec_meta appended len=%s", len(tool_exec_meta))
                             if run_id is not None:
+                                logging.debug("chat_completions:committee _db_insert_tool_call patch starting run_id=%r nm=%r", run_id, nm)
                                 await _db_insert_tool_call(
                                     run_id,
                                     nm,
@@ -8201,21 +8675,32 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                                     (res_obj if isinstance(res_obj, dict) else None),
                                     None,
                                 )
+                                logging.debug("chat_completions:committee _db_insert_tool_call patch done")
                             if _ledger_shard is not None and _ledger_root is not None:
                                 row = {"t": int(time.time() * 1000), "trace_id": str(trace_id), "run_id": int(run_id) if isinstance(run_id, int) else None, "name": nm, "ok": bool(ok_step), "args": args_obj, "result": res_obj, "error": err_obj, "artifacts": arts_val}
                                 _ledger_shard = _art_append_jsonl(_ledger_shard, row)
+                                logging.debug("chat_completions:committee ledger append patch done nm=%r", nm)
                     except Exception as ex:
-                        logging.warning("patch_exec_meta.persist.failed trace_id=%s: %s", str(trace_id), ex, exc_info=True)
+                        logging.debug("chat_completions:patch_exec_meta.persist.failed trace_id=%s ex=%s", str(trace_id), ex, exc_info=True)
                 patch_results = list(patch_failure_results) + list(exec_results or [])
+                logging.debug("chat_completions:committee patch_results_len=%s", len(patch_results))
                 tool_results = (tool_results or []) + patch_results
+                logging.debug("chat_completions:committee tool_results_len_after_patch=%s", len(tool_results or []))
                 _log("committee.revision.executed", trace_id=trace_id, steps=len(patch_validated or []), failures=len(patch_failures or []))
+                logging.debug("chat_completions:committee revision executed steps=%s failures=%s", len(patch_validated or []), len(patch_failures or []))
                 # Recompute QA metrics after revision
                 _img_count = assets_count_images(tool_results)
+                logging.debug("chat_completions:postrev_qa _img_count=%r", _img_count)
                 _vid_count = assets_count_video(tool_results)
+                logging.debug("chat_completions:postrev_qa _vid_count=%r", _vid_count)
                 _aud_count = assets_count_audio(tool_results)
+                logging.debug("chat_completions:postrev_qa _aud_count=%r", _aud_count)
                 counts_summary = {"images": int(_img_count), "videos": int(_vid_count), "audio": int(_aud_count)}
+                logging.debug("chat_completions:postrev_qa counts_summary=%r", counts_summary)
                 domain_qa = assets_compute_domain_qa(tool_results)
+                logging.debug("chat_completions:postrev_qa domain_qa=%r", domain_qa)
                 qa_metrics = {"counts": counts_summary, "domain": domain_qa}
+                logging.debug("chat_completions:postrev_qa qa_metrics_keys=%r", sorted(list(qa_metrics.keys())))
             _log("qa.metrics", trace_id=trace_id, tool="postrun.revise", metrics=qa_metrics)
         # Make full tool results (including internal error stacks) available to the
         # final COMPOSE pass so the committee can explain failures and partial
@@ -8558,7 +9043,8 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             planner_id = QWEN_MODEL_ID if _use_qwen else GLM_MODEL_ID
             label_cfg = (WRAPPER_CONFIG.get("teacher") or {}).get("default_label")
             # Normalize tool_calls shape for teacher (use args, not arguments)
-            _tc = tool_exec_meta or []
+            _warn_double_wrapped_tool_results(tool_results or [])
+            _tc = _merge_tool_exec_meta_from_tool_results(tool_exec_meta, tool_results)
             trace_payload_stream = {
                 "label": label_cfg or "exp_default",
                 "seed": master_seed,
@@ -8747,6 +9233,10 @@ async def chat_completions(body: Dict[str, Any], request: Request):
 
         # Build canonical envelope (merged from steps) to attach to response for internal use
         try:
+            # Ensure tool_exec_meta includes *all* tool runs, including any QA-driven patch runs
+            # that were appended directly to tool_results (segment-level refine loops).
+            _warn_double_wrapped_tool_results(tool_results or [])
+            tool_exec_meta = _merge_tool_exec_meta_from_tool_results(tool_exec_meta, tool_results)
             step_texts: List[str] = []
             if isinstance(plan_text, str) and plan_text.strip():
                 step_texts.append(plan_text)
@@ -8863,7 +9353,8 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         master_seed = provided_seed2 if provided_seed2 is not None else _derive_seed("chat", msgs_for_seed)
         label_cfg = (WRAPPER_CONFIG.get("teacher") or {}).get("default_label")
         # Normalize tool_calls shape for teacher (use args, not arguments)
-        _tc2 = tool_exec_meta or []
+        _warn_double_wrapped_tool_results(tool_results or [])
+        _tc2 = _merge_tool_exec_meta_from_tool_results(tool_exec_meta, tool_results)
         # Mirror planner routing decision from the unified planner entry point (plan.committee.produce_tool_plan) for trace metadata.
         _use_qwen2 = str(PLANNER_MODEL or "qwen").lower().startswith("qwen")
         planner_id = QWEN_MODEL_ID if _use_qwen2 else GLM_MODEL_ID
@@ -8946,7 +9437,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             response_art.setdefault("assets", urls_out)
             response_art.setdefault("items", items_out)
     except Exception:
-        pass
+        logging.getLogger("orchestrator.api").debug("failed to attach artifacts to response (non-fatal)", exc_info=True)
 
     # Always append assets URLs to the visible assistant content (avoid double-appends).
     try:
@@ -8958,9 +9449,9 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 try:
                     response["choices"][0]["message"]["content"] = msg0
                 except Exception:
-                    pass
+                    logging.getLogger("orchestrator.api").debug("failed to mutate response message content for assets (non-fatal)", exc_info=True)
     except Exception:
-        pass
+        logging.getLogger("orchestrator.api").debug("failed to append assets to visible content (non-fatal)", exc_info=True)
 
     # Unified local trace only; no background network calls
     try:
@@ -9126,6 +9617,7 @@ async def refs_compose_character(body: Dict[str, Any]):
 # ---------- Direct Tool Runner helper (route centralized in routes/toolrun) ----------
 async def http_tool_run(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     base = (PUBLIC_BASE_URL or "http://127.0.0.1:8000").rstrip("/")
+    url = base + "/tool.run"
     async with _hx.AsyncClient(trust_env=False, timeout=None) as client:
         # Best-effort propagation of a stable trace identifier to /tool.run so
         # inner tool execution and envelopes can correlate with the outer
@@ -9133,12 +9625,49 @@ async def http_tool_run(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         # arguments when present. (cid is a different identifier and must not be
         # used as a trace id fallback.)
         payload: Dict[str, Any] = {"name": name, "args": args}
+        trace_id: str = ""
         if isinstance(args, dict):
             _trace_val = args.get("trace_id") or args.get("tid")
             if isinstance(_trace_val, (str, int)) and str(_trace_val).strip():
-                payload["trace_id"] = str(_trace_val).strip()
-        r = await client.post(base + "/tool.run", json=payload)
+                trace_id = str(_trace_val).strip()
+                payload["trace_id"] = trace_id
+
+        t0 = time.perf_counter()
+        try:
+            _log(
+                "toolrun.http.start",
+                trace_id=trace_id,
+                tool=str(name),
+                url=str(url),
+                payload_keys=sorted([str(k) for k in payload.keys()]),
+                args_preview=_args_preview_for_log(args),
+            )
+            r = await client.post(url, json=payload)
+        except Exception as ex:
+            dur_ms = int((time.perf_counter() - t0) * 1000)
+            _log(
+                "toolrun.http.exception",
+                trace_id=trace_id,
+                tool=str(name),
+                url=str(url),
+                duration_ms=dur_ms,
+                error=str(ex),
+                args_preview=_args_preview_for_log(args),
+            )
+            return {
+                "name": name,
+                "error": {
+                    "code": "tool_http_exception",
+                    "message": str(ex),
+                    "status": 0,
+                    "duration_ms": dur_ms,
+                    "url": url,
+                    "stack": "".join(traceback.format_exc()),
+                },
+            }
+
         raw_body = r.text or ""
+        dur_ms = int((time.perf_counter() - t0) * 1000)
         parser = JSONParser()
         # Include cid/trace_id in the schema so they survive coercion and can be
         # surfaced in error payloads for robust correlation, matching how cid is
@@ -9153,8 +9682,39 @@ async def http_tool_run(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
             "trace_id": str,
         }
         env = parser.parse(raw_body or "{}", env_schema)
+        try:
+            env_keys = sorted([str(k) for k in (env.keys() if isinstance(env, dict) else [])])
+        except Exception:
+            env_keys = []
+        _log(
+            "toolrun.http.response",
+            trace_id=trace_id,
+            tool=str(name),
+            url=str(url),
+            status_code=int(r.status_code),
+            duration_ms=dur_ms,
+            body_len=int(len(raw_body)),
+            body_preview=(raw_body[:2000] + "…") if len(raw_body) > 2000 else raw_body,
+            env_keys=env_keys,
+            env_ok=bool(env.get("ok")) if isinstance(env, dict) else False,
+            env_has_result=bool(isinstance(env.get("result"), dict)) if isinstance(env, dict) else False,
+            env_has_error=bool(isinstance(env.get("error"), dict)) if isinstance(env, dict) else False,
+        )
         # Canonical consumer: interpret ok/error from envelope; propagate full error object.
         if isinstance(env, dict) and env.get("ok") and isinstance(env.get("result"), dict):
+            try:
+                rk = sorted([str(k) for k in env["result"].keys()])
+            except Exception:
+                rk = []
+            _log(
+                "toolrun.http.ok",
+                trace_id=trace_id,
+                tool=str(name),
+                url=str(url),
+                status_code=int(r.status_code),
+                duration_ms=dur_ms,
+                result_keys=rk[:128],
+            )
             return {"name": name, "result": env["result"]}
         if isinstance(env, dict) and isinstance(env.get("error"), dict):
             # Preserve the entire error payload from /tool.run, including status/details,
@@ -9170,11 +9730,32 @@ async def http_tool_run(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
                 error_out.setdefault("trace_id", env.get("trace_id"))
             error_out.setdefault("body", raw_body)
             error_out.setdefault("stack_local", "".join(traceback.format_stack()))
+            _log(
+                "toolrun.http.error",
+                trace_id=trace_id or str(error_out.get("trace_id") or ""),
+                tool=str(name),
+                url=str(url),
+                status_code=int(r.status_code),
+                duration_ms=dur_ms,
+                err_code=str(error_out.get("code") or ""),
+                err_message=(str(error_out.get("message") or "")[:400] + "…")
+                if len(str(error_out.get("message") or "")) > 400
+                else str(error_out.get("message") or ""),
+            )
             return {
                 "name": name,
                 "error": error_out,
             }
         # Fallback: unknown error shape; include raw body and local stack so nothing is masked.
+        _log(
+            "toolrun.http.unknown",
+            trace_id=trace_id,
+            tool=str(name),
+            url=str(url),
+            status_code=int(r.status_code),
+            duration_ms=dur_ms,
+            env_type=type(env).__name__,
+        )
         return {
             "name": name,
             "error": {

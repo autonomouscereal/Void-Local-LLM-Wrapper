@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 import time
 import random
 import re
+import logging
+import sys
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI
@@ -32,6 +34,29 @@ from fastapi.responses import JSONResponse
 
 ICW_VERSION = "1.0.0"
 app = FastAPI(title="ICW Core", version=ICW_VERSION)
+
+# ---- Logging (stdout + shared log volume file) ----
+try:
+    from logging.handlers import RotatingFileHandler
+
+    _log_dir = os.getenv("LOG_DIR", "/workspace/logs").strip() or "/workspace/logs"
+    os.makedirs(_log_dir, exist_ok=True)
+    _log_file = os.getenv("LOG_FILE", "").strip() or os.path.join(_log_dir, "icw.log")
+    _lvl = getattr(logging, (os.getenv("LOG_LEVEL", "INFO") or "INFO").upper(), logging.INFO)
+    logging.basicConfig(
+        level=_lvl,
+        format="%(asctime)s.%(msecs)03d %(levelname)s %(process)d/%(threadName)s %(name)s %(pathname)s:%(funcName)s:%(lineno)d - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+            RotatingFileHandler(_log_file, maxBytes=50 * 1024 * 1024, backupCount=5, encoding="utf-8"),
+        ],
+        force=True,
+    )
+    logging.getLogger("icw.logging").info("icw logging configured file=%r level=%s", _log_file, logging.getLevelName(_lvl))
+except Exception as _ex:
+    logging.basicConfig(level=logging.INFO, stream=sys.stdout)
+    logging.getLogger("icw.logging").warning("icw file logging disabled: %s", _ex, exc_info=True)
 
 
 # -------------------- Utilities --------------------
@@ -631,8 +656,10 @@ async def context_pack(body: Dict[str, Any]):
         if not cited.issubset(ev_ids):
             missing = sorted(list(cited - ev_ids))
             return JSONResponse(status_code=422, content={"error": "citation_mismatch", "missing": missing})
-    except Exception:
-        pass
+    except Exception as exc:
+        # Non-fatal; if citation parsing fails we proceed (citations are a UI feature),
+        # but we must not be silent.
+        logging.getLogger("icw").warning("citation validation failed (non-fatal): %s", exc, exc_info=True)
     if not evidence:
         return JSONResponse(status_code=409, content={
             "run_id": run_id,
