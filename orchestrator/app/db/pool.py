@@ -40,6 +40,19 @@ async def get_pg_pool() -> Optional[asyncpg.pool.Pool]:
     )
     async with pg_pool.acquire() as conn:
         await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
+        # Orchestrator-owned conversation registry:
+        # - External callers may *suggest* a cid, but only the orchestrator may mint and authorize it.
+        # - We keep a lightweight table so we can reject/overwrite unknown cids deterministically.
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS orc_conversation (
+              cid        TEXT PRIMARY KEY,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+            """
+        )
+        await conn.execute("CREATE INDEX IF NOT EXISTS orc_conversation_updated_idx ON orc_conversation(updated_at DESC);")
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS run (

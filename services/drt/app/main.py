@@ -1116,12 +1116,15 @@ async def render_fetch(url: str, opts: Dict[str, Any] | None = None) -> Dict[str
                 except Exception as ex:
                     logging.debug("render_fetch.headers_failed url=%s: %s", url, ex, exc_info=True)
             page = await ctx.new_page()
-            resp = await page.goto(url, wait_until="domcontentloaded", timeout=0)
+            # TIMEOUTS FORBIDDEN: disable Playwright timeouts globally for this page.
+            page.set_default_timeout(0)
+            page.set_default_navigation_timeout(0)
+            resp = await page.goto(url, wait_until="domcontentloaded")
             try:
                 # Minimal consent auto-close (best-effort; non-fatal)
                 btn = await page.query_selector("button:has-text('Accept'), button:has-text('I agree')")
                 if btn:
-                    await btn.click(timeout=0)
+                    await btn.click()
             except Exception as ex:
                 logging.debug("render_fetch.consent_click_failed url=%s: %s", url, ex, exc_info=True)
             if scroll_max > 0:
@@ -1134,7 +1137,7 @@ async def render_fetch(url: str, opts: Dict[str, Any] | None = None) -> Dict[str
                         logging.debug("render_fetch.scroll_failed url=%s: %s", url, ex, exc_info=True)
                         break
             try:
-                await page.wait_for_load_state("networkidle", timeout=0)
+                await page.wait_for_load_state("networkidle")
             except Exception as ex:
                 logging.debug("render_fetch.networkidle_wait_failed url=%s: %s", url, ex, exc_info=True)
             html = await page.content()

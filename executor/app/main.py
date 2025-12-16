@@ -26,7 +26,6 @@ import uuid
 
 
 WORKSPACE_DIR = os.getenv("WORKSPACE_DIR", "/workspace")
-EXEC_TIMEOUT_SEC = int(os.getenv("EXEC_TIMEOUT_SEC", "30"))
 EXEC_MEMORY_MB = int(os.getenv("EXEC_MEMORY_MB", "2048"))
 ALLOW_SHELL = os.getenv("ALLOW_SHELL", "false").lower() == "true"
 SHELL_WHITELIST = set([s for s in (os.getenv("SHELL_WHITELIST") or "").split(",") if s])
@@ -76,7 +75,7 @@ def within_workspace(path: str) -> str:
     return full
 
 
-def run_subprocess(cmd: list[str], cwd: Optional[str] = None, timeout: int = EXEC_TIMEOUT_SEC) -> Dict[str, Any]:
+def run_subprocess(cmd: list[str], cwd: Optional[str] = None) -> Dict[str, Any]:
     proc = subprocess.Popen(
         cmd,
         cwd=cwd or WORKSPACE_DIR,
@@ -427,7 +426,8 @@ async def execute_plan(body: Dict[str, Any]):
     for s in raw_steps:
         if not isinstance(s, dict):
             continue
-        sid = (s.get("id") or "").strip()
+        # Canonical identifier is step_id (required).
+        sid = (s.get("step_id") or "").strip()
         if not sid:
             while True:
                 sid = f"s{auto_idx}"
@@ -461,9 +461,9 @@ async def execute_plan(body: Dict[str, Any]):
         # supplied values so ids remain fully server-controlled.
         if trace_id_val:
             inputs["trace_id"] = trace_id_val
-        sid_local = (step.get("id") or "").strip()
-        if sid_local:
-            inputs["step_id"] = sid_local
+        step_id_local = (step.get("id") or "").strip()
+        if step_id_local:
+            inputs["step_id"] = step_id_local
         return inputs
 
     pending = set(norm_steps.keys())
@@ -562,7 +562,8 @@ async def run_steps(trace_id: str, request_id: str, steps: list[dict]) -> Dict[s
     for s in steps:
         if not isinstance(s, dict):
             continue
-        sid = (s.get("id") or "").strip()
+        # Canonical identifier is step_id (required).
+        sid = (s.get("step_id") or "").strip()
         if not sid:
             while True:
                 sid = f"s{auto_idx}"
@@ -607,9 +608,9 @@ async def run_steps(trace_id: str, request_id: str, steps: list[dict]) -> Dict[s
         # CID should be taken from step args when present; do not fabricate one.
         if trace_corr:
             merged["trace_id"] = trace_corr
-        sid_local = (step.get("id") or "").strip()
-        if sid_local:
-            merged["step_id"] = sid_local
+        step_id_local = (step.get("id") or "").strip()
+        if step_id_local:
+            merged["step_id"] = step_id_local
         return merged
 
     pending = set(norm_steps.keys())

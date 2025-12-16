@@ -1,3 +1,8 @@
+'''
+committee.py: Central chat planner entry point.
+'''
+
+
 from __future__ import annotations
 
 import json
@@ -44,30 +49,21 @@ def _tool_schema_by_name(name: str) -> Dict[str, Any]:
     """
     nm = str(name or "").strip()
     if not nm:
+        log.error('tool_schema_by_name: name is empty')
         return {}
-    try:
-        tools_schema = get_builtin_tools_schema() or []
-    except Exception as exc:  # pragma: no cover - defensive logging
-        log.error("planner _tool_schema_by_name get_builtin_tools_schema failed name=%r: %s", nm, exc, exc_info=True)
-        return {}
+    
+    tools_schema = get_builtin_tools_schema() or []
     for t in tools_schema:
-        try:
-            if not isinstance(t, dict):
-                continue
-            fn = t.get("function") if isinstance(t.get("function"), dict) else {}
-            tool_name = fn.get("name") if isinstance(fn.get("name"), str) else None
-            if tool_name == nm:
-                params = fn.get("parameters")
-                return params if isinstance(params, dict) else {}
-        except Exception as exc:  # pragma: no cover - defensive logging
-            log.error("planner _tool_schema_by_name iterate failed name=%r: %s", nm, exc, exc_info=True)
+        if not isinstance(t, dict):
             continue
-    return {}
+        fn = t.get("function") if isinstance(t.get("function"), dict) else {}
+        tool_name = fn.get("name") if isinstance(fn.get("name"), str) else None
+        if tool_name == nm:
+            params = fn.get("parameters")
+            return params if isinstance(params, dict) else {}
 
 
 def _safe_message_list(messages: Any, *, trace_id: str) -> List[Dict[str, Any]]:
-    if messages is None:
-        return []
     if not isinstance(messages, list):
         log.warning("planner messages not list trace_id=%s type=%s", trace_id, type(messages).__name__)
         messages = [messages]
@@ -84,13 +80,9 @@ def _safe_message_list(messages: Any, *, trace_id: str) -> List[Dict[str, Any]]:
             continue
         # Content can be non-string in some adapter paths; coerce safely.
         if content is not None and not isinstance(content, str):
-            try:
-                content = str(content)
-            except Exception as ex:
-                # Extremely defensive: content coercion should not fail, but if it does, log so it's not silent.
-                log.warning("planner message content str() failed trace_id=%s type=%s: %s", trace_id, type(content).__name__, ex, exc_info=True)
-                content = repr(content)
-        out.append({"role": role.strip(), "content": (content or "")})
+            
+            content = str(content)
+            out.append({"role": role.strip(), "content": (content or "")})
     if dropped:
         log.warning("planner messages dropped=%s kept=%s trace_id=%s", dropped, len(out), trace_id)
     return out
@@ -133,15 +125,8 @@ async def produce_tool_plan(
     # Use trace_id only (no derived/fallback trace keys, no normalization).
     messages = _safe_message_list(messages or [], trace_id=trace_id)
     tools = _safe_tools_list(tools, trace_id=trace_id)
-    try:
-        temp = float(temperature)
-    except Exception as exc:
-        log.warning("planner bad temperature=%r trace_id=%s; defaulting to 0.2", temperature, trace_id, exc_info=True)
-        temp = 0.2
-    if temp < 0.0:
-        temp = 0.0
-    if temp > 2.0:
-        temp = 2.0
+    
+    temp = float(temperature)
 
     # Latest user text for goal anchoring.
     last_user = ""
@@ -188,23 +173,21 @@ async def produce_tool_plan(
         "You must plan using ONLY these front-door tools. For each, the JSON args must follow the given schema.",
     ]
     for name in allowed_tools:
-        try:
-            schema = _tool_schema_by_name(name=name)
-            catalog_lines.append(f"- tool: {name}")
-            catalog_lines.append("  json_schema: " + json.dumps(schema or {}, ensure_ascii=False, sort_keys=True))
-        except Exception as exc:  # pragma: no cover - defensive logging
-            log.error("planner tool catalog build failed trace_id=%s tool=%r: %s", trace_id, name, exc, exc_info=True)
-            catalog_lines.append(f"- tool: {name}")
-            catalog_lines.append("  json_schema: {}")
+        
+        schema = _tool_schema_by_name(name=name)
+        catalog_lines.append(f"- tool: {name}")
+        catalog_lines.append("  json_schema: " + json.dumps(schema or {}, ensure_ascii=False, sort_keys=True))
+    
     tool_catalog_frame = {"role": "system", "content": "\n".join(catalog_lines)}
 
     planner_rules = (
         "### [PLANNER / SYSTEM]\n"
-        "Return ONLY strict JSON: {\"steps\":[{\"tool\":\"<name>\",\"args\":{...}}]} — no extra keys.\n"
+        "Return ONLY strict JSON: {\"steps\":[{\"step_id\":\"s1\",\"tool\":\"<name>\",\"args\":{...}}]} — no extra keys.\n"
         "For pure chat answers with no tool use, return {\"steps\":[]}.\n"
         "Rules:\n"
         f"- mode: {effective_mode}\n"
         f"- allowed_tools: {', '.join(allowed_tools) if allowed_tools else '(none)'}\n"
+        "- Each step MUST include a unique string field step_id (e.g., \"s1\", \"s2\", ...).\n"
         "- Do NOT invent tool names.\n"
         "- If the user asks for any images/video/music/audio/TTS, you MUST include at least one tool step.\n"
     )
@@ -216,15 +199,12 @@ async def produce_tool_plan(
     ] + messages
 
     t_call = time.perf_counter()
-    try:
-        env = await committee_ai_text(
-            messages=plan_messages,
-            trace_id=trace_id,
-            temperature=float(temp),
-        )
-    except Exception as ex:
-        log.error("planner committee_ai_text exception trace_id=%s: %s", trace_id, ex, exc_info=True)
-        return "", [], {"ok": False, "error": {"code": "planner_committee_exception", "message": str(ex)}}
+    
+    env = await committee_ai_text(
+        messages=plan_messages,
+        trace_id=trace_id,
+        temperature=float(temp),
+    )
     call_ms = int((time.perf_counter() - t_call) * 1000)
 
     planner_env: Dict[str, Any] = env if isinstance(env, dict) else {"ok": False, "error": {"code": "planner_env_invalid", "message": str(env)}}
@@ -239,9 +219,9 @@ async def produce_tool_plan(
     schema_steps = {
         "steps": [
             {
+                "step_id": str,
                 "tool": str,
                 "name": str,
-                "id": str,
                 "args": object,
                 "arguments": object,
                 "needs": list,
@@ -250,16 +230,13 @@ async def produce_tool_plan(
         ]
     }
     t_parse = time.perf_counter()
-    try:
-        parsed = await committee_jsonify(
-            raw_text=raw_text or "{}",
-            expected_schema=schema_steps,
-            trace_id=trace_id,
-            temperature=0.0,
-        )
-    except Exception as ex:
-        log.error("planner committee_jsonify exception trace_id=%s: %s", trace_id, ex, exc_info=True)
-        parsed = {"steps": [], "error": {"code": "planner_jsonify_error", "message": str(ex)}}
+    
+    parsed = await committee_jsonify(
+        raw_text=raw_text or "{}",
+        expected_schema=schema_steps,
+        trace_id=trace_id,
+        temperature=0.0,
+    )
     parse_ms = int((time.perf_counter() - t_parse) * 1000)
 
     steps_raw = parsed.get("steps") if isinstance(parsed, dict) else []
@@ -271,6 +248,7 @@ async def produce_tool_plan(
         if not isinstance(st, dict):
             rejected += 1
             continue
+        step_id_val = st.get("step_id")
         tool_name = str(st.get("tool") or st.get("name") or "").strip()
         if not tool_name or tool_name not in allowed_set:
             rejected += 1
@@ -284,20 +262,20 @@ async def produce_tool_plan(
             if isinstance(args_val, str):
                 # IMPORTANT: only use the Void JSON parser for parsing.
                 parser = JSONParser()
-                try:
-                    j = parser.parse(args_val, {})
-                    args_val = j if isinstance(j, dict) else {"_value": j}
-                    if getattr(parser, "errors", None):
-                        log.warning("planner tool args JSONParser had errors trace_id=%s tool=%s errors=%s", trace_id, tool_name, parser.errors)
-                except Exception as ex:
-                    # Never raise from planner normalization; preserve the raw value for downstream debugging.
-                    log.warning("planner tool args parse failed trace_id=%s tool=%s: %s", trace_id, tool_name, ex, exc_info=True)
-                    args_val = {"_raw": args_val}
+                
+                j = parser.parse(args_val, {})
+                args_val = j if isinstance(j, dict) else {"_value": j}
+                if getattr(parser, "errors", None):
+                    log.warning("planner tool args JSONParser had errors trace_id=%s tool=%s errors=%s", trace_id, tool_name, parser.errors)
                 coerced_args += 1
             else:
                 args_val = {"_value": args_val}
                 coerced_args += 1
-        tool_calls.append({"name": tool_name, "arguments": args_val})
+        step_id_str = str(step_id_val).strip() if isinstance(step_id_val, str) else ""
+        if not step_id_str:
+            # Defensive fallback: keep tool_calls stable even if planner omitted step_id.
+            step_id_str = f"s{len(tool_calls) + 1}"
+        tool_calls.append({"name": tool_name, "arguments": args_val, "step_id": step_id_str})
 
     dt_ms = int((time.perf_counter() - t0) * 1000)
     log.info(

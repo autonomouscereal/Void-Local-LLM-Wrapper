@@ -1,8 +1,11 @@
+'''
+committee_client.py: Committee client for text generation.
+'''
+
 from __future__ import annotations
 
 from typing import Any, Dict, List
 import logging
-
 import os
 import json
 import time
@@ -12,23 +15,12 @@ import httpx  # type: ignore
 from .json_parser import JSONParser
 from .trace_utils import emit_trace
 
-# Single logger per module (no custom logger names)
 log = logging.getLogger(__name__)
 
 
 def _env_int(name: str, default: int, *, min_val: int | None = None, max_val: int | None = None) -> int:
-    """
-    Parse an int env var defensively.
-
-    IMPORTANT: This module is imported very early (and used by ICW/CO budgeting),
-    so env parsing must never raise at import time.
-    """
     raw = os.getenv(name, None)
-    try:
-        val = int(str(raw).strip()) if raw is not None else int(default)
-    except Exception as exc:  # pragma: no cover - defensive logging
-        log.error("bad env %s=%r: %s", name, raw, exc, exc_info=True)
-        val = int(default)
+    val = int(str(raw).strip()) if raw is not None else int(default)
     if min_val is not None and val < min_val:
         val = min_val
     if max_val is not None and val > max_val:
@@ -37,13 +29,6 @@ def _env_int(name: str, default: int, *, min_val: int | None = None, max_val: in
 
 
 def _sanitize_mojibake_text(text: str) -> str:
-    """
-    Best-effort fixer for common UTF-8 mojibake sequences that frequently
-    appear in committee outputs (especially around apostrophes/quotes).
-
-    This is intentionally conservative and only replaces a few known bad
-    byte-sequence patterns with their intended ASCII equivalents.
-    """
     if not isinstance(text, str) or not text:
         return text
     replacements = (
@@ -61,11 +46,6 @@ def _sanitize_mojibake_text(text: str) -> str:
 
 
 def _is_empty_song_candidate(obj: Any) -> bool:
-    """
-    Heuristic to detect essentially-empty Song Graph candidates.
-
-    Used only when the expected_schema is a {"song": SONG_GRAPH_SCHEMA} wrapper.
-    """
     if not isinstance(obj, dict):
         return True
     global_block = obj.get("global") if isinstance(obj.get("global"), dict) else {}
@@ -76,200 +56,90 @@ def _is_empty_song_candidate(obj: Any) -> bool:
     lyrics = obj.get("lyrics") if isinstance(obj.get("lyrics"), dict) else {}
     lyrics_sections = lyrics.get("sections") if isinstance(lyrics.get("sections"), list) else []
     bpm = global_block.get("bpm")
-    # Treat as empty when there is no usable timing info and no structural/voice/instrument/motif content.
     if (not isinstance(bpm, (int, float)) or float(bpm) == 0.0) and not sections and not voices and not instruments and not motifs and not lyrics_sections:
         return True
     return False
 
 
-# Committee model routing and context configuration.
 QWEN_BASE_URL = os.getenv("QWEN_BASE_URL", "http://localhost:11435")
 QWEN_MODEL_ID = os.getenv("QWEN_MODEL_ID", "qwen3:30b-a3b-instruct-2507-q4_K_M")
 GLM_OLLAMA_BASE_URL = os.getenv("GLM_OLLAMA_BASE_URL", "http://localhost:11433")
 GLM_MODEL_ID = os.getenv("GLM_MODEL_ID", "glm4:9b")
 DEEPSEEK_CODER_OLLAMA_BASE_URL = os.getenv("DEEPSEEK_CODER_OLLAMA_BASE_URL", "http://localhost:11436")
 DEEPSEEK_CODER_MODEL_ID = os.getenv("DEEPSEEK_CODER_MODEL_ID", "deepseek-coder-v2:lite")
+
 DEFAULT_NUM_CTX = _env_int("DEFAULT_NUM_CTX", 8192, min_val=1024, max_val=262144)
 COMMITTEE_MODEL_ID = os.getenv("COMMITTEE_MODEL_ID") or f"committee:{QWEN_MODEL_ID}+{GLM_MODEL_ID}+{DEEPSEEK_CODER_MODEL_ID}"
 DEFAULT_COMMITTEE_ROUNDS = _env_int("COMMITTEE_ROUNDS", 1, min_val=1, max_val=10)
 
 PARTICIPANT_MODELS: Dict[str, Dict[str, str]] = {
-    "qwen": {
-        "base": QWEN_BASE_URL,
-        "model": QWEN_MODEL_ID,
-    },
-    "glm": {
-        "base": GLM_OLLAMA_BASE_URL,
-        "model": GLM_MODEL_ID,
-    },
-    "deepseek": {
-        "base": DEEPSEEK_CODER_OLLAMA_BASE_URL,
-        "model": DEEPSEEK_CODER_MODEL_ID,
-    },
+    "qwen": {"base": QWEN_BASE_URL, "model": QWEN_MODEL_ID},
+    "glm": {"base": GLM_OLLAMA_BASE_URL, "model": GLM_MODEL_ID},
+    "deepseek": {"base": DEEPSEEK_CODER_OLLAMA_BASE_URL, "model": DEEPSEEK_CODER_MODEL_ID},
 }
 COMMITTEE_PARTICIPANTS = [
     {"id": name, "base": cfg["base"], "model": cfg["model"]}
     for name, cfg in PARTICIPANT_MODELS.items()
 ]
 
-# Local state dir for committee traces (mirrors main.STATE_DIR logic).
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/workspace/uploads")
 STATE_DIR = os.path.join(UPLOAD_DIR, "state")
 os.makedirs(STATE_DIR, exist_ok=True)
 
-# Use orchestrator-wide logging; no per-module basicConfig. All committee logs
-# go through the same handlers configured in app.main.
-
 
 async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str) -> Dict[str, Any]:
-    """
-    Low-level Ollama generate call used by committee debate.
-
-    This function is owned by the committee layer so that all committee-related
-    backend calls are centralized here.
-
-    IMPORTANT: This function must **never** raise. All errors are logged and
-    returned in a structured envelope so upstream planner/committee callers can
-    surface them cleanly to HTTP responses instead of killing connections.
-    """
-    # Use trace_id only (no derived/fallback trace keys, no normalization).
     t_all = time.monotonic()
     model = payload.get("model")
     prompt = payload.get("prompt")
     options = payload.get("options") if isinstance(payload.get("options"), dict) else {}
     log.info(
-        "[committee] ollama.call.start trace_id=%s base=%s model=%s stream=%s options=%s prompt_chars=%d",
+        f"[committee] ollama.call.start trace_id={trace_id} base={base_url} model={model} "
+        f"stream={bool(payload.get('stream', False))} options={options} prompt_chars={len(str(prompt or ''))}"
+    )
+
+    emit_trace(
+        STATE_DIR,
         trace_id,
-        base_url,
-        model,
-        bool(payload.get("stream", False)),
-        options,
-        len(str(prompt or "")),
+        "committee.ollama.request",
+        {
+            "trace_id": trace_id,
+            "base_url": base_url,
+            "model": model,
+            "options": options,
+        },
     )
 
     async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
-        # Log full prompt and model for complete visibility.
-        log.info("[committee] ollama.request base=%s model=%s trace_id=%s prompt=%s", base_url, model, trace_id, prompt)
+        log.info(f"[committee] ollama.request base={base_url} model={model} trace_id={trace_id} prompt={prompt}")
 
-        # Trace request (keep it lean; logging carries the huge bits).
-        emit_trace(
-            STATE_DIR,
-            trace_id,
-            "committee.ollama.request",
-            {
-                "trace_id": trace_id,
-                "base_url": base_url,
-                "model": model,
-                "options": options,
-            },
-        )
-
-        resp: httpx.Response | None = None
         t_http = time.monotonic()
-        try:
-            resp = await client.post(f"{base_url.rstrip('/')}/api/generate", json=dict(payload))
-        except httpx.ConnectError as exc:
-            msg = str(exc)
-            log.error(
-                "[committee] ollama.connect_error trace_id=%s base=%s model=%s dur_ms=%d error=%s",
-                trace_id,
-                base_url,
-                model,
-                int((time.monotonic() - t_http) * 1000.0),
-                msg,
-            )
-            emit_trace(
-                STATE_DIR,
-                trace_id,
-                "committee.ollama.connect_error",
-                {"trace_id": trace_id, "base_url": base_url, "error": msg},
-            )
-            return {"ok": False, "error": {"code": "ollama_connect_error", "message": msg, "base_url": base_url}}
-        except Exception as exc:  # pragma: no cover - defensive logging
-            msg = str(exc)
-            log.error(
-                "[committee] ollama.request_error trace_id=%s base=%s model=%s dur_ms=%d error=%s",
-                trace_id,
-                base_url,
-                model,
-                int((time.monotonic() - t_http) * 1000.0),
-                msg,
-                exc_info=True,
-            )
-            emit_trace(
-                STATE_DIR,
-                trace_id,
-                "committee.ollama.request_error",
-                {"trace_id": trace_id, "base_url": base_url, "error": msg},
-            )
-            return {"ok": False, "error": {"code": "ollama_request_error", "message": msg, "base_url": base_url}}
-
-        raw_text = (resp.text or "") if resp is not None else ""
-        status_code = int(getattr(resp, "status_code", 0) or 0) if resp is not None else 0
-        headers = dict(resp.headers) if resp is not None else {}
+        resp = await client.post(f"{base_url.rstrip('/')}/api/generate", json=dict(payload))
+        raw_text = resp.text or ""
+        status_code = int(resp.status_code)
 
         log.info(
-            "[committee] ollama.http.response trace_id=%s base=%s model=%s status=%d http_dur_ms=%d raw_chars=%d content_type=%s",
-            trace_id,
-            base_url,
-            model,
-            status_code,
-            int((time.monotonic() - t_http) * 1000.0),
-            len(raw_text),
-            headers.get("content-type"),
+            f"[committee] ollama.http.response trace_id={trace_id} base={base_url} model={model} status={status_code} "
+            f"http_dur_ms={int((time.monotonic() - t_http) * 1000.0)} raw_chars={len(raw_text)} content_type={resp.headers.get('content-type')}"
         )
 
         parser = JSONParser()
         t_parse = time.monotonic()
-        try:
-            parsed_obj = parser.parse(raw_text or "{}", {})
-            parsed = parsed_obj if isinstance(parsed_obj, dict) else {}
-        except Exception as exc:  # pragma: no cover - defensive logging
-            msg = str(exc)
-            log.error(
-                "[committee] ollama.response_parse_error trace_id=%s base=%s model=%s status=%d parse_dur_ms=%d error=%s raw_chars=%d",
-                trace_id,
-                base_url,
-                model,
-                status_code,
-                int((time.monotonic() - t_parse) * 1000.0),
-                msg,
-                len(raw_text or ""),
-                exc_info=True,
-            )
-            emit_trace(
-                STATE_DIR,
-                trace_id,
-                "committee.ollama.response_parse_error",
-                {"trace_id": trace_id, "base_url": base_url, "status_code": status_code, "error": msg, "raw_chars": len(raw_text or "")},
-            )
-            return {
-                "ok": False,
-                "error": {"code": "ollama_bad_json", "message": msg, "status": status_code, "base_url": base_url},
-            }
+        parsed_obj = parser.parse(raw_text or "{}", {})
+        parsed = parsed_obj if isinstance(parsed_obj, dict) else {}
+
+        log.info(
+            f"[committee] ollama.parsed trace_id={trace_id} base={base_url} model={model} status={status_code} "
+            f"parse_dur_ms={int((time.monotonic() - t_parse) * 1000.0)} keys={sorted(list(parsed.keys()))}"
+        )
 
         if parser.errors:
             log.warning(
-                "[committee] ollama.parser_errors trace_id=%s base=%s model=%s status=%d last_error=%s errors=%s",
-                trace_id,
-                base_url,
-                model,
-                status_code,
-                parser.last_error,
-                list(parser.errors)[:25],
+                f"[committee] ollama.parser_errors trace_id={trace_id} base={base_url} model={model} status={status_code} "
+                f"last_error={parser.last_error} errors={list(parser.errors)[:25]}"
             )
-        log.info(
-            "[committee] ollama.parsed trace_id=%s base=%s model=%s status=%d parse_dur_ms=%d keys=%s",
-            trace_id,
-            base_url,
-            model,
-            status_code,
-            int((time.monotonic() - t_parse) * 1000.0),
-            sorted(list(parsed.keys())),
-        )
 
         if not (200 <= status_code < 300):
-            err_text = parsed.get("error") if isinstance(parsed.get("error"), str) else ""
+            err_text = parsed.get("error") if isinstance(parsed.get("error"), str) else raw_text
             emit_trace(
                 STATE_DIR,
                 trace_id,
@@ -277,13 +147,8 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str) -> 
                 {"trace_id": trace_id, "base_url": base_url, "status_code": status_code, "error": err_text},
             )
             log.error(
-                "[committee] ollama.http_error trace_id=%s base=%s model=%s status=%d dur_ms=%d error=%s",
-                trace_id,
-                base_url,
-                model,
-                status_code,
-                int((time.monotonic() - t_all) * 1000.0),
-                err_text,
+                f"[committee] ollama.http_error trace_id={trace_id} base={base_url} model={model} status={status_code} "
+                f"dur_ms={int((time.monotonic() - t_all) * 1000.0)} error={err_text}"
             )
             return {
                 "ok": False,
@@ -297,35 +162,15 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str) -> 
             }
 
         response_str = parsed.get("response") if isinstance(parsed.get("response"), str) else ""
+        response_str = _sanitize_mojibake_text(response_str or "")
+
         prompt_eval_val = parsed.get("prompt_eval_count")
         eval_count_val = parsed.get("eval_count")
-        # Defensive: Ollama may return weird numeric types (NaN/inf/str). Never raise here.
-        prompt_eval = 0
-        if isinstance(prompt_eval_val, (int, float)):
-            try:
-                prompt_eval = int(prompt_eval_val)
-            except Exception as exc:  # pragma: no cover - defensive logging
-                log.warning(
-                    "[committee] ollama.bad_prompt_eval_count trace_id=%s value=%r; defaulting to 0",
-                    trace_id,
-                    prompt_eval_val,
-                    exc_info=True,
-                )
-                prompt_eval = 0
-        eval_count = 0
-        if isinstance(eval_count_val, (int, float)):
-            try:
-                eval_count = int(eval_count_val)
-            except Exception as exc:  # pragma: no cover - defensive logging
-                log.warning(
-                    "[committee] ollama.bad_eval_count trace_id=%s value=%r; defaulting to 0",
-                    trace_id,
-                    eval_count_val,
-                    exc_info=True,
-                )
-                eval_count = 0
+        prompt_eval = int(prompt_eval_val) if isinstance(prompt_eval_val, (int, float)) else 0
+        eval_count = int(eval_count_val) if isinstance(eval_count_val, (int, float)) else 0
 
         data: Dict[str, Any] = {"ok": True, "response": response_str, "prompt_eval_count": prompt_eval, "eval_count": eval_count}
+
         usage: Dict[str, int] | None = None
         if prompt_eval or eval_count:
             usage = {"prompt_tokens": int(prompt_eval), "completion_tokens": int(eval_count)}
@@ -333,21 +178,11 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str) -> 
             data["_usage"] = usage
 
         log.info(
-            "[committee] ollama.response base=%s model=%s trace_id=%s status=%s response=%s usage=%s",
-            base_url,
-            model,
-            trace_id,
-            status_code,
-            response_str,
-            usage,
+            f"[committee] ollama.response base={base_url} model={model} trace_id={trace_id} status={status_code} response={response_str} usage={usage}"
         )
         log.info(
-            "[committee] ollama.call.finish trace_id=%s ok=true dur_ms=%d status=%d response_chars=%d usage=%s",
-            trace_id,
-            int((time.monotonic() - t_all) * 1000.0),
-            status_code,
-            len(response_str or ""),
-            usage,
+            f"[committee] ollama.call.finish trace_id={trace_id} ok=true dur_ms={int((time.monotonic() - t_all) * 1000.0)} "
+            f"status={status_code} response_chars={len(response_str or '')} usage={usage}"
         )
 
         emit_trace(
@@ -356,6 +191,7 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str) -> 
             "committee.ollama.response",
             {"trace_id": trace_id, "status_code": status_code, "usage": usage or {}, "response": data},
         )
+
         return data
 
 
@@ -381,67 +217,30 @@ def build_ollama_payload(messages: List[Dict[str, Any]], model: str, num_ctx: in
                 rendered.append("\n".join(text_parts))
             else:
                 rendered.append(str(content_val or ""))
+
     prompt = "\n\n".join(rendered)
-    # Defensive: callers sometimes pass str-ish values; log should never raise.
-    _num_ctx_int = DEFAULT_NUM_CTX
-    try:
-        _num_ctx_int = int(num_ctx)
-    except Exception as exc:  # pragma: no cover - defensive logging
-        log.warning("[committee] bad num_ctx=%r; defaulting=%d", num_ctx, int(DEFAULT_NUM_CTX), exc_info=True)
-        _num_ctx_int = int(DEFAULT_NUM_CTX)
-    _temp_f = 0.3
-    try:
-        _temp_f = float(temperature)
-    except Exception as exc:  # pragma: no cover - defensive logging
-        log.warning("[committee] bad temperature=%r; defaulting=0.3", temperature, exc_info=True)
-        _temp_f = 0.3
-    if _temp_f < 0.0:
-        _temp_f = 0.0
-    if _temp_f > 2.0:
-        _temp_f = 2.0
-    log.info(
-        "[committee] ollama.payload.rendered model=%s num_ctx=%s temperature=%s messages=%d prompt_chars=%d dur_ms=%d",
-        str(model),
-        int(_num_ctx_int),
-        float(_temp_f),
-        len(messages or []),
-        len(prompt),
-        int((time.monotonic() - t0) * 1000.0),
-    )
-    # ICW / context orchestration: keep the rendered prompt within a rough
-    # character budget derived from DEFAULT_NUM_CTX so we don't saturate the
-    # backend's context window and get garbage like ".TabStop" instead of real
-    # output. No try/except here; DEFAULT_NUM_CTX is validated at import time.
-    max_chars = DEFAULT_NUM_CTX * 4  # ≈4 chars/token heuristic
+
+    max_chars = DEFAULT_NUM_CTX * 4
     if len(prompt) > max_chars:
-        # Prefer to retain the tail of the prompt (latest user + tool context)
-        # while trimming older system/history content from the front.
         trimmed = prompt[-max_chars:]
         log.info(
-            "[committee] prompt.truncated model=%s num_ctx=%s orig_chars=%d kept_chars=%d",
-            model,
-            DEFAULT_NUM_CTX,
-            len(prompt),
-            len(trimmed),
-        )
-        log.info(
-            "[committee] prompt.truncated.details model=%s default_num_ctx=%d orig_chars=%d kept_chars=%d max_chars=%d",
-            str(model),
-            int(DEFAULT_NUM_CTX),
-            len(prompt),
-            len(trimmed),
-            int(max_chars),
+            f"[committee] prompt.truncated model={model} num_ctx={int(DEFAULT_NUM_CTX)} orig_chars={len(prompt)} kept_chars={len(trimmed)}"
         )
         prompt = trimmed
+
+    log.info(
+        f"[committee] ollama.payload.rendered model={str(model)} num_ctx={int(num_ctx)} temperature={float(temperature)} "
+        f"messages={len(messages or [])} prompt_chars={len(prompt)} dur_ms={int((time.monotonic() - t0) * 1000.0)}"
+    )
+
     return {
         "model": model,
         "prompt": prompt,
         "stream": False,
-        # Ollama expects keep_alive at the top-level (not inside options).
         "keep_alive": "24h",
         "options": {
-            "num_ctx": int(_num_ctx_int),
-            "temperature": float(_temp_f),
+            "num_ctx": int(num_ctx),
+            "temperature": float(temperature),
         },
     }
 
@@ -458,54 +257,34 @@ async def committee_member_text(
     trace_id: str,
     temperature: float = 0.3,
 ) -> Dict[str, Any]:
-    """
-    Internal-only primitive: call exactly one committee participant.
-    """
     t0 = time.monotonic()
     cfg = _participant_for(member_id=member_id)
     if not cfg:
         log.error(
-            "[committee] member.finish trace_id=%s member=%s ok=false dur_ms=%d error=unknown_member",
-            trace_id,
-            str(member_id or ""),
-            int((time.monotonic() - t0) * 1000.0),
+            f"[committee] member.finish trace_id={trace_id} member={str(member_id or '')} ok=false dur_ms={int((time.monotonic() - t0) * 1000.0)} error=unknown_member"
         )
         return {"ok": False, "error": {"code": "unknown_member", "message": f"unknown committee member: {member_id}"}}
+
     base = (cfg.get("base") or "").rstrip("/") or QWEN_BASE_URL
     model = cfg.get("model") or QWEN_MODEL_ID
+
     log.info(
-        "[committee] member.start trace_id=%s member=%s base=%s model=%s messages=%d temperature=%s",
-        trace_id,
-        str(member_id or ""),
-        str(base),
-        str(model),
-        len(messages or []),
-        float(temperature),
+        f"[committee] member.start trace_id={trace_id} member={str(member_id or '')} base={str(base)} model={str(model)} "
+        f"messages={len(messages or [])} temperature={float(temperature)}"
     )
+
     payload = build_ollama_payload(messages=messages or [], model=model, num_ctx=DEFAULT_NUM_CTX, temperature=temperature)
     res = await call_ollama(base_url=base, payload=payload, trace_id=trace_id)
-    if isinstance(res, dict):
-        res["_base_url"] = base
-        res["_model"] = model
-        res["_member"] = str(member_id or "")
-        log.info(
-            "[committee] member.finish trace_id=%s member=%s ok=%s dur_ms=%d response_chars=%d has_error=%s",
-            trace_id,
-            str(member_id or ""),
-            bool(res.get("ok", True)),
-            int((time.monotonic() - t0) * 1000.0),
-            len(str(res.get("response") or "")),
-            bool(res.get("error")),
-        )
-        return res
-    log.error(
-        "[committee] member.finish trace_id=%s member=%s ok=false dur_ms=%d error=invalid_member_response resp=%r",
-        trace_id,
-        str(member_id or ""),
-        int((time.monotonic() - t0) * 1000.0),
-        res,
+
+    res["_base_url"] = base
+    res["_model"] = model
+    res["_member"] = str(member_id or "")
+
+    log.info(
+        f"[committee] member.finish trace_id={trace_id} member={str(member_id or '')} ok={bool(res.get('ok', True))} "
+        f"dur_ms={int((time.monotonic() - t0) * 1000.0)} response_chars={len(str(res.get('response') or ''))} has_error={bool(res.get('error'))}"
     )
-    return {"ok": False, "error": {"code": "invalid_member_response", "message": str(res)}}
+    return res
 
 
 async def committee_synth_text(
@@ -515,15 +294,8 @@ async def committee_synth_text(
     temperature: float = 0.0,
     synth_member: str = "qwen",
 ) -> Dict[str, Any]:
-    """
-    Internal-only primitive: deterministic synthesis call (single member).
-    """
     log.info(
-        "[committee] synth.start trace_id=%s synth_member=%s messages=%d temperature=%s",
-        trace_id,
-        str(synth_member or "qwen"),
-        len(messages or []),
-        float(temperature),
+        f"[committee] synth.start trace_id={trace_id} synth_member={str(synth_member or 'qwen')} messages={len(messages or [])} temperature={float(temperature)}"
     )
     return await committee_member_text(
         member_id=synth_member,
@@ -540,42 +312,15 @@ async def committee_ai_text(
     rounds: int | None = None,
     temperature: float = 0.3,
 ) -> Dict[str, Any]:
-    """
-    Core committee primitive:
-    - Draft answers per member
-    - Cross-critique per member
-    - Revision per member
-    - Deterministic synthesis (single member) into result.text
-
-    IMPORTANT:
-    - Only the committee layer may call Ollama.
-    - Callers MUST NOT implement cross-debate by calling this function multiple
-      times pretending it's "per member". Per-member calls are internal helpers.
-    """
-    # Use trace_id only (no derived/fallback trace keys, no normalization).
-    # Defensive: rounds can be str-ish from callers; never raise.
-    try:
-        _rounds_raw = rounds if rounds is not None else DEFAULT_COMMITTEE_ROUNDS
-        effective_rounds = int(_rounds_raw)
-    except Exception as exc:  # pragma: no cover - defensive logging
-        log.warning(
-            "[committee] bad rounds=%r; defaulting=%r",
-            rounds,
-            DEFAULT_COMMITTEE_ROUNDS,
-            exc_info=True,
-        )
-        effective_rounds = int(DEFAULT_COMMITTEE_ROUNDS)
+    effective_rounds = int(rounds if rounds is not None else DEFAULT_COMMITTEE_ROUNDS)
     effective_rounds = max(1, int(effective_rounds))
-    # Defensive: temperature may be str-ish; clamp and never raise in logs.
-    try:
-        _temp_run = float(temperature)
-    except Exception as exc:  # pragma: no cover - defensive logging
-        log.warning("[committee] bad temperature=%r; defaulting=0.3", temperature, exc_info=True)
-        _temp_run = 0.3
+
+    _temp_run = float(temperature)
     if _temp_run < 0.0:
         _temp_run = 0.0
     if _temp_run > 2.0:
         _temp_run = 2.0
+
     member_ids = [p.get("id") or "member" for p in COMMITTEE_PARTICIPANTS]
 
     answers: Dict[str, str] = {}
@@ -585,13 +330,9 @@ async def committee_ai_text(
 
     t0 = time.monotonic()
     log.info(
-        "[committee] run.start trace_id=%s rounds=%d temperature=%s participants=%s messages=%d",
-        trace_id,
-        int(effective_rounds),
-        float(_temp_run),
-        member_ids,
-        len(messages or []),
+        f"[committee] run.start trace_id={trace_id} rounds={int(effective_rounds)} temperature={float(_temp_run)} participants={member_ids} messages={len(messages or [])}"
     )
+
     emit_trace(
         STATE_DIR,
         trace_id,
@@ -606,10 +347,10 @@ async def committee_ai_text(
     )
 
     for r in range(effective_rounds):
-        # Phase 1: Draft answers
-        log.info("[committee] round.start trace_id=%s round=%d", trace_id, int(r + 1))
+        log.info(f"[committee] round.start trace_id={trace_id} round={int(r + 1)}")
+
         for mid in member_ids:
-            log.info("[committee] member_draft.start trace_id=%s round=%d member=%s", trace_id, int(r + 1), mid)
+            log.info(f"[committee] member_draft.start trace_id={trace_id} round={int(r + 1)} member={mid}")
             draft_lines = [
                 f"You are committee member {mid}. Provide your best answer to the user.",
                 "All content must be written in English only. Do NOT respond in any other language.",
@@ -633,25 +374,16 @@ async def committee_ai_text(
                 txt = str(res.get("response") or "").strip()
             answers[mid] = txt
             log.info(
-                "[committee] member_draft.finish trace_id=%s round=%d member=%s ok=%s answer_chars=%d has_error=%s",
-                trace_id,
-                int(r + 1),
-                mid,
-                bool(isinstance(res, dict) and res.get("ok", True)),
-                len(txt),
-                bool(isinstance(res, dict) and res.get("error")),
+                f"[committee] member_draft.finish trace_id={trace_id} round={int(r + 1)} member={mid} "
+                f"ok={bool(isinstance(res, dict) and res.get('ok', True))} answer_chars={len(txt)} has_error={bool(isinstance(res, dict) and res.get('error'))}"
             )
 
-        # Phase 2: Cross-critique
-        log.info(
-            "[committee] round.critique.start trace_id=%s round=%d answers_chars=%s",
-            trace_id,
-            int(r + 1),
-            {mid: len(answers.get(mid) or "") for mid in member_ids},
-        )
+        answers_chars = {mid: len(answers.get(mid) or "") for mid in member_ids}
+        log.info(f"[committee] round.critique.start trace_id={trace_id} round={int(r + 1)} answers_chars={answers_chars}")
+
         critiques = {}
         for mid in member_ids:
-            log.info("[committee] member_critique.start trace_id=%s round=%d member=%s", trace_id, int(r + 1), mid)
+            log.info(f"[committee] member_critique.start trace_id={trace_id} round={int(r + 1)} member={mid}")
             other_blocks: List[str] = []
             for oid in member_ids:
                 if oid == mid:
@@ -659,6 +391,7 @@ async def committee_ai_text(
                 otext = answers.get(oid) or ""
                 if isinstance(otext, str) and otext.strip():
                     other_blocks.append(f"Answer from {oid}:\n{otext.strip()}")
+
             critique_lines = [
                 f"You are committee member {mid}. This is cross-critique for debate round {r + 1}.",
                 "Critique the other answers. Identify concrete mistakes, missing considerations, and specific improvements.",
@@ -685,26 +418,18 @@ async def committee_ai_text(
             if isinstance(res, dict) and res.get("ok") is not False:
                 crit_txt = str(res.get("response") or "").strip()
             critiques[mid] = crit_txt
+            others_count = sum(1 for oid in member_ids if oid != mid and (answers.get(oid) or "").strip())
             log.info(
-                "[committee] member_critique.finish trace_id=%s round=%d member=%s ok=%s critique_chars=%d has_error=%s others_count=%d",
-                trace_id,
-                int(r + 1),
-                mid,
-                bool(isinstance(res, dict) and res.get("ok", True)),
-                len(crit_txt),
-                bool(isinstance(res, dict) and res.get("error")),
-                sum(1 for oid in member_ids if oid != mid and (answers.get(oid) or "").strip()),
+                f"[committee] member_critique.finish trace_id={trace_id} round={int(r + 1)} member={mid} "
+                f"ok={bool(isinstance(res, dict) and res.get('ok', True))} critique_chars={len(crit_txt)} "
+                f"has_error={bool(isinstance(res, dict) and res.get('error'))} others_count={int(others_count)}"
             )
 
-        # Phase 3: Revision
-        log.info(
-            "[committee] round.revision.start trace_id=%s round=%d critiques_chars=%s",
-            trace_id,
-            int(r + 1),
-            {mid: len(critiques.get(mid) or "") for mid in member_ids},
-        )
+        critiques_chars = {mid: len(critiques.get(mid) or "") for mid in member_ids}
+        log.info(f"[committee] round.revision.start trace_id={trace_id} round={int(r + 1)} critiques_chars={critiques_chars}")
+
         for mid in member_ids:
-            log.info("[committee] member_revision.start trace_id=%s round=%d member=%s", trace_id, int(r + 1), mid)
+            log.info(f"[committee] member_revision.start trace_id={trace_id} round={int(r + 1)} member={mid}")
             ctx_lines: List[str] = [
                 f"You are committee member {mid}. This is revision for debate round {r + 1}.",
                 "Revise your answer using the critiques. Output ONLY your full final answer.",
@@ -715,6 +440,7 @@ async def committee_ai_text(
                 otext = answers.get(oid) or ""
                 if isinstance(otext, str) and otext.strip():
                     ctx_lines.append(f"Answer from {oid}:\n{otext.strip()}")
+
             crit_blocks: List[str] = []
             for cid in member_ids:
                 ctext = critiques.get(cid) or ""
@@ -722,9 +448,11 @@ async def committee_ai_text(
                     crit_blocks.append(f"Critique from {cid}:\n{ctext.strip()}")
             if crit_blocks:
                 ctx_lines.append("\n\n".join(crit_blocks))
+
             prior = answers.get(mid) or ""
             if isinstance(prior, str) and prior.strip():
                 ctx_lines.append(f"Your current answer is:\n{prior.strip()}")
+
             ctx_lines.append("All content must be written in English only. Do NOT respond in any other language.")
             member_msgs = list(messages or []) + [{"role": "system", "content": "\n\n".join(ctx_lines)}]
             emit_trace(
@@ -745,25 +473,13 @@ async def committee_ai_text(
                 txt = str(res.get("response") or "").strip()
             answers[mid] = txt
             log.info(
-                "[committee] member_revision.finish trace_id=%s round=%d member=%s ok=%s answer_chars=%d has_error=%s",
-                trace_id,
-                int(r + 1),
-                mid,
-                bool(isinstance(res, dict) and res.get("ok", True)),
-                len(txt),
-                bool(isinstance(res, dict) and res.get("error")),
+                f"[committee] member_revision.finish trace_id={trace_id} round={int(r + 1)} member={mid} "
+                f"ok={bool(isinstance(res, dict) and res.get('ok', True))} answer_chars={len(txt)} has_error={bool(isinstance(res, dict) and res.get('error'))}"
             )
 
     member_summaries: List[Dict[str, Any]] = [{"member": mid, "answer": (answers.get(mid) or "")} for mid in member_ids]
     critique_summaries: List[Dict[str, Any]] = [{"member": mid, "critique": (critiques.get(mid) or "")} for mid in member_ids]
 
-    # Deterministic synthesis (single member)
-    log.info(
-        "[committee] synth.build trace_id=%s answers_chars=%s critiques_present=%s",
-        trace_id,
-        {mid: len(answers.get(mid) or "") for mid in member_ids},
-        bool(any((critiques.get(mid) or "").strip() for mid in member_ids)),
-    )
     synth_parts: List[str] = []
     synth_parts.append("You are the committee synthesizer. Produce one final answer.")
     synth_parts.append("Rules: resolve conflicts by correctness; do not mention the committee or multiple models; output English only.")
@@ -787,6 +503,7 @@ async def committee_ai_text(
         "committee.synth.request",
         {"trace_id": trace_id, "synth_member": "qwen"},
     )
+
     t_synth = time.monotonic()
     synth_env = await committee_synth_text(
         messages=synth_messages,
@@ -797,16 +514,12 @@ async def committee_ai_text(
     synth_text = ""
     if isinstance(synth_env, dict) and synth_env.get("ok") is not False:
         synth_text = str(synth_env.get("response") or "").strip()
+
     log.info(
-        "[committee] synth.finish trace_id=%s ok=%s dur_ms=%d synth_chars=%d has_error=%s",
-        trace_id,
-        bool(isinstance(synth_env, dict) and synth_env.get("ok", True)),
-        int((time.monotonic() - t_synth) * 1000.0),
-        len(synth_text),
-        bool(isinstance(synth_env, dict) and synth_env.get("error")),
+        f"[committee] synth.finish trace_id={trace_id} ok={bool(isinstance(synth_env, dict) and synth_env.get('ok', True))} "
+        f"dur_ms={int((time.monotonic() - t_synth) * 1000.0)} synth_chars={len(synth_text)} has_error={bool(isinstance(synth_env, dict) and synth_env.get('error'))}"
     )
 
-    # Fallback if synth is empty: choose best member answer deterministically.
     final_text = synth_text
     if not final_text:
         best_mid = None
@@ -822,10 +535,7 @@ async def committee_ai_text(
         if best_mid:
             final_text = (answers.get(best_mid) or "").strip()
             log.warning(
-                "[committee] synth.fallback trace_id=%s chosen_member=%s chosen_chars=%d",
-                trace_id,
-                str(best_mid),
-                len(final_text),
+                f"[committee] synth.fallback trace_id={trace_id} chosen_member={str(best_mid)} chosen_chars={len(final_text)}"
             )
 
     ok = bool(isinstance(final_text, str) and final_text.strip())
@@ -833,9 +543,12 @@ async def committee_ai_text(
     backend_errors: List[Dict[str, Any]] = []
     for mid, mres in member_results.items():
         if isinstance(mres, dict) and mres.get("ok") is False and isinstance(mres.get("error"), dict):
-            backend_errors.append({"member": mid, "error": mres.get("error")})
+            backend_errors.append({"member": mid, "phase": "revision", "error": mres.get("error")})
+    for mid, cres in critique_results.items():
+        if isinstance(cres, dict) and cres.get("ok") is False and isinstance(cres.get("error"), dict):
+            backend_errors.append({"member": mid, "phase": "critique", "error": cres.get("error")})
     if isinstance(synth_env, dict) and synth_env.get("ok") is False and isinstance(synth_env.get("error"), dict):
-        backend_errors.append({"member": "synth", "error": synth_env.get("error")})
+        backend_errors.append({"member": "synth", "phase": "synth", "error": synth_env.get("error")})
 
     emit_trace(
         STATE_DIR,
@@ -843,13 +556,10 @@ async def committee_ai_text(
         "committee.finish",
         {"trace_id": trace_id, "ok": ok, "final_text": final_text, "members": member_summaries, "critiques": critique_summaries},
     )
+
     log.info(
-        "[committee] run.finish trace_id=%s ok=%s dur_ms=%d final_chars=%d backend_errors=%s",
-        trace_id,
-        ok,
-        int((time.monotonic() - t0) * 1000.0),
-        len(final_text or ""),
-        backend_errors,
+        f"[committee] run.finish trace_id={trace_id} ok={ok} dur_ms={int((time.monotonic() - t0) * 1000.0)} "
+        f"final_chars={len(final_text or '')} backend_errors={backend_errors}"
     )
 
     if not ok:
@@ -861,17 +571,13 @@ async def committee_ai_text(
             }
             for mid, mres in member_results.items()
         }
-        log.error(
-            "[committee] no_answer trace_id=%s backend_errors=%s members=%s",
-            trace_id,
-            backend_errors,
-            members_status,
-        )
+        log.error(f"[committee] no_answer trace_id={trace_id} backend_errors={backend_errors} members={members_status}")
 
     result_payload: Dict[str, Any] = {
         "text": final_text,
         "members": member_summaries,
         "critiques": critique_summaries,
+        "backend_errors": backend_errors,
         "qwen": member_results.get("qwen") or {},
         "glm": member_results.get("glm") or {},
         "deepseek": member_results.get("deepseek") or {},
@@ -895,26 +601,13 @@ async def committee_ai_text(
 
 
 def _schema_to_template(expected: Any) -> Any:
-    """
-    Build a literal JSON skeleton from an expected_schema that may contain
-    Python type objects (str, int, float, dict, list) as leaves.
-
-    This is ONLY for prompting the JSONFixer model; the original expected_schema
-    (with type objects) is still used for JSONParser coercion/validation.
-    """
-    # Structured containers: recurse into dicts/lists
     if isinstance(expected, dict):
         return {k: _schema_to_template(v) for k, v in expected.items()}
     if isinstance(expected, list):
-        # For list schemas, use the first element as the prototype when present.
         if not expected:
             return []
         return [_schema_to_template(expected[0])]
-    # Type objects: map Python types to concrete JSON-compatible sample values.
-    # This is the core path that prevents 'type' objects from leaking into
-    # json.dumps calls when we render schema skeletons into prompts.
     if isinstance(expected, type):
-        # Booleans first (bool is a subclass of int)
         if issubclass(expected, bool):
             return False
         if issubclass(expected, int):
@@ -927,18 +620,11 @@ def _schema_to_template(expected: Any) -> Any:
             return []
         if issubclass(expected, dict):
             return {}
-        # Unknown type object: fall back to null in JSON
         return None
-    # Primitive instances or anything else that is already JSON-serializable
-    # are returned as-is; non-serializable objects will be caught by json.dumps
-    # at call sites if they appear here.
     return expected
 
 
 def _default_for(expected: Any) -> Any:
-    """
-    Return a JSON-serializable default value for a given expected schema type.
-    """
     if expected is int:
         return 0
     if expected is float:
@@ -951,11 +637,6 @@ def _default_for(expected: Any) -> Any:
 
 
 def _is_default_scalar(val: Any, typ: Any) -> bool:
-    """
-    Treat "empty" scalar values (0, 0.0, "", None or blank strings) as defaults
-    that should not overwrite richer values from other candidates. Only when no
-    candidate provides a non-default value do we fall back to these.
-    """
     if typ is int:
         return not isinstance(val, int) or int(val) == 0
     if typ is float:
@@ -973,28 +654,10 @@ async def committee_jsonify(
     rounds: int | None = None,
     temperature: float = 0.0,
 ) -> Dict[str, Any]:
-    """
-    Use the committee to coerce a messy text blob into strict JSON matching expected_schema.
-
-    Fully traced so we can debug planner behavior:
-      - committee.jsonify.start
-      - committee.jsonify.committee_result
-      - committee.jsonify.candidates
-      - committee.jsonify.merge
-    """
-    # Use trace_id only (no derived/fallback trace keys, no normalization).
     t0 = time.monotonic()
-    log.info(
-        "[committee.jsonify] start trace_id=%s rounds=%d temperature=%s raw_chars=%d schema_type=%s",
-        trace_id,
-        int(rounds if rounds is not None else DEFAULT_COMMITTEE_ROUNDS),
-        float(temperature),
-        len(raw_text or ""),
-        str(type(expected_schema).__name__),
-    )
     schema_template = _schema_to_template(expected=expected_schema)
     schema_desc = json.dumps(schema_template, ensure_ascii=False)
-    raw_preview = (raw_text or "")[:600] if isinstance(raw_text, str) else ""
+
     emit_trace(
         STATE_DIR,
         trace_id,
@@ -1003,15 +666,11 @@ async def committee_jsonify(
             "trace_id": trace_id,
             "schema_preview": schema_desc[:600],
             "schema_len": len(schema_desc),
-            "raw_preview": raw_preview,
+            "raw_preview": (raw_text or "")[:600],
             "raw_len": len(raw_text or ""),
         },
     )
-    # Log full raw_text and schema for debugging (no truncation).
-    log.info("[committee.jsonify] start trace_id=%s schema=%s raw_text=%s", trace_id, schema_desc, raw_text)
-    # Hard JSON contract: show the exact skeleton and forbid any deviation.
-    # JSONFixer may receive arbitrary messy output (prose, partial JSON, mixed code).
-    # It must always ignore refusals/prose and return a single valid JSON object.
+
     sys_msg = (
         "You are JSONFixer. You receive messy AI output and MUST respond with exactly ONE JSON object.\n"
         "Respond ONLY in English. NO other languages are allowed.\n"
@@ -1032,10 +691,12 @@ async def committee_jsonify(
         "- If the input is pure prose or contains multiple candidates, extract or reconstruct the best JSON candidate that fits the schema.\n\n"
         "Fill in this JSON object according to the provided text. Respond ONLY with the JSON object."
     )
+
     messages: List[Dict[str, Any]] = [
         {"role": "system", "content": sys_msg},
         {"role": "user", "content": raw_text or ""},
     ]
+
     env = await committee_ai_text(
         messages=messages,
         trace_id=trace_id,
@@ -1043,32 +704,7 @@ async def committee_jsonify(
         temperature=temperature,
     )
     result_block = env.get("result") if isinstance(env, dict) else {}
-    ok_env = bool(env.get("ok")) if isinstance(env, dict) else False
-    txt_main_preview = ""
-    if isinstance(result_block, dict):
-        _txt = result_block.get("text")
-        if isinstance(_txt, str):
-            txt_main_preview = _txt[:600]
-    emit_trace(
-        STATE_DIR,
-        trace_id,
-        "committee.jsonify.committee_result",
-        {
-            "trace_id": trace_id,
-            "ok": ok_env,
-            "main_text_preview": txt_main_preview,
-        },
-    )
-    # Log full committee result text and envelope (no truncation).
-    log.info(
-        "[committee.jsonify] committee_result trace_id=%s ok=%s text=%s env=%s",
-        trace_id,
-        ok_env,
-        result_block.get("text") if isinstance(result_block, dict) else None,
-        result_block,
-    )
 
-    # Collect up to four candidate JSON texts: the merged text plus per-backend responses.
     candidates: List[str] = []
     if isinstance(result_block, dict):
         txt_main = result_block.get("text")
@@ -1080,7 +716,6 @@ async def committee_jsonify(
                 resp = inner.get("response")
                 if isinstance(resp, str) and resp.strip():
                     candidates.append(resp)
-    # Always include the original raw_text as a last-resort candidate.
     if isinstance(raw_text, str) and raw_text.strip():
         candidates.append(raw_text)
 
@@ -1094,18 +729,8 @@ async def committee_jsonify(
             "first_preview": (candidates[0][:400] if candidates else ""),
         },
     )
-    # Log all candidate texts for JSON parsing.
-    log.info(
-        "[committee.jsonify] candidates trace_id=%s count=%d candidates=%s",
-        trace_id,
-        len(candidates),
-        candidates,
-    )
 
     parsed_candidates: List[Dict[str, Any]] = []
-
-    # Detect Song Graph wrapper schemas so we can handle parse failures with a
-    # canonical empty song object and downweight empty candidates.
     song_schema: Dict[str, Any] | None = None
     if isinstance(expected_schema, dict):
         maybe_song = expected_schema.get("song")
@@ -1113,109 +738,12 @@ async def committee_jsonify(
             song_schema = maybe_song
 
     for idx, txt in enumerate(candidates):
-        log.info(
-            "[committee.jsonify] parse_candidate.start trace_id=%s index=%d text_chars=%d",
-            trace_id,
-            int(idx),
-            len(txt or ""),
-        )
-        log.info(
-            "[committee.jsonify] parse_candidate trace_id=%s index=%d text=%s",
-            trace_id,
-            idx,
-            txt,
-        )
         clean_txt = _sanitize_mojibake_text(txt or "")
-        # Use a fresh parser per candidate so errors/repairs are per-candidate.
         parser = JSONParser()
-        t_parse = time.monotonic()
-        try:
-            obj = parser.parse(clean_txt or "{}", expected_schema)
-        except Exception as ex:  # pragma: no cover - defensive logging
-            log.info(
-                "[committee.jsonify] JSONParser exception trace_id=%s index=%d error=%s",
-                trace_id,
-                idx,
-                str(ex),
-            )
-            # For Song Graph wrappers, treat parse failures as an explicit
-            # empty song shell instead of dropping the candidate entirely.
-            if song_schema is not None:
-                try:
-                    obj = parser.parse("{}", expected_schema)
-                except Exception as ex2:
-                    log.warning(
-                        "[committee.jsonify] JSONParser exception on fallback trace_id=%s index=%d error=%s",
-                        trace_id,
-                        idx,
-                        str(ex2),
-                        exc_info=True,
-                    )
-                    log.error(
-                        "[committee.jsonify] parse_candidate.finish trace_id=%s index=%d ok=false dur_ms=%d",
-                        trace_id,
-                        int(idx),
-                        int((time.monotonic() - t_parse) * 1000.0),
-                        exc_info=True,
-                    )
-                    continue
-            else:
-                log.error(
-                    "[committee.jsonify] parse_candidate.finish trace_id=%s index=%d ok=false dur_ms=%d",
-                    trace_id,
-                    int(idx),
-                    int((time.monotonic() - t_parse) * 1000.0),
-                    exc_info=True,
-                )
-                continue
-
-        # Surface JSONParser-internal errors (which never raise) so pack/compression
-        # failures are visible in logs instead of being silently repaired.
-        errors = list(parser.errors or [])
-        last_error = parser.last_error
-        if errors:
-            log.warning(
-                "[committee.jsonify] JSONParser reported errors trace_id=%s index=%d last_error=%s errors=%s",
-                trace_id,
-                idx,
-                last_error,
-                errors[:5],
-            )
-        log.info(
-            "[committee.jsonify] parsed_candidate trace_id=%s index=%d obj=%s",
-            trace_id,
-            idx,
-            obj,
-        )
+        obj = parser.parse(clean_txt or "{}", expected_schema)
         if isinstance(obj, dict):
             parsed_candidates.append(obj)
-            log.info(
-                "[committee.jsonify] parse_candidate.finish trace_id=%s index=%d ok=true dur_ms=%d keys=%s",
-                trace_id,
-                int(idx),
-                int((time.monotonic() - t_parse) * 1000.0),
-                sorted(list(obj.keys())),
-            )
-        else:
-            log.warning(
-                "[committee.jsonify] parse_candidate.finish trace_id=%s index=%d ok=false dur_ms=%d non_dict_type=%s",
-                trace_id,
-                int(idx),
-                int((time.monotonic() - t_parse) * 1000.0),
-                str(type(obj).__name__),
-            )
 
-    # Merge candidates field-wise, preferring the first non-empty value across candidates.
-    #
-    # CRITICAL: do not drop "extra" keys the model returned. Callers (especially
-    # tool pipelines) may rely on additional fields outside expected_schema.
-    # We therefore build merged as a *superset union* of parsed candidates and
-    # then apply schema-key selection logic on top.
-    merged: Any = {}
-
-    # For Song Graph wrappers, drop obviously-empty/default song candidates from
-    # consideration when at least one non-empty candidate exists, and reorder
-    # parsed_candidates so the richest candidate is considered first.
     if song_schema is not None and parsed_candidates:
         rich: List[tuple[int, int, int]] = []
         for idx, cand in enumerate(parsed_candidates):
@@ -1230,32 +758,25 @@ async def committee_jsonify(
             richness = len(voices) + len(instruments) + len(motifs)
             rich.append((idx, num_sections, richness))
         if rich:
-            # Sort by: most sections, then most (voices+instruments+motifs), then lowest index.
             rich_sorted = sorted(rich, key=lambda t: (-t[1], -t[2], t[0]))
             best_idx = rich_sorted[0][0]
-            log.info(
-                "[committee.jsonify] song_richness trace_id=%s chosen_index=%d top=%s",
-                trace_id,
-                int(best_idx),
-                [{"idx": i, "sections": s, "richness": r} for (i, s, r) in rich_sorted[:10]],
-            )
             reordered: List[Dict[str, Any]] = []
-            best_cand = parsed_candidates[best_idx]
-            reordered.append(best_cand)
+            reordered.append(parsed_candidates[best_idx])
             for i, cand in enumerate(parsed_candidates):
                 if i == best_idx:
                     continue
                 song_obj = cand.get("song")
-                # Skip pure-default/empty song shells when we have at least one rich candidate.
                 if isinstance(song_obj, dict) and not _is_empty_song_candidate(song_obj):
                     reordered.append(cand)
             parsed_candidates = reordered
 
+    merged: Any = {}
+
     if isinstance(expected_schema, dict):
-        # 1) Preserve all non-schema keys across candidates (top-level superset union).
         schema_keys = set(expected_schema.keys())
         base = parsed_candidates[0] if parsed_candidates else {}
         merged = dict(base) if isinstance(base, dict) else {}
+
         for cand in parsed_candidates:
             if not isinstance(cand, dict):
                 continue
@@ -1265,7 +786,6 @@ async def committee_jsonify(
                 if k not in merged:
                     merged[k] = v
 
-        # 2) For schema keys, run the existing "best value wins" logic.
         for key, expected_type in expected_schema.items():
             value_set = False
             for cand in parsed_candidates:
@@ -1278,9 +798,6 @@ async def committee_jsonify(
                         value_set = True
                         break
                 elif isinstance(expected_type, dict):
-                    # Special-case Song Graph wrapper: prefer structurally
-                    # non-empty song candidates (with bpm/sections/lyrics)
-                    # over default/empty shells.
                     if key == "song" and song_schema is not None:
                         if isinstance(v, dict) and not _is_empty_song_candidate(v):
                             merged[key] = v
@@ -1292,48 +809,20 @@ async def committee_jsonify(
                             value_set = True
                             break
                 else:
-                    # Scalars: only accept non-default values; 0/0.0/""/None are
-                    # treated as weaker than any non-default from another
-                    # candidate and used only as a final fallback.
                     if isinstance(v, expected_type) and not _is_default_scalar(v, expected_type):
                         merged[key] = v
                         value_set = True
                         break
             if not value_set:
                 merged[key] = _default_for(expected_type)
-            log.info(
-                "[committee.jsonify] merge.key trace_id=%s key=%s set=%s expected=%s chosen_type=%s",
-                trace_id,
-                str(key),
-                bool(value_set),
-                str(expected_type),
-                str(type(merged.get(key)).__name__) if isinstance(merged, dict) else None,
-            )
     else:
-        # Non-dict schema: just return the first successful parse or a default.
         if parsed_candidates:
             merged = parsed_candidates[0]
         else:
-            # No successful candidates: still return a value shaped to the expected schema.
-            # (The previous nested isinstance(expected_schema, dict) check was unreachable here.)
             if isinstance(expected_schema, list):
-                seed: Any = []
+                merged = []
             else:
-                seed = _default_for(expected_schema)
-            try:
-                merged = JSONParser().parse(seed, expected_schema)
-            except Exception as exc:
-                # Defensive: JSONParser should not raise here, but if it does, log so we don't silently
-                # degrade the output shape (this can otherwise look like "the request died").
-                log.warning(
-                    "[committee.jsonify] merge.seed_parse_failed trace_id=%s schema_type=%s seed_type=%s error=%s",
-                    trace_id,
-                    str(type(expected_schema).__name__),
-                    str(type(seed).__name__),
-                    str(exc),
-                    exc_info=True,
-                )
-                merged = seed
+                merged = _default_for(expected_schema)
 
     emit_trace(
         STATE_DIR,
@@ -1346,40 +835,12 @@ async def committee_jsonify(
             "merged_keys": sorted(list(merged.keys())) if isinstance(merged, dict) else [],
         },
     )
+
     log.info(
-        "[committee.jsonify] merge trace_id=%s candidates=%d parsed=%d keys=%s",
-        trace_id,
-        len(candidates),
-        len(parsed_candidates),
-        ",".join(sorted(list(merged.keys()))) if isinstance(merged, dict) else "",
+        f"[committee.jsonify] finish trace_id={trace_id} dur_ms={int((time.monotonic() - t0) * 1000.0)} "
+        f"candidates={int(len(candidates))} parsed_candidates={int(len(parsed_candidates))} merged_is_dict={bool(isinstance(merged, dict))} "
+        f"merged_keys={(sorted(list(merged.keys())) if isinstance(merged, dict) else [])}"
     )
-    log.info(
-        "[committee.jsonify] finish trace_id=%s dur_ms=%d candidates=%d parsed_candidates=%d merged_is_dict=%s merged_keys=%s",
-        trace_id,
-        int((time.monotonic() - t0) * 1000.0),
-        int(len(candidates)),
-        int(len(parsed_candidates)),
-        bool(isinstance(merged, dict)),
-        (sorted(list(merged.keys())) if isinstance(merged, dict) else []),
-    )
+
     return merged
-
-
-class CommitteeClient:
-    """
-    Thin, async-only façade that exposes the committee path as a method.
-    """
-
-    async def run(
-        self,
-        messages: List[Dict[str, Any]],
-        trace_id: str,
-        rounds: int | None = None,
-        temperature: float = 0.3,
-    ) -> Dict[str, Any]:
-        return await committee_ai_text(
-            messages=messages,
-            trace_id=trace_id,
-            rounds=rounds,
-            temperature=temperature,
-        )
+    

@@ -68,11 +68,17 @@ async def init_pool() -> asyncpg.pool.Pool:
             CREATE TABLE IF NOT EXISTS conversations (
               id BIGSERIAL PRIMARY KEY,
               title TEXT,
+              orch_cid TEXT,
               created_at TIMESTAMPTZ DEFAULT NOW(),
               updated_at TIMESTAMPTZ DEFAULT NOW()
             );
             """
         )
+        # Forward-compatible: if the table already existed, add orch_cid without needing a migration.
+        try:
+            await conn.execute("ALTER TABLE conversations ADD COLUMN IF NOT EXISTS orch_cid TEXT;")
+        except Exception:
+            pass
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS messages (
@@ -261,16 +267,27 @@ async def global_cors_middleware(request: Request, call_next):
 async def create_conversation(body: Dict[str, Any]):
     title = (body or {}).get("title") or "New Conversation"
     async with _pool().acquire() as conn:
-        row = await conn.fetchrow("INSERT INTO conversations (title) VALUES ($1) RETURNING id", title)
-    return {"id": row[0], "title": title}
+        row = await conn.fetchrow("INSERT INTO conversations (title, orch_cid) VALUES ($1, $2) RETURNING id, orch_cid", title, None)
+    return {"id": row[0], "title": title, "orch_cid": row[1]}
 
 
 @app.get("/api/conversations")
 async def list_conversations():
     async with _pool().acquire() as conn:
-        rows = await conn.fetch("SELECT id, title, created_at, updated_at FROM conversations ORDER BY updated_at DESC LIMIT 100")
-        data = [{"id": r["id"], "title": r["title"], "created_at": str(r["created_at"]), "updated_at": str(r["updated_at"]) } for r in rows]
+        rows = await conn.fetch("SELECT id, title, orch_cid, created_at, updated_at FROM conversations ORDER BY updated_at DESC LIMIT 100")
+        data = [{"id": r["id"], "title": r["title"], "orch_cid": r["orch_cid"], "created_at": str(r["created_at"]), "updated_at": str(r["updated_at"]) } for r in rows]
     return {"data": data}
+
+
+@app.post("/api/conversations/{cid}/orch_cid")
+async def set_orch_cid(cid: int, body: Dict[str, Any]):
+    orch_cid = (body or {}).get("orch_cid")
+    orch_cid = str(orch_cid).strip() if orch_cid is not None else ""
+    if not orch_cid:
+        return JSONResponse(status_code=400, content={"error": "missing orch_cid"})
+    async with _pool().acquire() as conn:
+        await conn.execute("UPDATE conversations SET orch_cid=$1, updated_at=NOW() WHERE id=$2", orch_cid, cid)
+    return {"ok": True, "orch_cid": orch_cid}
 
 
 @app.get("/api/conversations/{cid}/messages")
@@ -510,7 +527,7 @@ async def minimal_ui(request: Request):
         setOut('');
         const xhr = new XMLHttpRequest();
         xhr.open('POST', url, true);
-        xhr.timeout = 0; // no client-side timeout
+        xhr.timeout = null; // no client-side timeout
         xhr.withCredentials = false;
         xhr.setRequestHeader('Content-Type', 'application/json');
         xhr.setRequestHeader('Accept', '*/*');
@@ -526,7 +543,6 @@ async def minimal_ui(request: Request):
           }}
         }};
         xhr.onabort = () => {{ setStatus('Aborted'); setOut('Request aborted by browser'); }};
-        xhr.ontimeout = () => {{ setStatus('Timed out'); setOut('Client-side timeout'); }};
         xhr.onerror = () => {{ setStatus('Network error'); setOut('Network error'); }};
         try {{ xhr.send(body); }} catch (e) {{
           setStatus('Send failed');

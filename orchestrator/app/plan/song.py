@@ -1,3 +1,8 @@
+'''
+song.py: LLM-driven Song Graph planner.
+'''
+
+
 from __future__ import annotations
 
 import os

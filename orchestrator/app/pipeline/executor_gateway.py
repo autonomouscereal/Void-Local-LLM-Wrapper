@@ -28,6 +28,7 @@ async def execute(
     for call in (tool_calls or []):
         call_dict = call if isinstance(call, dict) else {}
         name_val = call_dict.get("name") if isinstance(call_dict.get("name"), str) else ""
+        step_id_val = call_dict.get("step_id") if isinstance(call_dict.get("step_id"), str) else None
         raw_args = call_dict.get("arguments", call_dict.get("args"))
         # IMPORTANT: never silently drop tool arguments. The executor expects an
         # object for step.args, so when arguments isn't a dict we preserve it
@@ -42,7 +43,11 @@ async def execute(
             args_val = {}
         else:
             args_val = {"_raw": raw_args}
-        steps.append({"tool": str(name_val or ""), "args": args_val})
+        step_payload: Dict[str, Any] = {"tool": str(name_val or ""), "args": args_val}
+        # Preserve planner-provided step_id so executor-produced keys match the plan.
+        if isinstance(step_id_val, str) and step_id_val.strip():
+            step_payload["step_id"] = step_id_val.strip()
+        steps.append(step_payload)
 
     # request_id (rid) and trace_id are distinct identifiers; never reuse one as the other.
     rid = str(request_id or _uuid.uuid4().hex)
@@ -177,15 +182,20 @@ async def execute(
         #
         # Instead, build a step-id -> input-step map using the implicit "s{i}"
         # convention used by the executor for list-ordered steps.
-        input_step_by_sid: Dict[str, Dict[str, Any]] = {}
+        input_step_by_step_id: Dict[str, Dict[str, Any]] = {}
         for i, st in enumerate(steps):
-            if isinstance(st, dict):
-                input_step_by_sid[f"s{i + 1}"] = st
-        for sid, step in produced.items():
+            if not isinstance(st, dict):
+                continue
+            # When a step_id is supplied, the executor can use it as the produced key.
+            key = st.get("step_id") if isinstance(st.get("step_id"), str) else None
+            if not key:
+                key = f"s{i + 1}"
+            input_step_by_step_id[str(key)] = st
+        for step_id, step in produced.items():
             if not isinstance(step, dict):
                 continue
-            sid_str = str(sid)
-            input_step = input_step_by_sid.get(sid_str, {})
+            step_id_str = str(step_id)
+            input_step = input_step_by_step_id.get(step_id_str, {})
             args_out = input_step.get("args") if isinstance(input_step.get("args"), dict) else {}
             input_tool = input_step.get("tool") if isinstance(input_step.get("tool"), str) else None
             tool_name = step.get("name") if isinstance(step.get("name"), str) else (input_tool or "tool")
@@ -197,7 +207,7 @@ async def execute(
             out["name"] = tool_name
             out["result"] = res
             out["args"] = args_out
-            out["step_id"] = sid_str
+            out["step_id"] = step_id_str
             results.append(out)
         return results
     err = (env or {}).get("error") or (env.get("result") or {}).get("error") or {}

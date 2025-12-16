@@ -41,7 +41,7 @@ def render_chunk(chunk: str) -> str:
 def make_entity_header(state) -> str:
     # Build compact header with entities/goals/constraints (deterministic order)
     if not isinstance(state, dict):
-        log.warning("icw.assembler make_entity_header state not dict type=%s", type(state).__name__)
+        log.warning(f"icw.assembler make_entity_header state not dict type={type(state).__name__}")
         state = {}
     ents = state.get("entities", [])
     if not isinstance(ents, list):
@@ -55,7 +55,7 @@ def make_entity_header(state) -> str:
             safe_ents.append(str(e))
         except Exception as exc:
             # Defensive: avoid silently dropping weird entity objects.
-            log.warning("icw.assembler entity str() failed type=%s: %s", type(e).__name__, exc, exc_info=True)
+            log.warning(f"icw.assembler entity str() failed type={type(e).__name__}: {exc}", exc_info=True)
             safe_ents.append(repr(e))
     return f"[Goal] {goal}\n[Entities] " + ", ".join(sorted([e for e in safe_ents if e]))[:400]
 
@@ -69,7 +69,7 @@ def compress_until_fit(parts: list[str], budget_bytes: int) -> list[str]:
     try:
         b = int(budget_bytes)
     except Exception as exc:  # pragma: no cover
-        log.warning("icw.assembler compress_until_fit bad budget_bytes=%r: %s", budget_bytes, exc, exc_info=True)
+        log.warning(f"icw.assembler compress_until_fit bad budget_bytes={budget_bytes!r}: {exc}", exc_info=True)
         b = 0
     if b <= 0:
         b = 4096
@@ -86,7 +86,7 @@ def compress_until_fit(parts: list[str], budget_bytes: int) -> list[str]:
             safe_parts.append(str(p))
             coerced += 1
     if coerced:
-        log.warning("icw.assembler compress_until_fit coerced_non_str_parts=%s", coerced)
+        log.warning(f"icw.assembler compress_until_fit coerced_non_str_parts={coerced}")
     parts = [cleanup_lossless(p) for p in safe_parts]
     # Pass 1: number/table compaction
     parts = [compact_numbers_tables(p) for p in parts]
@@ -106,12 +106,7 @@ def compress_until_fit(parts: list[str], budget_bytes: int) -> list[str]:
     dt_ms = int((time.perf_counter() - t0) * 1000)
     if before > b:
         log.info(
-            "icw.assembler compress_until_fit budget_bytes=%s before=%s after=%s iters=%s ms=%s",
-            b,
-            before,
-            after,
-            iters,
-            dt_ms,
+            f"icw.assembler compress_until_fit budget_bytes={b} before={before} after={after} iters={iters} ms={dt_ms}"
         )
     return parts
 
@@ -123,14 +118,14 @@ def _normalize_candidate(c: Any) -> str:
         try:
             return json.dumps(c, ensure_ascii=False)
         except Exception as exc:
-            log.error("icw.assembler candidate json.dumps failed: %s", exc, exc_info=True)
+            log.error(f"icw.assembler candidate json.dumps failed: {exc}", exc_info=True)
             return repr(c)
     if c is None:
         return ""
     try:
         return str(c)
     except Exception as exc:  # pragma: no cover
-        log.error("icw.assembler candidate str() failed type=%s: %s", type(c), exc, exc_info=True)
+        log.error(f"icw.assembler candidate str() failed type={type(c)}: {exc}", exc_info=True)
         return repr(c)
 
 
@@ -138,22 +133,22 @@ def assemble_window(request_msg: dict, state: dict, in_limit_bytes: int, step_ou
     """Return a prompt string that fits the byte budget."""
     t0 = time.perf_counter()
     if not isinstance(request_msg, dict):
-        log.error("icw.assembler assemble_window request_msg not dict type=%s", type(request_msg).__name__)
+        log.error(f"icw.assembler assemble_window request_msg not dict type={type(request_msg).__name__}")
         request_msg = {}
     if not isinstance(state, dict):
-        log.error("icw.assembler assemble_window state not dict type=%s", type(state).__name__)
+        log.error(f"icw.assembler assemble_window state not dict type={type(state).__name__}")
         state = {}
     try:
         budget_bytes = int(in_limit_bytes)
     except Exception as exc:
-        log.warning("icw.assembler assemble_window bad in_limit_bytes=%r: %s", in_limit_bytes, exc, exc_info=True)
+        log.warning(f"icw.assembler assemble_window bad in_limit_bytes={in_limit_bytes!r}: {exc}", exc_info=True)
         budget_bytes = 0
     if budget_bytes <= 0:
         budget_bytes = 4096
     try:
         out_tokens = int(step_out_tokens)
     except Exception as exc:
-        log.warning("icw.assembler assemble_window bad step_out_tokens=%r: %s", step_out_tokens, exc, exc_info=True)
+        log.warning(f"icw.assembler assemble_window bad step_out_tokens={step_out_tokens!r}: {exc}", exc_info=True)
         out_tokens = 0
     goal = str(request_msg.get("content", "") or "")
     anchor = str(state.get("anchor_text", "") or "")  # recent exact turns (verbatim)
@@ -161,7 +156,7 @@ def assemble_window(request_msg: dict, state: dict, in_limit_bytes: int, step_ou
     # Candidates = history chunks + RAG chunks + artifacts summaries (strings)
     raw_candidates = state.get("candidates", []) or []
     if not isinstance(raw_candidates, list):
-        log.warning("icw.assembler candidates not list type=%s", type(raw_candidates).__name__)
+        log.warning(f"icw.assembler candidates not list type={type(raw_candidates).__name__}")
         raw_candidates = [raw_candidates]
     candidates = [_normalize_candidate(c) for c in raw_candidates if c is not None]
     # Optional: append filtered RAG evidence footer at the tail (newest-first)
@@ -169,19 +164,19 @@ def assemble_window(request_msg: dict, state: dict, in_limit_bytes: int, step_ou
     footer = ""
     try:
         if not isinstance(retrieved, list):
-            log.warning("icw.assembler retrieved not list type=%s", type(retrieved).__name__)
+            log.warning(f"icw.assembler retrieved not list type={type(retrieved).__name__}")
             retrieved = [retrieved]
         if retrieved:
             ttl = None
             try:
                 ttl = int(os.getenv("RAG_TTL_SECONDS", "3600"))
             except Exception as exc:  # defensive logging
-                log.error("icw.assembler RAG_TTL_SECONDS parse failed: %s", exc, exc_info=True)
+                log.error(f"icw.assembler RAG_TTL_SECONDS parse failed: {exc}", exc_info=True)
                 ttl = None
             distilled = rag_filter(retrieved, ttl_s=ttl)
             footer = evidence_binding_footer(distilled)
     except Exception as exc:  # defensive logging
-        log.error("icw.assembler RAG footer build failed: %s", exc, exc_info=True)
+        log.error(f"icw.assembler RAG footer build failed: {exc}", exc_info=True)
         footer = "[RAG] evidence temporarily unavailable due to error."
 
     # Rank by relevance
@@ -211,16 +206,11 @@ def assemble_window(request_msg: dict, state: dict, in_limit_bytes: int, step_ou
                         render_chunk(f"[Ledger older] {p.get('path')} sha256:{sha[:8]}")
                     )
     except Exception as exc:  # defensive logging
-        log.error("icw.assembler ledger summary build failed for cid=%r: %s", cid, exc, exc_info=True)
+        log.error(f"icw.assembler ledger summary build failed for cid={cid!r}: {exc}", exc_info=True)
 
     log.info(
-        "icw.assembler assemble_window start cid=%r budget_bytes=%s goal_len=%s anchor_len=%s candidates=%s retrieved=%s",
-        cid,
-        budget_bytes,
-        len(goal),
-        len(anchor),
-        len(ranked),
-        len(retrieved) if isinstance(retrieved, list) else 0,
+        f"icw.assembler assemble_window start cid={cid!r} budget_bytes={budget_bytes} goal_len={len(goal)} anchor_len={len(anchor)} "
+        f"candidates={len(ranked)} retrieved={(len(retrieved) if isinstance(retrieved, list) else 0)}"
     )
     for c in ranked:
         parts.append(render_chunk(c))
@@ -236,11 +226,7 @@ def assemble_window(request_msg: dict, state: dict, in_limit_bytes: int, step_ou
     final_prompt = _joined(parts)
     dt_ms = int((time.perf_counter() - t0) * 1000)
     log.info(
-        "icw.assembler assemble_window done bytes=%s budget=%s parts=%s ms=%s",
-        bytes_len(final_prompt),
-        budget_bytes,
-        len(parts),
-        dt_ms,
+        f"icw.assembler assemble_window done bytes={bytes_len(final_prompt)} budget={budget_bytes} parts={len(parts)} ms={dt_ms}"
     )
     return SimpleNamespace(prompt=final_prompt, target_output_tokens=out_tokens)
 
@@ -270,32 +256,32 @@ def pack_icw_system_frame_from_messages(
 
     msgs = messages or []
     if not isinstance(msgs, list):
-        log.warning("icw.assembler pack messages not list type=%s", type(msgs).__name__)
+        log.warning(f"icw.assembler pack messages not list type={type(msgs).__name__}")
         msgs = [msgs]  # type: ignore[list-item]
     # Budget: token limit -> byte budget, then allocate pct_budget for ICW.
     try:
         _ctx_limit = int(model_ctx_limit_tokens)
     except Exception as exc:
-        log.warning("icw.assembler pack bad model_ctx_limit_tokens=%r: %s", model_ctx_limit_tokens, exc, exc_info=True)
+        log.warning(f"icw.assembler pack bad model_ctx_limit_tokens={model_ctx_limit_tokens!r}: {exc}", exc_info=True)
         _ctx_limit = 2048
     if _ctx_limit <= 0:
         _ctx_limit = 2048
     try:
         total_budget_bytes = int(byte_budget_for_model(_ctx_limit))
     except Exception as exc:  # pragma: no cover - defensive logging
-        log.error("icw.assembler pack budget calc failed: %s", exc, exc_info=True)
+        log.error(f"icw.assembler pack budget calc failed: {exc}", exc_info=True)
         total_budget_bytes = 8192
     try:
         _pct = float(pct_budget)
     except Exception as exc:
-        log.warning("icw.assembler pack bad pct_budget=%r: %s", pct_budget, exc, exc_info=True)
+        log.warning(f"icw.assembler pack bad pct_budget={pct_budget!r}: {exc}", exc_info=True)
         _pct = 0.65
     if _pct <= 0.0 or _pct > 1.0:
         _pct = 0.65
     try:
         icw_budget_bytes = int(total_budget_bytes * _pct)
     except Exception as exc:
-        log.warning("icw.assembler pack budget multiply failed pct_budget=%r: %s", pct_budget, exc, exc_info=True)
+        log.warning(f"icw.assembler pack budget multiply failed pct_budget={pct_budget!r}: {exc}", exc_info=True)
         icw_budget_bytes = int(total_budget_bytes * 0.65)
     if icw_budget_bytes <= 0:
         icw_budget_bytes = max(1024, int(total_budget_bytes * 0.5))
@@ -330,7 +316,7 @@ def pack_icw_system_frame_from_messages(
     try:
         icw_state["state_hash"] = state_hash_from(icw_state)
     except Exception as exc:  # pragma: no cover - defensive logging
-        log.error("icw.assembler pack state_hash_from failed cid=%r: %s", cid, exc, exc_info=True)
+        log.error(f"icw.assembler pack state_hash_from failed cid={cid!r}: {exc}", exc_info=True)
         return None, None, {"ok": False, "reason": "state_hash_failed"}
 
     req = {"role": "user", "content": last_user}
@@ -346,12 +332,12 @@ def pack_icw_system_frame_from_messages(
     try:
         window = assemble_window(req, icw_state, int(icw_budget_bytes), int(_step_out))
     except Exception as exc:
-        log.error("icw.assembler pack assemble_window failed cid=%r: %s", cid, exc, exc_info=True)
+        log.error(f"icw.assembler pack assemble_window failed cid={cid!r}: {exc}", exc_info=True)
         return None, None, {"ok": False, "reason": "assemble_window_failed"}
     prompt = getattr(window, "prompt", "") if window is not None else ""
     prompt = str(prompt or "").strip()
     if not prompt:
-        log.error("icw.assembler pack empty_prompt cid=%r budget_bytes=%s", cid, icw_budget_bytes)
+        log.error(f"icw.assembler pack empty_prompt cid={cid!r} budget_bytes={icw_budget_bytes}")
         return None, None, {"ok": False, "reason": "empty_prompt"}
 
     pack_hash = "sha256:" + hashlib.sha256(prompt.encode("utf-8")).hexdigest()
@@ -371,12 +357,7 @@ def pack_icw_system_frame_from_messages(
     }
     dt_ms = int((time.perf_counter() - t0) * 1000)
     log.info(
-        "icw.assembler pack ok cid=%r msg_count=%s bytes=%s budget_bytes=%s ms=%s",
-        cid,
-        len(msgs),
-        bytes_len(prompt),
-        int(icw_budget_bytes),
-        dt_ms,
+        f"icw.assembler pack ok cid={cid!r} msg_count={len(msgs)} bytes={bytes_len(prompt)} budget_bytes={int(icw_budget_bytes)} ms={dt_ms}"
     )
     return frame, pack_hash, meta
 

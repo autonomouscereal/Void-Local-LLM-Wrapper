@@ -1,3 +1,7 @@
+'''
+catalog.py: Minimal tool catalog for shape validation only (not routing)
+'''
+
 from __future__ import annotations
 
 from typing import Dict, List, Set

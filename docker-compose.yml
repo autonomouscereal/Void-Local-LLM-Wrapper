@@ -888,7 +888,6 @@ services:
     environment:
       - WORKSPACE_DIR=/workspace
       - LOG_DIR=/workspace/logs
-      - EXEC_TIMEOUT_SEC=${EXEC_TIMEOUT_SEC:-30}
       - EXEC_MEMORY_MB=${EXEC_MEMORY_MB:-2048}
       - ALLOW_SHELL=${ALLOW_SHELL:-false}
       - SHELL_WHITELIST=${SHELL_WHITELIST:-}

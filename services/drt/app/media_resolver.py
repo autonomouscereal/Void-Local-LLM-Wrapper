@@ -52,14 +52,15 @@ def _yt_dlp_info(url: str) -> Dict[str, Any]:
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=0.5, max=8))
-def _http_get(url: str, max_bytes: int = 32 * 1024 * 1024, timeout: int | None = None) -> bytes:
+def _http_get(url: str, max_bytes: int = 32 * 1024 * 1024) -> bytes:
     headers = {"User-Agent": DEFAULT_USER_AGENT}
     if HEADERS_JSON:
         parser = JSONParser()
         hdrs = parser.parse(HEADERS_JSON, {}) or {}
         if isinstance(hdrs, dict):
             headers.update(hdrs)
-    with httpx.Client(timeout=timeout, follow_redirects=True) as cli:
+    # TIMEOUTS FORBIDDEN: always disable client-side timeouts explicitly.
+    with httpx.Client(timeout=None, follow_redirects=True) as cli:
         with cli.stream("GET", url, headers=headers) as r:
             out = bytearray()
             for chunk in r.iter_bytes():

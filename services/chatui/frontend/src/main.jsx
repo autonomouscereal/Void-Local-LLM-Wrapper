@@ -14,7 +14,8 @@ import AdminTab from './Admin.jsx'
 function App() {
   const ORCH_BASE = ((window.__ORCH_BASE__ || window.localStorage.getItem('ORCH_BASE') || (window.location.protocol + '//' + window.location.hostname + ':8000')) + '').replace(/\/$/, '')
   const [convos, setConvos] = useState([])
-  const [cid, setCid] = useState(null)
+  const [cid, setCid] = useState(null) // UI conversation id (ChatUI backend BIGSERIAL)
+  const [orchCid, setOrchCid] = useState(null) // Orchestrator-owned cid (uuid string)
   const [msgs, setMsgs] = useState([])
   const [text, setText] = useState('')
   const fileRef = useRef()
@@ -135,7 +136,7 @@ function App() {
       const xhr = new XMLHttpRequest()
       xhr.open('POST', `${ORCH_BASE}/v1/chat/completions`, true)
       // No client-side timeout: allow long generations to complete
-      xhr.timeout = 0
+      xhr.timeout = null
       // Do NOT send credentials/cookies across origins
       xhr.withCredentials = false
       xhr.setRequestHeader('Content-Type', 'application/json')
@@ -145,16 +146,12 @@ function App() {
         setSending(false)
         resolve()
       }
-      xhr.ontimeout = () => {
-        updateThinking('Request timed out on the client')
-        setSending(false)
-        resolve()
-      }
       xhr.onreadystatechange = async () => {
         if (xhr.readyState !== 4) return
         try {
           const textBody = xhr.responseText || ''
           let finalText = String(textBody || '').trim()
+          let returnedOrchCid = null
           // Try to parse as JSON to extract OpenAI message content; never throw on parse
           try {
             const obj = textBody ? JSON.parse(textBody) : null
@@ -162,8 +159,24 @@ function App() {
             if (msgObj && typeof msgObj.content === 'string') {
               finalText = String(msgObj.content).trim() || finalText
             }
+            const metaObj = obj && obj._meta
+            if (metaObj && (typeof metaObj.cid === 'string' || typeof metaObj.cid === 'number')) {
+              returnedOrchCid = String(metaObj.cid).trim()
+            }
           } catch {}
           updateThinking(finalText || '(no content)')
+          // Persist orchestrator-owned cid for this UI conversation (best-effort).
+          try {
+            if (returnedOrchCid && conversationId) {
+              setOrchCid(returnedOrchCid)
+              await fetch(`/api/conversations/${conversationId}/orch_cid`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ orch_cid: returnedOrchCid })
+              })
+              await refreshConvos()
+            }
+          } catch {}
           // Persist assistant message (best-effort)
           try {
             if (conversationId) {
@@ -184,7 +197,10 @@ function App() {
         setSending(false)
         resolve()
       }
-      const body = JSON.stringify({ messages: [{ role: 'user', content: userText }], stream: false })
+      // cid is orchestrator-owned; UI may send the last known orchCid, but the orchestrator will validate/overwrite it.
+      const payload = { messages: [{ role: 'user', content: userText }], stream: false }
+      if (orchCid && String(orchCid).trim()) payload.cid = String(orchCid).trim()
+      const body = JSON.stringify(payload)
       try { xhr.send(body) } catch { xhr.abort(); updateThinking('Network unreachable'); setSending(false); resolve() }
     })
   }
@@ -330,6 +346,10 @@ function App() {
   async function openConversation(id) {
     if (!id) return
     setCid(id)
+    try {
+      const found = (convos || []).find(c => c && String(c.id) === String(id))
+      setOrchCid((found && found.orch_cid) ? String(found.orch_cid) : null)
+    } catch { setOrchCid(null) }
     const r = await fetch(`/api/conversations/${id}/messages`)
     const j = await r.json()
     setMsgs(j.data || [])

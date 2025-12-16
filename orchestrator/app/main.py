@@ -352,7 +352,7 @@ def _configure_logging() -> str:
     )
 
     
-    logging.getLogger(__name__).debug("logging configured level=%s file=%r", LOG_LEVEL, _log_file)
+    logging.getLogger(__name__).debug(f"logging configured level={LOG_LEVEL} file={_log_file!r}")
     return _log_file
 
 
@@ -377,7 +377,7 @@ def _log(event: str, **fields: Any) -> None:
         checkpoints_append_event(STATE_DIR, tr, str(row.get("event") or "event"), row)
 
 
-def _inject_execution_context(tool_calls: List[Dict[str, Any]], trace_id: str, effective_mode: str) -> None:
+def _inject_execution_context(tool_calls: List[Dict[str, Any]], trace_id: str, effective_mode: str, cid: str | None) -> None:
     for tc in tool_calls or []:
         if not isinstance(tc, dict):
             continue
@@ -386,6 +386,44 @@ def _inject_execution_context(tool_calls: List[Dict[str, Any]], trace_id: str, e
             if trace_id and not args_tc.get("trace_id"):
                 args_tc["trace_id"] = trace_id
             args_tc.setdefault("_effective_mode", effective_mode)
+            # Enforce orchestrator-owned cid end-to-end: never allow planner/client to force a cid.
+            if isinstance(cid, str) and cid.strip():
+                args_tc["cid"] = cid.strip()
+
+
+async def _resolve_or_create_conversation_cid(requested_cid: str | None) -> str:
+    """
+    Enforce orchestrator-owned conversation ids (cid).
+
+    Rules:
+    - If caller sends no cid: mint a new UUID cid.
+    - If caller sends a cid that exists: use it.
+    - If caller sends a cid that does NOT exist: ignore it, mint a new UUID cid, and use that.
+    - If Postgres isn't configured: always mint a new UUID cid (never trust external input).
+    """
+    pool = await get_pg_pool()
+    # Hard security posture when DB isn't available: never trust a caller-provided cid.
+    if pool is None:
+        return uuid.uuid4().hex
+
+    rcid = requested_cid.strip() if isinstance(requested_cid, str) and requested_cid.strip() else None
+    async with pool.acquire() as conn:
+        if rcid:
+            try:
+                row = await conn.fetchrow("SELECT cid FROM orc_conversation WHERE cid=$1", rcid)
+                if row and row.get("cid"):
+                    await conn.execute("UPDATE orc_conversation SET updated_at=NOW() WHERE cid=$1", rcid)
+                    return rcid
+            except Exception as ex:
+                # Fall through to minting a new cid; never let DB errors break chat completions.
+                log.warning(f"cid.resolve: lookup failed rcid={rcid!r} ex={ex}", exc_info=True)
+
+        new_cid = uuid.uuid4().hex
+        try:
+            await conn.execute("INSERT INTO orc_conversation (cid) VALUES ($1) ON CONFLICT (cid) DO UPDATE SET updated_at=NOW()", new_cid)
+        except Exception as ex:
+            log.warning(f"cid.resolve: insert failed new_cid={new_cid!r} ex={ex}", exc_info=True)
+        return new_cid
 
 
 def _args_preview_for_log(args: Any, *, max_keys: int = 64) -> Dict[str, Any]:
@@ -467,7 +505,7 @@ async def _run_patch_call(
             "result": {},
         }
     patch_calls: List[Dict[str, Any]] = [call]
-    _inject_execution_context(patch_calls, trace_id, mode)
+    _inject_execution_context(patch_calls, trace_id, mode, None)
     # Validator disabled: execute patch calls directly without pre-validation.
     patch_validated = list(patch_calls)
     patch_failures: List[Dict[str, Any]] = []
@@ -847,7 +885,10 @@ async def segment_qa_and_committee(
                 try:
                     failure_counts[tname] = int(failure_counts.get(tname, 0) or 0) + 1
                 except Exception as ex:
-                    logging.warning("patch_exec: bad failure_counts[%s]=%r; resetting to 1", tname, failure_counts.get(tname), exc_info=True)
+                    logging.warning(
+                        f"patch_exec: bad failure_counts[{tname}]={failure_counts.get(tname)!r}; resetting to 1",
+                        exc_info=True,
+                    )
                     failure_counts[tname] = 1
             else:
                 artifacts_summary: List[Dict[str, Any]] = []
@@ -1602,7 +1643,10 @@ async def global_cors_middleware(request: Request, call_next):
     try:
         resp = await call_next(request)
     except Exception as ex:
-        logging.error("http.exception (global_cors) path=%s: %s", str(request.url.path), ex, exc_info=True)
+        logging.error(
+            f"http.exception (global_cors) path={str(request.url.path)}: {ex}",
+            exc_info=True,
+        )
         hdrs = {
             "Access-Control-Allow-Origin": (allowed_origin or "*"),
             "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
@@ -1859,7 +1903,7 @@ def _creative_alt_score(tr: Dict[str, Any], base_tool: str) -> float:
                     return float(score_block.get("overall") or 0.0)
                 except Exception as ex:
                     # Image QA is best-effort; log and fall back to neutral score.
-                    logging.warning("creative_alt_score.image_analysis_failed: %s", ex, exc_info=True)
+                    logging.warning(f"creative_alt_score.image_analysis_failed: {ex}", exc_info=True)
                     return 0.0
             if kind.startswith("audio") or base_tool.startswith("music"):
                 try:
@@ -1868,7 +1912,7 @@ def _creative_alt_score(tr: Dict[str, Any], base_tool: str) -> float:
                     return float((m.get("spectral_flatness") or 0.0))
                 except Exception as ex:
                     # Audio QA is best-effort; log and fall back to neutral score.
-                    logging.warning("creative_alt_score.audio_analysis_failed: %s", ex, exc_info=True)
+                    logging.warning(f"creative_alt_score.audio_analysis_failed: {ex}", exc_info=True)
                     return 0.0
     return 0.0
 
@@ -1915,7 +1959,7 @@ def _video_draw_on(im: "Image.Image", spec: dict) -> "Image.Image":
     try:
         font = ImageFont.truetype(font_name, size)
     except (OSError, IOError) as ex:
-        logging.debug("video_draw_on.font_fallback: %s", ex, exc_info=True)
+        logging.debug(f"video_draw_on.font_fallback: {ex}", exc_info=True)
         font = ImageFont.load_default()
     x = int(spec.get("x") or im.width // 2)
     y = int(spec.get("y") or int(im.height * 0.9))
@@ -1947,6 +1991,11 @@ def _normalize_tool_calls(calls: Any) -> List[Dict[str, Any]]:
     for c in calls:
         if not isinstance(c, dict):
             continue
+        # Carry through planner-provided step_id (canonical).
+        step_id_val: str = ""
+        raw_step_id = c.get("step_id")
+        if isinstance(raw_step_id, str) and raw_step_id.strip():
+            step_id_val = raw_step_id.strip()
         # Accept normalized or "steps" style
         if c.get("name") or c.get("tool"):
             nm = (c.get("name") or c.get("tool") or "")
@@ -1965,7 +2014,10 @@ def _normalize_tool_calls(calls: Any) -> List[Dict[str, Any]]:
                 elif isinstance(alt, str):
                     # Do not parse inline; carry raw for gating
                     args = {"_raw": alt}
-            out.append({"name": str(nm), "arguments": (args or {})})
+            item = {"name": str(nm), "arguments": (args or {})}
+            if step_id_val:
+                item["step_id"] = step_id_val
+            out.append(item)
             continue
         if c.get("type") == "function":
             fn = c.get("function") or {}
@@ -1978,7 +2030,10 @@ def _normalize_tool_calls(calls: Any) -> List[Dict[str, Any]]:
                 # Do not parse inline; carry raw for gating
                 args = {"_raw": args_obj}
             if nm:
-                out.append({"name": str(nm), "arguments": (args or {})})
+                item = {"name": str(nm), "arguments": (args or {})}
+                if step_id_val:
+                    item["step_id"] = step_id_val
+                out.append(item)
     return out
 
 
@@ -2126,10 +2181,8 @@ def _warn_double_wrapped_tool_results(tool_results: List[Dict[str, Any]] | None)
             # Heuristic: nested envelope usually contains ok/result/error keys
             if isinstance(inner, dict) and ("ok" in res or "error" in res) and ("result" in res):
                 log.warning(
-                    "double_wrapped_tool_result detected name=%r keys=%s inner_keys=%s",
-                    tr.get("name") or tr.get("tool"),
-                    sorted(list(res.keys()))[:24],
-                    sorted(list(inner.keys()))[:24],
+                    f"double_wrapped_tool_result detected name={(tr.get('name') or tr.get('tool'))!r} "
+                    f"keys={sorted(list(res.keys()))[:24]} inner_keys={sorted(list(inner.keys()))[:24]}"
                 )
     except Exception:
         log.debug("_warn_double_wrapped_tool_results failed (non-fatal)", exc_info=True)
@@ -2152,7 +2205,7 @@ def _datasets_emit(job_id: str, ev: Dict[str, Any]) -> None:
         _orcjob_set_state(job_id, "running", phase=ph, progress=pr)
     except Exception as ex:
         # Emitting dataset job progress is best-effort; log failures but never raise.
-        logging.error("datasets_emit failed for job_id=%s: %s", job_id, ex, exc_info=True)
+        logging.error(f"datasets_emit failed for job_id={job_id}: {ex}", exc_info=True)
 
 
 async def _datasets_runner(job_id: str, body: Dict[str, Any]) -> None:
@@ -2162,7 +2215,7 @@ async def _datasets_runner(job_id: str, body: Dict[str, Any]) -> None:
         _datasets_start(body or {}, emit)
         _orcjob_set_state(job_id, "done", phase="done", progress=1.0)
     except Exception as ex:
-        logging.error("datasets_runner failed for job_id=%s: %s", job_id, ex, exc_info=True)
+        logging.error(f"datasets_runner failed for job_id={job_id}: {ex}", exc_info=True)
         _orcjob_set_state(job_id, "failed", phase="error", progress=1.0, error=str(ex))
 
 
@@ -2216,7 +2269,7 @@ async def _send_trace_stream_async(payload: Dict[str, Any]) -> None:
     except Exception as ex:
         dt_ms = int((time.time() - t0) * 1000.0)
         _log("teacher.trace.append.exception", trace_id=str(payload.get("trace_id") or ""), url=url, ms=dt_ms, error=str(ex))
-        logging.warning("teacher.trace.append failed url=%s: %s", url, ex, exc_info=True)
+        logging.warning(f"teacher.trace.append failed url={url}: {ex}", exc_info=True)
 
 
 async def _orcjob_stream_gen(job_id: str, interval_ms: Optional[int] = None):
@@ -2338,7 +2391,7 @@ async def _tool_ws_keepalive(websocket: WebSocket) -> None:
         try:
             await websocket.send_text(json.dumps({"keepalive": True}))
         except Exception as ex:
-            logging.debug("ws_tool.keepalive_failed: %s", ex, exc_info=True)
+            logging.debug(f"ws_tool.keepalive_failed: {ex}", exc_info=True)
             break
         await _as.sleep(10)
 
@@ -4900,7 +4953,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                         },
                     )
                 except Exception as ex:
-                    logging.warning("music_samples.append_failed: %s", ex, exc_info=True)
+                    logging.warning(f"music_samples.append_failed: {ex}", exc_info=True)
                 # RAG: embed prompt text against the full track path
                 try:
                     pool = await get_pg_pool()
@@ -4920,7 +4973,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                                 list(vec),
                             )
                 except Exception as ex:
-                    logging.warning("music_rag.insert_failed: %s", ex, exc_info=True)
+                    logging.warning(f"music_rag.insert_failed: {ex}", exc_info=True)
 
         # Trace: standalone music.infinite.windowed finish
         if trace_val:
@@ -5268,7 +5321,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                             if cid:
                                 urls.append(f"/uploads/artifacts/music/{cid}/{aid}")
             except Exception as ex:
-                logging.warning("creative.alts.asset_collect_failed: %s", ex, exc_info=True)
+                logging.warning(f"creative.alts.asset_collect_failed: {ex}", exc_info=True)
                 continue
         return {"name": name, "result": {"variants": len(results), "assets": urls, "best": (urls[0] if urls else None)}}
     if name == "creative.pro_polish" and ALLOW_TOOL_EXECUTION:
@@ -5331,7 +5384,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                         h,s,v = colorsys.rgb_to_hsv(r/255.0,g/255.0,b/255.0)
                         palette.append({"rgb": [int(r),int(g),int(b)], "hsv": [h,s,v]})
                 except Exception as ex:
-                    logging.warning("style.dna.extract.palette.error path=%r err=%s", p, str(ex), exc_info=True)
+                    logging.warning(f"style.dna.extract.palette.error path={p!r} err={str(ex)}", exc_info=True)
                     continue
         dna = {"palette": palette[:4], "keywords": [], "ts": int(time.time())}
         try:
@@ -6415,7 +6468,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                             sem = ai.get("semantics") or {}
                             sc = float(sem.get("clip_score") or 0.0)
                         except Exception as ex:
-                            logging.debug("image.super_gen.clip_score_failed: %s", ex, exc_info=True)
+                            logging.debug(f"image.super_gen.clip_score_failed: {ex}", exc_info=True)
                             sc = 1.0
                         best_tile = tile if (best_tile is None or sc >= 0.35) else best_tile
                         if sc >= 0.35:
@@ -6542,7 +6595,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         try:
             k = int(args.get("k", 10))
         except Exception as ex:
-            logging.warning("metasearch.fuse: bad k=%r; defaulting to 10", args.get("k"), exc_info=True)
+            logging.warning(f"metasearch.fuse: bad k={args.get('k')!r}; defaulting to 10 ({ex})", exc_info=True)
             k = 10
         # Deterministic multi-engine placeholder only; SERPAPI removed in favor of internal metasearch
         engines: Dict[str, List[Dict[str, Any]]] = {}
@@ -6582,7 +6635,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 preview = txt[:2000]
             return {"name": name, "result": {"status": r.status_code, "content_type": ct, "sha256": h, "preview": preview}}
         except Exception as ex:
-            logging.warning("source_fetch.failed url=%s: %s", url, ex, exc_info=True)
+            logging.warning(f"source_fetch.failed url={url}: {ex}", exc_info=True)
             return {"name": name, "error": str(ex)}
     if name == "frame_interpolate":
         # Acknowledge and surface parameters; actual interpolation occurs during assembly if requested
@@ -6620,7 +6673,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     _log("video.interpolate.checkpoint.error", error=str(ex), path=dst)
             return {"name": name, "result": {"path": url}}
         except Exception as ex:
-            logging.error("ffmpeg.trim failed src=%s dst=%s cmd=%s: %s", src, dst, " ".join(ff), ex, exc_info=True)
+            logging.error(f"ffmpeg.trim failed src={src} dst={dst} cmd={' '.join(ff)}: {ex}", exc_info=True)
             return {"name": name, "error": str(ex)}
     if name == "ffmpeg.concat":
         inputs = args.get("inputs") or []
@@ -6639,7 +6692,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             url = dst.replace("/workspace", "") if dst.startswith("/workspace/") else dst
             return {"name": name, "result": {"path": url}}
         except Exception as ex:
-            logging.error("ffmpeg.concat failed dst=%s cmd=%s: %s", dst, " ".join(ff), ex, exc_info=True)
+            logging.error(f"ffmpeg.concat failed dst={dst} cmd={' '.join(ff)}: {ex}", exc_info=True)
             return {"name": name, "error": str(ex)}
     if name == "ffmpeg.audio_mix":
         a = args.get("a"); b = args.get("b"); vol_a = str(args.get("vol_a") or "1.0"); vol_b = str(args.get("vol_b") or "1.0")
@@ -6654,7 +6707,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             url = dst.replace("/workspace", "") if dst.startswith("/workspace/") else dst
             return {"name": name, "result": {"path": url}}
         except Exception as ex:
-            logging.error("ffmpeg.audio_mix failed dst=%s cmd=%s: %s", dst, " ".join(ff), ex, exc_info=True)
+            logging.error(f"ffmpeg.audio_mix failed dst={dst} cmd={' '.join(ff)}: {ex}", exc_info=True)
             return {"name": name, "error": str(ex)}
     if name == "image.cleanup":
         src = args.get("src") or ""
@@ -6728,7 +6781,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             trace_append("video", {"cid": cid_str, "tool": "video.cleanup", "src": src, "vf": vf, "path": dst})
             return {"name": name, "result": {"path": url}}
         except Exception as ex:
-            logging.error("video.cleanup failed src=%s dst=%s cmd=%s: %s", src, dst, " ".join(ff), ex, exc_info=True)
+            logging.error(f"video.cleanup failed src={src} dst={dst} cmd={' '.join(ff)}: {ex}", exc_info=True)
             return {"name": name, "error": str(ex)}
     if name == "image.artifact_fix":
         src = args.get("src") or ""; atype = (args.get("type") or "").strip().lower()
@@ -6811,7 +6864,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             )
             return {"name": name, "result": {"path": url}}
         except Exception as ex:
-            logging.error("image.artifact_fix failed src=%s type=%s: %s", src, atype, ex, exc_info=True)
+            logging.error(f"image.artifact_fix failed src={src} type={atype}: {ex}", exc_info=True)
             return {"name": name, "error": str(ex)}
     if name == "video.artifact_fix":
         src = args.get("src") or ""; atype = (args.get("type") or "").strip().lower()
@@ -6851,7 +6904,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             )
             return {"name": name, "result": {"path": url}}
         except Exception as ex:
-            logging.error("video.flow.derive failed src=%s frame_a=%s frame_b=%s: %s", src, frame_a, frame_b, ex, exc_info=True)
+            logging.error(f"video.flow.derive failed src={src} frame_a={frame_a} frame_b={frame_b}: {ex}", exc_info=True)
             return {"name": name, "error": str(ex)}
     if name == "image.hands.fix":
         src = args.get("src") or ""
@@ -7131,7 +7184,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 tvl1 = cv2.optflow.DualTVL1OpticalFlow_create()  # type: ignore
                 flow = tvl1.calc(a_gray, b_gray, None)
             except (AttributeError, cv2.error) as ex:
-                logging.debug("video.flow.tvl1_unavailable: %s", ex, exc_info=True)
+                logging.debug(f"video.flow.tvl1_unavailable: {ex}", exc_info=True)
                 flow = cv2.calcOpticalFlowFarneback(a_gray, b_gray, None, 0.5, 3, 15, 3, 5, 1.2, 0)
             fx = flow[..., 0].astype(np.float32)
             fy = flow[..., 1].astype(np.float32)
@@ -7446,13 +7499,13 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     logging.debug("sympy_approx_failed", exc_info=True)
                 return {"name": name, "result": res}
             except Exception as ex:
-                logging.debug("sympy_parse_failed: %s", ex, exc_info=True)
+                logging.debug(f"sympy_parse_failed: {ex}", exc_info=True)
                 allowed = {k: getattr(math, k) for k in dir(math) if not k.startswith("_")}
                 allowed.update({"__builtins__": {}})
                 val = eval(str(expr), allowed, {})  # noqa: S307 (safe namespace)
                 return {"name": name, "result": {"approx": float(val)}}
         except Exception as ex:
-            logging.error("math.sympy failed: %s", ex, exc_info=True)
+            logging.error(f"math.sympy failed: {ex}", exc_info=True)
             return {"name": name, "error": str(ex)}
     if name == "rag_index":
         res = await rag_index_dir(root=args.get("root", "/workspace"))
@@ -7682,11 +7735,14 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         logging.debug("chat_completions:try t0=%r", t0)
         # ---- NO request shaping: use original body/messages as provided ----
         # ids / mode / seed
-        conv_cid = None
+        requested_cid = None
         if isinstance(body0.get("cid"), (int, str)) and str(body0.get("cid")).strip():
-            conv_cid = str(body0.get("cid")).strip()
+            requested_cid = str(body0.get("cid")).strip()
         elif isinstance(body0.get("conversation_id"), (int, str)) and str(body0.get("conversation_id")).strip():
-            conv_cid = str(body0.get("conversation_id")).strip()
+            requested_cid = str(body0.get("conversation_id")).strip()
+
+        # Canonical cid is orchestrator-owned; never trust external sources.
+        conv_cid = await _resolve_or_create_conversation_cid(requested_cid)
 
         mode = _as_str(body0.get("mode"), "general")
         effective_mode = mode
@@ -7707,7 +7763,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         # trace_id is not part of the OpenAI chat completions contract; generate one when missing
         # so all planner/executor logs and artifacts are correlated.
         trace_id = uuid.uuid4().hex
-        logging.debug("chat_completions:trace_id source=%s trace_id=%s", trace_id, trace_id)
+        logging.debug(f"chat_completions:trace_id source={trace_id} trace_id={trace_id}")
 
         # messages (verbatim)
         messages: List[Dict[str, Any]] = []
@@ -7733,7 +7789,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             plan_text = ""
             logging.debug("chat_completions:set plan_text=%r", plan_text)
             tool_calls = []
-            logging.debug("chat_completions:set tool_calls_len=%s", len(tool_calls))
+            logging.debug(f"chat_completions:set tool_calls_len={len(tool_calls)}")
             planner_env = {}
             logging.debug("chat_completions:set planner_env=%r", planner_env)
         else:
@@ -7770,7 +7826,9 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 body_summary={"messages_count": len(messages or []), "first_user_text_len": first_user_len},
                 seed=master_seed,
             )
-            logging.debug("chat_completions:chat.start trace_id=%s mode=%s effective_mode=%s cid=%r", trace_id, mode, effective_mode, conv_cid)
+            logging.debug(
+                f"chat_completions:chat.start trace_id={trace_id} mode={mode} effective_mode={effective_mode} cid={conv_cid!r}"
+            )
             _log("chat.start", trace_id=trace_id, mode=mode, effective_mode=effective_mode, cid=conv_cid)
             _log("start", trace_id=trace_id, seed=master_seed, mode=mode, effective_mode=effective_mode)
 
@@ -7779,7 +7837,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 run_id = await _db_insert_run(trace_id=trace_id, mode=mode, seed=master_seed, pack_hash=pack_hash, request_json=body0)
                 logging.debug("chat_completions:_db_insert_run run_id=%r", run_id)            
             except Exception as ex:
-                log.error("chat_completions:_db_insert_run failed trace_id=%s ex=%s", trace_id, ex, exc_info=True)
+                log.error(f"chat_completions:_db_insert_run failed trace_id={trace_id} ex={ex}", exc_info=True)
                 run_id = None
             # Artifacts ledger shard (required): store step-level tool execution summaries.
             try:
@@ -7788,7 +7846,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 _ledger_shard = _art_open_shard(_ledger_root, _ledger_name, int(ARTIFACT_SHARD_BYTES))
                 logging.debug("chat_completions:ledger _art_open_shard ok shard=%r", _ledger_shard)
             except Exception as ex:
-                logging.debug("chat_completions:ledger.open.failed trace_id=%s ex=%s", trace_id, ex, exc_info=True)
+                logging.debug(f"chat_completions:ledger.open.failed trace_id={trace_id} ex={ex}", exc_info=True)
 
         # If client supplies tool results (role=tool) we include them verbatim for the planner/executors
 
@@ -7798,7 +7856,12 @@ async def chat_completions(body: Dict[str, Any], request: Request):
 
         # 1) Planner proposes tool calls (planning lives under orchestrator/app/plan/*).
         _log("planner.call", trace_id=trace_id, mode=effective_mode)
-        logging.debug("chat_completions:planner.call trace_id=%s effective_mode=%s", trace_id, effective_mode)
+        logging.debug(f"chat_completions:planner.call trace_id={trace_id} effective_mode={effective_mode}")
+        # IMPORTANT: never leave these uninitialized. If produce_tool_plan throws,
+        # subsequent logging/normalization must not crash with UnboundLocalError.
+        plan_text: str = ""
+        tool_calls: List[Dict[str, Any]] = []
+        planner_env: Dict[str, Any] = {"ok": False, "error": {"code": "planner_not_run", "message": "planner did not run"}}
         try:
             plan_text, tool_calls, planner_env = await produce_tool_plan(
                 messages=messages,
@@ -7808,16 +7871,28 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 mode=effective_mode,
             )
         except Exception as e:
-            log.error("chat_completions:produce_tool_plan failed trace_id=%s ex=%s", trace_id, e, exc_info=True)
+            log.error(f"chat_completions:produce_tool_plan failed trace_id={trace_id} ex={e}", exc_info=True)
+            # Preserve a structured envelope so downstream logic can surface a
+            # meaningful error instead of crashing on undefined locals.
+            planner_env = {
+                "ok": False,
+                "error": {"code": "produce_tool_plan_exception", "message": str(e)},
+                "trace_id": trace_id,
+            }
+            plan_text = ""
+            tool_calls = []
+        plan_text_len = len(plan_text) if isinstance(plan_text, str) else -1
+        tool_calls_type = type(tool_calls).__name__
+        tool_calls_len = len(tool_calls) if isinstance(tool_calls, list) else -1
+        planner_env_keys = sorted(list(planner_env.keys())) if isinstance(planner_env, dict) else type(planner_env).__name__
         logging.debug(
-            "chat_completions:produce_tool_plan done plan_text_len=%s tool_calls_type=%s tool_calls_len=%s planner_env_keys=%r",
-            len(plan_text) if isinstance(plan_text, str) else -1,
-            type(tool_calls).__name__,
-            len(tool_calls) if isinstance(tool_calls, list) else -1,
-            sorted(list(planner_env.keys())) if isinstance(planner_env, dict) else type(planner_env).__name__,
+            f"chat_completions:produce_tool_plan done plan_text_len={plan_text_len} tool_calls_type={tool_calls_type} "
+            f"tool_calls_len={tool_calls_len} planner_env_keys={planner_env_keys!r}"
         )
         tool_calls = _normalize_tool_calls(tool_calls)
-        logging.debug("chat_completions:_normalize_tool_calls len=%s", len(tool_calls) if isinstance(tool_calls, list) else -1)
+        logging.debug(
+            f"chat_completions:_normalize_tool_calls len={len(tool_calls) if isinstance(tool_calls, list) else -1}"
+        )
         # Hardening: ensure tool arguments are objects (parse JSON strings / {"_raw": "..."}), and fill minimal defaults.
         parser_tc = JSONParser()
         hardened_tool_calls: List[Dict[str, Any]] = []
@@ -7833,7 +7908,9 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                     try:
                         parsed_inner = parser_tc.parse(raw_inner or "", {})
                     except Exception as ex:
-                        logging.warning("planner.tool_args._raw parse failed trace_id=%s tool=%s: %s", trace_id, nm, ex, exc_info=True)
+                        logging.warning(
+                            f"planner.tool_args._raw parse failed trace_id={trace_id} tool={nm}: {ex}", exc_info=True
+                        )
                         parsed_inner = {}
                     if isinstance(parsed_inner, dict):
                         args_obj = dict(parsed_inner)
@@ -7850,7 +7927,9 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 try:
                     parsed = parser_tc.parse(raw_args or "", {})
                 except Exception as ex:
-                    logging.warning("planner.tool_args parse failed trace_id=%s tool=%s: %s", trace_id, nm, ex, exc_info=True)
+                    logging.warning(
+                        f"planner.tool_args parse failed trace_id={trace_id} tool={nm}: {ex}", exc_info=True
+                    )
                     parsed = {}
                 args_obj = dict(parsed) if isinstance(parsed, dict) else {"_raw": raw_args}
             elif raw_args is None:
@@ -7875,7 +7954,9 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             hardened_tool_calls.append({**tc, "name": nm, "arguments": args_obj})
 
         tool_calls = hardened_tool_calls
-        logging.debug("chat_completions:tool_calls.hardened len=%s", len(tool_calls) if isinstance(tool_calls, list) else -1)
+        logging.debug(
+            f"chat_completions:tool_calls.hardened len={len(tool_calls) if isinstance(tool_calls, list) else -1}"
+        )
         try:
             # Deep planner/tool-call visibility: log the *shape* of tool args without dumping full prompts.
             preview: List[Dict[str, Any]] = []
@@ -7893,22 +7974,28 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 )
             _log("planner.tool_calls.normalized", trace_id=trace_id, count=len(tool_calls or []), preview=preview)
         except Exception as ex:
-            logging.warning("planner.tool_calls.normalized log failed trace_id=%s: %s", trace_id, ex, exc_info=True)
+            logging.warning(f"planner.tool_calls.normalized log failed trace_id={trace_id}: {ex}", exc_info=True)
         # Hardening: filter unknown tools against runtime catalog (registry + builtins).
         allowed_runtime = catalog_allowed(get_builtin_tools_schema)
-        logging.debug("chat_completions:catalog_allowed count=%s", len(allowed_runtime) if isinstance(allowed_runtime, (list, set, tuple)) else -1)
+        logging.debug(
+            f"chat_completions:catalog_allowed count={len(allowed_runtime) if isinstance(allowed_runtime, (list, set, tuple)) else -1}"
+        )
         # Restrict to planner-visible + mode-allowed tools (single source of truth; do not re-filter later).
         allowed_runtime = {n for n in allowed_runtime if n in PLANNER_VISIBLE_TOOLS}
-        logging.debug("chat_completions:allowed_runtime after planner_visible count=%s", len(allowed_runtime))
+        logging.debug(f"chat_completions:allowed_runtime after planner_visible count={len(allowed_runtime)}")
         allowed_runtime = {n for n in allowed_runtime if n in set(_allowed_tools_for_mode(effective_mode))}
-        logging.debug("chat_completions:allowed_runtime after mode filter count=%s", len(allowed_runtime))
+        logging.debug(f"chat_completions:allowed_runtime after mode filter count={len(allowed_runtime)}")
         tool_calls, unknown_tools = catalog_validate(tool_calls or [], allowed_runtime)
-        logging.debug("chat_completions:catalog_validate tool_calls_len=%s unknown_tools=%r", len(tool_calls or []), unknown_tools)
+        logging.debug(
+            f"chat_completions:catalog_validate tool_calls_len={len(tool_calls or [])} unknown_tools={unknown_tools!r}"
+        )
         if unknown_tools:
             _log("tools.unknown.filtered", trace_id=trace_id, unknown=unknown_tools)
             logging.debug("chat_completions:tools.unknown.filtered unknown_tools=%r", unknown_tools)
         _log("planner.done", trace_id=trace_id, tool_count=len(tool_calls or []), ok=bool((planner_env or {}).get("ok")))
-        logging.debug("chat_completions:planner.done tool_count=%s ok=%s", len(tool_calls or []), bool((planner_env or {}).get("ok")))
+        logging.debug(
+            f"chat_completions:planner.done tool_count={len(tool_calls or [])} ok={bool((planner_env or {}).get('ok'))}"
+        )
         trace_append("decision", {"cid": conv_cid, "trace_id": trace_id, "plan": plan_text, "tool_calls": tool_calls})
         logging.debug("chat_completions:trace_append decision done")
 
@@ -7969,15 +8056,20 @@ async def chat_completions(body: Dict[str, Any], request: Request):
 
         if (not abort_pipeline) and tool_calls:
             _log("tools.exec.start", trace_id=trace_id, count=len(tool_calls or []))
-            logging.debug("chat_completions:tools.exec.start abort_pipeline=%r tool_calls_len=%s", abort_pipeline, len(tool_calls or []))
-            _inject_execution_context(tool_calls, trace_id, effective_mode)
+            logging.debug(
+                f"chat_completions:tools.exec.start abort_pipeline={abort_pipeline!r} tool_calls_len={len(tool_calls or [])}"
+            )
+            _inject_execution_context(tool_calls, trace_id, effective_mode, conv_cid)
             logging.debug("chat_completions:_inject_execution_context done trace_id=%r effective_mode=%r", trace_id, effective_mode)
             for tc in tool_calls:
-                logging.debug("chat_completions:tool_loop:iter tc_type=%s tc_keys=%r", type(tc).__name__, sorted(list(tc.keys())) if isinstance(tc, dict) else None)
+                logging.debug(
+                    f"chat_completions:tool_loop:iter tc_type={type(tc).__name__} "
+                    f"tc_keys={(sorted(list(tc.keys())) if isinstance(tc, dict) else None)!r}"
+                )
                 tn = (tc.get("name") or "tool")
                 logging.debug("chat_completions:tool_loop:tn=%r", tn)
                 raw_args = tc.get("arguments")
-                logging.debug("chat_completions:tool_loop:raw_args_type=%s", type(raw_args).__name__)
+                logging.debug(f"chat_completions:tool_loop:raw_args_type={type(raw_args).__name__}")
                 if isinstance(raw_args, dict):
                     ta = raw_args
                 elif raw_args is None:
@@ -7985,7 +8077,10 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 else:
                     # Never drop args: preserve non-dict payloads under _raw.
                     ta = {"_raw": raw_args}
-                logging.debug("chat_completions:tool_loop:ta_type=%s ta_keys=%r", type(ta).__name__, sorted(list(ta.keys())) if isinstance(ta, dict) else None)
+                logging.debug(
+                    f"chat_completions:tool_loop:ta_type={type(ta).__name__} "
+                    f"ta_keys={(sorted(list(ta.keys())) if isinstance(ta, dict) else None)!r}"
+                )
                 # For film2.run, never rely on planner-fabricated clip/image URLs. Instead,
                 # automatically wire in real image artifacts from any prior image.dispatch
                 # (or other image-producing) tool results in this trace. If no real images
@@ -7996,9 +8091,9 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                     args_film = ta if isinstance(ta, dict) else {}
                     logging.debug("chat_completions:tool_loop:film2.run args_film_keys_pre=%r", sorted(list(args_film.keys())) if isinstance(args_film, dict) else None)
                     urls_all = assets_collect_urls(tool_results or [], abs_url_fn)
-                    logging.debug("chat_completions:tool_loop:film2.run urls_all_len=%s", len(urls_all or []))
+                    logging.debug(f"chat_completions:tool_loop:film2.run urls_all_len={len(urls_all or [])}")
                     img_urls = [u for u in (urls_all or []) if isinstance(u, str) and "/artifacts/image/" in u]
-                    logging.debug("chat_completions:tool_loop:film2.run img_urls_len=%s", len(img_urls or []))
+                    logging.debug(f"chat_completions:tool_loop:film2.run img_urls_len={len(img_urls or [])}")
                     if img_urls:
                         args_film["images"] = img_urls
                         # Ensure we do not carry over any stale clip references from the planner.
@@ -8021,12 +8116,12 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 # Execute tools via the external executor so all heavy/remote work
                 # happens in the executor container instead of the orchestrator.
                 exec_batch = [tc]
-                logging.debug("chat_completions:tool_loop:exec_batch_len=%s", len(exec_batch))
+                logging.debug(f"chat_completions:tool_loop:exec_batch_len={len(exec_batch)}")
                 try:
                     exec_res = await gateway_execute(exec_batch, trace_id, executor_endpoint, request_id=str(request_id))
                 except Exception as ex:
                     # Hardening: a single tool execution failure must not crash the whole run.
-                    logging.error("chat_completions:tool_loop:gateway_execute raised tool=%r ex=%s", tn, ex, exc_info=True)
+                    logging.error(f"chat_completions:tool_loop:gateway_execute raised tool={tn!r} ex={ex}", exc_info=True)
                     exec_res = [
                         {
                             "name": str(tn or "tool"),
@@ -8040,7 +8135,10 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                             "args": (tc.get("arguments") if isinstance(tc.get("arguments"), dict) else {}),
                         }
                     ]
-                logging.debug("chat_completions:tool_loop:gateway_execute returned type=%s len=%s", type(exec_res).__name__, len(exec_res) if isinstance(exec_res, list) else -1)
+                logging.debug(
+                    f"chat_completions:tool_loop:gateway_execute returned type={type(exec_res).__name__} "
+                    f"len={(len(exec_res) if isinstance(exec_res, list) else -1)}"
+                )
                 tr = exec_res[0] if isinstance(exec_res, list) and exec_res else {}
                 logging.debug("chat_completions:tool_loop:tr_keys=%r", sorted(list(tr.keys())) if isinstance(tr, dict) else None)
                 tname = str((tr or {}).get("name") or "tool")
@@ -8048,10 +8146,10 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 res = (tr or {}).get("result") if isinstance((tr or {}).get("result"), dict) else {}
                 logging.debug("chat_completions:tool_loop:res_keys=%r", sorted(list(res.keys())) if isinstance(res, dict) else None)
                 err_obj = (tr or {}).get("error")
-                logging.debug("chat_completions:tool_loop:err_obj_type=%s", type(err_obj).__name__)
+                logging.debug(f"chat_completions:tool_loop:err_obj_type={type(err_obj).__name__}")
                 if not err_obj and isinstance(res, dict):
                     err_obj = res.get("error")
-                    logging.debug("chat_completions:tool_loop:err_obj_from_res type=%s", type(err_obj).__name__)
+                    logging.debug(f"chat_completions:tool_loop:err_obj_from_res type={type(err_obj).__name__}")
                 # Executor does not echo args; executor_gateway attaches them back. Fall back to our input args.
                 args_echo = tr.get("args") if isinstance(tr.get("args"), dict) else {}
                 logging.debug("chat_completions:tool_loop:args_echo_keys=%r", sorted(list(args_echo.keys())) if isinstance(args_echo, dict) else None)
@@ -8067,11 +8165,11 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                     args_preview=_args_preview_for_log(args_echo),
                     step_id=(tr.get("step_id") if isinstance(tr.get("step_id"), str) else None),
                 )
-                logging.debug("chat_completions:tool_loop:after_exec ok=%s", not isinstance(err_obj, (str, dict)))
+                logging.debug(f"chat_completions:tool_loop:after_exec ok={not isinstance(err_obj, (str, dict))}")
                 # Required: persist tool execution metadata (teacher + ledger + db)
                 try:
                     arts_val = res.get("artifacts") if isinstance(res, dict) else None
-                    logging.debug("chat_completions:tool_loop:arts_val_type=%s", type(arts_val).__name__)
+                    logging.debug(f"chat_completions:tool_loop:arts_val_type={type(arts_val).__name__}")
                     ok_step = not isinstance(err_obj, (str, dict))
                     logging.debug("chat_completions:tool_loop:ok_step=%r", ok_step)
                     tool_exec_meta.append(
@@ -8084,7 +8182,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                             "artifacts": arts_val,
                         }
                     )
-                    logging.debug("chat_completions:tool_loop:tool_exec_meta appended len=%s", len(tool_exec_meta))
+                    logging.debug(f"chat_completions:tool_loop:tool_exec_meta appended len={len(tool_exec_meta)}")
                     if run_id is not None:
                         logging.debug("chat_completions:tool_loop:_db_insert_tool_call starting run_id=%r tool=%r", run_id, tname)
                         await _db_insert_tool_call(
@@ -8113,7 +8211,10 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                         _ledger_shard = _art_append_jsonl(_ledger_shard, row)
                         logging.debug("chat_completions:tool_loop:ledger append done shard=%r", _ledger_shard)
                 except Exception as ex:
-                    logging.debug("chat_completions:tool_exec_meta.persist.failed trace_id=%s tool=%s ex=%s", trace_id, str(tname), ex, exc_info=True)
+                    logging.debug(
+                        f"chat_completions:tool_exec_meta.persist.failed trace_id={trace_id} tool={str(tname)} ex={ex}",
+                        exc_info=True,
+                    )
                 if isinstance(err_obj, (str, dict)):
                     logging.debug("chat_completions:tool_loop:error_branch entered")
                     code = (err_obj.get("code") if isinstance(err_obj, dict) else str(err_obj))
@@ -8121,7 +8222,9 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                     status = (err_obj.get("status") if isinstance(err_obj, dict) else None)
                     logging.debug("chat_completions:tool_loop:error_branch status=%r", status)
                     message = (err_obj.get("message") if isinstance(err_obj, dict) else "")
-                    logging.debug("chat_completions:tool_loop:error_branch message_len=%s", len(message) if isinstance(message, str) else -1)
+                    logging.debug(
+                        f"chat_completions:tool_loop:error_branch message_len={len(message) if isinstance(message, str) else -1}"
+                    )
                     _log("tool.run.error", trace_id=trace_id, tool=tname, code=(code or ""), status=status, message=(message or ""))
                     # Flip pipeline_ok to False when a critical front-door tool fails.
                     if tname in ("image.dispatch", "music.infinite.windowed", "film2.run", "tts.speak"):
@@ -8130,9 +8233,9 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 else:
                     logging.debug("chat_completions:tool_loop:success_branch entered")
                     arts_summary: List[Dict[str, Any]] = []
-                    logging.debug("chat_completions:tool_loop:arts_summary init len=%s", len(arts_summary))
+                    logging.debug(f"chat_completions:tool_loop:arts_summary init len={len(arts_summary)}")
                     arts = res.get("artifacts") if isinstance(res, dict) else None
-                    logging.debug("chat_completions:tool_loop:arts_type=%s", type(arts).__name__)
+                    logging.debug(f"chat_completions:tool_loop:arts_type={type(arts).__name__}")
                     if isinstance(arts, list):
                         for a in arts:
                             if isinstance(a, dict):
@@ -8140,20 +8243,22 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                                 kind = a.get("kind")
                                 if isinstance(aid, str) and isinstance(kind, str):
                                     arts_summary.append({"id": aid, "kind": kind})
-                                    logging.debug("chat_completions:tool_loop:arts_summary append id=%r kind=%r len=%s", aid, kind, len(arts_summary))
+                                    logging.debug(
+                                        f"chat_completions:tool_loop:arts_summary append id={aid!r} kind={kind!r} len={len(arts_summary)}"
+                                    )
                     urls_this = assets_collect_urls([tr], _abs_url)
-                    logging.debug("chat_completions:tool_loop:urls_this_len=%s", len(urls_this or []))
+                    logging.debug(f"chat_completions:tool_loop:urls_this_len={len(urls_this or [])}")
                     _log("tool.run.after", trace_id=trace_id, tool=tname, artifacts=arts_summary, urls_count=len(urls_this or []))
                     meta = res.get("meta") if isinstance(res, dict) else {}
-                    logging.debug("chat_completions:tool_loop:meta_type=%s", type(meta).__name__)
+                    logging.debug(f"chat_completions:tool_loop:meta_type={type(meta).__name__}")
                     first_url = urls_this[0] if isinstance(urls_this, list) and urls_this else None
                     logging.debug("chat_completions:tool_loop:first_url=%r", first_url)
                     extra_results: List[Dict[str, Any]] = []
-                    logging.debug("chat_completions:tool_loop:extra_results init len=%s", len(extra_results))
+                    logging.debug(f"chat_completions:tool_loop:extra_results init len={len(extra_results)}")
                     if tname == "film2.run":
                         logging.debug("chat_completions:tool_loop:film2.run qa branch entered")
                         meta_obj = res.get("meta") if isinstance(res, dict) else {}
-                        logging.debug("chat_completions:tool_loop:film2.run meta_obj_type=%s", type(meta_obj).__name__)
+                        logging.debug(f"chat_completions:tool_loop:film2.run meta_obj_type={type(meta_obj).__name__}")
                         profile_name = meta_obj.get("quality_profile") if isinstance(meta_obj, dict) and isinstance(meta_obj.get("quality_profile"), str) else None
                         logging.debug("chat_completions:tool_loop:film2.run profile_name=%r", profile_name)
                         preset = LOCK_QUALITY_PRESETS.get((profile_name or "standard").lower(), LOCK_QUALITY_PRESETS["standard"])
@@ -8163,13 +8268,18 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                         try:
                             refine_budget = min(1, int(_rb_raw))
                         except Exception as exc:
-                            logging.warning("chat_completions: bad max_refine_passes=%r for film2.run; defaulting to 1", _rb_raw, exc_info=True)
+                            logging.warning(
+                                f"chat_completions: bad max_refine_passes={_rb_raw!r} for film2.run; defaulting to 1",
+                                exc_info=True,
+                            )
                             refine_budget = 1
                         logging.debug("chat_completions:tool_loop:film2.run refine_budget=%r", refine_budget)
                         segments_obj = meta_obj.get("segments") if isinstance(meta_obj, dict) else {}
-                        logging.debug("chat_completions:tool_loop:film2.run segments_obj_type=%s", type(segments_obj).__name__)
+                        logging.debug(f"chat_completions:tool_loop:film2.run segments_obj_type={type(segments_obj).__name__}")
                         clips_for_committee = segments_obj.get("clips") if isinstance(segments_obj, dict) else None
-                        logging.debug("chat_completions:tool_loop:film2.run clips_for_committee_type=%s", type(clips_for_committee).__name__)
+                        logging.debug(
+                            f"chat_completions:tool_loop:film2.run clips_for_committee_type={type(clips_for_committee).__name__}"
+                        )
                         if isinstance(clips_for_committee, list) and clips_for_committee:
                             seg_results_payload: List[Dict[str, Any]] = []
                             for seg in clips_for_committee:
@@ -8179,9 +8289,14 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                                 res_obj = seg.get("result")
                                 if isinstance(seg_id, str) and seg_id and isinstance(res_obj, dict):
                                     seg_results_payload.append({"name": seg_id, "result": res_obj})
-                                    logging.debug("chat_completions:tool_loop:film2.run seg_results_payload append seg_id=%r len=%s", seg_id, len(seg_results_payload))
+                                    logging.debug(
+                                        f"chat_completions:tool_loop:film2.run seg_results_payload append seg_id={seg_id!r} "
+                                        f"len={len(seg_results_payload)}"
+                                    )
                             if seg_results_payload:
-                                logging.debug("chat_completions:tool_loop:film2.run segment_qa_and_committee call len=%s", len(seg_results_payload))
+                                logging.debug(
+                                    f"chat_completions:tool_loop:film2.run segment_qa_and_committee call len={len(seg_results_payload)}"
+                                )
                                 trace_append(
                                     "film2.segment_qa_start",
                                     {
@@ -8203,18 +8318,21 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                                     quality_profile=profile_name,
                                     max_refine_passes=refine_budget,
                                 )
+                                _updated_seg_type = type(updated_seg).__name__
+                                _seg_outcome_keys = sorted(list(seg_outcome.keys())) if isinstance(seg_outcome, dict) else None
+                                _seg_patch_len = len(seg_patch) if isinstance(seg_patch, list) else -1
                                 logging.debug(
-                                    "chat_completions:tool_loop:film2.run segment_qa_and_committee returned updated_seg_type=%s seg_outcome_keys=%r seg_patch_len=%s",
-                                    type(updated_seg).__name__,
-                                    sorted(list(seg_outcome.keys())) if isinstance(seg_outcome, dict) else None,
-                                    len(seg_patch) if isinstance(seg_patch, list) else -1,
+                                    f"chat_completions:tool_loop:film2.run segment_qa_and_committee returned updated_seg_type={_updated_seg_type} "
+                                    f"seg_outcome_keys={_seg_outcome_keys!r} seg_patch_len={_seg_patch_len}"
                                 )
                                 if isinstance(meta_obj, dict):
                                     meta_obj["segment_committee"] = seg_outcome
                                     if seg_patch:
                                         meta_obj["segment_patch_results"] = seg_patch
                                         extra_results.extend(seg_patch)
-                                        logging.debug("chat_completions:tool_loop:film2.run extra_results extended len=%s", len(extra_results))
+                                        logging.debug(
+                                            f"chat_completions:tool_loop:film2.run extra_results extended len={len(extra_results)}"
+                                        )
                                         # Mark refined clips in segments metadata.
                                         segments_container = meta_obj.get("segments")
                                         if isinstance(segments_container, dict):
@@ -8276,7 +8394,11 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                             quality_profile=profile_name,
                             max_refine_passes=refine_budget_music,
                         )
-                        logging.debug("chat_completions:tool_loop:music segment_qa returned outcome_keys=%r patch_len=%s", sorted(list(seg_outcome.keys())) if isinstance(seg_outcome, dict) else None, len(seg_patch) if isinstance(seg_patch, list) else -1)
+                        _seg_outcome_keys = sorted(list(seg_outcome.keys())) if isinstance(seg_outcome, dict) else None
+                        _seg_patch_len = len(seg_patch) if isinstance(seg_patch, list) else -1
+                        logging.debug(
+                            f"chat_completions:tool_loop:music segment_qa returned outcome_keys={_seg_outcome_keys!r} patch_len={_seg_patch_len}"
+                        )
                         if isinstance(res, dict):
                             meta_music = res.setdefault("meta", {})
                             if isinstance(meta_music, dict):
@@ -8285,7 +8407,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                                     meta_music["segment_patch_results"] = seg_patch
                         if seg_patch:
                             extra_results.extend(seg_patch)
-                            logging.debug("chat_completions:tool_loop:music extra_results extended len=%s", len(extra_results))
+                            logging.debug(f"chat_completions:tool_loop:music extra_results extended len={len(extra_results)}")
                     elif tname.startswith("image."):
                         logging.debug("chat_completions:tool_loop:image qa branch entered tname=%r", tname)
                         # Optional: run segment-level QA/committee for image tools as well.
@@ -8317,7 +8439,11 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                             quality_profile=profile_name,
                             max_refine_passes=refine_budget_img,
                         )
-                        logging.debug("chat_completions:tool_loop:image segment_qa returned outcome_keys=%r patch_len=%s", sorted(list(seg_outcome.keys())) if isinstance(seg_outcome, dict) else None, len(seg_patch) if isinstance(seg_patch, list) else -1)
+                        _seg_outcome_keys = sorted(list(seg_outcome.keys())) if isinstance(seg_outcome, dict) else None
+                        _seg_patch_len = len(seg_patch) if isinstance(seg_patch, list) else -1
+                        logging.debug(
+                            f"chat_completions:tool_loop:image segment_qa returned outcome_keys={_seg_outcome_keys!r} patch_len={_seg_patch_len}"
+                        )
                         if isinstance(res, dict):
                             meta_img = res.setdefault("meta", {})
                             if isinstance(meta_img, dict):
@@ -8326,7 +8452,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                                     meta_img["segment_patch_results"] = seg_patch
                         if seg_patch:
                             extra_results.extend(seg_patch)
-                            logging.debug("chat_completions:tool_loop:image extra_results extended len=%s", len(extra_results))
+                            logging.debug(f"chat_completions:tool_loop:image extra_results extended len={len(extra_results)}")
                     elif tname == "tts.speak":
                         logging.debug("chat_completions:tool_loop:tts qa branch entered")
                         # Segment-level QA/committee for TTS segments
@@ -8357,7 +8483,11 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                             quality_profile=profile_name,
                             max_refine_passes=refine_budget_tts,
                         )
-                        logging.debug("chat_completions:tool_loop:tts segment_qa returned outcome_keys=%r patch_len=%s", sorted(list(seg_outcome.keys())) if isinstance(seg_outcome, dict) else None, len(seg_patch) if isinstance(seg_patch, list) else -1)
+                        _seg_outcome_keys = sorted(list(seg_outcome.keys())) if isinstance(seg_outcome, dict) else None
+                        _seg_patch_len = len(seg_patch) if isinstance(seg_patch, list) else -1
+                        logging.debug(
+                            f"chat_completions:tool_loop:tts segment_qa returned outcome_keys={_seg_outcome_keys!r} patch_len={_seg_patch_len}"
+                        )
                         if isinstance(res, dict):
                             meta_tts = res.setdefault("meta", {})
                             if isinstance(meta_tts, dict):
@@ -8366,7 +8496,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                                     meta_tts["segment_patch_results"] = seg_patch
                         if seg_patch:
                             extra_results.extend(seg_patch)
-                            logging.debug("chat_completions:tool_loop:tts extra_results extended len=%s", len(extra_results))
+                            logging.debug(f"chat_completions:tool_loop:tts extra_results extended len={len(extra_results)}")
                     elif tname == "audio.sfx.compose":
                         logging.debug("chat_completions:tool_loop:sfx qa branch entered")
                         # Optional: SFX QA/committee wiring (currently metrics are sparse)
@@ -8397,7 +8527,11 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                             quality_profile=profile_name,
                             max_refine_passes=refine_budget_sfx,
                         )
-                        logging.debug("chat_completions:tool_loop:sfx segment_qa returned outcome_keys=%r patch_len=%s", sorted(list(seg_outcome.keys())) if isinstance(seg_outcome, dict) else None, len(seg_patch) if isinstance(seg_patch, list) else -1)
+                        _seg_outcome_keys = sorted(list(seg_outcome.keys())) if isinstance(seg_outcome, dict) else None
+                        _seg_patch_len = len(seg_patch) if isinstance(seg_patch, list) else -1
+                        logging.debug(
+                            f"chat_completions:tool_loop:sfx segment_qa returned outcome_keys={_seg_outcome_keys!r} patch_len={_seg_patch_len}"
+                        )
                         if isinstance(res, dict):
                             meta_sfx = res.setdefault("meta", {})
                             if isinstance(meta_sfx, dict):
@@ -8406,28 +8540,36 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                                     meta_sfx["segment_patch_results"] = seg_patch
                         if seg_patch:
                             extra_results.extend(seg_patch)
-                            logging.debug("chat_completions:tool_loop:sfx extra_results extended len=%s", len(extra_results))
+                            logging.debug(f"chat_completions:tool_loop:sfx extra_results extended len={len(extra_results)}")
                     tool_results.append(tr)
-                    logging.debug("chat_completions:tool_loop:tool_results appended len=%s", len(tool_results))
+                    logging.debug(f"chat_completions:tool_loop:tool_results appended len={len(tool_results)}")
                     if extra_results:
                         tool_results.extend(extra_results)
-                        logging.debug("chat_completions:tool_loop:tool_results extended with extra_results len=%s", len(tool_results))
+                        logging.debug(f"chat_completions:tool_loop:tool_results extended with extra_results len={len(tool_results)}")
 
         _log("flow.after_execute", trace_id=trace_id, tool_results_count=len(tool_results or []))
-        logging.debug("chat_completions:flow.after_execute tool_results_count=%s pipeline_ok=%r", len(tool_results or []), pipeline_ok)
+        logging.debug(
+            f"chat_completions:flow.after_execute tool_results_count={len(tool_results or [])} pipeline_ok={pipeline_ok!r}"
+        )
 
         for _tr in tool_results or []:
-            logging.debug("chat_completions:post_tool_scan:iter _tr_type=%s _tr_keys=%r", type(_tr).__name__, sorted(list(_tr.keys())) if isinstance(_tr, dict) else None)
+            logging.debug(
+                f"chat_completions:post_tool_scan:iter _tr_type={type(_tr).__name__} "
+                f"_tr_keys={(sorted(list(_tr.keys())) if isinstance(_tr, dict) else None)!r}"
+            )
             _res = (_tr or {}).get("result") or {}
-            logging.debug("chat_completions:post_tool_scan:_res_type=%s _res_keys=%r", type(_res).__name__, sorted(list(_res.keys())) if isinstance(_res, dict) else None)
+            logging.debug(
+                f"chat_completions:post_tool_scan:_res_type={type(_res).__name__} "
+                f"_res_keys={(sorted(list(_res.keys())) if isinstance(_res, dict) else None)!r}"
+            )
             if isinstance(_res, dict):
                 _meta = _res.get("meta") if isinstance(_res, dict) else {}
-                logging.debug("chat_completions:post_tool_scan:_meta_type=%s", type(_meta).__name__)
+                logging.debug(f"chat_completions:post_tool_scan:_meta_type={type(_meta).__name__}")
                 _pid = (_meta or {}).get("prompt_id")
                 logging.debug("chat_completions:post_tool_scan:_pid=%r", _pid)
                 if isinstance(_pid, str) and _pid:
                     _ids = _res.get("ids") if isinstance(_res.get("ids"), dict) else {}
-                    logging.debug("chat_completions:post_tool_scan:_ids_type=%s", type(_ids).__name__)
+                    logging.debug(f"chat_completions:post_tool_scan:_ids_type={type(_ids).__name__}")
                     _comfy_client_id = _ids.get("client_id") if isinstance(_ids.get("client_id"), str) else None
                     logging.debug("chat_completions:post_tool_scan:_comfy_client_id=%r", _comfy_client_id)
                     _log("[comfy] POST /prompt", trace_id=trace_id, prompt_id=_pid, client_id=_comfy_client_id)
@@ -8460,7 +8602,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         counts_summary = {"images": _img_i, "videos": _vid_i, "audio": _aud_i}
         logging.debug("chat_completions:postrun_qa counts_summary=%r", counts_summary)
         domain_qa = assets_compute_domain_qa(tool_results)
-        logging.debug("chat_completions:postrun_qa domain_qa_type=%s domain_qa=%r", type(domain_qa).__name__, domain_qa)
+        logging.debug(f"chat_completions:postrun_qa domain_qa_type={type(domain_qa).__name__} domain_qa={domain_qa!r}")
         qa_metrics = {"counts": counts_summary, "domain": domain_qa}
         logging.debug("chat_completions:postrun_qa qa_metrics_keys=%r", sorted(list(qa_metrics.keys())))
         _log("qa.metrics", trace_id=trace_id, tool="postrun", metrics=qa_metrics)
@@ -8478,23 +8620,29 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         committee_action = str((committee_outcome.get("action") or "go")).strip().lower()
         logging.debug("chat_completions:committee committee_action=%r", committee_action)
         committee_rationale = str(committee_outcome.get("rationale") or "")
-        logging.debug("chat_completions:committee committee_rationale_len=%s", len(committee_rationale))
+        logging.debug(f"chat_completions:committee committee_rationale_len={len(committee_rationale)}")
         patch_plan = committee_outcome.get("patch_plan") or []
-        logging.debug("chat_completions:committee patch_plan_type=%s patch_plan_len=%s", type(patch_plan).__name__, len(patch_plan) if isinstance(patch_plan, list) else -1)
+        logging.debug(
+            f"chat_completions:committee patch_plan_type={type(patch_plan).__name__} "
+            f"patch_plan_len={(len(patch_plan) if isinstance(patch_plan, list) else -1)}"
+        )
         _log("committee.decision", trace_id=trace_id, action=committee_action, rationale=committee_rationale)
         _log("flow.after_committee", trace_id=trace_id, action=committee_action)
         _log("committee.review.final", trace_id=trace_id, summary=qa_metrics)
         _log("committee.decision.final", trace_id=trace_id, action=committee_action)
         # Optional one-pass revision
         if committee_action == "revise" and isinstance(patch_plan, list) and patch_plan:
-            logging.debug("chat_completions:committee revise branch entered patch_plan_len=%s", len(patch_plan))
+            logging.debug(f"chat_completions:committee revise branch entered patch_plan_len={len(patch_plan)}")
             # Filter patch plan by front-door + mode rules
             _allowed_mode_set = set(_allowed_tools_for_mode(effective_mode))
-            logging.debug("chat_completions:committee _allowed_mode_set_len=%s", len(_allowed_mode_set))
+            logging.debug(f"chat_completions:committee _allowed_mode_set_len={len(_allowed_mode_set)}")
             filtered_patch_plan: List[Dict[str, Any]] = []
-            logging.debug("chat_completions:committee filtered_patch_plan init len=%s", len(filtered_patch_plan))
+            logging.debug(f"chat_completions:committee filtered_patch_plan init len={len(filtered_patch_plan)}")
             for st in patch_plan:
-                logging.debug("chat_completions:committee patch_plan_iter st_type=%s st_keys=%r", type(st).__name__, sorted(list(st.keys())) if isinstance(st, dict) else None)
+                logging.debug(
+                    f"chat_completions:committee patch_plan_iter st_type={type(st).__name__} "
+                    f"st_keys={(sorted(list(st.keys())) if isinstance(st, dict) else None)!r}"
+                )
                 if not isinstance(st, dict):
                     continue
                 tl = (st.get("tool") or "").strip() if isinstance(st.get("tool"), str) else ""
@@ -8504,37 +8652,46 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                     continue
                 # IMPORTANT: do not drop args when the committee returns args as a JSON string.
                 args_raw = st.get("args") if ("args" in st) else st.get("arguments")
-                logging.debug("chat_completions:committee patch_plan_iter args_raw_type=%s", type(args_raw).__name__)
+                logging.debug(f"chat_completions:committee patch_plan_iter args_raw_type={type(args_raw).__name__}")
                 args_st: Dict[str, Any]
                 if isinstance(args_raw, dict):
                     args_st = dict(args_raw)
                 elif isinstance(args_raw, str):
                     parser_patch = JSONParser()
-                    logging.debug("chat_completions:committee patch_plan_iter parsing args_raw_json_len=%s", len(args_raw))
+                    logging.debug(
+                        f"chat_completions:committee patch_plan_iter parsing args_raw_json_len={len(args_raw)}"
+                    )
                     parsed = parser_patch.parse(args_raw or "", dict)
-                    logging.debug("chat_completions:committee patch_plan_iter parsed_type=%s", type(parsed).__name__)
+                    logging.debug(f"chat_completions:committee patch_plan_iter parsed_type={type(parsed).__name__}")
                     args_st = dict(parsed) if isinstance(parsed, dict) else {"_raw": args_raw}
                 elif args_raw is None:
                     args_st = {}
                 else:
                     args_st = {"_raw": args_raw}
                 filtered_patch_plan.append({"tool": tl, "args": args_st})
-                logging.debug("chat_completions:committee filtered_patch_plan append tool=%r args_keys=%r len=%s", tl, sorted(list(args_st.keys())) if isinstance(args_st, dict) else None, len(filtered_patch_plan))
+                logging.debug(
+                    f"chat_completions:committee filtered_patch_plan append tool={tl!r} "
+                    f"args_keys={(sorted(list(args_st.keys())) if isinstance(args_st, dict) else None)!r} len={len(filtered_patch_plan)}"
+                )
             if filtered_patch_plan:
-                logging.debug("chat_completions:committee filtered_patch_plan nonempty len=%s", len(filtered_patch_plan))
+                logging.debug(f"chat_completions:committee filtered_patch_plan nonempty len={len(filtered_patch_plan)}")
                 # Normalize to internal tool_calls schema
                 patch_calls: List[Dict[str, Any]] = [{"name": s.get("tool"), "arguments": (s.get("args") or {})} for s in filtered_patch_plan]
-                logging.debug("chat_completions:committee patch_calls_len=%s first=%r", len(patch_calls), patch_calls[0] if patch_calls else None)
-                _inject_execution_context(patch_calls, trace_id, effective_mode)
+                logging.debug(
+                    f"chat_completions:committee patch_calls_len={len(patch_calls)} first={(patch_calls[0] if patch_calls else None)!r}"
+                )
+                _inject_execution_context(patch_calls, trace_id, effective_mode, conv_cid)
                 logging.debug("chat_completions:committee _inject_execution_context patch_calls done")
                 # Validator disabled: execute patch plan directly without pre-validation.
                 patch_validated = list(patch_calls)
-                logging.debug("chat_completions:committee patch_validated_len=%s", len(patch_validated))
+                logging.debug(f"chat_completions:committee patch_validated_len={len(patch_validated)}")
                 patch_failures: List[Dict[str, Any]] = []
-                logging.debug("chat_completions:committee patch_failures_len=%s", len(patch_failures))
+                logging.debug(f"chat_completions:committee patch_failures_len={len(patch_failures)}")
                 # Execute validated patch steps
                 patch_failure_results: List[Dict[str, Any]] = []
-                logging.debug("chat_completions:committee patch_failure_results init len=%s", len(patch_failure_results))
+                logging.debug(
+                    f"chat_completions:committee patch_failure_results init len={len(patch_failure_results)}"
+                )
                 for failure in patch_failures or []:
                     env = failure.get("envelope") if isinstance(failure.get("envelope"), dict) else {}
                     args_snapshot = failure.get("arguments") if isinstance(failure.get("arguments"), dict) else {}
@@ -8548,12 +8705,16 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                             "args": args_snapshot,
                         }
                     )
-                    logging.debug("chat_completions:committee patch_failure_results append name=%r len=%s", name_snapshot, len(patch_failure_results))
+                    logging.debug(
+                        f"chat_completions:committee patch_failure_results append name={name_snapshot!r} len={len(patch_failure_results)}"
+                    )
                 exec_results: List[Dict[str, Any]] = []
-                logging.debug("chat_completions:committee exec_results init len=%s", len(exec_results))
+                logging.debug(f"chat_completions:committee exec_results init len={len(exec_results)}")
                 # Advisory-only: execute the patch plan once via the executor path.
                 exec_batch = patch_validated or patch_calls
-                logging.debug("chat_completions:committee exec_batch_len=%s", len(exec_batch) if isinstance(exec_batch, list) else -1)
+                logging.debug(
+                    f"chat_completions:committee exec_batch_len={(len(exec_batch) if isinstance(exec_batch, list) else -1)}"
+                )
                 if exec_batch:
                     _log("exec.payload", trace_id=trace_id, steps=[{"tool": (c.get("name") or "")} for c in exec_batch[:5]])
                     logging.debug("chat_completions:committee gateway_execute patch exec starting")
@@ -8561,7 +8722,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                         exec_results = await gateway_execute(exec_batch, trace_id, executor_endpoint, request_id=str(request_id))
                     except Exception as ex:
                         # Hardening: patch-plan execution is advisory; never crash the main run.
-                        logging.error("chat_completions:committee:gateway_execute raised ex=%s", ex, exc_info=True)
+                        logging.error(f"chat_completions:committee:gateway_execute raised ex={ex}", exc_info=True)
                         exec_results = [
                             {
                                 "name": "executor",
@@ -8574,15 +8735,20 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                                 "result": {},
                             }
                         ]
-                    logging.debug("chat_completions:committee gateway_execute patch exec returned len=%s", len(exec_results) if isinstance(exec_results, list) else -1)
+                    logging.debug(
+                        f"chat_completions:committee gateway_execute patch exec returned len={(len(exec_results) if isinstance(exec_results, list) else -1)}"
+                    )
                     # Persist patch exec results (teacher + ledger + db)
                     try:
                         results_list = exec_results if isinstance(exec_results, list) else []
-                        logging.debug("chat_completions:committee results_list_len=%s", len(results_list))
+                        logging.debug(f"chat_completions:committee results_list_len={len(results_list)}")
                         for i, call in enumerate(exec_batch or []):
                             nm = str((call or {}).get("name") or "tool")
                             args_obj = (call or {}).get("arguments") if isinstance((call or {}).get("arguments"), dict) else {}
-                            logging.debug("chat_completions:committee patch_result_iter i=%s nm=%r args_keys=%r", i, nm, sorted(list(args_obj.keys())) if isinstance(args_obj, dict) else None)
+                            logging.debug(
+                                f"chat_completions:committee patch_result_iter i={i} nm={nm!r} "
+                                f"args_keys={(sorted(list(args_obj.keys())) if isinstance(args_obj, dict) else None)!r}"
+                            )
                             tr: Dict[str, Any] = {}
                             if i < len(results_list) and isinstance(results_list[i], dict):
                                 tr = results_list[i]
@@ -8598,9 +8764,11 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                                 err_obj = res_obj.get("error")
                             arts_val = res_obj.get("artifacts") if isinstance(res_obj, dict) else None
                             ok_step = not isinstance(err_obj, (str, dict))
-                            logging.debug("chat_completions:committee patch_result_iter ok_step=%r err_type=%s", ok_step, type(err_obj).__name__)
+                            logging.debug(
+                                f"chat_completions:committee patch_result_iter ok_step={ok_step!r} err_type={type(err_obj).__name__}"
+                            )
                             tool_exec_meta.append({"name": nm, "args": args_obj, "ok": bool(ok_step), "result": res_obj, "error": err_obj, "artifacts": arts_val})
-                            logging.debug("chat_completions:committee tool_exec_meta appended len=%s", len(tool_exec_meta))
+                            logging.debug(f"chat_completions:committee tool_exec_meta appended len={len(tool_exec_meta)}")
                             if run_id is not None:
                                 logging.debug("chat_completions:committee _db_insert_tool_call patch starting run_id=%r nm=%r", run_id, nm)
                                 await _db_insert_tool_call(
@@ -8617,13 +8785,18 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                                 _ledger_shard = _art_append_jsonl(_ledger_shard, row)
                                 logging.debug("chat_completions:committee ledger append patch done nm=%r", nm)
                     except Exception as ex:
-                        logging.debug("chat_completions:patch_exec_meta.persist.failed trace_id=%s ex=%s", trace_id, ex, exc_info=True)
+                        logging.debug(
+                            f"chat_completions:patch_exec_meta.persist.failed trace_id={trace_id} ex={ex}",
+                            exc_info=True,
+                        )
                 patch_results = list(patch_failure_results) + list(exec_results or [])
-                logging.debug("chat_completions:committee patch_results_len=%s", len(patch_results))
+                logging.debug(f"chat_completions:committee patch_results_len={len(patch_results)}")
                 tool_results = (tool_results or []) + patch_results
-                logging.debug("chat_completions:committee tool_results_len_after_patch=%s", len(tool_results or []))
+                logging.debug(f"chat_completions:committee tool_results_len_after_patch={len(tool_results or [])}")
                 _log("committee.revision.executed", trace_id=trace_id, steps=len(patch_validated or []), failures=len(patch_failures or []))
-                logging.debug("chat_completions:committee revision executed steps=%s failures=%s", len(patch_validated or []), len(patch_failures or []))
+                logging.debug(
+                    f"chat_completions:committee revision executed steps={len(patch_validated or [])} failures={len(patch_failures or [])}"
+                )
                 # Recompute QA metrics after revision
                 _img_count = assets_count_images(tool_results)
                 logging.debug("chat_completions:postrev_qa _img_count=%r", _img_count)
@@ -8810,7 +8983,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 meta_sections.append("Tool Results:\n" + json.dumps(tool_results, indent=2))
             except Exception as ex:
                 # This metadata block is non-critical; log and continue.
-                logging.warning("final.tool_results.meta_serialize_failed: %s", ex, exc_info=True)
+                logging.warning(f"final.tool_results.meta_serialize_failed: {ex}", exc_info=True)
         # Instead of verbose plan/critique footers, append a minimal Tool Results summary (IDs/errors) only
         tool_summary_lines: List[str] = []
         tool_tracebacks: List[str] = []
@@ -8836,7 +9009,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                                     },
                                 )
                             except Exception as ex:
-                                logging.warning("tool_results.parse.failed: %s", ex, exc_info=True)
+                                logging.warning(f"tool_results.parse.failed: {ex}", exc_info=True)
                                 res_field = {}
                         if not isinstance(res_field, dict):
                             res_field = {}
@@ -8880,7 +9053,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 if errors:
                     tool_summary_lines.append("- **errors**: " + "; ".join(errors)[:800])
             except Exception as ex:
-                logging.error("tool_results.summary_failed: %s", ex, exc_info=True)
+                logging.error(f"tool_results.summary_failed: {ex}", exc_info=True)
         footer = ("\n\n### Tool Results\n" + "\n".join(tool_summary_lines)) if tool_summary_lines else ""
         if tool_tracebacks:
             # Include full tracebacks verbatim (truncated to a safe length per item)
@@ -8903,7 +9076,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 content_preview=(display_content or "")[:800],
             )
         except Exception as ex:
-            logging.warning("final.response.checkpoint_failed: %s", ex, exc_info=True)
+            logging.warning(f"final.response.checkpoint_failed: {ex}", exc_info=True)
         # Provide an appendix with raw model answers to avoid any perception of truncation
         try:
             raw_q = (qwen_text or "").strip()
@@ -8921,7 +9094,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             if appendix_parts:
                 display_content += "".join(appendix_parts)
         except Exception as ex:
-            logging.warning("final.appendix.build_failed: %s", ex, exc_info=True)
+            logging.warning(f"final.appendix.build_failed: {ex}", exc_info=True)
         # Evaluate fallback after footer creation, but using main-only flags
         if looks_empty or looks_refusal:
             # For now, log detection without overriding the composed content.
@@ -8966,7 +9139,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 try:
                     step_texts.append(json.dumps(tool_results, ensure_ascii=False))
                 except Exception as ex:
-                    logging.warning("final.step_texts.tool_results_serialize_failed: %s", ex, exc_info=True)
+                    logging.warning(f"final.step_texts.tool_results_serialize_failed: {ex}", exc_info=True)
             if isinstance(qwen_text, str) and qwen_text.strip():
                 step_texts.append(qwen_text)
             if isinstance(glm_text, str) and glm_text.strip():
@@ -8995,7 +9168,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             # Do not let final envelope stitching fail silently; log and fall back
             # to an empty envelope so the main /v1/chat/completions response still
             # returns a well-formed JSON body to clients.
-            logging.error("chat.final_env_build_failed: %s", ex, exc_info=True)
+            logging.error(f"chat.final_env_build_failed: {ex}", exc_info=True)
             final_env = {}
 
         # Compose final OpenAI-compatible response envelope. The ok flag reflects
@@ -9018,8 +9191,8 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         response_meta = response.setdefault("_meta", {})
         if isinstance(response_meta, dict):
             response_meta.setdefault("trace_id", trace_id)
-            if isinstance(conv_cid, (str, int)):
-                response_meta.setdefault("cid", str(conv_cid))
+            # Always surface the canonical orchestrator-owned cid (even if caller supplied something else).
+            response_meta["cid"] = str(conv_cid)
             # Surface planner failures explicitly in the response metadata so callers
             # are not left with a silent empty plan when the planner/committee path fails.
             if isinstance(planner_error_payload, dict):
@@ -9119,7 +9292,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
 
         # response prepared; single return happens after the try/except.
     except Exception as ex:
-        logging.error("chat.finish: %s", ex, exc_info=True)
+        logging.error(f"chat.finish: {ex}", exc_info=True)
         response = _build_openai_envelope(
             ok=False,
             text="Internal error.",
@@ -9151,7 +9324,8 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         if isinstance(response_meta, dict):
             response_meta.setdefault("trace_id", trace_id)
             if 'conv_cid' in locals() and isinstance(locals().get("conv_cid"), (str, int)):
-                response_meta.setdefault("cid", str(locals().get("conv_cid")))
+                # Always overwrite with canonical cid (never trust external callers).
+                response_meta["cid"] = str(locals().get("conv_cid"))
             if isinstance(artifacts_out, dict):
                 urls_out = artifacts_out.get("urls") if isinstance(artifacts_out.get("urls"), list) else []
                 response_meta.setdefault("assets", urls_out)
@@ -9594,7 +9768,7 @@ async def tools_append(body: Dict[str, Any], request: Request):
                         if _wb > 0:
                             _log("artifact_summary", trace_id=trace_id, kind="audio", bytes=_wb)
                 except Exception as ex:
-                    logging.warning("artifact summary distillation failed: %s", ex, exc_info=True)
+                    logging.warning(f"artifact summary distillation failed: {ex}", exc_info=True)
             # Forward review WS events to connected client if present
             try:
                 app = request.app
@@ -9604,9 +9778,9 @@ async def tools_append(body: Dict[str, Any], request: Request):
                     payload = {"type": row["event"], "trace_id": trace_id, "step_id": row.get("step_id"), "notes": row.get("notes")}
                     await ws.send_json(payload)
             except Exception as ex:
-                logging.warning("websocket forward failed: %s", ex, exc_info=True)
+                logging.warning(f"websocket forward failed: {ex}", exc_info=True)
     except Exception as ex:
-        logging.error("trace.append failed trace_id=%s: %s", trace_id, ex, exc_info=True)
+        logging.error(f"trace.append failed trace_id={trace_id}: {ex}", exc_info=True)
         return JSONResponse(status_code=400, content={"error": "append_failed"})
     return {"ok": True}
 
@@ -9956,7 +10130,7 @@ def _save_capsule(cap: Dict[str, Any]) -> str:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(cap, f, ensure_ascii=False)
     except Exception as ex:
-        logging.warning("capsule.save.error path=%r error=%s", path, str(ex), exc_info=True)
+        logging.warning(f"capsule.save.error path={path!r} error={str(ex)}", exc_info=True)
     return cid
 
 @app.get("/v1/video/state/{capsule_id}")
@@ -10362,7 +10536,7 @@ async def v1_capsules_project(project_id: str):
             if fn.endswith('.json'):
                 windows.append(_read_json_safe(os.path.join(wins_dir, fn)))
     except Exception as ex:
-        logging.error("v1_state_icw: failed to list windows in %s: %s", wins_dir, ex, exc_info=True)
+        logging.error(f"v1_state_icw: failed to list windows in {wins_dir}: {ex}", exc_info=True)
     return {"project_id": project_id, "omni": omni, "windows": windows}
 
 @app.post("/v1/distill/pack")
@@ -10463,11 +10637,11 @@ async def ws_alias(websocket: WebSocket):
     try:
         await websocket.send_text(json.dumps({"type": "error", "error": {"code": "gone", "message": "Deprecated. Use /v1/chat/completions"}}))
     except Exception as ex:
-        logging.debug("ws_alias: failed to send deprecation message: %s", ex, exc_info=True)
+        logging.debug(f"ws_alias: failed to send deprecation message: {ex}", exc_info=True)
     try:
         await websocket.close(code=1000)
     except Exception as ex:
-        logging.debug("ws_alias: failed to close websocket cleanly: %s", ex, exc_info=True)
+        logging.debug(f"ws_alias: failed to close websocket cleanly: {ex}", exc_info=True)
 
 
 @app.websocket("/tool.ws")
@@ -10571,7 +10745,7 @@ async def ws_tool(websocket: WebSocket):
     try:
         await websocket.close(code=1000)
     except Exception as ex:
-        logging.debug("ws_tool: failed to close websocket cleanly: %s", ex, exc_info=True)
+        logging.debug(f"ws_tool: failed to close websocket cleanly: {ex}", exc_info=True)
 
 @app.post("/upload")
 async def upload(file: UploadFile = File(...)):
@@ -10677,7 +10851,10 @@ async def _comfy_submit_workflow(workflow: Dict[str, Any]) -> Dict[str, Any]:
                             return res if isinstance(res, dict) else {}
                     except Exception as ex:
                         last_err = r.text
-                        logging.warning("comfy.wait_for_executed.error base=%s prompt_id=%s: %s", str(base), str(pid), ex, exc_info=True)
+                        logging.warning(
+                            f"comfy.wait_for_executed.error base={str(base)} prompt_id={str(pid)}: {ex}",
+                            exc_info=True,
+                        )
             except Exception as ex:
                 last_err = str(ex)
             finally:
@@ -10686,7 +10863,7 @@ async def _comfy_submit_workflow(workflow: Dict[str, Any]) -> Dict[str, Any]:
         try:
             await _as.sleep(max(0.0, float(delay) / 1000.0))
         except Exception as ex:
-            logging.warning("comfy.backoff.sleep.error: %s", str(ex), exc_info=True)
+            logging.warning(f"comfy.backoff.sleep.error: {str(ex)}", exc_info=True)
         delay = min(delay * 2, COMFYUI_BACKOFF_MAX_MS)
     return {"error": last_err or "all comfyui instances failed after retries"}
 
@@ -10948,12 +11125,12 @@ async def _track_comfy_job(job_id: str, prompt_id: str) -> None:
                 try:
                     await _update_scene_from_job(job_id, detail)
                 except Exception as ex:
-                    logging.warning("job.update_scene.error job_id=%s err=%s", str(job_id), str(ex), exc_info=True)
+                    logging.warning(f"job.update_scene.error job_id={str(job_id)} err={str(ex)}", exc_info=True)
                 if JOBS_RAG_INDEX:
                     try:
                         await _index_job_into_rag(job_id)
                     except Exception as ex:
-                        logging.warning("job.rag_index.error job_id=%s err=%s", str(job_id), str(ex), exc_info=True)
+                        logging.warning(f"job.rag_index.error job_id={str(job_id)} err={str(ex)}", exc_info=True)
                 break
             if detail.get("status", {}).get("status") == "error":
                 err = detail.get("status")
@@ -10964,7 +11141,7 @@ async def _track_comfy_job(job_id: str, prompt_id: str) -> None:
                 try:
                     await _update_scene_from_job(job_id, detail, failed=True)
                 except Exception as ex:
-                    logging.warning("job.update_scene_failed.error job_id=%s err=%s", str(job_id), str(ex), exc_info=True)
+                    logging.warning(f"job.update_scene_failed.error job_id={str(job_id)} err={str(ex)}", exc_info=True)
                 break
         else:
             # History not yet available. Do NOT fail early and do NOT auto-resubmit; keep polling up to grace window.
@@ -11092,7 +11269,7 @@ async def cancel_job(job_id: str):
             async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
                 await client.post(COMFYUI_API_URL.rstrip("/") + "/interrupt")
     except Exception as ex:
-        logging.warning("comfy.interrupt.error job_id=%s err=%s", str(job_id), str(ex), exc_info=True)
+        logging.warning(f"comfy.interrupt.error job_id={str(job_id)} err={str(ex)}", exc_info=True)
     async with pool.acquire() as conn:
         await conn.execute("UPDATE jobs SET status='cancelled', updated_at=NOW() WHERE id=$1", job_id)
     _jobs_store.setdefault(job_id, {})["state"] = "cancelled"
@@ -11161,7 +11338,7 @@ async def _update_scene_from_job(job_id: str, detail: Dict[str, Any] | str, fail
                 if prefs.get("duration_seconds"):
                     duration = int(float(prefs.get("duration_seconds")))
             except Exception as ex:
-                logging.warning("scene.duration.parse.error scene_id=%s err=%s", str(row.get("id")), str(ex), exc_info=True)
+                logging.warning(f"scene.duration.parse.error scene_id={str(row.get('id'))} err={str(ex)}", exc_info=True)
             # read toggles
             audio_enabled = True
             subs_enabled = False
@@ -11171,7 +11348,7 @@ async def _update_scene_from_job(job_id: str, detail: Dict[str, Any] | str, fail
                     audio_enabled = bool(prefs.get("audio_enabled", True))
                     subs_enabled = bool(prefs.get("subtitles_enabled", False))
             except Exception as ex:
-                logging.warning("scene.toggles.parse.error scene_id=%s err=%s", str(row.get("id")), str(ex), exc_info=True)
+                logging.warning(f"scene.toggles.parse.error scene_id={str(row.get('id'))} err={str(ex)}", exc_info=True)
             # choose voice: character-specific -> scene plan -> film-level preference
             voice = None
             try:
@@ -11199,7 +11376,7 @@ async def _update_scene_from_job(job_id: str, detail: Dict[str, Any] | str, fail
                         if isinstance(meta, dict):
                             voice = meta.get("voice")
             except Exception as ex:
-                logging.warning("scene.voice.resolve.error scene_id=%s err=%s", str(row.get("id")), str(ex), exc_info=True)
+                logging.warning(f"scene.voice.resolve.error scene_id={str(row.get('id'))} err={str(ex)}", exc_info=True)
             # language preference
             language = None
             try:
@@ -11208,7 +11385,7 @@ async def _update_scene_from_job(job_id: str, detail: Dict[str, Any] | str, fail
                     if isinstance(meta, dict):
                         language = meta.get("language")
             except Exception as ex:
-                logging.warning("scene.language.resolve.error scene_id=%s err=%s", str(row.get("id")), str(ex), exc_info=True)
+                logging.warning(f"scene.language.resolve.error scene_id={str(row.get('id'))} err={str(ex)}", exc_info=True)
             if XTTS_API_URL and ALLOW_TOOL_EXECUTION and scene_text and audio_enabled:
                 async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
                     tr = await client.post(XTTS_API_URL.rstrip("/") + "/tts", json={"text": scene_text, "voice": voice, "language": language})
@@ -11226,7 +11403,7 @@ async def _update_scene_from_job(job_id: str, detail: Dict[str, Any] | str, fail
                 srt = _text_to_simple_srt(scene_text, duration)
                 assets["subtitles_srt"] = srt
         except Exception as ex:
-            logging.warning("scene.assets.build.error scene_id=%s err=%s", str(row.get("id")), str(ex), exc_info=True)
+            logging.warning(f"scene.assets.build.error scene_id={str(row.get('id'))} err={str(ex)}", exc_info=True)
         # Update scene assets with audio
         if scene_tts or scene_music:
             assets = dict(assets)
@@ -11239,7 +11416,7 @@ async def _update_scene_from_job(job_id: str, detail: Dict[str, Any] | str, fail
         try:
             await _maybe_compile_film(row["film_id"])
         except Exception as ex:
-            logging.warning("film.compile.maybe.error film_id=%s err=%s", str(row.get("film_id")), str(ex), exc_info=True)
+            logging.warning(f"film.compile.maybe.error film_id={str(row.get('film_id'))} err={str(ex)}", exc_info=True)
 
 
 def _mean_normalize_embedding(embs: List[List[float]]) -> List[float]:
@@ -11279,7 +11456,7 @@ async def _maybe_compile_film(film_id: str) -> None:
                 parser = JSONParser()
                 assembly_result = parser.parse(r.text or "", {})
         except Exception as ex:
-            logging.warning("film.compile.assembler.failed film_id=%s: %s", str(film_id), ex, exc_info=True)
+            logging.warning(f"film.compile.assembler.failed film_id={str(film_id)}: {ex}", exc_info=True)
             assembly_result = {"error": True, "message": str(ex)}
     elif N8N_WEBHOOK_URL and ENABLE_N8N:
         try:
@@ -11288,7 +11465,7 @@ async def _maybe_compile_film(film_id: str) -> None:
                 parser = JSONParser()
                 assembly_result = parser.parse(r.text or "", {})
         except Exception as ex:
-            logging.warning("film.compile.n8n.failed film_id=%s: %s", str(film_id), ex, exc_info=True)
+            logging.warning(f"film.compile.n8n.failed film_id={str(film_id)}: {ex}", exc_info=True)
             assembly_result = {"error": True, "message": str(ex)}
     # Always write a manifest to uploads for convenience
     manifest_url = None
@@ -11301,7 +11478,7 @@ async def _maybe_compile_film(film_id: str) -> None:
                 name = f"film_{film_id}_manifest.json"
                 manifest_url = (f"{PUBLIC_BASE_URL.rstrip('/')}/uploads/{name}" if PUBLIC_BASE_URL else f"/uploads/{name}")
     except Exception as ex:
-        logging.warning("film.compile.manifest_write.error film_id=%s err=%s", str(film_id), str(ex), exc_info=True)
+        logging.warning(f"film.compile.manifest_write.error film_id={str(film_id)} err={str(ex)}", exc_info=True)
     # persist compile artifact into films.metadata
     async with pool.acquire() as conn:
         meta_row = await conn.fetchrow("SELECT metadata FROM films WHERE id=$1", film_id)

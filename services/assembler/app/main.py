@@ -95,8 +95,9 @@ def _ffmpeg_mux(
     subprocess.run(cmd, check=True)
 
 
-def _download(url: str, dest_path: str, timeout: int = 60) -> None:
-    r = requests.get(url)
+def _download(url: str, dest_path: str, timeout: float | None = None) -> None:
+    # TIMEOUTS FORBIDDEN: requests default is no timeout; pass timeout=None explicitly.
+    r = requests.get(url, timeout=timeout)
     with open(dest_path, "wb") as f:
         f.write(r.content)
 
