@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import math
@@ -18,6 +19,10 @@ class JSONParser:
     2) If source is str: try json.loads immediately (no fixes). If ok, return it.
     3) Only if json.loads fails: then do repairs/extraction/fallback parsing.
     4) Finally: coerce to expected_structure without dropping extras, and pack misplaced keys.
+
+    EXTRA SAFETY (added):
+    - The final returned value is guaranteed JSON-serializable by converting
+      bytes/bytearray/memoryview anywhere in the tree into base64 strings.
     """
 
     def __init__(self) -> None:
@@ -72,7 +77,65 @@ class JSONParser:
             coerced = self._default_for_schema(expected_structure)
         if coerced is None:
             coerced = self._default_for_schema(expected_structure)
+
+        # CRITICAL: ensure the final output is JSON-serializable (fixes bytes leaks).
+        coerced = self._json_sanitize_any_safe(coerced)
         return coerced
+
+    # ---------------- JSON-serializable sanitation (bytes-safe) ----------------
+
+    def _bytes_to_b64(self, v: Any) -> str:
+        try:
+            b = bytes(v)
+        except Exception as exc:
+            self._err(f"bytes_to_b64:{type(exc).__name__}:{exc}")
+            return "b64:"
+        try:
+            return "b64:" + base64.b64encode(b).decode("ascii")
+        except Exception as exc:
+            self._err(f"bytes_b64encode:{type(exc).__name__}:{exc}")
+            return "b64:"
+
+    def _json_sanitize_any_safe(self, v: Any) -> Any:
+        try:
+            return self._json_sanitize_any(v)
+        except Exception as exc:
+            self._err(f"json_sanitize_any:{type(exc).__name__}:{exc}")
+            # last-resort: stringify so response never kills the connection
+            try:
+                return str(v)
+            except Exception:
+                return ""
+
+    def _json_sanitize_any(self, v: Any) -> Any:
+        # bytes anywhere -> base64 string (lossless)
+        if isinstance(v, (bytes, bytearray, memoryview)):
+            return self._bytes_to_b64(v)
+
+        # dict: sanitize keys + values
+        if isinstance(v, dict):
+            out: Dict[str, Any] = {}
+            for k, val in v.items():
+                # JSON requires string keys; ensure keys are safe
+                if isinstance(k, (bytes, bytearray, memoryview)):
+                    key = self._bytes_to_b64(k)
+                else:
+                    key = str(k)
+                out[key] = self._json_sanitize_any(val)
+            return out
+
+        # list/tuple/set: sanitize elements (and normalize to list)
+        if isinstance(v, list):
+            return [self._json_sanitize_any(x) for x in v]
+        if isinstance(v, (tuple, set, frozenset)):
+            return [self._json_sanitize_any(x) for x in list(v)]
+
+        # primitives are fine
+        if v is None or isinstance(v, (str, int, float, bool)):
+            return v
+
+        # anything else: to be absolutely safe, stringify here instead of returning raw objects.
+        return str(v)
 
     # ---------------- any-type raw parsing ----------------
 

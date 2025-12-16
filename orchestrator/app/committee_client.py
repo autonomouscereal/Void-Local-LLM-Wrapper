@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional
 import os
 import time
 
-import httpx  # type: ignore
+import requests  # type: ignore
 
 from .json_parser import JSONParser
 
@@ -126,17 +126,42 @@ def build_ollama_payload(messages: List[Dict[str, Any]], model: str, num_ctx: in
 
 async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str) -> Dict[str, Any]:
     t0 = time.monotonic()
-    async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
-        r = await client.post(f"{(base_url or '').rstrip('/')}/api/generate", json=dict(payload))
+    url = f"{(base_url or '').rstrip('/')}/api/generate"
+    try:
+        with requests.Session() as s:
+            # Mirror httpx trust_env=False: ignore proxy env vars (prevents odd corporate proxy issues).
+            try:
+                s.trust_env = False
+            except Exception:
+                pass
+            r = s.post(url, json=dict(payload))
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": {
+                "code": "ollama_request_failed",
+                "message": str(exc),
+                "base_url": str(base_url),
+            },
+        }
 
-    raw_text = r.text or ""
-    status_code = int(r.status_code)
+    status_code = int(getattr(r, "status_code", 0) or 0)
+    parsed_any: Any = None
+    raw_text = ""
+    try:
+        parsed_any = r.json()
+    except Exception:
+        raw_text = str(getattr(r, "text", "") or "")
 
-    parser = JSONParser()
-    parsed_obj = parser.parse(raw_text or "{}", {})
-    parsed = parsed_obj if isinstance(parsed_obj, dict) else {}
+    # Normalize to dict-like payload (Ollama should return JSON, but we fail-soft).
+    parsed: Dict[str, Any] = parsed_any if isinstance(parsed_any, dict) else {}
+    if not parsed and raw_text:
+        parser = JSONParser()
+        parsed_obj = parser.parse(raw_text or "{}", {})
+        parsed = parsed_obj if isinstance(parsed_obj, dict) else {}
 
     if not (200 <= status_code < 300):
+        body: Any = parsed_any if parsed_any is not None else raw_text
         return {
             "ok": False,
             "error": {
@@ -144,7 +169,7 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str) -> 
                 "message": f"ollama returned HTTP {status_code}",
                 "status": status_code,
                 "base_url": str(base_url),
-                "body": raw_text,
+                "body": body,
             },
         }
 
@@ -156,7 +181,7 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str) -> 
     prompt_eval = int(prompt_eval_val) if isinstance(prompt_eval_val, (int, float)) else 0
     eval_count = int(eval_count_val) if isinstance(eval_count_val, (int, float)) else 0
 
-    data: Dict[str, Any] = {
+    out: Dict[str, Any] = {
         "ok": True,
         "response": response_str,
         "prompt_eval_count": prompt_eval,
@@ -164,12 +189,12 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str) -> 
         "dur_ms": int((time.monotonic() - t0) * 1000.0),
     }
     if prompt_eval or eval_count:
-        data["_usage"] = {
+        out["_usage"] = {
             "prompt_tokens": int(prompt_eval),
             "completion_tokens": int(eval_count),
             "total_tokens": int(prompt_eval) + int(eval_count),
         }
-    return data
+    return out
 
 
 async def committee_member_text(
@@ -241,26 +266,3 @@ async def committee_jsonify(
     parser = JSONParser()
     obj = parser.parse(txt or "{}", expected_schema)
     return obj if isinstance(obj, dict) else {}
-
-def _schema_to_template(expected: Any) -> Any:
-    if isinstance(expected, dict):
-        return {k: _schema_to_template(v) for k, v in expected.items()}
-    if isinstance(expected, list):
-        if not expected:
-            return []
-        return [_schema_to_template(expected[0])]
-    if isinstance(expected, type):
-        if issubclass(expected, bool):
-            return False
-        if issubclass(expected, int):
-            return 0
-        if issubclass(expected, float):
-            return 0.0
-        if issubclass(expected, str):
-            return ""
-        if issubclass(expected, (list, tuple, set)):
-            return []
-        if issubclass(expected, dict):
-            return {}
-        return None
-    return expected
