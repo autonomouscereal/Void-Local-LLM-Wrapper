@@ -6,7 +6,6 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from ..json_parser import JSONParser
-from ..pipeline.compression_orchestrator import co_pack, frames_to_string
 from ..tracing.runtime import trace_event
 from ..committee_client import CommitteeClient, committee_jsonify, _schema_to_template
 
@@ -132,8 +131,7 @@ async def plan_song_graph(
     """
     LLM-driven Song Graph planner.
 
-    Uses the same CO packing and JSONParser infrastructure as the main planner,
-    but targets a compact Song Graph JSON shape under {"song": SONG_GRAPH_SCHEMA}.
+    Targets a compact Song Graph JSON shape under {"song": SONG_GRAPH_SCHEMA}.
     """
     text = str(user_text or "").strip()
     approx_len = 30
@@ -150,36 +148,12 @@ async def plan_song_graph(
     bpm_val = int(bpm) if isinstance(bpm, (int, float)) and bpm and bpm > 0 else 0
     key_txt = str(key or "").strip()
 
-    co_env = {
-        "schema_version": 1,
-        "trace_id": str(trace_id).strip(),
-        "call_kind": "planner",
-        "model_caps": {"num_ctx": 8192},
-        "user_turn": {"role": "user", "content": text},
-        "history": [],
-        "attachments": [],
-        "tool_memory": [],
-        "rag_hints": [],
-        "subject_canon": {},
-        "percent_budget": {
-            "icw_pct": [65, 70],
-            "tools_pct": [18, 20],
-            "misc_pct": [3, 5],
-            "buffer_pct": 5,
-        },
-        "sweep_plan": ["0-90", "30-120", "60-150+wrap"],
-    }
-    co_out = co_pack(co_env)
-    frames_text = frames_to_string(co_out.get("frames") or [])
-
     schema_wrapper = {"song": SONG_GRAPH_SCHEMA}
     profile_txt = ""
     if isinstance(music_profile, dict) and music_profile:
         profile_txt = json.dumps(music_profile, ensure_ascii=False, default=str)
     prompt = (
-        frames_text
-        + "\n\n"
-        + "You are MusicOps Song Planner. Plan a complete song structure before any audio is generated.\n"
+        "You are MusicOps Song Planner. Plan a complete song structure before any audio is generated.\n"
         + "Return ONLY JSON matching this schema exactly:\n"
         + json.dumps(_schema_to_template(schema_wrapper), ensure_ascii=False)
         + "\n\n"

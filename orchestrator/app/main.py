@@ -2553,11 +2553,7 @@ async def propose_search_queries(messages: List[Dict[str, Any]]) -> List[str]:
     )
     prompt_messages = messages + [{"role": "user", "content": guidance}]
     try:
-        env = await committee_ai_text(
-            prompt_messages,
-            trace_id="search_suggest",
-            temperature=DEFAULT_TEMPERATURE,
-        )
+        env = await committee_ai_text(messages=prompt_messages, trace_id="search_suggest", temperature=DEFAULT_TEMPERATURE)
     except Exception as ex:
         # Fail-soft: log and return no suggestions instead of killing the request
         _log(
@@ -7890,9 +7886,9 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         _log("planner.call", trace_id=trace_id, mode=effective_mode)
         logging.debug("chat_completions:planner.call trace_id=%s effective_mode=%s", trace_id, effective_mode)
         plan_text, tool_calls, planner_env = await produce_tool_plan(
-            messages,
-            tools_spec,
-            exec_temperature,
+            messages=messages,
+            tools=tools_spec,
+            temperature=exec_temperature,
             trace_id=trace_id,
             mode=effective_mode,
         )
@@ -8748,7 +8744,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
         # Use the central committee path to derive a single merged LLM view over exec_messages.
         try:
             llm_env = await committee_ai_text(
-                exec_messages,
+                messages=exec_messages,
                 trace_id=f"{str(trace_id).strip() or 'tt_unknown'}.executor_summary",
                 temperature=exec_temperature,
             )
@@ -10388,11 +10384,7 @@ async def orcjob_stream(job_id: str, interval_ms: Optional[int] = None):
 @app.get("/debug")
 async def debug():
     try:
-        env = await committee_ai_text(
-            [{"role": "user", "content": "ping"}],
-            trace_id="debug_ping",
-            temperature=0.0,
-        )
+        env = await committee_ai_text(messages=[{"role": "user", "content": "ping"}], trace_id="debug_ping", temperature=0.0)
         ok = bool(isinstance(env, dict) and env.get("ok"))
         err = (env or {}).get("error") if isinstance(env, dict) else None
         return {"committee_ok": ok, "error": err, "envelope": env}

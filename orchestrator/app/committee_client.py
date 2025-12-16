@@ -10,7 +10,6 @@ import time
 import httpx  # type: ignore
 
 from .json_parser import JSONParser
-from .pipeline.compression_orchestrator import co_pack, frames_to_messages
 from .trace_utils import emit_trace
 
 # Single logger per module (no custom logger names)
@@ -539,6 +538,7 @@ async def committee_synth_text(
 
 async def committee_ai_text(
     messages: List[Dict[str, Any]],
+    *,
     trace_id: str,
     rounds: int | None = None,
     temperature: float = 0.3,
@@ -1024,7 +1024,7 @@ async def committee_jsonify(
         {"role": "user", "content": raw_text or ""},
     ]
     env = await committee_ai_text(
-        messages,
+        messages=messages,
         trace_id=trace_full,
         rounds=rounds,
         temperature=temperature,
@@ -1368,7 +1368,7 @@ class CommitteeClient:
         temperature: float = 0.3,
     ) -> Dict[str, Any]:
         return await committee_ai_text(
-            messages,
+            messages=messages,
             trace_id=trace_id,
             rounds=rounds,
             temperature=temperature,

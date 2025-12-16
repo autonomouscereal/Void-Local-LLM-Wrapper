@@ -5,7 +5,6 @@ import logging
 import time
 from typing import Dict, Any, List, Optional, Tuple
 
-from ..pipeline.compression_orchestrator import co_pack, frames_to_string
 from ..committee_client import committee_ai_text, committee_jsonify
 from ..json_parser import JSONParser
 from .catalog import PLANNER_VISIBLE_TOOLS
@@ -131,13 +130,13 @@ async def produce_tool_plan(
     """
     effective_mode = str(mode).strip() or "general"
     t0 = time.perf_counter()
-    tid = str(trace_id).strip() or "planner"
-    msgs = _safe_message_list(messages or [], trace_id=tid)
-    tools = _safe_tools_list(tools, trace_id=tid)
+    trace_id = str(trace_id).strip()
+    messages = _safe_message_list(messages or [], trace_id=trace_id)
+    tools = _safe_tools_list(tools, trace_id=trace_id)
     try:
         temp = float(temperature)
     except Exception as exc:
-        log.warning("planner bad temperature=%r trace_id=%s; defaulting to 0.2", temperature, tid, exc_info=True)
+        log.warning("planner bad temperature=%r trace_id=%s; defaulting to 0.2", temperature, trace_id, exc_info=True)
         temp = 0.2
     if temp < 0.0:
         temp = 0.0
@@ -146,7 +145,7 @@ async def produce_tool_plan(
 
     # Latest user text for goal anchoring.
     last_user = ""
-    for m in reversed(msgs):
+    for m in reversed(messages):
         if (
             isinstance(m, dict)
             and m.get("role") == "user"
@@ -156,15 +155,15 @@ async def produce_tool_plan(
             last_user = m.get("content").strip()
             break
     if not last_user:
-        log.warning("planner no_last_user trace_id=%s msgs=%s", tid, len(msgs))
+        log.warning("planner no_last_user trace_id=%s msgs=%s", trace_id, len(messages))
 
     # Planner-visible tool palette (fixed) — keep consistent with plan.catalog.
     allowed_tools = sorted([t for t in (PLANNER_VISIBLE_TOOLS or set()) if isinstance(t, str) and t.strip()])
     log.info(
         "planner.start trace_id=%s mode=%s msgs=%s tools_param=%s allowed_tools=%s temp=%s last_user_len=%s",
-        tid,
+        trace_id,
         effective_mode,
-        len(msgs),
+        len(messages),
         (len(tools) if isinstance(tools, list) else 0),
         len(allowed_tools),
         temp,
@@ -180,27 +179,8 @@ async def produce_tool_plan(
     elif effective_mode == "audio":
         mode_system = SYSTEM_AUDIO
 
-    # CO frames (prompt-only) to provide compact guidance.
-    co_env = {
-        "schema_version": 1,
-        "trace_id": str(trace_id or ""),
-        "call_kind": "planner",
-        "model_caps": {"num_ctx": 8192},
-        "user_turn": {"role": "user", "content": last_user},
-        "history": msgs,
-        "attachments": [],
-        "tool_memory": [],
-        "rag_hints": [],
-        "subject_canon": {},
-        "percent_budget": {"icw_pct": [65, 70], "tools_pct": [18, 20], "misc_pct": [3, 5], "buffer_pct": 5},
-        "sweep_plan": ["0-90", "30-120", "60-150+wrap"],
-    }
-    try:
-        co_out = co_pack(co_env)
-        frames_text = frames_to_string(co_out.get("frames") or [])
-    except Exception as exc:
-        log.error("planner co_pack failed trace_id=%s: %s", tid, exc, exc_info=True)
-        return "", [], {"ok": False, "error": {"code": "planner_co_pack_failed", "message": str(exc)}}
+    # No context orchestration in planning: pass messages directly to the committee
+    # (mode steering + tool catalog + planner rules only).
 
     # Tool catalog: strict, explicit, planner-visible tools only.
     catalog_lines: List[str] = [
@@ -213,7 +193,7 @@ async def produce_tool_plan(
             catalog_lines.append(f"- tool: {name}")
             catalog_lines.append("  json_schema: " + json.dumps(schema or {}, ensure_ascii=False, sort_keys=True))
         except Exception as exc:  # pragma: no cover - defensive logging
-            log.error("planner tool catalog build failed trace_id=%s tool=%r: %s", tid, name, exc, exc_info=True)
+            log.error("planner tool catalog build failed trace_id=%s tool=%r: %s", trace_id, name, exc, exc_info=True)
             catalog_lines.append(f"- tool: {name}")
             catalog_lines.append("  json_schema: {}")
     tool_catalog_frame = {"role": "system", "content": "\n".join(catalog_lines)}
@@ -231,31 +211,30 @@ async def produce_tool_plan(
 
     plan_messages = [
         {"role": "system", "content": mode_system},
-        {"role": "system", "content": frames_text},
         tool_catalog_frame,
         {"role": "system", "content": planner_rules},
-    ] + msgs
+    ] + messages
 
     t_call = time.perf_counter()
     try:
         env = await committee_ai_text(
-            plan_messages,
-            trace_id=tid,
+            messages=plan_messages,
+            trace_id=trace_id,
             temperature=float(temp),
         )
     except Exception as ex:
-        log.error("planner committee_ai_text exception trace_id=%s: %s", tid, ex, exc_info=True)
+        log.error("planner committee_ai_text exception trace_id=%s: %s", trace_id, ex, exc_info=True)
         return "", [], {"ok": False, "error": {"code": "planner_committee_exception", "message": str(ex)}}
     call_ms = int((time.perf_counter() - t_call) * 1000)
 
     planner_env: Dict[str, Any] = env if isinstance(env, dict) else {"ok": False, "error": {"code": "planner_env_invalid", "message": str(env)}}
     if not planner_env.get("ok"):
-        log.warning("planner committee not ok trace_id=%s call_ms=%s env=%r", tid, call_ms, planner_env.get("error") or planner_env)
+        log.warning("planner committee not ok trace_id=%s call_ms=%s env=%r", trace_id, call_ms, planner_env.get("error") or planner_env)
         return "", [], planner_env
 
     res = planner_env.get("result") if isinstance(planner_env.get("result"), dict) else {}
     raw_text = res.get("text") if isinstance(res.get("text"), str) else ""
-    log.info("planner committee ok trace_id=%s call_ms=%s raw_len=%s", tid, call_ms, len(raw_text))
+    log.info("planner committee ok trace_id=%s call_ms=%s raw_len=%s", trace_id, call_ms, len(raw_text))
 
     schema_steps = {
         "steps": [
@@ -275,11 +254,11 @@ async def produce_tool_plan(
         parsed = await committee_jsonify(
             raw_text or "{}",
             expected_schema=schema_steps,
-            trace_id=tid,
+            trace_id=trace_id,
             temperature=0.0,
         )
     except Exception as ex:
-        log.error("planner committee_jsonify exception trace_id=%s: %s", tid, ex, exc_info=True)
+        log.error("planner committee_jsonify exception trace_id=%s: %s", trace_id, ex, exc_info=True)
         parsed = {"steps": [], "error": {"code": "planner_jsonify_error", "message": str(ex)}}
     parse_ms = int((time.perf_counter() - t_parse) * 1000)
 
@@ -309,10 +288,10 @@ async def produce_tool_plan(
                     j = parser.parse(args_val, {})
                     args_val = j if isinstance(j, dict) else {"_value": j}
                     if getattr(parser, "errors", None):
-                        log.warning("planner tool args JSONParser had errors trace_id=%s tool=%s errors=%s", tid, tool_name, parser.errors)
+                        log.warning("planner tool args JSONParser had errors trace_id=%s tool=%s errors=%s", trace_id, tool_name, parser.errors)
                 except Exception as ex:
                     # Never raise from planner normalization; preserve the raw value for downstream debugging.
-                    log.warning("planner tool args parse failed trace_id=%s tool=%s: %s", tid, tool_name, ex, exc_info=True)
+                    log.warning("planner tool args parse failed trace_id=%s tool=%s: %s", trace_id, tool_name, ex, exc_info=True)
                     args_val = {"_raw": args_val}
                 coerced_args += 1
             else:
@@ -323,7 +302,7 @@ async def produce_tool_plan(
     dt_ms = int((time.perf_counter() - t0) * 1000)
     log.info(
         "planner.done trace_id=%s mode=%s steps_in=%s steps_out=%s rejected=%s coerced_args=%s parse_ms=%s total_ms=%s",
-        tid,
+        trace_id,
         effective_mode,
         (len(steps_raw) if isinstance(steps_raw, list) else -1),
         len(tool_calls),

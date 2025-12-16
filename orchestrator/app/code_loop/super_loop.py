@@ -49,7 +49,7 @@ async def run_super_loop(task: str, repo_root: str, *, trace_id: str, step_token
     # Phase 1: Architect
     arch_in = build_architect_input(task, idx)
     arch_env = await committee_ai_text(
-        [{"role": "user", "content": arch_in}],
+        messages=[{"role": "user", "content": arch_in}],
         trace_id=str(trace_id or "code_super_loop") + ".architect",
         temperature=0.3,
     )
@@ -71,7 +71,7 @@ async def run_super_loop(task: str, repo_root: str, *, trace_id: str, step_token
     # Phase 2: Implementer
     impl_in = build_implementer_input(plan, excerpts)
     impl_env = await committee_ai_text(
-        [{"role": "user", "content": impl_in}],
+        messages=[{"role": "user", "content": impl_in}],
         trace_id=str(trace_id or "code_super_loop") + ".implementer",
         temperature=0.3,
     )
@@ -86,7 +86,7 @@ async def run_super_loop(task: str, repo_root: str, *, trace_id: str, step_token
     # Phase 3: Reviewer
     rev_in = build_reviewer_input(task, plan, patch)
     rev_env = await committee_ai_text(
-        [{"role": "user", "content": rev_in}],
+        messages=[{"role": "user", "content": rev_in}],
         trace_id=str(trace_id or "code_super_loop") + ".reviewer",
         temperature=0.3,
     )

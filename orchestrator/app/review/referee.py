@@ -170,11 +170,7 @@ async def postrun_committee_decide(
     # Two-model postrun committee: gather decisions from all participants and merge.
     # Post-run decision is now derived from a single committee debate call.
     decisions: List[Dict[str, Any]] = []
-    env_decide = await committee_ai_text(
-        msgs,
-        trace_id=str(trace_id or "committee_postrun"),
-        temperature=0.0,
-    )
+    env_decide = await committee_ai_text(messages=msgs, trace_id=str(trace_id or "committee_postrun"), temperature=0.0)
     if isinstance(env_decide, dict) and env_decide.get("ok"):
         res_decide = env_decide.get("result") or {}
         txt_decide = res_decide.get("text") or ""
