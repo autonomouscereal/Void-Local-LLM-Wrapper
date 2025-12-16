@@ -7704,11 +7704,10 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             else:
                 request_id = uuid.uuid4().hex
 
-        trace_id = ""
-        if isinstance(body0.get("trace_id"), (str, int)) and str(body0.get("trace_id")).strip():
-            trace_id = str(body0.get("trace_id")).strip()
-        else:
-            trace_id = trace_id
+        # trace_id is not part of the OpenAI chat completions contract; generate one when missing
+        # so all planner/executor logs and artifacts are correlated.
+        trace_id = uuid.uuid4().hex
+        logging.debug("chat_completions:trace_id source=%s trace_id=%s", trace_src, trace_id)
 
         # messages (verbatim)
         messages: List[Dict[str, Any]] = []
