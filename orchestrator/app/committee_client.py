@@ -71,7 +71,7 @@ def _participant_for(member_id: str) -> Optional[Dict[str, str]]:
     return cfg if isinstance(cfg, dict) else None
 
 
-def build_ollama_payload(messages: List[Dict[str, Any]], model: str, num_ctx: int, temperature: float):
+def build_ollama_payload(messages: List[Dict[str, Any]], model: str, num_ctx: int, temperature: float = 0.3):
     prompt = (messages)
 
     return {
@@ -172,5 +172,5 @@ async def committee_ai_text(messages: List[Dict[str, Any]], trace_id: str, round
     }
 
 
-async def committee_jsonify(raw_text: str, expected_schema: Any, trace_id: str, rounds: int | None = None, temperature: float = 0.0):
+async def committee_jsonify(raw_text: str, expected_schema: Any, trace_id: str, rounds: int | None = None, temperature: float = 0.3):
     return  {}
