@@ -1244,7 +1244,17 @@ async def committee_jsonify(
                 seed = _default_for(expected_schema)
             try:
                 merged = JSONParser().parse(seed, expected_schema)
-            except Exception:
+            except Exception as exc:
+                # Defensive: JSONParser should not raise here, but if it does, log so we don't silently
+                # degrade the output shape (this can otherwise look like "the request died").
+                log.warning(
+                    "[committee.jsonify] merge.seed_parse_failed trace_id=%s schema_type=%s seed_type=%s error=%s",
+                    trace_base,
+                    str(type(expected_schema).__name__),
+                    str(type(seed).__name__),
+                    str(exc),
+                    exc_info=True,
+                )
                 merged = seed
 
     emit_trace(

@@ -7,6 +7,7 @@ from typing import Dict, Any, List, Optional, Tuple
 
 from ..pipeline.compression_orchestrator import co_pack, frames_to_string
 from ..committee_client import committee_ai_text, committee_jsonify
+from ..json_parser import JSONParser
 from .catalog import PLANNER_VISIBLE_TOOLS
 from ..tools_schema import get_builtin_tools_schema
 
@@ -86,7 +87,9 @@ def _safe_message_list(messages: Any, *, trace_id: str) -> List[Dict[str, Any]]:
         if content is not None and not isinstance(content, str):
             try:
                 content = str(content)
-            except Exception:
+            except Exception as ex:
+                # Extremely defensive: content coercion should not fail, but if it does, log so it's not silent.
+                log.warning("planner message content str() failed trace_id=%s type=%s: %s", trace_id, type(content).__name__, ex, exc_info=True)
                 content = repr(content)
         out.append({"role": role.strip(), "content": (content or "")})
     if dropped:
@@ -300,10 +303,16 @@ async def produce_tool_plan(
             coerced_args += 1
         elif not isinstance(args_val, dict):
             if isinstance(args_val, str):
+                # IMPORTANT: only use the Void JSON parser for parsing.
+                parser = JSONParser()
                 try:
-                    j = json.loads(args_val)
+                    j = parser.parse(args_val, {})
                     args_val = j if isinstance(j, dict) else {"_value": j}
-                except Exception:
+                    if getattr(parser, "errors", None):
+                        log.warning("planner tool args JSONParser had errors trace_id=%s tool=%s errors=%s", tid, tool_name, parser.errors)
+                except Exception as ex:
+                    # Never raise from planner normalization; preserve the raw value for downstream debugging.
+                    log.warning("planner tool args parse failed trace_id=%s tool=%s: %s", tid, tool_name, ex, exc_info=True)
                     args_val = {"_raw": args_val}
                 coerced_args += 1
             else:

@@ -1356,74 +1356,6 @@ def finalize_response(trace_id: str, messages: List[Dict[str, Any]], state: RunS
     checkpoints_append_event(STATE_DIR, str(trace_id), "response.preview", {"ok": ok_flag, "assets": len(urls)})
     return resp
 
-@app.get("/minimal")
-async def minimal_same_origin():
-    """
-    Same-origin minimal UI to eliminate CORS entirely. Posts to /v1/chat/completions on this host.
-    """
-    html = """<!doctype html>
-<html>
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Minimal Same-Origin Client</title>
-    <style>
-      body { background:#0b0b0f; color:#e6e6e6; font-family: ui-sans-serif, system-ui, Arial; margin:0; padding:20px; }
-      .row { display:flex; gap:8px; margin-bottom:8px; align-items:center; }
-      input, textarea, button { background:#0f172a; color:#fff; border:1px solid #333; border-radius:6px; padding:8px; }
-      textarea { width:100%; }
-      #out { white-space:pre-wrap; background:#111827; border:1px solid #222; border-radius:8px; padding:12px; min-height:160px; }
-      label.small { font-size:12px; color:#9ca3af; }
-    </style>
-  </head>
-  <body>
-    <h2>Same-Origin /v1/chat/completions</h2>
-    <div class="row">
-      <textarea id="prompt" rows="4" placeholder="Describe the image…">please draw me a picture of shadow the hedgehog</textarea>
-    </div>
-    <div class="row">
-      <button id="send">Send</button>
-      <label class="small" id="status"></label>
-    </div>
-    <div id="out"></div>
-    <script>
-      const statusEl = document.getElementById('status');
-      const outEl = document.getElementById('out');
-      const promptEl = document.getElementById('prompt');
-      function setStatus(s){ statusEl.textContent = s; }
-      function setOut(t){ outEl.textContent = t; }
-      document.getElementById('send').onclick = async () => {
-        const url = '/v1/chat/completions';
-        const body = JSON.stringify({ messages: [{ role: 'user', content: promptEl.value }], stream: false });
-        setStatus('Sending…'); setOut('');
-        const xhr = new XMLHttpRequest();
-        xhr.open('POST', url, true);
-        xhr.timeout = 0; xhr.withCredentials = false;
-        xhr.setRequestHeader('Content-Type', 'application/json');
-        xhr.setRequestHeader('Accept', '*/*');
-        xhr.onreadystatechange = () => {
-          if (xhr.readyState !== 4) return;
-          setStatus('Done ('+xhr.status+')');
-          const txt = xhr.responseText || '';
-          try { setOut(JSON.stringify(JSON.parse(txt), null, 2)); } catch { setOut(txt); }
-        };
-        xhr.onabort = () => { setStatus('Aborted'); setOut('Request aborted by browser'); };
-        xhr.ontimeout = () => { setStatus('Timed out'); setOut('Client-side timeout'); };
-        xhr.onerror = () => { setStatus('Network error'); setOut('Network error'); };
-        try { xhr.send(body); } catch(e){ setStatus('Send failed'); setOut(String(e && e.message || e)); }
-      };
-    </script>
-  </body>
-</html>"""
-    return Response(
-        content=html,
-        media_type="text/html",
-        headers={
-            "Cache-Control": "no-store",
-            "Connection": "close",
-            "Content-Length": str(len(html.encode("utf-8"))),
-        },
-    )
 
 # Reflective CORS headers on all responses to satisfy browsers with credentials
 @app.middleware("http")
@@ -1445,7 +1377,30 @@ async def _reflect_cors_headers(request: Request, call_next):
         }
         # Return 200 with an explicit zero-length body to avoid chunked 204s confusing some browsers/proxies
         return Response(content=b"", status_code=200, headers=headers, media_type="text/plain")
-    response = await call_next(request)
+    try:
+        response = await call_next(request)
+    except Exception as ex:
+        # If anything raises inside the route stack, browsers often surface it as a CORS error because
+        # the connection closes before any CORS headers are applied. Always return a JSON body + CORS.
+        logging.error("http.exception (cors_reflect) path=%s: %s", str(request.url.path), ex, exc_info=True)
+        origin = request.headers.get("origin") or request.headers.get("Origin")
+        hdrs = {
+            "Access-Control-Allow-Origin": origin or "*",
+            "Vary": "Origin",
+            "Access-Control-Allow-Credentials": "true",
+            "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+            "Access-Control-Allow-Headers": request.headers.get("access-control-request-headers") or "*",
+            "Access-Control-Expose-Headers": "*",
+            "Access-Control-Allow-Private-Network": "true",
+            "Cross-Origin-Resource-Policy": "cross-origin",
+            "Timing-Allow-Origin": "*",
+        }
+        body = {
+            "ok": False,
+            "error": {"code": "internal_error", "message": str(ex)},
+            "_meta": {"route": str(request.url.path), "method": str(request.method)},
+        }
+        return Response(content=json.dumps(body, ensure_ascii=False), status_code=500, media_type="application/json", headers=hdrs)
     origin = request.headers.get("origin") or request.headers.get("Origin")
     if origin:
         response.headers["Access-Control-Allow-Origin"] = origin
@@ -1468,7 +1423,28 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 # Stamp permissive headers on every HTTP response to avoid any CORS/CORP issues
 @app.middleware("http")
 async def _perm_headers(request: Request, call_next):
-    resp = await call_next(request)
+    try:
+        resp = await call_next(request)
+    except Exception as ex:
+        logging.error("http.exception (perm_headers) path=%s: %s", str(request.url.path), ex, exc_info=True)
+        origin = request.headers.get("origin") or request.headers.get("Origin")
+        hdrs = {
+            "Access-Control-Allow-Origin": origin or "*",
+            "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
+            "Access-Control-Expose-Headers": "*",
+            "Access-Control-Allow-Credentials": "false",
+            "Access-Control-Allow-Private-Network": "true",
+            "Cross-Origin-Resource-Policy": "cross-origin",
+            "Timing-Allow-Origin": "*",
+            "Vary": "Origin",
+        }
+        body = {
+            "ok": False,
+            "error": {"code": "internal_error", "message": str(ex)},
+            "_meta": {"route": str(request.url.path), "method": str(request.method)},
+        }
+        return Response(content=json.dumps(body, ensure_ascii=False), status_code=500, media_type="application/json", headers=hdrs)
     resp.headers.setdefault("Access-Control-Allow-Origin", "*")
     resp.headers.setdefault("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
     resp.headers.setdefault("Access-Control-Allow-Headers", "*")
@@ -1615,7 +1591,28 @@ async def global_cors_middleware(request: Request, call_next):
         }
         # Always 200 with explicit zero-length body to avoid 204/chunked quirks
         return Response(content=b"", status_code=200, headers=hdrs, media_type="text/plain")
-    resp = await call_next(request)
+    try:
+        resp = await call_next(request)
+    except Exception as ex:
+        logging.error("http.exception (global_cors) path=%s: %s", str(request.url.path), ex, exc_info=True)
+        hdrs = {
+            "Access-Control-Allow-Origin": (origin or "*"),
+            "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
+            "Access-Control-Allow-Credentials": "true",
+            "Access-Control-Expose-Headers": "*",
+            "Access-Control-Max-Age": "86400",
+            "Access-Control-Allow-Private-Network": "true",
+            "Vary": "Origin",
+            "Cross-Origin-Resource-Policy": "cross-origin",
+            "Timing-Allow-Origin": "*",
+        }
+        body = {
+            "ok": False,
+            "error": {"code": "internal_error", "message": str(ex)},
+            "_meta": {"route": str(request.url.path), "method": str(request.method)},
+        }
+        return Response(content=json.dumps(body, ensure_ascii=False), status_code=500, media_type="application/json", headers=hdrs)
     resp.headers["Access-Control-Allow-Origin"] = origin or "*"
     resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
     resp.headers["Access-Control-Allow-Headers"] = "*"
@@ -2190,6 +2187,30 @@ async def _send_trace_stream_async(payload: Dict[str, Any]) -> None:
         dt_ms = int((time.time() - t0) * 1000.0)
         _log("teacher.trace.append.exception", trace_id=str(payload.get("trace_id") or ""), url=url, ms=dt_ms, error=str(ex))
         logging.warning("teacher.trace.append failed url=%s: %s", url, ex, exc_info=True)
+
+
+def _spawn_bg(coro, *, label: str, trace_id: str = "") -> None:
+    """
+    Run a coroutine in the background without blocking the request path.
+    Any exception is logged (and not silently dropped).
+    """
+    try:
+        task = _as.create_task(coro)
+    except Exception as ex:  # pragma: no cover - defensive logging
+        logging.warning("bg.spawn.failed label=%s trace_id=%s: %s", label, trace_id, ex, exc_info=True)
+        return
+
+    def _done(t) -> None:
+        try:
+            t.result()
+        except Exception as ex:  # pragma: no cover - defensive logging
+            logging.warning("bg.task.failed label=%s trace_id=%s: %s", label, trace_id, ex, exc_info=True)
+
+    try:
+        task.add_done_callback(_done)
+    except Exception:  # pragma: no cover
+        # add_done_callback should never fail, but if it does, at least avoid crashing the caller.
+        pass
 
 
 async def _orcjob_stream_gen(job_id: str, interval_ms: Optional[int] = None):
@@ -7859,6 +7880,8 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 pct_budget=0.65,
                 step_out_tokens=512,
             )
+            if isinstance(icw_meta, dict) and not bool(icw_meta.get("ok", True)):
+                logging.warning("chat_completions:icw.pack_failed trace_id=%s cid=%r meta=%r", str(trace_id), conv_cid, icw_meta)
             logging.debug(
                 "chat_completions:icw packed icw_frame_type=%s pack_hash=%r icw_meta_keys=%r",
                 type(icw_frame).__name__,
@@ -9058,7 +9081,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
                 "privacy": {"vault_refs": 0, "secrets_in": 0, "secrets_out": 0},
                 "events": planned_events[:64],
             }
-            await _send_trace_stream_async(trace_payload_stream)
+            _spawn_bg(_send_trace_stream_async(trace_payload_stream), label="teacher.trace.append.stream", trace_id=str(trace_id))
             checkpoints_append_event(STATE_DIR, trace_id, "halt", {"kind": "committee", "chars": len(final_text)})
             # Do not stream; proceed to build the full final response below
 
@@ -9390,7 +9413,7 @@ async def chat_completions(body: Dict[str, Any], request: Request):
             "env": {"public_base_url": PUBLIC_BASE_URL, "config_hash": WRAPPER_CONFIG_HASH},
             "privacy": {"vault_refs": 0, "secrets_in": 0, "secrets_out": 0},
         }
-        await _send_trace_stream_async(trace_payload)
+        _spawn_bg(_send_trace_stream_async(trace_payload), label="teacher.trace.append", trace_id=str(trace_id))
 
         # response prepared; single return happens after the try/except.
     except Exception as ex:

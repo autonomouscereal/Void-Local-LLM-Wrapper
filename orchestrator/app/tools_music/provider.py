@@ -46,7 +46,18 @@ class RestMusicProvider:
 
     def compose(self, args: Dict[str, Any]) -> Dict[str, Any]:
         if not self._base:
-            raise RuntimeError("MUSIC_API_URL is not configured for RestMusicProvider")
+            # Never raise from tool providers; return empty audio with a structured error.
+            sample_rate = int(args.get("sample_rate") or 44100)
+            channels = int(args.get("channels") or 2)
+            return {
+                "wav_bytes": b"",
+                "sample_rate": sample_rate,
+                "channels": channels,
+                "error": {
+                    "code": "config_missing",
+                    "message": "MUSIC_API_URL is not configured for RestMusicProvider",
+                },
+            }
 
         seconds = int(args.get("length_s") or 30)
         sample_rate = int(args.get("sample_rate") or 44100)

@@ -53,7 +53,9 @@ def make_entity_header(state) -> str:
             continue
         try:
             safe_ents.append(str(e))
-        except Exception:
+        except Exception as exc:
+            # Defensive: avoid silently dropping weird entity objects.
+            log.warning("icw.assembler entity str() failed type=%s: %s", type(e).__name__, exc, exc_info=True)
             safe_ents.append(repr(e))
     return f"[Goal] {goal}\n[Entities] " + ", ".join(sorted([e for e in safe_ents if e]))[:400]
 
@@ -142,13 +144,15 @@ def assemble_window(request_msg: dict, state: dict, in_limit_bytes: int, step_ou
         state = {}
     try:
         budget_bytes = int(in_limit_bytes)
-    except Exception:
+    except Exception as exc:
+        log.warning("icw.assembler assemble_window bad in_limit_bytes=%r: %s", in_limit_bytes, exc, exc_info=True)
         budget_bytes = 0
     if budget_bytes <= 0:
         budget_bytes = 4096
     try:
         out_tokens = int(step_out_tokens)
-    except Exception:
+    except Exception as exc:
+        log.warning("icw.assembler assemble_window bad step_out_tokens=%r: %s", step_out_tokens, exc, exc_info=True)
         out_tokens = 0
     goal = str(request_msg.get("content", "") or "")
     anchor = str(state.get("anchor_text", "") or "")  # recent exact turns (verbatim)
@@ -273,7 +277,8 @@ def pack_icw_system_frame_from_messages(
         total_budget_bytes = 8192
     try:
         icw_budget_bytes = int(total_budget_bytes * float(pct_budget))
-    except Exception:
+    except Exception as exc:
+        log.warning("icw.assembler pack bad pct_budget=%r: %s", pct_budget, exc, exc_info=True)
         icw_budget_bytes = int(total_budget_bytes * 0.65)
     if icw_budget_bytes <= 0:
         icw_budget_bytes = max(1024, int(total_budget_bytes * 0.5))

@@ -72,8 +72,14 @@ def strip_tags(text: str) -> str:
 
 
 def state_hash_from(state: dict) -> str:
+    # Never raise from continuation helpers; invalid state should degrade safely.
     if not isinstance(state, dict):
-        raise TypeError(f"state_hash_from expected dict, got {type(state).__name__}")
+        log.warning("icw.continuation state_hash_from expected dict, got %s", type(state).__name__)
+        try:
+            material = repr(state)
+        except Exception:
+            material = f"<unrepr:{type(state).__name__}>"
+        return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
     material = repr(
         (
             state.get("goals"),
