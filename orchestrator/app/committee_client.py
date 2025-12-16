@@ -11,8 +11,6 @@ committee_client.py: Committee client for text generation (MINIMAL).
 - One Ollama call -> return
 """
 
-from __future__ import annotations
-
 from typing import Any, Dict, List, Optional
 import os
 import time
