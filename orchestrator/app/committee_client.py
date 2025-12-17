@@ -96,15 +96,13 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str):
     
     parsed = {}
 
-    with requests.Session() as s:
-        
-        r = s.post(url, json=payload)
+    r = requests.post(url, json=payload)
 
 
-        logger.info(f"ollama response: {r.text}")
-        parser = JSONParser()
-        parsed_obj = parser.parse(r.text, {})
-        parsed = parsed_obj if isinstance(parsed_obj, dict) else {}
+    logger.info(f"ollama response: {r.text}")
+    parser = JSONParser()
+    parsed_obj = parser.parse(r.text, {})
+    parsed = parsed_obj if isinstance(parsed_obj, dict) else {}
 
     response_str = parsed.get("response") if isinstance(parsed.get("response"), str) else ""
     response_str = _sanitize_mojibake_text(response_str or "")
