@@ -72,29 +72,30 @@ def _participant_for(member_id: str) -> Optional[Dict[str, str]]:
 
 
 def build_ollama_payload(messages: List[Dict[str, Any]], model: str, num_ctx: int, temperature: float = 0.3):
-    prompt = (messages)
-
+    
     return {
         "model": str(model),
-        "prompt": prompt,
+        "prompt": messages,
         "stream": False,
         "keep_alive": "24h",
         "options": {
-            "num_ctx": int(8000),
+            "num_ctx": int(num_ctx),
         },
     }
 
 
 async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str):
-    url = f"{(base_url or '').rstrip('/')}/api/generate"
+    url = f"{(base_url or '').rstrip('/')}/api/chat"
     
     with requests.Session() as s:
         # Mirror httpx trust_env=False: ignore proxy env vars (prevents odd corporate proxy issues).
+        s.trust_env = False
         r = s.post(url, json=payload)
     
     status_code = int(getattr(r, "status_code", 0) or 0)
     parsed_any: Any = None
-    raw_text = ""
+    raw_text = getattr(r, "text", "") or ""
+    
     parsed_any = r.json()
     
     # Normalize to dict-like payload (Ollama should return JSON, but we fail-soft).
