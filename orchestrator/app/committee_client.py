@@ -14,6 +14,7 @@ import os
 import time
 
 import requests  # type: ignore
+import httpx  # type: ignore
 
 from .json_parser import JSONParser
 
@@ -96,23 +97,16 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str):
     
     parsed = {}
 
-    # Force explicit JSON semantics and avoid environment proxy surprises.
-    # (Requests defaults usually do this, but being explicit helps when debugging “instant drop” reports.)
-    r = requests.post(
-        url,
-        json=payload,
-        headers={
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        },
-        # Disable env-based proxies (closest equivalent to httpx.AsyncClient(trust_env=False))
-        proxies={"http": None, "https": None},
-    )
+    # IMPORTANT: do not use blocking requests inside an async Uvicorn/FastAPI handler.
+    # It can stall the event loop and cause the client connection to be dropped
+    # before the response is written. Use true async I/O and wait indefinitely.
+    async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
+        resp = await client.post(url, json=payload)
+        raw_text = resp.text or ""
 
-
-    logger.info(f"ollama response: {r.text}")
+    logger.info(f"ollama response: {raw_text}")
     parser = JSONParser()
-    parsed_obj = parser.parse(r.text, {})
+    parsed_obj = parser.parse(raw_text, {})
     parsed = parsed_obj if isinstance(parsed_obj, dict) else {}
 
     # Ollama has two common shapes:
