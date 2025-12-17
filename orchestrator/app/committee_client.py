@@ -97,11 +97,16 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str):
     
     parsed = {}
 
-    # IMPORTANT: do not use blocking requests inside an async Uvicorn/FastAPI handler.
-    # It can stall the event loop and cause the client connection to be dropped
-    # before the response is written. Use true async I/O and wait indefinitely.
-    async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
-        resp = await client.post(url, json=payload)
+    # Keep changes strictly local to the Ollama POST:
+    # - Force HTTP/1.1 (no HTTP/2)
+    # - Disable keep-alive pooling (fresh connection per call)
+    transport = httpx.AsyncHTTPTransport(
+        retries=0,
+        http2=False,
+        limits=httpx.Limits(max_keepalive_connections=0, max_connections=1),
+    )
+    async with httpx.AsyncClient(timeout=None, trust_env=False, transport=transport) as client:
+        resp = await client.post(url, json=payload, headers={"Connection": "close"})
         raw_text = resp.text or ""
 
     logger.info(f"ollama response: {raw_text}")

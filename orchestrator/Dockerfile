@@ -32,6 +32,9 @@ COPY void_envelopes /app/void_envelopes
 # Uvicorn must be started with module 'app.main_min:app' (or 'app.main:app').
 EXPOSE 8000
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000" "--workers", "4"]
+# NOTE: docker-compose.yml may override this command. Keep the image CMD correct
+# for direct `docker run` usage as well.
+# Force HTTP/1.1 (h11) for maximum compatibility with long-held requests.
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--http", "h11", "--loop", "asyncio", "--log-level", "info", "--access-log"]
 
 
