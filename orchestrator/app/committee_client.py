@@ -73,9 +73,14 @@ def _participant_for(member_id: str) -> Optional[Dict[str, str]]:
 
 def build_ollama_payload(messages: List[Dict[str, Any]], model: str, num_ctx: int, temperature: float = 0.3):
     
+    msgs: List[Dict[str, Any]] = []
+    for m in (messages or []):
+        if isinstance(m, dict):
+            msgs.append(m)
+    
     return {
         "model": str(model),
-        "prompt": messages,
+        "prompt": msgs,
         "stream": False,
         "keep_alive": "24h",
         "options": {
