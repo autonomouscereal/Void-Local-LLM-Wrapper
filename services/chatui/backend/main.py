@@ -25,6 +25,7 @@ from typing import Any, Dict, List, Optional
 import time
 from urllib.parse import parse_qs, urlparse
 
+import anyio
 import httpx
 from fastapi import FastAPI, UploadFile, File, Form, Request, BackgroundTasks, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, HTMLResponse, StreamingResponse, Response
@@ -465,32 +466,56 @@ async def jobs_list_proxy():
 # Same-origin proxy for chat completions to avoid browser-side CORS/network failures.
 @app.post("/api/orch/v1/chat/completions")
 async def orch_chat_completions_proxy(request: Request):
+    # Proxy-only streaming keepalive:
+    # - We do NOT stream the real chat completion.
+    # - We DO send harmless whitespace bytes periodically so the browser connection stays open
+    #   while the upstream orchestrator/Ollama call blocks.
     try:
         raw = await request.body()
-        r = await _ORCH_PROXY_CLIENT.post(
-            "/v1/chat/completions",
-            content=raw,
-            headers={
-                # Force text to eliminate any browser/json framing differences end-to-end.
-                # Body is still JSON text; orchestrator accepts/decodes from raw bytes.
-                "Content-Type": "text/plain; charset=utf-8",
-                "Accept": request.headers.get("accept") or "*/*",
-            },
-        )
-        try:
-            body = await r.aread()
-        finally:
-            await r.aclose()
-        content_type = r.headers.get("content-type") or "application/json; charset=utf-8"
-        # Important for browser reliability: do NOT send duplicate Content-Type headers.
-        # Starlette will set Content-Type from media_type; if we also include it in headers,
-        # some browsers treat it as a network/framing error even if curl is forgiving.
+        done = anyio.Event()
+        result: Dict[str, Any] = {"body": b"", "status": 200, "content_type": "application/json; charset=utf-8"}
+
+        async def fetch_upstream():
+            nonlocal result
+            r = await _ORCH_PROXY_CLIENT.post(
+                "/v1/chat/completions",
+                content=raw,
+                headers={
+                    # Body is still JSON text; orchestrator accepts/decodes from raw bytes.
+                    "Content-Type": "text/plain; charset=utf-8",
+                    "Accept": request.headers.get("accept") or "*/*",
+                },
+            )
+            try:
+                body_bytes = await r.aread()
+            finally:
+                await r.aclose()
+            result = {
+                "body": body_bytes,
+                "status": int(getattr(r, "status_code", 200) or 200),
+                "content_type": r.headers.get("content-type") or "application/json; charset=utf-8",
+            }
+            done.set()
+
+        async def gen():
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(fetch_upstream)
+                # Send at least one byte immediately so headers flush and the socket is "active".
+                yield b" "
+                while not done.is_set():
+                    await anyio.sleep(1.0)
+                    yield b" "
+            # Upstream finished; now send the real JSON body (whitespace prefix is valid JSON).
+            yield result.get("body") or b""
+
+        # Browser-facing response: streaming (chunked). Do not set Content-Length.
         headers = {
             "Cache-Control": "no-store",
             "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Private-Network": "true",
+            "Access-Control-Expose-Headers": "Content-Type",
         }
-        return Response(content=body, media_type=content_type, status_code=r.status_code, headers=headers)
+        return StreamingResponse(gen(), status_code=200, media_type="application/json", headers=headers)
     except Exception as ex:
         return JSONResponse(status_code=502, content={"error": "proxy failure", "detail": str(ex)})
 

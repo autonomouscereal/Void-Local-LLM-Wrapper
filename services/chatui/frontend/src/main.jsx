@@ -137,7 +137,8 @@ function App() {
       // Use same-origin proxy to avoid browser-side CORS/network failures.
       xhr.open('POST', `/api/orch/v1/chat/completions`, true)
       // No client-side timeout: allow long generations to complete
-      xhr.timeout = null
+      // (XHR expects a number; set explicitly to 0 == no timeout)
+      xhr.timeout = 0
       // Do NOT send credentials/cookies across origins
       xhr.withCredentials = false
       xhr.setRequestHeader('Content-Type', 'application/json')
