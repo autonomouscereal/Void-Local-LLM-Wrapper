@@ -48,8 +48,22 @@ def infer_domain(kind: str, payload: Dict[str, Any] | None = None) -> str:
     return TraceEmitter.infer_domain(kind, payload)
 
 
-def emit_trace(state_dir: str, trace_id: str, kind: str, payload: Dict[str, Any]) -> None:
-    TraceEmitter(state_dir).emit(trace_id, kind, payload or {})
+def emit_trace(
+    state_dir: str,
+    trace_id: str,
+    kind: str | None = None,
+    payload: Dict[str, Any] | None = None,
+    *,
+    event: str | None = None,
+) -> None:
+    """
+    Unified trace emission API.
+
+    - Canonical argument name is `kind`.
+    - `event` is accepted as a backwards-compatible alias (some modules historically used it).
+    """
+    k = str(kind or event or "event")
+    TraceEmitter(state_dir).emit(trace_id, k, payload or {})
 
 
 def append_jsonl_compat(state_dir: str, path: str, obj: Dict[str, Any]) -> None:

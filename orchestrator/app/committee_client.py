@@ -113,7 +113,7 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str):
     options = payload.get("options") if isinstance(payload.get("options"), dict) else {}
     messages = payload.get("messages") if isinstance(payload.get("messages"), list) else []
     log.info(f"[committee] ollama.call.start trace_id={trace_id} base={base_url} model={model} stream={bool(payload.get('stream', False))} options={options} messages={len(messages)}")
-    emit_trace(state_dir=STATE_DIR, trace_id=trace_id, event="committee.ollama.request", payload={"trace_id": trace_id, "base_url": base_url, "model": model, "options": options, "messages_count": len(messages)})
+    emit_trace(state_dir=STATE_DIR, trace_id=trace_id, kind="committee.ollama.request", payload={"trace_id": trace_id, "base_url": base_url, "model": model, "options": options, "messages_count": len(messages)})
     async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
         t_http = time.monotonic()
         resp = await client.post(url=f"{base_url.rstrip('/')}/api/chat", json=dict(payload))
@@ -129,7 +129,7 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str):
             log.warning(f"[committee] ollama.parser_errors trace_id={trace_id} base={base_url} model={model} status={status_code} last_error={parser.last_error} errors={list(parser.errors)[:25]}")
         if not (200 <= status_code < 300):
             err_text = parsed.get("error") if isinstance(parsed.get("error"), str) else raw_text
-            emit_trace(state_dir=STATE_DIR, trace_id=trace_id, event="committee.ollama.http_error", payload={"trace_id": trace_id, "base_url": base_url, "status_code": status_code, "error": err_text})
+            emit_trace(state_dir=STATE_DIR, trace_id=trace_id, kind="committee.ollama.http_error", payload={"trace_id": trace_id, "base_url": base_url, "status_code": status_code, "error": err_text})
             log.error(f"[committee] ollama.http_error trace_id={trace_id} base={base_url} model={model} status={status_code} dur_ms={int((time.monotonic() - t_all) * 1000.0)} error={err_text}")
             return {"ok": False, "error": {"code": "ollama_http_error", "message": f"ollama returned HTTP {status_code}", "status": status_code, "base_url": base_url, "details": {"error": err_text}}}
         response_str = ""
@@ -151,7 +151,7 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str):
             data["_usage"] = usage
         log.info(f"[committee] ollama.response base={base_url} model={model} trace_id={trace_id} status={status_code} response_chars={len(response_str or '')} usage={usage}")
         log.info(f"[committee] ollama.call.finish trace_id={trace_id} ok=true dur_ms={int((time.monotonic() - t_all) * 1000.0)} status={status_code} response_chars={len(response_str or '')} usage={usage}")
-        emit_trace(state_dir=STATE_DIR, trace_id=trace_id, event="committee.ollama.response", payload={"trace_id": trace_id, "status_code": status_code, "usage": (usage or {}), "response": data})
+        emit_trace(state_dir=STATE_DIR, trace_id=trace_id, kind="committee.ollama.response", payload={"trace_id": trace_id, "status_code": status_code, "usage": (usage or {}), "response": data})
         return data
 
 
@@ -196,14 +196,14 @@ async def committee_ai_text(messages: List[Dict[str, Any]], *, trace_id: str, ro
     critique_results: Dict[str, Dict[str, Any]] = {}
     t0 = time.monotonic()
     log.info(f"[committee] run.start trace_id={trace_id} rounds={int(effective_rounds)} temperature={(None if temp_run is None else float(temp_run))} participants={member_ids} messages={len(messages or [])}")
-    emit_trace(state_dir=STATE_DIR, trace_id=trace_id, event="committee.start", payload={"trace_id": trace_id, "rounds": int(effective_rounds), "temperature": (None if temp_run is None else float(temp_run)), "participants": member_ids, "messages": (messages or [])})
+    emit_trace(state_dir=STATE_DIR, trace_id=trace_id, kind="committee.start", payload={"trace_id": trace_id, "rounds": int(effective_rounds), "temperature": (None if temp_run is None else float(temp_run)), "participants": member_ids, "messages": (messages or [])})
     for r in range(effective_rounds):
         log.info(f"[committee] round.start trace_id={trace_id} round={int(r + 1)}")
         for mid in member_ids:
             log.info(f"[committee] member_draft.start trace_id={trace_id} round={int(r + 1)} member={mid}")
             sys_txt = f"You are committee member {mid}. Provide your best answer to the user.\nAll content must be written in English only. Do NOT respond in any other language."
             member_msgs = list(messages or []) + [{"role": "system", "content": sys_txt}]
-            emit_trace(state_dir=STATE_DIR, trace_id=trace_id, event="committee.member_draft", payload={"trace_id": trace_id, "round": int(r + 1), "member": mid})
+            emit_trace(state_dir=STATE_DIR, trace_id=trace_id, kind="committee.member_draft", payload={"trace_id": trace_id, "round": int(r + 1), "member": mid})
             res = await committee_member_text(member_id=mid, messages=member_msgs, trace_id=trace_id, temperature=temp_run)
             member_results[mid] = res if isinstance(res, dict) else {}
             txt = str(res.get("response") or "").strip() if isinstance(res, dict) and res.get("ok") is not False else ""
@@ -223,7 +223,7 @@ async def committee_ai_text(messages: List[Dict[str, Any]], *, trace_id: str, ro
                     other_blocks.append(f"Answer from {oid}:\n{otext.strip()}")
             critique_txt = f"You are committee member {mid}. This is cross-critique for debate round {r + 1}.\nCritique the other answers. Identify concrete mistakes, missing considerations, and specific improvements.\nReturn a concise bullet list.\n" + ("\n\n".join(other_blocks) if other_blocks else "") + "\nAll content must be written in English only. Do NOT respond in any other language."
             member_msgs = list(messages or []) + [{"role": "system", "content": critique_txt}]
-            emit_trace(state_dir=STATE_DIR, trace_id=trace_id, event="committee.member_critique", payload={"trace_id": trace_id, "round": int(r + 1), "member": mid})
+            emit_trace(state_dir=STATE_DIR, trace_id=trace_id, kind="committee.member_critique", payload={"trace_id": trace_id, "round": int(r + 1), "member": mid})
             res = await committee_member_text(member_id=mid, messages=member_msgs, trace_id=trace_id, temperature=temp_run)
             critique_results[mid] = res if isinstance(res, dict) else {}
             crit_txt = str(res.get("response") or "").strip() if isinstance(res, dict) and res.get("ok") is not False else ""
@@ -255,7 +255,7 @@ async def committee_ai_text(messages: List[Dict[str, Any]], *, trace_id: str, ro
                 ctx_lines.append(f"Your current answer is:\n{prior.strip()}")
             ctx_lines.append("All content must be written in English only. Do NOT respond in any other language.")
             member_msgs = list(messages or []) + [{"role": "system", "content": "\n\n".join(ctx_lines)}]
-            emit_trace(state_dir=STATE_DIR, trace_id=trace_id, event="committee.member_revision", payload={"trace_id": trace_id, "round": int(r + 1), "member": mid})
+            emit_trace(state_dir=STATE_DIR, trace_id=trace_id, kind="committee.member_revision", payload={"trace_id": trace_id, "round": int(r + 1), "member": mid})
             res = await committee_member_text(member_id=mid, messages=member_msgs, trace_id=trace_id, temperature=temp_run)
             member_results[mid] = res if isinstance(res, dict) else {}
             txt = str(res.get("response") or "").strip() if isinstance(res, dict) and res.get("ok") is not False else ""
@@ -279,7 +279,7 @@ async def committee_ai_text(messages: List[Dict[str, Any]], *, trace_id: str, ro
                 synth_parts.append(f"#### {mid}\n{crit.strip()}")
     synth_parts.append("### Task\nSynthesize the best final answer. Output ONLY the final answer.")
     synth_messages = list(messages or []) + [{"role": "system", "content": "\n\n".join(synth_parts)}]
-    emit_trace(state_dir=STATE_DIR, trace_id=trace_id, event="committee.synth.request", payload={"trace_id": trace_id, "synth_member": "qwen"})
+    emit_trace(state_dir=STATE_DIR, trace_id=trace_id, kind="committee.synth.request", payload={"trace_id": trace_id, "synth_member": "qwen"})
     t_synth = time.monotonic()
     synth_env = await committee_synth_text(messages=synth_messages, trace_id=trace_id, temperature=0.0, synth_member="qwen")
     synth_text = str(synth_env.get("response") or "").strip() if isinstance(synth_env, dict) and synth_env.get("ok") is not False else ""
@@ -309,7 +309,7 @@ async def committee_ai_text(messages: List[Dict[str, Any]], *, trace_id: str, ro
             backend_errors.append({"member": mid, "phase": "critique", "error": cres.get("error")})
     if isinstance(synth_env, dict) and synth_env.get("ok") is False and isinstance(synth_env.get("error"), dict):
         backend_errors.append({"member": "synth", "phase": "synth", "error": synth_env.get("error")})
-    emit_trace(state_dir=STATE_DIR, trace_id=trace_id, event="committee.finish", payload={"trace_id": trace_id, "ok": ok, "final_text": final_text, "members": member_summaries, "critiques": critique_summaries})
+    emit_trace(state_dir=STATE_DIR, trace_id=trace_id, kind="committee.finish", payload={"trace_id": trace_id, "ok": ok, "final_text": final_text, "members": member_summaries, "critiques": critique_summaries})
     log.info(f"[committee] run.finish trace_id={trace_id} ok={ok} dur_ms={int((time.monotonic() - t0) * 1000.0)} final_chars={len(final_text or '')} backend_errors={backend_errors}")
     if not ok:
         members_status = {mid: {"ok": bool(isinstance(mres, dict) and mres.get("ok", True)), "has_error": bool(isinstance(mres, dict) and mres.get("error")), "error": (mres.get("error") if isinstance(mres, dict) else None)} for mid, mres in member_results.items()}
@@ -384,7 +384,7 @@ async def committee_jsonify(raw_text: str, expected_schema: Any, *, trace_id: st
     t0 = time.monotonic()
     schema_template = _schema_to_template(expected=expected_schema)
     schema_desc = json.dumps(schema_template, ensure_ascii=False)
-    emit_trace(state_dir=STATE_DIR, trace_id=trace_id, event="committee.jsonify.start", payload={"trace_id": trace_id, "schema_preview": schema_desc[:600], "schema_len": len(schema_desc), "raw_preview": (raw_text or "")[:600], "raw_len": len(raw_text or "")})
+    emit_trace(state_dir=STATE_DIR, trace_id=trace_id, kind="committee.jsonify.start", payload={"trace_id": trace_id, "schema_preview": schema_desc[:600], "schema_len": len(schema_desc), "raw_preview": (raw_text or "")[:600], "raw_len": len(raw_text or "")})
     sys_msg = "You are JSONFixer. You receive messy AI output and MUST respond with exactly ONE JSON object.\nRespond ONLY in English. NO other languages are allowed.\nNO markdown, NO code fences, NO prose, NO comments.\n\nThe JSON MUST match this exact structure (keys and nesting):\n\n" + str(schema_desc) + "\n\nRules:\n- You MUST preserve all keys and their nesting exactly as shown.\n- You MUST NOT add any extra keys at any level.\n- You MUST NOT remove or rename any keys.\n- Values MUST be of the correct JSON type implied by the structure (number, string, object, array, null).\n- The output MUST be valid JSON:\n  - All keys and string values in double quotes.\n  - No trailing commas.\n  - No unescaped quotes inside strings.\n- You MUST NOT output any text before or after the JSON object.\n- Ignore any apology, refusal, or capability disclaimer in the input; your ONLY job is to produce valid JSON.\n- If the input is pure prose or contains multiple candidates, extract or reconstruct the best JSON candidate that fits the schema.\n\nFill in this JSON object according to the provided text. Respond ONLY with the JSON object."
     messages = [{"role": "system", "content": sys_msg}, {"role": "user", "content": (raw_text or "")}]
     env = await committee_ai_text(messages=messages, trace_id=trace_id, rounds=rounds, temperature=temperature)
@@ -400,7 +400,7 @@ async def committee_jsonify(raw_text: str, expected_schema: Any, *, trace_id: st
                 candidates.append(str(inner.get("response") or ""))
     if isinstance(raw_text, str) and raw_text.strip():
         candidates.append(raw_text)
-    emit_trace(state_dir=STATE_DIR, trace_id=trace_id, event="committee.jsonify.candidates", payload={"trace_id": trace_id, "count": len(candidates), "first_preview": ((candidates[0][:400]) if candidates else "")})
+    emit_trace(state_dir=STATE_DIR, trace_id=trace_id, kind="committee.jsonify.candidates", payload={"trace_id": trace_id, "count": len(candidates), "first_preview": ((candidates[0][:400]) if candidates else "")})
     parsed_candidates: List[Dict[str, Any]] = []
     song_schema = None
     if isinstance(expected_schema, dict):
@@ -485,6 +485,6 @@ async def committee_jsonify(raw_text: str, expected_schema: Any, *, trace_id: st
             merged = parsed_candidates[0]
         else:
             merged = [] if isinstance(expected_schema, list) else _default_for(expected=expected_schema)
-    emit_trace(state_dir=STATE_DIR, trace_id=trace_id, event="committee.jsonify.merge", payload={"trace_id": trace_id, "candidates": len(candidates), "parsed_candidates": len(parsed_candidates), "merged_keys": (sorted(list(merged.keys())) if isinstance(merged, dict) else [])})
+    emit_trace(state_dir=STATE_DIR, trace_id=trace_id, kind="committee.jsonify.merge", payload={"trace_id": trace_id, "candidates": len(candidates), "parsed_candidates": len(parsed_candidates), "merged_keys": (sorted(list(merged.keys())) if isinstance(merged, dict) else [])})
     log.info(f"[committee.jsonify] finish trace_id={trace_id} dur_ms={int((time.monotonic() - t0) * 1000.0)} candidates={int(len(candidates))} parsed_candidates={int(len(parsed_candidates))} merged_is_dict={bool(isinstance(merged, dict))} merged_keys={(sorted(list(merged.keys())) if isinstance(merged, dict) else [])}")
     return merged
