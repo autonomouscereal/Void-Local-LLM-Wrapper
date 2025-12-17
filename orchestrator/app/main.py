@@ -7903,7 +7903,17 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     env = await committee_ai_text(messages=(body.get("messages")), trace_id=uuid.uuid4().hex)
     log.debug(f"chat_completions:env={env}")
     # log.debug(f'''produce_tool_plan:env={await produce_tool_plan(messages=(body.get("messages") or []), trace_id=uuid.uuid4().hex)}''')
-    return JSONResponse(content=env, status_code=200)
+    # IMPORTANT: Materialize the JSON body eagerly so serialization errors cannot
+    # occur later during ASGI send (which manifests as "no response headers/body"
+    # in browsers). Also send an explicit Content-Length for deterministic framing.
+    body_text = json.dumps(env, ensure_ascii=False)
+    body_bytes = body_text.encode("utf-8")
+    headers = {
+        "Cache-Control": "no-store",
+        "Content-Type": "application/json; charset=utf-8",
+        "Content-Length": str(len(body_bytes)),
+    }
+    return Response(content=body_bytes, status_code=200, media_type="application/json", headers=headers)
 
 
 async def chat_completions2(body: Dict[str, Any], request: Request):

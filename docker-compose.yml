@@ -496,7 +496,9 @@ services:
       - VISION_REPAIR_API_URL=${VISION_REPAIR_API_URL:-http://127.0.0.1:8095}
       - INSIGHTFACE_HOME=/models/insightface
     # Run the canonical orchestrator application
-    command: ["uvicorn","app.main:app","--host","0.0.0.0","--port","8000","--log-level","info","--access-log","--use-colors"]
+    # Force the pure-Python HTTP/1.1 stack (h11) to avoid intermittent connection issues
+    # that can occur with alternative HTTP protocol implementations under long-held requests.
+    command: ["uvicorn","app.main:app","--host","0.0.0.0","--port","8000","--log-level","info","--access-log","--use-colors","--http","h11","--loop","asyncio"]
     volumes:
       - ./:/workspace
       - void_artifacts:/workspace/uploads

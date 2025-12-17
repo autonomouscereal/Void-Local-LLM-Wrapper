@@ -155,7 +155,7 @@ async def committee_member_text(member_id: str, messages: List[Dict[str, Any]], 
     return res
 
 
-async def committee_ai_text(messages: List[Dict[str, Any]], trace_id: str, rounds: int | None = None, temperature: float = 0.3):
+async def committee_ai_text(messages , trace_id: str, rounds: int = None, temperature: float = 0.3):
     member_id = 'qwen'
     logger.info(f"committee_ai_text: messages={messages}")
     res = await committee_member_text(member_id, messages, trace_id=trace_id)
@@ -174,5 +174,5 @@ async def committee_ai_text(messages: List[Dict[str, Any]], trace_id: str, round
     }
 
 
-async def committee_jsonify(raw_text: str, expected_schema: Any, trace_id: str, rounds: int | None = None, temperature: float = 0.3):
+async def committee_jsonify(raw_text: str, expected_schema: Any, trace_id: str, rounds: int = None, temperature: float = 0.3):
     return  {}
