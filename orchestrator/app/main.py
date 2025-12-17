@@ -1406,8 +1406,7 @@ async def tool_run(request: Request) -> Any:
 # We want Preflight to run FIRST, so add it LAST.
 from .middleware.ws_permissive import PermissiveWebSocketMiddleware
 app.add_middleware(PermissiveWebSocketMiddleware)
-from .middleware.cors_extra import AppendCommonHeadersMiddleware
-app.add_middleware(AppendCommonHeadersMiddleware)
+# CORS is handled by global_cors_middleware below; avoid stacking extra CORS/header middleware.
 
 
 def _json_response(obj: Dict[str, Any], status_code: int = 200) -> Response:

@@ -96,7 +96,18 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str):
     
     parsed = {}
 
-    r = requests.post(url, json=payload)
+    # Force explicit JSON semantics and avoid environment proxy surprises.
+    # (Requests defaults usually do this, but being explicit helps when debugging “instant drop” reports.)
+    r = requests.post(
+        url,
+        json=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        # Disable env-based proxies (closest equivalent to httpx.AsyncClient(trust_env=False))
+        proxies={"http": None, "https": None},
+    )
 
 
     logger.info(f"ollama response: {r.text}")
@@ -104,7 +115,16 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str):
     parsed_obj = parser.parse(r.text, {})
     parsed = parsed_obj if isinstance(parsed_obj, dict) else {}
 
-    response_str = parsed.get("response") if isinstance(parsed.get("response"), str) else ""
+    # Ollama has two common shapes:
+    # - /api/generate -> {"response": "..."}
+    # - /api/chat     -> {"message": {"content": "..."}, ...}
+    response_str = ""
+    if isinstance(parsed.get("response"), str):
+        response_str = str(parsed.get("response") or "")
+    else:
+        msg = parsed.get("message") if isinstance(parsed.get("message"), dict) else {}
+        if isinstance(msg.get("content"), str):
+            response_str = str(msg.get("content") or "")
     response_str = _sanitize_mojibake_text(response_str or "")
 
     prompt_eval_val = parsed.get("prompt_eval_count")

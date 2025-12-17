@@ -39,13 +39,12 @@ class AppendCommonHeadersMiddleware:
                     if name.lower() not in lower:
                         headers.append((name, value))
 
-                # Always expose origin-related headers for browser consumption
-                setdefault(b"access-control-allow-origin", b"*")
-                setdefault(b"access-control-allow-private-network", b"true")
-                setdefault(b"access-control-expose-headers", b"*")
+                # NOTE: CORS is handled centrally in orchestrator/app/main.py via
+                # @app.middleware("http") global_cors_middleware. Do not inject
+                # additional Access-Control-* headers here as it can create
+                # contradictory responses.
                 setdefault(b"cross-origin-resource-policy", b"cross-origin")
                 setdefault(b"timing-allow-origin", b"*")
-                setdefault(b"connection", b"close")
                 # Cache/key vary on Origin
                 # If Vary already present, avoid duplicating; else add
                 vary_idx = lower.get(b"vary")
