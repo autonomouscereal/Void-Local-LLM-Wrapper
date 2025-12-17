@@ -7897,8 +7897,12 @@ def _as_float(v: Any, default: float = 0.0) -> float:
         return float(default)
 
 
-@app.post("/v1/chat/completions")
-async def chat_completions(request: Request):
+
+async def chat_completions2(request: Request):
+    '''
+    Kept mininmal for testing purposes.
+    '''
+
     # OpenAI-compatible endpoint:
     # - Accept standard application/json bodies
     # - Also accept clients that send JSON text with a different Content-Type
@@ -7922,7 +7926,11 @@ async def chat_completions(request: Request):
     return Response(content=body_bytes, status_code=200, media_type="application/json", headers=headers)
 
 
-async def chat_completions2(body: Dict[str, Any], request: Request):
+@app.post("/v1/chat/completions")
+async def chat_completions(request: Request):
+    
+    
+    # *****************************INITIALIZE VARIABLES*****************************
     # Single-exit discipline: exactly one return at the bottom of this function.
     response = None
     usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
@@ -7957,6 +7965,24 @@ async def chat_completions2(body: Dict[str, Any], request: Request):
     # Executor routing knobs are used in multiple places; define once.
     executor_endpoint: str = EXECUTOR_BASE_URL or "http://127.0.0.1:8081"
     
+    # *****************************END INITIALIZE VARIABLES*****************************
+
+    # *****************************PROCESS REQUEST*****************************
+
+    raw = await request.body()
+    body_text_in = raw.decode("utf-8", errors="replace") if isinstance(raw, (bytes, bytearray)) else str(raw or "")
+    parser = JSONParser()
+    parsed_obj = parser.parse(body_text_in, {})
+    body: Dict[str, Any] = dict(parsed_obj) if isinstance(parsed_obj, dict) else {}
+    log.info(f"chat_completions:body={body}")
+    log.info(f"request={request}")
+    
+
+
+
+
+
+
 
     # Normalize request shapes once (avoid repeated isinstance checks throughout chat_completions)
     body0: Dict[str, Any] = body if isinstance(body, dict) else {}
