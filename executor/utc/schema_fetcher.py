@@ -18,11 +18,24 @@ def _hash_schema(schema: Dict[str, Any]) -> str:
 
 def _post(url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     import urllib.request
+    import urllib.error
 
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
-    with urllib.request.urlopen(req) as resp:
-        raw = resp.read().decode("utf-8", errors="replace")
+    try:
+        with urllib.request.urlopen(req) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        # Critical: do NOT raise — executor must continue even if tool.describe is missing.
+        try:
+            raw = (e.read() or b"").decode("utf-8", errors="replace")
+        except Exception:
+            raw = ""
+        logging.warning("schema_fetcher._post HTTPError url=%s status=%s body_prefix=%r", url, e.code, (raw or "")[:200])
+        return {"ok": False, "error": {"code": "http_error", "status": int(getattr(e, "code", 0) or 0), "message": "tool.describe http error"}, "raw": raw}
+    except urllib.error.URLError as e:
+        logging.warning("schema_fetcher._post URLError url=%s err=%r", url, e)
+        return {"ok": False, "error": {"code": "url_error", "status": 0, "message": str(e)}, "raw": ""}
     try:
         parser = JSONParser()
         obj = parser.parse(raw, {}) or {}

@@ -1339,6 +1339,143 @@ app = FastAPI(title="Void Orchestrator", version="0.1.0")
 from void_envelopes import ToolEnvelope  # type: ignore
 
 
+def _hash_schema_obj(schema: Dict[str, Any]) -> str:
+    """
+    Deterministic schema hash used by executor UTC schema cache.
+
+    Must match executor/utc/schema_fetcher.py hashing strategy (json.dumps with
+    sort_keys + compact separators).
+    """
+    try:
+        # IMPORTANT: Keep json.dumps parameters identical to executor/utc/schema_fetcher.py
+        # (ensure_ascii defaults to True).
+        compact = json.dumps(schema or {}, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    except Exception:
+        compact = b"{}"
+    return _h.sha256(compact).hexdigest()
+
+
+def _legacy_tool_list_payload() -> Dict[str, Any]:
+    """
+    Legacy /tool.list payload (historical compatibility).
+
+    Old behavior (see commit HEAD~50: 1d2ed0f):
+      POST /tool.list -> ToolEnvelope.success({"tools":[{"name","version","kind"}]})
+    """
+    reg = get_tool_introspection_registry()
+    tools: List[Dict[str, Any]] = []
+    if isinstance(reg, dict):
+        for n, meta in reg.items():
+            if not isinstance(meta, dict):
+                continue
+            tools.append(
+                {
+                    "name": n,
+                    "version": meta.get("version"),
+                    "kind": meta.get("kind"),
+                }
+            )
+    tools.sort(key=lambda d: (d.get("name") or "") if isinstance(d, dict) else "")
+    return {"tools": tools}
+
+
+@app.post("/tool.list")
+async def tool_list_post(request: Request) -> Any:
+    # JSON-in only; body currently unused (kept for policy consistency with other tool-ish endpoints).
+    _ = await request.body()
+    return ToolEnvelope.success(_legacy_tool_list_payload(), request_id="tool.list")
+
+
+@app.get("/tool.list")
+async def tool_list_get() -> Any:
+    """
+    Tool introspection endpoint.
+
+    GET variant kept for convenience; returns a richer payload than the legacy
+    POST variant but includes the legacy list under result.tools.
+    """
+    reg = get_tool_introspection_registry()
+    tools_full = list(reg.values()) if isinstance(reg, dict) else []
+    tools_full.sort(key=lambda d: (d.get("name") or "") if isinstance(d, dict) else "")
+    names = [t.get("name") for t in tools_full if isinstance(t, dict) and isinstance(t.get("name"), str)]
+    return ToolEnvelope.success(
+        {
+            "version": "1",
+            "count": len(names),
+            "names": names,
+            "tools": _legacy_tool_list_payload().get("tools", []),
+            "tools_full": tools_full,
+        }
+    )
+
+
+@app.post("/tool.describe")
+async def tool_describe(request: Request) -> Any:
+    """
+    Describe a tool by name.
+
+    Contract: executor UTC expects ToolEnvelope.success with:
+      result = { name, version, schema, schema_hash, ... }
+    """
+    raw = await request.body()
+    raw_text = raw.decode("utf-8", errors="replace") if isinstance(raw, (bytes, bytearray)) else str(raw or "")
+    parser = JSONParser()
+    body = parser.parse(raw_text, {"name": str, "tool": str, "tool_name": str, "request_id": str})
+    if not isinstance(body, dict):
+        rid = uuid.uuid4().hex
+        return ToolEnvelope.failure("invalid_body_type", "Body must be a JSON object", status=422, request_id=rid, details={})
+    # Legacy behavior used a stable request_id ("tool.describe") regardless of client input.
+    # Keep accepting request_id, but default to the legacy stable id for consistency.
+    rid = (str(body.get("request_id") or "").strip()) or "tool.describe"
+    name = str(body.get("name") or body.get("tool") or body.get("tool_name") or "").strip()
+    if not name:
+        return ToolEnvelope.failure("missing_name", "name is required", status=422, request_id=rid, details={})
+
+    reg = get_tool_introspection_registry([name])
+    meta = reg.get(name) if isinstance(reg, dict) else None
+    if not isinstance(meta, dict):
+        return ToolEnvelope.failure(
+            "tool_not_found",
+            f"tool not found: {name}",
+            status=404,
+            request_id=rid,
+            details={"name": name},
+        )
+    schema = meta.get("schema") if isinstance(meta.get("schema"), dict) else {}
+    out = dict(meta)
+    out["schema"] = schema
+    out.setdefault("version", "1")
+    out["schema_hash"] = _hash_schema_obj(schema)
+    return ToolEnvelope.success(out, request_id=rid)
+
+
+@app.get("/tool.describe")
+async def tool_describe_get(name: str) -> Any:
+    """
+    Convenience GET variant of /tool.describe.
+
+    Returns the same ToolEnvelope result payload as POST /tool.describe.
+    """
+    nm = (name or "").strip()
+    if not nm:
+        return ToolEnvelope.failure("missing_name", "name is required", status=422, request_id="tool.describe", details={})
+    reg = get_tool_introspection_registry([nm])
+    meta = reg.get(nm) if isinstance(reg, dict) else None
+    if not isinstance(meta, dict):
+        return ToolEnvelope.failure("tool_not_found", f"tool not found: {nm}", status=404, request_id="tool.describe", details={"name": nm})
+    schema = meta.get("schema") if isinstance(meta.get("schema"), dict) else {}
+    out = dict(meta)
+    out["schema"] = schema
+    out.setdefault("version", "1")
+    out["schema_hash"] = _hash_schema_obj(schema)
+    return ToolEnvelope.success(out, request_id="tool.describe")
+
+
+@app.get("/tool.describe/{name}")
+async def tool_describe_path(name: str) -> Any:
+    return await tool_describe_get(name=name)
+
+
 @app.post("/tool.run")
 async def tool_run(request: Request) -> Any:
     """
