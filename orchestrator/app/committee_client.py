@@ -92,36 +92,17 @@ def build_ollama_payload(messages: List[Dict[str, Any]], model: str, num_ctx: in
 async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str):
     url = f"{(base_url or '').rstrip('/')}/api/chat"
     
-    with requests.Session() as s:
-        # Mirror httpx trust_env=False: ignore proxy env vars (prevents odd corporate proxy issues).
-        s.trust_env = False
-        r = s.post(url, json=payload)
-    
-    status_code = int(getattr(r, "status_code", 0) or 0)
-    parsed_any: Any = None
-    raw_text = getattr(r, "text", "") or ""
-    
-    parsed_any = r.json()
-    
-    # Normalize to dict-like payload (Ollama should return JSON, but we fail-soft).
-    parsed: Dict[str, Any] = parsed_any if isinstance(parsed_any, dict) else {}
-    if not parsed and raw_text:
-        parser = JSONParser()
-        parsed_obj = parser.parse(raw_text or "{}", {})
-        parsed = parsed_obj if isinstance(parsed_obj, dict) else {}
+    parsed = {}
 
-    if not (200 <= status_code < 300):
-        body: Any = parsed_any if parsed_any is not None else raw_text
-        return {
-            "ok": False,
-            "error": {
-                "code": "ollama_http_error",
-                "message": f"ollama returned HTTP {status_code}",
-                "status": status_code,
-                "base_url": str(base_url),
-                "body": body,
-            },
-        }
+    with requests.Session() as s:
+        
+        r = s.post(url, json=payload)
+
+
+        logger.info(f"ollama response: {r.text}")
+        parser = JSONParser()
+        parsed_obj = parser.parse(r.text, {})
+        parsed = parsed_obj if isinstance(parsed_obj, dict) else {}
 
     response_str = parsed.get("response") if isinstance(parsed.get("response"), str) else ""
     response_str = _sanitize_mojibake_text(response_str or "")
