@@ -481,13 +481,16 @@ async def orch_chat_completions_proxy(request: Request):
             body = await r.aread()
         finally:
             await r.aclose()
+        content_type = r.headers.get("content-type") or "application/json; charset=utf-8"
+        # Important for browser reliability: do NOT send duplicate Content-Type headers.
+        # Starlette will set Content-Type from media_type; if we also include it in headers,
+        # some browsers treat it as a network/framing error even if curl is forgiving.
         headers = {
             "Cache-Control": "no-store",
             "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Private-Network": "true",
-            "Content-Type": r.headers.get("content-type") or "application/json",
         }
-        return Response(content=body, media_type=headers["Content-Type"], status_code=r.status_code, headers=headers)
+        return Response(content=body, media_type=content_type, status_code=r.status_code, headers=headers)
     except Exception as ex:
         return JSONResponse(status_code=502, content={"error": "proxy failure", "detail": str(ex)})
 

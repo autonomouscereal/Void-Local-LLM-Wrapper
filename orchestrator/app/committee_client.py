@@ -91,6 +91,10 @@ def build_ollama_payload(messages: List[Dict[str, Any]], model: str, num_ctx: in
     return payload
 
 
+'''
+
+proof this didn't work
+
 async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str):
 
     logger.info(f"call_ollama: base_url={base_url}, payload={payload}, trace_id={trace_id}")
@@ -241,6 +245,8 @@ def committee_ai_text_sync(messages, trace_id: str, rounds: int = None, temperat
         "error": None if ok else {"code": "committee_no_answer", "message": "empty response", "raw": res},
     }
 
+
+'''
 
 async def committee_member_text(member_id: str, messages: List[Dict[str, Any]], trace_id: str, temperature: float = 0.3):
     cfg = _participant_for(member_id=member_id)
