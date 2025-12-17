@@ -2539,7 +2539,7 @@ from .rag.core import rag_index_dir  # re-exported for backwards-compat
 
 
 from .rag.core import rag_search  # re-exported for backwards-compat
-from .committee_client import committee_ai_text, committee_ai_text_sync, committee_jsonify
+from .committee_client import committee_ai_text, committee_jsonify
 
 # committee_client import policy: only import committee call + jsonify.
 # All other config is sourced directly from environment here.
