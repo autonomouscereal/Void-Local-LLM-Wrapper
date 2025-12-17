@@ -95,7 +95,7 @@ from .tools_schema import (
     compute_tools_hash,
     tool_expected_from_jsonschema,
 )
-from fastapi import FastAPI, Request, UploadFile, File, WebSocket, WebSocketDisconnect  # type: ignore
+from fastapi import FastAPI, Request, UploadFile, File, WebSocket, WebSocketDisconnect, Body  # type: ignore
 from fastapi.responses import JSONResponse, StreamingResponse, Response  # type: ignore
 from fastapi.staticfiles import StaticFiles  # type: ignore
 from tenacity import retry, stop_after_attempt, wait_exponential  # type: ignore
@@ -7898,12 +7898,31 @@ def _as_float(v: Any, default: float = 0.0) -> float:
 
 
 @app.post("/v1/chat/completions")
-def chat_completions(body: Dict[str, Any], request: Request):
+def chat_completions(body: Any = Body(None), request: Request = None):
     # Sync endpoint intentionally: FastAPI will run this in its worker threadpool,
     # keeping the main event loop free while we perform blocking work (Ollama call).
-    log.info(f"chat_completions:body={body}")
+    # Accept both:
+    # - application/json -> parsed dict
+    # - text/plain -> raw JSON string
+    parsed_body: Dict[str, Any] = {}
+    if isinstance(body, dict):
+        parsed_body = body
+    elif isinstance(body, (bytes, bytearray)):
+        raw_text_in = bytes(body).decode("utf-8", errors="replace")
+        parser = JSONParser()
+        obj = parser.parse(raw_text_in, {})
+        parsed_body = dict(obj) if isinstance(obj, dict) else {}
+    elif isinstance(body, str):
+        parser = JSONParser()
+        obj = parser.parse(body, {})
+        parsed_body = dict(obj) if isinstance(obj, dict) else {}
+    else:
+        parsed_body = {}
+
+    log.info(f"chat_completions:body={parsed_body}")
     log.info(f"request={request}")
-    env = committee_ai_text_sync(messages=(body.get("messages")), trace_id=uuid.uuid4().hex)
+    msgs = parsed_body.get("messages") if isinstance(parsed_body.get("messages"), list) else []
+    env = committee_ai_text_sync(messages=msgs, trace_id=uuid.uuid4().hex)
     log.debug(f"chat_completions:env={env}")
     body_text = json.dumps(env, ensure_ascii=False)
     body_bytes = body_text.encode("utf-8")

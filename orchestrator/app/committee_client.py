@@ -154,7 +154,7 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str):
     return out
 
 
-def call_ollama_sync(base_url: str, payload: Dict[str, Any], trace_id: str) -> Dict[str, Any]:
+def call_ollama_sync(base_url: str, payload: Dict[str, Any], trace_id: str):
     logger.info(f"call_ollama_sync: base_url={base_url}, payload={payload}, trace_id={trace_id}")
     url = f"{(base_url or '').rstrip('/')}/api/chat"
     parsed: Dict[str, Any] = {}
