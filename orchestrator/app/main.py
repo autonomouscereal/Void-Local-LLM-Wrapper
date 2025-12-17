@@ -2539,7 +2539,7 @@ from .rag.core import rag_index_dir  # re-exported for backwards-compat
 
 
 from .rag.core import rag_search  # re-exported for backwards-compat
-from .committee_client import committee_ai_text, committee_jsonify
+from .committee_client import committee_ai_text, committee_ai_text_sync, committee_jsonify
 
 # committee_client import policy: only import committee call + jsonify.
 # All other config is sourced directly from environment here.
@@ -7898,18 +7898,12 @@ def _as_float(v: Any, default: float = 0.0) -> float:
 
 
 @app.post("/v1/chat/completions")
-async def chat_completions(request: Request):
-    # OpenAI-compatible endpoint:
-    # - Accept standard application/json bodies
-    # - Also accept clients that send JSON text with a different Content-Type
-    raw = await request.body()
-    body_text_in = raw.decode("utf-8", errors="replace") if isinstance(raw, (bytes, bytearray)) else str(raw or "")
-    parser = JSONParser()
-    parsed_obj = parser.parse(body_text_in, {})
-    body: Dict[str, Any] = dict(parsed_obj) if isinstance(parsed_obj, dict) else {}
+def chat_completions(body: Dict[str, Any], request: Request):
+    # Sync endpoint intentionally: FastAPI will run this in its worker threadpool,
+    # keeping the main event loop free while we perform blocking work (Ollama call).
     log.info(f"chat_completions:body={body}")
     log.info(f"request={request}")
-    env = await committee_ai_text(messages=(body.get("messages")), trace_id=uuid.uuid4().hex)
+    env = committee_ai_text_sync(messages=(body.get("messages")), trace_id=uuid.uuid4().hex)
     log.debug(f"chat_completions:env={env}")
     body_text = json.dumps(env, ensure_ascii=False)
     body_bytes = body_text.encode("utf-8")
