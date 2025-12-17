@@ -485,9 +485,6 @@ async def orch_chat_completions_proxy(request: Request):
             "Cache-Control": "no-store",
             "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Private-Network": "true",
-            "Access-Control-Expose-Headers": "Content-Type, Content-Length",
-            "Connection": "close",
-            "Content-Length": str(len(body)),
             "Content-Type": r.headers.get("content-type") or "application/json",
         }
         return Response(content=body, media_type=headers["Content-Type"], status_code=r.status_code, headers=headers)

@@ -14,6 +14,7 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         libgl1 \
         libglib2.0-0 \
+        curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Default path for LAION aesthetic head weights (can be overridden via env)
