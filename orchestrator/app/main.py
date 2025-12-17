@@ -1694,7 +1694,6 @@ async def global_cors_middleware(request: Request, call_next):
             "Access-Control-Expose-Headers": "*",
             "Access-Control-Max-Age": "86400",
             "Access-Control-Allow-Private-Network": "true",
-            "Connection": "close",
             "Vary": "Origin",
             "Content-Length": "0",
         }
@@ -7902,12 +7901,9 @@ async def chat_completions(body: Dict[str, Any], request: Request):
     log.info(f"request={request}")
     env = await committee_ai_text(messages=(body.get("messages")), trace_id=uuid.uuid4().hex)
     log.debug(f"chat_completions:env={env}")
-    # log.debug(f'''produce_tool_plan:env={await produce_tool_plan(messages=(body.get("messages") or []), trace_id=uuid.uuid4().hex)}''')
-    # IMPORTANT: Materialize the JSON body eagerly so serialization errors cannot
-    # occur later during ASGI send (which manifests as "no response headers/body"
-    # in browsers). Also send an explicit Content-Length for deterministic framing.
     body_text = json.dumps(env, ensure_ascii=False)
     body_bytes = body_text.encode("utf-8")
+    # Deterministic framing + no persistent socket reuse (helps with intermittent client-side failures).
     headers = {
         "Cache-Control": "no-store",
         "Content-Type": "application/json; charset=utf-8",
@@ -10706,51 +10702,6 @@ async def orcjob_cancel(job_id: str):
 async def orcjob_stream(job_id: str, interval_ms: Optional[int] = None):
     return StreamingResponse(_orcjob_stream_gen(job_id, interval_ms), media_type="text/event-stream")
 
-
-@app.get("/debug")
-async def debug():
-    try:
-        env = await committee_ai_text(messages=[{"role": "user", "content": "ping"}], trace_id="debug_ping", temperature=0.0)
-        ok = bool(isinstance(env, dict) and env.get("ok"))
-        err = (env or {}).get("error") if isinstance(env, dict) else None
-        return {"committee_ok": ok, "error": err, "envelope": env}
-    except Exception as ex:
-        return {
-            "committee_ok": False,
-            "error": {"code": "debug_committee_exception", "message": str(ex)},
-            "envelope": None,
-        }
-
-
-@app.get("/debug/sleep")
-async def debug_sleep(seconds: float = 60.0):
-    """
-    Minimal endpoint to prove the client connection stays open while the server awaits.
-    """
-    await _asyncio.sleep(float(seconds))
-    return {"ok": True, "slept_seconds": float(seconds)}
-
-
-@app.post("/debug/ollama_chat")
-async def debug_ollama_chat(body: Dict[str, Any]):
-    """
-    Minimal endpoint to isolate whether *any* outbound Ollama /api/chat POST correlates
-    with the browser connection dropping, independent of chat-completions plumbing.
-    """
-    base_url = str((body or {}).get("base_url") or os.getenv("QWEN_BASE_URL", "http://127.0.0.1:11435")).rstrip("/")
-    payload = (body or {}).get("payload")
-    if not isinstance(payload, dict):
-        payload = {
-            "model": os.getenv("QWEN_MODEL_ID", "qwen3:30b-a3b-instruct-2507-q4_K_M"),
-            "messages": [{"role": "user", "content": "ping"}],
-            "stream": False,
-        }
-    url = f"{base_url}/api/chat"
-    async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
-        resp = await client.post(url, json=payload)
-        raw = await resp.aread()
-    # Return raw upstream response bytes with the upstream status code.
-    return Response(content=raw, status_code=int(resp.status_code), media_type="application/json")
 
 
 @app.get("/v1/models")

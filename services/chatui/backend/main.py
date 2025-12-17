@@ -449,6 +449,35 @@ async def jobs_list_proxy():
         return JSONResponse(status_code=502, content={"error": str(ex)})
 
 
+# Same-origin proxy for chat completions to avoid browser-side CORS/network failures.
+@app.post("/api/orch/v1/chat/completions")
+async def orch_chat_completions_proxy(request: Request):
+    try:
+        raw = await request.body()
+        async with httpx.AsyncClient(trust_env=False, timeout=None) as client:
+            r = await client.post(
+                ORCH_URL.rstrip("/") + "/v1/chat/completions",
+                content=raw,
+                headers={
+                    "Content-Type": request.headers.get("content-type") or "application/json",
+                    "Accept": request.headers.get("accept") or "*/*",
+                },
+            )
+        body = r.content
+        headers = {
+            "Cache-Control": "no-store",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Private-Network": "true",
+            "Access-Control-Expose-Headers": "Content-Type, Content-Length",
+            "Connection": "close",
+            "Content-Length": str(len(body)),
+            "Content-Type": r.headers.get("content-type") or "application/json",
+        }
+        return Response(content=body, media_type=headers["Content-Type"], status_code=r.status_code, headers=headers)
+    except Exception as ex:
+        return JSONResponse(status_code=502, content={"error": "proxy failure", "detail": str(ex)})
+
+
 @app.get("/healthz")
 async def healthz():
     return {"status": "ok"}

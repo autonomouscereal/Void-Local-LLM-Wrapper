@@ -134,7 +134,8 @@ function App() {
     const updateThinking = (text) => setMsgs(prev => (prev.map(m => m.id === thinkingId ? { ...m, content: { text } } : m)))
     return new Promise((resolve) => {
       const xhr = new XMLHttpRequest()
-      xhr.open('POST', `${ORCH_BASE}/v1/chat/completions`, true)
+      // Use same-origin proxy to avoid browser-side CORS/network failures.
+      xhr.open('POST', `/api/orch/v1/chat/completions`, true)
       // No client-side timeout: allow long generations to complete
       xhr.timeout = null
       // Do NOT send credentials/cookies across origins
