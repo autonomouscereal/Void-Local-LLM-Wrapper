@@ -1694,8 +1694,9 @@ async def global_cors_middleware(request: Request, call_next):
             "Access-Control-Expose-Headers": "*",
             "Access-Control-Max-Age": "86400",
             "Access-Control-Allow-Private-Network": "true",
+            # Be explicit: do not close the connection on preflight.
+            "Connection": "keep-alive",
             "Vary": "Origin",
-            "Content-Length": "0",
         }
         # Always 200 with explicit zero-length body to avoid 204/chunked quirks
         return Response(content=b"", status_code=200, headers=hdrs, media_type="text/plain")
@@ -1724,7 +1725,7 @@ async def global_cors_middleware(request: Request, call_next):
             "_meta": {"route": str(request.url.path), "method": str(request.method)},
         }
         return Response(content=json.dumps(body, ensure_ascii=False), status_code=500, media_type="application/json", headers=hdrs)
-    resp.headers["Access-Control-Allow-Origin"] = allowed_origin or "*"
+    resp.headers["Access-Control-Allow-Origin"] = "*"
     resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
     resp.headers["Access-Control-Allow-Headers"] = "*"
     resp.headers["Access-Control-Allow-Credentials"] = allow_credentials
