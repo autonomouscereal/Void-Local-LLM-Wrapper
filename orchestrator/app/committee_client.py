@@ -11,11 +11,9 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional
 import os
-import json
 import time
 
-import http.client
-import urllib.parse
+import httpx  # type: ignore
 
 from .json_parser import JSONParser
 
@@ -98,39 +96,16 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str):
     
     parsed = {}
 
-    # Ollama POST using Python stdlib HTTP client (no requests/httpx).
-    # This isolates the call from third-party HTTP client behavior.
-    u = urllib.parse.urlsplit(url)
-    if u.scheme and u.scheme != "http":
-        raise ValueError(f"unsupported ollama url scheme: {u.scheme!r}")
-    host = u.hostname or "127.0.0.1"
-    port = int(u.port or 80)
-    path = u.path or "/"
-    if u.query:
-        path = f"{path}?{u.query}"
-
-    body_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    conn = http.client.HTTPConnection(host, port, timeout=None)
-    try:
-        conn.request(
-            "POST",
-            path,
-            body=body_bytes,
-            headers={
-                "Content-Type": "application/json; charset=utf-8",
-                "Accept": "application/json",
-                "Connection": "close",
-                "Content-Length": str(len(body_bytes)),
-            },
-        )
-        resp = conn.getresponse()
-        raw_bytes = resp.read()
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
-
+    # IMPORTANT: keep this non-blocking. Blocking socket I/O inside async Uvicorn handlers
+    # will stall the event loop and can make browsers report "CORS did not succeed (status null)".
+    transport = httpx.AsyncHTTPTransport(
+        retries=0,
+        http2=False,
+        limits=httpx.Limits(max_keepalive_connections=0, max_connections=1),
+    )
+    async with httpx.AsyncClient(timeout=None, trust_env=False, transport=transport) as client:
+        resp = await client.post(url, json=payload, headers={"Connection": "close"})
+        raw_bytes = await resp.aread()
     raw_text = raw_bytes.decode("utf-8", errors="replace")
 
     logger.info(f"ollama response: {raw_text}")

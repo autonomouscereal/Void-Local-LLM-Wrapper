@@ -10722,6 +10722,37 @@ async def debug():
         }
 
 
+@app.get("/debug/sleep")
+async def debug_sleep(seconds: float = 60.0):
+    """
+    Minimal endpoint to prove the client connection stays open while the server awaits.
+    """
+    await _asyncio.sleep(float(seconds))
+    return {"ok": True, "slept_seconds": float(seconds)}
+
+
+@app.post("/debug/ollama_chat")
+async def debug_ollama_chat(body: Dict[str, Any]):
+    """
+    Minimal endpoint to isolate whether *any* outbound Ollama /api/chat POST correlates
+    with the browser connection dropping, independent of chat-completions plumbing.
+    """
+    base_url = str((body or {}).get("base_url") or os.getenv("QWEN_BASE_URL", "http://127.0.0.1:11435")).rstrip("/")
+    payload = (body or {}).get("payload")
+    if not isinstance(payload, dict):
+        payload = {
+            "model": os.getenv("QWEN_MODEL_ID", "qwen3:30b-a3b-instruct-2507-q4_K_M"),
+            "messages": [{"role": "user", "content": "ping"}],
+            "stream": False,
+        }
+    url = f"{base_url}/api/chat"
+    async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
+        resp = await client.post(url, json=payload)
+        raw = await resp.aread()
+    # Return raw upstream response bytes with the upstream status code.
+    return Response(content=raw, status_code=int(resp.status_code), media_type="application/json")
+
+
 @app.get("/v1/models")
 async def list_models():
     return {
