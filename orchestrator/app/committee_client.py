@@ -72,15 +72,11 @@ def _participant_for(member_id: str) -> Optional[Dict[str, str]]:
 
 
 def build_ollama_payload(messages: List[Dict[str, Any]], model: str, num_ctx: int, temperature: float = 0.3):
+    logger.info(f"build_ollama_payload: messages={messages}, model={model}, num_ctx={num_ctx}, temperature={temperature}")
     
-    msgs: List[Dict[str, Any]] = []
-    for m in (messages or []):
-        if isinstance(m, dict):
-            msgs.append(m)
-    
-    return {
+    payload = {
         "model": str(model),
-        "prompt": msgs,
+        "prompt": messages,
         "stream": False,
         "keep_alive": "24h",
         "options": {
@@ -88,8 +84,14 @@ def build_ollama_payload(messages: List[Dict[str, Any]], model: str, num_ctx: in
         },
     }
 
+    logger.info(f"build_ollama_payload: payload={payload}")
+
+    return payload
+
 
 async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str):
+
+    logger.info(f"call_ollama: base_url={base_url}, payload={payload}, trace_id={trace_id}")
     url = f"{(base_url or '').rstrip('/')}/api/chat"
     
     parsed = {}
@@ -125,8 +127,8 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str):
 
 async def committee_member_text(member_id: str, messages: List[Dict[str, Any]], trace_id: str, temperature: float = 0.3):
     cfg = _participant_for(member_id=member_id)
-    if not cfg:
-        return {"ok": False, "error": {"code": "unknown_member", "message": f"unknown committee member: {member_id}"}}
+
+    logger.info(f"committee_ai_text: messages={messages}")
 
     base = (cfg.get("base") or "").rstrip("/") or QWEN_BASE_URL
     model = cfg.get("model") or QWEN_MODEL_ID
@@ -143,7 +145,8 @@ async def committee_member_text(member_id: str, messages: List[Dict[str, Any]], 
 
 async def committee_ai_text(messages: List[Dict[str, Any]], trace_id: str, rounds: int | None = None, temperature: float = 0.3):
     member_id = 'qwen'
-    res = await committee_member_text(member_id, messages or [], trace_id=trace_id)
+    logger.info(f"committee_ai_text: messages={messages}")
+    res = await committee_member_text(member_id, messages, trace_id=trace_id)
 
     text = ""
     if isinstance(res, dict) and res.get("ok") is not False:
