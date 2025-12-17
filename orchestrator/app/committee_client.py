@@ -76,7 +76,7 @@ def build_ollama_payload(messages: List[Dict[str, Any]], model: str, num_ctx: in
     
     payload = {
         "model": str(model),
-        "prompt": messages,
+        "messages": messages,
         "stream": False,
         "keep_alive": "24h",
         "options": {
