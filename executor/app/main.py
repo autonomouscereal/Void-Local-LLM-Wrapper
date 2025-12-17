@@ -181,13 +181,42 @@ ORCHESTRATOR_BASE_URL = os.getenv("ORCHESTRATOR_BASE_URL", "http://127.0.0.1:800
 
 
 def _post_json(url: str, payload: Dict[str, Any], expected: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    data = json.dumps(payload).encode("utf-8")
+    """
+    Post JSON to orchestrator.
+
+    Logging is critical: if orchestrator ingestion fails, we still emit the
+    payload to executor logs so the event isn't lost, and we do NOT crash /execute.
+    """
+    import urllib.error
+
+    data = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
-    with urllib.request.urlopen(req) as resp:
-        raw = resp.read().decode("utf-8", errors="replace")
-        parser = JSONParser()
-        schema = expected if expected is not None else {}
-        return parser.parse(raw, schema)
+    try:
+        with urllib.request.urlopen(req) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        try:
+            body = (e.read() or b"").decode("utf-8", errors="replace")
+        except Exception:
+            body = ""
+        logging.error(
+            "[executor] _post_json HTTPError url=%s status=%s body_prefix=%r payload_keys=%r",
+            url,
+            getattr(e, "code", None),
+            (body or "")[:300],
+            sorted(list(payload.keys()))[:64],
+        )
+        # Preserve the event locally (stdout/file) so it is not lost.
+        logging.error("[executor] _post_json payload=%s", json.dumps(payload, ensure_ascii=False, default=str)[:4000])
+        return {}
+    except urllib.error.URLError as e:
+        logging.error("[executor] _post_json URLError url=%s err=%r payload_keys=%r", url, e, sorted(list(payload.keys()))[:64])
+        logging.error("[executor] _post_json payload=%s", json.dumps(payload, ensure_ascii=False, default=str)[:4000])
+        return {}
+
+    parser = JSONParser()
+    schema = expected if expected is not None else {}
+    return parser.parse(raw, schema)
 
 
 def _distill_summary(result_obj: Any) -> Dict[str, Any]:

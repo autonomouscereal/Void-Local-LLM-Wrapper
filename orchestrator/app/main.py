@@ -10124,7 +10124,9 @@ async def tools_append(body: Dict[str, Any], request: Request):
             if bool(row.get("ok") is True) and row.get("event") == "end":
                 distilled = {
                     "t": 0,
-                    "event": "tool_end",
+                    # IMPORTANT: do not use key name "event" here; _log(event, **fields)
+                    # would receive event twice and raise TypeError, breaking /logs/tools.append.
+                    "tool_event": "tool_end",
                     "tool": row.get("tool"),
                     "step_id": row.get("step_id"),
                     "duration_ms": 0,
