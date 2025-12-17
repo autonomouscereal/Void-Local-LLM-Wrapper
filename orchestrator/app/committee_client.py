@@ -91,9 +91,6 @@ def build_ollama_payload(messages: List[Dict[str, Any]], model: str, num_ctx: in
     return payload
 
 
-'''
-
-proof this didn't work
 
 async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str):
 
@@ -246,7 +243,6 @@ def committee_ai_text_sync(messages, trace_id: str, rounds: int = None, temperat
     }
 
 
-'''
 
 async def committee_member_text(member_id: str, messages: List[Dict[str, Any]], trace_id: str, temperature: float = 0.3):
     cfg = _participant_for(member_id=member_id)
