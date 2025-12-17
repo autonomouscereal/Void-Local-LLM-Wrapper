@@ -9,6 +9,7 @@ committee_client.py: Committee client for text generation (MINIMAL).
 from __future__ import annotations
 
 import logging
+import asyncio
 from typing import Any, Dict, List, Optional
 import os
 import time
@@ -47,6 +48,36 @@ PARTICIPANT_MODELS: Dict[str, Dict[str, str]] = {
     "glm": {"base": GLM_OLLAMA_BASE_URL, "model": GLM_MODEL_ID},
     "deepseek": {"base": DEEPSEEK_CODER_OLLAMA_BASE_URL, "model": DEEPSEEK_CODER_MODEL_ID},
 }
+
+# Shared outbound HTTP resources for Ollama calls.
+# Key point: avoid creating a new TCP connection per request (TIME_WAIT / ephemeral port churn),
+# and ensure responses are explicitly closed so connections return to the pool.
+_OLLAMA_TRANSPORT = httpx.AsyncHTTPTransport(
+    retries=0,
+    http2=False,
+    limits=httpx.Limits(
+        max_connections=32,
+        max_keepalive_connections=32,
+        keepalive_expiry=60.0,
+    ),
+)
+_OLLAMA_CLIENTS: Dict[str, httpx.AsyncClient] = {}
+_OLLAMA_CLIENTS_LOCK = asyncio.Lock()
+
+
+async def _get_ollama_client(base_url: str) -> httpx.AsyncClient:
+    key = (base_url or "").rstrip("/")
+    async with _OLLAMA_CLIENTS_LOCK:
+        client = _OLLAMA_CLIENTS.get(key)
+        if client is None:
+            client = httpx.AsyncClient(
+                timeout=None,
+                trust_env=False,
+                base_url=key,
+                transport=_OLLAMA_TRANSPORT,
+            )
+            _OLLAMA_CLIENTS[key] = client
+        return client
 
 
 def _sanitize_mojibake_text(text: str) -> str:
@@ -92,20 +123,19 @@ def build_ollama_payload(messages: List[Dict[str, Any]], model: str, num_ctx: in
 async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str):
 
     logger.info(f"call_ollama: base_url={base_url}, payload={payload}, trace_id={trace_id}")
-    url = f"{(base_url or '').rstrip('/')}/api/chat"
+    url_path = "/api/chat"
     
     parsed = {}
 
-    # IMPORTANT: keep this non-blocking. Blocking socket I/O inside async Uvicorn handlers
-    # will stall the event loop and can make browsers report "CORS did not succeed (status null)".
-    transport = httpx.AsyncHTTPTransport(
-        retries=0,
-        http2=False,
-        limits=httpx.Limits(max_keepalive_connections=0, max_connections=1),
-    )
-    async with httpx.AsyncClient(timeout=None, trust_env=False, transport=transport) as client:
-        resp = await client.post(url, json=payload, headers={"Connection": "close"})
+    # IMPORTANT: keep this non-blocking. Also: do NOT force Connection: close.
+    # Reusing keep-alive sockets prevents TIME_WAIT / ephemeral port churn over many calls.
+    client = await _get_ollama_client(base_url)
+    resp = await client.post(url_path, json=payload)
+    try:
         raw_bytes = await resp.aread()
+    finally:
+        # Ensure the connection is returned to the pool even if downstream parsing fails.
+        await resp.aclose()
     raw_text = raw_bytes.decode("utf-8", errors="replace")
 
     logger.info(f"ollama response: {raw_text}")

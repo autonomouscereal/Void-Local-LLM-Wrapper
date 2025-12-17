@@ -1697,6 +1697,7 @@ async def global_cors_middleware(request: Request, call_next):
             # Be explicit: do not close the connection on preflight.
             "Connection": "keep-alive",
             "Vary": "Origin",
+            "Content-Length": "0",
         }
         # Always 200 with explicit zero-length body to avoid 204/chunked quirks
         return Response(content=b"", status_code=200, headers=hdrs, media_type="text/plain")
@@ -7897,7 +7898,15 @@ def _as_float(v: Any, default: float = 0.0) -> float:
 
 
 @app.post("/v1/chat/completions")
-async def chat_completions(body: Dict[str, Any], request: Request):
+async def chat_completions(request: Request):
+    # OpenAI-compatible endpoint:
+    # - Accept standard application/json bodies
+    # - Also accept clients that send JSON text with a different Content-Type
+    raw = await request.body()
+    body_text_in = raw.decode("utf-8", errors="replace") if isinstance(raw, (bytes, bytearray)) else str(raw or "")
+    parser = JSONParser()
+    parsed_obj = parser.parse(body_text_in, {})
+    body: Dict[str, Any] = dict(parsed_obj) if isinstance(parsed_obj, dict) else {}
     log.info(f"chat_completions:body={body}")
     log.info(f"request={request}")
     env = await committee_ai_text(messages=(body.get("messages")), trace_id=uuid.uuid4().hex)

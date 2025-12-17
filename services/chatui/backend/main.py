@@ -49,6 +49,19 @@ DB_NAME = os.getenv("POSTGRES_DB")
 DB_USER = os.getenv("POSTGRES_USER")
 DB_PASS = os.getenv("POSTGRES_PASSWORD")
 
+# Reuse keep-alive connections to the orchestrator to avoid per-request TCP churn.
+_ORCH_PROXY_TRANSPORT = httpx.AsyncHTTPTransport(
+    retries=0,
+    http2=False,
+    limits=httpx.Limits(max_connections=32, max_keepalive_connections=32, keepalive_expiry=60.0),
+)
+_ORCH_PROXY_CLIENT = httpx.AsyncClient(
+    trust_env=False,
+    timeout=None,
+    base_url=ORCH_URL.rstrip("/"),
+    transport=_ORCH_PROXY_TRANSPORT,
+)
+
 
 async def init_pool() -> asyncpg.pool.Pool:
     # Asyncpg pool with auto-DDL for required tables. No ORM anywhere.
@@ -454,16 +467,20 @@ async def jobs_list_proxy():
 async def orch_chat_completions_proxy(request: Request):
     try:
         raw = await request.body()
-        async with httpx.AsyncClient(trust_env=False, timeout=None) as client:
-            r = await client.post(
-                ORCH_URL.rstrip("/") + "/v1/chat/completions",
-                content=raw,
-                headers={
-                    "Content-Type": request.headers.get("content-type") or "application/json",
-                    "Accept": request.headers.get("accept") or "*/*",
-                },
-            )
-        body = r.content
+        r = await _ORCH_PROXY_CLIENT.post(
+            "/v1/chat/completions",
+            content=raw,
+            headers={
+                # Force text to eliminate any browser/json framing differences end-to-end.
+                # Body is still JSON text; orchestrator accepts/decodes from raw bytes.
+                "Content-Type": "text/plain; charset=utf-8",
+                "Accept": request.headers.get("accept") or "*/*",
+            },
+        )
+        try:
+            body = await r.aread()
+        finally:
+            await r.aclose()
         headers = {
             "Cache-Control": "no-store",
             "Access-Control-Allow-Origin": "*",
