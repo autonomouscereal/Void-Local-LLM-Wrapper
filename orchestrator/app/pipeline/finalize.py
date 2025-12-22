@@ -3,7 +3,8 @@ from __future__ import annotations
 from typing import Any, Callable, Dict, List, Optional
 import logging
 
-from .assets import collect_urls as assets_collect_urls
+# NOTE: pipeline/assets.py no longer exists; asset URL extraction lives under QA metrics.
+from ..quality.metrics.tool_results import collect_urls as assets_collect_urls
 from ..traces.writer import log_artifact as _trace_log_artifact
 
 
