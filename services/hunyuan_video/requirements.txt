@@ -1,0 +1,15 @@
+torch==2.7.1+cu118
+torchaudio==2.7.1+cu118
+diffusers==0.36.0
+transformers==4.57.3
+accelerate==1.12.0
+safetensors
+numpy==1.26.4
+pillow
+imageio
+imageio-ffmpeg
+fastapi
+uvicorn[standard]
+
+
+

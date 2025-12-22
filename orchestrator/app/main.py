@@ -22,7 +22,7 @@ from __future__ import annotations
 # - OpenAI-compatible /v1/chat/completions returns full Markdown: main answer first, then "### Tool Results"
 #   (film_id, job_id(s), errors), then an "### Appendix — Model Answers" with raw Qwen/GLM4-9B responses (trimmed).
 # - We never replace the main content with status; instead we append a Status block only when empty/refusal.
-# - Long-running film pipeline: film_create → film_add_scene (ComfyUI jobs via /jobs) → film_compile (n8n or local assembler).
+# - Long-running film pipeline: film_create → film_add_scene (ComfyUI jobs via /jobs) → film_compile (local, blocking).
 # - Keep LLM models warm: we set options.keep_alive=24h on every Ollama call to avoid reloading between requests.
 # - Timeouts: Default to no client-side timeouts. If a library/API requires a timeout param,
 #   set timeout=None (infinite) or the maximum safe cap. Never retry on timeouts; retries are allowed
@@ -37,7 +37,6 @@ import base64 as _b64
 import imageio.v3 as iio  # type: ignore
 from PIL import Image, ImageDraw, ImageFont  # type: ignore
 import asyncio as _as
-import asyncio as _asyncio
 import contextlib
 import httpx as _hx  # type: ignore
 import httpx  # type: ignore
@@ -108,6 +107,7 @@ from .tools.progress import emit_progress, set_progress_queue, get_progress_queu
 from .tools.mcp_bridge import call_mcp_tool as _call_mcp_tool
 from .state.checkpoints import append_event as checkpoints_append_event
 from .trace_utils import emit_trace, append_jsonl_compat
+from .tracing.teacher import tap_trace as _teacher_tap_trace
 from .omni.context import build_omni_context
 from void_envelopes import merge_envelopes as stitch_merge_envelopes, stitch_openai as stitch_openai_final
 # router layer removed; planner-only orchestration lives in this module now
@@ -123,21 +123,30 @@ from .jobs.state import get_job as _get_orcjob, request_cancel as _orcjob_cancel
 from void_envelopes import bump_envelope as _env_bump, assert_envelope as _env_assert
 from void_envelopes import build_openai_envelope as _build_openai_envelope
 from .determinism.seeds import stamp_envelope as _env_stamp, stamp_tool_args as _tool_stamp
-from .refs.api import (
-    post_refs_save as _refs_save,
-    post_refs_refine as _refs_refine,
-    get_refs_list as _refs_list,
-    post_refs_apply as _refs_apply,
-    post_refs_music_profile as _refs_music_profile,
+from .ref_library.registry import create_ref as _ref_create
+from .ref_library.apply import ref_pack_for_ref_id as _ref_pack_for_ref_id
+from .ref_library.embeds import (
+    compute_face_embeddings as _ref_compute_face_embeddings,
+    compute_voice_embedding as _ref_compute_voice_embedding,
+    compute_music_embedding as _ref_compute_music_embedding,
 )
-from .context.index import resolve_reference as _ctx_resolve, list_recent as _ctx_list, resolve_global as _glob_resolve, infer_audio_emotion as _infer_emotion
+from .artifacts.index import (
+    resolve_reference as _ctx_resolve,
+    list_recent as _ctx_list,
+    resolve_global as _glob_resolve,
+    infer_audio_emotion as _infer_emotion,
+)
 from .datasets.api import post_datasets_start as _datasets_start, get_datasets_list as _datasets_list, get_datasets_versions as _datasets_versions, get_datasets_index as _datasets_index
+from .datasets.stream import append_row as _ds_append_row
 from .jobs.state import create_job as _orcjob_create, set_state as _orcjob_set_state
+from .film_assembly import (
+    assemble_film_from_scene_rows as _assemble_film_from_scene_rows,
+    assemble_film_from_shots as _assemble_film_from_shots,
+    build_srt_from_dialogue_index as _build_srt_from_dialogue_index,
+)
 from .admin.api import get_jobs_list as _admin_jobs_list, get_jobs_replay as _admin_jobs_replay, post_artifacts_gc as _admin_gc
 from .admin.prompts import _id_of as _prompt_id_of, save_prompt as _save_prompt, list_prompts as _list_prompts
 from .state.checkpoints import append_ndjson as _append_jsonl, read_tail as _read_tail
-from .film2.snapshots import save_shot_snapshot as _film_save_snap, load_shot_snapshot as _film_load_snap
-from .film2.qa_embed import face_similarity as _qa_face, voice_similarity as _qa_voice, music_similarity as _qa_music
 from .icw.project import (
     project_dir as _proj_dir,
     capsules_dir as _capsules_dir,
@@ -156,7 +165,7 @@ from .tools_tts.voice_tools import run_voice_register, run_voice_train
 from .tools_music.variation import run_music_variation
 from .tools_music.mixdown import run_music_mixdown
 from .tools_music.vocals import render_vocal_stems_for_track
-from .context.index import add_artifact as _ctx_add
+from .artifacts.index import add_artifact as _ctx_add
 from .artifacts.shard import open_shard as _art_open_shard, append_jsonl as _art_append_jsonl, _finalize_shard as _art_finalize
 from .artifacts.shard import newest_part as _art_newest_part, list_parts as _art_list_parts
 from .artifacts.manifest import add_manifest_row as _art_manifest_add, write_manifest_atomic as _art_manifest_write
@@ -171,13 +180,14 @@ from .traces.writer import (
     log_error as _trace_log_error,
 )
 from .analysis.media import analyze_image as _analyze_image, analyze_audio as _analyze_audio
-from .analysis.media import analyze_image_regions as _analyze_image_regions
-from .review.referee import build_delta_plan as _build_delta_plan
-from .review.ledger_writer import append_ledger as _append_ledger
-from .comfy.dispatcher import load_workflow as _comfy_load_wf, patch_workflow as _comfy_patch_wf, submit as _comfy_submit
+from .quality.metrics.media_scores import image_overall_score, image_clip_score, audio_spectral_flatness, audio_analysis
+from .quality.metrics.image_qa import analyze_image_with_regions, build_image_qa_block
+from .quality.api.review import review_score as _review_score, review_plan as _review_plan, review_loop as _review_loop
+from .quality.decisions.committee import build_delta_plan as _build_delta_plan
+from .quality.telemetry.ledger import append_ledger as _append_ledger
 from .comfy.client_aio import (
-    comfy_submit as _comfy_submit_aio,
-    comfy_history as _comfy_history_aio,
+    comfy_submit as _comfy_submit,
+    comfy_history as _comfy_history,
     comfy_upload_image as _comfy_upload_image,
     comfy_upload_mask as _comfy_upload_mask,
     comfy_view as _comfy_view,
@@ -222,27 +232,34 @@ from .locks.runtime import (
     summarize_film2_bundle_for_context as _lock_summarize_film2_bundle_for_context,
     summarize_all_locks_for_context as _lock_summarize_all_locks_for_context,
 )
-from .services.image.analysis.locks import (
+from .locks.image_lock_scoring import (
     compute_face_lock_score as _compute_face_lock_score,
     compute_style_similarity as _compute_style_similarity,
     compute_pose_similarity as _compute_pose_similarity,
     compute_region_scores,
     compute_scene_score,
+    compute_multiface_identity_scores as _compute_multiface_identity_scores,
 )
-from .film2.hero import choose_hero_frame, _extract_meta as _frame_meta_payload, frame_image_path as _frame_image_path
+from .locks.film2_hero_frame_video_locks import pick_hero_frame_from_video
+from .locks.image_dispatch_scoring import score_image_dispatch_outputs
 from .film2.timeline import text_to_simple_srt as _text_to_simple_srt
-from .film2.locks import (
+from .film2.runtime import film2_trace_event as _film2_trace_event, film2_artifact_video as _film2_artifact_video
+from void_quality.thresholds import get_film2_quality_thresholds as _film2_quality_thresholds
+from .locks.film2_story_locks import (
     ensure_story_character_bundles,
     ensure_visual_locks_for_story as _ensure_visual_locks_for_story,
     generate_scene_storyboards as _film2_generate_scene_storyboards,
     generate_shot_storyboards as _film2_generate_shot_storyboards,
 )
-from .image.graph_builder import build_full_graph as _build_full_graph
 from .tools_image.common import ensure_dir as _ensure_dir, sidecar as _sidecar, make_outpaths as _make_outpaths, now_ts as _now_ts
 from .tools_image.refine import build_image_refine_dispatch_args
-from .review.referee import build_delta_plan as _committee, postrun_committee_decide
+from .quality.refinement.postrun_review import (
+    compute_postrun_qa_metrics as _compute_postrun_qa_metrics,
+    decide_postrun_committee as _decide_postrun_committee,
+    normalize_patch_plan_to_tool_calls as _normalize_patch_plan_to_tool_calls,
+)
 from .plan.catalog import PLANNER_VISIBLE_TOOLS
-from .qa.segments import (
+from .quality.segments import (
     build_segments_for_tool,
     ALLOWED_PATCH_TOOLS,
     filter_patch_plan,
@@ -253,11 +270,30 @@ from .qa.segments import (
     enrich_patch_plan_for_tts_segments,
     enrich_patch_plan_for_sfx_segments,
 )
+from .quality.refinement.tool_step_qa import maybe_run_tool_step_segment_qa as _maybe_run_tool_step_segment_qa
+from .quality.selection.video_best import choose_best_video_pair
+from .quality.metrics.video_temporal import (
+    resolve_upload_video_path as _resolve_upload_video_path,
+    compute_temporal_clip_metrics as _compute_temporal_clip_metrics,
+)
+from .quality.refinement.video_refine_clip_qa import compute_refine_clip_lock_qa
+from .film2.hunyuan_video import (
+    build_hv_tool_args,
+    film2_generate_video,
+    hv_args_to_generate_payload,
+    hyvideo_generate,
+    normalize_generate_response,
+)
 from .plan.song import plan_song_graph
 from .tools_music.windowed import run_music_infinite_windowed, restitch_music_from_windows
-from .tools_music.export import append_music_sample as _append_music_sample
 from .tools_music.provider import RestMusicProvider
-from .music.eval import compute_music_eval, get_music_acceptance_thresholds, MUSIC_HERO_QUALITY_MIN, MUSIC_HERO_FIT_MIN
+from .quality.eval.music_eval import (
+    compute_music_eval,
+    eval_motif_locks,
+    get_music_acceptance_thresholds,
+    MUSIC_HERO_QUALITY_MIN,
+    MUSIC_HERO_FIT_MIN,
+)
 from functools import partial
 from .story import (
     draft_story_graph as _story_draft,
@@ -318,16 +354,17 @@ def _configure_logging() -> str:
         if os.path.isdir("/workspace/logs"):
             _log_dir = "/workspace/logs"
         else:
-            try:
-                _state_dir_env = (os.getenv("STATE_DIR", "") or "").strip()
-                _log_dir = os.path.join(_state_dir_env, "logs") if _state_dir_env else "."
-            except Exception:
-                _log_dir = "."
+            _state_dir_env = (os.getenv("STATE_DIR", "") or "").strip()
+            _log_dir = os.path.join(_state_dir_env, "logs") if _state_dir_env else "."
 
     try:
         os.makedirs(_log_dir, exist_ok=True)
     except Exception:
         # If the logs dir can't be created (permissions), fall back to cwd.
+        _stderr = getattr(sys, "__stderr__", None) or getattr(sys, "stderr", None)
+        if _stderr is not None:
+            with contextlib.suppress(Exception):
+                _stderr.write(f"[orchestrator.logging] failed to create ORCH_LOG_DIR={_log_dir!r}; falling back to cwd\n")
         _log_dir = "."
 
     _log_file = (os.getenv("ORCH_LOG_FILE", "") or "").strip() or os.path.join(_log_dir, "orchestrator.log")
@@ -337,10 +374,11 @@ def _configure_logging() -> str:
         _handlers.append(logging.FileHandler(_log_file, encoding="utf-8"))
     except Exception as _ex:
         # Never fail module import due to file handler issues; stdout logging remains.
-        try:
-            sys.stderr.write(f"[orchestrator.logging] file logging disabled: {_ex}\n")
-        except Exception:
-            pass
+        _stderr = getattr(sys, "__stderr__", None) or getattr(sys, "stderr", None)
+        if _stderr is not None:
+            # Best-effort only; logging isn't configured yet, so stderr is all we have here.
+            with contextlib.suppress(Exception):
+                _stderr.write(f"[orchestrator.logging] file logging disabled: {_ex}\n")
 
     logging.captureWarnings(True)
     logging.basicConfig(
@@ -375,6 +413,12 @@ def _log(event: str, **fields: Any) -> None:
             "notes": {k: v for k, v in fields.items() if k != "trace_id"},
         }
         checkpoints_append_event(STATE_DIR, tr, str(row.get("event") or "event"), row)
+
+
+def _log_event_payload(event: str, payload: Dict[str, Any]) -> None:
+    if not isinstance(payload, dict):
+        return
+    _log(event, **payload)
 
 
 def _inject_execution_context(tool_calls: List[Dict[str, Any]], trace_id: str, effective_mode: str, cid: str | None) -> None:
@@ -445,42 +489,32 @@ def _args_preview_for_log(args: Any, *, max_keys: int = 64) -> Dict[str, Any]:
     return out
 
 
-def _tool_step_eval_user_text(tool_name: str, tool_args: Any, last_user_text: str) -> str:
+def _ref_save_internal(kind: str, title: str, files: Dict[str, Any], *, compute_embeds: bool = False) -> Dict[str, Any]:
     """
-    Committee/QA prompt seed that is scoped to a SINGLE tool execution step.
+    Internal replacement for the removed refs API handlers.
+    Persists a reference manifest via ref_library and optionally computes embeddings
+    for image/voice/music kinds.
     """
-    a = tool_args if isinstance(tool_args, dict) else {"_raw": tool_args}
-    # Build a minimal, tool-specific "goal" hint using args rather than full chat context.
-    goal_hint = ""
-    if tool_name.startswith("image."):
-        p = a.get("prompt") or a.get("text") or ""
-        if isinstance(p, str) and p.strip():
-            goal_hint = f"Generate/refine image(s) to match prompt={p.strip()!r}."
-    elif tool_name.startswith("video."):
-        src = a.get("src") or a.get("video") or a.get("url") or ""
-        if isinstance(src, str) and src.strip():
-            goal_hint = f"Process video src={src.strip()!r}."
-    elif tool_name.startswith("music.") or tool_name.startswith("tts.") or tool_name.startswith("sfx."):
-        p = a.get("prompt") or a.get("text") or a.get("lyrics") or ""
-        if isinstance(p, str) and p.strip():
-            goal_hint = f"Generate/refine audio to match prompt/text={p.strip()!r}."
-    elif tool_name == "film2.run":
-        syn = a.get("synopsis") or a.get("prompt") or ""
-        if isinstance(syn, str) and syn.strip():
-            goal_hint = f"Generate film output to match synopsis/prompt={syn.strip()!r}."
-    blob = {
-        "scope": "tool_step_only",
-        "instruction": (
-            "Evaluate ONLY whether THIS SINGLE tool call executed correctly and whether its output matches the tool args. "
-            "Do NOT evaluate whether the entire user request has been completed. "
-            "Do NOT propose unrelated tools; only revise if this tool's own outputs/QA/locks are below thresholds."
-        ),
-        "tool": tool_name,
-        "tool_goal_hint": goal_hint,
-        "tool_args_preview": _args_preview_for_log(a),
-        "original_user_request_preview": (str(last_user_text or "")[:600] + "…") if isinstance(last_user_text, str) and len(last_user_text) > 600 else str(last_user_text or ""),
-    }
-    return json.dumps(blob, ensure_ascii=False, default=str)
+    k = str(kind or "").strip().lower()
+    t = str(title or "")
+    f = dict(files or {})
+    ref = _ref_create(k, t, f, meta={"source": "internal"})
+    if compute_embeds:
+        try:
+            if k == "image":
+                paths = [it.get("path") for it in (ref.get("files", {}) or {}).get("images", []) if isinstance(it, dict)]
+                _ref_compute_face_embeddings(ref.get("ref_id") or "", [p for p in paths if isinstance(p, str) and p])
+            elif k == "voice":
+                paths = [it.get("path") for it in (ref.get("files", {}) or {}).get("voice_samples", []) if isinstance(it, dict)]
+                _ref_compute_voice_embedding(ref.get("ref_id") or "", [p for p in paths if isinstance(p, str) and p])
+            elif k == "music":
+                tr = (ref.get("files", {}).get("track") or {}).get("path") if isinstance(ref.get("files"), dict) else None
+                st = [it.get("path") for it in (ref.get("files", {}) or {}).get("stems", []) if isinstance(it, dict)]
+                _ref_compute_music_embedding(ref.get("ref_id") or "", tr if isinstance(tr, str) and tr else None, [p for p in st if isinstance(p, str) and p])
+        except Exception:
+            # Best-effort only; never fail the request on embed compute.
+            logging.getLogger(__name__).debug("ref_save_internal: compute_embeds failed (non-fatal)", exc_info=True)
+    return {"ok": True, "ref": ref}
 
 
 async def _run_patch_call(
@@ -549,380 +583,7 @@ async def _run_patch_call(
     }
 
 
-async def segment_qa_and_committee(
-    trace_id: str,
-    user_text: str,
-    tool_name: str,
-    segment_results: List[Dict[str, Any]],
-    mode: str,
-    *,
-    base_url: str,
-    executor_base_url: str,
-    absolutize_url: Callable[[str], str],
-    quality_profile: Optional[str] = None,
-    max_refine_passes: int = 1,
-) -> Tuple[List[Dict[str, Any]], Dict[str, Any], List[Dict[str, Any]]]:
-    """
-    Run per-segment QA + committee review with an optional single patch pass.
-    Returns updated segment results, the committee outcome, and any patch call results.
-    """
-    if not segment_results:
-        outcome = {"action": "go", "rationale": "no_segment_results", "patch_plan": []}
-        return segment_results, outcome, []
-    thresholds = _lock_quality_thresholds(quality_profile)
-    attempt = 0
-    current_results = list(segment_results or [])
-    cumulative_patch_results: List[Dict[str, Any]] = []
-    committee_outcome: Dict[str, Any] = {"action": "go", "patch_plan": [], "rationale": ""}
-    # Track per-tool failure counts across attempts so we can detect and break
-    # out of potential self-looping patch plans (same tool failing repeatedly).
-    failure_counts: Dict[str, int] = {}
-    while attempt <= max(0, int(max_refine_passes)):
-        # Build per-segment structures and standalone QA scores for committee input
-        segments_summary: List[Dict[str, Any]] = []
-        segments_for_committee: List[Dict[str, Any]] = []
-        for idx, tr in enumerate(current_results):
-            if not isinstance(tr, dict):
-                continue
-            result_obj = tr.get("result")
-            if not isinstance(result_obj, dict):
-                continue
-            parent_cid = None
-            meta_part = result_obj.get("meta")
-            if isinstance(meta_part, dict) and isinstance(meta_part.get("cid"), str):
-                parent_cid = meta_part.get("cid")
-            segs = build_segments_for_tool(tool_name, trace_id=trace_id, cid=parent_cid, result=result_obj)
-            for seg in (segs or []):
-                if not isinstance(seg, dict):
-                    continue
-                # Compute standalone QA for this segment using existing domain QA helper
-                seg_result = seg.get("result") if isinstance(seg.get("result"), dict) else {}
-                single_tool_results: List[Dict[str, Any]] = []
-                if seg_result:
-                    single_tool_results.append({"name": seg.get("tool"), "result": seg_result})
-                if single_tool_results:
-                    seg_domain_qa = assets_compute_domain_qa(single_tool_results)
-                    domain_name = str(seg.get("domain") or "").strip().lower()
-                    scores: Dict[str, Any] = {}
-                    if domain_name == "image":
-                        scores = seg_domain_qa.get("images") or {}
-                    elif domain_name in ("music", "tts", "sfx", "audio"):
-                        scores = seg_domain_qa.get("audio") or {}
-                    elif domain_name in ("video", "film2"):
-                        scores = seg_domain_qa.get("videos") or {}
-                    # Inject lipsync_score and sharpness from segment meta when available.
-                    seg_meta_local = seg.get("meta") if isinstance(seg.get("meta"), dict) else {}
-                    ls_val = seg_meta_local.get("lipsync_score")
-                    if isinstance(ls_val, (int, float)):
-                        scores = dict(scores or {})
-                        scores["lipsync"] = float(ls_val)
-                    sharp_val = seg_meta_local.get("sharpness")
-                    if isinstance(sharp_val, (int, float)):
-                        scores = dict(scores or {})
-                        scores["sharpness"] = float(sharp_val)
-                    qa_block = seg.setdefault("qa", {})
-                    if isinstance(qa_block, dict):
-                        qa_block["scores"] = scores
-                segments_for_committee.append(seg)
-        for seg in segments_for_committee:
-            qa_block = seg.get("qa") if isinstance(seg.get("qa"), dict) else {}
-            scores = qa_block.get("scores") if isinstance(qa_block.get("scores"), dict) else {}
-            segments_summary.append(
-                {
-                    "id": seg.get("id"),
-                    "domain": seg.get("domain"),
-                    "qa": scores,
-                    "locks": seg.get("locks") if isinstance(seg.get("locks"), dict) else None,
-                }
-            )
-            # Per-segment QA trace row for forensic analysis
-            seg_meta = seg.get("meta") if isinstance(seg.get("meta"), dict) else {}
-            profile_val = seg_meta.get("profile") if isinstance(seg_meta.get("profile"), str) else None
-            locks_val = seg.get("locks") if isinstance(seg.get("locks"), dict) else None
-            cid_val = seg.get("cid")
-            trace_append(
-                "qa.segment.qa",
-                {
-                    "trace_id": trace_id,
-                    "tool": tool_name,
-                    "segment_id": seg.get("id"),
-                    "domain": seg.get("domain"),
-                    "profile": profile_val,
-                    "attempt": attempt,
-                    "cid": cid_val,
-                    "locks": locks_val,
-                    "qa_scores": scores,
-                },
-            )
-        counts = {
-            "images": int(assets_count_images(current_results)),
-            "videos": int(assets_count_video(current_results)),
-            "audio": int(assets_count_audio(current_results)),
-        }
-        domain_qa = assets_compute_domain_qa(current_results)
-        violations: Dict[str, float] = {}
-        images_domain = domain_qa.get("images") or {}
-        audio_domain = domain_qa.get("audio") or {}
-        if images_domain.get("face_lock") is not None and images_domain.get("face_lock") < thresholds["face_min"]:
-            violations["images.face_lock"] = images_domain.get("face_lock")
-        if images_domain.get("region_shape_min") is not None and images_domain.get("region_shape_min") < thresholds["region_shape_min"]:
-            violations["images.region_shape_min"] = images_domain.get("region_shape_min")
-        if images_domain.get("region_texture_mean") is not None and images_domain.get("region_texture_mean") < thresholds["region_texture_min"]:
-            violations["images.region_texture_mean"] = images_domain.get("region_texture_mean")
-        if images_domain.get("scene_lock") is not None and images_domain.get("scene_lock") < thresholds["scene_min"]:
-            violations["images.scene_lock"] = images_domain.get("scene_lock")
-        if audio_domain.get("voice_lock") is not None and audio_domain.get("voice_lock") < thresholds["voice_min"]:
-            violations["audio.voice_lock"] = audio_domain.get("voice_lock")
-        if audio_domain.get("tempo_lock") is not None and audio_domain.get("tempo_lock") < thresholds["tempo_min"]:
-            violations["audio.tempo_lock"] = audio_domain.get("tempo_lock")
-        if audio_domain.get("key_lock") is not None and audio_domain.get("key_lock") < thresholds["key_min"]:
-            violations["audio.key_lock"] = audio_domain.get("key_lock")
-        if audio_domain.get("stem_balance_lock") is not None and audio_domain.get("stem_balance_lock") < thresholds["stem_balance_min"]:
-            violations["audio.stem_balance_lock"] = audio_domain.get("stem_balance_lock")
-        if audio_domain.get("lyrics_lock") is not None and audio_domain.get("lyrics_lock") < thresholds["lyrics_min"]:
-            violations["audio.lyrics_lock"] = audio_domain.get("lyrics_lock")
-        qa_metrics_pre = {
-            "counts": counts,
-            "domain": domain_qa,
-            "threshold_violations": violations,
-            "segments": segments_summary,
-        }
-        _log("qa.metrics.segment", trace_id=trace_id, tool=tool_name, phase="pre", attempt=attempt, metrics=qa_metrics_pre)
-        _trace_log_event(
-            STATE_DIR,
-            trace_id,
-            {
-                "kind": "qa",
-                "stage": "segment_pre",
-                "data": qa_metrics_pre,
-            },
-        )
-        committee_outcome = await postrun_committee_decide(
-            trace_id=trace_id,
-            user_text=user_text,
-            tool_results=current_results,
-            qa_metrics=qa_metrics_pre,
-            mode=mode,
-        )
-        action = str((committee_outcome.get("action") or "go")).strip().lower()
-        if violations and action == "go":
-            if attempt < max_refine_passes:
-                action = "revise"
-                committee_outcome["action"] = "revise"
-                rationale = committee_outcome.get("rationale") or ""
-                committee_outcome["rationale"] = (rationale + " | auto-revise: lock thresholds unmet").strip()
-                committee_outcome.setdefault("threshold_violations", {}).update(violations)
-            else:
-                committee_outcome["action"] = "fail"
-                committee_outcome.setdefault("threshold_violations", {}).update(violations)
-                action = "fail"
-        _log(
-            "committee.decision.segment",
-            trace_id=trace_id,
-            tool=tool_name,
-            attempt=attempt,
-            action=action,
-            rationale=committee_outcome.get("rationale"),
-            violations=violations,
-            committee_error=committee_outcome.get("committee_error"),
-        )
-        # Auto-suggest video.refine.clip steps for low-quality clips based on per-segment QA.
-        if action == "revise":
-            auto_patch_steps: List[Dict[str, Any]] = []
-            # Collect already proposed (tool, segment_id) pairs to avoid duplicates.
-            existing_pairs = set()
-            for st in committee_outcome.get("patch_plan") or []:
-                if not isinstance(st, dict):
-                    continue
-                t = (st.get("tool"), st.get("segment_id"))
-                existing_pairs.add(t)
-            for seg in segments_for_committee:
-                if not isinstance(seg, dict):
-                    continue
-                domain_name = str(seg.get("domain") or "").strip().lower()
-                if domain_name not in ("video", "film2"):
-                    continue
-                seg_id = seg.get("id")
-                if not isinstance(seg_id, str) or not seg_id:
-                    continue
-                qa_block = seg.get("qa") if isinstance(seg.get("qa"), dict) else {}
-                scores = qa_block.get("scores") if isinstance(qa_block.get("scores"), dict) else {}
-                refine_mode_auto: Optional[str] = None
-                ls_val = scores.get("lipsync")
-                if isinstance(ls_val, (int, float)) and ls_val < 0.5:
-                    refine_mode_auto = "fix_lipsync"
-                face_val = scores.get("face_lock")
-                if refine_mode_auto is None and isinstance(face_val, (int, float)) and face_val < thresholds.get("face_min", 0.0):
-                    refine_mode_auto = "fix_faces"
-                temporal_val = scores.get("frame_lpips_mean") or scores.get("temporal_stability")
-                if refine_mode_auto is None and isinstance(temporal_val, (int, float)) and temporal_val < 0.5:
-                    refine_mode_auto = "stabilize_motion"
-                sharpness_val = scores.get("sharpness")
-                if refine_mode_auto is None and isinstance(sharpness_val, (int, float)) and sharpness_val < 50.0:
-                    refine_mode_auto = "improve_quality"
-                if refine_mode_auto is None:
-                    continue
-                key = ("video.refine.clip", seg_id)
-                if key in existing_pairs:
-                    continue
-                auto_patch_steps.append(
-                    {
-                        "tool": "video.refine.clip",
-                        "segment_id": seg_id,
-                        "args": {"refine_mode": refine_mode_auto},
-                    }
-                )
-            if auto_patch_steps:
-                committee_outcome.setdefault("patch_plan", [])
-                if isinstance(committee_outcome.get("patch_plan"), list):
-                    committee_outcome["patch_plan"].extend(auto_patch_steps)
-                # Trace the planned clip refinements for this QA pass.
-                plan_summary: Dict[str, Any] = {
-                    "event": "clip_refine_plan",
-                    "tool": tool_name,
-                    "segment_ids": [],
-                    "refine_modes": {},
-                }
-                seg_id_to_mode: Dict[str, str] = {}
-                for step in auto_patch_steps:
-                    sid = step.get("segment_id")
-                    args_used = step.get("args") if isinstance(step.get("args"), dict) else {}
-                    mode_val = args_used.get("refine_mode")
-                    if isinstance(sid, str) and sid and isinstance(mode_val, str) and mode_val:
-                        seg_id_to_mode[sid] = mode_val
-                plan_summary["segment_ids"] = list(seg_id_to_mode.keys())
-                plan_summary["refine_modes"] = seg_id_to_mode
-                trace_append(
-                    "film2.clip_refine_plan",
-                    {
-                        "trace_id": trace_id,
-                        **(plan_summary or {}),
-                    },
-                )
-        if action != "revise":
-            break
-        allowed_mode_set = set(_allowed_tools_for_mode(mode))
-        raw_patch_plan = committee_outcome.get("patch_plan") or []
-        # First, apply segment-aware filtering using the canonical helpers.
-        segment_filtered = filter_patch_plan(raw_patch_plan, segments_for_committee)
-        filtered_patch_plan: List[Dict[str, Any]] = []
-        for step in segment_filtered:
-            step_tool = (step.get("tool") or "").strip()
-            if not step_tool:
-                continue
-            if step_tool not in PLANNER_VISIBLE_TOOLS or step_tool not in allowed_mode_set:
-                continue
-            filtered_patch_plan.append(step)
-        committee_outcome["patch_plan"] = filtered_patch_plan
-        if not filtered_patch_plan:
-            break
-        # Loop guard: if any tool in the filtered patch plan has already failed
-        # multiple times in this segment-committee loop, stop revising and fail
-        # instead of attempting the same broken tool over and over.
-        loop_guard_tools: List[str] = []
-        for step in filtered_patch_plan:
-            st_name = (step.get("tool") or "").strip()
-            if st_name and failure_counts.get(st_name, 0) >= 2:
-                loop_guard_tools.append(st_name)
-        if loop_guard_tools:
-            _log(
-                "committee.loop_guard",
-                trace_id=trace_id,
-                tool=tool_name,
-                attempt=attempt,
-                tools=loop_guard_tools,
-            )
-            committee_outcome["action"] = "fail"
-            committee_outcome.setdefault("loop_guard", {"tools": loop_guard_tools})
-            break
-        # Enrich image/video/music refine steps with per-segment context before execution.
-        enriched_patch_plan = enrich_patch_plan_for_image_segments(
-            filtered_patch_plan,
-            segments_for_committee,
-        )
-        enriched_patch_plan = enrich_patch_plan_for_video_segments(
-            enriched_patch_plan,
-            segments_for_committee,
-        )
-        enriched_patch_plan = enrich_patch_plan_for_music_segments(
-            enriched_patch_plan,
-            segments_for_committee,
-        )
-        enriched_patch_plan = enrich_patch_plan_for_tts_segments(
-            enriched_patch_plan,
-            segments_for_committee,
-        )
-        enriched_patch_plan = enrich_patch_plan_for_sfx_segments(
-            enriched_patch_plan,
-            segments_for_committee,
-        )
-        # Execute enriched patch plan via central patch executor.
-        tool_runner = partial(
-            _run_patch_call,
-            trace_id=trace_id,
-            mode=mode,
-            base_url=base_url,
-            executor_base_url=executor_base_url,
-        )
-        updated_segments, patch_results = await apply_patch_plan(
-            enriched_patch_plan,
-            segments_for_committee,
-            tool_runner,
-            trace_id,
-            tool_name,
-        )
-        # Log patch execution results for telemetry/debugging and update failure counts.
-        for pr in patch_results or []:
-            tname = str((pr or {}).get("name") or "tool")
-            result_obj = (pr or {}).get("result") if isinstance((pr or {}).get("result"), dict) else {}
-            err_obj = (pr or {}).get("error") or (result_obj.get("error") if isinstance(result_obj, dict) else None)
-            if isinstance(err_obj, (str, dict)):
-                code = (err_obj.get("code") if isinstance(err_obj, dict) else str(err_obj))
-                status = (err_obj.get("status") if isinstance(err_obj, dict) else None)
-                message = (err_obj.get("message") if isinstance(err_obj, dict) else "")
-                _log("tool.run.error", trace_id=trace_id, tool=tname, code=(code or ""), status=status, message=(message or ""), attempt=attempt)
-                # Increment failure counter for this tool to detect repeated failures.
-                try:
-                    failure_counts[tname] = int(failure_counts.get(tname, 0) or 0) + 1
-                except Exception as ex:
-                    logging.warning(
-                        f"patch_exec: bad failure_counts[{tname}]={failure_counts.get(tname)!r}; resetting to 1",
-                        exc_info=True,
-                    )
-                    failure_counts[tname] = 1
-            else:
-                artifacts_summary: List[Dict[str, Any]] = []
-                arts = result_obj.get("artifacts") if isinstance(result_obj, dict) else None
-                if isinstance(arts, list):
-                    for art in arts:
-                        if isinstance(art, dict):
-                            aid = art.get("id")
-                            kind = art.get("kind")
-                            if isinstance(aid, str) and isinstance(kind, str):
-                                artifacts_summary.append({"id": aid, "kind": kind})
-                urls_local = assets_collect_urls([pr], absolutize_url)
-                _log("tool.run.after", trace_id=trace_id, tool=tname, artifacts=artifacts_summary, urls_count=len(urls_local or []), attempt=attempt)
-                meta_local = result_obj.get("meta") if isinstance(result_obj, dict) else {}
-                first_url = (urls_local[0] if isinstance(urls_local, list) and urls_local else None)
-        if filtered_patch_plan:
-            _log("committee.revision.segment", trace_id=trace_id, tool=tool_name, steps=len(filtered_patch_plan), failures=0, attempt=attempt)
-        if patch_results:
-            cumulative_patch_results.extend(patch_results)
-            current_results = (current_results or []) + patch_results
-        attempt += 1
-        _log("segment.refine.iteration", trace_id=trace_id, tool=tool_name, attempt=attempt)
-        if attempt > max_refine_passes:
-            break
-    if cumulative_patch_results:
-        counts_post = {
-            "images": int(assets_count_images(current_results)),
-            "videos": int(assets_count_video(current_results)),
-            "audio": int(assets_count_audio(current_results)),
-        }
-        domain_post = assets_compute_domain_qa(current_results)
-        qa_metrics_post = {"counts": counts_post, "domain": domain_post}
-        _log("qa.metrics.segment", trace_id=trace_id, tool=tool_name, phase="post", metrics=qa_metrics_post)
-    return current_results, committee_outcome, cumulative_patch_results
+
 
 
 async def _generate_scene_storyboards(
@@ -1136,6 +797,8 @@ MUSIC_API_URL = os.getenv("MUSIC_API_URL")     # e.g., http://127.0.0.1:7860
 VLM_API_URL = os.getenv("VLM_API_URL")        # e.g., http://vlm:8050
 OCR_API_URL = os.getenv("OCR_API_URL")        # e.g., http://ocr:8070
 VISION_REPAIR_API_URL = os.getenv("VISION_REPAIR_API_URL")  # e.g., http://vision_repair:8095
+VFI_API_URL = os.getenv("VFI_API_URL")  # e.g., http://127.0.0.1:8098
+UPSCALE_API_URL = os.getenv("UPSCALE_API_URL")  # e.g., http://127.0.0.1:8099
 MFA_API_URL = os.getenv("MFA_API_URL")        # e.g., http://mfa:7867
 VOCAL_FIXER_API_URL = os.getenv("VOCAL_FIXER_API_URL")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")
@@ -1144,16 +807,92 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 LOCKS_ROOT_DIR = _locks_root(UPLOAD_DIR)
 FILM2_MODELS_DIR = os.getenv("FILM2_MODELS", "/opt/models")
 FILM2_DATA_DIR = os.getenv("FILM2_DATA", "/srv/film2")
-N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL")  # optional external workflow orchestration
-ENABLE_N8N = os.getenv("ENABLE_N8N", "false").lower() == "true"
-ASSEMBLER_API_URL = os.getenv("ASSEMBLER_API_URL")  # http://assembler:9095
-TEACHER_API_URL = os.getenv("TEACHER_API_URL", "http://127.0.0.1:8097")
 WRAPPER_CONFIG_PATH = os.getenv("WRAPPER_CONFIG_PATH", "/workspace/configs/wrapper_config.json")
 WRAPPER_CONFIG: Dict[str, Any] = {}
 WRAPPER_CONFIG_HASH: Optional[str] = None
 DRT_API_URL = os.getenv("DRT_API_URL", "http://drt:8086")
 STATE_DIR = os.path.join(UPLOAD_DIR, "state")
 os.makedirs(STATE_DIR, exist_ok=True)
+
+
+def _migrate_legacy_artifact_layouts() -> None:
+    """
+    Backwards-compat for historic runs:
+    - Some code paths previously wrote music WAVs to UPLOAD_DIR/artifacts/audio/music/<cid>/...
+      while the UI (and URL builders) expected UPLOAD_DIR/artifacts/music/<cid>/...
+    - This migrates files so old URLs stop 404'ing without requiring regeneration.
+
+    Safe behavior:
+    - Only moves files that do not already exist at destination.
+    - Leaves directories in place if they contain anything we couldn't move.
+    """
+    try:
+        legacy_root = os.path.join(UPLOAD_DIR, "artifacts", "audio", "music")
+        canonical_root = os.path.join(UPLOAD_DIR, "artifacts", "music")
+        if not os.path.isdir(legacy_root):
+            return
+        os.makedirs(canonical_root, exist_ok=True)
+        for cid in os.listdir(legacy_root):
+            src_cid_dir = os.path.join(legacy_root, cid)
+            if not os.path.isdir(src_cid_dir):
+                continue
+            dst_cid_dir = os.path.join(canonical_root, cid)
+            os.makedirs(dst_cid_dir, exist_ok=True)
+            try:
+                entries = os.listdir(src_cid_dir)
+            except Exception:
+                logging.getLogger(__name__).debug(
+                    "legacy_artifacts.migrate.listdir_failed dir=%r",
+                    src_cid_dir,
+                    exc_info=True,
+                )
+                entries = []
+            for name in entries:
+                src = os.path.join(src_cid_dir, name)
+                if not os.path.isfile(src):
+                    continue
+                dst = os.path.join(dst_cid_dir, name)
+                if os.path.exists(dst):
+                    continue
+                try:
+                    _sh.move(src, dst)
+                except Exception:
+                    logging.getLogger(__name__).warning(
+                        "legacy_artifacts.migrate.move_failed src=%r dst=%r",
+                        src,
+                        dst,
+                        exc_info=True,
+                    )
+            # best-effort cleanup of empty dirs
+            try:
+                if not os.listdir(src_cid_dir):
+                    os.rmdir(src_cid_dir)
+            except Exception:
+                logging.getLogger(__name__).debug(
+                    "legacy_artifacts.migrate.cleanup_failed dir=%r",
+                    src_cid_dir,
+                    exc_info=True,
+                )
+        try:
+            if not os.listdir(legacy_root):
+                os.rmdir(legacy_root)
+        except Exception:
+            logging.getLogger(__name__).debug(
+                "legacy_artifacts.migrate.cleanup_failed dir=%r",
+                legacy_root,
+                exc_info=True,
+            )
+        logging.getLogger(__name__).info(
+            "legacy_artifacts.migrate.done legacy_root=%r canonical_root=%r",
+            legacy_root,
+            canonical_root,
+        )
+    except Exception:
+        logging.getLogger(__name__).warning("legacy_artifacts.migrate.failed", exc_info=True)
+
+
+# Run once at import/startup to heal old layouts.
+_migrate_legacy_artifact_layouts()
 _shard_bytes_raw = os.getenv("ARTIFACT_SHARD_BYTES", "200000")
 try:
     ARTIFACT_SHARD_BYTES = int(str(_shard_bytes_raw).strip() or "200000")
@@ -1188,7 +927,8 @@ PRIMARY_MUSIC_API_URL = (
     or os.getenv("MUSIC_API_URL")
 )
 HUNYUAN_FOLEY_API_URL = os.getenv("HUNYUAN_FOLEY_API_URL")    # http://foley:9006
-HUNYUAN_VIDEO_API_URL = os.getenv("HUNYUAN_VIDEO_API_URL")    # http://hunyuan:9007
+HUNYUAN_VIDEO_API_URL = os.getenv("HUNYUAN_VIDEO_API_URL")    # legacy (do not use)
+HYVIDEO_API_URL = os.getenv("HYVIDEO_API_URL")  # required: http://127.0.0.1:8094
 SVD_API_URL = os.getenv("SVD_API_URL")                        # http://svd:9008
 
 # Mandatory audio/vocal services: fail fast if configuration is missing.
@@ -1304,10 +1044,10 @@ def _get_music_acceptance_thresholds() -> Dict[str, float]:
     """
     Backwards-compatible helper for film2.run and any other paths that still
     reference the underscored variant. Delegates to the canonical
-    get_music_acceptance_thresholds() in app.music.eval.
+    get_music_acceptance_thresholds() in app.quality.eval.music_eval.
 
     Pure data, deterministic, no network; the underlying helper reads the
-    static review/acceptance_audio.json at most once per process.
+    shared void_quality thresholds at most once per process.
     """
     th = get_music_acceptance_thresholds()
     oq_raw = th.get("overall_quality_min", 0.6) if isinstance(th, dict) else 0.6
@@ -1516,10 +1256,31 @@ async def tool_run(request: Request) -> Any:
     else:
         args = {"_raw": args_in}
 
+    # ---- Preserve correlation fields: never silently drop cid/tool_call_id/meta. ----
+    # Many executors send these at the top-level (body), while tool handlers expect them in args.
+    cid_in = body.get("cid")
+    if not (isinstance(cid_in, str) and cid_in.strip()):
+        cid_in = args.get("cid")
+    cid = str(cid_in).strip() if isinstance(cid_in, (str, int)) and str(cid_in).strip() else ""
+    if cid and not (isinstance(args.get("cid"), (str, int)) and str(args.get("cid")).strip()):
+        args["cid"] = cid
+
+    tool_call_id_in = body.get("tool_call_id")
+    tool_call_id = str(tool_call_id_in).strip() if isinstance(tool_call_id_in, str) and tool_call_id_in.strip() else ""
+    if tool_call_id and not (isinstance(args.get("tool_call_id"), str) and str(args.get("tool_call_id")).strip()):
+        args["tool_call_id"] = tool_call_id
+
+    meta_in = body.get("meta") if isinstance(body.get("meta"), dict) else None
+    if isinstance(meta_in, dict) and "_request_meta" not in args:
+        # Keep request-scoped metadata under a reserved key to avoid collisions with tool schemas.
+        args["_request_meta"] = dict(meta_in)
+
     trace_id_val = body.get("trace_id")
     trace_id = trace_id_val if isinstance(trace_id_val, str) and trace_id_val.strip() else None
     if trace_id is None and isinstance(args.get("trace_id"), str) and str(args.get("trace_id")).strip():
         trace_id = str(args.get("trace_id")).strip()
+    if trace_id is not None and not (isinstance(args.get("trace_id"), str) and str(args.get("trace_id")).strip()):
+        args["trace_id"] = trace_id
 
     call: Dict[str, Any] = {"name": name, "arguments": args}
     if trace_id:
@@ -1527,7 +1288,21 @@ async def tool_run(request: Request) -> Any:
     res = await execute_tool_call(call)
 
     if isinstance(res, dict) and isinstance(res.get("result"), dict):
-        return ToolEnvelope.success(res["result"], request_id=rid)
+        # Best-effort: ensure correlation fields survive to the envelope layer for downstream tooling/UI.
+        # Do NOT override tool-provided values.
+        res_obj = res["result"]
+        if isinstance(res_obj, dict):
+            meta_out = res_obj.get("meta")
+            if not isinstance(meta_out, dict):
+                meta_out = {}
+                res_obj["meta"] = meta_out
+            if cid:
+                meta_out.setdefault("cid", cid)
+            if trace_id:
+                meta_out.setdefault("trace_id", trace_id)
+            if tool_call_id:
+                meta_out.setdefault("tool_call_id", tool_call_id)
+        return ToolEnvelope.success(res_obj, request_id=rid)
     err_obj = res.get("error") if isinstance(res, dict) else None
     if isinstance(err_obj, dict):
         code = str(err_obj.get("code") or "tool_error")
@@ -1541,8 +1316,6 @@ async def tool_run(request: Request) -> Any:
     return ToolEnvelope.failure("tool_error", str(err_obj or "tool failed"), status=422, request_id=rid, details={"raw": res})
 # Middleware order matters: last added runs first.
 # We want Preflight to run FIRST, so add it LAST.
-from .middleware.ws_permissive import PermissiveWebSocketMiddleware
-app.add_middleware(PermissiveWebSocketMiddleware)
 # CORS is handled by global_cors_middleware below; avoid stacking extra CORS/header middleware.
 
 
@@ -1556,7 +1329,13 @@ def _json_response(obj: Dict[str, Any], status_code: int = 200) -> Response:
     return Response(content=body, status_code=status_code, media_type="application/json", headers=headers)
 
 # ---- Pipeline imports (extracted helpers) ----
-from .pipeline.assets import collect_urls as assets_collect_urls, count_images as assets_count_images, count_video as assets_count_video, count_audio as assets_count_audio, compute_domain_qa as assets_compute_domain_qa  # type: ignore
+from .quality.metrics.tool_results import (  # type: ignore
+    collect_urls as assets_collect_urls,
+    count_images as assets_count_images,
+    count_video as assets_count_video,
+    count_audio as assets_count_audio,
+    compute_domain_qa as assets_compute_domain_qa,
+)
 from .pipeline.executor_gateway import execute as gateway_execute  # type: ignore
 from .pipeline.catalog import build_allowed_tool_names as catalog_allowed, validate_tool_names as catalog_validate  # type: ignore
 from .pipeline.finalize import finalize_tool_phase as finalize_tool_phase, compose_openai_response as compose_openai_response  # type: ignore
@@ -1669,6 +1448,13 @@ def finalize_response(trace_id: str, messages: List[Dict[str, Any]], state: RunS
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 os.makedirs(STATIC_DIR, exist_ok=True)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+# Serve generated artifacts to the UI. All services write into the shared volume
+# mounted at UPLOAD_DIR (default: /workspace/uploads).
+#
+# Without this, the UI will receive 404s for URLs like:
+#   /uploads/artifacts/music/<cid>/<file>.wav
+#   /uploads/artifacts/audio/tts/<cid>/<file>.wav
+app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 # run_all router removed (deprecated /v1/run, /ws.run)
 
 @app.post("/v1/image.generate")
@@ -1880,8 +1666,6 @@ async def global_cors_middleware(request: Request, call_next):
 
 # In-memory job cache (DB is source of truth)
 _jobs_store: Dict[str, Dict[str, Any]] = {}
-_job_endpoint: Dict[str, str] = {}
-_comfy_load: Dict[str, int] = {}
 _comfy_backoff_raw = os.getenv("COMFYUI_BACKOFF_MS", "250")
 try:
     COMFYUI_BACKOFF_MS = int(str(_comfy_backoff_raw).strip() or "250")
@@ -2060,24 +1844,6 @@ def _save_base64_file(b64: str, suffix: str) -> str:
     return f"/uploads/{filename}"
 
 
-# ---- Film2 helpers (event and artifact tracing) ----
-
-def _film2_trace_event(trace_id: Optional[str], e: Dict[str, Any]) -> None:
-    if not trace_id:
-        return
-    row = {"t": int(time.time() * 1000), **e}
-    ev = str(e.get("event") or "event")
-    payload = {k: v for k, v in row.items() if k != "event"}
-    _log(ev, trace_id=trace_id, **payload)
-
-
-def _film2_artifact_video(trace_id: Optional[str], path: str) -> None:
-    if not (trace_id and isinstance(path, str) and path):
-        return
-    rel = os.path.relpath(path, UPLOAD_DIR).replace("\\", "/")
-    _log("artifact", trace_id=trace_id, kind="video", path=rel)
-
-
 # ---- Creative helpers ----
 
 def _creative_alt_score(tr: Dict[str, Any], base_tool: str) -> float:
@@ -2095,23 +1861,11 @@ def _creative_alt_score(tr: Dict[str, Any], base_tool: str) -> float:
                 # Prefer full image score from the local artifact path
                 group = artifact_group_id or cid
                 img_path = os.path.join(UPLOAD_DIR, "artifacts", "image", str(group), str(aid))
-                try:
-                    ai = _analyze_image(img_path, prompt=None)
-                    score_block = ai.get("score") or {}
-                    return float(score_block.get("overall") or 0.0)
-                except Exception as ex:
-                    # Image QA is best-effort; log and fall back to neutral score.
-                    logging.warning(f"creative_alt_score.image_analysis_failed: {ex}", exc_info=True)
-                    return 0.0
+                return float(image_overall_score(img_path, prompt=None))
             if kind.startswith("audio") or base_tool.startswith("music"):
-                try:
-                    m = analyze_audio(f"/uploads/artifacts/music/{cid}/{aid}")
-                    # Simple composite: louder within safe LUFS and richer spectrum
-                    return float((m.get("spectral_flatness") or 0.0))
-                except Exception as ex:
-                    # Audio QA is best-effort; log and fall back to neutral score.
-                    logging.warning(f"creative_alt_score.audio_analysis_failed: {ex}", exc_info=True)
-                    return 0.0
+                group = artifact_group_id or cid
+                aud_path = os.path.join(UPLOAD_DIR, "artifacts", "music", str(group), str(aid))
+                return float(audio_spectral_flatness(aud_path))
     return 0.0
 
 
@@ -2455,19 +2209,22 @@ def _normalize_job(js: Dict[str, Any]) -> Dict[str, Any]:
 # ---- Teacher / streaming helpers ----
 
 async def _send_trace_stream_async(payload: Dict[str, Any]) -> None:
-    url = TEACHER_API_URL.rstrip("/") + "/teacher/trace.append"
     t0 = time.time()
     try:
-        async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
-            r = await client.post(url, json=payload)
-            dt_ms = int((time.time() - t0) * 1000.0)
-            _log("teacher.trace.append", trace_id=str(payload.get("trace_id") or ""), url=url, http_status=int(r.status_code), ms=dt_ms)
-            if not (200 <= int(r.status_code) < 300):
-                _log("teacher.trace.append.error", trace_id=str(payload.get("trace_id") or ""), url=url, http_status=int(r.status_code), body=(r.text or "")[:1000])
+        # In-process teacher tap (removed external `services/teacher` HTTP service).
+        res = await _teacher_tap_trace(payload or {})
+        dt_ms = int((time.time() - t0) * 1000.0)
+        _log(
+            "teacher.tap",
+            trace_id=str((payload or {}).get("trace_id") or (res or {}).get("trace_id") or ""),
+            ms=dt_ms,
+            ok=bool((res or {}).get("ok")),
+            label=(res or {}).get("label"),
+        )
     except Exception as ex:
         dt_ms = int((time.time() - t0) * 1000.0)
-        _log("teacher.trace.append.exception", trace_id=str(payload.get("trace_id") or ""), url=url, ms=dt_ms, error=str(ex))
-        logging.warning(f"teacher.trace.append failed url={url}: {ex}", exc_info=True)
+        _log("teacher.tap.exception", trace_id=str((payload or {}).get("trace_id") or ""), ms=dt_ms, error=str(ex))
+        logging.warning(f"teacher.tap failed: {ex}", exc_info=True)
 
 
 async def _orcjob_stream_gen(job_id: str, interval_ms: Optional[int] = None):
@@ -3234,133 +2991,230 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             width_int = dispatch_args.get("width") if isinstance(dispatch_args.get("width"), int) else None
             height_int = dispatch_args.get("height") if isinstance(dispatch_args.get("height"), int) else None
             # Parse "WxH" size when width/height not provided.
-            if (width_int is None or height_int is None) and isinstance(dispatch_args.get("size"), str) and "x" in str(dispatch_args.get("size")).lower():
-                try:
-                    w_str, h_str = str(dispatch_args.get("size")).lower().split("x", 1)
-                    if width_int is None and w_str.strip().isdigit():
-                        width_int = int(w_str.strip())
-                    if height_int is None and h_str.strip().isdigit():
-                        height_int = int(h_str.strip())
-                except Exception:
-                    pass
+            size_raw = dispatch_args.get("size")
+            if (width_int is None or height_int is None) and isinstance(size_raw, str):
+                size_s = size_raw.strip().lower()
+                if "x" in size_s:
+                    w_str, h_str = size_s.split("x", 1)
+                    w_str = w_str.strip()
+                    h_str = h_str.strip()
+                    if width_int is None and w_str.isdigit():
+                        width_int = int(w_str)
+                    if height_int is None and h_str.isdigit():
+                        height_int = int(h_str)
+                    if width_int is None or height_int is None:
+                        log.debug(
+                            "image.dispatch: size_parse_failed size=%r width=%r height=%r",
+                            size_raw,
+                            width_int,
+                            height_int,
+                        )
 
-            # Build a prompt graph. Prefer a configured workflow file if it already contains an API graph.
-            wf_path = os.getenv("COMFY_WORKFLOW_PATH") or "/workspace/services/image/workflows/stock_smoke.json"
-            prompt_graph: Dict[str, Any] | None = None
-            try:
-                if wf_path and os.path.exists(wf_path):
-                    with open(wf_path, "r", encoding="utf-8") as f:
-                        wf_obj = JSONParser().parse(f.read(), {})
-                else:
-                    wf_obj = {}
-            except Exception:
-                wf_obj = {}
-            if isinstance(wf_obj, dict) and isinstance(wf_obj.get("prompt"), dict):
-                prompt_graph = wf_obj.get("prompt")  # type: ignore[assignment]
-            elif isinstance(wf_obj, dict) and wf_obj:
-                # If it already looks like an API graph mapping, accept it.
-                looks_api = True
-                for _k, _v in wf_obj.items():
-                    if not (isinstance(_v, dict) and "class_type" in _v and "inputs" in _v):
-                        looks_api = False
-                        break
-                if looks_api:
-                    prompt_graph = wf_obj
-
-            if prompt_graph is None:
-                # Fallback: minimal SDXL graph.
-                w0, h0 = (width_int or 1024), (height_int or 1024)
-                steps0 = int(steps_val or 25)
-                seed0 = int(seed_int or 0)
-                prompt_graph = (build_default_scene_workflow(prompt_text, [], style=None, width=w0, height=h0, steps=steps0, seed=seed0, filename_prefix="void_image") or {}).get("prompt")  # type: ignore[name-defined]
-                if not isinstance(prompt_graph, dict):
-                    prompt_graph = {}
-
-            # Patch prompt / negative, seed, size, cfg/steps in common node types.
-            pos_set = False
-            for _nid, _node in (prompt_graph or {}).items():
-                if not isinstance(_node, dict):
-                    continue
-                ct = _node.get("class_type")
-                inp = _node.get("inputs") if isinstance(_node.get("inputs"), dict) else None
-                if not isinstance(inp, dict):
-                    continue
-                if ct == "CLIPTextEncode":
-                    # First CLIPTextEncode is positive, second is negative (common convention).
-                    if (not pos_set) and (prompt_text is not None):
-                        inp["text"] = str(prompt_text)
-                        pos_set = True
-                    elif negative_text is not None:
-                        inp["text"] = str(negative_text)
-                        negative_text = None
-                if ct in ("KSampler", "KSamplerAdvanced", "SamplerCustom"):
-                    if seed_int is not None and "seed" in inp:
-                        inp["seed"] = int(seed_int)
-                    if steps_val is not None and "steps" in inp:
-                        inp["steps"] = int(steps_val)
-                    if cfg_num is not None and "cfg" in inp:
-                        inp["cfg"] = float(cfg_num)
-                if ct in ("EmptyLatentImage", "LatentImage", "ImageResize", "LatentUpscale"):
-                    if width_int is not None and "width" in inp:
-                        inp["width"] = int(width_int)
-                    if height_int is not None and "height" in inp:
-                        inp["height"] = int(height_int)
-
-            workflow_payload: Dict[str, Any] = {"prompt": prompt_graph}
-            submit_res = await _comfy_submit_workflow(workflow_payload)  # type: ignore[name-defined]
-            if not isinstance(submit_res, dict) or submit_res.get("error"):
-                return _tool_error(name, "comfy_submit_failed", "comfy submit failed", status=502, details=submit_res)  # type: ignore[name-defined]
-            prompt_id = submit_res.get("prompt_id") or submit_res.get("uuid") or submit_res.get("id")
-            if not isinstance(prompt_id, str) or not prompt_id:
-                return _tool_error(name, "missing_prompt_id", "missing prompt_id from comfy", status=502, detail=submit_res)  # type: ignore[name-defined]
-
-            hist = await _comfy_history(prompt_id)  # type: ignore[name-defined]
-            detail = _normalize_comfy_history_entry(hist if isinstance(hist, dict) else {}, prompt_id)  # type: ignore[name-defined]
-            base = _job_endpoint.get(prompt_id) or (COMFYUI_API_URL or "")  # type: ignore[name-defined]
-            assets_list = _extract_comfy_asset_urls(detail if isinstance(detail, dict) else {}, base)  # type: ignore[name-defined]
-
-            # Download outputs into uploads/artifacts so downstream can serve them.
-            artifact_group_id = str(prompt_id)
-            save_dir = os.path.join(UPLOAD_DIR, "artifacts", "image", artifact_group_id)  # type: ignore[name-defined]
-            os.makedirs(save_dir, exist_ok=True)
-
+            mode_req = str(a.get("mode") or "gen").strip().lower()
+            prompt_id: str
+            artifact_group_id: str
+            save_dir: str
             orch_urls: List[str] = []
             artifacts_out: List[Dict[str, Any]] = []
             view_urls: List[str] = []
+            saved_paths: List[str] = []
 
-            async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
-                for it in assets_list:
-                    if not isinstance(it, dict):
-                        continue
-                    fn = it.get("filename")
-                    url = it.get("url")
-                    if not isinstance(fn, str) or not fn:
-                        continue
-                    if not isinstance(url, str) or not url:
-                        continue
-                    view_urls.append(url)
-                    # Fetch and persist
-                    resp = await client.get(url)
-                    if int(getattr(resp, "status_code", 0) or 0) != 200:
-                        continue
-                    safe_fn = os.path.basename(fn)
-                    dst = os.path.join(save_dir, safe_fn)
-                    try:
-                        with open(dst, "wb") as f:
-                            f.write(resp.content)
-                    except Exception:
-                        continue
-                    rel = os.path.relpath(dst, UPLOAD_DIR).replace("\\", "/")  # type: ignore[name-defined]
-                    orch_url = (f"{PUBLIC_BASE_URL.rstrip('/')}/uploads/{rel}" if PUBLIC_BASE_URL else f"/uploads/{rel}")  # type: ignore[name-defined]
-                    orch_urls.append(orch_url)
-                    artifacts_out.append(
-                        {
-                            "id": safe_fn,
-                            "kind": "image",
-                            "path": f"/uploads/{rel}",
-                            "view_url": orch_url,
-                        }
+            if mode_req == "upscale":
+                if not UPSCALE_API_URL:
+                    return _tool_error(name, "upscale_unconfigured", "UPSCALE_API_URL not configured", status=500)
+                # Resolve input image from args/assets.
+                src_img = a.get("image_ref") or assets.get("image_ref") or assets.get("src") or assets.get("init_image") or assets.get("image") or ""
+                if not isinstance(src_img, str) or not src_img.strip():
+                    return _tool_error(name, "missing_image_ref", "image_ref is required for mode=upscale", status=422)
+                img_abs = src_img.strip()
+                if img_abs.startswith("/uploads/"):
+                    img_abs = "/workspace" + img_abs
+                if not img_abs.startswith("/"):
+                    img_abs = os.path.normpath(os.path.join(UPLOAD_DIR, img_abs))  # type: ignore[name-defined]
+                img_abs = os.path.normpath(img_abs)
+                if not img_abs.startswith(os.path.normpath(UPLOAD_DIR)):  # type: ignore[name-defined]
+                    return _tool_error(name, "bad_image_path", "image_ref must be under UPLOAD_DIR", status=422, image_ref=src_img)
+                if not os.path.isfile(img_abs):
+                    return _tool_error(name, "image_not_found", "image_ref not found", status=404, image_ref=img_abs)
+
+                input_rel = os.path.relpath(img_abs, UPLOAD_DIR).replace("\\", "/")  # type: ignore[name-defined]
+                prompt_id = f"upscale_{int(time.time())}"
+                artifact_group_id = prompt_id
+                save_dir = os.path.join(UPLOAD_DIR, "artifacts", "image", artifact_group_id)  # type: ignore[name-defined]
+                os.makedirs(save_dir, exist_ok=True)
+
+                up_payload: Dict[str, Any] = {
+                    "job_id": prompt_id,
+                    "input_path": input_rel,
+                    "model_name": str(a.get("model_name") or os.getenv("REALESRGAN_MODEL_NAME", "RealESRGAN_x4plus")),
+                    "tile": int(a.get("tile") or os.getenv("REALESRGAN_TILE", "0") or 0),
+                    "ext": str(a.get("ext") or os.getenv("REALESRGAN_EXT", "png")),
+                    "suffix": str(a.get("suffix") or os.getenv("REALESRGAN_SUFFIX", "up")),
+                    "fp32": bool(a.get("fp32") or False),
+                    "face_enhance": bool(a.get("face_enhance") or False),
+                }
+                # Prefer a requested outscale if provided; else use target_long_edge from requested size.
+                outscale_val = a.get("outscale") or a.get("scale")
+                if isinstance(outscale_val, (int, float)) and float(outscale_val) > 0.0:
+                    up_payload["outscale"] = float(outscale_val)
+                elif isinstance(width_int, int) and isinstance(height_int, int) and width_int > 0 and height_int > 0:
+                    up_payload["target_long_edge"] = int(max(width_int, height_int))
+
+                async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
+                    r = await client.post(UPSCALE_API_URL.rstrip("/") + "/v1/upscale/image", content=json.dumps(up_payload))
+                env = JSONParser().parse(r.text or "{}", {})
+                if not (isinstance(env, dict) and bool(env.get("ok")) and isinstance(env.get("result"), dict)):
+                    err_obj = env.get("error") if isinstance(env, dict) else None
+                    return _tool_error(
+                        name,
+                        (err_obj.get("code") if isinstance(err_obj, dict) else "upscale_failed") or "upscale_failed",
+                        (err_obj.get("message") if isinstance(err_obj, dict) else "Upscale service failed") or "Upscale service failed",
+                        status=int((err_obj.get("status") if isinstance(err_obj, dict) else 500) or 500),
+                        details=(err_obj.get("details") if isinstance(err_obj, dict) else {"body": r.text, "status_code": r.status_code}),
                     )
+                res = env.get("result") if isinstance(env.get("result"), dict) else {}
+                out_path = res.get("output_path")
+                if not isinstance(out_path, str) or not out_path or not os.path.isfile(out_path):
+                    return _tool_error(name, "upscale_missing_output", "Upscale returned no output_path", status=500, result=res)
+
+                safe_fn = "upscaled." + str(up_payload.get("ext") or "png")
+                dst = os.path.join(save_dir, safe_fn)
+                _sh.copy2(out_path, dst)
+                saved_paths.append(dst)
+                rel = os.path.relpath(dst, UPLOAD_DIR).replace("\\", "/")  # type: ignore[name-defined]
+                orch_url = (f"{PUBLIC_BASE_URL.rstrip('/')}/uploads/{rel}" if PUBLIC_BASE_URL else f"/uploads/{rel}")  # type: ignore[name-defined]
+                orch_urls.append(orch_url)
+                artifacts_out.append({"id": safe_fn, "kind": "image", "path": f"/uploads/{rel}", "view_url": orch_url, "tag": "upscale"})
+                trace_append(
+                    "image.dispatch.upscale",
+                    {
+                        "trace_id": dispatch_args.get("trace_id"),
+                        "artifact_group_id": artifact_group_id,
+                        "src": img_abs,
+                        "out": dst,
+                        "payload": {k: v for k, v in up_payload.items() if k not in ("input_path",)},
+                    },
+                )
+            else:
+                # Build a prompt graph. Prefer a configured workflow file if it already contains an API graph.
+                wf_path = os.getenv("COMFY_WORKFLOW_PATH") or "/workspace/services/image/workflows/stock_smoke.json"
+                prompt_graph: Dict[str, Any] | None = None
+                try:
+                    if wf_path and os.path.exists(wf_path):
+                        with open(wf_path, "r", encoding="utf-8") as f:
+                            wf_obj = JSONParser().parse(f.read(), {})
+                    else:
+                        wf_obj = {}
+                except Exception:
+                    wf_obj = {}
+                if isinstance(wf_obj, dict) and isinstance(wf_obj.get("prompt"), dict):
+                    prompt_graph = wf_obj.get("prompt")  # type: ignore[assignment]
+                elif isinstance(wf_obj, dict) and wf_obj:
+                    # If it already looks like an API graph mapping, accept it.
+                    looks_api = True
+                    for _k, _v in wf_obj.items():
+                        if not (isinstance(_v, dict) and "class_type" in _v and "inputs" in _v):
+                            looks_api = False
+                            break
+                    if looks_api:
+                        prompt_graph = wf_obj
+
+                if prompt_graph is None:
+                    # Fallback: minimal SDXL graph.
+                    w0, h0 = (width_int or 1024), (height_int or 1024)
+                    steps0 = int(steps_val or 25)
+                    seed0 = int(seed_int or 0)
+                    prompt_graph = (build_default_scene_workflow(prompt_text, [], style=None, width=w0, height=h0, steps=steps0, seed=seed0, filename_prefix="void_image") or {}).get("prompt")  # type: ignore[name-defined]
+                    if not isinstance(prompt_graph, dict):
+                        prompt_graph = {}
+
+                # Patch prompt / negative, seed, size, cfg/steps in common node types.
+                pos_set = False
+                for _nid, _node in (prompt_graph or {}).items():
+                    if not isinstance(_node, dict):
+                        continue
+                    ct = _node.get("class_type")
+                    inp = _node.get("inputs") if isinstance(_node.get("inputs"), dict) else None
+                    if not isinstance(inp, dict):
+                        continue
+                    if ct == "CLIPTextEncode":
+                        # First CLIPTextEncode is positive, second is negative (common convention).
+                        if (not pos_set) and (prompt_text is not None):
+                            inp["text"] = str(prompt_text)
+                            pos_set = True
+                        elif negative_text is not None:
+                            inp["text"] = str(negative_text)
+                            negative_text = None
+                    if ct in ("KSampler", "KSamplerAdvanced", "SamplerCustom"):
+                        if seed_int is not None and "seed" in inp:
+                            inp["seed"] = int(seed_int)
+                        if steps_val is not None and "steps" in inp:
+                            inp["steps"] = int(steps_val)
+                        if cfg_num is not None and "cfg" in inp:
+                            inp["cfg"] = float(cfg_num)
+                    if ct in ("EmptyLatentImage", "LatentImage", "ImageResize", "LatentUpscale"):
+                        if width_int is not None and "width" in inp:
+                            inp["width"] = int(width_int)
+                        if height_int is not None and "height" in inp:
+                            inp["height"] = int(height_int)
+
+                workflow_payload: Dict[str, Any] = {"prompt": prompt_graph}
+                submit_res = _comfy_submit(workflow_payload, client_id="wrapper-001")
+                if not isinstance(submit_res, dict) or (isinstance(submit_res.get("error"), dict) and submit_res.get("error")):
+                    return _tool_error(name, "comfy_submit_failed", "comfy submit failed", status=502, details=submit_res)  # type: ignore[name-defined]
+                prompt_id = submit_res.get("prompt_id") or submit_res.get("uuid") or submit_res.get("id")
+                if not isinstance(prompt_id, str) or not prompt_id:
+                    return _tool_error(name, "missing_prompt_id", "missing prompt_id from comfy", status=502, detail=submit_res)  # type: ignore[name-defined]
+
+                # Hard-blocking polling: no websockets, no backoff/retries.
+                while True:
+                    hist = _comfy_history(prompt_id)
+                    detail = _normalize_comfy_history_entry(hist if isinstance(hist, dict) else {}, prompt_id)  # type: ignore[name-defined]
+                    if detail and _comfy_is_completed(detail if isinstance(detail, dict) else {}):
+                        break
+                    time.sleep(0.75)
+                base = COMFYUI_API_URL or ""
+                assets_list = _extract_comfy_asset_urls(detail if isinstance(detail, dict) else {}, base)  # type: ignore[name-defined]
+
+                # Download outputs into uploads/artifacts so downstream can serve them.
+                artifact_group_id = str(prompt_id)
+                save_dir = os.path.join(UPLOAD_DIR, "artifacts", "image", artifact_group_id)  # type: ignore[name-defined]
+                os.makedirs(save_dir, exist_ok=True)
+
+                async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
+                    for it in assets_list:
+                        if not isinstance(it, dict):
+                            continue
+                        fn = it.get("filename")
+                        url = it.get("url")
+                        if not isinstance(fn, str) or not fn:
+                            continue
+                        if not isinstance(url, str) or not url:
+                            continue
+                        view_urls.append(url)
+                        # Fetch and persist
+                        resp = await client.get(url)
+                        if int(getattr(resp, "status_code", 0) or 0) != 200:
+                            continue
+                        safe_fn = os.path.basename(fn)
+                        dst = os.path.join(save_dir, safe_fn)
+                        try:
+                            with open(dst, "wb") as f:
+                                f.write(resp.content)
+                        except Exception:
+                            continue
+                        saved_paths.append(dst)
+                        rel = os.path.relpath(dst, UPLOAD_DIR).replace("\\", "/")  # type: ignore[name-defined]
+                        orch_url = (f"{PUBLIC_BASE_URL.rstrip('/')}/uploads/{rel}" if PUBLIC_BASE_URL else f"/uploads/{rel}")  # type: ignore[name-defined]
+                        orch_urls.append(orch_url)
+                        artifacts_out.append(
+                            {
+                                "id": safe_fn,
+                                "kind": "image",
+                                "path": f"/uploads/{rel}",
+                                "view_url": orch_url,
+                            }
+                        )
 
             result_obj: Dict[str, Any] = {
                 "ids": {"prompt_id": prompt_id},
@@ -3376,8 +3230,27 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     "cfg": cfg_num,
                     "width": width_int,
                     "height": height_int,
+                    "mode": mode_req,
                 },
             }
+            # ---- Lock-aware QA + scoring (canonical locks module; best-effort) ----
+            meta_block = result_obj.get("meta") if isinstance(result_obj.get("meta"), dict) else {}
+            if isinstance(meta_block, dict):
+                meta_block.setdefault("quality_profile", quality_profile)
+                if isinstance(lock_bundle, dict):
+                    meta_block["locks"] = {"bundle": lock_bundle, "quality_profile": quality_profile}
+            try:
+                locks_scored = await score_image_dispatch_outputs(
+                    saved_paths=saved_paths,
+                    lock_bundle=lock_bundle if isinstance(lock_bundle, dict) else None,
+                    trace_id=dispatch_args.get("trace_id") if isinstance(dispatch_args, dict) else None,
+                    artifact_group_id=artifact_group_id,
+                    quality_profile=str(quality_profile or ""),
+                )
+                if isinstance(meta_block, dict) and isinstance(locks_scored, dict) and locks_scored:
+                    meta_block["locks"] = locks_scored
+            except Exception:
+                log.warning("image.dispatch: lock_scoring_failed artifact_group_id=%r", artifact_group_id, exc_info=True)
             if artifacts_out:
                 result_obj["artifacts"] = artifacts_out
             return {"name": name, "result": result_obj}
@@ -3463,6 +3336,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 if isinstance(lock_bundle, dict):
                     locks_meta = meta_block.get("locks") if isinstance(meta_block.get("locks"), dict) else {}
                     if isinstance(locks_meta, dict):
+                        # Never include raw bundles/embeddings in tool output.
                         if "bundle" not in locks_meta:
                             locks_meta["bundle"] = lock_bundle
                         meta_block["locks"] = locks_meta
@@ -3616,25 +3490,9 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
 
         frame_files = sorted(_glob(os.path.join(frames_dir, "*.png")))
         cleaned_frames: List[str] = []
-        clip_identity_scores: List[float] = []
         sharpness_sum: float = 0.0
         sharpness_count: int = 0
-
-        # Derive reference face embedding from lock bundle when available
-        face_ref: Optional[list] = None
         lock_bundle = locks.get("bundle") if isinstance(locks.get("bundle"), dict) else None
-        if isinstance(lock_bundle, dict):
-            vis = lock_bundle.get("visual")
-            if isinstance(vis, dict):
-                faces = vis.get("faces")
-                if isinstance(faces, list) and faces:
-                    emb_block = faces[0].get("embeddings") or {}
-                    if isinstance(emb_block, dict) and isinstance(emb_block.get("id_embedding"), list):
-                        face_ref = emb_block.get("id_embedding")  # type: ignore[assignment]
-            if face_ref is None:
-                fallback_face = lock_bundle.get("face")
-                if isinstance(fallback_face, dict) and isinstance(fallback_face.get("embedding"), list):
-                    face_ref = fallback_face.get("embedding")  # type: ignore[assignment]
 
         for idx, fp in enumerate(frame_files):
             cleaned_path = fp
@@ -3699,12 +3557,6 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
 
             cleaned_frames.append(cleaned_path)
 
-            # 4) Per-frame identity score (best-effort)
-            if face_ref is not None:
-                score = await _compute_face_lock_score(cleaned_path, face_ref)
-                if isinstance(score, (int, float)):
-                    clip_identity_scores.append(float(score))
-
             trace_append(
                 "film2.frame_fix",
                 {
@@ -3753,7 +3605,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     },
                 }
             refined_video_path = rebuilt_path
-            _film2_artifact_video(trace_id, rebuilt_path)
+            _film2_artifact_video(trace_id, rebuilt_path, upload_dir=UPLOAD_DIR, log_fn=_log)
             trace_append(
                 "film2.clip_rebuild_success",
                 {
@@ -3772,56 +3624,44 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         else:
             clip_sharpness = None
 
-        # 6) Clip-level identity QA summary
+        # 6) Clip-level identity QA summary (canonical quality module; best-effort and embedding-safe).
+        quality_profile = str(a.get("quality_profile") or locks.get("quality_profile") or "hero")
         qa_video: Dict[str, Any] = {}
-        if clip_identity_scores:
-            id_min = min(clip_identity_scores)
-            id_mean = sum(clip_identity_scores) / float(len(clip_identity_scores))
-            preset_hero = LOCK_QUALITY_PRESETS.get("hero", LOCK_QUALITY_PRESETS["standard"])
-            face_min_raw = preset_hero.get("face_min", 0.9)
-            face_min = float(face_min_raw) if isinstance(face_min_raw, (int, float)) else 0.9
-            weak_margin = 0.1 * face_min
-            if id_min >= face_min and id_mean >= face_min:
-                identity_status = "ok"
-            elif id_min >= max(0.0, face_min - weak_margin) and id_mean >= max(0.0, face_min - weak_margin):
-                identity_status = "weak"
-            else:
-                identity_status = "fail"
-            qa_video = {
-                "identity_min": id_min,
-                "identity_mean": id_mean,
-                "identity_status": identity_status,
-            }
-            trace_append(
-                "film2.clip_identity_qa",
-                {
-                    "trace_id": trace_id,
-                    "segment_id": segment_id,
-                    "film_id": film_id,
-                    "scene_id": scene_id,
-                    "shot_id": shot_id,
-                    "scores": clip_identity_scores,
-                    "min": id_min,
-                    "mean": id_mean,
-                },
+        try:
+            qa_env = await compute_refine_clip_lock_qa(
+                cleaned_frame_paths=cleaned_frames,
+                lock_bundle=lock_bundle,
+                lock_quality_presets=LOCK_QUALITY_PRESETS,
+                quality_profile=quality_profile,
+                trace_id=trace_id if isinstance(trace_id, str) else None,
+                context={"segment_id": segment_id, "film_id": film_id, "scene_id": scene_id, "shot_id": shot_id, "refine_mode": refine_mode},
             )
+            if isinstance(qa_env, dict):
+                qa_video = qa_env
+        except Exception:
+            # Never fail refine due to QA
+            qa_video = {"ok": False, "error": {"code": "qa_exception", "message": "refine clip QA failed"}}
 
         video_path: Optional[str] = refined_video_path
 
         # 7) Hunyuan fallback if frame-level path is unavailable.
         if video_path is None:
-            hv_args: Dict[str, Any] = {
-                "prompt": hv_prompt,
-                "width": width_val,
-                "height": height_val,
-                "fps": fps_val,
-                "seconds": seconds_val,
-                "locks": locks,
-                "seed": a.get("seed"),
-                "post": {"interpolate": True, "upscale": True, "face_lock": True, "hand_fix": True},
-                "latent_reinit_every": 48,
-                "cid": a.get("cid"),
-            }
+            _cid_hv = str(a.get("cid") or "").strip() if isinstance(a.get("cid"), (str, int)) else ""
+            hv_args: Dict[str, Any] = build_hv_tool_args(
+                prompt=hv_prompt,
+                width=width_val,
+                height=height_val,
+                fps=fps_val,
+                seconds=seconds_val,
+                locks=locks if isinstance(locks, dict) else {},
+                seed=a.get("seed"),
+                cid=_cid_hv,
+                trace_id=trace_id if isinstance(trace_id, str) else None,
+                film_id=str(film_id) if isinstance(film_id, str) else None,
+                scene_id=str(scene_id) if isinstance(scene_id, str) else None,
+                shot_id=str(shot_id) if isinstance(shot_id, str) else None,
+                act_id=str(act_id) if isinstance(act_id, str) else None,
+            )
             hv_res = await execute_tool_call({"name": "video.hv.t2v", "arguments": hv_args})
             if isinstance(hv_res, dict) and hv_res.get("error") is not None:
                 return hv_res
@@ -3837,7 +3677,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
 
         result_meta: Dict[str, Any] = {
             "timecode": timecode,
-            "locks": locks,
+            # Do not include raw embeddings/vectors in tool output; keep a safe summary for QA/committee/UI.
+            "locks": {"bundle": lock_bundle, "quality_profile": quality_profile},
         }
         if clip_sharpness is not None:
             result_meta["sharpness"] = clip_sharpness
@@ -3875,6 +3716,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     "message": "XTTS_API_URL is required for film2.run music vocals",
                 },
             }
+        t_film2 = time.perf_counter()
         a = raw_args if isinstance(raw_args, dict) else {}
         prompt = (a.get("prompt") or "").strip()
         trace_id = a.get("trace_id")
@@ -3897,6 +3739,22 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         fps_val = int(a.get("fps") or 60)
         width_val = int(a.get("width") or 1920)
         height_val = int(a.get("height") or 1080)
+        logging.info(
+            "film2.run:start trace_id=%r cid=%r film_id=%r prompt_len=%d duration_s=%s fps=%d size=%dx%d clips=%d images=%d interpolate=%s scale=%r locks=%s",
+            trace_id,
+            cid,
+            a.get("film_id"),
+            len(prompt or ""),
+            float(duration_s),
+            int(fps_val),
+            int(width_val),
+            int(height_val),
+            len(clips or []),
+            len(images or []),
+            bool(do_interpolate),
+            target_scale,
+            bool(isinstance(a.get("locks"), dict) and bool(a.get("locks"))),
+        )
         result: Dict[str, Any] = {"ids": {"film_id": film_id}, "meta": {"shots": [], "film_id": film_id}}
         if cid:
             result["meta"]["cid"] = cid
@@ -3913,6 +3771,11 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         warnings: List[str] = []
         # Character context derived from locks (if present); reused for music + hero updates.
         current_character_bundles: Dict[str, Dict[str, Any]] = await ensure_story_character_bundles(locks_arg if isinstance(locks_arg, dict) else {})
+        logging.info(
+            "film2.run:locks:bundles_loaded trace_id=%r characters=%d",
+            trace_id,
+            len(current_character_bundles or {}) if isinstance(current_character_bundles, dict) else 0,
+        )
         # Derive character_ids once for downstream use (music + hero lock updates).
         character_ids: List[str] = []
         raw_character_ids = a.get("character_ids")
@@ -3929,7 +3792,20 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 if isinstance(cid, (str, int))
             ]
         if prompt:
-            story_obj = _story_draft(prompt, duration_s)
+            story_obj = await _story_draft(prompt, duration_s, trace_id=trace_id)
+            if isinstance(story_obj, dict):
+                acts_n = len(story_obj.get("acts") or []) if isinstance(story_obj.get("acts"), list) else 0
+                chars_n = len(story_obj.get("characters") or []) if isinstance(story_obj.get("characters"), list) else 0
+                locs_n = len(story_obj.get("locations") or []) if isinstance(story_obj.get("locations"), list) else 0
+                objs_n = len(story_obj.get("objects") or []) if isinstance(story_obj.get("objects"), list) else 0
+                logging.info(
+                    "film2.run:story:drafted trace_id=%r acts=%d characters=%d locations=%d objects=%d",
+                    trace_id,
+                    acts_n,
+                    chars_n,
+                    locs_n,
+                    objs_n,
+                )
             trace_append(
                 "film2.story_draft",
                 {
@@ -3941,7 +3817,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             max_story_passes = 3
             last_issues: List[Dict[str, Any]] = []
             for pass_index in range(max_story_passes):
-                last_issues = _story_check(story_obj, prompt)
+                last_issues = await _story_check(story_obj, prompt, trace_id=trace_id)
                 issue_codes = [iss.get("code") for iss in last_issues if isinstance(iss, dict)]
                 trace_append(
                     "film2.story_consistency_pass",
@@ -3953,7 +3829,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 )
                 if not last_issues:
                     break
-                story_obj = _story_fix(story_obj, last_issues)
+                story_obj = await _story_fix(story_obj, last_issues, user_prompt=prompt, trace_id=trace_id)
             if last_issues:
                 warnings.append("story_consistency_unresolved")
                 trace_append(
@@ -3965,6 +3841,12 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     },
                 )
             scenes_from_story, shots_from_story = _story_derive(story_obj)
+            logging.info(
+                "film2.run:story:derived trace_id=%r scenes=%d shots=%d",
+                trace_id,
+                len(scenes_from_story or []),
+                len(shots_from_story or []),
+            )
         if warnings:
             meta_warnings = result["meta"].setdefault("warnings", [])
             if isinstance(meta_warnings, list):
@@ -3975,6 +3857,90 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             result["meta"]["scenes"] = scenes_from_story
         if shots_from_story:
             result["meta"]["shots_from_story"] = shots_from_story
+
+        def _emit_film2_hero_traces(hero_record: Any, shot_meta: Dict[str, Any]) -> None:
+            """
+            Distillation-grade hero tracing for Film2.
+            No try/except: avoid throws by guarding shapes only.
+            """
+            if not isinstance(hero_record, dict):
+                return
+            if not isinstance(shot_meta, dict):
+                return
+            cands = hero_record.get("candidates") if isinstance(hero_record.get("candidates"), list) else []
+            trace_append(
+                "film2.hero_frame_selected",
+                {
+                    "trace_id": trace_id,
+                    "film_id": film_id,
+                    "shot_id": shot_meta.get("shot_id"),
+                    "scene_id": shot_meta.get("scene_id"),
+                    "act_id": shot_meta.get("act_id"),
+                    "source_video": hero_record.get("source_video"),
+                    "hero_index": hero_record.get("index"),
+                    "hero_score": hero_record.get("score"),
+                    "hero_image_path": hero_record.get("image_path"),
+                    "locks": hero_record.get("locks") if isinstance(hero_record.get("locks"), dict) else {},
+                },
+            )
+            trace_append(
+                "film2.hero_frame_candidates",
+                {
+                    "trace_id": trace_id,
+                    "film_id": film_id,
+                    "shot_id": shot_meta.get("shot_id"),
+                    "candidates": cands,
+                },
+            )
+            _ds_append_row(
+                "film2.hero_frame",
+                {
+                    "cid": cid,
+                    "trace_id": trace_id,
+                    "tool": "film2.run",
+                    "tags": ["film2:hero_frame", f"profile:{profile_name}"],
+                    "inputs": {
+                        "film_id": film_id,
+                        "shot_id": shot_meta.get("shot_id"),
+                        "scene_id": shot_meta.get("scene_id"),
+                        "act_id": shot_meta.get("act_id"),
+                    },
+                    "outputs": {
+                        "image_path": hero_record.get("image_path"),
+                        "source_video": hero_record.get("source_video"),
+                    },
+                    "locks": hero_record.get("locks") if isinstance(hero_record.get("locks"), dict) else {},
+                    "metrics": {"score": hero_record.get("score"), "index": hero_record.get("index")},
+                    "meta": {"candidates": cands},
+                },
+            )
+            # Optional: write one row per candidate frame (small; max_frames defaults to 8).
+            for cand in cands:
+                if not isinstance(cand, dict):
+                    continue
+                _ds_append_row(
+                    "film2.hero_frame_candidate",
+                    {
+                        "cid": cid,
+                        "trace_id": trace_id,
+                        "tool": "film2.run",
+                        "tags": ["film2:hero_frame_candidate", f"profile:{profile_name}"],
+                        "inputs": {
+                            "film_id": film_id,
+                            "shot_id": shot_meta.get("shot_id"),
+                            "scene_id": shot_meta.get("scene_id"),
+                            "act_id": shot_meta.get("act_id"),
+                            "candidate_index": cand.get("index"),
+                        },
+                        "outputs": {
+                            "image_path": cand.get("image_path"),
+                        },
+                        "locks": cand.get("locks") if isinstance(cand.get("locks"), dict) else {},
+                        "metrics": {"score": cand.get("score"), "discarded": cand.get("discarded")},
+                        "meta": {},
+                        "payload": cand,
+                    },
+                )
         # Trace character state changes and per-shot state snapshots for distillation.
         if story_obj:
             acts = story_obj.get("acts") if isinstance(story_obj.get("acts"), list) else []
@@ -4028,6 +3994,12 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         if story_obj and isinstance(locks_arg, dict):
             locks_arg = await _ensure_visual_locks_for_story(story_obj, locks_arg, profile_name, trace_id)
             result["meta"]["locks"] = locks_arg
+            logging.info(
+                "film2.run:locks:enriched trace_id=%r has_locks=%s characters=%d",
+                trace_id,
+                bool(locks_arg),
+                len(locks_arg.get("characters") or []) if isinstance(locks_arg.get("characters"), list) else 0,
+            )
         # Precompute TTS dialogue audio when possible
         dialogue_index: Dict[str, Any] = {}
         if story_obj:
@@ -4042,6 +4014,23 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 result["meta"]["dialogue"] = dialogue_index
             if locks_arg:
                 result["meta"]["locks"] = locks_arg
+            if isinstance(dialogue_index, dict):
+                ok_lines = 0
+                bad_lines = 0
+                for v in dialogue_index.values():
+                    if not isinstance(v, dict):
+                        continue
+                    if v.get("audio_path"):
+                        ok_lines += 1
+                    if v.get("error"):
+                        bad_lines += 1
+                logging.info(
+                    "film2.run:tts:dialogue_pregen trace_id=%r lines=%d ok=%d failed=%d",
+                    trace_id,
+                    len(dialogue_index),
+                    ok_lines,
+                    bad_lines,
+                )
         # Generate simple scene and shot storyboards before hv video
         if scenes_from_story:
             scenes_from_story = await _film2_generate_scene_storyboards(
@@ -4052,6 +4041,11 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 execute_tool_call,
             )
             result["meta"]["scenes"] = scenes_from_story
+            sc_ok = 0
+            for sc in scenes_from_story or []:
+                if isinstance(sc, dict) and isinstance(sc.get("storyboard"), dict) and sc.get("storyboard", {}).get("image_url"):
+                    sc_ok += 1
+            logging.info("film2.run:storyboards:scenes trace_id=%r ok=%d/%d", trace_id, sc_ok, len(scenes_from_story or []))
         if shots_from_story:
             shots_from_story = await _film2_generate_shot_storyboards(
                 shots_from_story,
@@ -4061,6 +4055,11 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 execute_tool_call,
             )
             result["meta"]["shots_from_story"] = shots_from_story
+            sh_ok = 0
+            for sh in shots_from_story or []:
+                if isinstance(sh, dict) and isinstance(sh.get("storyboard"), dict) and sh.get("storyboard", {}).get("image_url"):
+                    sh_ok += 1
+            logging.info("film2.run:storyboards:shots trace_id=%r ok=%d/%d", trace_id, sh_ok, len(shots_from_story or []))
         # Music planning phase: optionally score the film via music.infinite.windowed.
         music_meta: Dict[str, Any] = {}
         if prompt and duration_s > 0:
@@ -4110,31 +4109,33 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             win_list = meta_obj.get("windows") if isinstance(meta_obj.get("windows"), list) else []
             scenes_for_music = result["meta"].get("scenes") if isinstance(result["meta"].get("scenes"), list) else []
             shots_for_music = result["meta"].get("shots_from_story") if isinstance(result["meta"].get("shots_from_story"), list) else []
-            # Simple heuristic: divide film duration evenly across scenes/shots if no explicit timing.
-            scene_timing: Dict[str, Dict[str, float]] = {}
-            if scenes_for_music:
-                seg = duration_s / float(len(scenes_for_music) or 1)
-                t0 = 0.0
-                for sc in scenes_for_music:
-                    if not isinstance(sc, dict):
-                        continue
-                    sid = sc.get("scene_id")
-                    if not isinstance(sid, str):
-                        continue
-                    scene_timing[sid] = {"t_start": t0, "t_end": t0 + seg}
-                    t0 += seg
+            # Derive precise scene/shot timing from story-driven shot durations when available.
+            # This ensures music windows line up perfectly with the generated film plan.
             shot_timing: Dict[str, Dict[str, float]] = {}
-            if shots_for_music:
-                seg = duration_s / float(len(shots_for_music) or 1)
-                t0 = 0.0
-                for sh in shots_for_music:
-                    if not isinstance(sh, dict):
-                        continue
-                    sid = sh.get("shot_id")
-                    if not isinstance(sid, str):
-                        continue
-                    shot_timing[sid] = {"t_start": t0, "t_end": t0 + seg}
-                    t0 += seg
+            scene_timing: Dict[str, Dict[str, float]] = {}
+            cursor_s = 0.0
+            for sh in shots_for_music or []:
+                if not isinstance(sh, dict):
+                    continue
+                shot_id = sh.get("shot_id")
+                if not isinstance(shot_id, str) or not shot_id:
+                    continue
+                dur_raw = sh.get("duration_s")
+                dur_s = float(dur_raw) if isinstance(dur_raw, (int, float)) else 0.0
+                if dur_s <= 0.0:
+                    # Fallback: evenly slice remaining duration if story didn't provide durations.
+                    # (keeps behavior reasonable without lying about precision)
+                    dur_s = float(duration_s) / float(len(shots_for_music) or 1)
+                shot_timing[shot_id] = {"t_start": float(cursor_s), "t_end": float(cursor_s + dur_s)}
+                cursor_s += dur_s
+                scene_id = sh.get("scene_id")
+                if isinstance(scene_id, str) and scene_id:
+                    prev = scene_timing.get(scene_id)
+                    if prev is None:
+                        scene_timing[scene_id] = {"t_start": float(shot_timing[shot_id]["t_start"]), "t_end": float(shot_timing[shot_id]["t_end"])}
+                    else:
+                        prev["t_start"] = min(prev.get("t_start", float("inf")), float(shot_timing[shot_id]["t_start"]))
+                        prev["t_end"] = max(prev.get("t_end", 0.0), float(shot_timing[shot_id]["t_end"]))
             for win in win_list or []:
                 if not isinstance(win, dict):
                     continue
@@ -4156,6 +4157,13 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             meta_obj["windows"] = win_list
             music_meta["meta"] = meta_obj
             result["meta"]["music"] = music_meta
+            win_list = (music_meta.get("meta") or {}).get("windows") if isinstance(music_meta.get("meta"), dict) else None
+            logging.info(
+                "film2.run:music:planned trace_id=%r windows=%d",
+                trace_id,
+                (len(win_list) if isinstance(win_list, list) else 0),
+            )
+            logging.info("film2.run:prepasses_complete trace_id=%r dur_ms=%d", trace_id, int((time.perf_counter() - t_film2) * 1000))
             # Trace cross-modal attachment for distillation and perform backing+vocals mix.
             music_meta_obj = music_meta.get("meta") if isinstance(music_meta.get("meta"), dict) else {}
             # Locate the backing audio path from the music envelope artifacts.
@@ -4270,7 +4278,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                         oq = float(overall_block.get("overall_quality_score") or 0.0)
                         fs = float(overall_block.get("fit_score") or 0.0)
                         th_music = get_music_acceptance_thresholds()
-                        # Acceptance thresholds loaded from review/acceptance_audio.json
+                        # Acceptance thresholds loaded from shared void_quality package
                         accepted = (oq >= th_music.get("overall_quality_min", 0.0) and fs >= th_music.get("fit_score_min", 0.0))
                         # Hero thresholds: stricter than acceptance
                         hero = (oq >= MUSIC_HERO_QUALITY_MIN and fs >= MUSIC_HERO_FIT_MIN)
@@ -4316,86 +4324,198 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     "num_windows": len(win_list),
                 },
             )
-        _film2_trace_event(trace_id, {"event": "film2.shot_start", "prompt": prompt})
+        _film2_trace_event(trace_id, {"event": "film2.shot_start", "prompt": prompt}, log_fn=_log)
         # Enhance/cleanup path with provided clips
         if clips:
             for i, src in enumerate(clips):
                 shot_meta: Dict[str, Any] = {"index": i, "source": src}
+                # Provide stable correlation ids to every internal tool call so outputs are
+                # always attributable (QA/committee/UI) and no args are lost.
+                clip_shot_id = f"clip_{i}"
                 segment_log: List[Dict[str, Any]] = []
                 # Cleanup
-                _film2_trace_event(trace_id, {"event": "film2.pass_cleanup_start", "src": src})
-                cc = await http_tool_run("video.cleanup", {"src": src, "cid": cid, "trace_id": trace_id})
+                _film2_trace_event(trace_id, {"event": "film2.pass_cleanup_start", "src": src}, log_fn=_log)
+                cc = await http_tool_run(
+                    "video.cleanup",
+                    {"src": src, "cid": cid, "trace_id": trace_id, "film_id": film_id, "shot_id": clip_shot_id},
+                )
                 if isinstance(cc, dict):
                     segment_log.append(cc)
                 ccr = (cc.get("result") or {}) if isinstance(cc, dict) else {}
                 clean_path = ccr.get("path") if isinstance(ccr, dict) else None
                 if isinstance(clean_path, str):
-                    _film2_artifact_video(trace_id, clean_path)
+                    _film2_artifact_video(trace_id, clean_path, upload_dir=UPLOAD_DIR, log_fn=_log)
                     shot_meta["clean_path"] = clean_path
-                _film2_trace_event(trace_id, {"event": "film2.pass_cleanup_finish"})
-                # Temporal interpolate (optional)
+                _film2_trace_event(trace_id, {"event": "film2.pass_cleanup_finish"}, log_fn=_log)
+                # Upscale (optional)
                 current = clean_path or src
-                if do_interpolate and isinstance(current, str):
-                    _film2_trace_event(trace_id, {"event": "film2.pass_interpolate_start"})
-                    ic = await http_tool_run("video.interpolate", {"src": current, "cid": cid, "trace_id": trace_id})
-                    if isinstance(ic, dict):
-                        segment_log.append(ic)
-                    icr = (ic.get("result") or {}) if isinstance(ic, dict) else {}
-                    interp_path = icr.get("path") if isinstance(icr, dict) else None
-                    if isinstance(interp_path, str):
-                        _film2_artifact_video(trace_id, interp_path)
-                        shot_meta["interp_path"] = interp_path
-                    current = interp_path or current
-                    _film2_trace_event(trace_id, {"event": "film2.pass_interpolate_finish"})
-                # Upscale
-                if isinstance(current, str):
-                    _film2_trace_event(trace_id, {"event": "film2.pass_upscale_start"})
-                    uc_args = {"src": current, "cid": cid, "trace_id": trace_id}
-                    if target_scale:
-                        uc_args["scale"] = target_scale
+                if isinstance(current, str) and target_scale:
+                    _film2_trace_event(trace_id, {"event": "film2.pass_upscale_start"}, log_fn=_log)
+                    uc_args = {
+                        "src": current,
+                        "cid": cid,
+                        "trace_id": trace_id,
+                        "film_id": film_id,
+                        "shot_id": clip_shot_id,
+                        "scale": target_scale,
+                    }
                     uc = await http_tool_run("video.upscale", uc_args)
                     if isinstance(uc, dict):
                         segment_log.append(uc)
                     up = (uc.get("result") or {}) if isinstance(uc, dict) else {}
                     up_path = up.get("path") if isinstance(up, dict) else None
                     if isinstance(up_path, str):
-                        _film2_artifact_video(trace_id, up_path)
+                        _film2_artifact_video(trace_id, up_path, upload_dir=UPLOAD_DIR, log_fn=_log)
                         shot_meta["upscaled_path"] = up_path
-                    _film2_trace_event(trace_id, {"event": "film2.pass_upscale_finish"})
+                        current = up_path
+                    _film2_trace_event(trace_id, {"event": "film2.pass_upscale_finish"}, log_fn=_log)
+
+                # Temporal interpolate (optional) - must preserve duration by targeting fps
+                if do_interpolate and isinstance(current, str):
+                    _film2_trace_event(trace_id, {"event": "film2.pass_interpolate_start"}, log_fn=_log)
+                    ic_args = {
+                        "src": current,
+                        "cid": cid,
+                        "trace_id": trace_id,
+                        "film_id": film_id,
+                        "shot_id": clip_shot_id,
+                        "target_fps": int(fps_val),
+                    }
+                    if isinstance(locks_arg, dict) and locks_arg:
+                        ic_args["locks"] = locks_arg
+                    ic = await http_tool_run("video.interpolate", ic_args)
+                    if isinstance(ic, dict):
+                        segment_log.append(ic)
+                    icr = (ic.get("result") or {}) if isinstance(ic, dict) else {}
+                    interp_path = icr.get("path") if isinstance(icr, dict) else None
+                    if isinstance(interp_path, str):
+                        _film2_artifact_video(trace_id, interp_path, upload_dir=UPLOAD_DIR, log_fn=_log)
+                        shot_meta["interp_path"] = interp_path
+                        current = interp_path
+                    _film2_trace_event(trace_id, {"event": "film2.pass_interpolate_finish"}, log_fn=_log)
+
+                # Final post-pass QA/cleanup (best-effort): sharpen/denoise after upscale+interp so
+                # downstream hero-frame + locks + committee see the final visual output.
+                if isinstance(current, str):
+                    _film2_trace_event(trace_id, {"event": "film2.pass_cleanup2_start", "src": current}, log_fn=_log)
+                    cc2 = await http_tool_run(
+                        "video.cleanup",
+                        {"src": current, "cid": cid, "trace_id": trace_id, "film_id": film_id, "shot_id": clip_shot_id},
+                    )
+                    if isinstance(cc2, dict):
+                        segment_log.append(cc2)
+                    cc2r = (cc2.get("result") or {}) if isinstance(cc2, dict) else {}
+                    clean2_path = cc2r.get("path") if isinstance(cc2r, dict) else None
+                    if isinstance(clean2_path, str) and clean2_path:
+                        _film2_artifact_video(trace_id, clean2_path, upload_dir=UPLOAD_DIR, log_fn=_log)
+                        shot_meta["final_clean_path"] = clean2_path
+                        current = clean2_path
+                    _film2_trace_event(trace_id, {"event": "film2.pass_cleanup2_finish"}, log_fn=_log)
+
+                # Temporal QA snapshot (best-effort; should never block the film run)
+                if isinstance(current, str):
+                    tq = await http_tool_run(
+                        "video.temporal_clip_qa",
+                        {"src": current, "cid": cid, "trace_id": trace_id, "film_id": film_id, "shot_id": clip_shot_id},
+                    )
+                    if isinstance(tq, dict):
+                        segment_log.append(tq)
+                        tqr = (tq.get("result") or {}) if isinstance(tq, dict) else {}
+                        if isinstance(tqr, dict):
+                            shot_meta["temporal_qa"] = tqr
+
+                # Decide best output (locks + QA composite): implemented in quality.selection (no inline QA logic here).
+                base_path = clean_path or src
+                processed_path = current if isinstance(current, str) and current else base_path
+                best_reason = "processed_default"
+
+                base_qa = shot_meta.get("temporal_qa_base") if isinstance(shot_meta.get("temporal_qa_base"), dict) else None
+                best_qa = shot_meta.get("temporal_qa") if isinstance(shot_meta.get("temporal_qa"), dict) else None
+                base_stab = None
+                proc_stab = None
+                if isinstance(base_qa, dict):
+                    m0 = base_qa.get("meta") if isinstance(base_qa.get("meta"), dict) else {}
+                    if isinstance(m0.get("temporal_stability"), (int, float)):
+                        base_stab = float(m0.get("temporal_stability"))
+                if isinstance(best_qa, dict):
+                    m1 = best_qa.get("meta") if isinstance(best_qa.get("meta"), dict) else {}
+                    if isinstance(m1.get("temporal_stability"), (int, float)):
+                        proc_stab = float(m1.get("temporal_stability"))
+
+                best_pick = await choose_best_video_pair(
+                    base_path=str(base_path or ""),
+                    processed_path=str(processed_path or ""),
+                    base_temporal_stability=base_stab,
+                    processed_temporal_stability=proc_stab,
+                    lock_bundle=locks_arg if isinstance(locks_arg, dict) else {},
+                    thresholds_lock=thresholds_lock if isinstance(thresholds_lock, dict) else {},
+                    upload_dir=UPLOAD_DIR,
+                    trace_id=trace_id if isinstance(trace_id, str) else None,
+                    event_kind="film2.best_select",
+                    context={"film_id": film_id, "shot_index": i},
+                )
+                best_path = best_pick.get("best_path") if isinstance(best_pick, dict) else processed_path
+                best_reason = best_pick.get("best_reason") if isinstance(best_pick, dict) else best_reason
+                if isinstance(best_pick, dict) and isinstance(best_pick.get("scores"), dict):
+                    shot_meta["best_scores"] = best_pick.get("scores")
+                heroes = best_pick.get("heroes") if isinstance(best_pick, dict) else {}
+                base_hero = (heroes.get("base") if isinstance(heroes, dict) else None)
+                proc_hero = (heroes.get("processed") if isinstance(heroes, dict) else None)
+
+                # Persist all known versions with QA pointers.
+                versions: List[Dict[str, Any]] = []
+                if isinstance(src, str) and src:
+                    versions.append({"kind": "source", "path": src})
+                if isinstance(clean_path, str) and clean_path:
+                    versions.append({"kind": "clean", "path": clean_path})
+                up_p = shot_meta.get("upscaled_path")
+                if isinstance(up_p, str) and up_p:
+                    versions.append({"kind": "upscale", "path": up_p})
+                ip_p = shot_meta.get("interp_path")
+                if isinstance(ip_p, str) and ip_p:
+                    versions.append({"kind": "interpolate", "path": ip_p})
+                fc_p = shot_meta.get("final_clean_path")
+                if isinstance(fc_p, str) and fc_p:
+                    versions.append({"kind": "final_clean", "path": fc_p})
+                # Attach per-candidate summaries so committee/UI can see every version's score.
+                if isinstance(base_path, str) and base_path:
+                    versions.append({"kind": "base_candidate", "path": base_path, "temporal_stability": base_stab, "hero_frame": base_hero})
+                if isinstance(processed_path, str) and processed_path:
+                    versions.append({"kind": "processed_candidate", "path": processed_path, "temporal_stability": proc_stab, "hero_frame": proc_hero})
+                if isinstance(best_path, str) and best_path:
+                    shot_meta["best_path"] = best_path
+                    shot_meta["best_reason"] = best_reason
+                shot_meta["versions"] = versions
                 if segment_log:
                     shot_meta["segment_results"] = segment_log
-                    frames_for_hero = segment_log
-                    hero_pick = choose_hero_frame(frames_for_hero, thresholds_lock)
-                    hero_record: Dict[str, Any] = {}
-                    hero_path_value: Optional[str] = None
-                    if hero_pick is not None:
-                        hero_frame = hero_pick.get("frame") if isinstance(hero_pick, dict) else None
-                        hero_index = int(hero_pick.get("index")) if isinstance(hero_pick.get("index"), int) else hero_pick.get("index")
-                        hero_meta_payload = _frame_meta_payload(hero_frame) if isinstance(hero_frame, dict) else {}
-                        hero_record = {
-                            "index": int(hero_index) if isinstance(hero_index, int) else hero_pick.get("index"),
-                            "score": hero_pick.get("score"),
-                            "locks": hero_meta_payload.get("locks") if isinstance(hero_meta_payload.get("locks"), dict) else {},
-                        }
-                        hero_path_value = _frame_image_path(hero_frame) if isinstance(hero_frame, dict) else None
-                    elif frames_for_hero:
-                        fallback_frame = frames_for_hero[-1]
-                        fallback_meta = _frame_meta_payload(fallback_frame)
-                        hero_record = {
-                            "index": len(frames_for_hero) - 1,
-                            "score": None,
-                            "locks": fallback_meta.get("locks") if isinstance(fallback_meta.get("locks"), dict) else {},
-                            "fallback": True,
-                        }
-                        hero_path_value = _frame_image_path(fallback_frame)
+                    # Choose hero frame from the final video (not from tool results), and compute real lock metrics.
+                    final_video = shot_meta.get("best_path") or shot_meta.get("final_clean_path") or shot_meta.get("upscaled_path") or shot_meta.get("interp_path") or shot_meta.get("clean_path") or src
+                    hero_record = await pick_hero_frame_from_video(
+                        str(final_video) if isinstance(final_video, str) else "",
+                        lock_bundle=locks_arg if isinstance(locks_arg, dict) else {},
+                        thresholds=thresholds_lock if isinstance(thresholds_lock, dict) else {},
+                        upload_dir=UPLOAD_DIR,
+                    )
                     if hero_record:
-                        if isinstance(hero_path_value, str) and hero_path_value:
-                            if os.path.isabs(hero_path_value):
-                                hero_abs = hero_path_value
-                            else:
-                                hero_abs = os.path.join(UPLOAD_DIR, hero_path_value.lstrip("/"))
-                            hero_record["image_path"] = hero_abs
                         shot_meta["hero_frame"] = hero_record
+                        # Shot-level artifacts for UI + distillation (hero frame image)
+                        hero_img = hero_record.get("image_path") if isinstance(hero_record, dict) else None
+                        if isinstance(hero_img, str) and hero_img:
+                            shot_meta.setdefault("artifacts", [])
+                            if isinstance(shot_meta.get("artifacts"), list):
+                                shot_meta["artifacts"].append({"kind": "image", "path": hero_img})
+                        # Persist hero lock metrics into the canonical meta.locks location so downstream
+                        # QA/reporting doesn't need to special-case hero_frame.
+                        hero_locks = hero_record.get("locks") if isinstance(hero_record, dict) else None
+                        if isinstance(hero_locks, dict) and hero_locks:
+                            hs = hero_record.get("score") if isinstance(hero_record, dict) else None
+                            if isinstance(hs, (int, float)):
+                                hero_locks["hero_score"] = float(hs)
+                            meta_obj = shot_meta.get("meta")
+                            if not isinstance(meta_obj, dict):
+                                meta_obj = {}
+                                shot_meta["meta"] = meta_obj
+                            meta_obj["locks"] = hero_locks
                         hero_abs_path = hero_record.get("image_path")
                         if isinstance(hero_abs_path, str) and hero_abs_path and character_ids:
                             for character_id in character_ids:
@@ -4411,6 +4531,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                                     hero_record.setdefault("bundle_versions", {})[character_id] = {
                                         "schema_version": updated_bundle.get("schema_version"),
                                     }
+                        _emit_film2_hero_traces(hero_record, shot_meta)
                 result["meta"]["shots"].append(shot_meta)
         # Story-driven Hunyuan generation when no explicit clips are provided.
         elif shots_from_story:
@@ -4438,25 +4559,24 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                             descr = f"{descr} ({extra})"
                     dur = float(shot.get("duration_s") or duration_s)
                     seconds_val = int(dur) if dur > 0.0 else int(duration_s)
-                    adapter = "hv.t2v"
-                    hv_name = "video.hv.t2v"
-                    hv_args: Dict[str, Any] = {
-                        "prompt": descr,
-                        "width": width_val,
-                        "height": height_val,
-                        "fps": fps_val,
-                        "seconds": seconds_val,
-                        "locks": locks_arg,
-                        "seed": a.get("seed"),
-                        "post": {"interpolate": True, "upscale": True, "face_lock": True, "hand_fix": True},
-                        "latent_reinit_every": 48,
-                        "cid": cid,
-                    }
+                    hv_args: Dict[str, Any] = build_hv_tool_args(
+                        prompt=descr,
+                        width=width_val,
+                        height=height_val,
+                        fps=fps_val,
+                        seconds=seconds_val,
+                        locks=locks_arg,
+                        seed=a.get("seed"),
+                        cid=cid,
+                        trace_id=trace_id if isinstance(trace_id, str) else None,
+                        film_id=film_id,
+                        scene_id=str(scene_id) if isinstance(scene_id, str) else None,
+                        shot_id=str(shot_id) if isinstance(shot_id, str) else None,
+                        act_id=str(act_id) if isinstance(act_id, str) else None,
+                    )
                     storyboard_img = shot.get("storyboard_image")
                     if isinstance(storyboard_img, str) and storyboard_img:
                         hv_args["init_image"] = storyboard_img
-                        hv_name = "video.hv.i2v"
-                        adapter = "hv.i2v"
                     shot_meta = {
                         "index": story_shot_index,
                         "shot_id": shot_id,
@@ -4465,125 +4585,356 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                         "prompt": descr,
                         "duration_s": dur,
                     }
-                    segment_log = []
-                    _film2_trace_event(trace_id, {"event": "film2.pass_gen_start", "adapter": adapter, "shot_id": shot_id})
-                    trace_append(
-                        "film2.hv_call_start",
-                        {
-                            "trace_id": trace_id,
-                            "adapter": hv_name,
-                            "shot_id": shot_id,
-                            "scene_id": scene_id,
-                            "act_id": act_id,
-                            "prompt": descr,
-                            "width": width_val,
-                            "height": height_val,
-                            "fps": fps_val,
-                            "seconds": seconds_val,
-                            "init_image": hv_args.get("init_image"),
-                        },
+                    gen_path, segment_log = await film2_generate_video(
+                        trace_id=trace_id,
+                        shot_id=str(shot_id) if isinstance(shot_id, str) else None,
+                        scene_id=str(scene_id) if isinstance(scene_id, str) else None,
+                        act_id=str(act_id) if isinstance(act_id, str) else None,
+                        hv_tool_args=hv_args,
+                        upload_dir=UPLOAD_DIR,
+                        log_fn=_log,
+                        trace_append=trace_append,
+                        http_tool_run=http_tool_run,
+                        artifact_video=(lambda tid, p: _film2_artifact_video(tid, p, upload_dir=UPLOAD_DIR, log_fn=_log)),
                     )
-                    gv = await http_tool_run(hv_name, hv_args)
-                    if isinstance(gv, dict):
-                        segment_log.append(gv)
-                    gvr = (gv.get("result") or {}) if isinstance(gv, dict) else {}
-                    gen_path = None
-                    if isinstance(gvr, dict):
-                        gen_path = gvr.get("path")
-                        if not isinstance(gen_path, str):
-                            video_obj = gvr.get("video") if isinstance(gvr.get("video"), dict) else {}
-                            gen_path = video_obj.get("path") if isinstance(video_obj.get("path"), str) else None
-                    if isinstance(gen_path, str):
-                        _film2_artifact_video(trace_id, gen_path)
-                        shot_meta["gen_path"] = gen_path
-                        trace_append(
-                            "film2.hv_call_success",
-                            {
-                                "trace_id": trace_id,
-                                "adapter": hv_name,
-                                "shot_id": shot_id,
-                                "scene_id": scene_id,
-                                "act_id": act_id,
-                                "video_path": gen_path,
-                            },
-                        )
-                    _film2_trace_event(trace_id, {"event": "film2.pass_gen_finish"})
+                    if isinstance(gen_path, str) and gen_path:
+                        # film2_generate_video returns the final path after post passes.
+                        shot_meta["final_path"] = gen_path
                     if segment_log:
                         shot_meta["segment_results"] = segment_log
+                        # Extract all known versions from tool results so we can choose the best output.
+                        versions: List[Dict[str, Any]] = []
+                        gen0 = None
+                        clean0 = None
+                        up0 = None
+                        ip0 = None
+                        hf0 = None
+                        for tr in segment_log:
+                            if not isinstance(tr, dict):
+                                continue
+                            tname = tr.get("name")
+                            tres = tr.get("result") if isinstance(tr.get("result"), dict) else {}
+                            pth = tres.get("path") if isinstance(tres.get("path"), str) else None
+                            if tname == "video.hv.t2v" and pth:
+                                gen0 = pth
+                            if tname == "video.cleanup" and pth:
+                                clean0 = pth
+                            if tname == "video.upscale" and pth:
+                                up0 = pth
+                            if tname == "video.interpolate" and pth:
+                                ip0 = pth
+                            if tname == "video.hands.fix" and pth:
+                                hf0 = pth
+                        if isinstance(gen0, str) and gen0:
+                            versions.append({"kind": "gen", "path": gen0})
+                            shot_meta["gen_path"] = gen0
+                        if isinstance(up0, str) and up0:
+                            versions.append({"kind": "upscale", "path": up0})
+                            shot_meta["upscaled_path"] = up0
+                        if isinstance(ip0, str) and ip0:
+                            versions.append({"kind": "interpolate", "path": ip0})
+                            shot_meta["interp_path"] = ip0
+                        if isinstance(hf0, str) and hf0:
+                            versions.append({"kind": "hands_fix", "path": hf0})
+                            shot_meta["handsfix_path"] = hf0
+                        if isinstance(clean0, str) and clean0:
+                            versions.append({"kind": "clean", "path": clean0})
+                            shot_meta["clean_path"] = clean0
+                        if isinstance(gen_path, str) and gen_path:
+                            versions.append({"kind": "final", "path": gen_path})
+
+                        # Choose best_path based on locks + temporal QA (compare gen vs final when possible).
+                        best_path = gen_path if isinstance(gen_path, str) and gen_path else (clean0 or gen0)
+                        best_reason = "final_default"
+                        if isinstance(gen0, str) and gen0 and isinstance(gen_path, str) and gen_path and gen0 != gen_path:
+                            qa_gen = await http_tool_run(
+                                "video.temporal_clip_qa",
+                                {
+                                    "src": gen0,
+                                    "cid": cid,
+                                    "trace_id": trace_id,
+                                    "film_id": film_id,
+                                    "scene_id": scene_id,
+                                    "shot_id": shot_id,
+                                    "act_id": act_id,
+                                },
+                            )
+                            qa_fin = await http_tool_run(
+                                "video.temporal_clip_qa",
+                                {
+                                    "src": gen_path,
+                                    "cid": cid,
+                                    "trace_id": trace_id,
+                                    "film_id": film_id,
+                                    "scene_id": scene_id,
+                                    "shot_id": shot_id,
+                                    "act_id": act_id,
+                                },
+                            )
+                            if isinstance(qa_gen, dict):
+                                segment_log.append(qa_gen)
+                                gqr = qa_gen.get("result") if isinstance(qa_gen.get("result"), dict) else {}
+                                if isinstance(gqr, dict):
+                                    shot_meta["temporal_qa_gen"] = gqr
+                            if isinstance(qa_fin, dict):
+                                segment_log.append(qa_fin)
+                                fqr = qa_fin.get("result") if isinstance(qa_fin.get("result"), dict) else {}
+                                if isinstance(fqr, dict):
+                                    shot_meta["temporal_qa_final"] = fqr
+                            gmeta = (shot_meta.get("temporal_qa_gen") or {}).get("meta") if isinstance(shot_meta.get("temporal_qa_gen"), dict) else {}
+                            fmeta = (shot_meta.get("temporal_qa_final") or {}).get("meta") if isinstance(shot_meta.get("temporal_qa_final"), dict) else {}
+                            gstab = float(gmeta.get("temporal_stability")) if isinstance(gmeta.get("temporal_stability"), (int, float)) else None
+                            fstab = float(fmeta.get("temporal_stability")) if isinstance(fmeta.get("temporal_stability"), (int, float)) else None
+                            best_pick = await choose_best_video_pair(
+                                base_path=gen0,
+                                processed_path=gen_path,
+                                base_temporal_stability=gstab,
+                                processed_temporal_stability=fstab,
+                                lock_bundle=locks_arg if isinstance(locks_arg, dict) else {},
+                                thresholds_lock=thresholds_lock if isinstance(thresholds_lock, dict) else {},
+                                upload_dir=UPLOAD_DIR,
+                                trace_id=trace_id if isinstance(trace_id, str) else None,
+                                event_kind="film2.best_select_story",
+                                context={"film_id": film_id, "shot_id": shot_id},
+                            )
+                            if isinstance(best_pick, dict):
+                                if isinstance(best_pick.get("best_path"), str) and best_pick.get("best_path"):
+                                    best_path = str(best_pick.get("best_path"))
+                                if isinstance(best_pick.get("best_reason"), str) and best_pick.get("best_reason"):
+                                    best_reason = str(best_pick.get("best_reason"))
+                                if isinstance(best_pick.get("scores"), dict):
+                                    shot_meta["best_scores"] = best_pick.get("scores")
+                                heroes = best_pick.get("heroes") if isinstance(best_pick.get("heroes"), dict) else {}
+                                versions.append({"kind": "gen_candidate", "path": gen0, "temporal_stability": gstab, "hero_frame": heroes.get("base")})
+                                versions.append({"kind": "final_candidate", "path": gen_path, "temporal_stability": fstab, "hero_frame": heroes.get("processed")})
+
+                        if isinstance(best_path, str) and best_path:
+                            shot_meta["best_path"] = best_path
+                            shot_meta["best_reason"] = best_reason
+                        shot_meta["versions"] = versions
+                        hero_record = await pick_hero_frame_from_video(
+                            str(shot_meta.get("best_path") or gen_path) if isinstance((shot_meta.get("best_path") or gen_path), str) else "",
+                            lock_bundle=locks_arg if isinstance(locks_arg, dict) else {},
+                            thresholds=thresholds_lock if isinstance(thresholds_lock, dict) else {},
+                            upload_dir=UPLOAD_DIR,
+                        )
+                        if hero_record:
+                            shot_meta["hero_frame"] = hero_record
+                            hero_img = hero_record.get("image_path") if isinstance(hero_record, dict) else None
+                            if isinstance(hero_img, str) and hero_img:
+                                shot_meta.setdefault("artifacts", [])
+                                if isinstance(shot_meta.get("artifacts"), list):
+                                    shot_meta["artifacts"].append({"kind": "image", "path": hero_img})
+                            hero_locks = hero_record.get("locks")
+                            if isinstance(hero_locks, dict) and hero_locks:
+                                hs = hero_record.get("score")
+                                if isinstance(hs, (int, float)):
+                                    hero_locks["hero_score"] = float(hs)
+                                shot_meta.setdefault("meta", {})["locks"] = hero_locks
+                            hero_abs_path = hero_record.get("image_path")
+                            if isinstance(hero_abs_path, str) and hero_abs_path and character_ids:
+                                for character_id in character_ids:
+                                    existing_bundle = current_character_bundles.get(character_id)
+                                    if existing_bundle is not None:
+                                        updated_bundle = await _lock_update_from_hero(
+                                            character_id,
+                                            hero_abs_path,
+                                            existing_bundle,
+                                            locks_root_dir=LOCKS_ROOT_DIR,
+                                        )
+                                        current_character_bundles[character_id] = updated_bundle
+                                        hero_record.setdefault("bundle_versions", {})[character_id] = {
+                                            "schema_version": updated_bundle.get("schema_version"),
+                                        }
+                            _emit_film2_hero_traces(hero_record, shot_meta)
                     result["meta"]["shots"].append(shot_meta)
                     story_shot_index += 1
         # Image-based generation goes through Hunyuan (full-res, max quality) when story shots are unavailable.
         elif images:
                 for i, img in enumerate(images):
                     shot_meta = {"index": i, "init_image": img}
-                    segment_log = []
-                    hv_args_img: Dict[str, Any] = {
-                        "init_image": img,
-                        "prompt": prompt or "",
-                        "width": width_val,
-                        "height": height_val,
-                        "fps": fps_val,
-                        "seconds": int(duration_s),
-                        "locks": locks_arg,
-                        "seed": a.get("seed"),
-                        "post": {"interpolate": True, "upscale": True, "face_lock": True, "hand_fix": True},
-                        "latent_reinit_every": 48,
-                        "cid": cid,
-                    }
-                    _film2_trace_event(trace_id, {"event": "film2.pass_gen_start", "adapter": "hv.i2v", "image": img})
-                    gv = await http_tool_run("video.hv.i2v", hv_args_img)
-                    if isinstance(gv, dict):
-                        segment_log.append(gv)
-                    gvr = (gv.get("result") or {}) if isinstance(gv, dict) else {}
-                    gen_path = None
-                    if isinstance(gvr, dict):
-                        gen_path = gvr.get("path")
-                        if not isinstance(gen_path, str):
-                            video_obj = gvr.get("video") if isinstance(gvr.get("video"), dict) else {}
-                            gen_path = video_obj.get("path") if isinstance(video_obj.get("path"), str) else None
-                    if isinstance(gen_path, str):
-                        _artifact_video(gen_path)
-                        shot_meta["gen_path"] = gen_path
-                    _film2_trace_event(trace_id, {"event": "film2.pass_gen_finish"})
+                    hv_args_img: Dict[str, Any] = build_hv_tool_args(
+                        prompt=prompt or "",
+                        width=width_val,
+                        height=height_val,
+                        fps=fps_val,
+                        seconds=int(duration_s),
+                        locks=locks_arg,
+                        seed=a.get("seed"),
+                        cid=cid,
+                        trace_id=trace_id if isinstance(trace_id, str) else None,
+                        film_id=film_id,
+                        shot_id=f"shot_{i}",
+                        init_image=img,
+                    )
+                    gen_path, segment_log = await film2_generate_video(
+                        trace_id=trace_id,
+                        shot_id=f"shot_{i}",
+                        scene_id=None,
+                        act_id=None,
+                        hv_tool_args=hv_args_img,
+                        upload_dir=UPLOAD_DIR,
+                        log_fn=_log,
+                        trace_append=trace_append,
+                        http_tool_run=http_tool_run,
+                        artifact_video=(lambda tid, p: _film2_artifact_video(tid, p, upload_dir=UPLOAD_DIR, log_fn=_log)),
+                    )
+                    if isinstance(gen_path, str) and gen_path:
+                        shot_meta["final_path"] = gen_path
                     if segment_log:
                         shot_meta["segment_results"] = segment_log
+                        versions: List[Dict[str, Any]] = []
+                        gen0 = None
+                        clean0 = None
+                        up0 = None
+                        ip0 = None
+                        for tr in segment_log:
+                            if not isinstance(tr, dict):
+                                continue
+                            tname = tr.get("name")
+                            tres = tr.get("result") if isinstance(tr.get("result"), dict) else {}
+                            pth = tres.get("path") if isinstance(tres.get("path"), str) else None
+                            if tname == "video.hv.t2v" and pth:
+                                gen0 = pth
+                            if tname == "video.cleanup" and pth:
+                                clean0 = pth
+                            if tname == "video.upscale" and pth:
+                                up0 = pth
+                            if tname == "video.interpolate" and pth:
+                                ip0 = pth
+                        if isinstance(gen0, str) and gen0:
+                            versions.append({"kind": "gen", "path": gen0})
+                            shot_meta["gen_path"] = gen0
+                        if isinstance(up0, str) and up0:
+                            versions.append({"kind": "upscale", "path": up0})
+                            shot_meta["upscaled_path"] = up0
+                        if isinstance(ip0, str) and ip0:
+                            versions.append({"kind": "interpolate", "path": ip0})
+                            shot_meta["interp_path"] = ip0
+                        if isinstance(clean0, str) and clean0:
+                            versions.append({"kind": "clean", "path": clean0})
+                            shot_meta["clean_path"] = clean0
+                        if isinstance(gen_path, str) and gen_path:
+                            versions.append({"kind": "final", "path": gen_path})
+                        best_path = gen_path if isinstance(gen_path, str) and gen_path else (clean0 or gen0)
+                        if isinstance(best_path, str) and best_path:
+                            shot_meta["best_path"] = best_path
+                            shot_meta["best_reason"] = "final_default"
+                        shot_meta["versions"] = versions
+                        hero_record = await pick_hero_frame_from_video(
+                            str(shot_meta.get("best_path") or gen_path) if isinstance((shot_meta.get("best_path") or gen_path), str) else "",
+                            lock_bundle=locks_arg if isinstance(locks_arg, dict) else {},
+                            thresholds=thresholds_lock if isinstance(thresholds_lock, dict) else {},
+                            upload_dir=UPLOAD_DIR,
+                        )
+                        if hero_record:
+                            shot_meta["hero_frame"] = hero_record
+                            hero_img = hero_record.get("image_path") if isinstance(hero_record, dict) else None
+                            if isinstance(hero_img, str) and hero_img:
+                                shot_meta.setdefault("artifacts", [])
+                                if isinstance(shot_meta.get("artifacts"), list):
+                                    shot_meta["artifacts"].append({"kind": "image", "path": hero_img})
+                            hero_locks = hero_record.get("locks")
+                            if isinstance(hero_locks, dict) and hero_locks:
+                                hs = hero_record.get("score")
+                                if isinstance(hs, (int, float)):
+                                    hero_locks["hero_score"] = float(hs)
+                                shot_meta.setdefault("meta", {})["locks"] = hero_locks
+                            _emit_film2_hero_traces(hero_record, shot_meta)
                     result["meta"]["shots"].append(shot_meta)
         else:
             # Prompt-only Hunyuan generation when no clips/images/story shots are supplied.
             if prompt:
                 shot_meta = {"index": 0, "prompt": prompt}
-                segment_log = []
-                hv_args_prompt = {
-                    "prompt": prompt,
-                    "width": width_val,
-                    "height": height_val,
-                    "fps": fps_val,
-                    "seconds": int(duration_s),
-                    "locks": locks_arg,
-                    "seed": a.get("seed"),
-                    "post": {"interpolate": True, "upscale": True, "face_lock": True, "hand_fix": True},
-                    "latent_reinit_every": 48,
-                    "cid": cid,
-                }
-                _film2_trace_event(trace_id, {"event": "film2.pass_gen_start", "adapter": "hv.t2v"})
-                gv = await execute_tool_call({"name": "video.hv.t2v", "arguments": hv_args_prompt})
-                if isinstance(gv, dict):
-                    segment_log.append(gv)
-                gvr = (gv.get("result") or {}) if isinstance(gv, dict) else {}
-                gen_path = None
-                if isinstance(gvr, dict):
-                    gen_path = gvr.get("path")
-                    if not isinstance(gen_path, str):
-                        video_obj = gvr.get("video") if isinstance(gvr.get("video"), dict) else {}
-                        gen_path = video_obj.get("path") if isinstance(video_obj.get("path"), str) else None
-                if isinstance(gen_path, str):
-                    _artifact_video(gen_path)
-                    shot_meta["gen_path"] = gen_path
-                _film2_trace_event(trace_id, {"event": "film2.pass_gen_finish"})
+                hv_args_prompt: Dict[str, Any] = build_hv_tool_args(
+                    prompt=prompt or "",
+                    width=width_val,
+                    height=height_val,
+                    fps=fps_val,
+                    seconds=int(duration_s),
+                    locks=locks_arg,
+                    seed=a.get("seed"),
+                    cid=cid,
+                    trace_id=trace_id if isinstance(trace_id, str) else None,
+                    film_id=film_id,
+                    shot_id="shot_0",
+                )
+                gen_path, segment_log = await film2_generate_video(
+                    trace_id=trace_id,
+                    shot_id="shot_0",
+                    scene_id=None,
+                    act_id=None,
+                    hv_tool_args=hv_args_prompt,
+                    upload_dir=UPLOAD_DIR,
+                    log_fn=_log,
+                    trace_append=trace_append,
+                    http_tool_run=http_tool_run,
+                    artifact_video=(lambda tid, p: _film2_artifact_video(tid, p, upload_dir=UPLOAD_DIR, log_fn=_log)),
+                )
+                if isinstance(gen_path, str) and gen_path:
+                    shot_meta["final_path"] = gen_path
                 if segment_log:
                     shot_meta["segment_results"] = segment_log
+                    versions: List[Dict[str, Any]] = []
+                    gen0 = None
+                    clean0 = None
+                    up0 = None
+                    ip0 = None
+                    for tr in segment_log:
+                        if not isinstance(tr, dict):
+                            continue
+                        tname = tr.get("name")
+                        tres = tr.get("result") if isinstance(tr.get("result"), dict) else {}
+                        pth = tres.get("path") if isinstance(tres.get("path"), str) else None
+                        if tname == "video.hv.t2v" and pth:
+                            gen0 = pth
+                        if tname == "video.cleanup" and pth:
+                            clean0 = pth
+                        if tname == "video.upscale" and pth:
+                            up0 = pth
+                        if tname == "video.interpolate" and pth:
+                            ip0 = pth
+                    if isinstance(gen0, str) and gen0:
+                        versions.append({"kind": "gen", "path": gen0})
+                        shot_meta["gen_path"] = gen0
+                    if isinstance(up0, str) and up0:
+                        versions.append({"kind": "upscale", "path": up0})
+                        shot_meta["upscaled_path"] = up0
+                    if isinstance(ip0, str) and ip0:
+                        versions.append({"kind": "interpolate", "path": ip0})
+                        shot_meta["interp_path"] = ip0
+                    if isinstance(clean0, str) and clean0:
+                        versions.append({"kind": "clean", "path": clean0})
+                        shot_meta["clean_path"] = clean0
+                    if isinstance(gen_path, str) and gen_path:
+                        versions.append({"kind": "final", "path": gen_path})
+                    best_path = gen_path if isinstance(gen_path, str) and gen_path else (clean0 or gen0)
+                    if isinstance(best_path, str) and best_path:
+                        shot_meta["best_path"] = best_path
+                        shot_meta["best_reason"] = "final_default"
+                    shot_meta["versions"] = versions
+                    hero_record = await pick_hero_frame_from_video(
+                        str(shot_meta.get("best_path") or gen_path) if isinstance((shot_meta.get("best_path") or gen_path), str) else "",
+                        lock_bundle=locks_arg if isinstance(locks_arg, dict) else {},
+                        thresholds=thresholds_lock if isinstance(thresholds_lock, dict) else {},
+                        upload_dir=UPLOAD_DIR,
+                    )
+                    if hero_record:
+                        shot_meta["hero_frame"] = hero_record
+                        hero_img = hero_record.get("image_path") if isinstance(hero_record, dict) else None
+                        if isinstance(hero_img, str) and hero_img:
+                            shot_meta.setdefault("artifacts", [])
+                            if isinstance(shot_meta.get("artifacts"), list):
+                                shot_meta["artifacts"].append({"kind": "image", "path": hero_img})
+                        hero_locks = hero_record.get("locks")
+                        if isinstance(hero_locks, dict) and hero_locks:
+                            hs = hero_record.get("score")
+                            if isinstance(hs, (int, float)):
+                                hero_locks["hero_score"] = float(hs)
+                            shot_meta.setdefault("meta", {})["locks"] = hero_locks
+                        _emit_film2_hero_traces(hero_record, shot_meta)
                 result["meta"]["shots"].append(shot_meta)
-        _film2_trace_event(trace_id, {"event": "film2.shot_finish"})
+        _film2_trace_event(trace_id, {"event": "film2.shot_finish"}, log_fn=_log)
         # Build a simple segment hierarchy: film -> scenes -> shots -> clips (one clip per shot for now)
         film_segment: Dict[str, Any] = {
             "segment_id": film_id,
@@ -4593,6 +4944,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 "prompt": prompt,
                 "duration_s": duration_s,
             },
+            "artifacts": [],
         }
         scene_segments: Dict[str, Dict[str, Any]] = {}
         shot_segments: Dict[str, Dict[str, Any]] = {}
@@ -4630,6 +4982,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     continue
                 lines = s.get("dialogue") if isinstance(s.get("dialogue"), list) else []
                 story_shot_dialogue[sid] = [ln for ln in lines if isinstance(ln, dict)]
+            # Derive deterministic, cumulative timing for the film from shot durations.
+            film_cursor_s = 0.0
             for sh in shots_meta:
                 if not isinstance(sh, dict):
                     continue
@@ -4639,7 +4993,32 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 scene_id = sh.get("scene_id")
                 act_id = sh.get("act_id")
                 dur_s = float(sh.get("duration_s") or duration_s)
+                if dur_s <= 0.0:
+                    dur_s = float(duration_s) / float(len(shots_meta) or 1)
+                shot_start_s = float(film_cursor_s)
+                shot_end_s = float(film_cursor_s + dur_s)
+                film_cursor_s = shot_end_s
+                # Prefer best_path (post-processed) for all downstream QA/UI views, but keep all versions.
+                best_path = sh.get("best_path") or sh.get("final_clean_path") or sh.get("final_path") or sh.get("upscaled_path") or sh.get("interp_path") or sh.get("clean_path") or sh.get("gen_path")
                 gen_path = sh.get("gen_path")
+                # Pull any explicit shot-level artifacts (e.g., hero frame) from the shot meta block.
+                shot_artifacts: List[Dict[str, Any]] = []
+                if isinstance(sh.get("artifacts"), list):
+                    shot_artifacts = [a for a in (sh.get("artifacts") or []) if isinstance(a, dict)]
+                # Always include the best shot video first, then all other versions.
+                if isinstance(best_path, str) and best_path:
+                    shot_artifacts.append({"kind": "video", "path": best_path, "tag": "best"})
+                # Include all known versions if present (without dropping anything).
+                if isinstance(sh.get("versions"), list):
+                    for v in sh.get("versions") or []:
+                        if not isinstance(v, dict):
+                            continue
+                        vp = v.get("path")
+                        if isinstance(vp, str) and vp:
+                            shot_artifacts.append({"kind": "video", "path": vp, "tag": str(v.get("kind") or "version")})
+                # Back-compat: include gen_path if not already present.
+                if isinstance(gen_path, str) and gen_path and not any((isinstance(a, dict) and a.get("path") == gen_path) for a in shot_artifacts):
+                    shot_artifacts.append({"kind": "video", "path": gen_path, "tag": "gen"})
                 shot_seg: Dict[str, Any] = {
                     "segment_id": shot_id,
                     "level": "shot",
@@ -4648,8 +5027,14 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                         "scene_id": scene_id,
                         "act_id": act_id,
                         "duration_s": dur_s,
+                        "timecode": {"start_s": shot_start_s, "end_s": shot_end_s, "fps": fps_val},
+                        "best_path": best_path,
                         "gen_path": gen_path,
+                        "prompt": sh.get("prompt"),
+                        "locks": (sh.get("meta") or {}).get("locks") if isinstance(sh.get("meta"), dict) else None,
+                        "versions": sh.get("versions") if isinstance(sh.get("versions"), list) else [],
                     },
+                    "artifacts": shot_artifacts,
                 }
                 shot_segments[shot_id] = shot_seg
                 if isinstance(scene_id, str) and scene_id in scene_segments:
@@ -4683,6 +5068,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     start_s = clip_index * clip_window_s
                     end_s = dur_s if clip_index == num_clips - 1 else min(dur_s, (clip_index + 1) * clip_window_s)
                     clip_id = f"{shot_id}_clip_{clip_index}"
+                    film_start_s = float(shot_start_s + float(start_s))
+                    film_end_s = float(shot_start_s + float(end_s))
                     clip_result: Dict[str, Any] = {
                         "meta": {
                             "cid": cid,
@@ -4690,7 +5077,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                             "scene_id": scene_id,
                             "shot_id": shot_id,
                             "clip_index": clip_index,
-                            "timecode": {"start_s": start_s, "end_s": end_s, "fps": fps_val},
+                            # Keep relative clip timecode for local operations, but include absolute film timecode for perfect alignment.
+                            "timecode": {"start_s": start_s, "end_s": end_s, "fps": fps_val, "film_start_s": film_start_s, "film_end_s": film_end_s},
                             "locks": locks_arg if isinstance(locks_arg, dict) else {},
                             "prompt": sh.get("prompt"),
                             "width": width_val,
@@ -4698,8 +5086,17 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                         },
                         "artifacts": [],
                     }
-                    if isinstance(gen_path, str) and gen_path:
-                        clip_result["artifacts"].append({"kind": "video", "path": gen_path})
+                    clip_video = best_path if isinstance(best_path, str) and best_path else gen_path
+                    if isinstance(clip_video, str) and clip_video:
+                        clip_result["artifacts"].append({"kind": "video", "path": clip_video, "tag": "best"})
+                    # Keep all versions for clip-level QA tools (committee can see everything).
+                    if isinstance(sh.get("versions"), list):
+                        for v in sh.get("versions") or []:
+                            if not isinstance(v, dict):
+                                continue
+                            vp = v.get("path")
+                            if isinstance(vp, str) and vp:
+                                clip_result["artifacts"].append({"kind": "video", "path": vp, "tag": str(v.get("kind") or "version")})
                     # Compute a simple lipsync score based on dialogue durations overlapping this clip window.
                     clip_lines: List[str] = []
                     dialogue_total_s = 0.0
@@ -4764,12 +5161,39 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                             "clip_index": clip_index,
                             "start_s": start_s,
                             "end_s": end_s,
+                            "film_start_s": film_start_s,
+                            "film_end_s": film_end_s,
                             "fps": fps_val,
-                            "video_path": gen_path,
+                            "video_path": clip_video,
                             "dialogue_total_s": dialogue_total_s,
                             "lipsync_score": lipsync_score,
                         },
                     )
+            # Attach computed film timecode.
+            film_segment["meta"]["timecode"] = {"start_s": 0.0, "end_s": float(film_cursor_s), "fps": fps_val}
+            # Attach computed scene timecodes from their child shots.
+            for sid, seg_scene in scene_segments.items():
+                if not isinstance(seg_scene, dict):
+                    continue
+                child_ids = seg_scene.get("children") if isinstance(seg_scene.get("children"), list) else []
+                starts: List[float] = []
+                ends: List[float] = []
+                for shid in child_ids or []:
+                    if not isinstance(shid, str):
+                        continue
+                    shseg = shot_segments.get(shid)
+                    if not isinstance(shseg, dict):
+                        continue
+                    tc = shseg.get("meta", {}).get("timecode") if isinstance(shseg.get("meta"), dict) else None
+                    if isinstance(tc, dict):
+                        if isinstance(tc.get("start_s"), (int, float)):
+                            starts.append(float(tc.get("start_s")))
+                        if isinstance(tc.get("end_s"), (int, float)):
+                            ends.append(float(tc.get("end_s")))
+                if starts and ends:
+                    seg_scene.setdefault("meta", {})
+                    if isinstance(seg_scene.get("meta"), dict):
+                        seg_scene["meta"]["timecode"] = {"start_s": float(min(starts)), "end_s": float(max(ends)), "fps": fps_val}
         result.setdefault("meta", {})["segments"] = {
                 "film": film_segment,
                 "scenes": list(scene_segments.values()),
@@ -4777,16 +5201,55 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 "clips": list(clip_segments.values()),
             }
         # No error handling here: if segment hierarchy construction fails, let it surface.
-        # Select a final video output and expose as ids/meta for UI
+        # Assemble shots into scenes and scenes into a final film video (canonical).
+        final_music_mix_path = None
+        try:
+            meta_music = result.get("meta", {}).get("music") if isinstance(result.get("meta"), dict) else None
+            if isinstance(meta_music, dict):
+                final_music_mix_path = meta_music.get("final_mix_path")
+        except Exception:
+            final_music_mix_path = None
+        # Optional film-level subtitles from dialogue timing when enabled.
+        subtitles_srt_path = None
+        try:
+            if bool(a.get("subtitles_enabled")):
+                meta_block = result.get("meta") if isinstance(result.get("meta"), dict) else {}
+                dialogue_index = meta_block.get("dialogue") if isinstance(meta_block.get("dialogue"), dict) else {}
+                srt_text = _build_srt_from_dialogue_index(dialogue_index)
+                if srt_text.strip():
+                    srt_outdir = os.path.join(UPLOAD_DIR, "artifacts", "video", "film2_assemble", str(film_id))
+                    os.makedirs(srt_outdir, exist_ok=True)
+                    subtitles_srt_path = os.path.join(srt_outdir, "subtitles.srt")
+                    with open(subtitles_srt_path, "w", encoding="utf-8") as f:
+                        f.write(srt_text)
+        except Exception:
+            subtitles_srt_path = None
+
+        assembly = None
+        try:
+            assembly = _assemble_film_from_shots(
+                film_id=film_id,
+                shots=(result.get("meta", {}).get("shots") if isinstance(result.get("meta"), dict) else []) or [],
+                upload_dir=UPLOAD_DIR,
+                public_base_url=PUBLIC_BASE_URL,
+                audio_path=(final_music_mix_path if isinstance(final_music_mix_path, str) else None),
+                audio_policy=str(a.get("audio_policy") or "mix"),
+                subtitles_srt_path=subtitles_srt_path,
+                trace_id=(trace_id if isinstance(trace_id, str) else None),
+                state_dir=STATE_DIR,
+            )
+        except Exception as ex:
+            trace_append("film2.assemble.error", {"trace_id": trace_id, "film_id": film_id, "error": str(ex)})
+            assembly = {"ok": False, "error": str(ex)}
+        if isinstance(assembly, dict):
+            result.setdefault("meta", {})["assembly"] = assembly
+        # Assembly returns a ToolEnvelope dict; final video path lives under result.path
         final_path = None
-        for sh in reversed(result.get("meta", {}).get("shots", [])):
-            for key in ("upscaled_path", "interp_path", "clean_path", "gen_path"):
-                p = sh.get(key)
-                if isinstance(p, str) and p:
-                    final_path = p
-                    break
-            if final_path:
-                break
+        if isinstance(assembly, dict):
+            ar = assembly.get("result") if isinstance(assembly.get("result"), dict) else {}
+            p = ar.get("path")
+            if isinstance(p, str) and p:
+                final_path = p
         if final_path:
             if trace_id:
                 rel = final_path
@@ -4796,6 +5259,20 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 result.setdefault("ids", {})["video_id"] = rel
                 view_rel = rel if rel.startswith("uploads/") else f"uploads/{rel.lstrip('/')}"
                 result.setdefault("meta", {})["view_url"] = f"/{view_rel}"
+                # Explicit tool-level artifacts list (for UI + executor + dataset consumers).
+                arts = result.setdefault("artifacts", [])
+                if isinstance(arts, list):
+                    arts.append({"kind": "video", "path": final_path, "view_url": f"/{view_rel}", "id": rel})
+                # Also attach the final artifact to the film-level segment node so segment QA/UI
+                # can treat film/scene/shot/clip uniformly.
+                segs = result.get("meta", {}).get("segments") if isinstance(result.get("meta"), dict) else None
+                if isinstance(segs, dict) and isinstance(segs.get("film"), dict):
+                    fseg = segs.get("film")
+                    far = fseg.get("artifacts")
+                    if not isinstance(far, list):
+                        far = []
+                        fseg["artifacts"] = far
+                    far.append({"kind": "video", "path": final_path, "view_url": f"/{view_rel}", "id": rel})
                 final_abs = final_path if os.path.isabs(final_path) else os.path.join(UPLOAD_DIR, rel)
                 frame0 = iio.imread(final_abs, index=0)
                 img = Image.fromarray(frame0).convert("RGB")
@@ -4804,6 +5281,38 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 img.save(buf, format="JPEG", quality=70, optimize=True)
                 poster_b64 = _b64.b64encode(buf.getvalue()).decode("ascii")
                 result.setdefault("meta", {})["poster_data_url"] = f"data:image/jpeg;base64,{poster_b64}"
+        # Distillation-grade dataset row (sharded stream) for film2.run outputs.
+        _ds_append_row(
+            "tool_result",
+            {
+                "cid": cid,
+                "trace_id": trace_id,
+                "tool": "film2.run",
+                "tags": ["tool:film2.run", f"profile:{profile_name}"],
+                "inputs": {
+                    "prompt": prompt,
+                    "clips": clips,
+                    "images": images,
+                    "duration_s": duration_s,
+                    "fps": fps_val,
+                    "width": width_val,
+                    "height": height_val,
+                    "film_id": film_id,
+                },
+                "outputs": {
+                    "video_path": (final_path or ""),
+                    "view_url": (result.get("meta", {}).get("view_url") if isinstance(result.get("meta"), dict) else None),
+                },
+                            "locks": locks_arg if isinstance(locks_arg, dict) else {},
+                "qa": result.get("qa") if isinstance(result.get("qa"), dict) else {},
+                "meta": {
+                    "ids": result.get("ids") if isinstance(result.get("ids"), dict) else {},
+                    "shots_count": len(result.get("meta", {}).get("shots", []) or []) if isinstance(result.get("meta"), dict) else 0,
+                },
+                # Preserve full result for maximal distillation fidelity.
+                "payload": {"result": result},
+            },
+        )
         meta_obj = result.get("meta") if isinstance(result.get("meta"), dict) else {}
         segments_container = meta_obj.get("segments") if isinstance(meta_obj.get("segments"), dict) else {}
         clips_meta = segments_container.get("clips") if isinstance(segments_container, dict) else None
@@ -4837,7 +5346,98 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                         },
                     )
     
-        return {"name": name, "result": result}
+        # Return a canonical assistant envelope (not a raw dict) so downstream systems never drop args/results.
+        try:
+            # Envelope artifacts: include final film (and optionally per-scene clips from assembly).
+            # Envelope artifacts should be self-describing for UI + QA:
+            # include path + view_url when available (not just id/bytes).
+            env_artifacts: List[Dict[str, Any]] = []
+            if isinstance(result.get("artifacts"), list):
+                for art in result.get("artifacts") or []:
+                    if not isinstance(art, dict):
+                        continue
+                    kind = art.get("kind") or "video"
+                    pth = art.get("path")
+                    pid = art.get("id") or (os.path.basename(pth or "") if isinstance(pth, str) else None)
+                    view_url = art.get("view_url") if isinstance(art.get("view_url"), str) else None
+                    bsz = None
+                    if isinstance(pth, str) and pth and os.path.exists(pth):
+                        try:
+                            bsz = int(os.path.getsize(pth))
+                        except Exception:
+                            bsz = None
+                    row: Dict[str, Any] = {"kind": kind, "summary": "film2 output", "bytes": bsz}
+                    if pid:
+                        row["id"] = pid
+                    if isinstance(pth, str) and pth:
+                        row["path"] = pth
+                    if view_url:
+                        row["view_url"] = view_url
+                    env_artifacts.append(row)
+            # Add scene clips as artifacts when available.
+            try:
+                assembly_env = result.get("meta", {}).get("assembly") if isinstance(result.get("meta"), dict) else None
+                assembly_res = assembly_env.get("result") if isinstance(assembly_env, dict) and isinstance(assembly_env.get("result"), dict) else {}
+                scene_rows = assembly_res.get("scenes") if isinstance(assembly_res.get("scenes"), list) else []
+                for sc in scene_rows or []:
+                    if not isinstance(sc, dict):
+                        continue
+                    clip_path = sc.get("clip_path")
+                    if not isinstance(clip_path, str) or not clip_path:
+                        continue
+                    sid = sc.get("scene_id") or sc.get("scene_index")
+                    bsz = None
+                    if os.path.exists(clip_path):
+                        try:
+                            bsz = int(os.path.getsize(clip_path))
+                        except Exception:
+                            bsz = None
+                    env_artifacts.append(
+                        {
+                            "id": os.path.basename(clip_path),
+                            "kind": "video",
+                            "summary": f"scene:{sid}",
+                            "bytes": bsz,
+                            "path": clip_path,
+                            "view_url": (clip_path.replace("/workspace", "") if clip_path.startswith("/workspace/") else None),
+                        }
+                    )
+            except Exception:
+                pass
+
+            env_obj: Dict[str, Any] = {
+                "meta": {
+                    "model": "film2",
+                    "ts": _now_ts(),
+                    "cid": cid,
+                    "trace_id": trace_id,
+                    "film_id": film_id,
+                    "quality_profile": profile_name,
+                    # Preserve the full tool result for retrieval/QA.
+                    "result": result,
+                },
+                "reasoning": {"goal": "film assembly", "constraints": ["json-only"], "decisions": ["film2.run done"]},
+                "evidence": [],
+                "message": {"role": "assistant", "type": "tool", "content": "film2 assembled"},
+                "tool_calls": [
+                    {
+                        "tool": "film2.run",
+                        "args": dict(a) if isinstance(a, dict) else {},
+                        "status": "done",
+                        "result_ref": (result.get("ids", {}) or {}).get("video_id") if isinstance(result.get("ids"), dict) else None,
+                    }
+                ],
+                "artifacts": env_artifacts,
+                "telemetry": {"window": {"input_bytes": 0, "output_target_tokens": 0}, "compression_passes": [], "notes": []},
+            }
+            env = normalize_to_envelope(json.dumps(env_obj, ensure_ascii=False, default=str))
+            env = _env_bump(env)
+            _env_assert(env)
+            env = _env_stamp(env, tool="film2.run", model="film2")
+        except Exception:
+            # If envelope building fails, fall back to raw result to avoid breaking tool execution.
+            env = result
+        return {"name": name, "result": env}
     if name == "voice.register" and ALLOW_TOOL_EXECUTION:
         res = await run_voice_register(args if isinstance(args, dict) else {})
         if isinstance(res, dict) and res.get("error"):
@@ -5271,6 +5871,9 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 "bpm": bpm_int,
                 "key": key_txt,
             })
+        # Pass trace emitter down into the music windowed runner so sub-steps can emit trace events.
+        # This avoids imports/cycles and keeps the runner testable.
+        a["_trace_append"] = trace_append
         env = await run_music_infinite_windowed(a, provider, manifest)
 
         # Persist updated lock bundle (including song graph and windows) when character_id present.
@@ -5286,33 +5889,17 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             for art in artifacts_env:
                 if not isinstance(art, dict):
                     continue
-                if art.get("kind") == "audio-ref" and isinstance(art.get("id"), str):
+                # music.infinite.windowed historically emitted "music-ref"; other audio tools use "audio-ref".
+                # Accept both so we never lose the primary track artifact.
+                if art.get("kind") in ("audio-ref", "music-ref") and isinstance(art.get("id"), str):
                     main_artifact_id = art["id"]
                     break
             if isinstance(cid_env, str) and cid_env and isinstance(main_artifact_id, str) and main_artifact_id:
-                outdir_music = os.path.join(UPLOAD_DIR, "artifacts", "audio", "music", cid_env)
+                # Canonical music artifact location: UPLOAD_DIR/artifacts/music/<cid>/<file>
+                # (NOT artifacts/audio/music). The UI and /uploads URLs assume this layout.
+                outdir_music = os.path.join(UPLOAD_DIR, "artifacts", "music", cid_env)
                 full_path_music = os.path.join(outdir_music, main_artifact_id)
-                # Dataset JSONL sample row
-                locks_meta = meta_env.get("locks") if isinstance(meta_env.get("locks"), dict) else {}
-                style_score = locks_meta.get("style_score") if isinstance(locks_meta, dict) else None
-                try:
-                    _append_music_sample(
-                        outdir_music,
-                        {
-                            "prompt": prompt_text,
-                            "bpm": bpm_int,
-                            "length_s": length_s,
-                            "seed": int(a.get("seed") or 0),
-                            "music_lock": bool(locks_meta),
-                            "track_ref": full_path_music,
-                            "stems": [],
-                            "model": meta_env.get("model") or "music",
-                            "style_score": style_score,
-                            "created_at": _now_ts(),
-                        },
-                    )
-                except Exception as ex:
-                    logging.warning(f"music_samples.append_failed: {ex}", exc_info=True)
+                # (Removed) per-artifact music_samples.jsonl writer. Canonical dataset stream is `datasets/stream.py`.
                 # RAG: embed prompt text against the full track path
                 try:
                     pool = await get_pg_pool()
@@ -5360,8 +5947,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             env = run_music_variation(a, manifest)
             wav = env.get("wav_bytes") if isinstance(env, dict) else None
             if isinstance(wav, (bytes, bytearray)) and len(wav) > 0:
-                cid = "aud-" + str(_now_ts())
-                outdir = os.path.join(UPLOAD_DIR, "artifacts", "audio", "music", cid)
+                cid = "music-" + str(_now_ts())
+                outdir = os.path.join(UPLOAD_DIR, "artifacts", "music", cid)
                 _ensure_dir(outdir)
                 stem = "music_var_00_00"
                 wav_path = os.path.join(outdir, stem + ".wav")
@@ -5409,7 +5996,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             res = provider.compose(compose_args)
             wav_bytes = res.get("wav_bytes") or b""
             cid = a.get("cid") or f"music-{_now_ts()}"
-            outdir = os.path.join(UPLOAD_DIR, "artifacts", "audio", "music", cid)
+            outdir = os.path.join(UPLOAD_DIR, "artifacts", "music", cid)
             _ensure_dir(outdir)
             stem = f"refine_{_now_ts()}"
             path = os.path.join(outdir, f"{stem}.wav")
@@ -5442,10 +6029,10 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                         old_metrics = dict(prev_metrics)
                     target_window["artifact_path"] = path
                     # Re-run audio analysis for refined clip to update metrics/locks.
-                    ainfo = _analyze_audio(path)
+                    ainfo = audio_analysis(path)
                     if isinstance(ainfo, dict):
                         new_metrics = dict(ainfo)
-                        # Recompute simple tempo/key lock scores using existing section/global targets when possible.
+                        # Canonical motif lock computation (tempo/key) using existing section/global targets.
                         section_index: Dict[str, Dict[str, Any]] = {}
                         sections_music = music_branch.get("sections") if isinstance(music_branch.get("sections"), list) else []
                         for sec in sections_music:
@@ -5459,14 +6046,6 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                             g = music_branch.get("global") if isinstance(music_branch.get("global"), dict) else {}
                             if isinstance(g.get("tempo_bpm"), (int, float)):
                                 tempo_target = float(g.get("tempo_bpm"))
-                        tempo_lock = None
-                        tempo_detected = ainfo.get("tempo_bpm")
-                        if isinstance(tempo_detected, (int, float)) and tempo_target and tempo_target > 0.0:
-                            tempo_lock = 1.0 - (abs(float(tempo_detected) - tempo_target) / tempo_target)
-                            if tempo_lock < 0.0:
-                                tempo_lock = 0.0
-                            if tempo_lock > 1.0:
-                                tempo_lock = 1.0
                         key_target = None
                         if isinstance(sec_obj, dict) and isinstance(sec_obj.get("key"), str):
                             key_target = sec_obj.get("key")
@@ -5474,12 +6053,9 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                             g = music_branch.get("global") if isinstance(music_branch.get("global"), dict) else {}
                             if isinstance(g.get("key"), str):
                                 key_target = g.get("key")
-                        key_lock = None
-                        key_detected = ainfo.get("key")
-                        if isinstance(key_target, str) and key_target.strip() and isinstance(key_detected, str) and key_detected:
-                            key_lock = 1.0 if key_target.strip().lower() == key_detected.strip().lower() else 0.0
-                        new_metrics["tempo_lock"] = tempo_lock
-                        new_metrics["key_lock"] = key_lock
+                        motif = eval_motif_locks(path, tempo_target=tempo_target, key_target=key_target)
+                        new_metrics["tempo_lock"] = motif.get("tempo_lock")
+                        new_metrics["key_lock"] = motif.get("key_lock")
                         target_window["metrics"] = new_metrics
                 music_branch["windows"] = windows_list
                 lock_bundle["music"] = music_branch
@@ -5567,8 +6143,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             env = run_music_mixdown(a, manifest)
             wav = env.get("wav_bytes") if isinstance(env, dict) else None
             if isinstance(wav, (bytes, bytearray)) and len(wav) > 0:
-                cid = "aud-" + str(_now_ts())
-                outdir = os.path.join(UPLOAD_DIR, "artifacts", "audio", "music", cid)
+                cid = "music-" + str(_now_ts())
+                outdir = os.path.join(UPLOAD_DIR, "artifacts", "music", cid)
                 _ensure_dir(outdir)
                 stem = "music_mix_00_00"
                 wav_path = os.path.join(outdir, stem + ".wav")
@@ -5747,7 +6323,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     continue
         dna = {"palette": palette[:4], "keywords": [], "ts": int(time.time())}
         try:
-            outdir = os.path.join(UPLOAD_DIR, "refs", "style_dna")
+            outdir = os.path.join(UPLOAD_DIR, "ref_library", "style_dna")
             os.makedirs(outdir, exist_ok=True)
             path = os.path.join(outdir, f"dna_{int(time.time()*1000)}.json")
             with open(path, "w", encoding="utf-8") as f:
@@ -5758,22 +6334,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             _tb = traceback.format_exc()
             logging.error(_tb)
             return {"name": name, "error": str(ex), "traceback": _tb}
-    if name == "refs.auto_hunt" and ALLOW_TOOL_EXECUTION:
-        try:
-            q = args.get("query") or ""
-            k = int(args.get("k") or 8)
-            tr = await execute_tool_call({"name": "metasearch.fuse", "arguments": {"q": q, "k": k}})
-            res = (tr.get("result") or {}).get("results") if isinstance(tr, dict) else []
-            links = []
-            for it in (res or [])[:k]:
-                u = it.get("link") or it.get("url")
-                if isinstance(u, str) and u:
-                    links.append(u)
-            return {"name": name, "result": {"refs": links}}
-        except Exception as ex:
-            _tb = traceback.format_exc()
-            logging.error(_tb)
-            return {"name": name, "error": str(ex), "traceback": _tb}
+    # reference-library tool surface removed (no external refs system).
     if name == "director.mode" and ALLOW_TOOL_EXECUTION:
         # No keyword-based intent detection here; return generic clarifying questions.
         p = str(args.get("prompt") or "").strip()
@@ -5803,8 +6364,52 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             objs.append({"label": t, "box": [x0,y0,x1,y1]})
         return {"name": name, "result": {"size": [w,h], "objects": objs}}
     if name == "video.temporal_clip_qa" and ALLOW_TOOL_EXECUTION:
-        # Lightweight drift score placeholder (no heavy deps): report a high score by default
-        return {"name": name, "result": {"drift_score": 0.95, "notes": "basic check"}}
+        src = args.get("src") or ""
+        if not isinstance(src, str) or not src:
+            return {"name": name, "error": "missing src"}
+        src_abs = _resolve_upload_video_path(UPLOAD_DIR, src)
+        if not src_abs:
+            return {"name": name, "error": "src must be under UPLOAD_DIR"}
+        metrics = _compute_temporal_clip_metrics(src_abs)
+        if not isinstance(metrics, dict):
+            return {"name": name, "error": "failed to compute temporal metrics"}
+        fps = float(metrics.get("fps") or 0.0)
+        dur_s = float(metrics.get("duration_s") or 0.0)
+        total = int(metrics.get("frames") or 0)
+        sharp_med = float(metrics.get("sharpness_median") or 0.0)
+        delta_med = float(metrics.get("delta_median") or 0.0)
+        temporal_stability = float(metrics.get("temporal_stability") or 0.0)
+
+        url = src_abs.replace("/workspace", "") if src_abs.startswith("/workspace/") else src_abs
+        cid_val = args.get("cid")
+        cid_str = str(cid_val).strip() if isinstance(cid_val, (str, int)) else ""
+        if not cid_str:
+            cid_str = f"vid-{_now_ts()}"
+            args["cid"] = cid_str
+        _ctx_add(cid_str, "video", src_abs, url, src_abs, ["temporal_qa"], {"fps": fps})
+        trace_append("video", {"cid": cid_str, "tool": "video.temporal_clip_qa", "src": src_abs, "fps": fps, "duration_s": dur_s})
+        return {
+            "name": name,
+            "result": {
+                "path": url,
+                "meta": {
+                    "cid": cid_str,
+                    "trace_id": args.get("trace_id"),
+                    "film_id": args.get("film_id"),
+                    "scene_id": args.get("scene_id"),
+                    "shot_id": args.get("shot_id"),
+                    "act_id": args.get("act_id"),
+                    "fps": float(fps),
+                    "duration_s": float(dur_s),
+                    "frames": int(total),
+                    "sharpness_median": float(sharp_med),
+                    "delta_median": float(delta_med),
+                    "temporal_stability": float(temporal_stability),
+                },
+                "qa": {"videos": {"temporal_stability": float(temporal_stability), "sharpness_median": float(sharp_med), "delta_median": float(delta_med)}},
+                "artifacts": [{"kind": "video", "path": url, "view_url": url}],
+            },
+        }
     if name == "image.qa" and ALLOW_TOOL_EXECUTION:
         a = args if isinstance(args, dict) else {}
         src = a.get("path") or a.get("src") or a.get("image_path") or ""
@@ -5812,45 +6417,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             return {"name": name, "error": "missing_image_path"}
         prompt = str(a.get("prompt") or "").strip()
         # src is expected to be an absolute path under UPLOAD_DIR; callers are responsible for resolving URLs.
-        try:
-            global_info = _analyze_image(src, prompt)
-            region_info = _analyze_image_regions(src, prompt, global_info)
-        except Exception as ex:
-            _tb = traceback.format_exc()
-            logging.error(_tb)
-            return {"name": name, "error": f"image_qa_error:{ex}", "traceback": _tb}
-        # Attach a QA-shaped summary so compute_domain_qa can consume it if needed
-        qa_block: Dict[str, Any] = {}
-        if isinstance(global_info, dict):
-            sb = global_info.get("score") or {}
-            sem = global_info.get("semantics") or {}
-            if isinstance(sb, dict):
-                qa_block["overall"] = float(sb.get("overall") or 0.0)
-                qa_block["semantic"] = float(sb.get("semantic") or 0.0)
-                qa_block["technical"] = float(sb.get("technical") or 0.0)
-                qa_block["aesthetic"] = float(sb.get("aesthetic") or 0.0)
-            if isinstance(sem, dict):
-                cs = sem.get("clip_score")
-                if isinstance(cs, (int, float)):
-                    qa_block["clip_score"] = float(cs)
-        if isinstance(region_info, dict):
-            agg = region_info.get("aggregates") or {}
-            if isinstance(agg, dict):
-                fl = agg.get("face_lock")
-                if isinstance(fl, (int, float)):
-                    qa_block["face_lock"] = float(fl)
-                il = agg.get("id_lock")
-                if isinstance(il, (int, float)):
-                    qa_block["id_lock"] = float(il)
-                hr = agg.get("hands_ok_ratio")
-                if isinstance(hr, (int, float)):
-                    qa_block["hands_ok_ratio"] = float(hr)
-                tr = agg.get("text_readable_lock")
-                if isinstance(tr, (int, float)):
-                    qa_block["text_readable_lock"] = float(tr)
-                bq = agg.get("background_quality")
-                if isinstance(bq, (int, float)):
-                    qa_block["background_quality"] = float(bq)
+        global_info, region_info = analyze_image_with_regions(src=src, prompt=prompt)
+        qa_block = build_image_qa_block(global_info=global_info, region_info=region_info)
         return {
             "name": name,
             "result": {
@@ -6323,12 +6891,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             parser = JSONParser()
             js = parser.parse(r.text or "", {})
             return {"name": name, "result": js if isinstance(js, dict) else {}}
-    if name == "refs.music.build_profile" and ALLOW_TOOL_EXECUTION:
-        try:
-            body = args if isinstance(args, dict) else {}
-            return {"name": name, "result": _refs_music_profile(body)}
-        except Exception as ex:
-            return {"name": name, "error": str(ex)}
+    # tool removed (no external refs system).
     if name == "music.lyrics.align" and ALLOW_TOOL_EXECUTION:
         a = args if isinstance(args, dict) else {}
         audio_path = a.get("audio_path")
@@ -6712,7 +7275,82 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             parser = JSONParser()
             js = parser.parse(r.text or "", {})
             return {"name": name, "result": js if isinstance(js, dict) else {}}
-    if name in ("image.edit", "image.upscale") and ALLOW_TOOL_EXECUTION:
+    if name == "image.upscale" and ALLOW_TOOL_EXECUTION:
+        if not UPSCALE_API_URL:
+            return _tool_error(name, "upscale_unconfigured", "UPSCALE_API_URL not configured", status=500)
+        image_ref = args.get("image_ref") or ""
+        if not isinstance(image_ref, str) or not image_ref.strip():
+            return _tool_error(name, "missing_image_ref", "image_ref is required", status=422)
+        scale = int(args.get("scale") or 2)
+        if scale < 1:
+            scale = 1
+        # Resolve to an absolute path under UPLOAD_DIR
+        img_abs = image_ref.strip()
+        if img_abs.startswith("/uploads/"):
+            img_abs = "/workspace" + img_abs
+        if not img_abs.startswith("/"):
+            img_abs = os.path.normpath(os.path.join(UPLOAD_DIR, img_abs))
+        img_abs = os.path.normpath(img_abs)
+        if not img_abs.startswith(os.path.normpath(UPLOAD_DIR)):
+            return _tool_error(name, "bad_image_path", "image_ref must be under UPLOAD_DIR", status=422, image_ref=image_ref)
+        if not os.path.isfile(img_abs):
+            return _tool_error(name, "image_not_found", "image_ref not found", status=404, image_ref=img_abs)
+
+        input_rel = os.path.relpath(img_abs, UPLOAD_DIR).replace("\\", "/")
+        job_id = f"imgup-{int(time.time())}"
+        payload = {
+            "job_id": job_id,
+            "input_path": input_rel,
+            "outscale": float(scale),
+            "model_name": str(args.get("model_name") or os.getenv("REALESRGAN_MODEL_NAME", "RealESRGAN_x4plus")),
+            "tile": int(args.get("tile") or os.getenv("REALESRGAN_TILE", "0") or 0),
+            "ext": str(args.get("ext") or os.getenv("REALESRGAN_EXT", "png")),
+            "suffix": str(args.get("suffix") or os.getenv("REALESRGAN_SUFFIX", "up")),
+            "fp32": bool(args.get("fp32") or False),
+            "face_enhance": bool(args.get("face_enhance") or False),
+        }
+        async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
+            r = await client.post(UPSCALE_API_URL.rstrip("/") + "/v1/upscale/image", content=json.dumps(payload))
+        env = JSONParser().parse(r.text or "{}", {})
+        if not (isinstance(env, dict) and bool(env.get("ok")) and isinstance(env.get("result"), dict)):
+            err_obj = env.get("error") if isinstance(env, dict) else None
+            return _tool_error(
+                name,
+                (err_obj.get("code") if isinstance(err_obj, dict) else "upscale_failed") or "upscale_failed",
+                (err_obj.get("message") if isinstance(err_obj, dict) else "Upscale service failed") or "Upscale service failed",
+                status=int((err_obj.get("status") if isinstance(err_obj, dict) else 500) or 500),
+                details=(err_obj.get("details") if isinstance(err_obj, dict) else {"body": r.text, "status_code": r.status_code}),
+            )
+        res = env.get("result") if isinstance(env.get("result"), dict) else {}
+        out_path = res.get("output_path")
+        if not isinstance(out_path, str) or not out_path:
+            return _tool_error(name, "upscale_missing_output", "Upscale returned no output_path", status=500, result=res)
+        url = out_path.replace("/workspace", "") if out_path.startswith("/workspace/") else out_path
+        cid_val = args.get("cid")
+        cid_str = str(cid_val).strip() if isinstance(cid_val, (str, int)) else ""
+        if not cid_str:
+            cid_str = f"img-{_now_ts()}"
+            args["cid"] = cid_str
+        _ctx_add(cid_str, "image", out_path, url, img_abs, ["upscale", "realesrgan"], {"scale": scale})
+        trace_append("image", {"cid": cid_str, "tool": "image.upscale", "src": img_abs, "scale": scale, "path": out_path})
+        return {
+            "name": name,
+            "result": {
+                "path": url,
+                "meta": {
+                    "cid": cid_str,
+                    "trace_id": args.get("trace_id"),
+                    "film_id": args.get("film_id"),
+                    "scene_id": args.get("scene_id"),
+                    "shot_id": args.get("shot_id"),
+                    "act_id": args.get("act_id"),
+                    "scale": scale,
+                    "provider": "realesrgan",
+                },
+                "artifacts": [{"kind": "image", "path": url, "view_url": url}],
+            },
+        }
+    if name == "image.edit" and ALLOW_TOOL_EXECUTION:
         return {"name": name, "error": "disabled: use image.dispatch with full graph (no fallbacks)"}
     if name == "image.super_gen" and ALLOW_TOOL_EXECUTION:
         # Multi-object iterative generation: base canvas + per-object refinement + global polish
@@ -6821,14 +7459,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     sub_path = _os.path.join(UPLOAD_DIR, "artifacts", "image", scid, srid) if (scid and srid) else None
                     if sub_path and _os.path.exists(sub_path):
                         tile = Image.open(sub_path).convert("RGB")
-                        # object-level CLIP score via full analyzer
-                        try:
-                            ai = _analyze_image(sub_path, prompt=refined_prompt)
-                            sem = ai.get("semantics") or {}
-                            sc = float(sem.get("clip_score") or 0.0)
-                        except Exception as ex:
-                            logging.debug(f"image.super_gen.clip_score_failed: {ex}", exc_info=True)
-                            sc = 1.0
+                        sc = float(image_clip_score(sub_path, prompt=refined_prompt))
                         best_tile = tile if (best_tile is None or sc >= 0.35) else best_tile
                         if sc >= 0.35:
                             break
@@ -6996,10 +7627,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         except Exception as ex:
             logging.warning(f"source_fetch.failed url={url}: {ex}", exc_info=True)
             return {"name": name, "error": str(ex)}
-    if name == "frame_interpolate":
-        # Acknowledge and surface parameters; actual interpolation occurs during assembly if requested
-        factor = int(args.get("factor") or 2)
-        return {"name": name, "result": {"accepted": True, "factor": factor}}
+    # frame_interpolate removed (legacy; interpolation is handled explicitly by video.interpolate and/or film assembly preferences).
     if name == "upscale":
         scale = int(args.get("scale") or 2)
         tile = int(args.get("tile") or 512)
@@ -7034,25 +7662,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         except Exception as ex:
             logging.error(f"ffmpeg.trim failed src={src} dst={dst} cmd={' '.join(ff)}: {ex}", exc_info=True)
             return {"name": name, "error": str(ex)}
-    if name == "ffmpeg.concat":
-        inputs = args.get("inputs") or []
-        if not isinstance(inputs, list) or not inputs:
-            return {"name": name, "error": "missing inputs"}
-        outdir = os.path.join(UPLOAD_DIR, "artifacts", "video", f"concat-{int(time.time())}")
-        os.makedirs(outdir, exist_ok=True)
-        listfile = os.path.join(outdir, "list.txt")
-        with open(listfile, "w", encoding="utf-8") as f:
-            for p in inputs:
-                f.write(f"file '{p}'\n")
-        dst = os.path.join(outdir, "concat.mp4")
-        ff = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", listfile, "-c", "copy", dst]
-        try:
-            subprocess.run(ff, check=True)
-            url = dst.replace("/workspace", "") if dst.startswith("/workspace/") else dst
-            return {"name": name, "result": {"path": url}}
-        except Exception as ex:
-            logging.error(f"ffmpeg.concat failed dst={dst} cmd={' '.join(ff)}: {ex}", exc_info=True)
-            return {"name": name, "error": str(ex)}
+    # ffmpeg.concat removed (legacy/unsafe). Canonical concat/mux lives in app/film_assembly.py.
     if name == "ffmpeg.audio_mix":
         a = args.get("a"); b = args.get("b"); vol_a = str(args.get("vol_a") or "1.0"); vol_b = str(args.get("vol_b") or "1.0")
         if not a or not b:
@@ -7138,7 +7748,14 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 args["cid"] = cid_str
             _ctx_add(cid_str, "video", dst, url, src, ["cleanup"], {"vf": vf})
             trace_append("video", {"cid": cid_str, "tool": "video.cleanup", "src": src, "vf": vf, "path": dst})
-            return {"name": name, "result": {"path": url}}
+            return {
+                "name": name,
+                "result": {
+                    "path": url,
+                    "meta": {"vf": vf, "cid": cid_str, "trace_id": args.get("trace_id"), "film_id": args.get("film_id"), "shot_id": args.get("shot_id")},
+                    "artifacts": [{"kind": "video", "path": url, "view_url": url}],
+                },
+            }
         except Exception as ex:
             logging.error(f"video.cleanup failed src={src} dst={dst} cmd={' '.join(ff)}: {ex}", exc_info=True)
             return {"name": name, "error": str(ex)}
@@ -7221,7 +7838,24 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     "path": dst,
                 },
             )
-            return {"name": name, "result": {"path": url}}
+            return {
+                "name": name,
+                "result": {
+                    "path": url,
+                    "meta": {
+                        "cid": cid_str,
+                        "trace_id": args.get("trace_id"),
+                        "film_id": args.get("film_id"),
+                        "scene_id": args.get("scene_id"),
+                        "shot_id": args.get("shot_id"),
+                        "act_id": args.get("act_id"),
+                        "type": atype,
+                        "region": args.get("region"),
+                        "target_time": args.get("target_time"),
+                    },
+                    "artifacts": [{"kind": "image", "path": url, "view_url": url}],
+                },
+            }
         except Exception as ex:
             logging.error(f"image.artifact_fix failed src={src} type={atype}: {ex}", exc_info=True)
             return {"name": name, "error": str(ex)}
@@ -7261,7 +7895,24 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     "path": dst,
                 },
             )
-            return {"name": name, "result": {"path": url}}
+            return {
+                "name": name,
+                "result": {
+                    "path": url,
+                    "meta": {
+                        "cid": cid_str,
+                        "trace_id": args.get("trace_id"),
+                        "film_id": args.get("film_id"),
+                        "scene_id": args.get("scene_id"),
+                        "shot_id": args.get("shot_id"),
+                        "act_id": args.get("act_id"),
+                        "type": atype,
+                        "region": args.get("region"),
+                        "target_time": args.get("target_time"),
+                    },
+                    "artifacts": [{"kind": "video", "path": url, "view_url": url}],
+                },
+            }
         except Exception as ex:
             logging.error(f"video.flow.derive failed src={src} frame_a={frame_a} frame_b={frame_b}: {ex}", exc_info=True)
             return {"name": name, "error": str(ex)}
@@ -7337,7 +7988,21 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 args["cid"] = cid_str
             _ctx_add(cid_str, "image", dst, url, src, ["hands_fix"], {})
             trace_append("image", {"cid": cid_str, "tool": "image.hands.fix", "src": src, "path": dst})
-            return {"name": name, "result": {"path": url}}
+            return {
+                "name": name,
+                "result": {
+                    "path": url,
+                    "meta": {
+                        "cid": cid_str,
+                        "trace_id": args.get("trace_id"),
+                        "film_id": args.get("film_id"),
+                        "scene_id": args.get("scene_id"),
+                        "shot_id": args.get("shot_id"),
+                        "act_id": args.get("act_id"),
+                    },
+                    "artifacts": [{"kind": "image", "path": url, "view_url": url}],
+                },
+            }
         except Exception as ex:
             return {"name": name, "error": str(ex)}
     if name == "video.hands.fix":
@@ -7364,7 +8029,21 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 args["cid"] = cid_str
             _ctx_add(cid_str, "video", dst, url, src, ["hands_fix"], {})
             trace_append("video", {"cid": cid_str, "tool": "video.hands.fix", "src": src, "path": dst})
-            return {"name": name, "result": {"path": url}}
+            return {
+                "name": name,
+                "result": {
+                    "path": url,
+                    "meta": {
+                        "cid": cid_str,
+                        "trace_id": args.get("trace_id"),
+                        "film_id": args.get("film_id"),
+                        "scene_id": args.get("scene_id"),
+                        "shot_id": args.get("shot_id"),
+                        "act_id": args.get("act_id"),
+                    },
+                    "artifacts": [{"kind": "video", "path": url, "view_url": url}],
+                },
+            }
         except Exception as ex:
             return {"name": name, "error": str(ex)}
     if name == "video.interpolate":
@@ -7372,24 +8051,89 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         target_fps = int(args.get("target_fps") or 60)
         if not src:
             return {"name": name, "error": "missing src"}
+        if not VFI_API_URL:
+            return _tool_error(name, "vfi_unconfigured", "VFI_API_URL not configured", status=500)
+
         outdir = os.path.join(UPLOAD_DIR, "artifacts", "video", f"interp-{int(time.time())}")
         os.makedirs(outdir, exist_ok=True)
-        dst = os.path.join(outdir, "interpolated.mp4")
-        vf = f"minterpolate=fps={target_fps}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1"
-        ff = ["ffmpeg", "-y", "-i", src, "-vf", vf, "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-an", dst]
-        proc = subprocess.run(ff, check=False)
-        if proc.returncode != 0:
-            return {"name": name, "error": f"ffmpeg interpolate exited with code {proc.returncode}"}
-        # Optional face/consistency lock stabilization pass
+
+        # Resolve src to absolute path under UPLOAD_DIR (service requires UPLOAD_DIR-relative input).
+        src_abs = src
+        if isinstance(src_abs, str) and src_abs.startswith("/uploads/"):
+            src_abs = "/workspace" + src_abs
+        if isinstance(src_abs, str) and not src_abs.startswith("/"):
+            src_abs = os.path.normpath(os.path.join(UPLOAD_DIR, src_abs))
+        src_abs = os.path.normpath(str(src_abs))
+        if not src_abs.startswith(os.path.normpath(UPLOAD_DIR)):
+            return _tool_error(name, "bad_src_path", "src must be under UPLOAD_DIR", status=422, src=src)
+        if not os.path.isfile(src_abs):
+            return _tool_error(name, "src_missing", "src file not found", status=404, src=src_abs)
+
+        input_rel = os.path.relpath(src_abs, UPLOAD_DIR).replace("\\", "/")
+        job_id = f"interp-{int(time.time())}"
+
+        async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
+            payload = {
+                "job_id": job_id,
+                "input_path": input_rel,
+                "target_fps": int(target_fps),
+                # Correlation fields so the service can include them in its envelope/logs.
+                "cid": args.get("cid"),
+                "trace_id": args.get("trace_id"),
+                "film_id": args.get("film_id"),
+                "scene_id": args.get("scene_id"),
+                "shot_id": args.get("shot_id"),
+                "act_id": args.get("act_id"),
+            }
+            # Optional RIFE controls (pass through when provided).
+            if args.get("multi") is not None:
+                payload["multi"] = args.get("multi")
+            if args.get("exp") is not None:
+                payload["exp"] = args.get("exp")
+            if args.get("model_dir") is not None:
+                payload["model_dir"] = args.get("model_dir")
+            if args.get("uhd") is not None:
+                payload["uhd"] = args.get("uhd")
+            if args.get("scale") is not None:
+                payload["scale"] = args.get("scale")
+            if args.get("ext") is not None:
+                payload["ext"] = args.get("ext")
+            if args.get("montage") is not None:
+                payload["montage"] = args.get("montage")
+            r = await client.post(VFI_API_URL.rstrip("/") + "/v1/vfi/interpolate", content=json.dumps(payload))
+        parser = JSONParser()
+        env = parser.parse(r.text or "{}", {})
+        if not (isinstance(env, dict) and bool(env.get("ok")) and isinstance(env.get("result"), dict)):
+            err_obj = env.get("error") if isinstance(env, dict) else None
+            return _tool_error(
+                name,
+                (err_obj.get("code") if isinstance(err_obj, dict) else "vfi_failed") or "vfi_failed",
+                (err_obj.get("message") if isinstance(err_obj, dict) else "VFI service failed") or "VFI service failed",
+                status=int((err_obj.get("status") if isinstance(err_obj, dict) else 500) or 500),
+                details=(err_obj.get("details") if isinstance(err_obj, dict) else {"body": r.text, "status_code": r.status_code}),
+            )
+
+        res_vfi = env.get("result") if isinstance(env.get("result"), dict) else {}
+        out_path = res_vfi.get("output_path")
+        if not isinstance(out_path, str) or not out_path:
+            return _tool_error(name, "vfi_missing_output", "VFI returned no output_path", status=500, result=res_vfi)
+        dst = out_path
+        vf = f"rife_vfi:{int(target_fps)}"
+        # Optional face/consistency lock stabilization pass.
+        # This is ONLY "model-tied" when:
+        # - COMFYUI_API_URL is set
+        # - FACEID_API_URL is set
+        # - InstantIDApply node exists in the ComfyUI graph runtime
+        # - we have at least one face reference image to embed
         locks = args.get("locks") or {}
         face_images: list[str] = []
-        # Resolve ref_ids -> images via refs.apply
+        # Resolve ref_ids -> images via ref_library.apply
         if isinstance(args.get("ref_ids"), list):
             for rid in args.get("ref_ids"):
-                pack, code = _refs_apply({"ref_id": rid})
-                if isinstance(pack, dict) and pack.get("ref_pack"):
-                    imgs = (pack.get("ref_pack") or {}).get("images") or []
-                    for p in imgs:
+                if isinstance(rid, str) and rid:
+                    pack = _ref_pack_for_ref_id(rid)
+                    imgs = pack.get("images") if isinstance(pack, dict) else []
+                    for p in (imgs or []):
                         if isinstance(p, str):
                             face_images.append(p)
         # Also accept direct locks.image.images
@@ -7398,6 +8142,13 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 for p in (locks.get("image", {}).get(k) or []):
                     if isinstance(p, str):
                         face_images.append(p)
+        # Also accept Film2 lock bundle schema: locks.face.ref_faces[].image_path
+        if isinstance(locks.get("face"), dict) and isinstance(locks.get("face", {}).get("ref_faces"), list):
+            for r in (locks.get("face", {}).get("ref_faces") or []):
+                if isinstance(r, dict):
+                    p = r.get("image_path")
+                    if isinstance(p, str) and p.strip():
+                        face_images.append(p.strip())
         if not face_images:
             cid_raw = args.get("cid")
             cid_val = str(cid_raw).strip() if isinstance(cid_raw, (str, int)) else ""
@@ -7408,7 +8159,15 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     if isinstance(p, str):
                         face_images.append(p)
                         break
+        # Dedup
+        face_images = list(dict.fromkeys([p for p in face_images if isinstance(p, str) and p.strip()]))
+
+        stabilize_attempted = False
+        stabilize_applied = False
+        stabilize_ckpt = "sd_xl_base_1.0.safetensors"
+        stabilize_node = "InstantIDApply"
         if COMFYUI_API_URL and FACEID_API_URL and face_images:
+            stabilize_attempted = True
             # 1) Extract frames
             frames_dir = os.path.join(outdir, "frames")
             os.makedirs(frames_dir, exist_ok=True)
@@ -7424,16 +8183,23 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 emb = None
                 if er.status_code == 200:
                     parser = JSONParser()
-                    ej = parser.parse(er.text or "", {"embedding": list, "vec": list})
+                    ej = parser.parse(er.text or "", {})
                     if isinstance(ej, dict):
-                        emb = ej.get("embedding") or ej.get("vec")
+                        # Accept multiple response shapes from faceid service:
+                        # - ToolEnvelope {ok,result:{embedding,vec,embeddings}}
+                        # - Legacy bare payload {embedding,vec,embeddings}
+                        res = ej.get("result") if bool(ej.get("ok")) and isinstance(ej.get("result"), dict) else ej
+                        if isinstance(res, dict):
+                            emb = res.get("embedding") or res.get("vec")
+                            if emb is None and isinstance(res.get("embeddings"), list) and res.get("embeddings"):
+                                emb = res.get("embeddings")[0]
             # 3) Per-frame InstantID apply with low denoise
             if emb and isinstance(emb, list):
                 frame_files = sorted(_glob(os.path.join(frames_dir, "*.png")))
                 for fp in frame_files:
                     # Build minimal ComfyUI graph for stabilization
                     g = {
-                        "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "sd_xl_base_1.0.safetensors"}},
+                        "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": stabilize_ckpt}},
                         "2": {"class_type": "LoadImage", "inputs": {"image": fp}},
                         "5": {"class_type": "VAEEncode", "inputs": {"pixels": ["2", 0], "vae": ["1", 2]}},
                         "6": {
@@ -7458,7 +8224,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     }
                     # Inject InstantIDApply
                     g["22"] = {
-                        "class_type": "InstantIDApply",
+                        "class_type": stabilize_node,
                         "inputs": {"model": ["1", 0], "image": ["2", 0], "embedding": emb, "strength": 0.70},
                     }
                     g["6"]["inputs"]["model"] = ["22", 0]
@@ -7487,6 +8253,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                                                     break
                                         break
                                 time.sleep(0.5)
+                stabilize_applied = True
                 # 4) Reassemble stabilized video
                 dst2 = os.path.join(outdir, "interpolated_stabilized.mp4")
                 subprocess.run(
@@ -7505,7 +8272,38 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             args["cid"] = cid_str
         _ctx_add(cid_str, "video", dst, url, src, ["interpolate"], {"target_fps": target_fps})
         trace_append("video", {"cid": cid_str, "tool": "video.interpolate", "src": src, "target_fps": target_fps, "path": dst})
-        return {"name": name, "result": {"path": url}}
+        return {
+            "name": name,
+            "result": {
+                "path": url,
+                "meta": {
+                    "vf": vf,
+                    "target_fps": target_fps,
+                    "job_id": job_id,
+                    "input_rel": input_rel,
+                    "src": src,
+                    "src_abs": src_abs,
+                    "src_fps": (res_vfi.get("src_fps") if isinstance(res_vfi, dict) else None),
+                    "src_duration_s": (res_vfi.get("src_duration_s") if isinstance(res_vfi, dict) else None),
+                    "out_fps": (res_vfi.get("out_fps") if isinstance(res_vfi, dict) else None),
+                    "out_duration_s": (res_vfi.get("out_duration_s") if isinstance(res_vfi, dict) else None),
+                    "duration_drift_s": (res_vfi.get("duration_drift_s") if isinstance(res_vfi, dict) else None),
+                    "vfi_chosen": (res_vfi.get("chosen") if isinstance(res_vfi, dict) else None),
+                    "cid": cid_str,
+                    "trace_id": args.get("trace_id"),
+                    "film_id": args.get("film_id"),
+                    "scene_id": args.get("scene_id"),
+                    "shot_id": args.get("shot_id"),
+                    "act_id": args.get("act_id"),
+                    "stabilize_attempted": bool(stabilize_attempted),
+                    "stabilize_applied": bool(stabilize_applied),
+                    "stabilize_ckpt": stabilize_ckpt,
+                    "stabilize_node": stabilize_node,
+                    "face_ref_image": (face_images[0] if face_images else None),
+                },
+                "artifacts": [{"kind": "video", "path": url, "view_url": url}],
+            },
+        }
     if name == "video.flow.derive":
         frame_a = args.get("frame_a") or ""
         frame_b = args.get("frame_b") or ""
@@ -7585,25 +8383,177 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         outdir = os.path.join(UPLOAD_DIR, "artifacts", "video", f"upscale-{int(time.time())}")
         os.makedirs(outdir, exist_ok=True)
         dst = os.path.join(outdir, "upscaled.mp4")
+        # Resolve to absolute path under UPLOAD_DIR
+        src_abs = src
+        if isinstance(src_abs, str) and src_abs.startswith("/uploads/"):
+            src_abs = "/workspace" + src_abs
+        if isinstance(src_abs, str) and not src_abs.startswith("/"):
+            src_abs = os.path.normpath(os.path.join(UPLOAD_DIR, src_abs))
+        src_abs = os.path.normpath(str(src_abs))
+        if not src_abs.startswith(os.path.normpath(UPLOAD_DIR)):
+            return {"name": name, "error": "src must be under UPLOAD_DIR"}
+        if not os.path.isfile(src_abs):
+            return {"name": name, "error": f"src not found: {src_abs}"}
+
+        # Probe fps and (optional) source width/height for target_long_edge decisions.
+        fps = 30.0
+        p_fps = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=avg_frame_rate", "-of", "default=noprint_wrappers=1:nokey=1", src_abs],
+            capture_output=True,
+            text=True,
+        )
+        fr = (p_fps.stdout or "").strip()
+        if "/" in fr:
+            a, b = fr.split("/", 1)
+            try:
+                aa = float(a); bb = float(b)
+                if bb != 0.0:
+                    fps = aa / bb
+            except Exception:
+                fps = 30.0
+        else:
+            try:
+                fps = float(fr) if fr else 30.0
+            except Exception:
+                fps = 30.0
+
+        # Extract frames and original audio.
+        frames_in = os.path.join(outdir, "frames_in")
+        frames_up = os.path.join(outdir, "frames_up")
+        os.makedirs(frames_in, exist_ok=True)
+        os.makedirs(frames_up, exist_ok=True)
+        proc_frames = subprocess.run(["ffmpeg", "-y", "-i", src_abs, os.path.join(frames_in, "%06d.png")], check=False)
+        if proc_frames.returncode != 0:
+            return {"name": name, "error": f"ffmpeg frame extract exited with code {proc_frames.returncode}"}
+
+        audio_path = os.path.join(outdir, "audio.m4a")
+        proc_audio = subprocess.run(["ffmpeg", "-y", "-i", src_abs, "-vn", "-c:a", "copy", audio_path], check=False)
+        has_audio = bool(proc_audio.returncode == 0 and os.path.isfile(audio_path) and os.path.getsize(audio_path) > 0)
+
+        frame_files = sorted(_glob(os.path.join(frames_in, "*.png")))
+        if not frame_files:
+            return {"name": name, "error": "no frames extracted"}
+
+        # Determine upscale parameters for the image service.
+        # Prefer explicit scale; if width/height provided, map to target_long_edge.
+        target_long_edge = None
+        outscale = None
         if scale and scale > 1:
-            vf = f"scale=iw*{scale}:ih*{scale}:flags=lanczos"
-        elif w and h:
-            vf = f"scale={int(w)}:{int(h)}:flags=lanczos"
+            outscale = float(scale)
+        elif w and h and int(w) > 0 and int(h) > 0:
+            target_long_edge = int(max(int(w), int(h)))
+        else:
+            outscale = 2.0
+
+        # If the upscale service is configured, upscale each frame individually (blocking, sequential).
+        # If not configured, fall back to ffmpeg scale (preserves audio).
+        failures: List[Dict[str, Any]] = []
+        used_service = False
+        if UPSCALE_API_URL:
+            used_service = True
+            async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
+                for idx, fp in enumerate(frame_files):
+                    rel = os.path.relpath(fp, UPLOAD_DIR).replace("\\", "/")
+                    payload = {
+                        "job_id": f"vidup-{int(time.time())}-{idx}",
+                        "input_path": rel,
+                        "model_name": str(args.get("model_name") or os.getenv("REALESRGAN_MODEL_NAME", "RealESRGAN_x4plus")),
+                        "tile": int(args.get("tile") or os.getenv("REALESRGAN_TILE", "0") or 0),
+                        "ext": str(args.get("ext") or "png"),
+                        "suffix": str(args.get("suffix") or "up"),
+                        "fp32": bool(args.get("fp32") or False),
+                        "face_enhance": bool(args.get("face_enhance") or False),
+                        # Correlation fields for service visibility/debugging.
+                        "cid": args.get("cid"),
+                        "trace_id": args.get("trace_id"),
+                        "film_id": args.get("film_id"),
+                        "scene_id": args.get("scene_id"),
+                        "shot_id": args.get("shot_id"),
+                        "act_id": args.get("act_id"),
+                    }
+                    if outscale is not None:
+                        payload["outscale"] = float(outscale)
+                    if target_long_edge is not None:
+                        payload["target_long_edge"] = int(target_long_edge)
+                    r = await client.post(UPSCALE_API_URL.rstrip("/") + "/v1/upscale/image", content=json.dumps(payload))
+                    env = JSONParser().parse(r.text or "{}", {})
+                    outp = None
+                    if isinstance(env, dict) and bool(env.get("ok")) and isinstance(env.get("result"), dict):
+                        outp = env["result"].get("output_path")
+                    if isinstance(outp, str) and outp and os.path.isfile(outp) and os.path.getsize(outp) > 0:
+                        _sh.copy2(outp, os.path.join(frames_up, os.path.basename(fp)))
+                    else:
+                        failures.append({"frame": os.path.basename(fp), "status": int(r.status_code), "body": (r.text[:500] if isinstance(r.text, str) else "")})
+                        _sh.copy2(fp, os.path.join(frames_up, os.path.basename(fp)))
         else:
             vf = "scale=iw*2:ih*2:flags=lanczos"
-        ff = ["ffmpeg", "-y", "-i", src, "-vf", vf, "-c:v", "libx264", "-preset", "slow", "-crf", "18", "-an", dst]
-        proc = subprocess.run(ff, check=False)
-        if proc.returncode != 0:
-            return {"name": name, "error": f"ffmpeg upscale exited with code {proc.returncode}"}
+            if outscale is not None and outscale > 1.0:
+                vf = f"scale=iw*{int(outscale)}:ih*{int(outscale)}:flags=lanczos"
+            elif w and h:
+                vf = f"scale={int(w)}:{int(h)}:flags=lanczos"
+            proc_scale = subprocess.run(["ffmpeg", "-y", "-i", src_abs, "-vf", vf, "-c:v", "libx264", "-preset", "slow", "-crf", "18", "-c:a", "copy", dst], check=False)
+            if proc_scale.returncode != 0:
+                return {"name": name, "error": f"ffmpeg upscale exited with code {proc_scale.returncode}"}
+            # Jump to post-return path building with this dst.
+            url = dst.replace("/workspace", "") if dst.startswith("/workspace/") else dst
+            cid_val = args.get("cid")
+            if isinstance(cid_val, (str, int)):
+                cid_str = str(cid_val).strip()
+            else:
+                cid_str = ""
+            if not cid_str:
+                cid_str = f"vid-{_now_ts()}"
+                args["cid"] = cid_str
+            _ctx_add(cid_str, "video", dst, url, src_abs, ["upscale"], {"scale": scale, "width": w, "height": h})
+            trace_append("video", {"cid": cid_str, "tool": "video.upscale", "src": src_abs, "scale": scale, "width": w, "height": h, "path": dst})
+            return {
+                "name": name,
+                "result": {
+                    "path": url,
+                    "meta": {
+                        "vf": vf,
+                        "cid": cid_str,
+                        "trace_id": args.get("trace_id"),
+                        "film_id": args.get("film_id"),
+                        "scene_id": args.get("scene_id"),
+                        "shot_id": args.get("shot_id"),
+                        "act_id": args.get("act_id"),
+                        "provider": "ffmpeg",
+                    },
+                    "artifacts": [{"kind": "video", "path": url, "view_url": url}],
+                },
+            }
+
+        # Reassemble from upscaled frames and mux original audio back in.
+        noaudio = os.path.join(outdir, "upscaled_noaudio.mp4")
+        proc_enc = subprocess.run(
+            ["ffmpeg", "-y", "-framerate", str(float(fps)), "-i", os.path.join(frames_up, "%06d.png"), "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart", noaudio],
+            check=False,
+        )
+        if proc_enc.returncode != 0:
+            return {"name": name, "error": f"ffmpeg encode exited with code {proc_enc.returncode}"}
+
+        if has_audio:
+            proc_mux = subprocess.run(
+                ["ffmpeg", "-y", "-i", noaudio, "-i", audio_path, "-c:v", "copy", "-c:a", "copy", "-shortest", dst],
+                check=False,
+            )
+            if proc_mux.returncode != 0:
+                # If mux fails, still return video-only output (do not break run).
+                _sh.copy2(noaudio, dst)
+        else:
+            _sh.copy2(noaudio, dst)
+
+        vf = f"realesrgan_frames outscale={outscale} target_long_edge={target_long_edge}"
         # Optional stabilization pass via face lock
         locks = args.get("locks") or {}
         face_images: list[str] = []
         if isinstance(args.get("ref_ids"), list):
             for rid in args.get("ref_ids"):
-                pack, code = _refs_apply({"ref_id": rid})
-                if isinstance(pack, dict) and pack.get("ref_pack"):
-                    imgs = (pack.get("ref_pack") or {}).get("images") or []
-                    for p in imgs:
+                if isinstance(rid, str) and rid:
+                    pack = _ref_pack_for_ref_id(rid)
+                    imgs = pack.get("images") if isinstance(pack, dict) else []
+                    for p in (imgs or []):
                         if isinstance(p, str):
                             face_images.append(p)
         if isinstance(locks.get("image"), dict):
@@ -7634,9 +8584,16 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 emb = None
                 if er.status_code == 200:
                     parser = JSONParser()
-                    ej = parser.parse(er.text or "", {"embedding": list, "vec": list})
+                    ej = parser.parse(er.text or "", {})
                     if isinstance(ej, dict):
-                        emb = ej.get("embedding") or ej.get("vec")
+                        # Accept multiple response shapes from faceid service:
+                        # - ToolEnvelope {ok,result:{embedding,vec,embeddings}}
+                        # - Legacy bare payload {embedding,vec,embeddings}
+                        res = ej.get("result") if bool(ej.get("ok")) and isinstance(ej.get("result"), dict) else ej
+                        if isinstance(res, dict):
+                            emb = res.get("embedding") or res.get("vec")
+                            if emb is None and isinstance(res.get("embeddings"), list) and res.get("embeddings"):
+                                emb = res.get("embeddings")[0]
             if emb and isinstance(emb, list):
                 frame_files = sorted(_glob(os.path.join(frames_dir, "*.png")))
                 for fp in frame_files:
@@ -7695,10 +8652,19 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                                 time.sleep(0.5)
                 dst2 = os.path.join(outdir, "upscaled_stabilized.mp4")
                 subprocess.run(
-                    ["ffmpeg", "-y", "-framerate", "30", "-i", os.path.join(frames_dir, "%06d.png"), "-c:v", "libx264", "-pix_fmt", "yuv420p", dst2],
+                    ["ffmpeg", "-y", "-framerate", str(float(fps)), "-i", os.path.join(frames_dir, "%06d.png"), "-c:v", "libx264", "-pix_fmt", "yuv420p", dst2],
                     check=True,
                 )
-                dst = dst2
+                # Preserve original audio when stabilization re-encodes the video stream.
+                if has_audio:
+                    dst3 = os.path.join(outdir, "upscaled_stabilized_audio.mp4")
+                    pm = subprocess.run(["ffmpeg", "-y", "-i", dst2, "-i", audio_path, "-c:v", "copy", "-c:a", "copy", "-shortest", dst3], check=False)
+                    if pm.returncode == 0 and os.path.isfile(dst3) and os.path.getsize(dst3) > 0:
+                        dst = dst3
+                    else:
+                        dst = dst2
+                else:
+                    dst = dst2
         url = dst.replace("/workspace", "") if dst.startswith("/workspace/") else dst
         cid_val = args.get("cid")
         if isinstance(cid_val, (str, int)):
@@ -7710,7 +8676,28 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             args["cid"] = cid_str
         _ctx_add(cid_str, "video", dst, url, src, ["upscale"], {"scale": scale, "width": w, "height": h})
         trace_append("video", {"cid": cid_str, "tool": "video.upscale", "src": src, "scale": scale, "width": w, "height": h, "path": dst})
-        return {"name": name, "result": {"path": url}}
+        return {
+            "name": name,
+            "result": {
+                "path": url,
+                "meta": {
+                    "vf": vf,
+                    "cid": cid_str,
+                    "trace_id": args.get("trace_id"),
+                    "film_id": args.get("film_id"),
+                    "scene_id": args.get("scene_id"),
+                    "shot_id": args.get("shot_id"),
+                    "act_id": args.get("act_id"),
+                    "fps": float(fps),
+                    "frames_total": int(len(frame_files)),
+                    "frames_failed": int(len(failures)),
+                    "has_audio": bool(has_audio),
+                    "provider": ("realesrgan" if used_service else "ffmpeg"),
+                    "failures": failures[:50],
+                },
+                "artifacts": [{"kind": "video", "path": url, "view_url": url}],
+            },
+        }
     if name == "video.text.overlay":
         src = args.get("src") or ""
         texts = args.get("texts") or []
@@ -7750,53 +8737,20 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         trace_append("video", {"cid": cid_str, "tool": "video.text.overlay", "src": src, "path": dst, "texts": texts})
         return {"name": name, "result": {"path": url}}
     if name == "video.hv.t2v" and ALLOW_TOOL_EXECUTION:
-        if not HUNYUAN_VIDEO_API_URL:
-            return {"name": name, "error": "HUNYUAN_VIDEO_API_URL not configured"}
-        try:
-            lr_every = int(args.get("latent_reinit_every") or 48)
-            payload = {
-                "prompt": args.get("prompt"),
-                "negative": args.get("negative"),
-                "video": {"width": int(args.get("width") or 1024), "height": int(args.get("height") or 576), "fps": int(args.get("fps") or 24), "seconds": int(args.get("seconds") or 6)},
-                "locks": args.get("locks") or {},
-                "seed": args.get("seed"),
-                "quality": "max",
-                "post": args.get("post") or {"interpolate": True, "upscale": True, "face_lock": True, "hand_fix": True},
-                "latent_reinit": {"every_n_frames": lr_every},
-                "meta": {"trace_level": "full", "stream": True},
-            }
-            async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
-                r = await client.post(HUNYUAN_VIDEO_API_URL.rstrip("/") + "/v1/video/hv/t2v", json=payload)
-            parser = JSONParser()
-            # Treat Hunyuan video responses as free-form mapping; callers inspect fields as needed.
-            js = parser.parse(r.text or "{}", {})
-            return {"name": name, "result": js if isinstance(js, dict) else {}}
-        except Exception as ex:
-            return {"name": name, "error": str(ex)}
+        if not HYVIDEO_API_URL:
+            return {"name": name, "error": "HYVIDEO_API_URL not configured"}
+        payload, job_id, fps = hv_args_to_generate_payload(args if isinstance(args, dict) else {}, upload_dir=UPLOAD_DIR, job_prefix="hv")
+        env = await hyvideo_generate(HYVIDEO_API_URL, payload)
+        norm = normalize_generate_response(env if isinstance(env, dict) else {}, upload_dir=UPLOAD_DIR)
+        return {"name": name, "result": norm}
     if name == "video.hv.i2v" and ALLOW_TOOL_EXECUTION:
-        if not HUNYUAN_VIDEO_API_URL:
-            return {"name": name, "error": "HUNYUAN_VIDEO_API_URL not configured"}
-        try:
-            lr_every = int(args.get("latent_reinit_every") or 48)
-            payload = {
-                "init_image": args.get("init_image"),
-                "prompt": args.get("prompt"),
-                "negative": args.get("negative"),
-                "video": {"width": int(args.get("width") or 1024), "height": int(args.get("height") or 1024), "fps": int(args.get("fps") or 24), "seconds": int(args.get("seconds") or 5)},
-                "locks": args.get("locks") or {},
-                "seed": args.get("seed"),
-                "quality": "max",
-                "post": args.get("post") or {"interpolate": True, "upscale": True, "face_lock": True},
-                "latent_reinit": {"every_n_frames": lr_every},
-                "meta": {"trace_level": "full", "stream": True},
-            }
-            async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
-                r = await client.post(HUNYUAN_VIDEO_API_URL.rstrip("/") + "/v1/video/hv/i2v", json=payload)
-            parser = JSONParser()
-            js = parser.parse(r.text or "{}", {})
-            return {"name": name, "result": js if isinstance(js, dict) else {}}
-        except Exception as ex:
-            return {"name": name, "error": str(ex)}
+        if not HYVIDEO_API_URL:
+            return {"name": name, "error": "HYVIDEO_API_URL not configured"}
+        # Back-compat alias: same endpoint; `init_image` triggers i2v if present.
+        payload, job_id, fps = hv_args_to_generate_payload(args if isinstance(args, dict) else {}, upload_dir=UPLOAD_DIR, job_prefix="hv")
+        env = await hyvideo_generate(HYVIDEO_API_URL, payload)
+        norm = normalize_generate_response(env if isinstance(env, dict) else {}, upload_dir=UPLOAD_DIR)
+        return {"name": name, "result": norm}
     if name == "math.eval":
         expr = args.get("expr") or ""
         task = (args.get("task") or "").strip().lower()
@@ -8355,6 +9309,14 @@ async def chat_completions(request: Request):
                     trace_id=trace_id,
                     args={k: args_obj.get(k) for k in ("prompt", "width", "height", "steps", "cfg", "negative")},
                 )
+            if nm == "film2.run":
+                # Ensure film2.run always has a prompt so it can actually generate story/shots
+                # when no input clips/images are present. (Planner sometimes omits it.)
+                merged = dict(args_obj or {})
+                if (not isinstance(merged.get("prompt"), str)) or not (merged.get("prompt") or "").strip():
+                    if isinstance(last_user_text, str) and last_user_text.strip():
+                        merged["prompt"] = last_user_text.strip()
+                args_obj = merged
 
             hardened_tool_calls.append({**tc, "name": nm, "arguments": args_obj})
 
@@ -8660,292 +9622,38 @@ async def chat_completions(request: Request):
                     logging.debug("chat_completions:tool_loop:first_url=%r", first_url)
                     extra_results: List[Dict[str, Any]] = []
                     logging.debug(f"chat_completions:tool_loop:extra_results init len={len(extra_results)}")
-                    if tname == "film2.run":
-                        logging.debug("chat_completions:tool_loop:film2.run qa branch entered")
-                        meta_obj = res.get("meta") if isinstance(res, dict) else {}
-                        logging.debug(f"chat_completions:tool_loop:film2.run meta_obj_type={type(meta_obj).__name__}")
-                        profile_name = meta_obj.get("quality_profile") if isinstance(meta_obj, dict) and isinstance(meta_obj.get("quality_profile"), str) else None
-                        logging.debug("chat_completions:tool_loop:film2.run profile_name=%r", profile_name)
-                        preset = LOCK_QUALITY_PRESETS.get((profile_name or "standard").lower(), LOCK_QUALITY_PRESETS["standard"])
-                        logging.debug("chat_completions:tool_loop:film2.run preset_keys=%r", sorted(list(preset.keys())) if isinstance(preset, dict) else None)
-                        # Clamp to a single refinement pass for segment-level film QA (defensive).
-                        _rb_raw = preset.get("max_refine_passes", 1) if isinstance(preset, dict) else 1
-                        try:
-                            refine_budget = min(1, int(_rb_raw))
-                        except Exception as exc:
-                            logging.warning(
-                                f"chat_completions: bad max_refine_passes={_rb_raw!r} for film2.run; defaulting to 1",
-                                exc_info=True,
+                    # Optional: segment QA + committee for tool steps (tool-specific glue lives under app.quality/*).
+                    try:
+                        segment_runner = partial(
+                            _run_patch_call,
+                            trace_id=trace_id,
+                            mode=effective_mode,
+                            base_url=base_url,
+                            executor_base_url=executor_endpoint,
+                        )
+                        extra_results.extend(
+                            await _maybe_run_tool_step_segment_qa(
+                                trace_id=trace_id,
+                                tool_name=tname,
+                                tool_args=args_echo,
+                                last_user_text=last_user_text,
+                                tool_trace_result=(tr if isinstance(tr, dict) else {}),
+                                result_obj=(res if isinstance(res, dict) else {}),
+                                effective_mode=effective_mode,
+                                absolutize_url=_abs_url,
+                                quality_presets=(LOCK_QUALITY_PRESETS if isinstance(LOCK_QUALITY_PRESETS, dict) else {}),
+                                state_dir=STATE_DIR,
+                                tool_runner=segment_runner,
                             )
-                            refine_budget = 1
-                        logging.debug("chat_completions:tool_loop:film2.run refine_budget=%r", refine_budget)
-                        segments_obj = meta_obj.get("segments") if isinstance(meta_obj, dict) else {}
-                        logging.debug(f"chat_completions:tool_loop:film2.run segments_obj_type={type(segments_obj).__name__}")
-                        clips_for_committee = segments_obj.get("clips") if isinstance(segments_obj, dict) else None
+                        )
+                    except Exception as exc:
+                        # QA is advisory; never let it break the main run.
                         logging.debug(
-                            f"chat_completions:tool_loop:film2.run clips_for_committee_type={type(clips_for_committee).__name__}"
+                            "chat_completions:tool_loop:tool_step_segment_qa failed tool=%r ex=%r",
+                            tname,
+                            exc,
+                            exc_info=True,
                         )
-                        if isinstance(clips_for_committee, list) and clips_for_committee:
-                            seg_results_payload: List[Dict[str, Any]] = []
-                            for seg in clips_for_committee:
-                                if not isinstance(seg, dict):
-                                    continue
-                                seg_id = seg.get("id")
-                                res_obj = seg.get("result")
-                                if isinstance(seg_id, str) and seg_id and isinstance(res_obj, dict):
-                                    seg_results_payload.append({"name": seg_id, "result": res_obj})
-                                    logging.debug(
-                                        f"chat_completions:tool_loop:film2.run seg_results_payload append seg_id={seg_id!r} "
-                                        f"len={len(seg_results_payload)}"
-                                    )
-                            if seg_results_payload:
-                                logging.debug(
-                                    f"chat_completions:tool_loop:film2.run segment_qa_and_committee call len={len(seg_results_payload)}"
-                                )
-                                trace_append(
-                                    "film2.segment_qa_start",
-                                    {
-                                        "trace_id": trace_id,
-                                        "tool": "film2.run",
-                                        "segment_ids": [s.get("name") for s in seg_results_payload if isinstance(s, dict)],
-                                        "quality_profile": profile_name,
-                                    },
-                                )
-                                updated_seg, seg_outcome, seg_patch = await segment_qa_and_committee(
-                                    trace_id=trace_id,
-                                    user_text=_tool_step_eval_user_text("film2.run", args_echo, last_user_text),
-                                    tool_name="film2.run",
-                                    segment_results=seg_results_payload,
-                                    mode=effective_mode,
-                                    base_url=base_url,
-                                    executor_base_url=executor_endpoint,
-                                    absolutize_url=_abs_url,
-                                    quality_profile=profile_name,
-                                    max_refine_passes=refine_budget,
-                                )
-                                _updated_seg_type = type(updated_seg).__name__
-                                _seg_outcome_keys = sorted(list(seg_outcome.keys())) if isinstance(seg_outcome, dict) else None
-                                _seg_patch_len = len(seg_patch) if isinstance(seg_patch, list) else -1
-                                logging.debug(
-                                    f"chat_completions:tool_loop:film2.run segment_qa_and_committee returned updated_seg_type={_updated_seg_type} "
-                                    f"seg_outcome_keys={_seg_outcome_keys!r} seg_patch_len={_seg_patch_len}"
-                                )
-                                if isinstance(meta_obj, dict):
-                                    meta_obj["segment_committee"] = seg_outcome
-                                    if seg_patch:
-                                        meta_obj["segment_patch_results"] = seg_patch
-                                        extra_results.extend(seg_patch)
-                                        logging.debug(
-                                            f"chat_completions:tool_loop:film2.run extra_results extended len={len(extra_results)}"
-                                        )
-                                        # Mark refined clips in segments metadata.
-                                        segments_container = meta_obj.get("segments")
-                                        if isinstance(segments_container, dict):
-                                            clips_meta = segments_container.get("clips")
-                                            if isinstance(clips_meta, list):
-                                                for pr in seg_patch:
-                                                    if not isinstance(pr, dict):
-                                                        continue
-                                                    if pr.get("tool") != "video.refine.clip":
-                                                        continue
-                                                    if pr.get("error"):
-                                                        continue
-                                                    sid = pr.get("segment_id")
-                                                    args_used = pr.get("args") if isinstance(pr.get("args"), dict) else {}
-                                                    refine_mode_val = args_used.get("refine_mode")
-                                                    for clip in clips_meta:
-                                                        if not isinstance(clip, dict):
-                                                            continue
-                                                        if clip.get("id") == sid:
-                                                            clip_meta = clip.setdefault("meta", {})
-                                                            if isinstance(clip_meta, dict):
-                                                                clip_meta["refined"] = True
-                                                                if isinstance(refine_mode_val, str) and refine_mode_val:
-                                                                    clip_meta["refine_mode"] = refine_mode_val
-                                                                logging.debug("chat_completions:tool_loop:film2.run marked refined sid=%r refine_mode=%r", sid, refine_mode_val)
-                                trace_append(
-                                    "film2.segment_qa_result",
-                                    {
-                                        "trace_id": trace_id,
-                                        "tool": "film2.run",
-                                        "segment_ids": [s.get("name") for s in seg_results_payload if isinstance(s, dict)],
-                                        "action": seg_outcome.get("action"),
-                                    },
-                                )
-                    elif tname in ("music.infinite.windowed", "music.dispatch", "music.variation", "music.mixdown"):
-                        logging.debug("chat_completions:tool_loop:music qa branch entered tname=%r", tname)
-                        meta_block = res.get("meta") if isinstance(res, dict) else {}
-                        profile_name = meta_block.get("quality_profile") if isinstance(meta_block, dict) and isinstance(meta_block.get("quality_profile"), str) else None
-                        logging.debug("chat_completions:tool_loop:music profile_name=%r", profile_name)
-                        preset_music = LOCK_QUALITY_PRESETS.get((profile_name or "standard").lower(), LOCK_QUALITY_PRESETS["standard"])
-                        logging.debug("chat_completions:tool_loop:music preset_keys=%r", sorted(list(preset_music.keys())) if isinstance(preset_music, dict) else None)
-                        # Clamp to a single refinement pass for music QA (defensive).
-                        _rbm_raw = preset_music.get("max_refine_passes", 1) if isinstance(preset_music, dict) else 1
-                        try:
-                            refine_budget_music = min(1, int(_rbm_raw))
-                        except Exception as exc:
-                            logging.warning("chat_completions: bad max_refine_passes=%r for music; defaulting to 1", _rbm_raw, exc_info=True)
-                            refine_budget_music = 1
-                        logging.debug("chat_completions:tool_loop:music refine_budget_music=%r", refine_budget_music)
-                        updated_seg, seg_outcome, seg_patch = await segment_qa_and_committee(
-                            trace_id=trace_id,
-                            user_text=_tool_step_eval_user_text(tname, args_echo, last_user_text),
-                            tool_name=tname,
-                            segment_results=[tr],
-                            mode=effective_mode,
-                            base_url=base_url,
-                            executor_base_url=executor_endpoint,
-                            absolutize_url=_abs_url,
-                            quality_profile=profile_name,
-                            max_refine_passes=refine_budget_music,
-                        )
-                        _seg_outcome_keys = sorted(list(seg_outcome.keys())) if isinstance(seg_outcome, dict) else None
-                        _seg_patch_len = len(seg_patch) if isinstance(seg_patch, list) else -1
-                        logging.debug(
-                            f"chat_completions:tool_loop:music segment_qa returned outcome_keys={_seg_outcome_keys!r} patch_len={_seg_patch_len}"
-                        )
-                        if isinstance(res, dict):
-                            meta_music = res.setdefault("meta", {})
-                            if isinstance(meta_music, dict):
-                                meta_music["segment_committee"] = seg_outcome
-                                if seg_patch:
-                                    meta_music["segment_patch_results"] = seg_patch
-                        if seg_patch:
-                            extra_results.extend(seg_patch)
-                            logging.debug(f"chat_completions:tool_loop:music extra_results extended len={len(extra_results)}")
-                    elif tname.startswith("image."):
-                        logging.debug("chat_completions:tool_loop:image qa branch entered tname=%r", tname)
-                        # Optional: run segment-level QA/committee for image tools as well.
-                        profile_name = None
-                        if isinstance(res, dict):
-                            meta_block = res.get("meta")
-                            if isinstance(meta_block, dict) and isinstance(meta_block.get("quality_profile"), str):
-                                profile_name = meta_block.get("quality_profile")
-                        logging.debug("chat_completions:tool_loop:image profile_name=%r", profile_name)
-                        preset_img = LOCK_QUALITY_PRESETS.get((profile_name or "standard").lower(), LOCK_QUALITY_PRESETS["standard"])
-                        logging.debug("chat_completions:tool_loop:image preset_keys=%r", sorted(list(preset_img.keys())) if isinstance(preset_img, dict) else None)
-                        # Clamp to a single refinement pass for image QA (defensive).
-                        _rbi_raw = preset_img.get("max_refine_passes", 0) if isinstance(preset_img, dict) else 0
-                        try:
-                            refine_budget_img = min(1, int(_rbi_raw))
-                        except Exception as exc:
-                            logging.warning("chat_completions: bad max_refine_passes=%r for image; defaulting to 0", _rbi_raw, exc_info=True)
-                            refine_budget_img = 0
-                        logging.debug("chat_completions:tool_loop:image refine_budget_img=%r", refine_budget_img)
-                        updated_seg, seg_outcome, seg_patch = await segment_qa_and_committee(
-                            trace_id=trace_id,
-                            user_text=_tool_step_eval_user_text(tname, args_echo, last_user_text),
-                            tool_name=tname,
-                            segment_results=[tr],
-                            mode=effective_mode,
-                            base_url=base_url,
-                            executor_base_url=executor_endpoint,
-                            absolutize_url=_abs_url,
-                            quality_profile=profile_name,
-                            max_refine_passes=refine_budget_img,
-                        )
-                        _seg_outcome_keys = sorted(list(seg_outcome.keys())) if isinstance(seg_outcome, dict) else None
-                        _seg_patch_len = len(seg_patch) if isinstance(seg_patch, list) else -1
-                        logging.debug(
-                            f"chat_completions:tool_loop:image segment_qa returned outcome_keys={_seg_outcome_keys!r} patch_len={_seg_patch_len}"
-                        )
-                        if isinstance(res, dict):
-                            meta_img = res.setdefault("meta", {})
-                            if isinstance(meta_img, dict):
-                                meta_img["segment_committee"] = seg_outcome
-                                if seg_patch:
-                                    meta_img["segment_patch_results"] = seg_patch
-                        if seg_patch:
-                            extra_results.extend(seg_patch)
-                            logging.debug(f"chat_completions:tool_loop:image extra_results extended len={len(extra_results)}")
-                    elif tname == "tts.speak":
-                        logging.debug("chat_completions:tool_loop:tts qa branch entered")
-                        # Segment-level QA/committee for TTS segments
-                        profile_name = None
-                        if isinstance(res, dict):
-                            meta_block = res.get("meta")
-                            if isinstance(meta_block, dict) and isinstance(meta_block.get("quality_profile"), str):
-                                profile_name = meta_block.get("quality_profile")
-                        logging.debug("chat_completions:tool_loop:tts profile_name=%r", profile_name)
-                        preset_tts = LOCK_QUALITY_PRESETS.get((profile_name or "standard").lower(), LOCK_QUALITY_PRESETS["standard"])
-                        logging.debug("chat_completions:tool_loop:tts preset_keys=%r", sorted(list(preset_tts.keys())) if isinstance(preset_tts, dict) else None)
-                        _rbt_raw = preset_tts.get("max_refine_passes", 1) if isinstance(preset_tts, dict) else 1
-                        try:
-                            refine_budget_tts = min(1, int(_rbt_raw))
-                        except Exception as exc:
-                            logging.warning("chat_completions: bad max_refine_passes=%r for tts; defaulting to 1", _rbt_raw, exc_info=True)
-                            refine_budget_tts = 1
-                        logging.debug("chat_completions:tool_loop:tts refine_budget_tts=%r", refine_budget_tts)
-                        updated_seg, seg_outcome, seg_patch = await segment_qa_and_committee(
-                            trace_id=trace_id,
-                            user_text=_tool_step_eval_user_text(tname, args_echo, last_user_text),
-                            tool_name=tname,
-                            segment_results=[tr],
-                            mode=effective_mode,
-                            base_url=base_url,
-                            executor_base_url=executor_endpoint,
-                            absolutize_url=_abs_url,
-                            quality_profile=profile_name,
-                            max_refine_passes=refine_budget_tts,
-                        )
-                        _seg_outcome_keys = sorted(list(seg_outcome.keys())) if isinstance(seg_outcome, dict) else None
-                        _seg_patch_len = len(seg_patch) if isinstance(seg_patch, list) else -1
-                        logging.debug(
-                            f"chat_completions:tool_loop:tts segment_qa returned outcome_keys={_seg_outcome_keys!r} patch_len={_seg_patch_len}"
-                        )
-                        if isinstance(res, dict):
-                            meta_tts = res.setdefault("meta", {})
-                            if isinstance(meta_tts, dict):
-                                meta_tts["segment_committee"] = seg_outcome
-                                if seg_patch:
-                                    meta_tts["segment_patch_results"] = seg_patch
-                        if seg_patch:
-                            extra_results.extend(seg_patch)
-                            logging.debug(f"chat_completions:tool_loop:tts extra_results extended len={len(extra_results)}")
-                    elif tname == "audio.sfx.compose":
-                        logging.debug("chat_completions:tool_loop:sfx qa branch entered")
-                        # Optional: SFX QA/committee wiring (currently metrics are sparse)
-                        profile_name = None
-                        if isinstance(res, dict):
-                            meta_block = res.get("meta")
-                            if isinstance(meta_block, dict) and isinstance(meta_block.get("quality_profile"), str):
-                                profile_name = meta_block.get("quality_profile")
-                        logging.debug("chat_completions:tool_loop:sfx profile_name=%r", profile_name)
-                        preset_sfx = LOCK_QUALITY_PRESETS.get((profile_name or "standard").lower(), LOCK_QUALITY_PRESETS["standard"])
-                        logging.debug("chat_completions:tool_loop:sfx preset_keys=%r", sorted(list(preset_sfx.keys())) if isinstance(preset_sfx, dict) else None)
-                        _rbs_raw = preset_sfx.get("max_refine_passes", 0) if isinstance(preset_sfx, dict) else 0
-                        try:
-                            refine_budget_sfx = min(1, int(_rbs_raw))
-                        except Exception as exc:
-                            logging.warning("chat_completions: bad max_refine_passes=%r for sfx; defaulting to 0", _rbs_raw, exc_info=True)
-                            refine_budget_sfx = 0
-                        logging.debug("chat_completions:tool_loop:sfx refine_budget_sfx=%r", refine_budget_sfx)
-                        updated_seg, seg_outcome, seg_patch = await segment_qa_and_committee(
-                            trace_id=trace_id,
-                            user_text=_tool_step_eval_user_text(tname, args_echo, last_user_text),
-                            tool_name=tname,
-                            segment_results=[tr],
-                            mode=effective_mode,
-                            base_url=base_url,
-                            executor_base_url=executor_endpoint,
-                            absolutize_url=_abs_url,
-                            quality_profile=profile_name,
-                            max_refine_passes=refine_budget_sfx,
-                        )
-                        _seg_outcome_keys = sorted(list(seg_outcome.keys())) if isinstance(seg_outcome, dict) else None
-                        _seg_patch_len = len(seg_patch) if isinstance(seg_patch, list) else -1
-                        logging.debug(
-                            f"chat_completions:tool_loop:sfx segment_qa returned outcome_keys={_seg_outcome_keys!r} patch_len={_seg_patch_len}"
-                        )
-                        if isinstance(res, dict):
-                            meta_sfx = res.setdefault("meta", {})
-                            if isinstance(meta_sfx, dict):
-                                meta_sfx["segment_committee"] = seg_outcome
-                                if seg_patch:
-                                    meta_sfx["segment_patch_results"] = seg_patch
-                        if seg_patch:
-                            extra_results.extend(seg_patch)
-                            logging.debug(f"chat_completions:tool_loop:sfx extra_results extended len={len(extra_results)}")
                     tool_results.append(tr)
                     logging.debug(f"chat_completions:tool_loop:tool_results appended len={len(tool_results)}")
                     if extra_results:
@@ -8982,46 +9690,19 @@ async def chat_completions(request: Request):
                     _log("[comfy] polling /history/" + _pid)
 
         # Post-run QA checkpoint (lightweight) — run once after all tool results are collected.
-        _img_count = assets_count_images(tool_results)
-        logging.debug("chat_completions:postrun_qa _img_count=%r", _img_count)
-        _vid_count = assets_count_video(tool_results)
-        logging.debug("chat_completions:postrun_qa _vid_count=%r", _vid_count)
-        _aud_count = assets_count_audio(tool_results)
-        logging.debug("chat_completions:postrun_qa _aud_count=%r", _aud_count)
-        # Defensive: counts should be ints, but never allow logging/response to crash if not.
-        try:
-            _img_i = int(_img_count)
-        except Exception as exc:
-            logging.warning("chat_completions: bad images_count=%r; defaulting to 0", _img_count, exc_info=True)
-            _img_i = 0
-        try:
-            _vid_i = int(_vid_count)
-        except Exception as exc:
-            logging.warning("chat_completions: bad videos_count=%r; defaulting to 0", _vid_count, exc_info=True)
-            _vid_i = 0
-        try:
-            _aud_i = int(_aud_count)
-        except Exception as exc:
-            logging.warning("chat_completions: bad audio_count=%r; defaulting to 0", _aud_count, exc_info=True)
-            _aud_i = 0
-        counts_summary = {"images": _img_i, "videos": _vid_i, "audio": _aud_i}
-        logging.debug("chat_completions:postrun_qa counts_summary=%r", counts_summary)
-        domain_qa = assets_compute_domain_qa(tool_results)
-        logging.debug(f"chat_completions:postrun_qa domain_qa_type={type(domain_qa).__name__} domain_qa={domain_qa!r}")
-        qa_metrics = {"counts": counts_summary, "domain": domain_qa}
+        qa_metrics = _compute_postrun_qa_metrics(tool_results)
         logging.debug("chat_completions:postrun_qa qa_metrics_keys=%r", sorted(list(qa_metrics.keys())))
         _log("qa.metrics", trace_id=trace_id, tool="postrun", metrics=qa_metrics)
         _log("committee.postrun.review", trace_id=trace_id, summary=qa_metrics)
         # Committee decision with optional single revision
-        logging.debug("chat_completions:committee postrun_committee_decide call trace_id=%r", trace_id)
-        committee_outcome = await postrun_committee_decide(
+        committee_outcome = await _decide_postrun_committee(
             trace_id=trace_id,
             user_text=last_user_text,
             tool_results=tool_results,
             qa_metrics=qa_metrics,
             mode=effective_mode,
+            state_dir=STATE_DIR,
         )
-        logging.debug("chat_completions:committee postrun_committee_decide returned keys=%r", sorted(list(committee_outcome.keys())) if isinstance(committee_outcome, dict) else None)
         committee_action = str((committee_outcome.get("action") or "go")).strip().lower()
         logging.debug("chat_completions:committee committee_action=%r", committee_action)
         committee_rationale = str(committee_outcome.get("rationale") or "")
@@ -9041,50 +9722,12 @@ async def chat_completions(request: Request):
             # Filter patch plan by front-door + mode rules
             _allowed_mode_set = set(_allowed_tools_for_mode(effective_mode))
             logging.debug(f"chat_completions:committee _allowed_mode_set_len={len(_allowed_mode_set)}")
-            filtered_patch_plan: List[Dict[str, Any]] = []
-            logging.debug(f"chat_completions:committee filtered_patch_plan init len={len(filtered_patch_plan)}")
-            for st in patch_plan:
-                logging.debug(
-                    f"chat_completions:committee patch_plan_iter st_type={type(st).__name__} "
-                    f"st_keys={(sorted(list(st.keys())) if isinstance(st, dict) else None)!r}"
-                )
-                if not isinstance(st, dict):
-                    continue
-                tl = (st.get("tool") or "").strip() if isinstance(st.get("tool"), str) else ""
-                logging.debug("chat_completions:committee patch_plan_iter tl=%r", tl)
-                if not tl or tl not in PLANNER_VISIBLE_TOOLS or tl not in _allowed_mode_set:
-                    logging.debug("chat_completions:committee patch_plan_iter skipped tl=%r", tl)
-                    continue
-                # IMPORTANT: do not drop args when the committee returns args as a JSON string.
-                args_raw = st.get("args") if ("args" in st) else st.get("arguments")
-                logging.debug(f"chat_completions:committee patch_plan_iter args_raw_type={type(args_raw).__name__}")
-                args_st: Dict[str, Any]
-                if isinstance(args_raw, dict):
-                    args_st = dict(args_raw)
-                elif isinstance(args_raw, str):
-                    parser_patch = JSONParser()
-                    logging.debug(
-                        f"chat_completions:committee patch_plan_iter parsing args_raw_json_len={len(args_raw)}"
-                    )
-                    parsed = parser_patch.parse(args_raw or "", dict)
-                    logging.debug(f"chat_completions:committee patch_plan_iter parsed_type={type(parsed).__name__}")
-                    args_st = dict(parsed) if isinstance(parsed, dict) else {"_raw": args_raw}
-                elif args_raw is None:
-                    args_st = {}
-                else:
-                    args_st = {"_raw": args_raw}
-                filtered_patch_plan.append({"tool": tl, "args": args_st})
-                logging.debug(
-                    f"chat_completions:committee filtered_patch_plan append tool={tl!r} "
-                    f"args_keys={(sorted(list(args_st.keys())) if isinstance(args_st, dict) else None)!r} len={len(filtered_patch_plan)}"
-                )
-            if filtered_patch_plan:
-                logging.debug(f"chat_completions:committee filtered_patch_plan nonempty len={len(filtered_patch_plan)}")
-                # Normalize to internal tool_calls schema
-                patch_calls: List[Dict[str, Any]] = [{"name": s.get("tool"), "arguments": (s.get("args") or {})} for s in filtered_patch_plan]
-                logging.debug(
-                    f"chat_completions:committee patch_calls_len={len(patch_calls)} first={(patch_calls[0] if patch_calls else None)!r}"
-                )
+            patch_calls = _normalize_patch_plan_to_tool_calls(
+                patch_plan,
+                planner_visible_tools=PLANNER_VISIBLE_TOOLS,
+                allowed_tools=_allowed_mode_set,
+            )
+            if patch_calls:
                 _inject_execution_context(patch_calls, trace_id, effective_mode, conv_cid)
                 logging.debug("chat_completions:committee _inject_execution_context patch_calls done")
                 # Validator disabled: execute patch plan directly without pre-validation.
@@ -9203,35 +9846,9 @@ async def chat_completions(request: Request):
                     f"chat_completions:committee revision executed steps={len(patch_validated or [])} failures={len(patch_failures or [])}"
                 )
                 # Recompute QA metrics after revision
-                _img_count = assets_count_images(tool_results)
-                logging.debug("chat_completions:postrev_qa _img_count=%r", _img_count)
-                _vid_count = assets_count_video(tool_results)
-                logging.debug("chat_completions:postrev_qa _vid_count=%r", _vid_count)
-                _aud_count = assets_count_audio(tool_results)
-                logging.debug("chat_completions:postrev_qa _aud_count=%r", _aud_count)
-                # Defensive: counts should be ints, but never allow logging/response to crash if not.
-                try:
-                    _img_i = int(_img_count)
-                except Exception as exc:
-                    logging.warning("chat_completions: bad images_count=%r; defaulting to 0", _img_count, exc_info=True)
-                    _img_i = 0
-                try:
-                    _vid_i = int(_vid_count)
-                except Exception as exc:
-                    logging.warning("chat_completions: bad videos_count=%r; defaulting to 0", _vid_count, exc_info=True)
-                    _vid_i = 0
-                try:
-                    _aud_i = int(_aud_count)
-                except Exception as exc:
-                    logging.warning("chat_completions: bad audio_count=%r; defaulting to 0", _aud_count, exc_info=True)
-                    _aud_i = 0
-                counts_summary = {"images": _img_i, "videos": _vid_i, "audio": _aud_i}
-                logging.debug("chat_completions:postrev_qa counts_summary=%r", counts_summary)
-                domain_qa = assets_compute_domain_qa(tool_results)
-                logging.debug("chat_completions:postrev_qa domain_qa=%r", domain_qa)
-                qa_metrics = {"counts": counts_summary, "domain": domain_qa}
+                qa_metrics = _compute_postrun_qa_metrics(tool_results)
                 logging.debug("chat_completions:postrev_qa qa_metrics_keys=%r", sorted(list(qa_metrics.keys())))
-            _log("qa.metrics", trace_id=trace_id, tool="postrun.revise", metrics=qa_metrics)
+                _log("qa.metrics", trace_id=trace_id, tool="postrun.revise", metrics=qa_metrics)
         # Make full tool results (including internal error stacks) available to the
         # final COMPOSE pass so the committee can explain failures and partial
         # successes directly to the user instead of using a prebuilt summary.
@@ -9782,66 +10399,6 @@ async def healthz():
     }
 
 
-# ---------- Refs API ----------
-@app.post("/refs.save")
-async def refs_save(body: Dict[str, Any]):
-    try:
-        return _refs_save(body or {})
-    except Exception as ex:
-        _tb = traceback.format_exc()
-        logging.error(_tb)
-        return JSONResponse(status_code=422, content={"error": "tool_error", "message": str(ex), "traceback": _tb})
-
-
-@app.post("/refs.refine")
-async def refs_refine(body: Dict[str, Any]):
-    try:
-        return _refs_refine(body or {})
-    except Exception as ex:
-        return JSONResponse(status_code=400, content={"error": str(ex)})
-
-
-@app.get("/refs.list")
-async def refs_list(kind: Optional[str] = None):
-    try:
-        return _refs_list(kind)
-    except Exception as ex:
-        return JSONResponse(status_code=400, content={"error": str(ex)})
-
-
-@app.post("/refs.apply")
-async def refs_apply(body: Dict[str, Any]):
-    try:
-        res, code = _refs_apply(body or {})
-        if code != 200:
-            return JSONResponse(status_code=code, content=res)
-        return res
-    except Exception as ex:
-        return JSONResponse(status_code=400, content={"error": str(ex)})
-
-
-@app.post("/refs.resolve")
-async def refs_resolve(body: Dict[str, Any]):
-    try:
-        cid_val = (body or {}).get("cid")
-        cid = str(cid_val).strip() if isinstance(cid_val, (str, int)) else ""
-        if not cid:
-            return JSONResponse(status_code=400, content={"error": "missing cid"})
-        text = str((body or {}).get("text") or "")
-        kind = (body or {}).get("kind")
-        rec = _ctx_resolve(cid, text, kind)
-        if not rec:
-            # Fallback to global artifact memory across conversations
-            rec = _glob_resolve(text, kind)
-            if not rec:
-                trace_append("memory_ref", {"cid": cid, "text": text, "kind": kind, "found": False})
-                return {"ok": False, "matches": []}
-            trace_append("memory_ref", {"cid": cid, "text": text, "kind": kind, "found": True, "path": rec.get("path"), "source": ("cid" if cid else "global")})
-        return {"ok": True, "matches": [rec]}
-    except Exception as ex:
-        return JSONResponse(status_code=400, content={"error": str(ex)})
-
-
 def _build_locks_from_context(cid: str) -> Dict[str, Any]:
     locks: Dict[str, Any] = {"characters": []}
     # Pick recent artifacts
@@ -9849,15 +10406,15 @@ def _build_locks_from_context(cid: str) -> Dict[str, Any]:
     last_voice = _ctx_resolve(cid, "last voice", "audio")
     last_music = _ctx_resolve(cid, "last music", "audio")
     char: Dict[str, Any] = {"id": "C_A"}
-    # Save temporary refs for each kind and wire ref_ids
+    # Save temporary reference-library manifests for each kind and wire ref_ids.
     if last_img and isinstance(last_img.get("path"), str):
-        ref = _refs_save({"kind": "image", "title": f"ctx:{cid}:image", "files": {"images": [last_img.get("path")]}, "compute_embeds": False})
-        if isinstance(ref, dict) and isinstance(ref.get("ref"), dict):
-            char["image_ref_id"] = ref["ref"].get("ref_id")
+        ref = _ref_create("image", f"ctx:{cid}:image", {"images": [last_img.get("path")]}, meta={"source": "locks.from_context"})
+        if isinstance(ref, dict):
+            char["image_ref_id"] = ref.get("ref_id")
     if last_voice and isinstance(last_voice.get("path"), str):
-        ref = _refs_save({"kind": "voice", "title": f"ctx:{cid}:voice", "files": {"voice_samples": [last_voice.get("path")]}, "compute_embeds": False})
-        if isinstance(ref, dict) and isinstance(ref.get("ref"), dict):
-            char["voice_ref_id"] = ref["ref"].get("ref_id")
+        ref = _ref_create("voice", f"ctx:{cid}:voice", {"voice_samples": [last_voice.get("path")]}, meta={"source": "locks.from_context"})
+        if isinstance(ref, dict):
+            char["voice_ref_id"] = ref.get("ref_id")
     if last_music and isinstance(last_music.get("path"), str):
         # Collect any stems tagged in recent context
         stems: List[str] = []
@@ -9866,9 +10423,9 @@ def _build_locks_from_context(cid: str) -> Dict[str, Any]:
             if any(str(t).startswith("stem:") for t in tags):
                 pth = it.get("path")
                 if isinstance(pth, str): stems.append(pth)
-        ref = _refs_save({"kind": "music", "title": f"ctx:{cid}:music", "files": {"track": last_music.get("path"), "stems": stems}, "compute_embeds": False})
-        if isinstance(ref, dict) and isinstance(ref.get("ref"), dict):
-            char["music_ref_id"] = ref["ref"].get("ref_id")
+        ref = _ref_create("music", f"ctx:{cid}:music", {"track": last_music.get("path"), "stems": stems}, meta={"source": "locks.from_context"})
+        if isinstance(ref, dict):
+            char["music_ref_id"] = ref.get("ref_id")
     if len(char) > 1:
         locks["characters"].append(char)
     return locks
@@ -9882,36 +10439,6 @@ async def locks_from_context(body: Dict[str, Any]):
             return JSONResponse(status_code=400, content={"error": "missing cid"})
         locks = _build_locks_from_context(cid)
         return {"ok": True, "locks": locks}
-    except Exception as ex:
-        return JSONResponse(status_code=400, content={"error": str(ex)})
-
-
-@app.post("/refs.compose_character")
-async def refs_compose_character(body: Dict[str, Any]):
-    try:
-        cid = str((body or {}).get("cid") or "").strip()
-        face_txt = str((body or {}).get("face") or "")
-        style_txt = str((body or {}).get("style") or "")
-        clothes_txt = str((body or {}).get("clothes") or "")
-        emotion_txt = str((body or {}).get("emotion") or "")
-        out: Dict[str, Any] = {"image": {}, "audio": {}}
-        if face_txt:
-            rec = _ctx_resolve(cid, face_txt, "image") or _glob_resolve(face_txt, "image")
-            if rec and isinstance(rec.get("path"), str):
-                out["image"]["face_images"] = [rec.get("path")]
-        if style_txt:
-            rec = _ctx_resolve(cid, style_txt, "image") or _glob_resolve(style_txt, "image")
-            if rec and isinstance(rec.get("path"), str):
-                out["image"].setdefault("style_images", []).append(rec.get("path"))
-        if clothes_txt:
-            rec = _ctx_resolve(cid, clothes_txt, "image") or _glob_resolve(clothes_txt, "image")
-            if rec and isinstance(rec.get("path"), str):
-                out["image"].setdefault("clothes_images", []).append(rec.get("path"))
-        if emotion_txt:
-            em = _infer_emotion(emotion_txt)
-            if em:
-                out["audio"]["emotion"] = em
-        return {"ok": True, "refs": out}
     except Exception as ex:
         return JSONResponse(status_code=400, content={"error": str(ex)})
 
@@ -10088,7 +10615,12 @@ async def tools_append(body: Dict[str, Any], request: Request):
                 trace_append(str(row.get("event") or "executor.event"), row)
             except Exception:
                 # Never allow tracing to break ingestion.
-                pass
+                log.debug(
+                    "tools_append: trace_append_failed trace_id=%r event=%r",
+                    trace_id,
+                    row.get("event"),
+                    exc_info=True,
+                )
             if row.get("event") == "exec_step_start":
                 _log("exec_step_start", trace_id=trace_id, tool=row.get("tool"), step_id=row.get("step_id"))
             if row.get("event") == "exec_step_finish":
@@ -10260,110 +10792,78 @@ async def datasets_index(name: str, version: str):
 # ---------- Film-2 QA (Step 23) ----------
 @app.post("/film2/qa")
 async def film2_qa(body: Dict[str, Any]):
-    try:
-        cid_raw = body.get("cid") or body.get("film_id")
-        cid = str(cid_raw).strip() if isinstance(cid_raw, (str, int)) else ""
-        if not cid:
-            return JSONResponse(status_code=400, content={"error": "missing cid"})
-        shots = body.get("shots") or []
-        voice_lines = body.get("voice_lines") or []
-        music_cues = body.get("music_cues") or []
-        _t_face_raw = os.getenv("FILM2_QA_T_FACE", "0.85")
-        _t_voice_raw = os.getenv("FILM2_QA_T_VOICE", "0.85")
-        _t_music_raw = os.getenv("FILM2_QA_T_MUSIC", "0.80")
-        try:
-            T_FACE = float(str(_t_face_raw).strip() or "0.85")
-        except Exception:
-            logging.warning("film2.qa: bad FILM2_QA_T_FACE=%r; defaulting to 0.85", _t_face_raw, exc_info=True)
-            T_FACE = 0.85
-        try:
-            T_VOICE = float(str(_t_voice_raw).strip() or "0.85")
-        except Exception:
-            logging.warning("film2.qa: bad FILM2_QA_T_VOICE=%r; defaulting to 0.85", _t_voice_raw, exc_info=True)
-            T_VOICE = 0.85
-        try:
-            T_MUSIC = float(str(_t_music_raw).strip() or "0.80")
-        except Exception:
-            logging.warning("film2.qa: bad FILM2_QA_T_MUSIC=%r; defaulting to 0.80", _t_music_raw, exc_info=True)
-            T_MUSIC = 0.80
-        issues = []
-        for shot in shots:
-            sid = shot.get("id") or shot.get("shot_id")
-            if not sid:
-                continue
-            snap = _film_load_snap(cid, sid) or {}
-            sb_meta = {"face_vec": snap.get("face_vec")}
-            fin_meta = {"face_vec": None}
-            score = _qa_face(sb_meta, fin_meta, face_ref_embed=None)
-            if score < T_FACE:
-                _seed_raw = snap.get("seed") if isinstance(snap, dict) else None
-                try:
-                    _seed = int(_seed_raw or 0)
-                except Exception:
-                    logging.warning("film2.qa: bad snap.seed=%r; defaulting to 0", _seed_raw, exc_info=True)
-                    _seed = 0
-                args = {"name": "image.dispatch", "args": {"mode": "gen", "prompt": shot.get("prompt") or "", "size": shot.get("size", "1024x1024"), "refs": snap.get("refs", {}), "seed": _seed, "film_cid": cid, "shot_id": sid}}
-                _ = await http_tool_run(args.get("name") or "image.dispatch", args.get("args") or {})
-                issues.append({"shot": sid, "type": "image", "score": score})
-        for ln in voice_lines:
-            lid = ln.get("id") or ln.get("line_id")
-            if not lid:
-                continue
-            snap = _film_load_snap(cid, f"vo_{lid}") or {}
-            score = _qa_voice({"voice_vec": None}, voice_ref_embed=None)
-            if score < T_VOICE:
-                _seed_raw2 = snap.get("seed") if isinstance(snap, dict) else None
-                try:
-                    _seed2 = int(_seed_raw2 or 0)
-                except Exception:
-                    logging.warning("film2.qa: bad snap.seed=%r; defaulting to 0", _seed_raw2, exc_info=True)
-                    _seed2 = 0
-                args = {"name": "tts.speak", "args": {"text": ln.get("text") or "", "voice_id": ln.get("voice_ref_id"), "voice_refs": snap.get("refs", {}), "seed": _seed2, "film_cid": cid, "line_id": lid}}
-                _ = await http_tool_run(args.get("name") or "tts.speak", args.get("args") or {})
-                issues.append({"line": lid, "type": "voice", "score": score})
-        for cue in music_cues:
-            cid2 = cue.get("id") or cue.get("cue_id")
-            if not cid2:
-                continue
-            snap = _film_load_snap(cid, f"cue_{cid2}") or {}
-            score = _qa_music({"motif_vec": None}, motif_embed=None)
-            if score < T_MUSIC:
-                # Prefer timed music generation for video scoring using SAO when available
-                args = {"name": "music.timed.sao", "args": {"text": cue.get("prompt") or "", "seconds": 8}}
-                _ = await http_tool_run(args.get("name") or "music.timed.sao", args.get("args") or {})
-                issues.append({"cue": cid2, "type": "music", "score": score})
-        # Best-effort integration of per-shot image QA from image.dispatch when present.
-        # This does not replace the existing Film2 QA heuristics; it augments them with
-        # face_lock and entity_lock_score from the lock-aware image pipeline.
-        preset = LOCK_QUALITY_PRESETS.get("hero", LOCK_QUALITY_PRESETS["standard"])
-        face_min_raw = preset.get("face_min", T_FACE) if isinstance(preset, dict) else T_FACE
-        face_min_lock = float(face_min_raw) if isinstance(face_min_raw, (int, float)) else T_FACE
-        for shot in shots:
-            sid = shot.get("id") or shot.get("shot_id")
-            if not sid:
-                continue
-            qa_block = (shot.get("qa") or {}).get("images") if isinstance(shot.get("qa"), dict) else {}
-            locks_meta = (shot.get("meta") or {}).get("locks") if isinstance(shot.get("meta"), dict) else {}
-            face_lock_val = None
-            ent_lock_val = None
-            if isinstance(qa_block, dict):
-                fl = qa_block.get("face_lock")
-                if isinstance(fl, (int, float)):
-                    face_lock_val = float(fl)
-            if isinstance(locks_meta, dict):
-                el = locks_meta.get("entity_lock_score")
-                if isinstance(el, (int, float)):
-                    ent_lock_val = float(el)
-            shot_issues = []
-            if face_lock_val is not None and face_lock_val < face_min_lock:
-                shot_issues.append({"type": "identity_lock", "face_lock": face_lock_val})
-            if ent_lock_val is not None and ent_lock_val < 0.8:
-                shot_issues.append({"type": "entity_lock", "entity_lock_score": ent_lock_val})
-            if shot_issues:
-                issues.append({"shot": sid, "type": "image_lock", "details": shot_issues})
-        return {"cid": cid, "issues": issues, "thresholds": {"face": T_FACE, "voice": T_VOICE, "music": T_MUSIC, "face_lock": face_min_lock}}
-    except Exception as ex:
-        return JSONResponse(status_code=400, content={"error": str(ex)})
+    cid_raw = body.get("cid") or body.get("film_id")
+    cid = str(cid_raw).strip() if isinstance(cid_raw, (str, int)) else ""
+    if not cid:
+        return ToolEnvelope.failure("ValidationError", "missing cid", status=400, details={"field": "cid"})
+
+    shots = body.get("shots") or []
+    th_film2 = _film2_quality_thresholds()
+    T_FACE = float(th_film2.get("face", 0.85))
+    T_VOICE = float(th_film2.get("voice", 0.85))
+    T_MUSIC = float(th_film2.get("music", 0.80))
+
+    # Film2 QA is lock-driven. Prefer film2.run-computed lock keys:
+    #   face_lock, region_shape_min, scene_score, entity_lock_score
+    issues = []
+    profile_name = (body.get("quality_profile") or "hero")
+    preset = LOCK_QUALITY_PRESETS.get(str(profile_name).lower(), LOCK_QUALITY_PRESETS["standard"])
+    face_min_raw = preset.get("face_min", T_FACE) if isinstance(preset, dict) else T_FACE
+    face_min_lock = float(face_min_raw) if isinstance(face_min_raw, (int, float)) else T_FACE
+    region_min_raw = preset.get("region_shape_min", 0.0) if isinstance(preset, dict) else 0.0
+    region_min = float(region_min_raw) if isinstance(region_min_raw, (int, float)) else 0.0
+    scene_min_raw = preset.get("scene_min", 0.0) if isinstance(preset, dict) else 0.0
+    scene_min = float(scene_min_raw) if isinstance(scene_min_raw, (int, float)) else 0.0
+    for shot in (shots if isinstance(shots, list) else []):
+        if not isinstance(shot, dict):
+            continue
+        sid = shot.get("id") or shot.get("shot_id")
+        if not sid:
+            continue
+        qa_block = (shot.get("qa") or {}).get("images") if isinstance(shot.get("qa"), dict) else {}
+        locks_meta = (shot.get("meta") or {}).get("locks") if isinstance(shot.get("meta"), dict) else {}
+        face_lock_val = None
+        region_shape_val = None
+        scene_score_val = None
+        ent_lock_val = None
+        # Back-compat: allow image.dispatch qa.images.face_lock if present.
+        if isinstance(qa_block, dict):
+            fl = qa_block.get("face_lock")
+            if isinstance(fl, (int, float)):
+                face_lock_val = float(fl)
+        if isinstance(locks_meta, dict):
+            if face_lock_val is None:
+                fl2 = locks_meta.get("face_lock")
+                if isinstance(fl2, (int, float)):
+                    face_lock_val = float(fl2)
+            rv = locks_meta.get("region_shape_min")
+            if isinstance(rv, (int, float)):
+                region_shape_val = float(rv)
+            sv = locks_meta.get("scene_score")
+            if isinstance(sv, (int, float)):
+                scene_score_val = float(sv)
+            el = locks_meta.get("entity_lock_score")
+            if isinstance(el, (int, float)):
+                ent_lock_val = float(el)
+        shot_issues = []
+        if face_lock_val is not None and face_lock_val < face_min_lock:
+            shot_issues.append({"type": "identity_lock", "face_lock": face_lock_val})
+        if region_shape_val is not None and region_min > 0.0 and region_shape_val < region_min:
+            shot_issues.append({"type": "region_shape_lock", "region_shape_min": region_shape_val})
+        if scene_score_val is not None and scene_min > 0.0 and scene_score_val < scene_min:
+            shot_issues.append({"type": "scene_lock", "scene_score": scene_score_val})
+        if ent_lock_val is not None and ent_lock_val < 0.8:
+            shot_issues.append({"type": "entity_lock", "entity_lock_score": ent_lock_val})
+        if shot_issues:
+            issues.append({"shot": sid, "type": "image_lock", "details": shot_issues})
+
+    return ToolEnvelope.success(
+        {
+            "cid": cid,
+            "issues": issues,
+            "thresholds": {"face": T_FACE, "voice": T_VOICE, "music": T_MUSIC, "face_lock": face_min_lock, "region_shape_min": region_min, "scene_min": scene_min},
+        }
+    )
 
 
 # ---------- Admin & Ops (Step 22) ----------
@@ -10432,72 +10932,15 @@ async def v1_state_project(job_id: str):
 
 @app.post("/v1/review/score")
 async def v1_review_score(body: Dict[str, Any]):
-    expected = {"kind": str, "path": str, "prompt": str}
-    parser = JSONParser()
-    payload = parser.parse(json.dumps(body or {}), expected)
-    kind = (payload.get("kind") or "").strip().lower()
-    path = payload.get("path") or ""
-    prompt = (payload.get("prompt") or "").strip()
-    if kind not in ("image", "audio", "music"):
-        return JSONResponse(status_code=400, content={"error": "invalid kind"})
-    scores: Dict[str, Any] = {}
-    if kind == "image":
-        ai = _analyze_image(path, prompt=prompt)
-        sem = ai.get("semantics") or {}
-        score_block = ai.get("score") or {}
-        scores = {
-            "image": {
-                "overall": float(score_block.get("overall") or 0.0),
-                "semantic": float(score_block.get("semantic") or 0.0),
-                "technical": float(score_block.get("technical") or 0.0),
-                "clip": float(sem.get("clip_score") or 0.0),
-            }
-        }
-    else:
-        aa = _analyze_audio(path)
-        scores = {"audio": {"lufs": aa.get("lufs"), "tempo_bpm": aa.get("tempo_bpm")}}
-    return {"ok": True, "scores": scores}
+    return _review_score(body or {})
 
 @app.post("/v1/review/plan")
 async def v1_review_plan(body: Dict[str, Any]):
-    parser = JSONParser()
-    payload = parser.parse(json.dumps(body or {}), {"scores": dict})
-    plan = _build_delta_plan(payload.get("scores") or {})
-    return {"ok": True, "plan": plan}
+    return _review_plan(body or {})
 
 @app.post("/v1/review/loop")
 async def v1_review_loop(body: Dict[str, Any]):
-    expected = {"artifacts": list, "prompt": str}
-    parser = JSONParser()
-    payload = parser.parse(json.dumps(body or {}), expected)
-    arts = payload.get("artifacts") or []
-    prompt = (payload.get("prompt") or "").strip()
-    loop_idx = 0
-    while loop_idx < 6:
-        # Score first image or audio artifact only (fast path)
-        img = next((a for a in arts if (a.get("kind") or "").startswith("image")), None)
-        aud = next((a for a in arts if (a.get("kind") or "").startswith("audio")), None)
-        scores: Dict[str, Any] = {}
-        if img and isinstance(img.get("path"), str):
-            ai = _analyze_image(img.get("path"), prompt=prompt)
-            sem = ai.get("semantics") or {}
-            score_block = ai.get("score") or {}
-            scores["image"] = {
-                "overall": float(score_block.get("overall") or 0.0),
-                "semantic": float(score_block.get("semantic") or 0.0),
-                "technical": float(score_block.get("technical") or 0.0),
-                "clip": float(sem.get("clip_score") or 0.0),
-            }
-        if aud and isinstance(aud.get("path"), str):
-            aa = _analyze_audio(aud.get("path"))
-            scores["audio"] = {"lufs": aa.get("lufs"), "tempo_bpm": aa.get("tempo_bpm")}
-        plan = _build_delta_plan(scores)
-        _append_ledger({"phase": f"review.loop#{loop_idx}", "scores": scores, "decision": plan})
-        if plan.get("accept") is True:
-            return {"ok": True, "loop_idx": loop_idx, "accepted": True, "plan": plan}
-        # Minimal refinement stub: not executing real deltas here; return plan to caller
-        return {"ok": True, "loop_idx": loop_idx, "accepted": False, "plan": plan}
-    return {"ok": True, "loop_idx": loop_idx, "accepted": False, "plan": {"accept": False}}
+    return _review_loop(body or {})
 
 # ---- Film-2 Video endpoints (HunyuanVideo-first; deterministic; ICW capsules) ----
 @app.post("/v1/video/locks/{lock_type}")
@@ -10511,10 +10954,11 @@ async def v1_video_locks(lock_type: str, body: Dict[str, Any]):
         imgs: list[str] = []
         for r in refs:
             if isinstance(r, dict) and isinstance(r.get("ref_id"), str):
-                pack, code = _refs_apply({"ref_id": r.get("ref_id")})
-                if code == 200 and isinstance(pack, dict):
-                    for p in (pack.get("images") or []) + (pack.get("image") or []):
-                        if isinstance(p, str): imgs.append(p)
+                pack = _ref_pack_for_ref_id(r.get("ref_id"))
+                if isinstance(pack, dict):
+                    for p in (pack.get("images") or []):
+                        if isinstance(p, str):
+                            imgs.append(p)
             elif isinstance(r, dict) and isinstance(r.get("image_url"), str):
                 imgs.append(r.get("image_url"))
             elif isinstance(r, str):
@@ -10524,7 +10968,7 @@ async def v1_video_locks(lock_type: str, body: Dict[str, Any]):
         files = {"images": imgs}
     if lock_type == "voice":
         files = {"voice_samples": [r.get("audio_url") for r in refs if isinstance(r, dict) and r.get("audio_url")]}
-    saved = _refs_save({"kind": lock_type, "title": f"vlock:{lock_type}:{int(time.time())}", "files": files, "compute_embeds": True})
+    saved = _ref_save_internal(lock_type, f"vlock:{lock_type}:{int(time.time())}", files, compute_embeds=True)
     return {"ok": True, "lock": saved}
 
 def _save_capsule(cap: Dict[str, Any]) -> str:
@@ -10551,10 +10995,10 @@ async def v1_video_state(capsule_id: str):
 @app.post("/v1/video/generate")
 async def v1_video_generate(body: Dict[str, Any]):
     rid = uuid.uuid4().hex
-    if not HUNYUAN_VIDEO_API_URL:
+    if not HYVIDEO_API_URL:
         return ToolEnvelope.failure(
             "hunyuan_not_configured",
-            "HUNYUAN_VIDEO_API_URL not configured",
+            "HYVIDEO_API_URL not configured",
             status=500,
             request_id=rid,
         )
@@ -10602,10 +11046,10 @@ async def v1_video_generate(body: Dict[str, Any]):
 @app.post("/v1/video/edit")
 async def v1_video_edit(body: Dict[str, Any]):
     rid = uuid.uuid4().hex
-    if not HUNYUAN_VIDEO_API_URL:
+    if not HYVIDEO_API_URL:
         return ToolEnvelope.failure(
             "hunyuan_not_configured",
-            "HUNYUAN_VIDEO_API_URL not configured",
+            "HYVIDEO_API_URL not configured",
             status=500,
             request_id=rid,
         )
@@ -10812,7 +11256,7 @@ async def v1_locks_create(body: Dict[str, Any]):
     elif lk_type == "sfx" or lk_type == "sfx_identity":
         files = {"sfx_samples": [r.get("audio_url") for r in refs if isinstance(r, dict) and r.get("audio_url")]}
     title = f"lock:{lk_type}:{int(time.time())}"
-    saved = _refs_save({"kind": lk_type, "title": title, "files": files, "tags": tags, "compute_embeds": True})
+    saved = _ref_save_internal(lk_type, title, files, compute_embeds=True)
     return ToolEnvelope.success({"lock": saved}, request_id=rid)
 
 @app.post("/v1/tts")
@@ -11123,101 +11567,7 @@ async def upload(file: UploadFile = File(...)):
 
 
 # ---------- Jobs API for long ComfyUI workflows ----------
-_job_endpoint: Dict[str, str] = {}
-_comfy_load: Dict[str, int] = {}
-
-
-def _comfy_candidates() -> List[str]:
-    if COMFYUI_API_URLS:
-        return COMFYUI_API_URLS
-    if COMFYUI_API_URL:
-        return [COMFYUI_API_URL]
-    return []
-
-
-async def _pick_comfy_base() -> Optional[str]:
-    candidates = _comfy_candidates()
-    if not candidates:
-        return None
-    for u in candidates:
-        _comfy_load.setdefault(u, 0)
-    return min(candidates, key=lambda u: _comfy_load.get(u, 0))
-
-
-async def _comfy_submit_workflow(workflow: Dict[str, Any]) -> Dict[str, Any]:
-    candidates = _comfy_candidates()
-    if not candidates:
-        return {"error": "COMFYUI_API_URL(S) not configured"}
-    delay = COMFYUI_BACKOFF_MS
-    last_err: Optional[str] = None
-    for attempt in range(1, COMFYUI_MAX_RETRIES + 1):
-        ordered = sorted(candidates, key=lambda u: _comfy_load.get(u, 0))
-        for base in ordered:
-            try:
-                async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
-                    if _comfy_sem is not None:
-                        async with _comfy_sem:
-                            _comfy_load[base] = _comfy_load.get(base, 0) + 1
-                            payload = workflow if isinstance(workflow, dict) else {"prompt": workflow}
-                            if "prompt" not in payload and isinstance(workflow, dict):
-                                payload = {"prompt": workflow}
-                            payload = {**payload, "client_id": "wrapper-001"}
-                            r = await client.post(base.rstrip("/") + "/prompt", json=payload)
-                    else:
-                        _comfy_load[base] = _comfy_load.get(base, 0) + 1
-                        payload = workflow if isinstance(workflow, dict) else {"prompt": workflow}
-                        if "prompt" not in payload and isinstance(workflow, dict):
-                            payload = {"prompt": workflow}
-                        payload = {**payload, "client_id": "wrapper-001"}
-                        r = await client.post(base.rstrip("/") + "/prompt", json=payload)
-                    try:
-                        parser = JSONParser()
-                        res = parser.parse(r.text or "", {"prompt_id": str, "uuid": str, "id": str})
-                        pid = res.get("prompt_id") or res.get("uuid") or res.get("id") if isinstance(res, dict) else None
-                        if isinstance(pid, str):
-                            _job_endpoint[pid] = base
-                            # Wait for execution via WS
-                            ws_url = base.replace("http", "ws").rstrip("/") + f"/ws?clientId=wrapper-001"
-                            async with _ws.connect(ws_url, ping_interval=None) as ws:
-                                # Drain until executed message for our pid
-                                while True:
-                                    msg = await ws.recv()
-                                    jd = JSONParser().parse(msg, {"type": str, "data": dict}) if isinstance(msg, (str, bytes)) else {}
-                                    if isinstance(jd, dict) and jd.get("type") == "executed":
-                                        d = jd.get("data") or {}
-                                        if d.get("prompt_id") == pid:
-                                            break
-                            return res if isinstance(res, dict) else {}
-                    except Exception as ex:
-                        last_err = r.text
-                        logging.warning(
-                            f"comfy.wait_for_executed.error base={str(base)} prompt_id={str(pid)}: {ex}",
-                            exc_info=True,
-                        )
-            except Exception as ex:
-                last_err = str(ex)
-            finally:
-                _comfy_load[base] = max(0, _comfy_load.get(base, 1) - 1)
-        # backoff before next round
-        try:
-            await _as.sleep(max(0.0, float(delay) / 1000.0))
-        except Exception as ex:
-            logging.warning(f"comfy.backoff.sleep.error: {str(ex)}", exc_info=True)
-        delay = min(delay * 2, COMFYUI_BACKOFF_MAX_MS)
-    return {"error": last_err or "all comfyui instances failed after retries"}
-
-
-async def _comfy_history(prompt_id: str) -> Dict[str, Any]:
-    base = _job_endpoint.get(prompt_id) or (await _pick_comfy_base())
-    if not base:
-        return {"error": "COMFYUI_API_URL(S) not configured"}
-    async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
-        r = await client.get(base.rstrip("/") + f"/history/{prompt_id}")
-        parser = JSONParser()
-        js = parser.parse(r.text or "", {})
-        if 200 <= r.status_code < 300:
-            return js if isinstance(js, dict) else {}
-        return {"error": r.text}
+# (Removed) ComfyUI submit/history helpers lived here; canonical versions now live in `app.comfy.client_aio`.
 
 
 async def get_film_characters(film_id: str) -> List[Dict[str, Any]]:
@@ -11437,7 +11787,7 @@ async def _track_comfy_job(job_id: str, prompt_id: str) -> None:
         HISTORY_GRACE_SECONDS = 86400
     start_time = time.time()
     while True:
-        data = await _comfy_history(prompt_id)
+        data = _comfy_history(prompt_id)
         _jobs_store[job_id]["updated_at"] = time.time()
         _jobs_store[job_id]["last_history"] = data
         detail = _normalize_comfy_history_entry(data if isinstance(data, dict) else {}, prompt_id)
@@ -11506,7 +11856,7 @@ async def create_job(body: Dict[str, Any]):
     workflow = body.get("workflow") if isinstance(body, dict) else None
     if not workflow:
         workflow = body or {}
-    submit = await _comfy_submit_workflow(workflow)
+    submit = _comfy_submit(workflow, client_id="wrapper-001")
     if submit.get("error"):
         return JSONResponse(status_code=502, content=submit)
     prompt_id = submit.get("prompt_id") or submit.get("uuid") or submit.get("id")
@@ -11640,7 +11990,7 @@ async def _update_scene_from_job(job_id: str, detail: Dict[str, Any] | str, fail
     # Prefer the exact ComfyUI base that handled this job (per-job endpoint pinning)
     job = _jobs_store.get(job_id) if isinstance(_jobs_store.get(job_id), dict) else {}
     pid = job.get("prompt_id")
-    base = _job_endpoint.get(pid) if pid else None
+    base = COMFYUI_API_URL or ""
     if isinstance(detail, str):
         parsed = JSONParser().parse(detail, {"outputs": dict, "status": dict})
         detail = parsed if isinstance(parsed, dict) else {}
@@ -11762,36 +12112,51 @@ async def _maybe_compile_film(film_id: str) -> None:
     pool = await get_pg_pool()
     if pool is None:
         return
-    # If all scenes for film are succeeded, trigger compilation via N8N if available
+    # If all scenes for film are succeeded, trigger local compilation (blocking).
     async with pool.acquire() as conn:
         counts = await conn.fetchrow("SELECT COUNT(*) AS total, SUM(CASE WHEN status='succeeded' THEN 1 ELSE 0 END) AS done FROM scenes WHERE film_id=$1", film_id)
         total = int(counts["total"] or 0)
         done = int(counts["done"] or 0)
         if total == 0 or done != total:
             return
-        rows = await conn.fetch("SELECT id, index_num, assets FROM scenes WHERE film_id=$1 ORDER BY index_num ASC", film_id)
+        rows = await conn.fetch("SELECT id, index_num, assets, plan FROM scenes WHERE film_id=$1 ORDER BY index_num ASC", film_id)
     scenes = [dict(r) for r in rows]
-    payload = {"film_id": film_id, "scenes": [dict(s) for s in scenes], "public_base_url": PUBLIC_BASE_URL}
+    # Derive compile preferences from the first scene plan (when available).
+    preferences: Dict[str, Any] = {}
+    try:
+        for sc in scenes:
+            pl = sc.get("plan")
+            if isinstance(pl, str) and pl.strip():
+                pl = JSONParser().parse(pl, {}) if pl.strip().startswith("{") else {}
+            if isinstance(pl, dict):
+                prefs = pl.get("preferences") if isinstance(pl.get("preferences"), dict) else {}
+                if prefs:
+                    preferences = dict(prefs)
+                    break
+    except Exception:
+        preferences = {}
+    payload = {"film_id": film_id, "scenes": [dict(s) for s in scenes], "public_base_url": PUBLIC_BASE_URL, "preferences": preferences}
     assembly_result = None
-    # Prefer local assembler if available
-    if ASSEMBLER_API_URL:
-        try:
-            async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
-                r = await client.post(ASSEMBLER_API_URL.rstrip("/") + "/assemble", json=payload)
-                parser = JSONParser()
-                assembly_result = parser.parse(r.text or "", {})
-        except Exception as ex:
-            logging.warning(f"film.compile.assembler.failed film_id={str(film_id)}: {ex}", exc_info=True)
-            assembly_result = {"error": True, "message": str(ex)}
-    elif N8N_WEBHOOK_URL and ENABLE_N8N:
-        try:
-            async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
-                r = await client.post(N8N_WEBHOOK_URL, json=payload)
-                parser = JSONParser()
-                assembly_result = parser.parse(r.text or "", {})
-        except Exception as ex:
-            logging.warning(f"film.compile.n8n.failed film_id={str(film_id)}: {ex}", exc_info=True)
-            assembly_result = {"error": True, "message": str(ex)}
+    try:
+        assembly_result = await _assemble_film_from_scene_rows(
+            film_id=film_id,
+            scenes=scenes,
+            upload_dir=UPLOAD_DIR,
+            public_base_url=PUBLIC_BASE_URL,
+            preferences=preferences,
+            # This compilation path isn't tied to a chat trace_id; leave trace_id unset.
+            trace_id=None,
+            state_dir=None,
+        )
+    except Exception as ex:
+        logging.warning("film.compile.local.failed film_id=%s err=%s", str(film_id), str(ex), exc_info=True)
+        assembly_result = {
+            "schema_version": 1,
+            "request_id": f"film.compile:{film_id}",
+            "ok": False,
+            "result": None,
+            "error": {"code": "compile_failed", "message": str(ex), "status": 500, "details": {"film_id": film_id}},
+        }
     # Always write a manifest to uploads for convenience
     manifest_url = None
     try:

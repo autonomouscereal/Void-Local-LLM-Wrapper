@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import os
+import time
 from typing import Any, Dict
 
 import httpx  # type: ignore
@@ -49,6 +50,7 @@ class RestMusicProvider:
         self._base = (base_url or os.getenv("MUSIC_API_URL") or "").rstrip("/")
 
     def compose(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        t0 = time.time()
         if not self._base:
             # Never raise from tool providers; return empty audio with a structured error.
             try:
@@ -96,15 +98,44 @@ class RestMusicProvider:
             "instrumental_only": args.get("instrumental_only"),
             "style": args.get("style"),
         }
+        # Correlation IDs for end-to-end logging (music service will log these).
+        if isinstance(args.get("cid"), (str, int)) and str(args.get("cid")).strip():
+            payload["cid"] = str(args.get("cid")).strip()
+        if isinstance(args.get("trace_id"), str) and args.get("trace_id").strip():
+            payload["trace_id"] = args.get("trace_id").strip()
+        if isinstance(args.get("request_id"), (str, int)) and str(args.get("request_id")).strip():
+            payload["request_id"] = str(args.get("request_id")).strip()
 
         url = self._base + "/generate"
+        # Keep logs dense but safe: never dump full prompt, only a preview + length.
+        prompt_preview = payload.get("prompt")[:120] if isinstance(payload.get("prompt"), str) else ""
+        log.info(
+            "music.provider.compose.request url=%s seconds=%s sr=%s ch=%s seed=%r cid=%r trace_id=%r prompt_len=%s prompt_preview=%r",
+            url,
+            seconds,
+            sample_rate,
+            channels,
+            payload.get("seed"),
+            payload.get("cid"),
+            payload.get("trace_id"),
+            (len(payload.get("prompt")) if isinstance(payload.get("prompt"), str) else 0),
+            prompt_preview,
+        )
         with httpx.Client(timeout=None, trust_env=False) as client:  # type: ignore[arg-type]
             resp = client.post(url, json=payload)
+        dur_ms = int((time.time() - t0) * 1000.0)
 
         # Raw audio response (e.g., Content-Type: audio/wav)
         ctype = resp.headers.get("content-type") or ""
         if ctype.startswith("audio/") or ctype == "application/octet-stream":
             wav_bytes = resp.content or b""
+            log.info(
+                "music.provider.compose.response kind=raw_audio status=%s ctype=%r bytes=%s ms=%s",
+                int(resp.status_code),
+                ctype,
+                len(wav_bytes),
+                dur_ms,
+            )
             return {
                 "wav_bytes": wav_bytes,
                 "sample_rate": sample_rate,
@@ -120,6 +151,15 @@ class RestMusicProvider:
 
         if isinstance(data, dict):
             inner = data.get("result") if isinstance(data.get("result"), dict) else data
+            if not (200 <= int(resp.status_code) < 300):
+                # Preserve response body shape for callers; still return empty wav_bytes.
+                log.warning(
+                    "music.provider.compose.http_error status=%s ctype=%r ms=%s keys=%r",
+                    int(resp.status_code),
+                    ctype,
+                    dur_ms,
+                    sorted(list(inner.keys())) if isinstance(inner, dict) else [],
+                )
             b64 = (
                 inner.get("wav_bytes_b64")
                 or inner.get("wav_base64")
@@ -144,6 +184,14 @@ class RestMusicProvider:
             except Exception as exc:
                 log.warning("music.provider: bad inner.channels=%r; using %d", _ch_raw, int(channels), exc_info=True)
                 out_ch = int(channels)
+            log.info(
+                "music.provider.compose.response kind=json status=%s ctype=%r bytes=%s ms=%s model=%r",
+                int(resp.status_code),
+                ctype,
+                len(wav_bytes),
+                dur_ms,
+                inner.get("model") if isinstance(inner, dict) else None,
+            )
             return {
                 "wav_bytes": wav_bytes,
                 "sample_rate": out_sr,
@@ -153,6 +201,15 @@ class RestMusicProvider:
             }
 
         # Fallback: unknown format; return empty audio so callers can surface a structured error.
+        body_preview = (resp.text or "")[:500] if hasattr(resp, "text") else ""
+        log.warning(
+            "music.provider.compose.unknown_response status=%s ctype=%r bytes=%s ms=%s body_preview=%r",
+            int(resp.status_code),
+            ctype,
+            len(resp.content or b""),
+            dur_ms,
+            body_preview,
+        )
         return {
             "wav_bytes": b"",
             "sample_rate": sample_rate,

@@ -10,6 +10,7 @@ from .diffutil import apply_patch_in_memory
 from .fsview import read_text
 from .envelope import make_artifact, make_envelope
 from ..committee_client import committee_ai_text, committee_jsonify
+from ..json_parser import JSONParser
 
 
 ARCH_SCHEMA: Dict[str, Any] = {
@@ -38,7 +39,10 @@ async def _parse_json(text: str, expected_schema: Any, *, trace_id: str) -> Dict
         trace_id=trace_id,
         temperature=0.0,
     )
-    return parsed if isinstance(parsed, dict) else {}
+    # Always run the final coercion/normalization pass via JSONParser with the expected structure.
+    parser = JSONParser()
+    obj = parser.parse(parsed if parsed is not None else "{}", expected_schema)
+    return obj if isinstance(obj, dict) else {}
 
 
 async def run_super_loop(task: str, repo_root: str, *, trace_id: str, step_tokens: int = 900) -> dict:

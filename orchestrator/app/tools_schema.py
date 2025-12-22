@@ -254,17 +254,6 @@ def get_builtin_tools_schema() -> List[Dict[str, Any]]:
         {
             "type": "function",
             "function": {
-                "name": "refs.music.build_profile",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"ref_ids": {"type": "array", "items": {"type": "string"}}, "audio_paths": {"type": "array", "items": {"type": "string"}}},
-                    "required": [],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
                 "name": "audio.foley.hunyuan",
                 "parameters": {
                     "type": "object",
@@ -436,8 +425,8 @@ def get_builtin_tools_schema() -> List[Dict[str, Any]]:
         },
         {"type": "function", "function": {"name": "video.interpolate", "parameters": {"type": "object", "properties": {"src": {"type": "string"}, "target_fps": {"type": "integer"}}, "required": ["src"]}}},
         {"type": "function", "function": {"name": "video.flow.derive", "parameters": {"type": "object", "properties": {"src": {"type": "string"}, "frame_a": {"type": "string"}, "frame_b": {"type": "string"}, "step": {"type": "integer"}}, "required": []}}},
-        {"type": "function", "function": {"name": "video.hv.t2v", "parameters": {"type": "object", "properties": {"prompt": {"type": "string"}, "negative": {"type": "string"}, "width": {"type": "integer"}, "height": {"type": "integer"}, "fps": {"type": "integer"}, "seconds": {"type": "integer"}, "seed": {"type": "integer"}, "locks": {"type": "object"}, "post": {"type": "object"}, "latent_reinit_every": {"type": "integer"}}, "required": ["prompt", "width", "height", "fps", "seconds"]}}},
-        {"type": "function", "function": {"name": "video.hv.i2v", "parameters": {"type": "object", "properties": {"init_image": {"type": "string"}, "prompt": {"type": "string"}, "negative": {"type": "string"}, "width": {"type": "integer"}, "height": {"type": "integer"}, "fps": {"type": "integer"}, "seconds": {"type": "integer"}, "seed": {"type": "integer"}, "locks": {"type": "object"}, "post": {"type": "object"}, "latent_reinit_every": {"type": "integer"}}, "required": ["init_image", "prompt", "width", "height", "fps", "seconds"]}}},
+        {"type": "function", "function": {"name": "video.hv.t2v", "parameters": {"type": "object", "properties": {"prompt": {"type": "string"}, "negative": {"type": "string"}, "width": {"type": "integer"}, "height": {"type": "integer"}, "fps": {"type": "integer"}, "seconds": {"type": "integer"}, "seed": {"type": "integer"}, "locks": {"type": "object"}, "post": {"type": "object"}, "latent_reinit_every": {"type": "integer"}, "cid": {"type": "string"}, "trace_id": {"type": "string"}}, "required": ["prompt"]}}},
+        {"type": "function", "function": {"name": "video.hv.i2v", "parameters": {"type": "object", "properties": {"init_image": {"type": "string"}, "prompt": {"type": "string"}, "negative": {"type": "string"}, "width": {"type": "integer"}, "height": {"type": "integer"}, "fps": {"type": "integer"}, "seconds": {"type": "integer"}, "seed": {"type": "integer"}, "locks": {"type": "object"}, "post": {"type": "object"}, "latent_reinit_every": {"type": "integer"}, "cid": {"type": "string"}, "trace_id": {"type": "string"}}, "required": ["prompt"]}}},
         {"type": "function", "function": {"name": "video.upscale", "parameters": {"type": "object", "properties": {"src": {"type": "string"}, "scale": {"type": "integer"}, "width": {"type": "integer"}, "height": {"type": "integer"}}, "required": ["src"]}}},
         {"type": "function", "function": {"name": "video.text.overlay", "parameters": {"type": "object", "properties": {"src": {"type": "string"}, "texts": {"type": "array", "items": {"type": "object"}}}, "required": ["src", "texts"]}}},
         {"type": "function", "function": {"name": "image.cleanup", "parameters": {"type": "object", "properties": {"src": {"type": "string"}, "denoise": {"type": "boolean"}, "sharpen": {"type": "boolean"}, "dehalo": {"type": "boolean"}, "clahe": {"type": "boolean"}}, "required": ["src"]}}},
@@ -620,8 +609,6 @@ def get_builtin_tools_schema() -> List[Dict[str, Any]]:
 # ---- Tool Introspection (data-only registry) ----
 _INTROSPECTION_DEFAULT_NAMES: List[str] = [
     "image.dispatch",
-    "image.refine.segment",
-    "api.request",
     "film2.run",
     "music.infinite.windowed",
     "tts.speak",
@@ -630,8 +617,6 @@ _INTROSPECTION_DEFAULT_NAMES: List[str] = [
 
 _INTROSPECTION_NOTES: Dict[str, str] = {
     "image.dispatch": "Comfy pipeline; requires either size or width/height. Returns ids.image_id and meta.{data_url,view_url,orch_view_url}.",
-    "image.refine.segment": "Segment-level image refinement entrypoint; reuses image.dispatch path with lock-aware settings.",
-    "api.request": "Generic HTTP request for public APIs and metadata discovery for repair. Disallows internal service hosts.",
     "film2.run": (
         "Unified Film-2 front door for Void. Planner MUST treat this as the final assembly step in a film pipeline. "
         "Do NOT fabricate or hard-code clip/image URLs in args; the orchestrator automatically wires real image "

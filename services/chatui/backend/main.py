@@ -36,6 +36,9 @@ from .json_parser import JSONParser
 import logging
 import websockets  # type: ignore
 
+# Single module logger.
+log = logging.getLogger(__name__)
+
 # Create app BEFORE any decorators use it
 app = FastAPI(title="Chat UI Backend", version="0.1.0")
 # NOTE: We rely on the custom global CORS middleware below for deterministic headers and
@@ -92,7 +95,8 @@ async def init_pool() -> asyncpg.pool.Pool:
         try:
             await conn.execute("ALTER TABLE conversations ADD COLUMN IF NOT EXISTS orch_cid TEXT;")
         except Exception:
-            pass
+            # Non-fatal (column may already exist), but never swallow silently.
+            log.warning("db.init: ALTER TABLE conversations ADD COLUMN orch_cid failed", exc_info=True)
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS messages (
@@ -641,6 +645,18 @@ async def chat_ws(websocket: WebSocket):
 
 
 app.mount("/", StaticFiles(directory="/app/frontend_dist", html=True), name="static")
+# Serve the shared artifacts volume (same one orchestrator writes into).
+# This makes `/uploads/...` work even when the browser is talking to ChatUI
+# as the origin (e.g., `http://host:3000/uploads/...`), and keeps URLs
+# consistent with orchestrator-emitted paths.
+UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/workspace/uploads")
+try:
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+except Exception:
+    # Keep the service up even if the shared volume is unavailable.
+    log.error("UPLOAD_DIR create failed path=%r; falling back to cwd", UPLOAD_DIR, exc_info=True)
+    UPLOAD_DIR = "."
+app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 # Static assets are mounted at root, AFTER API routes are declared to avoid intercepting /api/*. 
 
 

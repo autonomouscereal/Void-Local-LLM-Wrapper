@@ -1,3 +1,5 @@
+# bootstrap models script
+
 #!/usr/bin/env bash
 set -euo pipefail
 

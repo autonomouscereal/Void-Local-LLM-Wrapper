@@ -7,7 +7,7 @@ import traceback
 import httpx  # type: ignore
 
 from ..json_parser import JSONParser
-from ..refs.voice import resolve_voice_identity
+from ..locks.voice_identity import resolve_voice_identity
 
 
 async def run_voice_register(args: Dict[str, Any]) -> Dict[str, Any]:

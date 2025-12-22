@@ -105,6 +105,44 @@ def _load_voice_model_map() -> None:
 _load_voice_model_map()
 
 
+def _normalize_language(lang: Any, supported: Optional[list[str]] = None) -> str:
+    """
+    XTTS expects short language codes (e.g. "en", "zh-cn").
+
+    Upstream sometimes sends locale-style codes like "en-US". Normalize them
+    deterministically and always fall back to English when unsupported.
+    """
+    supported_norm = [str(x).strip().lower() for x in (supported or []) if isinstance(x, (str, int)) and str(x).strip()]
+    raw = lang if isinstance(lang, str) else str(lang or "")
+    s = raw.strip().lower().replace("_", "-")
+    if not s:
+        s = "en"
+    # Common aliases
+    if s in ("english", "eng"):
+        s = "en"
+    # Locale → base language
+    if "-" in s:
+        base = s.split("-", 1)[0].strip()
+    else:
+        base = s
+    if base == "zh":
+        # XTTS uses "zh-cn" (see upstream assertion in logs)
+        base = "zh-cn"
+        s = "zh-cn"
+    # Prefer exact supported match if we have the list.
+    if supported_norm:
+        if s in supported_norm:
+            return s
+        if base in supported_norm:
+            return base
+        # Hard fallback to English if available.
+        if "en" in supported_norm:
+            return "en"
+        return supported_norm[0]
+    # No supported list available (engine not loaded yet): best-effort base.
+    return base or "en"
+
+
 def _canonical_voice_key(voice_id: Optional[str]) -> str:
     """
     Map the incoming logical voice_id to a canonical cache key.
@@ -187,7 +225,8 @@ async def tts(body: Dict[str, Any]):
     segment_id = (body.get("segment_id") or "").strip() if isinstance(body.get("segment_id"), str) else ""
     text_raw = body.get("text") or ""
     text = text_raw.strip()
-    language = body.get("language") or "en"
+    # Normalize locale-style language codes early; refine after engine load using supported list.
+    language = _normalize_language(body.get("language") or "en", None)
     # Logical voice identifier from upstream (voice_id preferred, voice as fallback).
     raw_voice_id = body.get("voice_id") or body.get("voice") or ""
     voice_id = raw_voice_id.strip() if isinstance(raw_voice_id, str) else ""
@@ -217,6 +256,16 @@ async def tts(body: Dict[str, Any]):
     try:
         # Per-voice engine lookup and creation with GPU preference when available.
         engine, voice_key, model_identifier, lifecycle = _get_engine_for_voice(voice_id or None)
+        # Refine language normalization using the engine's supported list (when available).
+        supported_langs: Optional[list[str]] = None
+        try:
+            cfg = getattr(getattr(engine, "tts_model", None), "config", None)
+            langs = getattr(cfg, "languages", None)
+            if isinstance(langs, (list, tuple)) and langs:
+                supported_langs = [str(x) for x in langs if str(x).strip()]
+        except Exception:
+            supported_langs = None
+        language = _normalize_language(language, supported_langs)
         logging.info(
             "tts.request trace_id=%s voice_id=%s voice_key=%s model=%s device=%s engine_lifecycle=%s",
             trace_id,

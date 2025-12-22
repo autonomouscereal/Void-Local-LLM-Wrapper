@@ -231,12 +231,17 @@ async def produce_tool_plan(
     }
     t_parse = time.perf_counter()
     
-    parsed = await committee_jsonify(
+    parsed_raw = await committee_jsonify(
         raw_text=raw_text or "{}",
         expected_schema=schema_steps,
         trace_id=trace_id,
         temperature=0.0,
     )
+    # Always run a final JSONParser coercion pass to guarantee expected types/shape.
+    parser_steps = JSONParser()
+    parsed = parser_steps.parse(parsed_raw if parsed_raw is not None else "{}", schema_steps)
+    if not isinstance(parsed, dict):
+        parsed = {}
     parse_ms = int((time.perf_counter() - t_parse) * 1000)
 
     steps_raw = parsed.get("steps") if isinstance(parsed, dict) else []

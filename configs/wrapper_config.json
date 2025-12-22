@@ -7,7 +7,7 @@
   "tools": {
     "allowlist": [
       "web_search", "source_fetch", "repo_fs",
-      "video_gen", "frame_interpolate", "upscale",
+      "video_gen", "upscale",
       "tts", "music", "mux", "metasearch.fuse"
     ]
   },

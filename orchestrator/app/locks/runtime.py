@@ -211,6 +211,7 @@ def migrate_visual_bundle(bundle: Dict[str, Any]) -> Dict[str, Any]:
         legacy_face = bundle.get("face") or {}
         img_path = legacy_face.get("image_path") if isinstance(legacy_face.get("image_path"), str) else None
         extra_paths = legacy_face.get("extra_image_paths") if isinstance(legacy_face.get("extra_image_paths"), list) else []
+        face_model = legacy_face.get("model") if isinstance(legacy_face.get("model"), str) else None
         refs: List[Dict[str, Any]] = []
         if img_path:
             refs.append({"image_path": img_path})
@@ -229,6 +230,7 @@ def migrate_visual_bundle(bundle: Dict[str, Any]) -> Dict[str, Any]:
                 },
                 "embeddings": {
                     "id_embedding": legacy_face.get("embedding"),
+                    "id_model": face_model,
                     "clip_embedding": None,
                 },
                 "constraints": {
@@ -1224,53 +1226,11 @@ def bundle_to_image_locks(bundle: Dict[str, Any]) -> Dict[str, Any]:
     return locks
 
 
-QUALITY_PRESETS = {
-    "draft": {
-        "steps": 16,
-        "cfg": 4.5,
-        "lock_strength": 0.6,
-        "max_refine_passes": 0,
-        "face_min": 0.6,
-        "region_shape_min": 0.6,
-        "region_texture_min": 0.6,
-        "scene_min": 0.6,
-        "voice_min": 0.7,
-        "tempo_min": 0.7,
-        "key_min": 0.7,
-        "stem_balance_min": 0.7,
-        "lyrics_min": 0.7,
-    },
-    "standard": {
-        "steps": 26,
-        "cfg": 5.5,
-        "lock_strength": 0.75,
-        "max_refine_passes": 1,
-        "face_min": 0.82,
-        "region_shape_min": 0.8,
-        "region_texture_min": 0.8,
-        "scene_min": 0.8,
-        "voice_min": 0.85,
-        "tempo_min": 0.85,
-        "key_min": 0.85,
-        "stem_balance_min": 0.8,
-        "lyrics_min": 0.85,
-    },
-    "hero": {
-        "steps": 36,
-        "cfg": 6.2,
-        "lock_strength": 0.9,
-        "max_refine_passes": 3,
-        "face_min": 0.9,
-        "region_shape_min": 0.9,
-        "region_texture_min": 0.9,
-        "scene_min": 0.9,
-        "voice_min": 0.92,
-        "tempo_min": 0.9,
-        "key_min": 0.9,
-        "stem_balance_min": 0.9,
-        "lyrics_min": 0.9,
-    },
-}
+from void_quality.thresholds import get_lock_quality_presets as _get_lock_quality_presets
+from void_quality.thresholds import lock_quality_thresholds as _lock_quality_thresholds
+
+# Canonical, shared presets (copied into all containers).
+QUALITY_PRESETS = _get_lock_quality_presets()
 
 
 def apply_quality_profile(
@@ -1314,19 +1274,7 @@ def apply_quality_profile(
 
 
 def quality_thresholds(profile: Optional[str]) -> Dict[str, float]:
-    name = (profile or "standard").lower()
-    preset = QUALITY_PRESETS.get(name, QUALITY_PRESETS["standard"])
-    return {
-        "face_min": float(preset.get("face_min", 0.8)),
-        "region_shape_min": float(preset.get("region_shape_min", 0.8)),
-        "region_texture_min": float(preset.get("region_texture_min", 0.8)),
-        "scene_min": float(preset.get("scene_min", 0.8)),
-        "voice_min": float(preset.get("voice_min", 0.85)),
-        "tempo_min": float(preset.get("tempo_min", 0.85)),
-        "key_min": float(preset.get("key_min", 0.85)),
-        "stem_balance_min": float(preset.get("stem_balance_min", 0.8)),
-        "lyrics_min": float(preset.get("lyrics_min", 0.85)),
-    }
+    return _lock_quality_thresholds(profile)
 
 
 async def update_bundle_from_hero_frame(

@@ -1,0 +1,51 @@
+{
+  "draft": {
+    "steps": 16,
+    "cfg": 4.5,
+    "lock_strength": 0.6,
+    "max_refine_passes": 0,
+    "face_min": 0.6,
+    "region_shape_min": 0.6,
+    "region_texture_min": 0.6,
+    "scene_min": 0.6,
+    "voice_min": 0.7,
+    "tempo_min": 0.7,
+    "key_min": 0.7,
+    "stem_balance_min": 0.7,
+    "lyrics_min": 0.7
+  },
+  "standard": {
+    "steps": 26,
+    "cfg": 5.5,
+    "lock_strength": 0.75,
+    "max_refine_passes": 1,
+    "face_min": 0.82,
+    "region_shape_min": 0.8,
+    "region_texture_min": 0.8,
+    "scene_min": 0.8,
+    "voice_min": 0.85,
+    "tempo_min": 0.85,
+    "key_min": 0.85,
+    "stem_balance_min": 0.8,
+    "lyrics_min": 0.85
+  },
+  "hero": {
+    "steps": 36,
+    "cfg": 6.2,
+    "lock_strength": 0.9,
+    "max_refine_passes": 3,
+    "face_min": 0.9,
+    "region_shape_min": 0.9,
+    "region_texture_min": 0.9,
+    "scene_min": 0.9,
+    "voice_min": 0.92,
+    "tempo_min": 0.9,
+    "key_min": 0.9,
+    "stem_balance_min": 0.9,
+    "lyrics_min": 0.9
+  }
+}
+
+
+
+

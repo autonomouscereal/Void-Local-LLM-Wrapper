@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/workspace/uploads")
 import json
 import math
 import struct
@@ -31,7 +32,7 @@ def _sine_wav_bytes(freq: float, length_s: float, sample_rate: int = 22050) -> b
 
 def run_sfx_compose(job: dict, manifest: dict) -> dict:
     cid = job.get("cid") or f"sfx-{now_ts()}"
-    outdir = os.path.join("/workspace", "uploads", "artifacts", "audio", "sfx", cid)
+    outdir = os.path.join(UPLOAD_DIR, "artifacts", "audio", "sfx", cid)
     ensure_dir(outdir)
     args = {
         "type": job.get("type") or "beep",

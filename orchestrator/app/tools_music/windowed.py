@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 import os
+# All artifacts must live under the shared uploads volume so the UI can fetch them.
+UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/workspace/uploads")
 import wave
 import logging
+import time
 from typing import Any, Dict, List, Tuple, Optional
 
 from .common import now_ts, ensure_dir, sidecar, stamp_env, music_edge_defaults
-from ..analysis.media import analyze_audio
-from ..music.style_pack import style_score_for_track  # type: ignore
-from ..music.eval import compute_music_eval  # type: ignore
+from ..quality.style.music_style_pack import style_score_for_track  # type: ignore
+from ..quality.eval.music_eval import compute_music_eval, eval_motif_locks  # type: ignore
 from ..artifacts.manifest import add_manifest_row
-from ..context.index import add_artifact as _ctx_add
+from ..artifacts.index import add_artifact as _ctx_add
 from ..tracing.training import append_training_sample
+from ..datasets.stream import append_row as _ds_append_row
 from void_envelopes import normalize_to_envelope, normalize_envelope, bump_envelope, assert_envelope
 
 
@@ -211,7 +214,7 @@ async def _recompose_single_window(
     res = provider.compose(compose_args)
     wav_bytes = res.get("wav_bytes") or b""
     clip_stem = f"{window_id}_{now_ts()}"
-    outdir = os.path.join("/workspace", "uploads", "artifacts", "music", cid)
+    outdir = os.path.join(UPLOAD_DIR, "artifacts", "music", cid)
     ensure_dir(outdir)
     clip_path = os.path.join(outdir, f"{clip_stem}.wav")
     with wave.open(clip_path, "wb") as wf:
@@ -220,42 +223,17 @@ async def _recompose_single_window(
         wf.setframerate(sr_local)
         wf.writeframes(wav_bytes)
     add_manifest_row(manifest, clip_path, step_id="music.infinite.windowed")
-    ainfo = analyze_audio(clip_path)
-    tempo_detected = ainfo.get("tempo_bpm")
     tempo_target = None
     if isinstance(sec_obj, dict) and isinstance(sec_obj.get("tempo_bpm"), (int, float)):
         tempo_target = float(sec_obj.get("tempo_bpm"))
     elif isinstance(global_block.get("tempo_bpm"), (int, float)):
         tempo_target = float(global_block.get("tempo_bpm"))
-    tempo_lock = None
-    if isinstance(tempo_detected, (int, float)) and tempo_target and tempo_target > 0.0:
-        tempo_lock = 1.0 - (abs(float(tempo_detected) - tempo_target) / tempo_target)
-        if tempo_lock < 0.0:
-            tempo_lock = 0.0
-        if tempo_lock > 1.0:
-            tempo_lock = 1.0
-    key_detected = ainfo.get("key")
     key_target = None
     if isinstance(sec_obj, dict) and isinstance(sec_obj.get("key"), str):
         key_target = sec_obj.get("key")
     elif isinstance(global_block.get("key"), str):
         key_target = global_block.get("key")
-    key_lock = None
-    if (
-        isinstance(key_target, str)
-        and key_target.strip()
-        and isinstance(key_detected, str)
-        and key_detected
-    ):
-        key_lock = 1.0 if key_target.strip().lower() == key_detected.strip().lower() else 0.0
-    lyrics_lock = None
-    motif_lock = None
-    if isinstance(tempo_lock, (int, float)) and isinstance(key_lock, (int, float)):
-        motif_lock = min(float(tempo_lock), float(key_lock))
-    ainfo["tempo_lock"] = tempo_lock
-    ainfo["key_lock"] = key_lock
-    ainfo["lyrics_lock"] = lyrics_lock
-    ainfo["motif_lock"] = motif_lock
+    ainfo = eval_motif_locks(clip_path, tempo_target=tempo_target, key_target=key_target)
     win["artifact_path"] = clip_path
     win["metrics"] = ainfo
     await _eval_window_clip(win, clip_path, cid, music_branch)
@@ -342,7 +320,7 @@ async def _regenerate_bad_windows_only(
         if isinstance(wid, str) and wid in bad_set:
             await _recompose_single_window(job, provider, manifest, cid, win, music_branch, global_block, bpm, params)
     stitched_pcm, stitched_sr, stitched_ch = _stitch_from_windows(windows, crossfade_frames)
-    outdir = os.path.join("/workspace", "uploads", "artifacts", "music", cid)
+    outdir = os.path.join(UPLOAD_DIR, "artifacts", "music", cid)
     ensure_dir(outdir)
     stem = f"windowed_regen_{now_ts()}"
     full_path = os.path.join(outdir, f"{stem}.wav")
@@ -390,7 +368,7 @@ async def _regenerate_full_music(
     for pcm, sr, ch, _ in new_clips:
         clip_pcm_list.append((pcm, sr, ch))
     stitched_pcm, stitched_sr, stitched_ch = _stitch_windows_pcm(clip_pcm_list, crossfade_frames)
-    outdir = os.path.join("/workspace", "uploads", "artifacts", "music", cid)
+    outdir = os.path.join(UPLOAD_DIR, "artifacts", "music", cid)
     ensure_dir(outdir)
     stem = f"windowed_regen_full_{now_ts()}"
     full_path = os.path.join(outdir, f"{stem}.wav")
@@ -605,9 +583,15 @@ def _stitch_windows_pcm(clips: List[Tuple[bytes, int, int]], crossfade_frames: i
 
 
 async def run_music_infinite_windowed(job: Dict[str, Any], provider, manifest: Dict[str, Any]) -> Dict[str, Any]:
+    t0_all = time.time()
     cid = job.get("cid") or f"music-{now_ts()}"
     prompt = job.get("prompt") or ""
-    outdir = os.path.join("/workspace", "uploads", "artifacts", "music", cid)
+    trace_id = str(job.get("trace_id") or "").strip()
+    request_id = str(job.get("request_id") or "").strip()
+    trace_append = job.get("_trace_append")
+    if not callable(trace_append):
+        trace_append = None
+    outdir = os.path.join(UPLOAD_DIR, "artifacts", "music", cid)
     ensure_dir(outdir)
     params = music_edge_defaults(
         {
@@ -644,6 +628,65 @@ async def run_music_infinite_windowed(job: Dict[str, Any], provider, manifest: D
         music_branch["sections"] = _build_song_sections(global_block)
         sections = music_branch["sections"]
     windows = music_branch.get("windows") if isinstance(music_branch.get("windows"), list) else []
+    # Provider response scratchpad for metadata. Must be initialized even if no windows
+    # are generated/executed to avoid UnboundLocalError on envelope construction.
+    res: Dict[str, Any] = {}
+
+    log.info(
+        "music.windowed.start cid=%s trace_id=%r request_id=%r mode=%s length_s=%s bpm=%s window_bars=%s overlap_bars=%s existing_windows=%s",
+        cid,
+        trace_id,
+        request_id,
+        mode,
+        length_s,
+        bpm,
+        window_bars,
+        overlap_bars,
+        len(windows) if isinstance(windows, list) else 0,
+    )
+    if trace_append and trace_id:
+        try:
+            trace_append(
+                "music.windowed.start",
+                {
+                    "trace_id": trace_id,
+                    "cid": cid,
+                    "mode": mode,
+                    "length_s": length_s,
+                    "bpm": bpm,
+                    "window_bars": window_bars,
+                    "overlap_bars": overlap_bars,
+                    "prompt_preview": (prompt[:120] if isinstance(prompt, str) else ""),
+                    "prompt_len": (len(prompt) if isinstance(prompt, str) else 0),
+                },
+            )
+        except Exception:
+            log.debug("music.windowed.trace_append_start_failed cid=%s trace_id=%r", cid, trace_id, exc_info=True)
+
+    # Distillation-grade dataset row for the tool input (before any generation).
+    try:
+        _ds_append_row(
+            "tool_event",
+            {
+                "cid": cid,
+                "trace_id": trace_id,
+                "tool": "music.infinite.windowed",
+                "tags": ["tool:music.infinite.windowed", "phase:start"],
+                "inputs": {
+                    "prompt": prompt,
+                    "mode": mode,
+                    "length_s": length_s,
+                    "bpm": bpm,
+                    "window_bars": window_bars,
+                    "overlap_bars": overlap_bars,
+                    "seed": job.get("seed"),
+                },
+                "locks": (lock_bundle if isinstance(lock_bundle, dict) else {}),
+                "meta": {"request_id": request_id},
+            },
+        )
+    except Exception:
+        log.debug("music.windowed.dataset.append_start_failed cid=%s trace_id=%r", cid, trace_id, exc_info=True)
     if mode == "start":
         if not windows:
             windows = build_music_window_plan(music_branch, window_bars, overlap_bars)
@@ -723,13 +766,50 @@ async def run_music_infinite_windowed(job: Dict[str, Any], provider, manifest: D
             if src_win and isinstance(src_win.get("artifact_path"), str):
                 win["artifact_path"] = src_win.get("artifact_path")
                 win["metrics"] = src_win.get("metrics")
+                log.debug(
+                    "music.windowed.window.reuse cid=%s trace_id=%r window_id=%s reuse_from=%s path=%r",
+                    cid,
+                    trace_id,
+                    window_id,
+                    reuse_from,
+                    win.get("artifact_path"),
+                )
                 window_clips.append((b"", sr_local, ch_local, win))
                 continue
         existing_path = win.get("artifact_path")
         if isinstance(existing_path, str) and existing_path:
             # Existing window from a prior run; rely on disk contents and metrics.
+            log.debug(
+                "music.windowed.window.skip_existing cid=%s trace_id=%r window_id=%s path=%r",
+                cid,
+                trace_id,
+                window_id,
+                existing_path,
+            )
             window_clips.append((b"", sr_local, ch_local, win))
             continue
+        if trace_append and trace_id:
+            try:
+                trace_append(
+                    "music.windowed.window.start",
+                    {
+                        "trace_id": trace_id,
+                        "cid": cid,
+                        "window_id": window_id,
+                        "section_id": win.get("section_id"),
+                        "t_start": win.get("t_start"),
+                        "t_end": win.get("t_end"),
+                    },
+                )
+            except Exception:
+                log.debug(
+                    "music.windowed.trace_append_failed event=%s cid=%s trace_id=%r window_id=%s",
+                    "music.windowed.window.start",
+                    cid,
+                    trace_id,
+                    window_id,
+                    exc_info=True,
+                )
         # Build a section-aware prompt for this window.
         sec_obj = section_index.get(win.get("section_id")) if isinstance(win.get("section_id"), str) else None
         base_prompt = prompt or ""
@@ -807,9 +887,25 @@ async def run_music_infinite_windowed(job: Dict[str, Any], provider, manifest: D
             "channels": params.get("channels"),
             "music_lock": music_branch,
             "seed": job.get("seed"),
+            # Correlation IDs for backend logs
+            "cid": cid,
+            "trace_id": trace_id,
+            "request_id": request_id,
         }
+        t0_call = time.time()
         res = provider.compose(compose_args)
+        call_ms = int((time.time() - t0_call) * 1000.0)
         wav_bytes = res.get("wav_bytes") or b""
+        log.info(
+            "music.windowed.window.composed cid=%s trace_id=%r window_id=%s seconds=%s bytes=%s ms=%s model=%r",
+            cid,
+            trace_id,
+            window_id,
+            win_seconds,
+            len(wav_bytes) if isinstance(wav_bytes, (bytes, bytearray)) else 0,
+            call_ms,
+            (res.get("model") if isinstance(res, dict) else None),
+        )
         clip_stem = f"{window_id}_{now_ts()}"
         clip_path = os.path.join(outdir, f"{clip_stem}.wav")
         with wave.open(clip_path, "wb") as wf:
@@ -818,48 +914,84 @@ async def run_music_infinite_windowed(job: Dict[str, Any], provider, manifest: D
             wf.setframerate(sr_local)
             wf.writeframes(wav_bytes)
         add_manifest_row(manifest, clip_path, step_id="music.infinite.windowed")
-        ainfo = analyze_audio(clip_path)
         # Per-window lock scores based on Song Graph targets.
         # Tempo lock: closeness of detected tempo to section/global tempo.
-        tempo_detected = ainfo.get("tempo_bpm")
         sec_obj = section_index.get(win.get("section_id")) if isinstance(win.get("section_id"), str) else None
         tempo_target = None
         if isinstance(sec_obj, dict) and isinstance(sec_obj.get("tempo_bpm"), (int, float)):
             tempo_target = float(sec_obj.get("tempo_bpm"))
         elif isinstance(global_block.get("tempo_bpm"), (int, float)):
             tempo_target = float(global_block.get("tempo_bpm"))
-        tempo_lock = None
-        if isinstance(tempo_detected, (int, float)) and tempo_target and tempo_target > 0.0:
-            try:
-                tempo_lock = 1.0 - (abs(float(tempo_detected) - tempo_target) / tempo_target)
-                if tempo_lock < 0.0:
-                    tempo_lock = 0.0
-                if tempo_lock > 1.0:
-                    tempo_lock = 1.0
-            except Exception:
-                tempo_lock = None
-        key_detected = ainfo.get("key")
         key_target = None
         if isinstance(sec_obj, dict) and isinstance(sec_obj.get("key"), str):
             key_target = sec_obj.get("key")
         elif isinstance(global_block.get("key"), str):
             key_target = global_block.get("key")
-        key_lock = None
-        if isinstance(key_target, str) and key_target.strip() and isinstance(key_detected, str) and key_detected:
-            key_lock = 1.0 if key_target.strip().lower() == key_detected.strip().lower() else 0.0
-        # Lyrics/motif locks are placeholders until detailed alignment/motif detection is wired.
-        lyrics_lock = None
-        motif_lock = None
-        if isinstance(tempo_lock, (int, float)) and isinstance(key_lock, (int, float)):
-            motif_lock = min(float(tempo_lock), float(key_lock))
-        ainfo["tempo_lock"] = tempo_lock
-        ainfo["key_lock"] = key_lock
-        ainfo["lyrics_lock"] = lyrics_lock
-        ainfo["motif_lock"] = motif_lock
+        ainfo = eval_motif_locks(clip_path, tempo_target=tempo_target, key_target=key_target)
         win["artifact_path"] = clip_path
         win["metrics"] = ainfo
         # Per-window multi-axis evaluation (MusicEval 2.0).
         await _eval_window_clip(win, clip_path, cid, music_branch)
+        # Dataset row per window (distillation + debugging)
+        try:
+            _ds_append_row(
+                "tool_event",
+                {
+                    "cid": cid,
+                    "trace_id": trace_id,
+                    "tool": "music.infinite.windowed",
+                    "tags": ["tool:music.infinite.windowed", "phase:window", f"window:{window_id}"],
+                    "inputs": {
+                        "window_id": window_id,
+                        "section_id": win.get("section_id"),
+                        "prompt": win_prompt,
+                        "seconds": win_seconds,
+                        "bpm": compose_args.get("bpm"),
+                        "seed": compose_args.get("seed"),
+                    },
+                    "outputs": {"path": clip_path, "audio_ref": clip_path},
+                    "metrics": {
+                        "provider_ms": call_ms,
+                        "quality_score": win.get("quality_score"),
+                        "fit_score": win.get("fit_score"),
+                    },
+                    "qa": (win.get("eval") if isinstance(win.get("eval"), dict) else {}),
+                    "meta": {"request_id": request_id},
+                },
+            )
+        except Exception:
+            log.debug(
+                "music.windowed.dataset.append_window_failed cid=%s trace_id=%r window_id=%s",
+                cid,
+                trace_id,
+                window_id,
+                exc_info=True,
+            )
+
+        if trace_append and trace_id:
+            try:
+                trace_append(
+                    "music.windowed.window.finish",
+                    {
+                        "trace_id": trace_id,
+                        "cid": cid,
+                        "window_id": window_id,
+                        "bytes": (len(wav_bytes) if isinstance(wav_bytes, (bytes, bytearray)) else 0),
+                        "provider_ms": call_ms,
+                        "quality_score": win.get("quality_score"),
+                        "fit_score": win.get("fit_score"),
+                        "artifact_path": clip_path,
+                    },
+                )
+            except Exception:
+                log.debug(
+                    "music.windowed.trace_append_failed event=%s cid=%s trace_id=%r window_id=%s",
+                    "music.windowed.window.finish",
+                    cid,
+                    trace_id,
+                    window_id,
+                    exc_info=True,
+                )
         window_clips.append((wav_bytes, sr_local, ch_local, win))
     # For canonical windows we have PCM in memory; for reuse windows we read
     # their audio from disk before stitching.
@@ -886,8 +1018,12 @@ async def run_music_infinite_windowed(job: Dict[str, Any], provider, manifest: D
         wf_full.writeframes(stitched_pcm)
     add_manifest_row(manifest, full_path, step_id="music.infinite.windowed.full")
     _ctx_add(cid, "audio", full_path, None, None, ["music", "windowed"], {})
+    # Artifact kinds are used by the UI/url collectors. For music, ensure kinds start with "music"
+    # and include a stable /uploads URL so the UI never has to guess paths.
+    rel_full = f"/uploads/artifacts/music/{cid}/{os.path.basename(full_path)}"
+    # Use "audio-ref" for compatibility with orchestrator collectors, and keep "music" tags for modality.
     artifacts: List[Dict[str, Any]] = [
-        {"id": os.path.basename(full_path), "kind": "audio-ref", "summary": stem, "bytes": len(stitched_pcm)}
+        {"id": os.path.basename(full_path), "kind": "audio-ref", "summary": stem, "bytes": len(stitched_pcm), "url": rel_full}
     ]
     for _, _, _, win in window_clips:
         clip_path = win.get("artifact_path")
@@ -898,6 +1034,7 @@ async def run_music_infinite_windowed(job: Dict[str, Any], provider, manifest: D
                     "kind": "audio-window",
                     "summary": win.get("window_id"),
                     "bytes": os.path.getsize(clip_path) if os.path.exists(clip_path) else 0,
+                    "url": f"/uploads/artifacts/music/{cid}/{os.path.basename(clip_path)}",
                 }
             )
     # Aggregate basic audio metrics across windows for domain-level QA.
@@ -975,6 +1112,36 @@ async def run_music_infinite_windowed(job: Dict[str, Any], provider, manifest: D
         fit_ok = isinstance(track_fit, (int, float)) and float(track_fit) >= FIT_THRESHOLD_TRACK
         if quality_ok and fit_ok and not bad_window_ids:
             break
+        log.warning(
+            "music.windowed.regen.pass cid=%s trace_id=%r pass=%s track_quality=%r track_fit=%r bad_windows=%s",
+            cid,
+            trace_id,
+            regen_pass,
+            track_quality,
+            track_fit,
+            bad_window_ids,
+        )
+        if trace_append and trace_id:
+            try:
+                trace_append(
+                    "music.windowed.regen.pass",
+                    {
+                        "trace_id": trace_id,
+                        "cid": cid,
+                        "pass": regen_pass,
+                        "track_quality": track_quality,
+                        "track_fit": track_fit,
+                        "bad_window_ids": bad_window_ids,
+                    },
+                )
+            except Exception:
+                log.debug(
+                    "music.windowed.trace_append_failed event=%s cid=%s trace_id=%r",
+                    "music.windowed.regen.pass",
+                    cid,
+                    trace_id,
+                    exc_info=True,
+                )
         if bad_window_ids:
             windows, full_path = await _regenerate_bad_windows_only(
                 job,
@@ -1043,7 +1210,7 @@ async def run_music_infinite_windowed(job: Dict[str, Any], provider, manifest: D
 
     env: Dict[str, Any] = {
         "meta": {
-            "model": res.get("model", "music"),
+            "model": (res.get("model") if isinstance(res, dict) else None) or "music",
             "ts": now_ts(),
             "cid": cid,
             "step": 0,
@@ -1100,6 +1267,81 @@ async def run_music_infinite_windowed(job: Dict[str, Any], provider, manifest: D
                 "channels": int(stitched_ch),
             }
         )
+
+    # Final dataset row (full fidelity tool result + artifacts)
+    try:
+        _ds_append_row(
+            "tool_result",
+            {
+                "cid": cid,
+                "trace_id": trace_id,
+                "tool": "music.infinite.windowed",
+                "tags": ["tool:music.infinite.windowed", "phase:finish"],
+                "inputs": {
+                    "prompt": prompt,
+                    "mode": mode,
+                    "length_s": length_s,
+                    "bpm": bpm,
+                    "window_bars": window_bars,
+                    "overlap_bars": overlap_bars,
+                    "seed": job.get("seed"),
+                },
+                "outputs": {"path": full_path, "audio_ref": full_path},
+                "locks": (lock_bundle if isinstance(lock_bundle, dict) else {}),
+                "qa": track_eval if isinstance(track_eval, dict) else {},
+                "metrics": {
+                    "elapsed_ms": int((time.time() - t0_all) * 1000.0),
+                    "track_quality": track_quality,
+                    "track_fit": track_fit,
+                    "bad_window_ids": bad_window_ids,
+                    "windows": len(windows) if isinstance(windows, list) else 0,
+                    "mean_lufs": mean_lufs,
+                    "mean_tempo": mean_tempo,
+                    "key": key_summary,
+                    "style_score": style_score,
+                },
+                "meta": {"request_id": request_id, "artifacts": artifacts},
+                "payload": {"env": env},
+            },
+        )
+    except Exception:
+        log.debug("music.windowed.dataset.append_finish_failed cid=%s trace_id=%r", cid, trace_id, exc_info=True)
+
+    # Final trace event
+    if trace_append and trace_id:
+        try:
+            trace_append(
+                "music.windowed.finish",
+                {
+                    "trace_id": trace_id,
+                    "cid": cid,
+                    "full_path": full_path,
+                    "elapsed_ms": int((time.time() - t0_all) * 1000.0),
+                    "windows": len(windows) if isinstance(windows, list) else 0,
+                    "track_quality": track_quality,
+                    "track_fit": track_fit,
+                    "bad_window_ids": bad_window_ids,
+                },
+            )
+        except Exception:
+            log.debug(
+                "music.windowed.trace_append_failed event=%s cid=%s trace_id=%r",
+                "music.windowed.finish",
+                cid,
+                trace_id,
+                exc_info=True,
+            )
+
+    log.info(
+        "music.windowed.finish cid=%s trace_id=%r full_path=%r elapsed_ms=%s windows=%s track_quality=%r track_fit=%r",
+        cid,
+        trace_id,
+        full_path,
+        int((time.time() - t0_all) * 1000.0),
+        len(windows) if isinstance(windows, list) else 0,
+        track_quality,
+        track_fit,
+    )
     return env
 
 
@@ -1148,7 +1390,7 @@ def restitch_music_from_windows(lock_bundle: Dict[str, Any], cid: str, crossfade
     if not clips:
         return None
     stitched_pcm, stitched_sr, stitched_ch = _stitch_windows_pcm(clips, crossfade_frames)
-    outdir = os.path.join("/workspace", "uploads", "artifacts", "music", cid)
+    outdir = os.path.join(UPLOAD_DIR, "artifacts", "music", cid)
     ensure_dir(outdir)
     stem = f"windowed_restitch_{now_ts()}"
     full_path = os.path.join(outdir, f"{stem}.wav")

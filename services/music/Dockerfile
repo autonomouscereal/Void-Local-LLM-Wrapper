@@ -21,6 +21,7 @@ WORKDIR /app
 COPY services/music/app /app/app
 COPY void_envelopes /app/void_envelopes
 COPY void_json /app/void_json
+COPY void_quality /app/void_quality
 
 EXPOSE 7860
 

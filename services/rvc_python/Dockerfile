@@ -27,6 +27,10 @@ RUN python3 -m pip install --no-cache-dir "pip<24.1" && \
         "torchaudio==2.7.1+cu118" \
         --index-url https://download.pytorch.org/whl/cu118
 
+# Optional but commonly required by RVC training/inference stacks.
+# Installed here so it is always available inside the container.
+RUN python3 -m pip install --no-cache-dir "tensorboardX>=2.6"
+
 # Models directory; mount a volume here
 ENV RVC_MODELS_DIR=/srv/rvc_models
 RUN mkdir -p ${RVC_MODELS_DIR}

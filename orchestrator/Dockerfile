@@ -15,6 +15,7 @@ RUN apt-get update && \
         libgl1 \
         libglib2.0-0 \
         curl \
+        ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 # Default path for LAION aesthetic head weights (can be overridden via env)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/workspace/uploads")
 import json
 import wave
 import struct
@@ -9,10 +10,10 @@ from .common import now_ts, ensure_dir, sidecar, stamp_env
 from ..determinism.seeds import stamp_tool_args
 from ..artifacts.manifest import add_manifest_row
 from void_envelopes import normalize_to_envelope, bump_envelope, assert_envelope
-from ..refs.music import resolve_music_lock
-from ..refs.registry import append_provenance
-from ..context.index import add_artifact as _ctx_add
-from ..context.index import resolve_reference as _ctx_resolve, resolve_global as _glob_resolve
+from ..locks.music_lock import resolve_music_lock
+from ..ref_library.registry import append_provenance
+from ..artifacts.index import add_artifact as _ctx_add
+from ..artifacts.index import resolve_reference as _ctx_resolve, resolve_global as _glob_resolve
 from ..tracing.training import append_training_sample
 
 log = logging.getLogger(__name__)
@@ -43,7 +44,7 @@ def _apply_gain(data: bytes, sw: int, gain: float) -> bytes:
 
 
 def run_music_variation(job: dict, manifest: dict) -> dict:
-    cid = job.get("cid") or f"music-{now_ts()}"; outdir = os.path.join("/workspace", "uploads", "artifacts", "music", cid); ensure_dir(outdir)
+    cid = job.get("cid") or f"music-{now_ts()}"; outdir = os.path.join(UPLOAD_DIR, "artifacts", "music", cid); ensure_dir(outdir)
     lock = resolve_music_lock(job.get("music_id"), job.get("music_refs"))
     base_hint = str(job.get("desc") or job.get("prompt") or "")
     base_path = job.get("variation_of")

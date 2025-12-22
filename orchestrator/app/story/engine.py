@@ -1,180 +1,328 @@
 from __future__ import annotations
 
+import json
+import os
+import time
+import logging
 from typing import Any, Dict, List, Optional, Tuple, Callable, Awaitable
 
 from ..tracing.runtime import trace_event
+from ..committee_client import committee_ai_text, committee_jsonify
+from ..json_parser import JSONParser
 
 
-def draft_story_graph(user_prompt: str, duration_hint_s: Optional[float]) -> Dict[str, Any]:
+log = logging.getLogger(__name__)
+
+
+def _env_int(name: str, default: int, *, min_val: int = 1, max_val: int = 1000) -> int:
+    raw = os.getenv(name, None)
+    s = str(raw).strip() if raw is not None else ""
+    val = int(s) if (s and s.lstrip("+-").isdigit()) else int(default)
+    if val < min_val:
+        val = min_val
+    if val > max_val:
+        val = max_val
+    return val
+
+
+def _env_float(name: str, default: float, *, min_val: float = 0.0, max_val: float = 2.0) -> float:
+    raw = os.getenv(name, None)
+    s = str(raw).strip() if raw is not None else ""
+    # Avoid exceptions: only accept simple float forms.
+    ok = False
+    if s:
+        t = s.replace(".", "", 1)
+        t = t.replace("e", "", 1).replace("E", "", 1)
+        t = t.replace("+", "", 1).replace("-", "", 1)
+        ok = t.isdigit()
+    val = float(s) if ok else float(default)
+    if val < min_val:
+        val = min_val
+    if val > max_val:
+        val = max_val
+    return val
+
+
+STORY_COMMITTEE_ROUNDS = _env_int("STORY_COMMITTEE_ROUNDS", 1, min_val=1, max_val=10)
+STORY_MAX_PASSES = _env_int("STORY_MAX_PASSES", 8, min_val=1, max_val=1000)
+STORY_TEMPERATURE = _env_float("STORY_TEMPERATURE", 0.5, min_val=0.0, max_val=2.0)
+STORY_MIN_ISSUES_TO_REVISE = _env_int("STORY_MIN_ISSUES_TO_REVISE", 1, min_val=0, max_val=1000)
+
+
+def _story_schema() -> Dict[str, Any]:
     """
-    Build a minimal but structured story graph from a user prompt and optional duration hint.
+    Schema used for committee_jsonify.
 
-    This implementation is intentionally deterministic and lightweight so it can run without
-    external model calls. It produces a three-act structure with one scene per act and a small
-    number of beats per scene. Downstream tools can refine or override this as needed.
+    We keep the "classic" keys used by film2.run today (prompt/duration_hint_s/acts/characters/locations/objects),
+    and add richer fields for a real story engine without breaking callers.
     """
-    prompt_text = (user_prompt or "").strip()
+    return {
+        "prompt": str,
+        "duration_hint_s": float,
+        "logline": str,
+        "genre": list,
+        "tone": str,
+        "themes": list,
+        "constraints": list,
+        "characters": list,
+        "locations": list,
+        "objects": list,
+        "acts": list,
+        "continuity": dict,
+        "film_plan": dict,
+        "notes": dict,
+    }
+
+
+def _issue_schema() -> Dict[str, Any]:
+    return {
+        "issues": list,
+        "summary": str,
+        "must_fix": bool,
+    }
+
+
+def _norm_prompt(user_prompt: str) -> str:
+    return (user_prompt or "").strip()
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+async def _jsonify_then_parse(raw_text: str, expected_schema: Any, *, trace_id: str, rounds: int | None = None, temperature: float | None = None) -> Dict[str, Any]:
+    """
+    Required JSON flow for any LLM output used as structured data:
+      1) LLM produces raw text (possibly messy)
+      2) committee_jsonify(raw_text, expected_schema) -> best-effort structured JSON candidate
+      3) JSONParser.parse(candidate, expected_schema) -> schema-coerced dict (100% JSON-safe)
+    """
+    candidate = await committee_jsonify(
+        raw_text=(raw_text or "{}"),
+        expected_schema=expected_schema,
+        trace_id=trace_id,
+        rounds=rounds,
+        temperature=temperature,
+    )
+    parser = JSONParser()
+    obj = parser.parse(candidate if candidate is not None else "{}", expected_schema)
+    return obj if isinstance(obj, dict) else {}
+
+
+async def _committee_generate_story_raw(user_prompt: str, duration_hint_s: float, *, trace_id: Optional[str]) -> str:
+    """
+    Ask the committee to propose a story graph. We intentionally ask for JSON-only, then run committee_jsonify
+    to get strict structure for downstream consumers.
+    """
+    prompt_text = _norm_prompt(user_prompt)
+    dur = float(duration_hint_s) if isinstance(duration_hint_s, (int, float)) else 0.0
+    if dur <= 0.0:
+        dur = 600.0
+    sys_msg = (
+        "You are the Story Engine for a film generator.\n"
+        "You MUST produce a story that follows the user's request exactly, but you may fill in missing details.\n"
+        "Continuity is critical: injuries, inventory, relationships, time travel rules, and causal consequences MUST remain consistent.\n"
+        "Output MUST be a single JSON object (no markdown, no code fences, no prose) describing a full story graph.\n"
+        "The story MUST be temporally coherent end-to-end.\n"
+        "If the user requests a short duration, keep the story tight. If long, include deeper arcs.\n"
+    )
+    user_msg = json.dumps(
+        {
+            "user_prompt": prompt_text,
+            "duration_hint_s": dur,
+            "requirements": {
+                "acts": "3+ acts as needed; each act has scenes; each scene has beats; each beat has dialogue and events",
+                "continuity": "explicitly track character and object state changes via events; ensure later beats reflect them",
+                "film_plan": "include optional per-beat shot prompts usable by image/video tools",
+                "ids": "stable ids for acts/scenes/beats/lines/characters/objects/locations",
+            },
+        },
+        ensure_ascii=False,
+    )
+    t0 = time.perf_counter()
+    env = await committee_ai_text(
+        messages=[{"role": "system", "content": sys_msg}, {"role": "user", "content": user_msg}],
+        trace_id=(trace_id or "story_draft"),
+        rounds=STORY_COMMITTEE_ROUNDS,
+        temperature=STORY_TEMPERATURE,
+    )
+    result_block = env.get("result") if isinstance(env, dict) else {}
+    txt = ""
+    if isinstance(result_block, dict) and isinstance(result_block.get("text"), str):
+        txt = str(result_block.get("text") or "")
+    else:
+        txt = str(env.get("text") or "")
+    log.info(
+        "story.committee.draft_raw done trace_id=%s raw_chars=%d dur_ms=%d",
+        trace_id,
+        len(txt or ""),
+        int((time.perf_counter() - t0) * 1000),
+    )
+    return txt
+
+
+async def _committee_audit_story(story: Dict[str, Any], user_prompt: str, *, trace_id: Optional[str]) -> Dict[str, Any]:
+    """
+    Committee-based continuity + intent audit. Returns {issues: [...], summary: str, must_fix: bool}.
+    """
+    sys_msg = (
+        "You are a strict story continuity auditor.\n"
+        "Given a story graph JSON and the user prompt, find ALL violations:\n"
+        "- breaks user intent\n"
+        "- continuity contradictions (injuries, objects, locations, relationships)\n"
+        "- temporal contradictions and time travel inconsistencies\n"
+        "- missing causal links / dangling plot threads that will confuse viewers\n"
+        "- character motives that don't track\n"
+        "Return issues with precise pointers (act_id/scene_id/beat_id/line_id/char_id/obj_id).\n"
+        "Output JSON only."
+    )
+    user_msg = json.dumps(
+        {
+            "user_prompt": _norm_prompt(user_prompt),
+            "story": story,
+            "output": {
+                "issues": "list of issue objects (code, severity, message, pointers, suggested_fix)",
+                "summary": "short summary",
+                "must_fix": "true if any issue is severe",
+            },
+        },
+        ensure_ascii=False,
+    )
+    t0 = time.perf_counter()
+    env = await committee_ai_text(
+        messages=[{"role": "system", "content": sys_msg}, {"role": "user", "content": user_msg}],
+        trace_id=(trace_id or "story_audit"),
+        rounds=STORY_COMMITTEE_ROUNDS,
+        temperature=0.2,
+    )
+    raw = ""
+    result_block = env.get("result") if isinstance(env, dict) else {}
+    if isinstance(result_block, dict) and isinstance(result_block.get("text"), str):
+        raw = str(result_block.get("text") or "")
+    parsed = await _jsonify_then_parse(
+        raw_text=raw,
+        expected_schema=_issue_schema(),
+        trace_id=(trace_id or "story_audit.jsonify"),
+        rounds=STORY_COMMITTEE_ROUNDS,
+        temperature=0.0,
+    )
+    if not parsed:
+        return {"issues": [], "summary": "", "must_fix": False}
+    issues = parsed.get("issues") if isinstance(parsed.get("issues"), list) else []
+    log.info(
+        "story.committee.audit done trace_id=%s issues=%d must_fix=%s dur_ms=%d",
+        trace_id,
+        len(issues),
+        bool(parsed.get("must_fix")) if isinstance(parsed, dict) else False,
+        int((time.perf_counter() - t0) * 1000),
+    )
+    return parsed
+
+
+async def _committee_revise_story(story: Dict[str, Any], user_prompt: str, audit: Dict[str, Any], *, trace_id: Optional[str]) -> Dict[str, Any]:
+    """
+    Committee revision step. Produces a full updated story graph (same schema).
+    """
+    sys_msg = (
+        "You are the Story Engine revision pass.\n"
+        "You MUST fix the issues while preserving the user's intent and improving coherence.\n"
+        "Do not hand-wave: update the story graph so later beats reflect state changes.\n"
+        "Output JSON only."
+    )
+    user_msg = json.dumps(
+        {"user_prompt": _norm_prompt(user_prompt), "story": story, "audit": audit},
+        ensure_ascii=False,
+    )
+    t0 = time.perf_counter()
+    env = await committee_ai_text(
+        messages=[{"role": "system", "content": sys_msg}, {"role": "user", "content": user_msg}],
+        trace_id=(trace_id or "story_revise"),
+        rounds=STORY_COMMITTEE_ROUNDS,
+        temperature=STORY_TEMPERATURE,
+    )
+    raw = ""
+    result_block = env.get("result") if isinstance(env, dict) else {}
+    if isinstance(result_block, dict) and isinstance(result_block.get("text"), str):
+        raw = str(result_block.get("text") or "")
+    parsed = await _jsonify_then_parse(
+        raw_text=raw,
+        expected_schema=_story_schema(),
+        trace_id=(trace_id or "story_revise.jsonify"),
+        rounds=STORY_COMMITTEE_ROUNDS,
+        temperature=STORY_TEMPERATURE,
+    )
+    acts_n = len(parsed.get("acts") or []) if isinstance(parsed, dict) and isinstance(parsed.get("acts"), list) else 0
+    log.info(
+        "story.committee.revise done trace_id=%s acts=%d dur_ms=%d",
+        trace_id,
+        acts_n,
+        int((time.perf_counter() - t0) * 1000),
+    )
+    return parsed if parsed else dict(story or {})
+
+
+async def draft_story_graph(user_prompt: str, duration_hint_s: Optional[float], trace_id: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Committee-driven story generator.
+
+    This is intentionally heavy: it relies on repeated committee calls to draft, audit, and
+    revise until the story is coherent and follows the user intent.
+    """
+    t0 = time.monotonic()
+    prompt_text = _norm_prompt(user_prompt)
     duration = float(duration_hint_s) if isinstance(duration_hint_s, (int, float)) else 0.0
     if duration <= 0.0:
         duration = 600.0
-    total_beats = 9
-    beat_duration = duration / float(total_beats)
-    acts: List[Dict[str, Any]] = []
-    characters: List[Dict[str, Any]] = []
-    locations: List[Dict[str, Any]] = []
-    objects: List[Dict[str, Any]] = []
-    beat_index = 0
-    act_descriptions = [
-        "Act 1: setup and introduction.",
-        "Act 2: rising conflict and complications.",
-        "Act 3: climax and resolution.",
-    ]
-    # Minimal multi-character/location/object lists derived from prompt shape
-    main_char = {
-        "char_id": "char_1",
-        "name": "Protagonist",
-        "description": f"Main character of the film based on: {prompt_text}",
-        "traits": {"role": "hero"},
-    }
-    ally_char = {
-        "char_id": "char_2",
-        "name": "Ally",
-        "description": "A close ally or friend who supports the protagonist.",
-        "traits": {"role": "ally"},
-    }
-    antagonist_char = {
-        "char_id": "char_3",
-        "name": "Antagonist",
-        "description": "Primary antagonist or opposing force.",
-        "traits": {"role": "antagonist"},
-    }
-    characters.extend([main_char, ally_char, antagonist_char])
-    locations.extend(
-        [
-            {
-                "loc_id": "loc_1",
-                "name": "Primary Location",
-                "description": "Key location for the story.",
-            },
-            {
-                "loc_id": "loc_2",
-                "name": "Secondary Location",
-                "description": "Secondary setting where conflicts escalate.",
-            },
-            {
-                "loc_id": "loc_3",
-                "name": "Climactic Location",
-                "description": "Final confrontation or resolution setting.",
-            },
-        ]
+    log.info("story.draft start trace_id=%s duration_hint_s=%s prompt_len=%d", trace_id, float(duration), len(prompt_text))
+    raw = await _committee_generate_story_raw(prompt_text, duration, trace_id=(trace_id or "film2.story_draft"))
+    story = await _jsonify_then_parse(
+        raw_text=raw,
+        expected_schema=_story_schema(),
+        trace_id=(trace_id or "film2.story_draft.jsonify"),
+        rounds=STORY_COMMITTEE_ROUNDS,
+        temperature=STORY_TEMPERATURE,
     )
-    objects.extend(
-        [
+    if not isinstance(story, dict):
+        story = {}
+    story.setdefault("prompt", prompt_text)
+    story.setdefault("duration_hint_s", float(duration))
+    story.setdefault("acts", [])
+    story.setdefault("characters", [])
+    story.setdefault("locations", [])
+    story.setdefault("objects", [])
+    # Iterative audit/revise loop (can be large; configurable via env)
+    for pass_index in range(int(STORY_MAX_PASSES)):
+        log.info("story.draft.pass start trace_id=%s pass_index=%d", trace_id, int(pass_index))
+        audit = await _committee_audit_story(story, prompt_text, trace_id=(trace_id or f"film2.story_audit.{pass_index}"))
+        issues = audit.get("issues") if isinstance(audit, dict) and isinstance(audit.get("issues"), list) else []
+        trace_event(
+            "story.committee_audit",
             {
-                "obj_id": "obj_1",
-                "name": "Key Object",
-                "description": "An important prop or artifact in the story.",
+                "trace_id": trace_id,
+                "pass_index": int(pass_index),
+                "issues": len(issues),
+                "must_fix": bool(audit.get("must_fix")) if isinstance(audit, dict) else False,
             },
-            {
-                "obj_id": "obj_2",
-                "name": "Secondary Object",
-                "description": "Secondary prop that influences the conflict.",
-            },
-        ]
-    )
-    for act_num in range(3):
-        act_id = f"act_{act_num+1}"
-        act_summary = act_descriptions[act_num]
-        scene_id = f"{act_id}_sc_1"
-        beats: List[Dict[str, Any]] = []
-        for beat_in_act in range(3):
-            beat_id = f"beat_{beat_index+1}"
-            beat_desc = f"{act_summary} Beat {beat_index+1} derived from prompt."
-            # Simple placeholder dialogue lines rotating speakers
-            line_id = f"line_{beat_index+1}"
-            if act_num == 0:
-                speaker_id = main_char["char_id"]
-            elif act_num == 1:
-                speaker_id = ally_char["char_id"]
-            else:
-                speaker_id = antagonist_char["char_id"]
-            dialogue: List[Dict[str, Any]] = [
-                {
-                    "line_id": line_id,
-                    "speaker": speaker_id,
-                    "text": f"Line {beat_index+1} inspired by: {prompt_text[:80]}",
-                }
-            ]
-            # Basic character/location/object assignment per act
-            if act_num == 0:
-                beat_chars = [main_char["char_id"], ally_char["char_id"]]
-                beat_locs = ["loc_1"]
-                beat_objs = ["obj_1"]
-            elif act_num == 1:
-                beat_chars = [main_char["char_id"], ally_char["char_id"], antagonist_char["char_id"]]
-                beat_locs = ["loc_2"]
-                beat_objs = ["obj_1", "obj_2"]
-            else:
-                beat_chars = [main_char["char_id"], antagonist_char["char_id"]]
-                beat_locs = ["loc_3"]
-                beat_objs = ["obj_1"]
-            events: List[Dict[str, Any]] = []
-            # Inject a simple state_change timeline for main_char across the film
-            if beat_index == 3:
-                events.append(
-                    {
-                        "event_id": "evt_char1_loses_arm",
-                        "type": "state_change",
-                        "target": main_char["char_id"],
-                        "state_delta": {"left_arm": "missing"},
-                    }
-                )
-            if beat_index == 6:
-                events.append(
-                    {
-                        "event_id": "evt_char1_gets_robot_arm",
-                        "type": "state_change",
-                        "target": main_char["char_id"],
-                        "state_delta": {"left_arm": "robot"},
-                    }
-                )
-            beats.append(
-                {
-                    "beat_id": beat_id,
-                    "description": beat_desc,
-                    "time_hint_s": beat_duration,
-                    "characters": beat_chars,
-                    "locations": beat_locs,
-                    "objects": beat_objs,
-                    "events": events,
-                    "dialogue": dialogue,
-                }
-            )
-            beat_index += 1
-        scene = {
-            "scene_id": scene_id,
-            "summary": act_summary,
-            "beats": beats,
-        }
-        acts.append(
-            {
-                "act_id": act_id,
-                "summary": act_summary,
-                "scenes": [scene],
-            }
         )
-    story: Dict[str, Any] = {
-        "prompt": prompt_text,
-        "duration_hint_s": duration,
-        "acts": acts,
-        "characters": characters,
-        "locations": locations,
-        "objects": objects,
-    }
+        if len(issues) < int(STORY_MIN_ISSUES_TO_REVISE):
+            break
+        story = await _committee_revise_story(story, prompt_text, audit, trace_id=(trace_id or f"film2.story_revise.{pass_index}"))
+        if not isinstance(story, dict):
+            break
+    acts_n = len(story.get("acts") or []) if isinstance(story.get("acts"), list) else 0
+    chars_n = len(story.get("characters") or []) if isinstance(story.get("characters"), list) else 0
+    log.info(
+        "story.draft complete trace_id=%s dur_ms=%d prompt_len=%d acts=%d characters=%d",
+        trace_id,
+        int((time.monotonic() - t0) * 1000),
+        len(prompt_text),
+        acts_n,
+        chars_n,
+    )
     return story
 
 
-def check_story_consistency(story: Dict[str, Any], user_prompt: str) -> List[Dict[str, Any]]:
+async def check_story_consistency(story: Dict[str, Any], user_prompt: str, trace_id: Optional[str] = None) -> List[Dict[str, Any]]:
     """
     Perform basic structural checks on a story graph.
 
@@ -259,6 +407,22 @@ def check_story_consistency(story: Dict[str, Any], user_prompt: str) -> List[Dic
                             )
                         state_entry[key] = val
                     character_state[target] = state_entry
+    # Committee audit (deep continuity + intent). Merge issues.
+    audit = await _committee_audit_story(story if isinstance(story, dict) else {}, _norm_prompt(user_prompt), trace_id=(trace_id or "story_check.audit"))
+    ci = audit.get("issues") if isinstance(audit, dict) and isinstance(audit.get("issues"), list) else []
+    for it in ci:
+        if isinstance(it, dict):
+            it.setdefault("code", "committee_issue")
+            issues.append(it)
+    trace_event(
+        "story.consistency_audit",
+        {
+            "trace_id": trace_id,
+            "issues_deterministic": int(len(issues) - len(ci)),
+            "issues_committee": int(len(ci)),
+            "must_fix": bool(audit.get("must_fix")) if isinstance(audit, dict) else False,
+        },
+    )
     return issues
 
 
@@ -380,11 +544,11 @@ async def ensure_tts_locks_and_dialogue_audio(
     return updated_locks, dialogue_index
 
 
-def fix_story(story: Dict[str, Any], issues: List[Dict[str, Any]]) -> Dict[str, Any]:
+async def fix_story(story: Dict[str, Any], issues: List[Dict[str, Any]], user_prompt: str | None = None, trace_id: Optional[str] = None) -> Dict[str, Any]:
     """
-    Apply simple, deterministic fixes to address basic structural issues.
+    AI-driven story revision.
 
-    The initial implementation only adjusts beat duration when there is a duration mismatch.
+    We keep the deterministic duration normalization, but the primary fix mechanism is committee revision.
     """
     if not issues:
         return story
@@ -438,6 +602,12 @@ def fix_story(story: Dict[str, Any], issues: List[Dict[str, Any]]) -> Dict[str, 
                             state_delta[state_key] = canonical_val
                             ev["state_delta"] = state_delta
     adjusted["acts"] = acts
+    # Committee revision using the issues we found (and the prompt if available)
+    prompt_txt = _norm_prompt(user_prompt or adjusted.get("prompt") or "")
+    audit = {"issues": issues, "summary": "deterministic_consistency_issues", "must_fix": True}
+    revised = await _committee_revise_story(adjusted, prompt_txt, audit, trace_id=(trace_id or "story_fix"))
+    if isinstance(revised, dict) and revised:
+        return revised
     return adjusted
 
 

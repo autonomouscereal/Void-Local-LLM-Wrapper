@@ -81,6 +81,7 @@ async def generate(body: Dict[str, Any]):
     The file is persisted under UPLOAD_DIR/artifacts/music/{cid}/{artifact_id}.wav
     so the orchestrator/UI can serve it via /uploads/.
     """
+    t0 = time.time()
     prompt = body.get("prompt") or ""
     seconds = int(body.get("seconds", 8))
     cid = str(body.get("cid") or "music")
@@ -92,12 +93,14 @@ async def generate(body: Dict[str, Any]):
     )
     seed = body.get("seed")
     logger.info(
-        "music.generate.request prompt_preview=%r seconds=%s seed=%s cid=%r trace_id=%r",
+        "music.generate.request prompt_preview=%r prompt_len=%s seconds=%s seed=%s cid=%r trace_id=%r request_id=%r",
         (prompt[:80] if isinstance(prompt, str) else ""),
+        (len(prompt) if isinstance(prompt, str) else 0),
         seconds,
         seed,
         cid,
         trace_id,
+        request_id,
     )
     if not prompt:
         # Surface validation errors as structured JSON with a synthetic stack for debugging.
@@ -118,6 +121,7 @@ async def generate(body: Dict[str, Any]):
             request_id=request_id,
         )
     try:
+        logger.info("music.generate.invoke_engine cid=%r trace_id=%r request_id=%r", cid, trace_id, request_id)
         wav = generate_music(
             prompt=prompt,
             seconds=seconds,
@@ -146,12 +150,15 @@ async def generate(body: Dict[str, Any]):
         relative_url = f"/uploads/{rel}"
 
         logger.info(
-            "music.generate.saved cid=%s artifact_id=%s path=%s url=%s bytes=%s",
+            "music.generate.saved cid=%s trace_id=%r request_id=%r artifact_id=%s path=%s url=%s bytes=%s total_ms=%s",
             cid,
+            trace_id,
+            request_id,
             artifact_id,
             path,
             relative_url,
             len(wav),
+            int((time.time() - t0) * 1000.0),
         )
 
         b64 = base64.b64encode(wav).decode("utf-8")
@@ -170,7 +177,13 @@ async def generate(body: Dict[str, Any]):
         }
         return ToolEnvelope.success(result, request_id=request_id)
     except Exception as ex:  # surface full error as structured JSON
-        logger.exception("music.generate error cid=%r trace_id=%r", cid, trace_id)
+        logger.exception(
+            "music.generate error cid=%r trace_id=%r request_id=%r total_ms=%s",
+            cid,
+            trace_id,
+            request_id,
+            int((time.time() - t0) * 1000.0),
+        )
         return ToolEnvelope.failure(
             ex.__class__.__name__ or "InternalError",
             str(ex),

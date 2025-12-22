@@ -7,10 +7,15 @@ RUN apt-get update && apt-get install -y git build-essential && rm -rf /var/lib/
 
 WORKDIR /app
 
-COPY requirements.txt /app/requirements.txt
+COPY services/faceid/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-COPY app /app/app
+COPY services/faceid/app /app/app
+
+# Shared packages (canonical envelopes + json parser)
+COPY void_envelopes /app/void_envelopes
+COPY void_json /app/void_json
+COPY void_quality /app/void_quality
 
 EXPOSE 7000
 

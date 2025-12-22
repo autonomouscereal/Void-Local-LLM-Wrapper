@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from typing import Optional, List, Dict, Any, Tuple
+import glob as _glob
+import os as _os
 import time
 
 from sentence_transformers import SentenceTransformer  # type: ignore
@@ -22,8 +24,6 @@ def get_embedder() -> SentenceTransformer:
 
 
 async def rag_index_dir(root: str = "/workspace", glob_exts: Optional[List[str]] = None, chunk_size: int = 1000, chunk_overlap: int = 200) -> Dict[str, Any]:
-    import glob as _glob
-    import os as _os
     pool = await get_pg_pool()
     if pool is None:
         return {"error": "pgvector not configured"}

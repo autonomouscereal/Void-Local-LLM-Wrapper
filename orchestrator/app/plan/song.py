@@ -171,16 +171,8 @@ async def plan_song_graph(
     text = str(user_text or "").strip()
     t0 = time.perf_counter()
     approx_len = 30
-    try:
-        _ls = int(length_s) if length_s is not None else 0
-        approx_len = _ls if _ls > 0 else 30
-    except Exception as exc:
-        log.warning(
-            "plan_song_graph: bad length_s=%r; defaulting to 30",
-            length_s,
-            exc_info=True,
-        )
-        approx_len = 30
+    _ls = int(length_s) if isinstance(length_s, (int, float)) else 0
+    approx_len = _ls if _ls > 0 else 30
     bpm_val = int(bpm) if isinstance(bpm, (int, float)) and bpm and bpm > 0 else 0
     key_txt = str(key or "").strip()
 
@@ -214,18 +206,13 @@ async def plan_song_graph(
         bool(profile_txt),
     )
     # First, route song planner through the main committee to produce a Song Graph text.
-    try:
-        env = await committee_ai_text(
-            messages=[
-                {"role": "system", "content": "You are SongOps. Output ONLY JSON per the song schema."},
-                {"role": "user", "content": prompt},
-            ],
-            trace_id=trace_id,
-        )
-    except Exception as exc:
-        # This is a boundary: committee failures should not crash tool execution.
-        log.error("plan_song_graph committee exception trace_id=%s: %s", trace_id, exc, exc_info=True)
-        return {}
+    env = await committee_ai_text(
+        messages=[
+            {"role": "system", "content": "You are SongOps. Output ONLY JSON per the song schema."},
+            {"role": "user", "content": prompt},
+        ],
+        trace_id=trace_id,
+    )
     song: Dict[str, Any] = {}
     if not isinstance(env, dict) or not env.get("ok"):
         # Log committee failure instead of silently returning an empty song graph.
@@ -239,16 +226,16 @@ async def plan_song_graph(
         txt = res_env.get("text") or ""
 
         # Then, run the Song Graph text through committee.jsonify to enforce strict JSON.
-        try:
-            parsed = await committee_jsonify(
-                raw_text=txt or "{}",
-                expected_schema=schema_wrapper,
-                trace_id=trace_id,
-                temperature=0.0,
-            )
-        except Exception as exc:
-            log.error("plan_song_graph committee_jsonify exception trace_id=%s: %s", trace_id, exc, exc_info=True)
-            parsed = {}
+        parsed_raw = await committee_jsonify(
+            raw_text=txt or "{}",
+            expected_schema=schema_wrapper,
+            trace_id=trace_id,
+            temperature=0.0,
+        )
+        # Final schema coercion pass.
+        parser = JSONParser()
+        parsed = parser.parse(parsed_raw if parsed_raw is not None else "{}", schema_wrapper)
+        parsed = parsed if isinstance(parsed, dict) else {}
         song_obj = parsed.get("song")
         if isinstance(song_obj, dict):
             # Normalize textual fields (lyrics, section names, motif descriptions, etc.)

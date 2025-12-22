@@ -26,51 +26,6 @@ services:
     restart: "no"
 
 
-  melody:
-    build:
-      context: ./services/melody
-      dockerfile: Dockerfile
-    container_name: melody_service
-    restart: unless-stopped
-    runtime: nvidia
-    devices:
-      - "nvidia.com/gpu=all"
-    depends_on:
-      - nvidia_init
-      - film2_bootstrap
-    environment:
-      - NVIDIA_VISIBLE_DEVICES=${MUSIC_GPU:-all}
-      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
-      - LOG_DIR=/workspace/logs
-    network_mode: host
-    expose:
-      - "7861"
-    volumes:
-      - void_artifacts:/workspace/uploads
-      - void_logs:/workspace/logs
-    
-
-  dsinger:
-    build:
-      context: ./services/dsinger
-      dockerfile: Dockerfile
-    container_name: dsinger_service
-    restart: unless-stopped
-    runtime: nvidia
-    devices:
-      - "nvidia.com/gpu=all"
-    depends_on:
-      - nvidia_init
-    environment:
-      - NVIDIA_VISIBLE_DEVICES=${MUSIC_GPU:-all}
-      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
-      - LOG_DIR=/workspace/logs
-    network_mode: host
-    expose:
-      - "7862"
-    volumes:
-      - void_artifacts:/workspace/uploads
-      - void_logs:/workspace/logs
     
 
   rvc_python:
@@ -210,71 +165,6 @@ services:
       - void_artifacts:/workspace/uploads
       - void_logs:/workspace/logs
     
-
-  master:
-    build:
-      context: ./services/master
-      dockerfile: Dockerfile
-    container_name: master_service
-    restart: unless-stopped
-    network_mode: host
-    expose:
-      - "7865"
-    volumes:
-      - void_artifacts:/workspace/uploads
-      - void_logs:/workspace/logs
-    
-
-  mfa:
-    build:
-      context: ./services/mfa
-      dockerfile: Dockerfile
-    container_name: mfa_service
-    restart: unless-stopped
-    network_mode: host
-    expose:
-      - "7867"
-    volumes:
-      - void_artifacts:/workspace/uploads
-      - void_logs:/workspace/logs
-    
-    
-
-  prosody:
-    build:
-      context: ./services/prosody
-      dockerfile: Dockerfile
-    container_name: prosody_service
-    restart: unless-stopped
-    network_mode: host
-    expose:
-      - "7868"
-    volumes:
-      - void_artifacts:/workspace/uploads
-      - void_logs:/workspace/logs
-    
-      
-  sfx:
-    build:
-      context: ./services/sfx
-      dockerfile: Dockerfile
-    container_name: sfx_service
-    restart: unless-stopped
-    runtime: nvidia
-    devices:
-      - "nvidia.com/gpu=all"
-    depends_on:
-      - nvidia_init
-    environment:
-      - NVIDIA_VISIBLE_DEVICES=${MUSIC_GPU:-all}
-      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
-      - LOG_DIR=/workspace/logs
-    network_mode: host
-    expose:
-      - "7866"
-    volumes:
-      - void_artifacts:/workspace/uploads
-      - void_logs:/workspace/logs
     
       
   nvidia_init:
@@ -466,9 +356,9 @@ services:
       - RVC_API_URL=${RVC_API_URL:-http://127.0.0.1:7863}
       - VOCAL_FIXER_API_URL=${VOCAL_FIXER_API_URL:-http://127.0.0.1:7864}
       - MCP_HTTP_BRIDGE_URL
-      - N8N_WEBHOOK_URL=${N8N_WEBHOOK_URL:-}
       - ASSEMBLER_API_URL=http://127.0.0.1:9095
       - DRT_API_URL=http://127.0.0.1:8086
+      - HYVIDEO_API_URL=http://127.0.0.1:8094
       - ORCH_LOG_DIR=/workspace/logs
       - POSTGRES_HOST=127.0.0.1
       - POSTGRES_PORT=5432
@@ -490,10 +380,11 @@ services:
       - UPLOAD_DIR=/workspace/uploads
       - VLM_API_URL=http://127.0.0.1:8050
       - OCR_API_URL=http://127.0.0.1:8070
-      - TEACHER_API_URL=http://127.0.0.1:8097
       - AESTHETIC_HEAD_PATH=/opt/models/aesthetic/laion_v2_linear_L14.pt
       - MFA_API_URL=${MFA_API_URL:-http://127.0.0.1:7867}
       - VISION_REPAIR_API_URL=${VISION_REPAIR_API_URL:-http://127.0.0.1:8095}
+      - VFI_API_URL=${VFI_API_URL:-http://127.0.0.1:8098}
+      - UPSCALE_API_URL=${UPSCALE_API_URL:-http://127.0.0.1:8099}
       - INSIGHTFACE_HOME=/models/insightface
     # Run the canonical orchestrator application
     # Force the pure-Python HTTP/1.1 stack (h11) to avoid intermittent connection issues
@@ -605,8 +496,10 @@ services:
 
   faceid:
     build:
-      context: ./services/faceid
-      dockerfile: Dockerfile
+      # Build from repo root so we can COPY shared packages like `void_envelopes/`
+      # and `void_json/` into the image (faceid does not mount the whole repo at runtime).
+      context: .
+      dockerfile: services/faceid/Dockerfile
     container_name: faceid_service
     restart: unless-stopped
     runtime: nvidia
@@ -756,49 +649,6 @@ services:
       - void_logs:/workspace/logs
     command: ["python", "/app/init_assets.py"]
 
-  n8n:
-    image: n8nio/n8n:latest
-    container_name: n8n
-    restart: unless-stopped
-    environment:
-      - N8N_HOST=n8n
-      - N8N_PROTOCOL=http
-      - N8N_PORT=5678
-      - N8N_USER_MANAGEMENT_DISABLED=true
-      - N8N_DIAGNOSTICS_ENABLED=false
-      - N8N_VERSION_NOTIFICATIONS_ENABLED=false
-      - NODE_ENV=production
-      # Recommended settings to silence warnings and enable runners
-      - N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS=true
-      - DB_SQLITE_POOL_SIZE=5
-      - N8N_RUNNERS_ENABLED=true
-      - N8N_GIT_NODE_DISABLE_BARE_REPOS=true
-    expose:
-      - "5678"
-    ports:
-      - "5678:5678"
-    volumes:
-      - n8n_data:/home/node/.n8n
-      - void_artifacts:/workspace/uploads
-    
-
-  n8n_init:
-    image: n8nio/n8n:latest
-    container_name: n8n_init
-    depends_on:
-      - n8n
-    environment:
-      - N8N_HOST=n8n
-      - N8N_PROTOCOL=http
-      - N8N_PORT=5678
-      - N8N_USER_MANAGEMENT_DISABLED=true
-      - NODE_ENV=production
-    volumes:
-      - n8n_data:/home/node/.n8n
-      - ./services/n8n/workflows:/workflows:ro
-      - void_artifacts:/workspace/uploads
-    command: sh -lc "n8n import:workflow --input /workflows/film_assemble.json --separate"
-
 
   demucs:
     build:
@@ -919,36 +769,6 @@ services:
       - void_artifacts:/workspace/uploads
       - void_logs:/workspace/logs
 
-  film2:
-    build:
-      context: ./services/film2
-      dockerfile: Dockerfile
-    container_name: film2_service
-    restart: unless-stopped
-    runtime: nvidia
-    devices:
-      - "nvidia.com/gpu=all"
-    depends_on:
-      - nvidia_init
-      - film2_bootstrap
-    environment:
-      - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-}
-      - LOG_DIR=/workspace/logs
-      - NVIDIA_VISIBLE_DEVICES=all
-      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
-      - FILM2_MODELS=/opt/models
-      - FILM2_DATA=/srv/film2
-    # Run on host network so orchestrator and host can reach it at http://127.0.0.1:8090
-    network_mode: host
-    expose:
-      - "8090"
-    volumes:
-      - ./:/workspace
-      - film2_models:/opt/models:ro
-      - film2_data:/srv/film2
-      - void_artifacts:/workspace/uploads
-      - void_logs:/workspace/logs
-
   ablation:
     build:
       context: ./services/ablation
@@ -967,20 +787,118 @@ services:
       - void_artifacts:/workspace/uploads
       - void_logs:/workspace/logs
 
-  teacher:
+  hunyuan_video:
     build:
-      context: ./services/teacher
+      context: ./services/hunyuan_video
       dockerfile: Dockerfile
-    container_name: teacher_service
+      args:
+        <<: *cu118_args
+    container_name: hunyuan_video_service
     restart: unless-stopped
-    network_mode: host
+    runtime: nvidia
+    devices:
+      - "nvidia.com/gpu=all"
+    depends_on:
+      - nvidia_init
+      - film2_bootstrap
     environment:
-      - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-}
+      - NVIDIA_VISIBLE_DEVICES=${VIDEO_GPU:-all}
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - PYTHONUNBUFFERED=1
       - LOG_DIR=/workspace/logs
+      - UPLOAD_DIR=/workspace/uploads
+      - HYVIDEO_PORT=8094
+      # OFFLINE ONLY: use the pre-downloaded local model directory from bootstrap
+      - HYVIDEO_MODEL_ID=/opt/models/hunyuan_diffusers
+      - HYVIDEO_DEVICE=cuda:0
+      - HYVIDEO_TRANSFORMER_DTYPE=bf16
+      - HYVIDEO_PIPE_DTYPE=fp16
+      - HYVIDEO_CPU_OFFLOAD=1
+      - HYVIDEO_VAE_TILING=1
+      # share caches with film2_models volume
+      - HF_HOME=/opt/models/.hf
+      - TRANSFORMERS_CACHE=/opt/models/.hf
+      - TORCH_HOME=/opt/models/.torch
+      - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-}
+    network_mode: host
     expose:
-      - "8097"
+      - "8094"
+    shm_size: "2g"
     volumes:
-      - ./:/workspace
+      - film2_models:/opt/models
+      - film2_data:/srv/film2
+      - void_artifacts:/workspace/uploads
+      - void_logs:/workspace/logs
+
+  rife_vfi:
+    build:
+      context: .
+      dockerfile: services/rife_vfi/Dockerfile
+      args:
+        <<: *cu118_args
+    container_name: rife_vfi_service
+    restart: unless-stopped
+    runtime: nvidia
+    devices:
+      - "nvidia.com/gpu=all"
+    depends_on:
+      - nvidia_init
+      - film2_bootstrap
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=${VFI_GPU:-all}
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - PYTHONUNBUFFERED=1
+      - LOG_DIR=/workspace/logs
+      - UPLOAD_DIR=/workspace/uploads
+      - RIFE_VFI_PORT=8098
+      - RIFE_CODE_ROOT=/opt/practical_rife
+      - RIFE_MODEL_DIR=/opt/models/rife_vfi/train_log
+      - RIFE_UVICORN_WORKERS=${RIFE_UVICORN_WORKERS:-2}
+      - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-}
+    network_mode: host
+    expose:
+      - "8098"
+    shm_size: "2g"
+    volumes:
+      - film2_models:/opt/models:ro
+      - void_artifacts:/workspace/uploads
+      - void_logs:/workspace/logs
+
+  upscale:
+    build:
+      context: .
+      dockerfile: services/realesrgan_upscale/Dockerfile
+      args:
+        <<: *cu118_args
+    container_name: upscale_service
+    restart: unless-stopped
+    runtime: nvidia
+    devices:
+      - "nvidia.com/gpu=all"
+    depends_on:
+      - nvidia_init
+      - film2_bootstrap
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=${UPSCALE_GPU:-all}
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - PYTHONUNBUFFERED=1
+      - LOG_DIR=/workspace/logs
+      - UPLOAD_DIR=/workspace/uploads
+      - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-}
+      - UPSCALE_PORT=8099
+      - UPSCALE_UVICORN_WORKERS=${UPSCALE_UVICORN_WORKERS:-1}
+      - REALESRGAN_CODE_ROOT=/opt/realesrgan
+      - REALESRGAN_WEIGHTS_SRC=/opt/models/realesrgan/weights
+      - REALESRGAN_MODEL_NAME=${REALESRGAN_MODEL_NAME:-RealESRGAN_x4plus}
+      - REALESRGAN_TILE=${REALESRGAN_TILE:-0}
+      - REALESRGAN_EXT=${REALESRGAN_EXT:-png}
+      - REALESRGAN_SUFFIX=${REALESRGAN_SUFFIX:-up}
+    network_mode: host
+    expose:
+      - "8099"
+    shm_size: "2g"
+    volumes:
+      - film2_models:/opt/models:ro
       - void_artifacts:/workspace/uploads
       - void_logs:/workspace/logs
 
@@ -1011,7 +929,6 @@ volumes:
   pgvector_data: {}
   comfyui_models: {}
   comfyui_custom_nodes: {}
-  n8n_data: {}
   hf_cache: {}
   torch_cache: {}
   tts_cache: {}

@@ -1,0 +1,11 @@
+{
+  "thresholds": {
+    "face": 0.85,
+    "voice": 0.85,
+    "music": 0.8
+  }
+}
+
+
+
+

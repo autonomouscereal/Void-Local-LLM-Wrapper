@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from ..datasets.trace import append_sample as _append_dataset_sample
+from ..datasets.stream import append_sample as _append_dataset_sample
 from .runtime import trace_event
 
 
@@ -13,7 +13,7 @@ _OUTPUT_KEYS = ("path", "url", "audio_ref", "image_ref", "track_ref", "video_ref
 def append_training_sample(modality: str, row: Dict[str, Any] | Any) -> Optional[str]:
     """
     Append a modality training sample into:
-      <uploads>/datasets/trace/<modality>.jsonl
+      <uploads>/datasets/stream/dataset.part*.jsonl (indexed by dataset.index.json)
 
     This must NOT be used for generic logging events. If the input doesn't look
     like a real sample (no tool, no output path/url, no cid/trace_id), we reject

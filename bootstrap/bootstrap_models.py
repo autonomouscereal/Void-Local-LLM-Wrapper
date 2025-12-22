@@ -1,3 +1,7 @@
+'''
+bootstrap models script
+'''
+
 import os
 import sys
 import json
@@ -33,6 +37,8 @@ def write_status() -> None:
 
 HF_MODELS = [
     ("tencent/HunyuanVideo",                  "hunyuan",        None),
+    # Diffusers-format weights used by services/hunyuan_video (preferred for diffusers pipelines)
+    ("hunyuanvideo-community/HunyuanVideo",   "hunyuan_diffusers", None),
     ("Lightricks/LTX-Video",                  "ltx_video",      None),
     ("InstantX/InstantID",                    "instantid",      None),
     ("h94/IP-Adapter",                        "ip_adapter",     None),
@@ -68,6 +74,7 @@ GIT_REPOS = [
 # Mandatory model directories must exist (non-empty) after bootstrap
 MANDATORY_DIRS = [
     "hunyuan",
+    "hunyuan_diffusers",
     "ltx_video",
     "instantid",
     "ip_adapter",
@@ -79,6 +86,8 @@ MANDATORY_DIRS = [
     "blip2",
     "whisper",
     "rvc_titan",
+    "rife_vfi",
+    "realesrgan",
 ]
 # Do not require external/custom music engines as mandatory; removed from bootstrap scope
 
@@ -147,30 +156,27 @@ def snapshot(repo_id: str, local_key: str, allow_patterns: list[str] | None = No
     os.makedirs(tgt, exist_ok=True)
     STATUS.setdefault("hf", {})[local_key] = {"repo": repo_id, "state": "downloading"}
     write_status()
+    kw = dict(
+        repo_id=repo_id,
+        local_dir=tgt,
+        local_dir_use_symlinks=False,
+        resume_download=True,
+        max_workers=HF_MAX_WORKERS,
+    )
+    if allow_patterns:
+        kw["allow_patterns"] = allow_patterns
+    # Forward the compose-level token when available so private/gated models
+    # can be accessed without relying on global env defaults.
+    if HF_TOKEN:
+        kw["token"] = HF_TOKEN
     try:
-        kw = dict(
-            repo_id=repo_id,
-            local_dir=tgt,
-            local_dir_use_symlinks=False,
-            resume_download=True,
-            max_workers=HF_MAX_WORKERS,
-        )
-        if allow_patterns:
-            kw["allow_patterns"] = allow_patterns
-        # Forward the compose-level token when available so private/gated models
-        # can be accessed without relying on global env defaults.
-        if HF_TOKEN:
-            kw["token"] = HF_TOKEN
-        try:
+        snapshot_download(**kw)
+    except RuntimeError as e:
+        msg = str(e).lower()
+        if ("xet" in msg) or ("cas service" in msg):
+            os.environ["HF_HUB_ENABLE_XET"] = "0"
+            kw["max_workers"] = 2
             snapshot_download(**kw)
-        except RuntimeError as e:
-            msg = str(e).lower()
-            if ("xet" in msg) or ("cas service" in msg):
-                os.environ["HF_HUB_ENABLE_XET"] = "0"
-                kw["max_workers"] = 2
-                snapshot_download(**kw)
-    finally:
-        pass
     STATUS["hf"][local_key]["state"] = "done"
     write_status()
     log("DONE-HF", repo_id, "->", tgt)
@@ -237,6 +243,102 @@ def ensure_rvc_titan() -> None:
     log("DONE-RVC-TITAN-DG48k", d_local, g_local, "->", target_dir)
 
 
+def ensure_rife_vfi() -> None:
+    """
+    Ensure Practical-RIFE compatible model files exist under:
+      /opt/models/rife_vfi/train_log
+
+    Downloads hzwer/RIFE RIFEv4.26_0921.zip (via Hugging Face) and extracts
+    the train_log contents (*.py + *.pkl) into the expected directory.
+    """
+    from huggingface_hub import hf_hub_download
+    import zipfile
+
+    target_root = os.path.join(MODELS_DIR, "rife_vfi")
+    train_log_dir = os.path.join(target_root, "train_log")
+    os.makedirs(train_log_dir, exist_ok=True)
+
+    # If already populated, skip
+    if os.path.isdir(train_log_dir) and os.listdir(train_log_dir):
+        log("exists", "rife_vfi.train_log", "->", train_log_dir)
+        return
+
+    assets_dir = os.path.join(target_root, "_assets")
+    os.makedirs(assets_dir, exist_ok=True)
+
+    zip_name = "RIFEv4.26_0921.zip"
+    log("START-RIFE-VFI", "hzwer/RIFE", zip_name, "->", assets_dir)
+
+    zip_path = hf_hub_download(
+        repo_id="hzwer/RIFE",
+        filename=zip_name,
+        local_dir=assets_dir,
+        local_dir_use_symlinks=False,
+        token=HF_TOKEN,
+    )
+
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        members = zf.namelist()
+        picked = []
+        for n in members:
+            base = os.path.basename(n)
+            if not base:
+                continue
+            if base.endswith(".py") or base.endswith(".pkl"):
+                picked.append(n)
+        for n in picked:
+            base = os.path.basename(n)
+            out_path = os.path.join(train_log_dir, base)
+            with zf.open(n, "r") as src:
+                with open(out_path, "wb") as dst:
+                    dst.write(src.read())
+
+    # Hard check: must be non-empty after extraction
+    if not (os.path.isdir(train_log_dir) and os.listdir(train_log_dir)):
+        log("ERROR-RIFE-VFI", "train_log empty after unzip", "->", train_log_dir)
+        sys.exit(3)
+
+    log("DONE-RIFE-VFI", "->", train_log_dir)
+
+
+def ensure_realesrgan_weights() -> None:
+    """
+    Ensure Real-ESRGAN weights are present under:
+      /opt/models/realesrgan/weights
+
+    Downloads official release weights published by upstream.
+    """
+    import urllib.request  # noqa: S310
+
+    target_root = os.path.join(MODELS_DIR, "realesrgan")
+    weights_dir = os.path.join(target_root, "weights")
+    os.makedirs(weights_dir, exist_ok=True)
+
+    urls = [
+        ("RealESRGAN_x4plus.pth", "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth"),
+        ("RealESRGAN_x4plus_anime_6B.pth", "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.2.4/RealESRGAN_x4plus_anime_6B.pth"),
+        ("realesr-general-x4v3.pth", "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth"),
+        ("realesr-general-wdn-x4v3.pth", "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-wdn-x4v3.pth"),
+    ]
+
+    for fname, url in urls:
+        dst = os.path.join(weights_dir, fname)
+        if os.path.isfile(dst) and os.path.getsize(dst) > 0:
+            log("exists", "realesrgan", fname, "->", dst)
+            continue
+        log("START-REALESRGAN", url, "->", dst)
+        with urllib.request.urlopen(url) as resp:  # nosec: B310 – trusted URL configured by code
+            with open(dst, "wb") as f:
+                f.write(resp.read())
+        log("DONE-REALESRGAN", url, "->", dst)
+
+    if not (os.path.isdir(weights_dir) and os.listdir(weights_dir)):
+        log("ERROR: Missing Real-ESRGAN weights:", weights_dir)
+        sys.exit(3)
+
+    log("DONE: Real-ESRGAN weights present ->", weights_dir)
+
+
 def main() -> None:
     ensure_pkg()
     done_marker = os.path.join(MODELS_DIR, "manifests", ".bootstrap_done")
@@ -255,6 +357,8 @@ def main() -> None:
     # Ensure Titan's 48k Medium D/G checkpoints are present for rvc_service,
     # then optional aesthetic head weights for orchestrator image scoring.
     ensure_rvc_titan()
+    ensure_rife_vfi()
+    ensure_realesrgan_weights()
     ensure_aesthetic_head()
     manifest = {
         "hf": {rid: key for rid, key, _ in HF_MODELS},

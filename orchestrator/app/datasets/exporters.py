@@ -3,8 +3,11 @@ from __future__ import annotations
 import os
 import json
 import glob
+import shutil
 from typing import List, Dict, Any
 from .registry import _sha
+from .stream import STREAM_ROOT, STREAM_NAME
+from ..json_parser import JSONParser
 
 
 def _g(pattern: str) -> List[str]:
@@ -13,68 +16,8 @@ def _g(pattern: str) -> List[str]:
 
 def _copy(src: str, dst: str) -> Dict[str, Any]:
     os.makedirs(os.path.dirname(dst), exist_ok=True)
-    import shutil
     shutil.copy2(src, dst)
     return {"path": dst, "bytes": os.path.getsize(dst), "sha256": _sha(dst)}
-
-
-def _concat_jsonl(files: List[str], out: str) -> None:
-    os.makedirs(os.path.dirname(out), exist_ok=True)
-    with open(out, "wb") as w:
-        for p in files:
-            with open(p, "rb") as r:
-                for line in r:
-                    w.write(line)
-
-
-def export_facts(dst_dir: str) -> Dict[str, Any]:
-    files = _g("**/facts_*.jsonl") + _g("**/facts.jsonl")
-    files = sorted(list(dict.fromkeys(files)))
-    if not files:
-        return {}
-    out = os.path.join(dst_dir, "facts.jsonl")
-    _concat_jsonl(files, out)
-    return {"file": out, "bytes": os.path.getsize(out), "sha256": _sha(out), "sources": [{"path": p, "bytes": os.path.getsize(p), "sha256": _sha(p)} for p in files]}
-
-
-def export_image_samples(dst_dir: str) -> Dict[str, Any]:
-    files = _g("**/image_samples_*.jsonl") + _g("**/image_samples.jsonl")
-    files = sorted(list(dict.fromkeys(files)))
-    if not files:
-        return {}
-    out = os.path.join(dst_dir, "image_samples.jsonl")
-    _concat_jsonl(files, out)
-    return {"file": out, "bytes": os.path.getsize(out), "sha256": _sha(out), "sources": [{"path": p, "bytes": os.path.getsize(p), "sha256": _sha(p)} for p in files]}
-
-
-def export_tts_samples(dst_dir: str) -> Dict[str, Any]:
-    files = _g("**/tts_samples_*.jsonl") + _g("**/tts_samples.jsonl")
-    files = sorted(list(dict.fromkeys(files)))
-    if not files:
-        return {}
-    out = os.path.join(dst_dir, "tts_samples.jsonl")
-    _concat_jsonl(files, out)
-    return {"file": out, "bytes": os.path.getsize(out), "sha256": _sha(out), "sources": [{"path": p, "bytes": os.path.getsize(p), "sha256": _sha(p)} for p in files]}
-
-
-def export_music_samples(dst_dir: str) -> Dict[str, Any]:
-    files = _g("**/music_samples_*.jsonl") + _g("**/music_samples.jsonl")
-    files = sorted(list(dict.fromkeys(files)))
-    if not files:
-        return {}
-    out = os.path.join(dst_dir, "music_samples.jsonl")
-    _concat_jsonl(files, out)
-    return {"file": out, "bytes": os.path.getsize(out), "sha256": _sha(out), "sources": [{"path": p, "bytes": os.path.getsize(p), "sha256": _sha(p)} for p in files]}
-
-
-def export_code_patches(dst_dir: str) -> Dict[str, Any]:
-    files = _g("**/code_patches_*.jsonl")
-    files = sorted(list(dict.fromkeys(files)))
-    if not files:
-        return {}
-    out = os.path.join(dst_dir, "code_patches.jsonl")
-    _concat_jsonl(files, out)
-    return {"file": out, "bytes": os.path.getsize(out), "sha256": _sha(out), "sources": [{"path": p, "bytes": os.path.getsize(p), "sha256": _sha(p)} for p in files]}
 
 
 def export_research(dst_dir: str) -> Dict[str, Any]:
@@ -82,7 +25,6 @@ def export_research(dst_dir: str) -> Dict[str, Any]:
     for idx in _g(os.path.join("/workspace", "uploads", "artifacts", "research", "**", "ledger.index.json")):
         base = os.path.dirname(idx)
         parts: Dict[str, Any] = {}
-        from ..json_parser import JSONParser
         with open(idx, "r", encoding="utf-8") as fh:
             parser = JSONParser()
             schema = {"parts": list}
@@ -99,5 +41,43 @@ def export_research(dst_dir: str) -> Dict[str, Any]:
                 _copy(p, os.path.join(dst_dir, os.path.relpath(p, "/workspace/uploads/artifacts/research")))
         families.append(fam)
     return {"families": families}
+
+
+def export_dataset_stream(dst_dir: str) -> Dict[str, Any]:
+    """
+    Export the canonical dataset stream by copying its index + shard parts into the dataset version.
+    This avoids expensive globbing and keeps a single source of truth.
+    """
+    src_root = STREAM_ROOT
+    idx = os.path.join(src_root, f"{STREAM_NAME}.index.json")
+    if not os.path.exists(idx):
+        return {}
+    out_root = os.path.join(dst_dir, "dataset_stream")
+    items: List[Dict[str, Any]] = []
+    # copy index
+    items.append(_copy(idx, os.path.join(out_root, os.path.basename(idx))))
+    # copy meta (if present)
+    meta_path = os.path.join(src_root, f"{STREAM_NAME}.meta.json")
+    if os.path.exists(meta_path):
+        items.append(_copy(meta_path, os.path.join(out_root, os.path.basename(meta_path))))
+    # copy all parts referenced by index
+    try:
+        with open(idx, "r", encoding="utf-8") as f:
+            parser = JSONParser()
+            parsed = parser.parse(f.read(), {"parts": list})
+        parts = (parsed.get("parts") or []) if isinstance(parsed, dict) else []
+    except Exception:
+        parts = []
+    for pr in parts:
+        if not isinstance(pr, dict):
+            continue
+        rel = pr.get("path")
+        if not isinstance(rel, str):
+            continue
+        src = os.path.join(src_root, rel)
+        if not os.path.exists(src):
+            continue
+        items.append(_copy(src, os.path.join(out_root, os.path.basename(src))))
+    return {"root": out_root, "items": items}
 
 

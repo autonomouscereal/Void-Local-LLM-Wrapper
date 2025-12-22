@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Optional, Dict, Any
 
 from .pool import get_pg_pool
 
+log = logging.getLogger(__name__)
 
 async def db_insert_run(trace_id: str, mode: str, seed: int, pack_hash: Optional[str], request_json: Dict[str, Any]) -> Optional[int]:
     try:
@@ -18,6 +20,8 @@ async def db_insert_run(trace_id: str, mode: str, seed: int, pack_hash: Optional
             )
             return int(row[0]) if row else None
     except Exception:
+        # Tracing must never break the request path, but silent failures make debugging impossible.
+        log.warning("db.tracing.insert_run_failed trace_id=%r mode=%r", trace_id, mode, exc_info=True)
         return None
 
 
@@ -31,6 +35,7 @@ async def db_update_run_response(run_id: Optional[int], response_json: Dict[str,
         async with pool.acquire() as conn:
             await conn.execute("UPDATE run SET response_json=$1, metrics_json=$2 WHERE id=$3", json.dumps(response_json, ensure_ascii=False), json.dumps(metrics_json, ensure_ascii=False), int(run_id))
     except Exception:
+        log.warning("db.tracing.update_run_response_failed run_id=%r", run_id, exc_info=True)
         return
 
 
@@ -47,6 +52,7 @@ async def db_insert_icw_log(run_id: Optional[int], pack_hash: Optional[str], bud
                 int(run_id), pack_hash, int(budget_tokens), json.dumps(scores_json, ensure_ascii=False),
             )
     except Exception:
+        log.warning("db.tracing.insert_icw_log_failed run_id=%r pack_hash=%r", run_id, pack_hash, exc_info=True)
         return
 
 
@@ -61,6 +67,7 @@ async def db_insert_tool_call(run_id: Optional[int], name: str, seed: int, args_
                 int(run_id) if run_id else None, name, int(seed), json.dumps(args_json, ensure_ascii=False), json.dumps(result_json, ensure_ascii=False) if isinstance(result_json, dict) else None, int(duration_ms) if duration_ms is not None else None,
             )
     except Exception:
+        log.warning("db.tracing.insert_tool_call_failed run_id=%r name=%r", run_id, name, exc_info=True)
         return
 
 

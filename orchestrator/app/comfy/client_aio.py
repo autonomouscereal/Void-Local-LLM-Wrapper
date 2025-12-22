@@ -1,16 +1,16 @@
 from __future__ import annotations
 
-import os
-import json
-import uuid
 import base64
-from typing import Dict, Any, Optional, Tuple
+import json
 import logging
+import os
+import uuid
 from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
 
-import aiohttp  # type: ignore
+import httpx  # type: ignore
+
 from ..json_parser import JSONParser
-
 
 BASE = (
     os.getenv("COMFYUI_BASE_URL")
@@ -21,59 +21,64 @@ BASE = (
 log = logging.getLogger(__name__)
 
 
-async def comfy_submit(graph: Dict[str, Any], client_id: Optional[str] = None, ws=None) -> Dict[str, Any]:
+def comfy_submit(graph: Dict[str, Any], client_id: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Hard-blocking ComfyUI submit. No asyncio, no websockets, no retries/backoff.
+    """
     comfy_client_id = client_id or str(uuid.uuid4())
     payload = {"prompt": graph.get("prompt") or graph, "client_id": comfy_client_id}
-    # Validate/shape payload with project JSON parser
     body_bytes = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    logging.info(f"[comfy.submit] bytes={len(body_bytes)}")
+    logging.info("[comfy.submit] bytes=%s", len(body_bytes))
     try:
         Path("/tmp/last_comfy_payload.json").write_bytes(body_bytes)
     except Exception:
         log.debug("[comfy.submit] failed to persist /tmp/last_comfy_payload.json (non-fatal)", exc_info=True)
-    async with aiohttp.ClientSession(trust_env=False) as s:
-        async with s.post(f"{BASE}/prompt", data=body_bytes, headers={"Content-Type": "application/json"}) as r:
-            text = await r.text()
-            if r.status != 200:
-                err = {
-                    "ok": False,
-                    "error": {
-                        "code": "comfy_prompt_http_error",
-                        "message": f"/prompt {r.status}",
-                        "status": int(r.status),
-                        "details": {"body": text[:500]},
-                    },
-                }
-                if ws:
-                    try:
-                        await ws.send_json({"type": "error", "source": "comfy", "body": text[:500]})
-                        await ws.close(code=1000)
-                    except Exception:
-                        log.debug("[comfy.submit] ws error reporting failed (non-fatal)", exc_info=True)
-                return err
-            parser = JSONParser()
-            schema = {"prompt_id": str, "uuid": str, "id": str}
-            return parser.parse(text, schema)
+    try:
+        with httpx.Client(timeout=None, trust_env=False) as client:
+            r = client.post(f"{BASE}/prompt", content=body_bytes, headers={"Content-Type": "application/json"})
+        text = r.text or ""
+        if r.status_code < 200 or r.status_code >= 300:
+            return {
+                "ok": False,
+                "error": {
+                    "code": "comfy_prompt_http_error",
+                    "message": f"/prompt {r.status_code}",
+                    "status": int(r.status_code),
+                    "details": {"body": text[:500]},
+                },
+            }
+        parser = JSONParser()
+        schema = {"prompt_id": str, "uuid": str, "id": str}
+        return parser.parse(text, schema)
+    except Exception as ex:
+        log.warning("comfy_submit.error: %s", ex, exc_info=True)
+        return {"ok": False, "error": {"code": "comfy_submit_exception", "message": str(ex), "status": 500}}
 
 
-async def comfy_history(prompt_id: str) -> Dict[str, Any]:
-    async with aiohttp.ClientSession(trust_env=False) as s:
-        async with s.get(f"{BASE}/history/{prompt_id}") as r:
-            text = await r.text()
-            if r.status != 200:
-                # Return a structured error instead of raising.
-                return {
-                    "ok": False,
-                    "error": {
-                        "code": "comfy_history_http_error",
-                        "message": f"/history {r.status}",
-                        "status": int(r.status),
-                        "details": {"body": text[:500]},
-                    },
-                }
-            parser = JSONParser()
-            schema = {"history": dict}
-            return parser.parse(text, schema)
+def comfy_history(prompt_id: str) -> Dict[str, Any]:
+    """
+    Hard-blocking ComfyUI history fetch. No retries/backoff.
+    """
+    try:
+        with httpx.Client(timeout=None, trust_env=False) as client:
+            r = client.get(f"{BASE}/history/{prompt_id}")
+        text = r.text or ""
+        if r.status_code < 200 or r.status_code >= 300:
+            return {
+                "ok": False,
+                "error": {
+                    "code": "comfy_history_http_error",
+                    "message": f"/history {r.status_code}",
+                    "status": int(r.status_code),
+                    "details": {"body": text[:500]},
+                },
+            }
+        parser = JSONParser()
+        schema = {"history": dict}
+        return parser.parse(text, schema)
+    except Exception as ex:
+        log.warning("comfy_history.error prompt_id=%s: %s", prompt_id, ex, exc_info=True)
+        return {"ok": False, "error": {"code": "comfy_history_exception", "message": str(ex), "status": 500}}
 
 
 def comfy_is_completed(detail: Dict[str, Any]) -> bool:
@@ -95,77 +100,60 @@ def comfy_is_completed(detail: Dict[str, Any]) -> bool:
     return False
 
 
-async def comfy_upload_image(name_hint: str, b64_png: str) -> str:
+def comfy_upload_image(name_hint: str, b64_png: str) -> str:
     data = base64.b64decode(b64_png)
     filename = f"{name_hint or 'ref'}_{uuid.uuid4().hex[:8]}.png"
-    form = aiohttp.FormData()
-    form.add_field("image", data, filename=filename, content_type="image/png")
-    async with aiohttp.ClientSession(trust_env=False) as s:
-        async with s.post(f"{BASE}/upload/image", data=form) as r:
-            text = await r.text()
-            if r.status != 200:
-                # Return best-effort fallback name so callers can proceed.
-                return filename
+    try:
+        with httpx.Client(timeout=None, trust_env=False) as client:
+            files = {"image": (filename, data, "image/png")}
+            r = client.post(f"{BASE}/upload/image", files=files)
+        text = r.text or ""
+        if r.status_code < 200 or r.status_code >= 300:
+            return filename
         parser = JSONParser()
         schema = {"name": str}
         obj = parser.parse(text, schema)
         stored = obj.get("name") or filename if isinstance(obj, dict) else filename
         return stored
+    except Exception as ex:
+        log.warning("comfy_upload_image.error: %s", ex, exc_info=True)
+        return filename
 
 
-async def comfy_upload_mask(name_hint: str, b64_png: str) -> str:
+def comfy_upload_mask(name_hint: str, b64_png: str) -> str:
     data = base64.b64decode(b64_png)
     filename = f"{name_hint or 'mask'}_{uuid.uuid4().hex[:8]}.png"
-    form = aiohttp.FormData()
-    form.add_field("image", data, filename=filename, content_type="image/png")
-    async with aiohttp.ClientSession(trust_env=False) as s:
-        async with s.post(f"{BASE}/upload/mask", data=form) as r:
-            text = await r.text()
-            if r.status != 200:
-                # Return best-effort fallback name so callers can proceed.
-                return filename
+    try:
+        with httpx.Client(timeout=None, trust_env=False) as client:
+            files = {"image": (filename, data, "image/png")}
+            r = client.post(f"{BASE}/upload/mask", files=files)
+        text = r.text or ""
+        if r.status_code < 200 or r.status_code >= 300:
+            return filename
         parser = JSONParser()
         schema = {"name": str}
         obj = parser.parse(text, schema)
         return obj.get("name") or filename if isinstance(obj, dict) else filename
+    except Exception as ex:
+        log.warning("comfy_upload_mask.error: %s", ex, exc_info=True)
+        return filename
 
 
-async def comfy_view(filename: str) -> Tuple[bytes, str]:
+def comfy_view(filename: str) -> Tuple[bytes, str]:
     # Returns (bytes, content_type)
-    async with aiohttp.ClientSession(trust_env=False) as s:
-        async with s.get(f"{BASE}/view", params={"filename": filename}) as r:
-            data = await r.read()
-            if r.status != 200:
-                # Return empty payload and generic content type instead of raising.
-                return b"", r.headers.get("content-type", "application/octet-stream")
-            return data, r.headers.get("content-type", "application/octet-stream")
-
-
-async def comfy_object_info(session: aiohttp.ClientSession, node_class: str) -> Dict[str, Any]:
-    async with session.get(f"{BASE}/object_info/{node_class}") as r:
-        text = await r.text()
-        if r.status != 200:
-            return {}
-    parser = JSONParser()
-    schema = {"inputs": dict}
-    obj = parser.parse(text, schema)
-    return obj if isinstance(obj, dict) else {}
-
-
-def _norm(name: str) -> str:
-    return name.lower().replace(" ", "").replace("_", "").replace("+", "")
-
-
-async def choose_sampler_name(session: aiohttp.ClientSession) -> str:
-    info = await comfy_object_info(session, "KSampler")
     try:
-        choices = ((info.get("inputs") or {}).get("sampler_name") or {}).get("choices") or []
-        norm_map = {_norm(c): c for c in choices}
-        for want in ("dpmpp2m", "dpmppsde", "euler", "eulera"):
-            if want in norm_map:
-                return norm_map[want]
-        return choices[0] if choices else "euler"
-    except Exception:
-        return "euler"
+        with httpx.Client(timeout=None, trust_env=False) as client:
+            r = client.get(f"{BASE}/view", params={"filename": filename})
+        if r.status_code < 200 or r.status_code >= 300:
+            return b"", r.headers.get("content-type", "application/octet-stream")
+        return r.content or b"", r.headers.get("content-type", "application/octet-stream")
+    except Exception as ex:
+        log.warning("comfy_view.error filename=%s: %s", filename, ex, exc_info=True)
+        return b"", "application/octet-stream"
+
+
+def choose_sampler_name() -> str:
+    # Legacy name retained; hard-blocking and deterministic (no object_info call).
+    return "euler"
 
 

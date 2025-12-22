@@ -22,6 +22,7 @@ COPY services/xtts/app /app/app
 
 # Shared repo packages required at runtime (xtts does not mount the repo).
 COPY void_json /app/void_json
+COPY void_quality /app/void_quality
 
 EXPOSE 8020
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import logging
 import math
 import os
 import time
@@ -10,9 +11,11 @@ from collections import Counter
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx  # type: ignore
+import librosa  # type: ignore
 import numpy as np  # type: ignore
 from PIL import Image, ImageDraw  # type: ignore
-import logging
+
+from ..http.faceid_client import faceid_best_embedding, faceid_embed
 
 log = logging.getLogger(__name__)
 
@@ -88,43 +91,18 @@ def _palette_tags(palette: List[Tuple[int, int, int]]) -> List[str]:
     return tags
 
 
-def _blocking_face_embedding(image_path: str) -> Optional[List[float]]:
-    global _INSIGHTFACE_MODEL
-    try:
-        import numpy as np  # type: ignore
-        import insightface  # type: ignore
-    except Exception:
-        return None
-    if _INSIGHTFACE_MODEL is None:
-        try:
-            app = insightface.app.FaceAnalysis(name="buffalo_l")
-            app.prepare(ctx_id=-1)
-            _INSIGHTFACE_MODEL = app
-        except Exception:
-            return None
-    try:
-        import cv2  # type: ignore
-    except Exception:
-        cv2 = None
-    try:
-        if cv2 is not None:
-            img = cv2.imread(image_path)
-        else:
-            img = Image.open(image_path).convert("RGB")
-            import numpy as np  # type: ignore
-            img = np.array(img)
-    except Exception:
-        return None
-    faces = _INSIGHTFACE_MODEL.get(img) if _INSIGHTFACE_MODEL else []
-    if not faces:
-        return None
-    emb = faces[0].normed_embedding.tolist()
-    return emb
+async def _compute_face_embeddings(image_path: str) -> List[Dict[str, Any]]:
+    """
+    Return multi-face embeddings (best face is index 0).
+    """
+    faces, _model, _env = await faceid_embed(image_path=image_path, max_faces=8)
+    return faces
 
 
 async def _compute_face_embedding(image_path: str) -> Optional[List[float]]:
     # Hard-blocking execution (no thread pool/executor allowed).
-    return _blocking_face_embedding(image_path)
+    emb, _model, _env = await faceid_best_embedding(image_path=image_path)
+    return emb
 
 
 def _save_image_bytes(root: str, character_id: str, image_bytes: bytes, suffix: str) -> str:
@@ -183,8 +161,9 @@ async def build_image_bundle(
                 "all": palette_hex,
             },
         }
-    # Primary reference embedding from the main image.
-    primary_emb = await _compute_face_embedding(stored_path)
+    # Primary reference embedding(s) from the main image (computed by faceid service).
+    primary_faces, face_model, _env = await faceid_embed(image_path=stored_path, max_faces=8)
+    primary_emb = primary_faces[0].get("embedding") if primary_faces else None
     # Optional: additional reference images for the same character. These are
     # stored as extra_image_paths on the legacy face block so migrate_visual_bundle
     # can expose them as visual.faces[0].refs without changing callers.
@@ -210,10 +189,15 @@ async def build_image_bundle(
     embs: List[List[float]] = []
     if isinstance(primary_emb, list):
         embs.append(primary_emb)
+    ref_faces: List[Dict[str, Any]] = []
+    ref_faces.append({"image_path": stored_path, "faces": primary_faces})
     for p in extra_paths:
         try:
-            e = await _compute_face_embedding(p)
-        except Exception:
+            faces = await _compute_face_embeddings(p)
+            ref_faces.append({"image_path": p, "faces": faces})
+            e = faces[0].get("embedding") if faces else None
+        except Exception as ex:
+            log.exception("build_image_bundle: face embedding failed image_path=%s error=%s", p, ex)
             e = None
         if isinstance(e, list):
             embs.append(e)
@@ -235,11 +219,15 @@ async def build_image_bundle(
             count += 1
         if count > 0:
             mean_emb = [v / float(count) for v in acc]
+    # `face_model` is captured above from the primary faceid call; it may be None if embedding failed.
     face_block: Dict[str, Any] = {
         "embedding": mean_emb if mean_emb is not None else primary_emb,
+        "model": face_model,
         "mask": None,
         "image_path": stored_path,
         "strength": opts.get("face_strength", 0.75),
+        # For distillation/debugging: preserve multi-face detections on reference entries.
+        "ref_faces": ref_faces,
     }
     if extra_paths:
         face_block["extra_image_paths"] = extra_paths
@@ -267,11 +255,6 @@ async def build_image_bundle(
 
 
 def _blocking_voice_embedding(audio_path: str) -> Optional[List[float]]:
-    try:
-        import numpy as np  # type: ignore
-        import librosa  # type: ignore
-    except Exception:
-        return None
     try:
         y, sr = librosa.load(audio_path, sr=22050)
     except Exception:

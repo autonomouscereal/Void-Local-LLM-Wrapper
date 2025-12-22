@@ -111,6 +111,47 @@ async def get_pg_pool() -> Optional[asyncpg.pool.Pool]:
             );
             """
         )
+        # Teacher traces → distill sets (previously written by the removed `services/teacher` container).
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS teacher_trace (
+              id            BIGSERIAL PRIMARY KEY,
+              run_id        BIGINT NOT NULL REFERENCES run(id) ON DELETE CASCADE,
+              trace_line    JSONB NOT NULL,
+              created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+            """
+        )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS distill_sft (
+              id            BIGSERIAL PRIMARY KEY,
+              run_id        BIGINT NOT NULL REFERENCES run(id) ON DELETE CASCADE,
+              sample_json   JSONB NOT NULL,
+              created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+            """
+        )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS distill_dpo (
+              id            BIGSERIAL PRIMARY KEY,
+              run_id        BIGINT NOT NULL REFERENCES run(id) ON DELETE CASCADE,
+              pair_json     JSONB NOT NULL,
+              created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+            """
+        )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS distill_toolpolicy (
+              id            BIGSERIAL PRIMARY KEY,
+              run_id        BIGINT NOT NULL REFERENCES run(id) ON DELETE CASCADE,
+              policy_json   JSONB NOT NULL,
+              created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+            """
+        )
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS rag_docs (

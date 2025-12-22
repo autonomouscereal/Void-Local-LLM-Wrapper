@@ -1,17 +1,17 @@
 from __future__ import annotations
 
 import os
+UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/workspace/uploads")
 import json
 import logging
 from .common import ensure_dir, sidecar, make_outpaths, normalize_size, stamp_env, now_ts
 from ..determinism.seeds import stamp_tool_args
 from ..artifacts.manifest import add_manifest_row
 from void_envelopes import normalize_to_envelope, bump_envelope, assert_envelope
-from ..refs.apply import load_refs
-from ..refs.registry import append_provenance
-from .export import append_image_sample
-from ..context.index import add_artifact as _ctx_add
-from ..context.index import resolve_reference as _ctx_resolve, resolve_global as _glob_resolve
+from ..ref_library.apply import load_refs
+from ..ref_library.registry import append_provenance
+from ..artifacts.index import add_artifact as _ctx_add
+from ..artifacts.index import resolve_reference as _ctx_resolve, resolve_global as _glob_resolve
 from ..tracing.training import append_training_sample
 
 log = logging.getLogger(__name__)
@@ -23,7 +23,7 @@ def run_image_edit(job: dict, provider, manifest: dict) -> dict:
            "seed": int|None, "refs": {...}, "cid": str }
     """
     cid = job.get("cid") or ("img-" + str(now_ts()))
-    outdir = os.path.join("/workspace", "uploads", "artifacts", "image", cid)
+    outdir = os.path.join(UPLOAD_DIR, "artifacts", "image", cid)
     ensure_dir(outdir)
     size = normalize_size(job.get("size"), edge_safe=bool(job.get("edge")))
     refs = load_refs(job.get("ref_ids"), job.get("refs"))
@@ -54,10 +54,7 @@ def run_image_edit(job: dict, provider, manifest: dict) -> dict:
     except Exception as exc:
         log.debug("image.edit: append_provenance failed (non-fatal) cid=%s: %s", cid, exc, exc_info=True)
     add_manifest_row(manifest, png_path, step_id="image.edit")
-    try:
-        append_image_sample(outdir, {"tool": "image.edit", "prompt": args.get("prompt"), "negative": args.get("negative"), "size": args.get("size"), "seed": int(args.get("seed") or 0), "model": model, "path": png_path, "ts": now_ts()})
-    except Exception as exc:
-        log.debug("image.edit: append_image_sample failed (non-fatal) cid=%s: %s", cid, exc, exc_info=True)
+    # (Removed) per-artifact image_samples.jsonl writer. Canonical dataset stream is `datasets/stream.py`
     try:
         _ctx_add(cid, "image", png_path, None, args.get("image_ref"), [], {"prompt": args.get("prompt")})
     except Exception as exc:

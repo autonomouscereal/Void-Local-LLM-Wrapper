@@ -2,26 +2,30 @@ from __future__ import annotations
 
 import os
 import json
+import base64
+import traceback
 from typing import Any, Dict
 import logging
 import wave
 import struct
 import math
 
+from ..json_parser import JSONParser
 from .common import now_ts, ensure_dir, tts_edge_defaults, sidecar, stamp_env
 from ..locks import voice_embedding_from_path, tts_get_global, tts_get_voices
 from ..determinism.seeds import stamp_tool_args
 from ..artifacts.manifest import add_manifest_row
 from void_envelopes import normalize_to_envelope, bump_envelope, assert_envelope
-from ..refs.voice import resolve_voice_lock, resolve_voice_identity
-from ..refs.registry import append_provenance
-from .export import append_tts_sample
-from ..context.index import add_artifact as _ctx_add
-from ..context.index import list_recent as _ctx_list
+from ..locks.voice_identity import resolve_voice_lock, resolve_voice_identity
+from ..ref_library.registry import append_provenance
+from ..artifacts.index import add_artifact as _ctx_add
+from ..artifacts.index import list_recent as _ctx_list
 from ..analysis.media import analyze_audio, normalize_lufs, cosine_similarity
 from ..tracing.training import append_training_sample
 import httpx  # type: ignore
 
+
+UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/workspace/uploads")
 
 log = logging.getLogger(__name__)
 
@@ -73,7 +77,7 @@ async def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
     """
     cid = job.get("cid") or f"tts-{now_ts()}"
     trace_id = job.get("trace_id") if isinstance(job.get("trace_id"), str) else ""
-    outdir = os.path.join("/workspace", "uploads", "artifacts", "audio", "tts", cid)
+    outdir = os.path.join(UPLOAD_DIR, "artifacts", "audio", "tts", cid)
     ensure_dir(outdir)
     # If no explicit refs were provided, try to infer reference samples for the
     # requested voice_id from recent context so that music/film pipelines and
@@ -133,6 +137,17 @@ async def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
     lang = job.get("language")
     if not isinstance(lang, str) or not lang.strip():
         lang = "en"
+    else:
+        # Normalize locale-style values like "en-US" to XTTS-compatible codes ("en").
+        s = lang.strip().lower().replace("_", "-")
+        if s in ("english", "eng"):
+            s = "en"
+        if s == "zh":
+            s = "zh-cn"
+        if "-" in s and s != "zh-cn":
+            s = s.split("-", 1)[0].strip() or "en"
+        # Force to English if we ended up with an empty value.
+        lang = s or "en"
     # Logical voice identifier used for XTTS base-speaker mapping and RVC locks.
     logical_voice_id = resolved_voice_id or job.get("voice_id") or params.get("voice") or tts_voice_id or inferred_voice
     # Hard policy: always resolve a concrete voice_id before calling downstream
@@ -197,14 +212,13 @@ async def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
         # Final guardrail: if we still cannot resolve a voice, fail BEFORE
         # calling XTTS so the error surfaces explicitly in the envelope instead
         # of as an opaque runtime from the microservice.
-        import traceback as _tb_voice
         return {
             "ok": False,
             "error": {
                 "code": "voice_resolution_failed",
                 "status": 500,
                 "message": "Unable to resolve TTS voice_id; no explicit voice, lock-bundle default, or env default configured.",
-                "stack": "".join(_tb_voice.format_stack()),
+                "stack": "".join(traceback.format_stack()),
             },
         }
     # Log the resolved voice for traceability.
@@ -224,14 +238,13 @@ async def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
     if logical_voice_id and new_samples:
         rvc_url_train = os.getenv("RVC_API_URL")
         if not isinstance(rvc_url_train, str) or not rvc_url_train.strip():
-            import traceback as _tb_train_env
             return {
                 "ok": False,
                 "error": {
                     "code": "ValidationError",
                     "status": 500,
                     "message": "RVC_API_URL is not set; required for voice registration/training in tts.speak.",
-                    "stack": "".join(_tb_train_env.format_stack()),
+                    "stack": "".join(traceback.format_stack()),
                 },
             }
         payload_reg = {
@@ -240,16 +253,13 @@ async def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
             "reference_wav_path": new_samples[0],
             "additional_refs": new_samples[1:],
         }
-        from ..json_parser import JSONParser as _TrainParser  # type: ignore
-
         with httpx.Client(timeout=None, trust_env=False) as client:
             # Voice registration
             r_reg = client.post(rvc_url_train.rstrip("/") + "/v1/voice/register", json=payload_reg)
-            parser_reg = _TrainParser()
+            parser_reg = JSONParser()
             raw_reg = r_reg.text or ""
             reg_env = parser_reg.parse(raw_reg or "{}", {"ok": bool, "error": dict})
             if not isinstance(reg_env, dict) or not bool(reg_env.get("ok")):
-                import traceback as _tb_reg
                 err_obj = reg_env.get("error") if isinstance(reg_env, dict) else {}
                 return {
                     "ok": False,
@@ -258,7 +268,7 @@ async def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
                         "status": int(getattr(r_reg, "status_code", 500) or 500),
                         "message": "RVC /v1/voice/register failed for tts.speak",
                         "raw": reg_env,
-                        "stack": (err_obj or {}).get("stack") if isinstance(err_obj, dict) else _tb_reg.format_exc(),
+                        "stack": (err_obj or {}).get("stack") if isinstance(err_obj, dict) else traceback.format_exc(),
                     },
                 }
             # Blocking training: ensure updated model is ready before conversion.
@@ -266,11 +276,10 @@ async def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
                 rvc_url_train.rstrip("/") + "/v1/voice/train",
                 json={"voice_lock_id": str(logical_voice_id)},
             )
-            parser_train = _TrainParser()
+            parser_train = JSONParser()
             raw_train = r_train.text or ""
             train_env = parser_train.parse(raw_train or "{}", {"ok": bool, "error": dict})
             if not isinstance(train_env, dict) or not bool(train_env.get("ok")):
-                import traceback as _tb_train
                 err_obj = train_env.get("error") if isinstance(train_env, dict) else {}
                 return {
                     "ok": False,
@@ -279,7 +288,7 @@ async def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
                         "status": int(getattr(r_train, "status_code", 500) or 500),
                         "message": "RVC /v1/voice/train failed for tts.speak",
                         "raw": train_env,
-                        "stack": (err_obj or {}).get("stack") if isinstance(err_obj, dict) else _tb_train.format_exc(),
+                        "stack": (err_obj or {}).get("stack") if isinstance(err_obj, dict) else traceback.format_exc(),
                     },
                 }
     # Ensure each call is associated with a stable segment identifier for downstream
@@ -363,7 +372,7 @@ async def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
                 "code": "ValidationError",
                 "status": 500,
                 "message": "RVC_API_URL is not set; RVC is mandatory for tts.speak.",
-                "stack": "".join(__import__("traceback").format_stack()),
+                "stack": "".join(traceback.format_stack()),
             },
         }
     if not isinstance(voice_lock_id, str) or not voice_lock_id.strip():
@@ -373,25 +382,21 @@ async def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
                 "code": "ValidationError",
                 "status": 500,
                 "message": f"No voice_lock_id / reference configured for voice_id '{logical_voice_id}'.",
-                "stack": "".join(__import__("traceback").format_stack()),
+                "stack": "".join(traceback.format_stack()),
             },
         }
-    import base64 as _b64_rvc
     payload_rvc = {
-        "source_wav_base64": _b64_rvc.b64encode(wav_bytes or b"").decode("ascii"),
+        "source_wav_base64": base64.b64encode(wav_bytes or b"").decode("ascii"),
         "voice_lock_id": voice_lock_id.strip(),
     }
     with httpx.Client(timeout=None, trust_env=False) as client:
         r_rvc = client.post(rvc_url.rstrip("/") + "/v1/audio/convert", json=payload_rvc)
-    from ..json_parser import JSONParser  # type: ignore
-
     parser = JSONParser()
     js_rvc = parser.parse(
         r_rvc.text or "",
         {"ok": bool, "audio_wav_base64": str, "sample_rate": int},
     )
     if not isinstance(js_rvc, dict) or not bool(js_rvc.get("ok")):
-        import traceback as _tb
         return {
             "ok": False,
             "error": {
@@ -399,22 +404,21 @@ async def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
                 "status": int(getattr(r_rvc, "status_code", 500) or 500),
                 "message": "RVC /v1/audio/convert failed for tts.speak",
                 "raw": js_rvc,
-                "stack": js_rvc.get("error", {}).get("stack") if isinstance(js_rvc.get("error"), dict) else _tb.format_exc(),
+                "stack": js_rvc.get("error", {}).get("stack") if isinstance(js_rvc.get("error"), dict) else traceback.format_exc(),
             },
         }
     b64_rvc = js_rvc.get("audio_wav_base64") if isinstance(js_rvc.get("audio_wav_base64"), str) else None
     if not b64_rvc:
-        import traceback as _tb2
         return {
             "ok": False,
             "error": {
                 "code": "ValidationError",
                 "status": 500,
                 "message": "RVC /v1/audio/convert returned no audio_wav_base64",
-                "stack": _tb2.format_stack(),
+                "stack": traceback.format_stack(),
             },
         }
-    wav_bytes = _b64_rvc.b64decode(b64_rvc)
+    wav_bytes = base64.b64decode(b64_rvc)
     # Mandatory VocalFix quality stage for all TTS audio.
     vf_url = os.getenv("VOCAL_FIXER_API_URL")
     if not isinstance(vf_url, str) or not vf_url.strip():
@@ -424,20 +428,18 @@ async def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
                 "code": "ValidationError",
                 "status": 500,
                 "message": "VOCAL_FIXER_API_URL must be configured for tts.speak",
-                "stack": "".join(__import__("traceback").format_stack()),
+                "stack": "".join(traceback.format_stack()),
             },
         }
     try:
-        import base64 as _b64_vf
         payload_vf = {
-            "audio_wav_base64": _b64_vf.b64encode(wav_bytes or b"").decode("ascii"),
+            "audio_wav_base64": base64.b64encode(wav_bytes or b"").decode("ascii"),
             "sample_rate": int(params.get("sample_rate") or 22050),
             "ops": ["pitch", "align", "deess"],
         }
         with httpx.Client(timeout=None, trust_env=False) as client:
             r_vf = client.post(vf_url.rstrip("/") + "/v1/vocal/fix", json=payload_vf)
         try:
-            from ..json_parser import JSONParser  # type: ignore
             parser = JSONParser()
             js_vf = parser.parse(
                 r_vf.text or "",
@@ -452,7 +454,6 @@ async def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
         except Exception:
             js_vf = {}
         if not isinstance(js_vf, dict) or not bool(js_vf.get("ok")):
-            import traceback as _tb3
             inner_err = js_vf.get("error") if isinstance(js_vf, dict) else None
             return {
                 "ok": False,
@@ -461,22 +462,21 @@ async def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
                     "status": int(getattr(r_vf, "status_code", 500) or 500),
                     "message": "VocalFix /v1/vocal/fix failed for tts.speak",
                     "raw": js_vf,
-                    "stack": (inner_err or {}).get("stack") if isinstance(inner_err, dict) else _tb3.format_exc(),
+                    "stack": (inner_err or {}).get("stack") if isinstance(inner_err, dict) else traceback.format_exc(),
                 },
             }
         b64_vf = js_vf.get("audio_wav_base64") if isinstance(js_vf.get("audio_wav_base64"), str) else None
         if not b64_vf:
-            import traceback as _tb4
             return {
                 "ok": False,
                 "error": {
                     "code": "ValidationError",
                     "status": 500,
                     "message": "VocalFix /v1/vocal/fix returned no audio_wav_base64",
-                    "stack": _tb4.format_stack(),
+                    "stack": traceback.format_stack(),
                 },
             }
-        wav_bytes = _b64_vf.b64decode(b64_vf)
+        wav_bytes = base64.b64decode(b64_vf)
         # Attach VocalFix metrics to manifest for teacher/distillation.
         manifest.setdefault("items", []).append(
             {
@@ -559,10 +559,10 @@ async def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
         if bool(job.get("normalize")):
             qa_norm = _peak_normalize(wav_path, -1.0)
         qa_trim = _hard_trim(wav_path, float(params.get("max_seconds") or 0))
-        # Analyze LUFS always, normalize only if requested
-        ainfo = analyze_audio(wav_path)
-        if isinstance(ainfo, dict):
-            qa_norm["lufs_before"] = ainfo.get("lufs")
+        # Analyze audio once after preprocessing; reuse for downstream QA/locks.
+        ainfo_pre = analyze_audio(wav_path)
+        if isinstance(ainfo_pre, dict):
+            qa_norm["lufs_before"] = ainfo_pre.get("lufs")
         if bool(job.get("normalize_lufs")):
             applied = normalize_lufs(wav_path, -16.0)
             if applied is not None:
@@ -600,9 +600,8 @@ async def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
         locks_meta["lyrics_score"] = matched / len(hard_segments) if hard_segments else None
     # TTS prosody/emotion/timing QA from lock_bundle.tts when available
     if lock_bundle:
-        ainfo3 = analyze_audio(wav_path)
-        if isinstance(ainfo3, dict):
-            pitch_mean = ainfo3.get("pitch_mean_hz")
+        if isinstance(ainfo_pre, dict):
+            pitch_mean = ainfo_pre.get("pitch_mean_hz")
             # Voice-level baseline
             tts_section = lock_bundle.get("tts") if isinstance(lock_bundle.get("tts"), dict) else {}
             voices = tts_get_voices(lock_bundle)
@@ -678,6 +677,7 @@ async def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
         sidecar_payload["locks"] = locks_meta
     sidecar(wav_path, sidecar_payload)
     # Emotion/pace gate: single revision to match target emotion if provided
+    audio_modified = False
     try:
         target_emotion = None
         try:
@@ -685,9 +685,8 @@ async def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
                 target_emotion = job.get("voice_refs", {}).get("emotion")
         except Exception:
             target_emotion = None
-        ainfo2 = analyze_audio(wav_path)
-        if target_emotion and isinstance(ainfo2, dict):
-            cur = (ainfo2.get("emotion") or "").lower()
+        if target_emotion and isinstance(ainfo_pre, dict):
+            cur = (ainfo_pre.get("emotion") or "").lower()
             # Heuristic adjust rate/pitch to hit emotion
             if target_emotion == "excited" and cur != "excited":
                 adj = dict(args)
@@ -706,6 +705,7 @@ async def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
                 if wb2:
                     with open(wav_path, "wb") as f:
                         f.write(wb2)
+                    audio_modified = True
                     sidecar(
                         wav_path,
                         {"tool": "tts.speak.committee", "target_emotion": target_emotion, "adjusted": True},
@@ -727,39 +727,22 @@ async def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
                 if wb2:
                     with open(wav_path, "wb") as f:
                         f.write(wb2)
+                    audio_modified = True
                     sidecar(
                         wav_path,
                         {"tool": "tts.speak.committee", "target_emotion": target_emotion, "adjusted": True},
                     )
     except Exception:
         log.debug("tts.speak: committee emotion adjustment failed (non-fatal) cid=%s", cid, exc_info=True)
+    # (Removed) per-artifact tts_samples.jsonl writer. Canonical dataset stream is `datasets/stream.py`.
+    _seed_raw = args.get("seed")
+    seed_int = 0
     try:
-        _seed_raw = args.get("seed")
+        if _seed_raw is not None and not isinstance(_seed_raw, (dict, list)):
+            seed_int = int(_seed_raw)
+    except Exception as exc:
+        log.warning("tts.speak: bad seed=%r; defaulting to 0 cid=%s", _seed_raw, cid, exc_info=True)
         seed_int = 0
-        try:
-            if _seed_raw is not None and not isinstance(_seed_raw, (dict, list)):
-                seed_int = int(_seed_raw)
-        except Exception as exc:
-            log.warning("tts.speak: bad seed=%r; defaulting to 0 cid=%s", _seed_raw, cid, exc_info=True)
-            seed_int = 0
-        append_tts_sample(
-            outdir,
-            {
-                "text": args.get("text"),
-                "voice": args.get("voice"),
-                "rate": args.get("rate"),
-                "pitch": args.get("pitch"),
-                "sample_rate": args.get("sample_rate"),
-                "seed": seed_int,
-                "voice_lock": bool(lock),
-                "audio_ref": wav_path,
-                "duration_s": dur,
-                "model": model,
-                "created_at": now_ts(),
-            },
-        )
-    except Exception:
-        log.debug("tts.speak: append_tts_sample failed (non-fatal) cid=%s", cid, exc_info=True)
     try:
         if job.get("voice_id"):
             append_provenance(
@@ -815,7 +798,7 @@ async def run_tts_speak(job: dict, provider, manifest: dict) -> dict:
     env = stamp_env(env, "tts.speak", model)
     # Trace row for distillation
     try:
-        ainfo = analyze_audio(wav_path)
+        ainfo = analyze_audio(wav_path) if audio_modified else ainfo_pre
         trace_row = {
             "cid": cid,
             "tool": "tts.speak",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 from typing import Any, Dict, Optional
 
 from ..db.pool import get_pg_pool
@@ -30,7 +31,6 @@ async def upsert_lock_bundle(character_id: str, bundle: Dict[str, Any]) -> None:
     pool = await get_pg_pool()
     if pool is None:
         return
-    import json
     payload = json.dumps(bundle, ensure_ascii=False)
     async with pool.acquire() as conn:
         await conn.execute(

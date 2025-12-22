@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 from typing import Any, Dict
 import logging
 
@@ -113,7 +114,6 @@ def append_jsonl_compat(state_dir: str, path: str, obj: Dict[str, Any]) -> None:
     # Fallback: direct append without normalization
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "a", encoding="utf-8") as f:
-        import json as _json
-        f.write(_json.dumps(obj, ensure_ascii=False) + "\n")
+        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
 

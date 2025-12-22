@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import os
+import re
 from typing import Any, Dict, Optional, List, Tuple, Sequence
 import uuid
 import logging
@@ -134,7 +135,6 @@ def _run_ocr(path: str) -> Dict[str, Any]:
             data = f.read()
         b64 = base64.b64encode(data).decode("ascii")
         r = requests.post(OCR_API_URL.rstrip("/") + "/ocr", json={"b64": b64, "ext": ext})
-        from ..json_parser import JSONParser  # local import to avoid cycles at module import time
         parser = JSONParser()
         js = parser.parse(r.text or "{}", {"text": str})
         txt = (js.get("text") or "").strip() if isinstance(js, dict) else ""
@@ -166,7 +166,6 @@ def _run_yolo(path: str) -> Dict[str, Any]:
             json={"image_path": path},
             timeout=None,
         )
-        from ..json_parser import JSONParser  # local import to avoid cycles at module import time
         parser = JSONParser()
         js = parser.parse(r.text or "{}", {"objects": list, "faces": list})
         objects = js.get("objects") or [] if isinstance(js, dict) else []
@@ -277,8 +276,6 @@ def _qwen_vl_analyze(path: str, prompt: Optional[str]) -> Dict[str, Any]:
         """
         if not isinstance(txt, str) or not txt:
             return None
-        import re
-
         # JSON-ish: "match_score": 0.73
         m = re.search(r'"match_score"\s*:\s*([0-9]+(?:\.[0-9]+)?)', txt)
         if not m:

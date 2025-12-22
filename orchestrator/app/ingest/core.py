@@ -6,6 +6,7 @@ import mimetypes
 import logging
 from typing import Dict, Any, List
 from ..json_parser import JSONParser
+import httpx  # type: ignore
 
 
 TEXT_EXTS = {".txt", ".md", ".csv", ".json", ".yaml", ".yml", ".xml", ".html", ".htm", ".toml", ".ini", ".cfg", ".log"}
@@ -52,7 +53,6 @@ def ingest_file(path: str, vlm_url: str | None = None, whisper_url: str | None =
         # Prefer OCR for PDFs and scanned docs when service available
         if ocr_url:
             try:
-                import httpx
                 b64 = _b64_of(path, max_bytes=10_000_000)
                 # TIMEOUTS FORBIDDEN: never pass timeout to HTTP clients
                 with httpx.Client(timeout=None, trust_env=False) as client:
@@ -74,7 +74,6 @@ def ingest_file(path: str, vlm_url: str | None = None, whisper_url: str | None =
     elif ext in IMAGE_EXTS:
         if vlm_url:
             try:
-                import httpx
                 b64 = _b64_of(path)
                 # TIMEOUTS FORBIDDEN
                 with httpx.Client(timeout=None, trust_env=False) as client:
@@ -88,7 +87,6 @@ def ingest_file(path: str, vlm_url: str | None = None, whisper_url: str | None =
                 texts.append(f"[image] {os.path.basename(path)}")
         if ocr_url:
             try:
-                import httpx
                 b64 = _b64_of(path)
                 # TIMEOUTS FORBIDDEN
                 with httpx.Client(timeout=None, trust_env=False) as client:
@@ -106,7 +104,6 @@ def ingest_file(path: str, vlm_url: str | None = None, whisper_url: str | None =
     elif ext in AUDIO_EXTS:
         if whisper_url:
             try:
-                import httpx
                 b64 = _b64_of(path)
                 # TIMEOUTS FORBIDDEN
                 with httpx.Client(timeout=None, trust_env=False) as client:

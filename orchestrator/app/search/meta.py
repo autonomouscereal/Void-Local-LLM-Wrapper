@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Dict, Any, List
+import hashlib
 
 
 def rrf_fuse(results_by_engine: Dict[str, List[Dict[str, Any]]], k: int = 60) -> List[Dict[str, Any]]:
@@ -22,8 +23,7 @@ def rrf_fuse(results_by_engine: Dict[str, List[Dict[str, Any]]], k: int = 60) ->
     def _rec(x: Dict[str, Any]) -> float:
         return 0.0
     def _sha(x: str) -> str:
-        import hashlib as _h
-        return _h.sha256(x.encode("utf-8")).hexdigest()
+        return hashlib.sha256(x.encode("utf-8")).hexdigest()
     items: List[Dict[str, Any]] = []
     for key, sc in scores.items():
         m = meta.get(key) or {}
