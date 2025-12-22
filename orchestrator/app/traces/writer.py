@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Dict
 
-from app.trace_utils import emit_trace
+from ..trace_utils import emit_trace
 
 
 def _iso_now() -> str:

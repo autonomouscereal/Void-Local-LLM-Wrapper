@@ -9,8 +9,10 @@ from tool results. This used to live in `pipeline/assets.py` but is logically QA
 
 from typing import Any, Callable, Dict, List, Optional
 
-from app.locks.runtime import QUALITY_PRESETS as LOCK_QUALITY_PRESETS
-from app.locks.runtime import quality_thresholds as _lock_quality_thresholds
+# Use relative imports to avoid relying on the top-level package name being `app`
+# (this file is imported both in-container and in some local/dev contexts).
+from ...locks.runtime import QUALITY_PRESETS as LOCK_QUALITY_PRESETS
+from ...locks.runtime import quality_thresholds as _lock_quality_thresholds
 
 
 def collect_urls(tool_results: List[Dict[str, Any]], absolutize_url: Callable[[str], str]) -> List[str]:

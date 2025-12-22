@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlencode
 
-from app.json_parser import JSONParser
+from ..json_parser import JSONParser
 
 
 def build_view_url(base: str, filename: str, ftype: str = "output", subfolder: Optional[str] = None) -> str:
