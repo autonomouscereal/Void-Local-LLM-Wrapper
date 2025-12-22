@@ -28,6 +28,7 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 COPY orchestrator/app /app/app
 COPY void_json /app/void_json
 COPY void_envelopes /app/void_envelopes
+COPY void_quality /app/void_quality
 
 # IMPORTANT (policy): Module import path is fixed to 'app.*' within /app.
 # Do NOT rely on external workpath or PYTHONPATH overrides from compose.

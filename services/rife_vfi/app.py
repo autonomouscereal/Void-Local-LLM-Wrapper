@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 import os
 import subprocess
 import time
@@ -12,7 +13,14 @@ from void_envelopes import ToolEnvelope
 from void_json import JSONParser
 
 
-APP = FastAPI(title="RIFE VFI Service", version="1.0")
+@asynccontextmanager
+async def _lifespan(_: FastAPI):
+    # FastAPI deprecated @app.on_event("startup"); use lifespan instead.
+    _mkdirs()
+    yield
+
+
+APP = FastAPI(title="RIFE VFI Service", version="1.0", lifespan=_lifespan)
 
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/workspace/uploads").rstrip("/")
 LOG_DIR = os.getenv("LOG_DIR", "/workspace/logs").rstrip("/")
@@ -121,11 +129,6 @@ def _pick_multi(
     if ratio <= 8.0:
         return {"mode": "multi", "value": 8}
     return {"mode": "multi", "value": 16}
-
-
-@APP.on_event("startup")
-def _startup() -> None:
-    _mkdirs()
 
 
 @APP.get("/healthz")
@@ -312,6 +315,8 @@ async def interpolate(request: Request):
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(APP, host="0.0.0.0", port=RIFE_VFI_PORT, log_level="info", workers=DEFAULT_WORKERS)
+    # If using reload/workers, uvicorn requires an import string ("module:app") not an app object.
+    workers = max(1, int(DEFAULT_WORKERS or 1))
+    uvicorn.run("app:APP", host="0.0.0.0", port=RIFE_VFI_PORT, log_level="info", workers=workers)
 
 

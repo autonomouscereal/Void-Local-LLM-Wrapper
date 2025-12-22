@@ -1,4 +1,10 @@
 from __future__ import annotations
+# NOTE: Uvicorn multi-worker "child process died" with no traceback usually
+# means a hard crash (segfault/abort) during import/startup. Enable Python's
+# faulthandler as early as possible so we get *something* in container logs.
+import faulthandler as _faulthandler
+_faulthandler.enable(all_threads=True)
+
 # HARD BAN (permanent): Never add Pydantic, SQLAlchemy, or any ORM/CSV/Parquet libs to this service.
 # - No Pydantic models. Use plain dicts + hand-rolled validators only.
 # - No SQLAlchemy/ORM. Use asyncpg with pooling and raw SQL only.
@@ -53,10 +59,17 @@ import colorsys
 import random as _rnd
 from urllib.parse import urlparse, urlencode
 import tempfile
+_ORCH_IMPORT_TRACE = os.getenv("ORCH_IMPORT_TRACE", "0").strip().lower() in ("1", "true", "yes", "on")
+if _ORCH_IMPORT_TRACE:
+    print("[orch.import] importing cv2...", flush=True)
 import cv2  # type: ignore
+if _ORCH_IMPORT_TRACE:
+    print("[orch.import] importing mediapipe...", flush=True)
 import mediapipe as mp  # type: ignore
 import numpy as np  # type: ignore
 import math
+if _ORCH_IMPORT_TRACE:
+    print("[orch.import] importing librosa...", flush=True)
 import librosa  # type: ignore
 import shutil as _sh
 import websockets as _ws  # type: ignore

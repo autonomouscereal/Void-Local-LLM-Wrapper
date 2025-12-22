@@ -354,7 +354,9 @@ services:
     # Run the canonical orchestrator application
     # Force the pure-Python HTTP/1.1 stack (h11) to avoid intermittent connection issues
     # that can occur with alternative HTTP protocol implementations under long-held requests.
-    command: ["uvicorn","app.main:app","--host","0.0.0.0","--port","8000","--log-level","info","--access-log","--use-colors","--http","h11","--loop","asyncio","--workers","4"]
+    # Run via python so we can enable faulthandler (-X faulthandler) to get
+    # useful output even on hard crashes during multi-worker startup.
+    command: ["python","-X","faulthandler","-m","uvicorn","app.main:app","--host","0.0.0.0","--port","8000","--log-level","info","--access-log","--use-colors","--http","h11","--loop","asyncio","--workers","4"]
     volumes:
       - ./:/workspace
       - void_artifacts:/workspace/uploads
