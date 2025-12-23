@@ -26,7 +26,7 @@ def get_embedder() -> SentenceTransformer:
 async def rag_index_dir(root: str = "/workspace", glob_exts: Optional[List[str]] = None, chunk_size: int = 1000, chunk_overlap: int = 200) -> Dict[str, Any]:
     pool = await get_pg_pool()
     if pool is None:
-        return {"error": "pgvector not configured"}
+        return {"error": {"code": "pgvector_unconfigured", "message": "pgvector not configured", "status": 500}}
     exts = glob_exts or ["*.md", "*.py", "*.ts", "*.tsx", "*.js", "*.json", "*.txt"]
     files: List[str] = []
     for ext in exts:

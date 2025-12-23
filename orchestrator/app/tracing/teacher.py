@@ -307,7 +307,7 @@ async def tap_trace(payload: Dict[str, Any]) -> Dict[str, Any]:
     - Best-effort write-through into Postgres: teacher_trace + distill_* tables.
     """
     if not isinstance(payload, dict):
-        return {"ok": False, "error": "payload_not_object"}
+        return {"ok": False, "error": {"code": "payload_not_object", "message": "payload must be an object", "status": 422}}
 
     t, label = _normalize_trace_payload(payload)
     paths = _teacher_paths(label)

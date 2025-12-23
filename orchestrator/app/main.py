@@ -44,6 +44,109 @@ import imageio.v3 as iio  # type: ignore
 from PIL import Image, ImageDraw, ImageFont  # type: ignore
 import asyncio as _as
 import contextlib
+
+# -------------------------------------------------------------------------------------------
+# Logging hygiene: silence noisy third-party libs (httpx/httpcore/h11/numba) early.
+# This MUST run before clients are created (and ideally before heavy imports) to prevent
+# DEBUG-level transport/JIT internals from polluting stdout in normal operation.
+# -------------------------------------------------------------------------------------------
+
+def _parse_log_level(name: str, default: int) -> int:
+    try:
+        s = (name or "").strip().upper()
+        if not s:
+            return default
+        return int(getattr(logging, s, default))
+    except Exception:
+        return default
+
+
+def _truthy_env(key: str, default: str = "0") -> bool:
+    v = (os.getenv(key, default) or default).strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def _silence_third_party_logs() -> None:
+    """
+    Pin common noisy libraries to a sane default level (WARNING) regardless of root logger.
+
+    Controlled via:
+      - ORCH_THIRD_PARTY_LOG_LEVEL (default WARNING)
+      - NUMBA_LOG_LEVEL / NUMBA_DEBUG (default WARNING / 0 if unset)
+    """
+    # Ensure numba picks up safe defaults even if imported very early via other deps (e.g. librosa).
+    os.environ.setdefault("NUMBA_LOG_LEVEL", (os.getenv("NUMBA_LOG_LEVEL", "WARNING") or "WARNING").strip().upper())
+    os.environ.setdefault("NUMBA_DEBUG", (os.getenv("NUMBA_DEBUG", "0") or "0").strip())
+
+    lvl = _parse_log_level(os.getenv("ORCH_THIRD_PARTY_LOG_LEVEL", "WARNING") or "WARNING", logging.WARNING)
+    for n in (
+        # HTTP transport stack
+        "httpx",
+        "httpcore",
+        "httpcore.http11",
+        "httpcore.connection",
+        "h11",
+        # Numba JIT internals (often triggered indirectly by librosa)
+        "numba",
+        "numba.core",
+        "numba.core.ssa",
+    ):
+        try:
+            logging.getLogger(n).setLevel(lvl)
+        except Exception:
+            pass
+
+
+def _maybe_divert_third_party_logs_to_file(log_dir: str) -> None:
+    """
+    Optional: route noisy third-party libraries to a dedicated file, keeping stdout clean.
+
+    Controlled via:
+      - ORCH_THIRD_PARTY_LOG_TO_FILE=1
+      - ORCH_THIRD_PARTY_LOG_FILE (default: <ORCH_LOG_DIR>/third_party_noise.log)
+      - ORCH_THIRD_PARTY_FILE_LEVEL (default: ORCH_THIRD_PARTY_LOG_LEVEL, else WARNING)
+    """
+    if not _truthy_env("ORCH_THIRD_PARTY_LOG_TO_FILE", "0"):
+        return
+
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+    except Exception:
+        return
+
+    path = (os.getenv("ORCH_THIRD_PARTY_LOG_FILE", "") or "").strip() or os.path.join(log_dir, "third_party_noise.log")
+    base_lvl = _parse_log_level(os.getenv("ORCH_THIRD_PARTY_LOG_LEVEL", "WARNING") or "WARNING", logging.WARNING)
+    lvl = _parse_log_level(os.getenv("ORCH_THIRD_PARTY_FILE_LEVEL", "") or "", base_lvl)
+
+    try:
+        fh = logging.FileHandler(path, encoding="utf-8")
+        fh.setLevel(lvl)
+        fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(process)d/%(threadName)s %(name)s - %(message)s"))
+    except Exception:
+        return
+
+    for n in (
+        "httpx",
+        "httpcore",
+        "httpcore.http11",
+        "httpcore.connection",
+        "h11",
+        "numba",
+        "numba.core",
+        "numba.core.ssa",
+    ):
+        try:
+            lg = logging.getLogger(n)
+            lg.handlers = [fh]
+            lg.propagate = False
+            # User intent: keep these libs quiet; only WARNING+ gets emitted, and it goes to file.
+            lg.setLevel(lvl)
+        except Exception:
+            pass
+
+
+# Execute immediately on import (before clients are created).
+_silence_third_party_logs()
 import httpx as _hx  # type: ignore
 import httpx  # type: ignore
 import hashlib as _hl
@@ -358,7 +461,8 @@ def _configure_logging() -> str:
     global LOG_LEVEL
 
     # Default to DEBUG to match historical behavior, but allow env override for deployments.
-    LOG_LEVEL = (os.getenv("ORCH_LOG_LEVEL", "DEBUG") or "DEBUG").strip().upper()
+    # Also accept LOG_LEVEL as a conventional alias (used by other services/compose).
+    LOG_LEVEL = (os.getenv("ORCH_LOG_LEVEL") or os.getenv("LOG_LEVEL") or "DEBUG").strip().upper()
     _level = getattr(logging, LOG_LEVEL, logging.DEBUG)
 
     _log_dir = (os.getenv("ORCH_LOG_DIR", "") or "").strip()
@@ -401,6 +505,10 @@ def _configure_logging() -> str:
         handlers=_handlers,
         force=True,
     )
+
+    # Keep stdout clean even when root is DEBUG: third-party libraries are pinned explicitly.
+    _silence_third_party_logs()
+    _maybe_divert_third_party_logs_to_file(_log_dir)
 
     
     logging.getLogger(__name__).debug(f"logging configured level={LOG_LEVEL} file={_log_file!r}")
@@ -2890,7 +2998,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         a = args if isinstance(args, dict) else {}
         character_id = str(a.get("character_id") or "").strip()
         if not character_id:
-            return {"name": name, "error": "missing_character_id"}
+            return _tool_error(name, "missing_character_id", "character_id is required", status=422)
         bundle = await _lock_load(character_id)
         if bundle is None:
             return {"name": name, "result": {"lock_bundle": None, "found": False}}
@@ -5454,16 +5562,22 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
     if name == "voice.register" and ALLOW_TOOL_EXECUTION:
         res = await run_voice_register(args if isinstance(args, dict) else {})
         if isinstance(res, dict) and res.get("error"):
-            return {"name": name, "error": res["error"]}
+            err_obj = res.get("error")
+            if isinstance(err_obj, dict):
+                return {"name": name, "error": err_obj}
+            return _tool_error(name, "voice_register_failed", str(err_obj), status=500)
         return {"name": name, "result": res.get("result", res)}
     if name == "voice.train" and ALLOW_TOOL_EXECUTION:
         res = await run_voice_train(args if isinstance(args, dict) else {})
         if isinstance(res, dict) and res.get("error"):
-            return {"name": name, "error": res["error"]}
+            err_obj = res.get("error")
+            if isinstance(err_obj, dict):
+                return {"name": name, "error": err_obj}
+            return _tool_error(name, "voice_train_failed", str(err_obj), status=500)
         return {"name": name, "result": res.get("result", res)}
     if name == "tts.speak" and ALLOW_TOOL_EXECUTION:
         if not XTTS_API_URL:
-            return {"name": name, "error": "XTTS_API_URL not configured"}
+            return _tool_error(name, "xtts_unconfigured", "XTTS_API_URL not configured", status=500)
         provider = _TTSProvider()
         manifest = {"items": []}
         a = args if isinstance(args, dict) else {}
@@ -6277,7 +6391,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         kind = (args.get("kind") or "").strip().lower()
         src = args.get("src") or ""
         if not kind or not src:
-            return {"name": name, "error": "missing kind|src"}
+            return _tool_error(name, "missing_input", "kind and src are required", status=422)
         try:
             if kind == "image":
                 c1 = await execute_tool_call({"name": "image.cleanup", "arguments": {"src": src, "cid": args.get("cid")}})
@@ -6294,7 +6408,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 # For now, prefer existing QA in TTS/music tools; here we just pass back src
                 return {"name": name, "result": {"src": src, "note": "audio QA runs in modality tools"}}
         except Exception as ex:
-            return {"name": name, "error": str(ex)}
+            return _tool_error(name, "creative_chain_exception", str(ex), status=500, stack=traceback.format_exc())
     if name == "creative.repro_pack" and ALLOW_TOOL_EXECUTION:
         # Write a small repro bundle next to the artifact (or under /uploads/repros)
         tool_used = (args.get("tool") or "").strip()
@@ -6346,7 +6460,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         except Exception as ex:
             _tb = traceback.format_exc()
             logging.error(_tb)
-            return {"name": name, "error": str(ex), "traceback": _tb}
+            return _tool_error(name, "style_dna_extract_failed", str(ex), status=500, stack=_tb)
     # reference-library tool surface removed (no external refs system).
     if name == "director.mode" and ALLOW_TOOL_EXECUTION:
         # No keyword-based intent detection here; return generic clarifying questions.
@@ -6379,13 +6493,13 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
     if name == "video.temporal_clip_qa" and ALLOW_TOOL_EXECUTION:
         src = args.get("src") or ""
         if not isinstance(src, str) or not src:
-            return {"name": name, "error": "missing src"}
+            return _tool_error(name, "missing_src", "src is required", status=422)
         src_abs = _resolve_upload_video_path(UPLOAD_DIR, src)
         if not src_abs:
-            return {"name": name, "error": "src must be under UPLOAD_DIR"}
+            return _tool_error(name, "path_escapes_uploads", "src must be under UPLOAD_DIR", status=422, src=src)
         metrics = _compute_temporal_clip_metrics(src_abs)
         if not isinstance(metrics, dict):
-            return {"name": name, "error": "failed to compute temporal metrics"}
+            return _tool_error(name, "metrics_failed", "failed to compute temporal metrics", status=500, src=src_abs)
         fps = float(metrics.get("fps") or 0.0)
         dur_s = float(metrics.get("duration_s") or 0.0)
         total = int(metrics.get("frames") or 0)
@@ -6427,7 +6541,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         a = args if isinstance(args, dict) else {}
         src = a.get("path") or a.get("src") or a.get("image_path") or ""
         if not isinstance(src, str) or not src:
-            return {"name": name, "error": "missing_image_path"}
+            return _tool_error(name, "missing_image_path", "path/src/image_path is required", status=422)
         prompt = str(a.get("prompt") or "").strip()
         # src is expected to be an absolute path under UPLOAD_DIR; callers are responsible for resolving URLs.
         global_info, region_info = analyze_image_with_regions(src=src, prompt=prompt)
@@ -6449,7 +6563,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
     # --- Extended Music/Audio tools ---
     if name == "music.melody.musicgen" and ALLOW_TOOL_EXECUTION:
         if not MUSIC_API_URL:
-            return {"name": name, "error": "MUSIC_API_URL not configured"}
+            return _tool_error(name, "music_backend_unconfigured", "MUSIC_API_URL not configured", status=500)
         async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
             payload = {
                 "text": args.get("text"),
@@ -6468,7 +6582,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             return {"name": name, "result": js if isinstance(js, dict) else {}}
     if name == "music.timed.sao" and ALLOW_TOOL_EXECUTION:
         if not SAO_API_URL:
-            return {"name": name, "error": "SAO_API_URL not configured"}
+            return _tool_error(name, "sao_backend_unconfigured", "SAO_API_URL not configured", status=500)
         async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
             payload = {
                 "text": args.get("text"),
@@ -6484,7 +6598,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             return {"name": name, "result": js if isinstance(js, dict) else {}}
     if name == "audio.stems.demucs" and ALLOW_TOOL_EXECUTION:
         if not DEMUCS_API_URL:
-            return {"name": name, "error": "DEMUCS_API_URL not configured"}
+            return _tool_error(name, "demucs_backend_unconfigured", "DEMUCS_API_URL not configured", status=500)
         try:
             async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
                 payload = {"mix_wav": args.get("mix_wav") or args.get("src"), "stems": args.get("stems") or ["vocals","drums","bass","other"]}
@@ -6534,7 +6648,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                             continue
                 return {"name": name, "result": js}
         except Exception as ex:
-            return {"name": name, "error": str(ex)}
+            return _tool_error(name, "demucs_exception", str(ex), status=500, stack=traceback.format_exc())
     if name == "audio.stems.adjust" and ALLOW_TOOL_EXECUTION:
         """
         Convenience tool: take a mixed WAV, run Demucs to get stems (if needed),
@@ -6542,7 +6656,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         """
         mix_path = args.get("mix_wav")
         if not isinstance(mix_path, str) or not mix_path.strip():
-            return {"name": name, "error": "missing mix_wav"}
+            return _tool_error(name, "missing_mix_wav", "mix_wav is required", status=422)
         mix_url = mix_path
         try:
             sep = await execute_tool_call(
@@ -6632,7 +6746,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             )
             return {"name": name, "result": env}
         except Exception as ex:
-            return {"name": name, "error": str(ex)}
+            return _tool_error(name, "audio_stems_adjust_exception", str(ex), status=500, stack=traceback.format_exc())
     if name == "audio.vocals.transform" and ALLOW_TOOL_EXECUTION:
         """
         Tool to adjust vocals in a mixed track: isolate vocals, apply pitch shift
@@ -6640,7 +6754,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         """
         mix_path = args.get("mix_wav")
         if not isinstance(mix_path, str) or not mix_path.strip():
-            return {"name": name, "error": "missing mix_wav"}
+            return _tool_error(name, "missing_mix_wav", "mix_wav is required", status=422)
         pitch_shift = args.get("pitch_shift_semitones")
         voice_lock_id = args.get("voice_lock_id")
         try:
@@ -6651,7 +6765,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             stems_info = (sep.get("result") or sep) if isinstance(sep, dict) else {}
             stems_obj = stems_info.get("stems") if isinstance(stems_info.get("stems"), dict) else stems_info
             if not isinstance(stems_obj, dict):
-                return {"name": name, "error": "stems_missing"}
+                return _tool_error(name, "stems_missing", "Demucs did not return stems", status=500, result=stems_info)
             vocals_path = None
             backing_stems: List[Dict[str, Any]] = []
             for stem_name, val in stems_obj.items():
@@ -6667,7 +6781,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 else:
                     backing_stems.append({"path": stem_path, "gain_db": 0.0})
             if not vocals_path:
-                return {"name": name, "error": "vocals_stem_missing"}
+                return _tool_error(name, "vocals_stem_missing", "Demucs returned no vocals stem", status=500, stems=list(stems_obj.keys()) if isinstance(stems_obj, dict) else None)
             # 2) Optional voice conversion via RVC (identity lock), required when voice_lock_id is provided.
             transformed_vocals = vocals_path
             if isinstance(voice_lock_id, str) and voice_lock_id.strip():
@@ -6891,7 +7005,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         return {"name": name, "result": js}
     if name == "voice.sing.diffsinger.rvc" and ALLOW_TOOL_EXECUTION:
         if not DIFFSINGER_RVC_API_URL:
-            return {"name": name, "error": "DIFFSINGER_RVC_API_URL not configured"}
+            return _tool_error(name, "diffsinger_backend_unconfigured", "DIFFSINGER_RVC_API_URL not configured", status=500)
         async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
             payload = {
                 "lyrics": args.get("lyrics"),
@@ -6911,9 +7025,9 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         lyrics_sections = a.get("lyrics_sections") if isinstance(a.get("lyrics_sections"), list) else []
         changed_line_ids = a.get("changed_line_ids") if isinstance(a.get("changed_line_ids"), list) else []
         if not isinstance(audio_path, str) or not audio_path.strip():
-            return {"name": name, "error": "missing_audio_path"}
+            return _tool_error(name, "missing_audio_path", "audio_path is required", status=422)
         if not lyrics_sections:
-            return {"name": name, "error": "missing_lyrics_sections"}
+            return _tool_error(name, "missing_lyrics_sections", "lyrics_sections is required", status=422)
         # Two-stage alignment:
         # 1) Coarse section ranges from Song Graph or uniform over duration.
         # 2) Fine line timings per section via MFA when available, else uniform within section.
@@ -7277,7 +7391,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         return {"name": name, "result": env}
     if name == "audio.foley.hunyuan" and ALLOW_TOOL_EXECUTION:
         if not HUNYUAN_FOLEY_API_URL:
-            return {"name": name, "error": "HUNYUAN_FOLEY_API_URL not configured"}
+            return _tool_error(name, "hunyuan_foley_unconfigured", "HUNYUAN_FOLEY_API_URL not configured", status=500)
         async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
             payload = {
                 "video_ref": args.get("video_ref") or args.get("src"),
@@ -7364,7 +7478,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             },
         }
     if name == "image.edit" and ALLOW_TOOL_EXECUTION:
-        return {"name": name, "error": "disabled: use image.dispatch with full graph (no fallbacks)"}
+        return _tool_error(name, "disabled", "disabled: use image.dispatch with full graph (no fallbacks)", status=403)
     if name == "image.super_gen" and ALLOW_TOOL_EXECUTION:
         # Multi-object iterative generation: base canvas + per-object refinement + global polish
         prompt = (args.get("prompt") or "").strip()
@@ -7455,7 +7569,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             if isinstance(cid, str) and cid and isinstance(rid, str) and rid:
                 base_path = _os.path.join(UPLOAD_DIR, "artifacts", "image", cid, rid)
         if not base_path or not _os.path.exists(base_path):
-            return {"name": name, "error": "base generation failed"}
+            return _tool_error(name, "base_generation_failed", "base generation failed", status=500)
         canvas = Image.open(base_path).convert("RGB")
         # 5) Per-object refinement via tiled generations blended into canvas with object-level CLIP constraint
         for (obj_prompt, box) in zip(objs, boxes):
@@ -7573,7 +7687,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         # Robust multi-engine metasearch without external API keys
         q = args.get("q") or args.get("query") or ""
         if not q:
-            return {"name": name, "error": "missing query"}
+            return _tool_error(name, "missing_query", "q/query is required", status=422)
         try:
             k = int(args.get("k", 10))
         except Exception as ex:
@@ -7590,11 +7704,11 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             lines.append(f"- {it.get('title','')}")
             lines.append(it.get('snippet',''))
             lines.append(it.get('link',''))
-        return {"name": name, "result": "\n".join(lines)}
+        return {"name": name, "result": {"text": "\n".join(lines), "items": fused}}
     if name == "metasearch.fuse" and ALLOW_TOOL_EXECUTION:
         q = args.get("q") or ""
         if not q:
-            return {"name": name, "error": "missing q"}
+            return _tool_error(name, "missing_q", "q is required", status=422)
         try:
             k = int(args.get("k", 10))
         except Exception as ex:
@@ -7610,10 +7724,10 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
     if name == "web.smart_get" and ALLOW_TOOL_EXECUTION:
         url = args.get("url") or ""
         if not url:
-            return {"name": name, "error": "missing url"}
+            return _tool_error(name, "missing_url", "url is required", status=422)
         base = (DRT_API_URL or "").rstrip("/")
         if not base:
-            return {"name": name, "error": "drt_unavailable"}
+            return _tool_error(name, "drt_unavailable", "DRT_API_URL not configured", status=500)
         async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
             payload = {"url": url, "modes": (args.get("modes") or {})}
             if isinstance(args.get("headers"), dict):
@@ -7625,7 +7739,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
     if name == "source_fetch" and ALLOW_TOOL_EXECUTION:
         url = args.get("url") or ""
         if not url:
-            return {"name": name, "error": "missing url"}
+            return _tool_error(name, "missing_url", "url is required", status=422)
         try:
             async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
                 r = await client.get(url)
@@ -7639,7 +7753,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             return {"name": name, "result": {"status": r.status_code, "content_type": ct, "sha256": h, "preview": preview}}
         except Exception as ex:
             logging.warning(f"source_fetch.failed url={url}: {ex}", exc_info=True)
-            return {"name": name, "error": str(ex)}
+            return _tool_error(name, "source_fetch_failed", str(ex), status=502, url=url, stack=traceback.format_exc())
     # frame_interpolate removed (legacy; interpolation is handled explicitly by video.interpolate and/or film assembly preferences).
     if name == "upscale":
         scale = int(args.get("scale") or 2)
@@ -7652,7 +7766,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         start = str(args.get("start") or "0")
         duration = str(args.get("duration") or "")
         if not src:
-            return {"name": name, "error": "missing src"}
+            return _tool_error(name, "missing_src", "src is required", status=422)
         outdir = os.path.join(UPLOAD_DIR, "artifacts", "video", f"trim-{int(time.time())}")
         os.makedirs(outdir, exist_ok=True)
         dst = os.path.join(outdir, "trimmed.mp4")
@@ -7674,12 +7788,12 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             return {"name": name, "result": {"path": url}}
         except Exception as ex:
             logging.error(f"ffmpeg.trim failed src={src} dst={dst} cmd={' '.join(ff)}: {ex}", exc_info=True)
-            return {"name": name, "error": str(ex)}
+            return _tool_error(name, "ffmpeg_trim_failed", str(ex), status=500, src=src, dst=dst, cmd=" ".join(ff), stack=traceback.format_exc())
     # ffmpeg.concat removed (legacy/unsafe). Canonical concat/mux lives in app/film_assembly.py.
     if name == "ffmpeg.audio_mix":
         a = args.get("a"); b = args.get("b"); vol_a = str(args.get("vol_a") or "1.0"); vol_b = str(args.get("vol_b") or "1.0")
         if not a or not b:
-            return {"name": name, "error": "missing a/b"}
+            return _tool_error(name, "missing_inputs", "a and b are required", status=422)
         outdir = os.path.join(UPLOAD_DIR, "artifacts", "audio", f"mix-{int(time.time())}")
         os.makedirs(outdir, exist_ok=True)
         dst = os.path.join(outdir, "mix.wav")
@@ -7690,15 +7804,15 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             return {"name": name, "result": {"path": url}}
         except Exception as ex:
             logging.error(f"ffmpeg.audio_mix failed dst={dst} cmd={' '.join(ff)}: {ex}", exc_info=True)
-            return {"name": name, "error": str(ex)}
+            return _tool_error(name, "ffmpeg_audio_mix_failed", str(ex), status=500, a=a, b=b, dst=dst, cmd=" ".join(ff), stack=traceback.format_exc())
     if name == "image.cleanup":
         src = args.get("src") or ""
         if not src:
-            return {"name": name, "error": "missing src"}
+            return _tool_error(name, "missing_src", "src is required", status=422)
         try:
             img = cv2.imread(src, cv2.IMREAD_COLOR)
             if img is None:
-                return {"name": name, "error": "failed to read src"}
+                return _tool_error(name, "src_read_failed", "failed to read src", status=422, src=src)
             work = img.copy()
             if bool(args.get("denoise")):
                 work = cv2.fastNlMeansDenoisingColored(work, None, 5, 5, 7, 21)
@@ -7733,11 +7847,11 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             trace_append("image", {"cid": cid_str, "tool": "image.cleanup", "src": src, "path": dst})
             return {"name": name, "result": {"path": url}}
         except Exception as ex:
-            return {"name": name, "error": str(ex)}
+            return _tool_error(name, "image_cleanup_exception", str(ex), status=500, src=src, stack=traceback.format_exc())
     if name == "video.cleanup":
         src = args.get("src") or ""
         if not src:
-            return {"name": name, "error": "missing src"}
+            return _tool_error(name, "missing_src", "src is required", status=422)
         outdir = os.path.join(UPLOAD_DIR, "artifacts", "video", f"vclean-{int(time.time())}")
         os.makedirs(outdir, exist_ok=True)
         dst = os.path.join(outdir, "clean.mp4")
@@ -7771,15 +7885,15 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             }
         except Exception as ex:
             logging.error(f"video.cleanup failed src={src} dst={dst} cmd={' '.join(ff)}: {ex}", exc_info=True)
-            return {"name": name, "error": str(ex)}
+            return _tool_error(name, "video_cleanup_failed", str(ex), status=500, src=src, dst=dst, cmd=" ".join(ff), stack=traceback.format_exc())
     if name == "image.artifact_fix":
         src = args.get("src") or ""; atype = (args.get("type") or "").strip().lower()
         if not src or atype not in ("clock", "glass"):
-            return {"name": name, "error": "missing src or unsupported type"}
+            return _tool_error(name, "missing_inputs", "src is required and type must be one of: clock, glass", status=422, src=src, type=atype)
         try:
             img = cv2.imread(src, cv2.IMREAD_COLOR)
             if img is None:
-                return {"name": name, "error": "failed to read src"}
+                return _tool_error(name, "src_read_failed", "failed to read src", status=422, src=src)
             work = img.copy()
             h, w = work.shape[:2]
             region = args.get("region") if isinstance(args.get("region"), list) and len(args.get("region")) == 4 else [0, 0, w, h]
@@ -7871,11 +7985,11 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             }
         except Exception as ex:
             logging.error(f"image.artifact_fix failed src={src} type={atype}: {ex}", exc_info=True)
-            return {"name": name, "error": str(ex)}
+            return _tool_error(name, "image_artifact_fix_failed", str(ex), status=500, src=src, type=atype, stack=traceback.format_exc())
     if name == "video.artifact_fix":
         src = args.get("src") or ""; atype = (args.get("type") or "").strip().lower()
         if not src or atype not in ("clock", "glass"):
-            return {"name": name, "error": "missing src or unsupported type"}
+            return _tool_error(name, "missing_inputs", "src is required and type must be one of: clock, glass", status=422, src=src, type=atype)
         outdir = os.path.join(UPLOAD_DIR, "artifacts", "video", f"vafix-{int(time.time())}")
         frames_dir = os.path.join(outdir, "frames"); os.makedirs(frames_dir, exist_ok=True)
         dst = os.path.join(outdir, "fixed.mp4")
@@ -7928,15 +8042,15 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             }
         except Exception as ex:
             logging.error(f"video.flow.derive failed src={src} frame_a={frame_a} frame_b={frame_b}: {ex}", exc_info=True)
-            return {"name": name, "error": str(ex)}
+            return _tool_error(name, "video_artifact_fix_failed", str(ex), status=500, src=src, type=atype, stack=traceback.format_exc())
     if name == "image.hands.fix":
         src = args.get("src") or ""
         if not src:
-            return {"name": name, "error": "missing src"}
+            return _tool_error(name, "missing_src", "src is required", status=422)
         try:
             img = cv2.imread(src, cv2.IMREAD_COLOR)
             if img is None:
-                return {"name": name, "error": "failed to read src"}
+                return _tool_error(name, "src_read_failed", "failed to read src", status=422, src=src)
             h, w = img.shape[:2]
             mask = np.zeros((h, w), dtype=np.uint8)
             mp_hands = mp.solutions.hands
@@ -7952,7 +8066,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                             hull = cv2.convexHull(np.array(pts, dtype=np.int32))
                             cv2.fillConvexPoly(mask, hull, 255)
             if mask.max() == 0:
-                return {"name": name, "error": "no hands detected"}
+                return _tool_error(name, "no_hands_detected", "no hands detected", status=422, src=src)
             # Split into per-hand components and fix each with dynamic parameters derived from local geometry
             work = img.copy()
             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -8017,11 +8131,11 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 },
             }
         except Exception as ex:
-            return {"name": name, "error": str(ex)}
+            return _tool_error(name, "image_hands_fix_failed", str(ex), status=500, src=src, stack=traceback.format_exc())
     if name == "video.hands.fix":
         src = args.get("src") or ""
         if not src:
-            return {"name": name, "error": "missing src"}
+            return _tool_error(name, "missing_src", "src is required", status=422)
         outdir = os.path.join(UPLOAD_DIR, "artifacts", "video", f"vhandsfix-{int(time.time())}")
         frames_dir = os.path.join(outdir, "frames"); os.makedirs(frames_dir, exist_ok=True)
         dst = os.path.join(outdir, "fixed.mp4")
@@ -8058,12 +8172,12 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 },
             }
         except Exception as ex:
-            return {"name": name, "error": str(ex)}
+            return _tool_error(name, "video_hands_fix_failed", str(ex), status=500, src=src, stack=traceback.format_exc())
     if name == "video.interpolate":
         src = args.get("src") or ""
         target_fps = int(args.get("target_fps") or 60)
         if not src:
-            return {"name": name, "error": "missing src"}
+            return _tool_error(name, "missing_src", "src is required", status=422)
         if not VFI_API_URL:
             return _tool_error(name, "vfi_unconfigured", "VFI_API_URL not configured", status=500)
 
@@ -8331,7 +8445,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 # Grab two frames step apart from the tail
                 cap = cv2.VideoCapture(src)
                 if not cap.isOpened():
-                    return {"name": name, "error": "failed to open src"}
+                    return _tool_error(name, "src_open_failed", "failed to open src", status=422, src=src)
                 total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
                 step = max(1, int(args.get("step") or 1))
                 idx_b = max(0, total - 1)
@@ -8344,7 +8458,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 if not ok_a or not ok_b:
                     a_img = None; b_img = None
             if a_img is None or b_img is None:
-                return {"name": name, "error": "missing frames"}
+                return _tool_error(name, "missing_frames", "missing frames", status=422, src=src, frame_a=frame_a, frame_b=frame_b)
             # Convert to gray
             a_gray = cv2.cvtColor(a_img, cv2.COLOR_BGR2GRAY)
             b_gray = cv2.cvtColor(b_img, cv2.COLOR_BGR2GRAY)
@@ -8386,13 +8500,13 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             )
             return {"name": name, "result": {"path": url}}
         except Exception as ex:
-            return {"name": name, "error": str(ex)}
+            return _tool_error(name, "video_flow_derive_failed", str(ex), status=500, src=src, frame_a=frame_a, frame_b=frame_b, stack=traceback.format_exc())
     if name == "video.upscale":
         src = args.get("src") or ""
         scale = int(args.get("scale") or 0)
         w = args.get("width"); h = args.get("height")
         if not src:
-            return {"name": name, "error": "missing src"}
+            return _tool_error(name, "missing_src", "src is required", status=422)
         outdir = os.path.join(UPLOAD_DIR, "artifacts", "video", f"upscale-{int(time.time())}")
         os.makedirs(outdir, exist_ok=True)
         dst = os.path.join(outdir, "upscaled.mp4")
@@ -8404,9 +8518,9 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             src_abs = os.path.normpath(os.path.join(UPLOAD_DIR, src_abs))
         src_abs = os.path.normpath(str(src_abs))
         if not src_abs.startswith(os.path.normpath(UPLOAD_DIR)):
-            return {"name": name, "error": "src must be under UPLOAD_DIR"}
+            return _tool_error(name, "bad_src_path", "src must be under UPLOAD_DIR", status=422, src=src)
         if not os.path.isfile(src_abs):
-            return {"name": name, "error": f"src not found: {src_abs}"}
+            return _tool_error(name, "src_not_found", f"src not found: {src_abs}", status=404, src=src_abs)
 
         # Probe fps and (optional) source width/height for target_long_edge decisions.
         fps = 30.0
@@ -8437,7 +8551,14 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         os.makedirs(frames_up, exist_ok=True)
         proc_frames = subprocess.run(["ffmpeg", "-y", "-i", src_abs, os.path.join(frames_in, "%06d.png")], check=False)
         if proc_frames.returncode != 0:
-            return {"name": name, "error": f"ffmpeg frame extract exited with code {proc_frames.returncode}"}
+            return _tool_error(
+                name,
+                "ffmpeg_extract_failed",
+                f"ffmpeg frame extract exited with code {proc_frames.returncode}",
+                status=500,
+                src=src_abs,
+                returncode=int(proc_frames.returncode),
+            )
 
         audio_path = os.path.join(outdir, "audio.m4a")
         proc_audio = subprocess.run(["ffmpeg", "-y", "-i", src_abs, "-vn", "-c:a", "copy", audio_path], check=False)
@@ -8445,7 +8566,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
 
         frame_files = sorted(_glob(os.path.join(frames_in, "*.png")))
         if not frame_files:
-            return {"name": name, "error": "no frames extracted"}
+            return _tool_error(name, "no_frames_extracted", "no frames extracted", status=500, src=src_abs)
 
         # Determine upscale parameters for the image service.
         # Prefer explicit scale; if width/height provided, map to target_long_edge.
@@ -8506,7 +8627,15 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 vf = f"scale={int(w)}:{int(h)}:flags=lanczos"
             proc_scale = subprocess.run(["ffmpeg", "-y", "-i", src_abs, "-vf", vf, "-c:v", "libx264", "-preset", "slow", "-crf", "18", "-c:a", "copy", dst], check=False)
             if proc_scale.returncode != 0:
-                return {"name": name, "error": f"ffmpeg upscale exited with code {proc_scale.returncode}"}
+                return _tool_error(
+                    name,
+                    "ffmpeg_upscale_failed",
+                    f"ffmpeg upscale exited with code {proc_scale.returncode}",
+                    status=500,
+                    src=src_abs,
+                    returncode=int(proc_scale.returncode),
+                    vf=vf,
+                )
             # Jump to post-return path building with this dst.
             url = dst.replace("/workspace", "") if dst.startswith("/workspace/") else dst
             cid_val = args.get("cid")
@@ -8544,7 +8673,14 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             check=False,
         )
         if proc_enc.returncode != 0:
-            return {"name": name, "error": f"ffmpeg encode exited with code {proc_enc.returncode}"}
+            return _tool_error(
+                name,
+                "ffmpeg_encode_failed",
+                f"ffmpeg encode exited with code {proc_enc.returncode}",
+                status=500,
+                src=src_abs,
+                returncode=int(proc_enc.returncode),
+            )
 
         if has_audio:
             proc_mux = subprocess.run(
@@ -8715,7 +8851,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         src = args.get("src") or ""
         texts = args.get("texts") or []
         if not src or not isinstance(texts, list) or not texts:
-            return {"name": name, "error": "missing src|texts"}
+            return _tool_error(name, "missing_inputs", "src and texts are required", status=422)
         # Extract frames
         outdir = os.path.join(UPLOAD_DIR, "artifacts", "video", f"txtov-{int(_tm.time())}")
         frames_dir = os.path.join(outdir, "frames")
@@ -8736,7 +8872,13 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             check=False,
         )
         if proc2.returncode != 0:
-            return {"name": name, "error": f"ffmpeg text.encode exited with code {proc2.returncode}"}
+            return _tool_error(
+                name,
+                "ffmpeg_text_overlay_failed",
+                f"ffmpeg text.encode exited with code {proc2.returncode}",
+                status=500,
+                returncode=int(proc2.returncode),
+            )
         url = dst.replace("/workspace", "") if dst.startswith("/workspace/") else dst
         cid_val = args.get("cid")
         if isinstance(cid_val, (str, int)):
@@ -8751,14 +8893,14 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         return {"name": name, "result": {"path": url}}
     if name == "video.hv.t2v" and ALLOW_TOOL_EXECUTION:
         if not HYVIDEO_API_URL:
-            return {"name": name, "error": "HYVIDEO_API_URL not configured"}
+            return _tool_error(name, "hyvideo_unconfigured", "HYVIDEO_API_URL not configured", status=500)
         payload, job_id, fps = hv_args_to_generate_payload(args if isinstance(args, dict) else {}, upload_dir=UPLOAD_DIR, job_prefix="hv")
         env = await hyvideo_generate(HYVIDEO_API_URL, payload)
         norm = normalize_generate_response(env if isinstance(env, dict) else {}, upload_dir=UPLOAD_DIR)
         return {"name": name, "result": norm}
     if name == "video.hv.i2v" and ALLOW_TOOL_EXECUTION:
         if not HYVIDEO_API_URL:
-            return {"name": name, "error": "HYVIDEO_API_URL not configured"}
+            return _tool_error(name, "hyvideo_unconfigured", "HYVIDEO_API_URL not configured", status=500)
         # Back-compat alias: same endpoint; `init_image` triggers i2v if present.
         payload, job_id, fps = hv_args_to_generate_payload(args if isinstance(args, dict) else {}, upload_dir=UPLOAD_DIR, job_prefix="hv")
         env = await hyvideo_generate(HYVIDEO_API_URL, payload)
@@ -8832,15 +8974,19 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                 return {"name": name, "result": {"approx": float(val)}}
         except Exception as ex:
             logging.error(f"math.sympy failed: {ex}", exc_info=True)
-            return {"name": name, "error": str(ex)}
+            return _tool_error(name, "math_eval_failed", str(ex), status=500, stack=traceback.format_exc())
     if name == "rag_index":
         res = await rag_index_dir(root=args.get("root", "/workspace"))
+        if isinstance(res, dict) and isinstance(res.get("error"), dict):
+            return {"name": name, "error": res.get("error")}
+        if isinstance(res, dict) and isinstance(res.get("error"), str) and str(res.get("error")).strip():
+            return _tool_error(name, "rag_index_failed", str(res.get("error")), status=500)
         return {"name": name, "result": res}
     if name == "rag_search":
         query = args.get("query")
         k = int(args.get("k", 8))
         if not query:
-            return {"name": name, "error": "missing query"}
+            return _tool_error(name, "missing_query", "query is required", status=422)
         res = await rag_search(query, k)
         return {"name": name, "result": res}
     # --- Multimodal external services (optional; enable via env URLs) ---
@@ -8869,7 +9015,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             js = parser.parse(r.text or "", {})
             if 200 <= r.status_code < 300:
                 return {"name": name, "result": js if isinstance(js, dict) else {}}
-            return {"name": name, "error": r.text}
+            return _tool_error(name, "asr_http_error", r.text or "asr_transcribe failed", status=int(r.status_code or 500), body=(r.text or "")[:2000])
     if name == "image_generate" and COMFYUI_API_URL and ALLOW_TOOL_EXECUTION:
         # expects a ComfyUI workflow graph or minimal prompt params passed through
         async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
@@ -8882,7 +9028,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             js = parser.parse(r.text or "", {})
             if 200 <= r.status_code < 300:
                 return {"name": name, "result": js if isinstance(js, dict) else {}}
-            return {"name": name, "error": r.text}
+            return _tool_error(name, "comfy_http_error", r.text or "image_generate failed", status=int(r.status_code or 500), body=(r.text or "")[:2000])
     if name == "controlnet" and COMFYUI_API_URL and ALLOW_TOOL_EXECUTION:
         async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
             wf_payload = args.get("workflow") or args
@@ -8894,7 +9040,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             js = parser.parse(r.text or "", {})
             if 200 <= r.status_code < 300:
                 return {"name": name, "result": js if isinstance(js, dict) else {}}
-            return {"name": name, "error": r.text}
+            return _tool_error(name, "comfy_http_error", r.text or "controlnet failed", status=int(r.status_code or 500), body=(r.text or "")[:2000])
     if name == "video_generate" and COMFYUI_API_URL and ALLOW_TOOL_EXECUTION:
         async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
             wf_payload = args.get("workflow") or args
@@ -8906,7 +9052,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             js = parser.parse(r.text or "", {})
             if 200 <= r.status_code < 300:
                 return {"name": name, "result": js if isinstance(js, dict) else {}}
-            return {"name": name, "error": r.text}
+            return _tool_error(name, "comfy_http_error", r.text or "video_generate failed", status=int(r.status_code or 500), body=(r.text or "")[:2000])
     if name == "face_embed" and FACEID_API_URL and ALLOW_TOOL_EXECUTION:
         async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
             r = await client.post(FACEID_API_URL.rstrip("/") + "/embed", json={"image_url": args.get("image_url")})
@@ -8914,7 +9060,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             js = parser.parse(r.text or "", {})
             if 200 <= r.status_code < 300:
                 return {"name": name, "result": js if isinstance(js, dict) else {}}
-            return {"name": name, "error": r.text}
+            return _tool_error(name, "faceid_http_error", r.text or "face_embed failed", status=int(r.status_code or 500), body=(r.text or "")[:2000])
     if name == "music_generate" and MUSIC_API_URL and ALLOW_TOOL_EXECUTION:
         async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
             r = await client.post(MUSIC_API_URL.rstrip("/") + "/generate", json=args)
@@ -8922,7 +9068,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             js = parser.parse(r.text or "", {})
             if 200 <= r.status_code < 300:
                 return {"name": name, "result": js if isinstance(js, dict) else {}}
-            return {"name": name, "error": r.text}
+            return _tool_error(name, "music_http_error", r.text or "music_generate failed", status=int(r.status_code or 500), body=(r.text or "")[:2000])
     if name == "vlm_analyze" and VLM_API_URL and ALLOW_TOOL_EXECUTION:
         async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
             r = await client.post(VLM_API_URL.rstrip("/") + "/analyze", json={"image_url": args.get("image_url"), "prompt": args.get("prompt")})
@@ -8930,7 +9076,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             js = parser.parse(r.text or "", {})
             if 200 <= r.status_code < 300:
                 return {"name": name, "result": js if isinstance(js, dict) else {}}
-            return {"name": name, "error": r.text}
+            return _tool_error(name, "vlm_http_error", r.text or "vlm_analyze failed", status=int(r.status_code or 500), body=(r.text or "")[:2000])
     # --- Film tools (LLM-driven, simple UI) ---
     if name == "run_python" and EXECUTOR_BASE_URL and ALLOW_TOOL_EXECUTION:
         async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
@@ -8939,7 +9085,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             js = parser.parse(r.text or "", {})
             if 200 <= r.status_code < 300:
                 return {"name": name, "result": js if isinstance(js, dict) else {}}
-            return {"name": name, "error": r.text}
+            return _tool_error(name, "executor_http_error", r.text or "run_python failed", status=int(r.status_code or 500), body=(r.text or "")[:2000])
     if name == "write_file" and EXECUTOR_BASE_URL and ALLOW_TOOL_EXECUTION:
         # Guard: forbid writing banned libraries into requirements/pyproject
         p = (args.get("path") or "").lower()
@@ -8947,14 +9093,14 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         if any(name in p for name in ("requirements.txt", "pyproject.toml")):
             banned = ("pydantic", "sqlalchemy", "pandas", "pyarrow", "fastparquet", "polars")
             if any(b in content_val.lower() for b in banned):
-                return {"name": name, "error": "forbidden_library", "detail": "banned library in dependency file"}
+                return _tool_error(name, "forbidden_library", "banned library in dependency file", status=422, path=str(args.get("path") or ""))
         async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
             r = await client.post(EXECUTOR_BASE_URL.rstrip("/") + "/write_file", json={"path": args.get("path"), "content": content_val})
             parser = JSONParser()
             js = parser.parse(r.text or "", {})
             if 200 <= r.status_code < 300:
                 return {"name": name, "result": js if isinstance(js, dict) else {}}
-            return {"name": name, "error": r.text}
+            return _tool_error(name, "executor_http_error", r.text or "write_file failed", status=int(r.status_code or 500), body=(r.text or "")[:2000])
     if name == "read_file" and EXECUTOR_BASE_URL and ALLOW_TOOL_EXECUTION:
         async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
             r = await client.post(EXECUTOR_BASE_URL.rstrip("/") + "/read_file", json={"path": args.get("path")})
@@ -8962,11 +9108,16 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             js = parser.parse(r.text or "", {})
             if 200 <= r.status_code < 300:
                 return {"name": name, "result": js if isinstance(js, dict) else {}}
-            return {"name": name, "error": r.text}
+            return _tool_error(name, "executor_http_error", r.text or "read_file failed", status=int(r.status_code or 500), body=(r.text or "")[:2000])
     # MCP tool forwarding (HTTP bridge)
     if name and (name.startswith("mcp:") or args.get("mcpTool") is True) and ALLOW_TOOL_EXECUTION:
-        res = await _call_mcp_tool(MCP_HTTP_BRIDGE_URL, name.replace("mcp:", "", 1), args)
-        return {"name": name, "result": res}
+        env = await _call_mcp_tool(MCP_HTTP_BRIDGE_URL, name.replace("mcp:", "", 1), args)
+        if isinstance(env, dict) and bool(env.get("ok")) and isinstance(env.get("result"), dict):
+            return {"name": name, "result": env.get("result")}
+        err_obj = env.get("error") if isinstance(env, dict) else None
+        if isinstance(err_obj, dict):
+            return {"name": name, "error": err_obj}
+        return _tool_error(name, "mcp_failed", "MCP tool call failed", status=502, raw=env)
     # Unknown tool - return as unexecuted
     return {"name": name or "unknown", "skipped": True, "reason": "unsupported tool in orchestrator"}
 

@@ -532,8 +532,28 @@ async def execute_plan(body: Dict[str, Any]):
                 return JSONResponse(body_env, status_code=200)
             args = _merge_inputs(step)
             t0 = time.time()
-            # Use UTC runner directly; any exceptions bubble to the global exception handler.
-            res = await utc_run_tool(trace_id_val, sid, tool_name, args)
+            # Use UTC runner directly, but never let exceptions crash the whole plan.
+            # If the await raises, ensure `res` is still defined and return a canonical error envelope.
+            res: Any = None
+            try:
+                res = await utc_run_tool(trace_id_val, sid, tool_name, args)
+            except Exception as ex:
+                stk = _stack_str()
+                err_env = {
+                    "code": "utc_exception",
+                    "message": f"utc_run_tool raised for tool={tool_name} step_id={sid}: {ex}",
+                    "status": 500,
+                    "details": {"tool": tool_name, "step": sid},
+                    "traceback": stk,
+                    "stack": stk,
+                }
+                body = _build_executor_envelope(
+                    str(request_id_val or "executor-plan"),
+                    False,
+                    produced,
+                    err_env,
+                )
+                return JSONResponse(body, status_code=200)
             ok = False
             if isinstance(res, dict) and bool(res.get("ok")) is True and res.get("result") is not None:
                 produced[sid] = res.get("result")
@@ -711,7 +731,30 @@ async def run_steps(trace_id: str, request_id: str, steps: list[dict]) -> Dict[s
             if cid_val:
                 step_start_payload["cid"] = cid_val
             _post_json(ORCHESTRATOR_BASE_URL.rstrip("/") + "/logs/tools.append", step_start_payload, expected={})
-            res = await utc_run_tool(trace_corr, sid, tool_name, args)
+            res: Any = None
+            try:
+                res = await utc_run_tool(trace_corr, sid, tool_name, args)
+            except Exception as ex:
+                produced[sid] = {
+                    "name": tool_name,
+                    "result": {
+                        "ids": {},
+                        "meta": {},
+                        "error": {
+                            "code": "utc_exception",
+                            "message": f"utc_run_tool raised: {ex}",
+                            "stack": _stack_str(),
+                            "trace_id": trace_corr,
+                            "details": {"tool": tool_name, "step": sid},
+                        },
+                        "status": 500,
+                        "trace_id": trace_corr,
+                    },
+                }
+                ok = False
+                # Still emit end events below; continue to next step.
+                # (Do not raise.)
+                res = {}
             ok = False
             # Guard: utc_run_tool must never return None/non-dict; if it does, wrap in a result block
             # that matches existing executor result structure (ids/meta/error/status), with a stack.
@@ -809,10 +852,24 @@ async def run_steps(trace_id: str, request_id: str, steps: list[dict]) -> Dict[s
                 "duration_ms": int((time.time() - t0) * 1000.0),
                 "trace_id": trace_corr,
                 "step_id": sid,
-                "error": (None if ok else "tool_error"),
+                # IMPORTANT: never emit string-typed errors; downstream expects dict envelopes.
+                "error": None,
                 "traceback": None,
                 "summary": (_distill_summary(produced.get(sid)) if ok else None),
             }
+            if not ok:
+                step_obj = produced.get(sid) if isinstance(produced.get(sid), dict) else {}
+                res_obj = step_obj.get("result") if isinstance(step_obj.get("result"), dict) else {}
+                err_obj = res_obj.get("error") if isinstance(res_obj.get("error"), dict) else None
+                if err_obj is None:
+                    # Fall back to a minimal structured error envelope.
+                    err_obj = {"code": "tool_error", "message": f"{tool_name} failed", "status": int(res_obj.get("status") or 422)}
+                end_payload["error"] = err_obj
+                tb = err_obj.get("traceback") if isinstance(err_obj, dict) else None
+                if not isinstance(tb, (str, bytes)) or not tb:
+                    tb = err_obj.get("stack") if isinstance(err_obj, dict) else None
+                if isinstance(tb, (str, bytes)) and tb:
+                    end_payload["traceback"] = tb
             if cid_val:
                 end_payload["cid"] = cid_val
             _post_json(ORCHESTRATOR_BASE_URL.rstrip("/") + "/logs/tools.append", end_payload, expected={})

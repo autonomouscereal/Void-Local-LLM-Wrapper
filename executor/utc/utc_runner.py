@@ -195,7 +195,11 @@ async def utc_run_tool(trace_id: Optional[str], step_id: Optional[str], name: st
         or 422
     )
     # Preserve the ORIGINAL tool traceback/stack when available.
-    tool_stack: str | bytes | None = None
+    #
+    # IMPORTANT: some tools return a structured stack/tool_stack object (dict/list),
+    # while others return a plain string traceback. Preserve both without changing
+    # types mid-flight.
+    tool_stack: Any = None
     containers = [
         err_obj,
         (err_obj.get("details") if isinstance(err_obj, dict) and isinstance(err_obj.get("details"), dict) else None),
@@ -204,13 +208,25 @@ async def utc_run_tool(trace_id: Optional[str], step_id: Optional[str], name: st
     for c in containers:
         if not isinstance(c, dict):
             continue
-        for k in ("traceback", "stack", "stacktrace"):
+        for k in ("tool_stack", "traceback", "stack", "stacktrace"):
             v = c.get(k)
-            if isinstance(v, (str, bytes)) and v:
+            if v is None:
+                continue
+            if isinstance(v, (dict, list)) and v:
                 tool_stack = v
+                break
+            if isinstance(v, (str, bytes)) and v:
+                # If this is actually JSON, keep it structured (tools sometimes return JSON strings).
+                parsed = JSONParser().parse(v, {})
+                if isinstance(parsed, (dict, list)) and parsed:
+                    tool_stack = parsed
+                else:
+                    tool_stack = v
                 break
         if tool_stack is not None:
             break
+    # Always include a human-readable stack string as `stack`; preserve any structured tool stack
+    # separately so downstream callers can safely do `.get(...)` on it.
     final_stack = tool_stack if isinstance(tool_stack, (str, bytes)) and tool_stack else _stack_str()
     return {
         "schema_version": 1,
@@ -222,6 +238,7 @@ async def utc_run_tool(trace_id: Optional[str], step_id: Optional[str], name: st
             "message": err_obj.get("message") or f"tool {name} failed",
             "status": status,
             "raw": res,
+            "tool_stack": (tool_stack if isinstance(tool_stack, (dict, list)) else None),
             "stack": final_stack,
         },
     }

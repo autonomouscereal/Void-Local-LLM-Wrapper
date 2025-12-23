@@ -292,6 +292,15 @@ services:
     # - Changing workpath/module path is FORBIDDEN.
     environment:
       - PYTHONUNBUFFERED=1
+      # Logging defaults: keep stdout readable in normal operation; override as needed.
+      - ORCH_LOG_LEVEL=${ORCH_LOG_LEVEL:-DEBUG}
+      - ORCH_THIRD_PARTY_LOG_LEVEL=${ORCH_THIRD_PARTY_LOG_LEVEL:-WARNING}
+      # Route third-party warnings to a separate file on the void log volume.
+      - ORCH_THIRD_PARTY_LOG_TO_FILE=${ORCH_THIRD_PARTY_LOG_TO_FILE:-1}
+      - ORCH_THIRD_PARTY_FILE_LEVEL=${ORCH_THIRD_PARTY_FILE_LEVEL:-WARNING}
+      # Numba JIT/logging defaults (librosa and other deps may import numba indirectly).
+      - NUMBA_LOG_LEVEL=${NUMBA_LOG_LEVEL:-WARNING}
+      - NUMBA_DEBUG=${NUMBA_DEBUG:-0}
       - FILM2_MODELS=/opt/models
       - FILM2_DATA=/srv/film2
       - QWEN_BASE_URL=http://127.0.0.1:11435
