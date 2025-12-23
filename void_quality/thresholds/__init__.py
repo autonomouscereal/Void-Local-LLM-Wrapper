@@ -6,12 +6,15 @@ from functools import lru_cache
 from importlib import resources
 from typing import Any, Dict, Optional
 
+from void_json.json_parser import JSONParser
+
 
 def _load_json_data(rel_path: str) -> Dict[str, Any]:
     # Package data loader: uses importlib.resources so it works inside containers
     # without relying on filesystem-relative paths.
     data = resources.files(__package__).joinpath("data").joinpath(rel_path).read_bytes()
-    obj = json.loads(data.decode("utf-8"))
+    parser = JSONParser()
+    obj = parser.parse(data.decode("utf-8", errors="replace"), {})
     return obj if isinstance(obj, dict) else {}
 
 

@@ -17,6 +17,8 @@ from diffusers import HunyuanVideoPipeline, HunyuanVideoTransformer3DModel
 from diffusers.utils import export_to_video
 from PIL import Image
 
+from void_json.json_parser import JSONParser
+
 
 APP = FastAPI(title="HunyuanVideo Service", version="1.0")
 
@@ -326,9 +328,9 @@ async def generate(req: Request):
     if not body_txt.strip():
         data: Dict[str, Any] = {}
     else:
-        try:
-            data = json.loads(body_txt)
-        except Exception:
+        parser = JSONParser()
+        data = parser.parse(body_txt, {})
+        if not isinstance(data, dict):
             return JSONResponse(status_code=400, content={"ok": False, "error": {"code": "invalid_json", "message": "request body must be JSON"}})
     if not isinstance(data, dict):
         return JSONResponse(status_code=400, content={"ok": False, "error": {"code": "invalid_json", "message": "request body must be a JSON object"}})

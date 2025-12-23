@@ -44,9 +44,9 @@ def _env_float(name: str, default: float, *, min_val: float = 0.0, max_val: floa
 
 
 STORY_COMMITTEE_ROUNDS = _env_int("STORY_COMMITTEE_ROUNDS", 1, min_val=1, max_val=10)
-STORY_MAX_PASSES = _env_int("STORY_MAX_PASSES", 8, min_val=1, max_val=1000)
+# By default, do NOT hard-cap story iterations. If you want a cap, set STORY_MAX_PASSES > 0.
+STORY_MAX_PASSES = _env_int("STORY_MAX_PASSES", 0, min_val=0, max_val=1000)
 STORY_TEMPERATURE = _env_float("STORY_TEMPERATURE", 0.5, min_val=0.0, max_val=2.0)
-STORY_MIN_ISSUES_TO_REVISE = _env_int("STORY_MIN_ISSUES_TO_REVISE", 1, min_val=0, max_val=1000)
 
 
 def _story_schema() -> Dict[str, Any]:
@@ -79,6 +79,11 @@ def _issue_schema() -> Dict[str, Any]:
         "issues": list,
         "summary": str,
         "must_fix": bool,
+        # "done" is the authoritative committee signal for whether the story meets user intent + length.
+        "done": bool,
+        "length_ok": bool,
+        "coverage_ratio": float,
+        "next_action": str,
     }
 
 
@@ -153,10 +158,10 @@ async def _committee_generate_story_raw(user_prompt: str, duration_hint_s: float
     else:
         txt = str(env.get("text") or "")
     log.info(
-        "story.committee.draft_raw done trace_id=%s raw_chars=%d dur_ms=%d",
+        "story.committee.draft_raw done trace_id=%s dur_ms=%d raw=%s",
         trace_id,
-        len(txt or ""),
         int((time.perf_counter() - t0) * 1000),
+        txt,
     )
     return txt
 
@@ -165,26 +170,54 @@ async def _committee_audit_story(story: Dict[str, Any], user_prompt: str, *, tra
     """
     Committee-based continuity + intent audit. Returns {issues: [...], summary: str, must_fix: bool}.
     """
+    # Provide basic quantitative coverage, but rely on committee judgement for "done".
+    total_hint = float(story.get("duration_hint_s") or 0.0) if isinstance(story, dict) else 0.0
+    total_beats_time = 0.0
+    acts = story.get("acts") if isinstance(story, dict) and isinstance(story.get("acts"), list) else []
+    for act in acts:
+        if not isinstance(act, dict):
+            continue
+        scenes = act.get("scenes") if isinstance(act.get("scenes"), list) else []
+        for scene in scenes:
+            if not isinstance(scene, dict):
+                continue
+            beats = scene.get("beats") if isinstance(scene.get("beats"), list) else []
+            for beat in beats:
+                if not isinstance(beat, dict):
+                    continue
+                total_beats_time += float(beat.get("time_hint_s") or 0.0)
+    ratio = (total_beats_time / total_hint) if (total_hint > 0.0 and total_beats_time > 0.0) else 0.0
+
     sys_msg = (
-        "You are a strict story continuity auditor.\n"
+        "You are a strict story continuity AND completion auditor.\n"
         "Given a story graph JSON and the user prompt, find ALL violations:\n"
         "- breaks user intent\n"
         "- continuity contradictions (injuries, objects, locations, relationships)\n"
         "- temporal contradictions and time travel inconsistencies\n"
         "- missing causal links / dangling plot threads that will confuse viewers\n"
         "- character motives that don't track\n"
+        "\n"
+        "You must ALSO judge whether the story is COMPLETE for the requested duration.\n"
+        "A 20-second story can be simple; a 2-hour story must have appropriately deep arcs.\n"
+        "You will be given duration_hint_s and current_beats_time_s/coverage_ratio, but you MUST decide completion.\n"
+        "\n"
+        "Return JSON only with fields:\n"
+        "- done: bool (authoritative: true ONLY if story is ready to proceed)\n"
+        "- length_ok: bool (true if duration/content depth matches the request)\n"
+        "- coverage_ratio: float (echo the provided ratio or your estimate)\n"
+        "- next_action: string one of: 'accept'|'extend'|'revise'|'extend_then_revise'\n"
+        "- must_fix: bool (true if severe issues exist)\n"
+        "- summary: string\n"
+        "- issues: list of issue objects (code, severity, message, pointers, suggested_fix)\n"
         "Return issues with precise pointers (act_id/scene_id/beat_id/line_id/char_id/obj_id).\n"
-        "Output JSON only."
     )
     user_msg = json.dumps(
         {
             "user_prompt": _norm_prompt(user_prompt),
+            "duration_hint_s": float(total_hint),
+            "current_beats_time_s": float(total_beats_time),
+            "coverage_ratio": float(ratio),
             "story": story,
-            "output": {
-                "issues": "list of issue objects (code, severity, message, pointers, suggested_fix)",
-                "summary": "short summary",
-                "must_fix": "true if any issue is severe",
-            },
         },
         ensure_ascii=False,
     )
@@ -207,8 +240,11 @@ async def _committee_audit_story(story: Dict[str, Any], user_prompt: str, *, tra
         temperature=0.0,
     )
     if not parsed:
-        return {"issues": [], "summary": "", "must_fix": False}
+        return {"issues": [], "summary": "", "must_fix": False, "done": False, "length_ok": False, "coverage_ratio": float(ratio), "next_action": "extend"}
     issues = parsed.get("issues") if isinstance(parsed.get("issues"), list) else []
+    parsed.setdefault("coverage_ratio", float(ratio))
+    if not isinstance(parsed.get("next_action"), str):
+        parsed["next_action"] = "revise" if bool(parsed.get("must_fix")) else ("accept" if bool(parsed.get("done")) else "extend")
     log.info(
         "story.committee.audit done trace_id=%s issues=%d must_fix=%s dur_ms=%d",
         trace_id,
@@ -290,25 +326,164 @@ async def draft_story_graph(user_prompt: str, duration_hint_s: Optional[float], 
     story.setdefault("characters", [])
     story.setdefault("locations", [])
     story.setdefault("objects", [])
-    # Iterative audit/revise loop (can be large; configurable via env)
-    for pass_index in range(int(STORY_MAX_PASSES)):
-        log.info("story.draft.pass start trace_id=%s pass_index=%d", trace_id, int(pass_index))
+    # Iterative expansion + audit/revise loop (can be large).
+    # We stop ONLY when the committee audit says to accept (authoritative), not after an arbitrary number of loops.
+    pass_index = 0
+    consecutive_no_progress = 0
+    last_beats_time_s: Optional[float] = None
+    last_beats_count: Optional[int] = None
+    max_passes = int(STORY_MAX_PASSES)
+    while True:
+        if max_passes > 0 and pass_index >= max_passes:
+            trace_event("story.max_passes_reached", {"trace_id": trace_id, "max_passes": int(max_passes)})
+            break
+        # Measure current duration coverage (sum beat time hints) for logging + context.
+        total_hint = float(story.get("duration_hint_s") or 0.0)
+        total_beats_time = 0.0
+        total_beats_count = 0
+        acts = story.get("acts") if isinstance(story.get("acts"), list) else []
+        for act in acts:
+            if not isinstance(act, dict):
+                continue
+            scenes = act.get("scenes") if isinstance(act.get("scenes"), list) else []
+            for scene in scenes:
+                if not isinstance(scene, dict):
+                    continue
+                beats = scene.get("beats") if isinstance(scene.get("beats"), list) else []
+                for beat in beats:
+                    if not isinstance(beat, dict):
+                        continue
+                    total_beats_count += 1
+                    total_beats_time += float(beat.get("time_hint_s") or 0.0)
+        ratio = (total_beats_time / total_hint) if (total_hint > 0.0 and total_beats_time > 0.0) else 0.0
+
+        log.info(
+            "story.draft.pass start trace_id=%s pass_index=%d beats_time_s=%.2f duration_hint_s=%.2f ratio=%.3f",
+            trace_id,
+            int(pass_index),
+            float(total_beats_time),
+            float(total_hint),
+            float(ratio),
+        )
+
+        # Audit after each iteration (authoritative "done" signal).
         audit = await _committee_audit_story(story, prompt_text, trace_id=(trace_id or f"film2.story_audit.{pass_index}"))
         issues = audit.get("issues") if isinstance(audit, dict) and isinstance(audit.get("issues"), list) else []
+        must_fix = bool(audit.get("must_fix")) if isinstance(audit, dict) else False
+        done = bool(audit.get("done")) if isinstance(audit, dict) else False
+        length_ok = bool(audit.get("length_ok")) if isinstance(audit, dict) else False
+        next_action = audit.get("next_action") if isinstance(audit, dict) else None
+        next_action_s = str(next_action) if isinstance(next_action, str) else ""
+
         trace_event(
             "story.committee_audit",
             {
                 "trace_id": trace_id,
                 "pass_index": int(pass_index),
                 "issues": len(issues),
-                "must_fix": bool(audit.get("must_fix")) if isinstance(audit, dict) else False,
+                "must_fix": must_fix,
+                "done": done,
+                "length_ok": length_ok,
+                "coverage_ratio": float(audit.get("coverage_ratio") or ratio) if isinstance(audit, dict) else float(ratio),
+                "next_action": next_action_s,
             },
         )
-        if len(issues) < int(STORY_MIN_ISSUES_TO_REVISE):
+
+        # Authoritative stop: committee says accept.
+        if done and next_action_s == "accept":
             break
-        story = await _committee_revise_story(story, prompt_text, audit, trace_id=(trace_id or f"film2.story_revise.{pass_index}"))
-        if not isinstance(story, dict):
-            break
+
+        # Fix pass when committee requests revision (or marks must_fix).
+        if must_fix or next_action_s in ("revise", "extend_then_revise"):
+            story = await _committee_revise_story(story, prompt_text, audit, trace_id=(trace_id or f"film2.story_revise.{pass_index}"))
+            if not isinstance(story, dict):
+                break
+            story.setdefault("prompt", prompt_text)
+            story.setdefault("duration_hint_s", float(duration))
+            pass_index += 1
+            continue
+
+        # Extend pass when committee requests extension (or says length not ok).
+        if (not length_ok) or next_action_s in ("extend", "extend_then_revise"):
+            sys_msg = (
+                "You are the Story Engine continuation pass.\n"
+                "You MUST EXTEND the existing story graph to meet the requested duration and depth.\n"
+                "Rules:\n"
+                "- Keep all existing acts/scenes/beats/dialogue/events unchanged unless required for continuity.\n"
+                "- Add NEW acts/scenes/beats to reach the duration. Deeper arcs for long films.\n"
+                "- Maintain strict continuity: state_change events must be reflected later.\n"
+                "- Maintain stable ids: never change existing ids; new ids must be unique and stable.\n"
+                "- Output MUST be a single JSON object (no markdown, no prose).\n"
+            )
+            user_msg = json.dumps(
+                {
+                    "user_prompt": prompt_text,
+                    "duration_hint_s": float(total_hint),
+                    "current_beats_time_s": float(total_beats_time),
+                    "coverage_ratio": float(ratio),
+                    "audit_summary": audit,
+                    "story": story,
+                },
+                ensure_ascii=False,
+            )
+            env2 = await committee_ai_text(
+                messages=[{"role": "system", "content": sys_msg}, {"role": "user", "content": user_msg}],
+                trace_id=(trace_id or f"film2.story_extend.{pass_index}"),
+                rounds=STORY_COMMITTEE_ROUNDS,
+                temperature=STORY_TEMPERATURE,
+            )
+            raw2 = ""
+            rb2 = env2.get("result") if isinstance(env2, dict) else {}
+            if isinstance(rb2, dict) and isinstance(rb2.get("text"), str):
+                raw2 = str(rb2.get("text") or "")
+            else:
+                raw2 = str(env2.get("text") or "")
+            extended = await _jsonify_then_parse(
+                raw_text=raw2,
+                expected_schema=_story_schema(),
+                trace_id=(trace_id or f"film2.story_extend.jsonify.{pass_index}"),
+                rounds=STORY_COMMITTEE_ROUNDS,
+                temperature=STORY_TEMPERATURE,
+            )
+            if isinstance(extended, dict) and extended:
+                story = extended
+                story.setdefault("prompt", prompt_text)
+                story.setdefault("duration_hint_s", float(duration))
+                trace_event(
+                    "story.extended",
+                    {
+                        "trace_id": trace_id,
+                        "pass_index": int(pass_index),
+                        "beats_time_s": float(total_beats_time),
+                        "duration_hint_s": float(total_hint),
+                    },
+                )
+                # Stall guard: if committee keeps asking to extend but the story doesn't grow, prevent infinite loops.
+                grew = True
+                if last_beats_time_s is not None and last_beats_count is not None:
+                    grew = (float(total_beats_time) > float(last_beats_time_s)) or (int(total_beats_count) > int(last_beats_count))
+                if not grew:
+                    consecutive_no_progress += 1
+                else:
+                    consecutive_no_progress = 0
+                last_beats_time_s = float(total_beats_time)
+                last_beats_count = int(total_beats_count)
+                if consecutive_no_progress >= 5:
+                    trace_event(
+                        "story.stalled",
+                        {
+                            "trace_id": trace_id,
+                            "pass_index": int(pass_index),
+                            "consecutive_no_progress": int(consecutive_no_progress),
+                            "last_audit": audit,
+                        },
+                    )
+                    break
+                pass_index += 1
+                continue
+
+        # Default: if committee doesn't require fix/extend, stop.
+        break
     acts_n = len(story.get("acts") or []) if isinstance(story.get("acts"), list) else 0
     chars_n = len(story.get("characters") or []) if isinstance(story.get("characters"), list) else 0
     log.info(
@@ -524,7 +699,7 @@ async def ensure_tts_locks_and_dialogue_audio(
                     "trace_id": trace_id,
                     "line_id": line_id,
                     "char_id": speaker,
-                    "text": (text[:128] if isinstance(text, str) else ""),
+                    "text": (text if isinstance(text, str) else ""),
                     "audio_path": entry.get("audio_path"),
                     "duration_s": entry.get("duration_s"),
                     "quality_profile": profile_name,

@@ -55,7 +55,7 @@ def tool_step_eval_user_text(tool_name: str, tool_args: Any, last_user_text: str
         ):
             v = a.get(k)
             if isinstance(v, str):
-                args_preview[k] = (v[:240] + "…") if len(v) > 240 else v
+                args_preview[k] = v
             elif isinstance(v, (int, float, bool)) or v is None:
                 args_preview[k] = v
 

@@ -105,7 +105,7 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str) -> 
             "trace_id": trace_id,
             "base_url": base_url,
             "model": model,
-            "options": options,
+            "payload": payload,
         },
     )
 
@@ -119,7 +119,7 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str) -> 
 
         log.info(
             f"[committee] ollama.http.response trace_id={trace_id} base={base_url} model={model} status={status_code} "
-            f"http_dur_ms={int((time.monotonic() - t_http) * 1000.0)} raw_chars={len(raw_text)} content_type={resp.headers.get('content-type')}"
+            f"http_dur_ms={int((time.monotonic() - t_http) * 1000.0)} content_type={resp.headers.get('content-type')} raw={raw_text}"
         )
 
         parser = JSONParser()
@@ -129,13 +129,13 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str) -> 
 
         log.info(
             f"[committee] ollama.parsed trace_id={trace_id} base={base_url} model={model} status={status_code} "
-            f"parse_dur_ms={int((time.monotonic() - t_parse) * 1000.0)} keys={sorted(list(parsed.keys()))}"
+            f"parse_dur_ms={int((time.monotonic() - t_parse) * 1000.0)} parsed={json.dumps(parsed, ensure_ascii=False, default=str)}"
         )
 
         if parser.errors:
             log.warning(
                 f"[committee] ollama.parser_errors trace_id={trace_id} base={base_url} model={model} status={status_code} "
-                f"last_error={parser.last_error} errors={list(parser.errors)[:25]}"
+                f"last_error={parser.last_error} errors={json.dumps(list(parser.errors), ensure_ascii=False, default=str)}"
             )
 
         if not (200 <= status_code < 300):
@@ -144,7 +144,7 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str) -> 
                 STATE_DIR,
                 trace_id,
                 "committee.ollama.http_error",
-                {"trace_id": trace_id, "base_url": base_url, "status_code": status_code, "error": err_text},
+                {"trace_id": trace_id, "base_url": base_url, "status_code": status_code, "error": err_text, "raw": raw_text, "parsed": parsed},
             )
             log.error(
                 f"[committee] ollama.http_error trace_id={trace_id} base={base_url} model={model} status={status_code} "
@@ -182,14 +182,14 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str) -> 
         )
         log.info(
             f"[committee] ollama.call.finish trace_id={trace_id} ok=true dur_ms={int((time.monotonic() - t_all) * 1000.0)} "
-            f"status={status_code} response_chars={len(response_str or '')} usage={usage}"
+            f"status={status_code} usage={usage} response={response_str}"
         )
 
         emit_trace(
             STATE_DIR,
             trace_id,
             "committee.ollama.response",
-            {"trace_id": trace_id, "status_code": status_code, "usage": usage or {}, "response": data},
+            {"trace_id": trace_id, "status_code": status_code, "usage": usage or {}, "payload": payload, "raw": raw_text, "parsed": parsed, "response_text": response_str, "response": data},
         )
 
         return data
@@ -726,7 +726,7 @@ async def committee_jsonify(
         {
             "trace_id": trace_id,
             "count": len(candidates),
-            "first_preview": (candidates[0][:400] if candidates else ""),
+            "candidates": candidates,
         },
     )
 

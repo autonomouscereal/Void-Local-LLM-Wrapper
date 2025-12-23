@@ -201,7 +201,7 @@ class RestMusicProvider:
             }
 
         # Fallback: unknown format; return empty audio so callers can surface a structured error.
-        body_preview = (resp.text or "")[:500] if hasattr(resp, "text") else ""
+        body_preview = (resp.text or "") if hasattr(resp, "text") else ""
         log.warning(
             "music.provider.compose.unknown_response status=%s ctype=%r bytes=%s ms=%s body_preview=%r",
             int(resp.status_code),

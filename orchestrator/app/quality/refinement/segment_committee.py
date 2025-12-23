@@ -70,6 +70,12 @@ async def segment_qa_and_committee(
         kind = str(record.get("kind") or record.get("event") or "event")
         checkpoints_append_event(state_dir, trace_id, kind, record)
 
+    # Hard cap: run at most ONE refine pass to prevent loops.
+    try:
+        max_refine_passes = min(int(max_refine_passes), 1)
+    except Exception:
+        max_refine_passes = 1
+
     thresholds = _lock_quality_thresholds(quality_profile)
     attempt = 0
     current_results = list(segment_results or [])

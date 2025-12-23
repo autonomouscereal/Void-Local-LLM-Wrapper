@@ -103,7 +103,16 @@ def build_ollama_payload(messages: List[Dict[str, Any]], model: str, num_ctx: in
     if temperature is not None:
         options["temperature"] = float(temperature)
     payload: Dict[str, Any] = {"model": str(model), "messages": norm_messages, "stream": False, "keep_alive": "24h", "options": options}
-    log.info(f"[committee] ollama.payload.rendered model={str(model)} num_ctx={int(num_ctx)} temperature={(None if temperature is None else float(temperature))} messages={len(norm_messages)} dur_ms={int((time.monotonic() - t0) * 1000.0)}")
+    # Full-fidelity: log the entire payload (messages + options) for debugging and distillation.
+    log.info(
+        "[committee] ollama.payload.rendered model=%s num_ctx=%d temperature=%r messages=%d dur_ms=%d payload=%s",
+        str(model),
+        int(num_ctx),
+        (None if temperature is None else float(temperature)),
+        len(norm_messages),
+        int((time.monotonic() - t0) * 1000.0),
+        json.dumps(payload, ensure_ascii=False, default=str),
+    )
     return payload
 
 
@@ -112,25 +121,78 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str):
     model = payload.get("model")
     options = payload.get("options") if isinstance(payload.get("options"), dict) else {}
     messages = payload.get("messages") if isinstance(payload.get("messages"), list) else []
-    log.info(f"[committee] ollama.call.start trace_id={trace_id} base={base_url} model={model} stream={bool(payload.get('stream', False))} options={options} messages={len(messages)}")
-    emit_trace(state_dir=STATE_DIR, trace_id=trace_id, kind="committee.ollama.request", payload={"trace_id": trace_id, "base_url": base_url, "model": model, "options": options, "messages_count": len(messages)})
+    log.info(
+        "[committee] ollama.call.start trace_id=%s base=%s model=%r stream=%s options=%s messages=%d payload=%s",
+        trace_id,
+        base_url,
+        model,
+        bool(payload.get("stream", False)),
+        options,
+        len(messages),
+        json.dumps(payload, ensure_ascii=False, default=str),
+    )
+    emit_trace(
+        state_dir=STATE_DIR,
+        trace_id=trace_id,
+        kind="committee.ollama.request",
+        payload={"trace_id": trace_id, "base_url": base_url, "model": model, "payload": payload},
+    )
     async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
         t_http = time.monotonic()
         resp = await client.post(url=f"{base_url.rstrip('/')}/api/chat", json=dict(payload))
         raw_text = resp.text or ""
         status_code = int(resp.status_code)
-        log.info(f"[committee] ollama.http.response trace_id={trace_id} base={base_url} model={model} status={status_code} http_dur_ms={int((time.monotonic() - t_http) * 1000.0)} raw_chars={len(raw_text)} content_type={resp.headers.get('content-type')}")
+        log.info(
+            "[committee] ollama.http.response trace_id=%s base=%s model=%r status=%d http_dur_ms=%d content_type=%r raw=%s",
+            trace_id,
+            base_url,
+            model,
+            status_code,
+            int((time.monotonic() - t_http) * 1000.0),
+            resp.headers.get("content-type"),
+            raw_text,
+        )
         parser = JSONParser()
         t_parse = time.monotonic()
         parsed_obj = parser.parse(raw_text or "{}", {})
         parsed = parsed_obj if isinstance(parsed_obj, dict) else {}
-        log.info(f"[committee] ollama.parsed trace_id={trace_id} base={base_url} model={model} status={status_code} parse_dur_ms={int((time.monotonic() - t_parse) * 1000.0)} keys={sorted(list(parsed.keys()))}")
+        log.info(
+            "[committee] ollama.parsed trace_id=%s base=%s model=%r status=%d parse_dur_ms=%d parsed=%s",
+            trace_id,
+            base_url,
+            model,
+            status_code,
+            int((time.monotonic() - t_parse) * 1000.0),
+            json.dumps(parsed, ensure_ascii=False, default=str),
+        )
         if parser.errors:
-            log.warning(f"[committee] ollama.parser_errors trace_id={trace_id} base={base_url} model={model} status={status_code} last_error={parser.last_error} errors={list(parser.errors)[:25]}")
+            log.warning(
+                "[committee] ollama.parser_errors trace_id=%s base=%s model=%r status=%d last_error=%r errors=%s",
+                trace_id,
+                base_url,
+                model,
+                status_code,
+                parser.last_error,
+                json.dumps(list(parser.errors), ensure_ascii=False, default=str),
+            )
         if not (200 <= status_code < 300):
             err_text = parsed.get("error") if isinstance(parsed.get("error"), str) else raw_text
-            emit_trace(state_dir=STATE_DIR, trace_id=trace_id, kind="committee.ollama.http_error", payload={"trace_id": trace_id, "base_url": base_url, "status_code": status_code, "error": err_text})
-            log.error(f"[committee] ollama.http_error trace_id={trace_id} base={base_url} model={model} status={status_code} dur_ms={int((time.monotonic() - t_all) * 1000.0)} error={err_text}")
+            emit_trace(
+                state_dir=STATE_DIR,
+                trace_id=trace_id,
+                kind="committee.ollama.http_error",
+                payload={"trace_id": trace_id, "base_url": base_url, "status_code": status_code, "error": err_text, "raw": raw_text, "parsed": parsed},
+            )
+            log.error(
+                "[committee] ollama.http_error trace_id=%s base=%s model=%r status=%d dur_ms=%d error=%s raw=%s",
+                trace_id,
+                base_url,
+                model,
+                status_code,
+                int((time.monotonic() - t_all) * 1000.0),
+                err_text,
+                raw_text,
+            )
             return {"ok": False, "error": {"code": "ollama_http_error", "message": f"ollama returned HTTP {status_code}", "status": status_code, "base_url": base_url, "details": {"error": err_text}}}
         response_str = ""
         msg = parsed.get("message") if isinstance(parsed.get("message"), dict) else {}
@@ -149,9 +211,38 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str):
             usage = {"prompt_tokens": int(prompt_eval), "completion_tokens": int(eval_count)}
             usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
             data["_usage"] = usage
-        log.info(f"[committee] ollama.response base={base_url} model={model} trace_id={trace_id} status={status_code} response_chars={len(response_str or '')} usage={usage}")
-        log.info(f"[committee] ollama.call.finish trace_id={trace_id} ok=true dur_ms={int((time.monotonic() - t_all) * 1000.0)} status={status_code} response_chars={len(response_str or '')} usage={usage}")
-        emit_trace(state_dir=STATE_DIR, trace_id=trace_id, kind="committee.ollama.response", payload={"trace_id": trace_id, "status_code": status_code, "usage": (usage or {}), "response": data})
+        log.info(
+            "[committee] ollama.response base=%s model=%r trace_id=%s status=%d usage=%s response=%s",
+            base_url,
+            model,
+            trace_id,
+            status_code,
+            usage,
+            response_str,
+        )
+        log.info(
+            "[committee] ollama.call.finish trace_id=%s ok=true dur_ms=%d status=%d usage=%s response=%s",
+            trace_id,
+            int((time.monotonic() - t_all) * 1000.0),
+            status_code,
+            usage,
+            response_str,
+        )
+        emit_trace(
+            state_dir=STATE_DIR,
+            trace_id=trace_id,
+            kind="committee.ollama.response",
+            payload={
+                "trace_id": trace_id,
+                "status_code": status_code,
+                "usage": (usage or {}),
+                "payload": payload,
+                "raw": raw_text,
+                "parsed": parsed,
+                "response_text": response_str,
+                "response_obj": data,
+            },
+        )
         return data
 
 
@@ -163,14 +254,30 @@ async def committee_member_text(member_id: str, messages: List[Dict[str, Any]], 
         return {"ok": False, "error": {"code": "unknown_member", "message": f"unknown committee member: {member_id}"}}
     base = (cfg.get("base") or "").rstrip("/") or QWEN_BASE_URL
     model = cfg.get("model") or QWEN_MODEL_ID
-    log.info(f"[committee] member.start trace_id={trace_id} member={str(member_id or '')} base={str(base)} model={str(model)} messages={len(messages or [])} temperature={(None if temperature is None else float(temperature))}")
+    log.info(
+        "[committee] member.start trace_id=%s member=%s base=%s model=%s temperature=%r messages=%d messages_full=%s",
+        trace_id,
+        str(member_id or ""),
+        str(base),
+        str(model),
+        (None if temperature is None else float(temperature)),
+        len(messages or []),
+        json.dumps(messages or [], ensure_ascii=False, default=str),
+    )
     payload = build_ollama_payload(messages=messages or [], model=model, num_ctx=DEFAULT_NUM_CTX, temperature=temperature)
     res = await call_ollama(base_url=base, payload=payload, trace_id=trace_id)
     if isinstance(res, dict):
         res["_base_url"] = base
         res["_model"] = model
         res["_member"] = str(member_id or "")
-    log.info(f"[committee] member.finish trace_id={trace_id} member={str(member_id or '')} ok={bool(isinstance(res, dict) and res.get('ok', True))} dur_ms={int((time.monotonic() - t0) * 1000.0)} response_chars={len(str((res or {}).get('response') or ''))} has_error={bool(isinstance(res, dict) and res.get('error'))}")
+    log.info(
+        "[committee] member.finish trace_id=%s member=%s ok=%s dur_ms=%d result=%s",
+        trace_id,
+        str(member_id or ""),
+        bool(isinstance(res, dict) and res.get("ok", True)),
+        int((time.monotonic() - t0) * 1000.0),
+        json.dumps(res if isinstance(res, dict) else {"_raw": res}, ensure_ascii=False, default=str),
+    )
     return res
 
 
@@ -400,7 +507,7 @@ async def committee_jsonify(raw_text: str, expected_schema: Any, *, trace_id: st
                 candidates.append(str(inner.get("response") or ""))
     if isinstance(raw_text, str) and raw_text.strip():
         candidates.append(raw_text)
-    emit_trace(state_dir=STATE_DIR, trace_id=trace_id, kind="committee.jsonify.candidates", payload={"trace_id": trace_id, "count": len(candidates), "first_preview": ((candidates[0][:400]) if candidates else "")})
+    emit_trace(state_dir=STATE_DIR, trace_id=trace_id, kind="committee.jsonify.candidates", payload={"trace_id": trace_id, "count": len(candidates), "candidates": candidates})
     parsed_candidates: List[Dict[str, Any]] = []
     song_schema = None
     if isinstance(expected_schema, dict):

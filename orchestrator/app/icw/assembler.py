@@ -57,7 +57,8 @@ def make_entity_header(state) -> str:
             # Defensive: avoid silently dropping weird entity objects.
             log.warning(f"icw.assembler entity str() failed type={type(e).__name__}: {exc}", exc_info=True)
             safe_ents.append(repr(e))
-    return f"[Goal] {goal}\n[Entities] " + ", ".join(sorted([e for e in safe_ents if e]))[:400]
+    # Full-fidelity: never truncate entity headers (needed for debugging/training).
+    return f"[Goal] {goal}\n[Entities] " + ", ".join(sorted([e for e in safe_ents if e]))
 
 
 def _joined(parts: list[str]) -> str:

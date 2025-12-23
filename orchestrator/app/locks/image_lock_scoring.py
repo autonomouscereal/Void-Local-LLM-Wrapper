@@ -29,6 +29,7 @@ from PIL import Image  # type: ignore
 
 from ..analysis.media import analyze_image, cosine_similarity
 from ..http.faceid_client import faceid_embed
+from ..json_parser import JSONParser
 
 log = logging.getLogger(__name__)
 
@@ -524,16 +525,15 @@ def _load_skeleton_any(pose_ref: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         p = sk.strip()
         # if looks like JSON, parse
         if p.startswith("{") and p.endswith("}"):
-            try:
-                obj = json.loads(p)
-                return obj if isinstance(obj, dict) else None
-            except Exception:
-                return None
+            parser = JSONParser()
+            obj = parser.parse(p, {})
+            return obj if isinstance(obj, dict) else None
         # else treat as path
         try:
             if os.path.exists(p):
                 with open(p, "r", encoding="utf-8") as f:
-                    obj = json.load(f)
+                    parser = JSONParser()
+                    obj = parser.parse(f.read(), {})
                 return obj if isinstance(obj, dict) else None
         except Exception:
             return None

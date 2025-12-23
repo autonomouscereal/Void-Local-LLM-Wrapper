@@ -497,6 +497,13 @@ def _configure_logging() -> str:
             with contextlib.suppress(Exception):
                 _stderr.write(f"[orchestrator.logging] file logging disabled: {_ex}\n")
 
+    # Ensure handlers never filter out DEBUG/WARNING/ERROR when root is configured accordingly.
+    for h in _handlers:
+        try:
+            h.setLevel(logging.DEBUG)
+        except Exception:
+            pass
+
     logging.captureWarnings(True)
     logging.basicConfig(
         level=_level,
@@ -505,6 +512,12 @@ def _configure_logging() -> str:
         handlers=_handlers,
         force=True,
     )
+
+    # Force root logger level explicitly (some frameworks mutate it after basicConfig).
+    try:
+        logging.getLogger().setLevel(_level)
+    except Exception:
+        pass
 
     # Keep stdout clean even when root is DEBUG: third-party libraries are pinned explicitly.
     _silence_third_party_logs()
@@ -600,11 +613,11 @@ def _args_preview_for_log(args: Any, *, max_keys: int = 64) -> Dict[str, Any]:
         return {"type": type(args).__name__}
     keys = sorted([str(k) for k in args.keys()])
     out: Dict[str, Any] = {"keys": keys[:max_keys], "has_raw": bool("_raw" in args)}
-    # Common fields (trim long strings)
+    # Common fields (full-fidelity; do NOT trim strings)
     for k in ("prompt", "text", "negative", "src", "url", "image_url", "video_url", "audio_url", "segment_id", "quality_profile", "profile"):
         v = args.get(k)
         if isinstance(v, str):
-            out[k] = (v[:240] + "…") if len(v) > 240 else v
+            out[k] = v
         elif isinstance(v, (int, float, bool)) or v is None:
             out[k] = v
     return out
@@ -685,7 +698,7 @@ async def _run_patch_call(
     exec_results: List[Dict[str, Any]] = []
     exec_batch = patch_validated or patch_calls
     if exec_batch:
-        _log("exec.payload", trace_id=trace_id, steps=[{"tool": (c.get("name") or "")} for c in exec_batch[:5]])
+        _log("exec.payload", trace_id=trace_id, steps=[{"tool": (c.get("name") or "")} for c in exec_batch])
         exec_results = await gateway_execute(exec_batch, trace_id, executor_base_url, request_id=str(uuid.uuid4().hex))
     # Prefer direct results; if none, return first failure snapshot.
     if exec_results:
@@ -1531,14 +1544,14 @@ def finalize_response(trace_id: str, messages: List[Dict[str, Any]], state: RunS
         if warns:
             lines.append("")
             lines.append("Warnings:")
-            for w in warns[:5]:
+            for w in warns:
                 lines.append(f"- {w.get('code','warn')}: {w.get('message','')}")
         ok_flag = True
         err_payload = None
     else:
         lines.append("The job completed with errors and no assets were produced.")
         errs = state.get("errors") or []
-        for e in errs[:5]:
+        for e in errs:
             lines.append(f"- {e.get('code','error')}: {e.get('message','')}")
         ok_flag = False
         err_payload = None
@@ -2244,7 +2257,7 @@ def _warn_double_wrapped_tool_results(tool_results: List[Dict[str, Any]] | None)
     under result["result"] (common shape drift that causes artifacts/args to "disappear").
     """
     try:
-        for tr in (tool_results or [])[:200]:
+        for tr in (tool_results or []):
             if not isinstance(tr, dict):
                 continue
             res = tr.get("result")
@@ -2255,18 +2268,20 @@ def _warn_double_wrapped_tool_results(tool_results: List[Dict[str, Any]] | None)
             if isinstance(inner, dict) and ("ok" in res or "error" in res) and ("result" in res):
                 log.warning(
                     f"double_wrapped_tool_result detected name={(tr.get('name') or tr.get('tool'))!r} "
-                    f"keys={sorted(list(res.keys()))[:24]} inner_keys={sorted(list(inner.keys()))[:24]}"
+                    f"keys={sorted(list(res.keys()))} inner_keys={sorted(list(inner.keys()))}"
                 )
     except Exception:
         log.debug("_warn_double_wrapped_tool_results failed (non-fatal)", exc_info=True)
 
 
 def _tb(s: str) -> str:
-    return s if len(s) <= 16000 else (s[:16000] + "\n... [traceback truncated]")
+    # Full-fidelity: never truncate tracebacks.
+    return s
 
 
 def _shorten(s: str, max_len: int = 12000) -> str:
-    return s if len(s) <= max_len else (s[:max_len] + "\n... [truncated]")
+    # Full-fidelity: never truncate model outputs.
+    return s
 
 
 # ---- Datasets helpers ----
@@ -3829,14 +3844,10 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
         return {"name": name, "result": out}
     if name == "film2.run" and ALLOW_TOOL_EXECUTION:
         # Unified Film-2 shot runner. Executes internal video passes and writes distilled traces/artifacts.
+        # XTTS is OPTIONAL: some films have no dialogue/TTS. Do not hard-fail.
+        # When XTTS isn't configured, we simply skip dialogue pregen and continue.
         if not XTTS_API_URL:
-            return {
-                "name": name,
-                "error": {
-                    "code": "xtts_unconfigured",
-                    "message": "XTTS_API_URL is required for film2.run music vocals",
-                },
-            }
+            logging.warning("film2.run: XTTS_API_URL not configured; skipping TTS dialogue pregen")
         t_film2 = time.perf_counter()
         a = raw_args if isinstance(raw_args, dict) else {}
         prompt = (a.get("prompt") or "").strip()
@@ -3935,32 +3946,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     "duration_hint_s": duration_s,
                 },
             )
-            max_story_passes = 3
-            last_issues: List[Dict[str, Any]] = []
-            for pass_index in range(max_story_passes):
-                last_issues = await _story_check(story_obj, prompt, trace_id=trace_id)
-                issue_codes = [iss.get("code") for iss in last_issues if isinstance(iss, dict)]
-                trace_append(
-                    "film2.story_consistency_pass",
-                    {
-                        "trace_id": trace_id,
-                        "pass_index": pass_index,
-                        "issue_codes": issue_codes,
-                    },
-                )
-                if not last_issues:
-                    break
-                story_obj = await _story_fix(story_obj, last_issues, user_prompt=prompt, trace_id=trace_id)
-            if last_issues:
-                warnings.append("story_consistency_unresolved")
-                trace_append(
-                    "film2.story_consistency_unresolved",
-                    {
-                        "trace_id": trace_id,
-                        "issues": last_issues,
-                        "prompt": prompt,
-                    },
-                )
+            # Story engine already runs iterative audit/revise/extend until committee says it's "done".
             scenes_from_story, shots_from_story = _story_derive(story_obj)
             logging.info(
                 "film2.run:story:derived trace_id=%r scenes=%d shots=%d",
@@ -4123,7 +4109,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             )
         # Precompute TTS dialogue audio when possible
         dialogue_index: Dict[str, Any] = {}
-        if story_obj:
+        if story_obj and XTTS_API_URL:
             locks_arg, dialogue_index = await _story_ensure_tts_locks_and_dialogue_audio(
                 story_obj,
                 locks_arg,
@@ -4152,6 +4138,8 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     ok_lines,
                     bad_lines,
                 )
+        elif story_obj and not XTTS_API_URL:
+            logging.warning("film2.run:tts:skipped trace_id=%r reason=XTTS_API_URL_not_configured", trace_id)
         # Generate simple scene and shot storyboards before hv video
         if scenes_from_story:
             scenes_from_story = await _film2_generate_scene_storyboards(
@@ -7749,7 +7737,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             preview = None
             if ct.startswith("text/") or ct.find("json") >= 0:
                 txt = data.decode("utf-8", errors="ignore")
-                preview = txt[:2000]
+                preview = txt
             return {"name": name, "result": {"status": r.status_code, "content_type": ct, "sha256": h, "preview": preview}}
         except Exception as ex:
             logging.warning(f"source_fetch.failed url={url}: {ex}", exc_info=True)
@@ -8617,7 +8605,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
                     if isinstance(outp, str) and outp and os.path.isfile(outp) and os.path.getsize(outp) > 0:
                         _sh.copy2(outp, os.path.join(frames_up, os.path.basename(fp)))
                     else:
-                        failures.append({"frame": os.path.basename(fp), "status": int(r.status_code), "body": (r.text[:500] if isinstance(r.text, str) else "")})
+                        failures.append({"frame": os.path.basename(fp), "status": int(r.status_code), "body": (r.text if isinstance(r.text, str) else "")})
                         _sh.copy2(fp, os.path.join(frames_up, os.path.basename(fp)))
         else:
             vf = "scale=iw*2:ih*2:flags=lanczos"
@@ -9015,7 +9003,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             js = parser.parse(r.text or "", {})
             if 200 <= r.status_code < 300:
                 return {"name": name, "result": js if isinstance(js, dict) else {}}
-            return _tool_error(name, "asr_http_error", r.text or "asr_transcribe failed", status=int(r.status_code or 500), body=(r.text or "")[:2000])
+            return _tool_error(name, "asr_http_error", r.text or "asr_transcribe failed", status=int(r.status_code or 500), body=(r.text or ""))
     if name == "image_generate" and COMFYUI_API_URL and ALLOW_TOOL_EXECUTION:
         # expects a ComfyUI workflow graph or minimal prompt params passed through
         async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
@@ -9028,7 +9016,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             js = parser.parse(r.text or "", {})
             if 200 <= r.status_code < 300:
                 return {"name": name, "result": js if isinstance(js, dict) else {}}
-            return _tool_error(name, "comfy_http_error", r.text or "image_generate failed", status=int(r.status_code or 500), body=(r.text or "")[:2000])
+            return _tool_error(name, "comfy_http_error", r.text or "image_generate failed", status=int(r.status_code or 500), body=(r.text or ""))
     if name == "controlnet" and COMFYUI_API_URL and ALLOW_TOOL_EXECUTION:
         async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
             wf_payload = args.get("workflow") or args
@@ -9040,7 +9028,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             js = parser.parse(r.text or "", {})
             if 200 <= r.status_code < 300:
                 return {"name": name, "result": js if isinstance(js, dict) else {}}
-            return _tool_error(name, "comfy_http_error", r.text or "controlnet failed", status=int(r.status_code or 500), body=(r.text or "")[:2000])
+            return _tool_error(name, "comfy_http_error", r.text or "controlnet failed", status=int(r.status_code or 500), body=(r.text or ""))
     if name == "video_generate" and COMFYUI_API_URL and ALLOW_TOOL_EXECUTION:
         async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
             wf_payload = args.get("workflow") or args
@@ -9052,7 +9040,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             js = parser.parse(r.text or "", {})
             if 200 <= r.status_code < 300:
                 return {"name": name, "result": js if isinstance(js, dict) else {}}
-            return _tool_error(name, "comfy_http_error", r.text or "video_generate failed", status=int(r.status_code or 500), body=(r.text or "")[:2000])
+            return _tool_error(name, "comfy_http_error", r.text or "video_generate failed", status=int(r.status_code or 500), body=(r.text or ""))
     if name == "face_embed" and FACEID_API_URL and ALLOW_TOOL_EXECUTION:
         async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
             r = await client.post(FACEID_API_URL.rstrip("/") + "/embed", json={"image_url": args.get("image_url")})
@@ -9060,7 +9048,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             js = parser.parse(r.text or "", {})
             if 200 <= r.status_code < 300:
                 return {"name": name, "result": js if isinstance(js, dict) else {}}
-            return _tool_error(name, "faceid_http_error", r.text or "face_embed failed", status=int(r.status_code or 500), body=(r.text or "")[:2000])
+            return _tool_error(name, "faceid_http_error", r.text or "face_embed failed", status=int(r.status_code or 500), body=(r.text or ""))
     if name == "music_generate" and MUSIC_API_URL and ALLOW_TOOL_EXECUTION:
         async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
             r = await client.post(MUSIC_API_URL.rstrip("/") + "/generate", json=args)
@@ -9068,7 +9056,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             js = parser.parse(r.text or "", {})
             if 200 <= r.status_code < 300:
                 return {"name": name, "result": js if isinstance(js, dict) else {}}
-            return _tool_error(name, "music_http_error", r.text or "music_generate failed", status=int(r.status_code or 500), body=(r.text or "")[:2000])
+            return _tool_error(name, "music_http_error", r.text or "music_generate failed", status=int(r.status_code or 500), body=(r.text or ""))
     if name == "vlm_analyze" and VLM_API_URL and ALLOW_TOOL_EXECUTION:
         async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
             r = await client.post(VLM_API_URL.rstrip("/") + "/analyze", json={"image_url": args.get("image_url"), "prompt": args.get("prompt")})
@@ -9076,7 +9064,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             js = parser.parse(r.text or "", {})
             if 200 <= r.status_code < 300:
                 return {"name": name, "result": js if isinstance(js, dict) else {}}
-            return _tool_error(name, "vlm_http_error", r.text or "vlm_analyze failed", status=int(r.status_code or 500), body=(r.text or "")[:2000])
+            return _tool_error(name, "vlm_http_error", r.text or "vlm_analyze failed", status=int(r.status_code or 500), body=(r.text or ""))
     # --- Film tools (LLM-driven, simple UI) ---
     if name == "run_python" and EXECUTOR_BASE_URL and ALLOW_TOOL_EXECUTION:
         async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
@@ -9085,7 +9073,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             js = parser.parse(r.text or "", {})
             if 200 <= r.status_code < 300:
                 return {"name": name, "result": js if isinstance(js, dict) else {}}
-            return _tool_error(name, "executor_http_error", r.text or "run_python failed", status=int(r.status_code or 500), body=(r.text or "")[:2000])
+            return _tool_error(name, "executor_http_error", r.text or "run_python failed", status=int(r.status_code or 500), body=(r.text or ""))
     if name == "write_file" and EXECUTOR_BASE_URL and ALLOW_TOOL_EXECUTION:
         # Guard: forbid writing banned libraries into requirements/pyproject
         p = (args.get("path") or "").lower()
@@ -9100,7 +9088,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             js = parser.parse(r.text or "", {})
             if 200 <= r.status_code < 300:
                 return {"name": name, "result": js if isinstance(js, dict) else {}}
-            return _tool_error(name, "executor_http_error", r.text or "write_file failed", status=int(r.status_code or 500), body=(r.text or "")[:2000])
+            return _tool_error(name, "executor_http_error", r.text or "write_file failed", status=int(r.status_code or 500), body=(r.text or ""))
     if name == "read_file" and EXECUTOR_BASE_URL and ALLOW_TOOL_EXECUTION:
         async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
             r = await client.post(EXECUTOR_BASE_URL.rstrip("/") + "/read_file", json={"path": args.get("path")})
@@ -9108,7 +9096,7 @@ async def execute_tool_call(call: Dict[str, Any]) -> Dict[str, Any]:
             js = parser.parse(r.text or "", {})
             if 200 <= r.status_code < 300:
                 return {"name": name, "result": js if isinstance(js, dict) else {}}
-            return _tool_error(name, "executor_http_error", r.text or "read_file failed", status=int(r.status_code or 500), body=(r.text or "")[:2000])
+            return _tool_error(name, "executor_http_error", r.text or "read_file failed", status=int(r.status_code or 500), body=(r.text or ""))
     # MCP tool forwarding (HTTP bridge)
     if name and (name.startswith("mcp:") or args.get("mcpTool") is True) and ALLOW_TOOL_EXECUTION:
         env = await _call_mcp_tool(MCP_HTTP_BRIDGE_URL, name.replace("mcp:", "", 1), args)
@@ -9928,7 +9916,7 @@ async def chat_completions(request: Request):
                     f"chat_completions:committee exec_batch_len={(len(exec_batch) if isinstance(exec_batch, list) else -1)}"
                 )
                 if exec_batch:
-                    _log("exec.payload", trace_id=trace_id, steps=[{"tool": (c.get("name") or "")} for c in exec_batch[:5]])
+                    _log("exec.payload", trace_id=trace_id, steps=[{"tool": (c.get("name") or "")} for c in exec_batch])
                     logging.debug("chat_completions:committee gateway_execute patch exec starting")
                     try:
                         exec_results = await gateway_execute(exec_batch, trace_id, executor_endpoint, request_id=str(request_id))
@@ -10683,7 +10671,7 @@ async def http_tool_run(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
             status_code=int(r.status_code),
             duration_ms=dur_ms,
             body_len=int(len(raw_body)),
-            body_preview=(raw_body[:2000] + "…") if len(raw_body) > 2000 else raw_body,
+            body_preview=raw_body,
             env_keys=env_keys,
             env_ok=bool(env.get("ok")) if isinstance(env, dict) else False,
             env_has_result=bool(isinstance(env.get("result"), dict)) if isinstance(env, dict) else False,
@@ -10733,9 +10721,9 @@ async def http_tool_run(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
                 status_code=int(r.status_code),
                 duration_ms=dur_ms,
                 err_code=str(error_out.get("code") or ""),
-                err_message=(str(error_out.get("message") or "")[:400] + "…")
-                if len(str(error_out.get("message") or "")) > 400
-                else str(error_out.get("message") or ""),
+                err_message=str(error_out.get("message") or ""),
+                body=raw_body,
+                error=error_out,
             )
             return {
                 "name": name,

@@ -33,7 +33,7 @@ async def call_mcp_tool(bridge_url: str | None, name: str, arguments: Dict[str, 
                 "code": "mcp_bridge_http_error",
                 "message": f"MCP bridge returned HTTP {int(getattr(r, 'status_code', 0) or 0)}",
                 "status": int(getattr(r, "status_code", 0) or 0) or 502,
-                "body": (r.text or "")[:2000],
+                "body": (r.text or ""),
             },
         }
     parser = JSONParser()
@@ -43,7 +43,7 @@ async def call_mcp_tool(bridge_url: str | None, name: str, arguments: Dict[str, 
         return {
             "ok": False,
             "result": None,
-            "error": {"code": "mcp_bridge_bad_json", "message": "invalid mcp bridge response", "status": 502, "body": (r.text or "")[:2000]},
+            "error": {"code": "mcp_bridge_bad_json", "message": "invalid mcp bridge response", "status": 502, "body": (r.text or "")},
         }
     return {"ok": True, "result": js, "error": None}
 

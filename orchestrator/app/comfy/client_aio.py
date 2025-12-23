@@ -44,7 +44,7 @@ def comfy_submit(graph: Dict[str, Any], client_id: Optional[str] = None) -> Dict
                     "code": "comfy_prompt_http_error",
                     "message": f"/prompt {r.status_code}",
                     "status": int(r.status_code),
-                    "details": {"body": text[:500]},
+                    "details": {"body": text},
                 },
             }
         parser = JSONParser()
@@ -70,7 +70,7 @@ def comfy_history(prompt_id: str) -> Dict[str, Any]:
                     "code": "comfy_history_http_error",
                     "message": f"/history {r.status_code}",
                     "status": int(r.status_code),
-                    "details": {"body": text[:500]},
+                    "details": {"body": text},
                 },
             }
         parser = JSONParser()

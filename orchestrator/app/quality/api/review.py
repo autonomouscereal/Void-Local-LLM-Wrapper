@@ -43,20 +43,19 @@ def review_loop(body: Dict[str, Any]) -> ToolEnvelope:
     payload = JSONParser().parse(json.dumps(body or {}), expected)
     arts = payload.get("artifacts") or []
     prompt = (payload.get("prompt") or "").strip()
+    # Single pass only: avoid infinite review loops.
     loop_idx = 0
-    while loop_idx < 6:
-        scores: Dict[str, Any] = {}
-        img_path, aud_path = pick_first_review_artifacts(arts)
-        if isinstance(img_path, str) and img_path:
-            scores.update(score_review_image(path=img_path, prompt=prompt))
-        if isinstance(aud_path, str) and aud_path:
-            scores.update(score_review_audio(path=aud_path))
-        plan = build_delta_plan(scores)
-        append_ledger({"phase": f"review.loop#{loop_idx}", "scores": scores, "decision": plan})
-        if plan.get("accept") is True:
-            return ToolEnvelope.success({"loop_idx": loop_idx, "accepted": True, "plan": plan}, request_id=rid)
-        return ToolEnvelope.success({"loop_idx": loop_idx, "accepted": False, "plan": plan}, request_id=rid)
-    return ToolEnvelope.success({"loop_idx": loop_idx, "accepted": False, "plan": {"accept": False}}, request_id=rid)
+    scores: Dict[str, Any] = {}
+    img_path, aud_path = pick_first_review_artifacts(arts)
+    if isinstance(img_path, str) and img_path:
+        scores.update(score_review_image(path=img_path, prompt=prompt))
+    if isinstance(aud_path, str) and aud_path:
+        scores.update(score_review_audio(path=aud_path))
+    plan = build_delta_plan(scores)
+    append_ledger({"phase": f"review.loop#{loop_idx}", "scores": scores, "decision": plan})
+    if plan.get("accept") is True:
+        return ToolEnvelope.success({"loop_idx": loop_idx, "accepted": True, "plan": plan}, request_id=rid)
+    return ToolEnvelope.success({"loop_idx": loop_idx, "accepted": False, "plan": plan}, request_id=rid)
 
 
 
