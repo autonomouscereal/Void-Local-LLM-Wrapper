@@ -677,7 +677,6 @@ async def run_steps(trace_id: str, conversation_id: str, steps: list[dict]):
                 # Still emit end events below; continue to next step.
                 # (Do not raise.)
                 res = {}
-            ok = False
             # Guard: utc_run_tool must never return None/non-dict; if it does, wrap in a result block
             # that matches existing executor result structure (ids/meta/error/status), with a stack.
             if not isinstance(res, dict):

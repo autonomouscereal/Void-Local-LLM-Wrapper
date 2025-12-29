@@ -27,8 +27,8 @@ def _collect_lyrics_for_section_and_voice(song_graph: Dict[str, Any], section_id
     for sec in sections:
         if not isinstance(sec, dict):
             continue
-        section_id = sec.get("section_id")
-        if not isinstance(section_id, str) or section_id != section_id:
+        sec_id = sec.get("section_id")
+        if not isinstance(sec_id, str) or sec_id != section_id:
             continue
         lines = sec.get("lines") if isinstance(sec.get("lines"), list) else []
         voice_specific: List[str] = []
@@ -209,23 +209,23 @@ async def render_vocal_stems_for_track(
                     stem_path = path_val
                     break
                 # Fallback: try to construct path from artifact_id if path not available
-            artifact_id = artifact.get("artifact_id")
+                artifact_id = artifact.get("artifact_id")
                 if isinstance(artifact_id, str) and artifact_id:
-                # TTS artifacts live in /workspace/uploads/artifacts/audio/tts/{conversation_id}
+                    # TTS artifacts live in /workspace/uploads/artifacts/audio/tts/{conversation_id}
                     # Convert artifact_id to safe filename (matching how files are saved)
                     safe_filename = artifact_id_to_safe_filename(artifact_id, ".wav")
                     candidate_path = os.path.join(
-                    "/workspace",
-                    "uploads",
-                    "artifacts",
-                    "audio",
-                    "tts",
+                        "/workspace",
+                        "uploads",
+                        "artifacts",
+                        "audio",
+                        "tts",
                         meta.get("conversation_id") or conversation_id,
                         safe_filename,
-                )
+                    )
                     if os.path.exists(candidate_path):
                         stem_path = candidate_path
-                break
+                        break
         if not stem_path or not os.path.exists(stem_path):
             return {
                 "error": {
