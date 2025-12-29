@@ -14,11 +14,11 @@ async def call_mcp_tool(bridge_url: str | None, name: str, arguments: Dict[str, 
             "error": {"code": "mcp_bridge_unconfigured", "message": "MCP bridge URL not configured", "status": 500},
         }
     try:
-    async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
-        r = await client.post(
-            bridge_url.rstrip("/") + "/call",
-            json={"name": name, "arguments": arguments or {}},
-        )
+        async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
+            r = await client.post(
+                bridge_url.rstrip("/") + "/call",
+                json={"name": name, "arguments": arguments or {}},
+            )
     except Exception as ex:
         return {
             "ok": False,
@@ -36,9 +36,9 @@ async def call_mcp_tool(bridge_url: str | None, name: str, arguments: Dict[str, 
                 "body": (r.text or ""),
             },
         }
-        parser = JSONParser()
-        # Open schema: do not drop any keys returned by the MCP bridge.
-        js = parser.parse(r.text or "", {})
+    parser = JSONParser()
+    # Open schema: do not drop any keys returned by the MCP bridge.
+    js = parser.parse(r.text or "", {})
     if not isinstance(js, dict):
         return {
             "ok": False,
