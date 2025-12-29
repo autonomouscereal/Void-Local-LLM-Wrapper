@@ -260,26 +260,53 @@ async def get_pg_pool() -> Optional[asyncpg.pool.Pool]:
 
 async def _create_indexes_after_migrations(conn: asyncpg.Connection) -> None:
     """
-    Create indexes that depend on migrations having run (e.g., trace_id column).
+    Create indexes that depend on migrations having run (e.g., trace_id column, tool_name column).
     """
     try:
-        # Check if trace_id exists before creating index
-        col_check = await conn.fetchval("""
+        # Determine which columns exist
+        trace_col = None
+        name_col = None
+        
+        # Check for trace_id or run_id
+        trace_id_check = await conn.fetchval("""
             SELECT 1 FROM information_schema.columns 
             WHERE table_name = 'tool_call' AND column_name = 'trace_id'
         """)
-        if col_check:
-            await conn.execute("CREATE INDEX IF NOT EXISTS tool_run_name_idx ON tool_call(trace_id, tool_name);")
+        if trace_id_check:
+            trace_col = 'trace_id'
         else:
-            # Fallback to run_id if trace_id doesn't exist (shouldn't happen after migrations, but be safe)
-            col_check_run_id = await conn.fetchval("""
+            run_id_check = await conn.fetchval("""
                 SELECT 1 FROM information_schema.columns 
                 WHERE table_name = 'tool_call' AND column_name = 'run_id'
             """)
-            if col_check_run_id:
-                await conn.execute("CREATE INDEX IF NOT EXISTS tool_run_name_idx ON tool_call(run_id, tool_name);")
-            else:
-                log.warning("db.pool: neither trace_id nor run_id found in tool_call table, skipping index creation")
+            if run_id_check:
+                trace_col = 'run_id'
+        
+        # Check for tool_name or name
+        tool_name_check = await conn.fetchval("""
+            SELECT 1 FROM information_schema.columns 
+            WHERE table_name = 'tool_call' AND column_name = 'tool_name'
+        """)
+        if tool_name_check:
+            name_col = 'tool_name'
+        else:
+            name_check = await conn.fetchval("""
+                SELECT 1 FROM information_schema.columns 
+                WHERE table_name = 'tool_call' AND column_name = 'name'
+            """)
+            if name_check:
+                name_col = 'name'
+        
+        # Create index if we have both columns
+        if trace_col and name_col:
+            await conn.execute(f"CREATE INDEX IF NOT EXISTS tool_run_name_idx ON tool_call({trace_col}, {name_col});")
+        else:
+            missing = []
+            if not trace_col:
+                missing.append("trace_id/run_id")
+            if not name_col:
+                missing.append("tool_name/name")
+            log.warning(f"db.pool: cannot create tool_run_name_idx - missing columns: {', '.join(missing)}")
     except Exception as ex:
         log.warning(f"db.pool: failed to create tool_run_name_idx: {ex}", exc_info=True)
 
