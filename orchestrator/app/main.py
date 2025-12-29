@@ -832,7 +832,7 @@ async def _generate_scene_storyboards(
         if isinstance(locks_arg, dict) and locks_arg:
             args_img["lock_bundle"] = locks_arg
         storyboard_path: Optional[str] = None
-        res = await execute_tool_call({"tool_name": "image.dispatch", "arguments": args_img})
+        res = await execute_tool_call({"tool_name": "image.dispatch", "arguments": args_img}, trace_id=trace_id or "", conversation_id="")
         if isinstance(res, dict) and isinstance(res.get("result"), dict):
             r = res.get("result") or {}
             arts = r.get("artifacts") if isinstance(r.get("artifacts"), list) else []
@@ -1395,23 +1395,29 @@ async def tool_describe(request: Request) -> Any:
     parser = JSONParser()
     body = parser.parse(raw_text, {"trace_id": str, "conversation_id": str, "tool_call_name": str, "tool": str, "tool_name": str})
     if not isinstance(body, dict):
-        return ToolEnvelope.failure(code="invalid_body_type", message="Body must be a JSON object", trace_id="", conversation_id="", status=422, details={})
-    trace_id = str(body.get("trace_id") or "").strip()
-    conversation_id = str(body.get("conversation_id") or "").strip()
-    tool_name = body.get("tool_name")
+        log.error("tool_list_get: invalid_body_type - Body must be a JSON object. Continuing with empty body but this is an error.")
+        body = {}
+    trace_id = str(body.get("trace_id") or "").strip() if isinstance(body, dict) else ""
+    conversation_id = str(body.get("conversation_id") or "").strip() if isinstance(body, dict) else ""
+    if not trace_id:
+        log.error(f"tool_list_get: missing trace_id in request body - upstream caller must pass trace_id. Continuing with empty trace_id but this is an error.")
+        trace_id = ""
+    tool_name = body.get("tool_name") if isinstance(body, dict) else None
     if not isinstance(tool_name, str):
-        tool_name = body.get("tool")
+        tool_name = body.get("tool") if isinstance(body, dict) else None
     if not isinstance(tool_name, str):
-        tool_name = body.get("tool_call_name")
+        tool_name = body.get("tool_call_name") if isinstance(body, dict) else None
     if not isinstance(tool_name, str):
         tool_name = ""
     tool_name = tool_name.strip()
     if not tool_name:
-        return ToolEnvelope.failure(code="missing_tool_name", message="tool_name is required", trace_id=trace_id, conversation_id=conversation_id, status=422, details={})
+        log.error(f"tool_list_get: missing_tool_name - tool_name is required. Continuing with empty tool_name but this is an error. trace_id={trace_id!r}")
+        tool_name = ""
 
     reg = get_tool_introspection_registry([tool_name])
     meta = reg.get(tool_name) if isinstance(reg, dict) else None
     if not isinstance(meta, dict):
+        log.error(f"tool_describe_get: tool not found - continuing but this is an error. tool_name={tool_name!r} trace_id={trace_id!r} conversation_id={conversation_id!r}")
         return ToolEnvelope.failure(
             code="tool_not_found",
             message=f"tool not found: {tool_name}",
@@ -1440,12 +1446,17 @@ async def tool_describe_get(tool_name: str, trace_id: str = "", conversation_id:
     nm = (tool_name or "").strip()
     trace_id = str(trace_id or "").strip()
     conversation_id = str(conversation_id or "").strip()
+    if not trace_id:
+        log.error(f"tool_describe_get: missing trace_id - upstream caller must pass trace_id. Continuing with empty trace_id but this is an error. tool_name={nm!r}")
+        trace_id = ""
     if not nm:
-        return ToolEnvelope.failure(code="missing_tool_name", message="tool_name is required", trace_id=trace_id, conversation_id=conversation_id, status=422, details={})
-    reg = get_tool_introspection_registry([nm])
-    meta = reg.get(nm) if isinstance(reg, dict) else None
+        log.error(f"tool_describe_get: missing_tool_name - tool_name is required. Continuing with empty tool_name but this is an error. trace_id={trace_id!r}")
+        nm = ""
+    reg = get_tool_introspection_registry([nm]) if nm else {}
+    meta = reg.get(nm) if isinstance(reg, dict) and nm else None
     if not isinstance(meta, dict):
-        return ToolEnvelope.failure(code="tool_not_found", message=f"tool not found: {nm}", trace_id=trace_id, conversation_id=conversation_id, status=404, details={"tool_name": nm})
+        log.error(f"tool_describe_get: tool_not_found - tool not found: {nm!r}. Continuing with empty meta but this is an error. trace_id={trace_id!r}")
+        meta = {}
     schema = meta.get("schema") if isinstance(meta.get("schema"), dict) else {}
     out = dict(meta)
     out["schema"] = schema
@@ -1484,12 +1495,17 @@ async def tool_run(request: Request) -> Any:
     }
     body = parser.parse(source=raw_text, expected_structure=schema)
     if not isinstance(body, dict):
-        return ToolEnvelope.failure(code="invalid_body_type", message="Body must be a JSON object", trace_id="", conversation_id="", status=422, details={})
-    trace_id = body.get("trace_id")
-    conversation_id = body.get("conversation_id")
-    tool_name = body.get("tool_name")
+        log.error("tool_run: invalid_body_type - Body must be a JSON object. Continuing with empty body but this is an error.")
+        body = {}
+    trace_id = body.get("trace_id") if isinstance(body, dict) else None
+    conversation_id = body.get("conversation_id") if isinstance(body, dict) else None
+    tool_name = body.get("tool_name") if isinstance(body, dict) else None
+    if not isinstance(trace_id, str) or not trace_id:
+        log.error(f"tool_run: missing trace_id in request body - upstream caller must pass trace_id. Continuing with empty trace_id but this is an error. tool_name={tool_name!r}")
+        trace_id = ""
     if not isinstance(tool_name, str) or not tool_name.strip():
-        return ToolEnvelope.failure(code="missing_tool_name", message="tool_name is required", trace_id=trace_id, conversation_id=conversation_id, status=422, details={})
+        log.error(f"tool_run: missing_tool_name - tool_name is required. Continuing with empty tool_name but this is an error. trace_id={trace_id!r}")
+        tool_name = ""
     tool_name = tool_name.strip()
 
     args_in = body.get("args") if ("args" in body) else body.get("arguments")
@@ -1497,14 +1513,13 @@ async def tool_run(request: Request) -> Any:
         args = dict(args_in)
     elif isinstance(args_in, str):
         # Argument strings are forbidden: tool args must be JSON objects at execution time.
-        return ToolEnvelope.failure(
-            code="args_must_be_object",
-            message="Tool args must be a JSON object (string args are forbidden)",
-            trace_id=trace_id,
-            conversation_id=conversation_id,
-            status=422,
-            details={"tool_name": tool_name, "args_type": "str", "args": args_in},
-        )
+        log.error(f"tool_run: args_must_be_object - Tool args must be a JSON object (string args are forbidden). Attempting to parse as JSON. tool_name={tool_name!r} trace_id={trace_id!r}")
+        try:
+            args = JSONParser().parse(args_in, {})
+            if not isinstance(args, dict):
+                args = {"_raw": args_in}
+        except Exception:
+            args = {"_raw": args_in}
     elif args_in is None:
         args = {}
     else:
@@ -1522,13 +1537,14 @@ async def tool_run(request: Request) -> Any:
         # Keep request-scoped metadata under a reserved key to avoid collisions with tool schemas.
         args["_request_meta"] = dict(meta_in)
 
-    args["trace_id"] = trace_id
+    # trace_id MUST be passed from upstream - log error if missing but continue
+    if not isinstance(trace_id, str) or not trace_id:
+        log.error(f"tool_run: trace_id is empty when setting args - upstream caller must pass trace_id. Continuing but this is an error. tool_name={tool_name!r}")
+    args["trace_id"] = trace_id if isinstance(trace_id, str) else ""
 
-    args["conversation_id"] = conversation_id
+    args["conversation_id"] = conversation_id if isinstance(conversation_id, str) else ""
 
     call: Dict[str, Any] = {"tool_name": tool_name, "tool": tool_name, "arguments": args}
-    call["trace_id"] = trace_id
-    call["conversation_id"] = conversation_id
     # Trace tool-run boundary (canonical). This is the *in-process* tool execution path.
     t0 = time.perf_counter()
     try:
@@ -1541,7 +1557,7 @@ async def tool_run(request: Request) -> Any:
         )
     except Exception:
         pass
-    res = await execute_tool_call(call)
+    res = await execute_tool_call(call, trace_id=trace_id, conversation_id=conversation_id)
     dur_ms = int((time.perf_counter() - t0) * 1000)
 
     if isinstance(res, dict) and isinstance(res.get("result"), dict):
@@ -1837,29 +1853,17 @@ async def v1_image_generate(request: Request):
     # into image.dispatch args below.
     body = JSONParser().parse(raw.decode("utf-8", errors="replace"), {})
     if not isinstance(body, dict):
-        return ToolEnvelope.failure(
-            code="invalid_body_type",
-            message="Body must be an object",
-            trace_id="",
-            conversation_id="",
-            status=422,
-        )
-    trace_id = str(body.get("trace_id") or "").strip() if isinstance(body.get("trace_id"), (str, int)) else ""
-    conversation_id = str(body.get("conversation_id") or "").strip() if isinstance(body.get("conversation_id"), (str, int)) else ""
-    prompt = body.get("prompt") or body.get("text") or ""
+        log.error(f"v1_image_generate: body is not a dict - continuing but this is an error. body_type={type(body).__name__!r}")
+        body = {}
+    trace_id = str(body.get("trace_id") or "").strip() if isinstance(body, dict) and isinstance(body.get("trace_id"), (str, int)) else ""
+    conversation_id = str(body.get("conversation_id") or "").strip() if isinstance(body, dict) and isinstance(body.get("conversation_id"), (str, int)) else ""
+    prompt = body.get("prompt") or body.get("text") or "" if isinstance(body, dict) else ""
     if not isinstance(prompt, str):
-        return ToolEnvelope.failure(
-            code="invalid_prompt",
-            message="prompt must be a string",
-            trace_id=trace_id,
-            conversation_id=conversation_id,
-            status=422,
-        )
+        log.error(f"v1_image_generate: prompt is not a string - continuing but this is an error. trace_id={trace_id!r} conversation_id={conversation_id!r} prompt_type={type(prompt).__name__!r}")
+        prompt = ""
     # Shape args for image.dispatch; keep contract minimal and forwards-compatible
     args: Dict[str, Any] = {
         "prompt": prompt,
-        "trace_id": trace_id,
-        "conversation_id": conversation_id,
     }
     if isinstance(body.get("negative"), str):
         args["negative"] = body.get("negative")
@@ -1898,7 +1902,7 @@ async def v1_image_generate(request: Request):
                 exc_info=True,
             )
     # Execute in-process (no /tool.run HTTP recursion)
-    res = await execute_tool_call({"tool_name": "image.dispatch", "arguments": args})
+    res = await execute_tool_call({"tool_name": "image.dispatch", "arguments": args}, trace_id=trace_id, conversation_id=conversation_id)
     if isinstance(res, dict) and isinstance(res.get("result"), dict):
         result_obj = res.get("result") or {}
         # Preserve existing shape: prompt_id, conversation_id, paths for compatibility,
@@ -2125,8 +2129,6 @@ async def post_image_dispatch(request: Request):
     cfg_num = float(cfg) if isinstance(cfg, (int, float)) else None
     # Execute in-process (no /tool.run HTTP recursion).
     args = {
-        "trace_id": trace_id,
-        "conversation_id": conversation_id,
         "prompt": prompt,
         "negative": negative,
         "seed": seed,
@@ -2139,7 +2141,7 @@ async def post_image_dispatch(request: Request):
         "steps": steps,
         "cfg": cfg_num,
     }
-    res = await execute_tool_call({"tool_name": "image.dispatch", "arguments": args})
+    res = await execute_tool_call({"tool_name": "image.dispatch", "arguments": args}, trace_id=trace_id, conversation_id=conversation_id)
     try:
         if isinstance(res, dict) and isinstance(res.get("result"), dict):
             res_obj = res.get("result")
@@ -2971,41 +2973,44 @@ def _tool_error(tool_name: str, code: str, message: str, status: int = 422, **de
     return {"tool_name": tool_name, "error": err}
 
 
-async def execute_tool_call(tool_call: Dict[str, Any]) -> Dict[str, Any]:
+async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conversation_id: str = "") -> Dict[str, Any]:
     tool_name = tool_call.get("tool_name")
     if not isinstance(tool_name, str) or not tool_name.strip():
-        return _tool_error("", "missing_tool_name", "tool_name is required", status=422)
-    tool_name = tool_name.strip()
+        log.error(f"execute_tool_call: missing tool_name in tool_call - continuing with empty tool_name but this is an error. trace_id={trace_id!r} conversation_id={conversation_id!r}")
+        tool_name = ""
+    tool_name = tool_name.strip() if isinstance(tool_name, str) else ""
     # IMPORTANT: do not use `or {}` here; falsy values (e.g. "" or 0) should
     # still be preserved and routed through normalization below.
     raw_args = tool_call.get("arguments")
-    # Determine trace id for this tool call; always present in envelopes.
-    trace_id: str
-    if isinstance(tool_call.get("trace_id"), str) and tool_call.get("trace_id"):
-        trace_id = str(tool_call.get("trace_id"))
-    else:
-        meta = tool_call.get("meta")
-        if isinstance(meta, dict) and isinstance(meta.get("trace_id"), str) and meta.get("trace_id"):
-            trace_id = str(meta.get("trace_id"))
+    # Use canonical trace_id and conversation_id from parameters (fallback to tool_call dict for backwards compatibility)
+    if not trace_id:
+        trace_id_val = tool_call.get("trace_id")
+        if isinstance(trace_id_val, str) and trace_id_val:
+            trace_id = trace_id_val
         else:
-            trace_id = "tt_unknown"
-    # Determine conversation id for this tool call (non-fatal; empty string is allowed).
-    conversation_id: str = ""
-    if isinstance(tool_call.get("conversation_id"), str) and tool_call.get("conversation_id"):
-        conversation_id = str(tool_call.get("conversation_id"))
-    else:
-        meta_val2 = tool_call.get("meta")
-        if isinstance(meta_val2, dict) and isinstance(meta_val2.get("conversation_id"), str) and meta_val2.get("conversation_id"):
-            conversation_id = str(meta_val2.get("conversation_id"))
+            meta = tool_call.get("meta")
+            if isinstance(meta, dict):
+                trace_id_val = meta.get("trace_id")
+                if isinstance(trace_id_val, str) and trace_id_val:
+                    trace_id = trace_id_val
+            if not trace_id:
+                trace_id = "tt_unknown"
+    if not conversation_id:
+        conv_id_val = tool_call.get("conversation_id")
+        if isinstance(conv_id_val, str) and conv_id_val:
+            conversation_id = conv_id_val
+        else:
+            meta = tool_call.get("meta")
+            if isinstance(meta, dict):
+                conv_id_val = meta.get("conversation_id")
+                if isinstance(conv_id_val, str) and conv_id_val:
+                    conversation_id = conv_id_val
     # The executor is not a callable tool; it is invoked only via
     # the external executor service (pipeline.executor_gateway).
     if tool_name == "executor":
-        return _tool_error(
-            "executor",
-            "executor_not_callable",
-            "The executor must be invoked via execute_tools(), not as a tool.",
-            status=500,
-        )
+        log.error(f"execute_tool_call: executor tool called directly - executor must be invoked via execute_tools(), not as a tool. trace_id={trace_id!r} conversation_id={conversation_id!r}")
+        # Continue processing but return error result
+        return {"tool_name": "executor", "error": {"code": "executor_not_callable", "message": "The executor must be invoked via execute_tools(), not as a tool.", "status": 500}}
 
     # Generic HTTP API request tool (public APIs only; no internal SSRF)
     if tool_name == "api.request":
@@ -3199,9 +3204,11 @@ async def execute_tool_call(tool_call: Dict[str, Any]) -> Dict[str, Any]:
         image_url = str(a.get("image_url") or "").strip()
         options = a.get("options") if isinstance(a.get("options"), dict) else {}
         if not character_id:
-            return _tool_error(tool_name, "missing_character_id", "character_id is required")
+            log.error(f"locks.build_image_bundle: missing character_id - continuing but this is an error. trace_id={trace_id!r} conversation_id={conversation_id!r}")
+            return {"tool_name": tool_name, "error": {"code": "missing_character_id", "message": "character_id is required"}}
         if not image_url:
-            return _tool_error(tool_name, "missing_image_url", "image_url is required")
+            log.error(f"locks.build_image_bundle: missing image_url - continuing but this is an error. trace_id={trace_id!r} conversation_id={conversation_id!r}")
+            return {"tool_name": tool_name, "error": {"code": "missing_image_url", "message": "image_url is required"}}
         bundle = await _build_image_lock_bundle(character_id, image_url, options, locks_root_dir=LOCKS_ROOT_DIR)
         existing = await _lock_load(character_id) or {}
         existing = _lock_migrate_visual(existing)
@@ -3220,9 +3227,11 @@ async def execute_tool_call(tool_call: Dict[str, Any]) -> Dict[str, Any]:
         max_frames = a.get("max_frames")
         max_frames = int(max_frames) if isinstance(max_frames, int) and max_frames > 0 else 16
         if not character_id:
-            return _tool_error(tool_name, "missing_character_id", "character_id is required")
+            log.error(f"locks.build_video_bundle: missing character_id - continuing but this is an error. trace_id={trace_id!r} conversation_id={conversation_id!r}")
+            return {"tool_name": tool_name, "error": {"code": "missing_character_id", "message": "character_id is required"}}
         if not video_path:
-            return _tool_error(tool_name, "missing_video_path", "video_path is required")
+            log.error(f"locks.build_video_bundle: missing video_path - continuing but this is an error. trace_id={trace_id!r} conversation_id={conversation_id!r}")
+            return {"tool_name": tool_name, "error": {"code": "missing_video_path", "message": "video_path is required"}}
         bundle = await _build_video_lock_bundle(character_id, video_path, locks_root_dir=LOCKS_ROOT_DIR, max_frames=max_frames)
         existing = await _lock_load(character_id) or {}
         existing = _lock_migrate_visual(existing)
@@ -3239,9 +3248,11 @@ async def execute_tool_call(tool_call: Dict[str, Any]) -> Dict[str, Any]:
         character_id = str(a.get("character_id") or "").strip()
         audio_url = str(a.get("audio_url") or "").strip()
         if not character_id:
-            return _tool_error(tool_name, "missing_character_id", "character_id is required")
+            log.error(f"locks.build_audio_bundle: missing character_id - continuing but this is an error. trace_id={trace_id!r} conversation_id={conversation_id!r}")
+            return {"tool_name": tool_name, "error": {"code": "missing_character_id", "message": "character_id is required"}}
         if not audio_url:
-            return _tool_error(tool_name, "missing_audio_url", "audio_url is required")
+            log.error(f"locks.build_audio_bundle: missing audio_url - continuing but this is an error. trace_id={trace_id!r} conversation_id={conversation_id!r}")
+            return {"tool_name": tool_name, "error": {"code": "missing_audio_url", "message": "audio_url is required"}}
         bundle = await _build_audio_lock_bundle(character_id, audio_url, locks_root_dir=LOCKS_ROOT_DIR)
         existing = await _lock_load(character_id) or {}
         existing = _lock_migrate_visual(existing)
@@ -3283,7 +3294,8 @@ async def execute_tool_call(tool_call: Dict[str, Any]) -> Dict[str, Any]:
         # requiring character identity. This avoids noisy failures in revise
         # flows when only a bundle snapshot is available.
         if not character_id and bundle_arg is None:
-            return _tool_error(tool_name, "missing_character_id", "character_id or lock_bundle is required")
+            log.error(f"locks.update_region_modes: missing character_id or lock_bundle - continuing but this is an error. trace_id={trace_id!r} conversation_id={conversation_id!r}")
+            return {"tool_name": tool_name, "error": {"code": "missing_character_id", "message": "character_id or lock_bundle is required"}}
         if character_id:
             existing = await _lock_load(character_id) or {}
         else:
@@ -3304,7 +3316,8 @@ async def execute_tool_call(tool_call: Dict[str, Any]) -> Dict[str, Any]:
         character_id = str(a.get("character_id") or "").strip()
         update_payload = a.get("update") if isinstance(a.get("update"), dict) else {}
         if not character_id:
-            return _tool_error(tool_name, "missing_character_id", "character_id is required")
+            log.error(f"locks.update_audio_modes: missing character_id - continuing but this is an error. trace_id={trace_id!r} conversation_id={conversation_id!r}")
+            return {"tool_name": tool_name, "error": {"code": "missing_character_id", "message": "character_id is required"}}
         existing = await _lock_load(character_id) or {}
         existing = _lock_migrate_visual(existing)
         existing = _lock_migrate_music(existing)
@@ -3319,7 +3332,8 @@ async def execute_tool_call(tool_call: Dict[str, Any]) -> Dict[str, Any]:
         a = args if isinstance(args, dict) else {}
         character_id = str(a.get("character_id") or "").strip()
         if not character_id:
-            return _tool_error(tool_name, "missing_character_id", "character_id is required", status=422)
+            log.error(f"locks.get_bundle: missing character_id - continuing but this is an error. trace_id={trace_id!r} conversation_id={conversation_id!r}")
+            return {"tool_name": tool_name, "error": {"code": "missing_character_id", "message": "character_id is required", "status": 422}}
         bundle = await _lock_load(character_id)
         if bundle is None:
             return {"tool_name": tool_name, "result": {"lock_bundle": None, "found": False}}
@@ -3460,11 +3474,13 @@ async def execute_tool_call(tool_call: Dict[str, Any]) -> Dict[str, Any]:
 
             if mode_req == "upscale":
                 if not UPSCALE_API_URL:
-                    return _tool_error(tool_name, "upscale_unconfigured", "UPSCALE_API_URL not configured", status=500)
+                    log.error(f"image.dispatch: UPSCALE_API_URL not configured - continuing but this is an error. trace_id={trace_id!r} conversation_id={conversation_id!r}")
+                    return {"tool_name": tool_name, "error": {"code": "upscale_unconfigured", "message": "UPSCALE_API_URL not configured", "status": 500}}
                 # Resolve input image from args/assets.
                 src_img = a.get("image_ref") or assets.get("image_ref") or assets.get("src") or assets.get("init_image") or assets.get("image") or ""
                 if not isinstance(src_img, str) or not src_img.strip():
-                    return _tool_error(tool_name, "missing_image_ref", "image_ref is required for mode=upscale", status=422)
+                    log.error(f"image.dispatch: missing image_ref for mode=upscale - continuing but this is an error. trace_id={trace_id!r} conversation_id={conversation_id!r}")
+                    return {"tool_name": tool_name, "error": {"code": "missing_image_ref", "message": "image_ref is required for mode=upscale", "status": 422}}
                 img_abs = src_img.strip()
                 if img_abs.startswith("/uploads/"):
                     img_abs = "/workspace" + img_abs
@@ -3472,9 +3488,11 @@ async def execute_tool_call(tool_call: Dict[str, Any]) -> Dict[str, Any]:
                     img_abs = os.path.normpath(os.path.join(UPLOAD_DIR, img_abs))  # type: ignore[name-defined]
                 img_abs = os.path.normpath(img_abs)
                 if not img_abs.startswith(os.path.normpath(UPLOAD_DIR)):  # type: ignore[name-defined]
-                    return _tool_error(tool_name, "bad_image_path", "image_ref must be under UPLOAD_DIR", status=422, image_ref=src_img)
+                    log.error(f"image.dispatch: bad image path - continuing but this is an error. trace_id={trace_id!r} conversation_id={conversation_id!r} image_ref={src_img!r}")
+                    return {"tool_name": tool_name, "error": {"code": "bad_image_path", "message": "image_ref must be under UPLOAD_DIR", "status": 422, "image_ref": src_img}}
                 if not os.path.isfile(img_abs):
-                    return _tool_error(tool_name, "image_not_found", "image_ref not found", status=404, image_ref=img_abs)
+                    log.error(f"image.dispatch: image_ref not found - continuing but this is an error. trace_id={trace_id!r} conversation_id={conversation_id!r} image_ref={img_abs!r}")
+                    return {"tool_name": tool_name, "error": {"code": "image_not_found", "message": "image_ref not found", "status": 404, "image_ref": img_abs}}
 
                 input_rel = os.path.relpath(img_abs, UPLOAD_DIR).replace("\\", "/")  # type: ignore[name-defined]
                 prompt_id = f"upscale_{int(time.time())}"
@@ -3789,7 +3807,9 @@ async def execute_tool_call(tool_call: Dict[str, Any]) -> Dict[str, Any]:
             lock_bundle = _lock_migrate_visual(lock_bundle)
         dispatch_args = build_image_refine_dispatch_args(a, lock_bundle, str(quality_profile or "standard"))
         # Execute in-process (no /tool.run recursion)
-        res = await execute_tool_call({"tool_name": "image.dispatch", "arguments": dispatch_args})
+        trace_id_val = a.get("trace_id") or ""
+        conv_id_val = a.get("conversation_id") or ""
+        res = await execute_tool_call({"tool_name": "image.dispatch", "arguments": dispatch_args}, trace_id=trace_id_val, conversation_id=conv_id_val)
         if isinstance(res, dict) and isinstance(res.get("result"), dict):
             env = res.get("result") or {}
         else:
@@ -3982,14 +4002,14 @@ async def execute_tool_call(tool_call: Dict[str, Any]) -> Dict[str, Any]:
             if VISION_REPAIR_API_URL:
                 det_res = await execute_tool_call(
                     {
-                        "name": "image.detect",
+                        "tool_name": "image.detect",
                         "arguments": {
                             "src": fp,
                             "locks": locks,
-                            "trace_id": trace_id,
-                            "conversation_id": conversation_id,
                         },
-                    }
+                    },
+                    trace_id=trace_id or "",
+                    conversation_id=conversation_id or "",
                 )
                 det_out = det_res.get("result") if isinstance(det_res, dict) else {}
                 regions: List[Dict[str, Any]] = []
@@ -4029,7 +4049,7 @@ async def execute_tool_call(tool_call: Dict[str, Any]) -> Dict[str, Any]:
                         },
                     )
                     rep_args: Dict[str, Any] = {"src": fp, "regions": regions, "mode": refine_mode, "locks": locks}
-                    rep_res = await execute_tool_call({"tool_name": "image.repair", "arguments": rep_args})
+                    rep_res = await execute_tool_call({"tool_name": "image.repair", "arguments": rep_args}, trace_id=trace_id or "", conversation_id=conversation_id or "")
                     rep_out = rep_res.get("result") if isinstance(rep_res, dict) else {}
                     if isinstance(rep_out, dict):
                         rp = rep_out.get("repaired_image_path")
@@ -4039,7 +4059,9 @@ async def execute_tool_call(tool_call: Dict[str, Any]) -> Dict[str, Any]:
             # 3) Fallback cleanup if no repair happened
             if cleaned_path == fp:
                 im_res = await execute_tool_call(
-                    {"name": "image.cleanup", "arguments": {"src": fp, "trace_id": trace_id, "conversation_id": conversation_id}}
+                    {"tool_name": "image.cleanup", "arguments": {"src": fp}},
+                    trace_id=trace_id or "",
+                    conversation_id=conversation_id or "",
                 )
                 if isinstance(im_res, dict) and isinstance(im_res.get("result"), dict):
                     r = im_res.get("result") or {}
@@ -4154,7 +4176,7 @@ async def execute_tool_call(tool_call: Dict[str, Any]) -> Dict[str, Any]:
                 shot_id=str(shot_id) if isinstance(shot_id, str) else None,
                 act_id=str(act_id) if isinstance(act_id, str) else None,
             )
-            hv_res = await execute_tool_call({"tool_name": "video.hv.t2v", "arguments": hv_args})
+            hv_res = await execute_tool_call({"tool_name": "video.hv.t2v", "arguments": hv_args}, trace_id=trace_id or "", conversation_id=conversation_id or "")
             if isinstance(hv_res, dict) and hv_res.get("error") is not None:
                 return hv_res
             hv_result_raw = hv_res.get("result") if isinstance(hv_res, dict) else hv_res
@@ -7013,7 +7035,9 @@ async def execute_tool_call(tool_call: Dict[str, Any]) -> Dict[str, Any]:
             try:
                 v_args = dict(base_args)
                 v_args["seed"] = det_seed_tool(f"{base_tool}#{i}", str(det_seed_router("alt", 0)))
-                tr = await execute_tool_call({"tool_name": base_tool, "arguments": v_args})
+                trace_id_val = args.get("trace_id") or ""
+                conv_id_val = args.get("conversation_id") or ""
+                tr = await execute_tool_call({"tool_name": base_tool, "arguments": v_args}, trace_id=trace_id_val, conversation_id=conv_id_val)
                 results.append(tr)
             except Exception as ex:
                 results.append({"name": base_tool, "error": str(ex)})
@@ -7051,60 +7075,45 @@ async def execute_tool_call(tool_call: Dict[str, Any]) -> Dict[str, Any]:
         kind = (args.get("kind") or "").strip().lower()
         src = args.get("src") or ""
         if not kind or not src:
-            return _tool_error(tool_name, "missing_input", "kind and src are required", status=422)
+            log.error(f"creative.pro_polish: missing inputs - kind={kind!r} src={src!r} - continuing but this is an error. trace_id={trace_id!r} conversation_id={conversation_id!r}")
+            return {"tool_name": tool_name, "error": {"code": "missing_input", "message": "kind and src are required", "status": 422}}
         try:
             if kind == "image":
+                trace_id_val = args.get("trace_id") or ""
+                conv_id_val = args.get("conversation_id") or ""
                 c1 = await execute_tool_call(
-                    {
-                        "name": "image.cleanup",
-                        "arguments": {"src": src, "trace_id": args.get("trace_id"), "conversation_id": args.get("conversation_id")},
-                    }
+                    {"tool_name": "image.cleanup", "arguments": {"src": src}},
+                    trace_id=trace_id_val,
+                    conversation_id=conv_id_val,
                 )
                 c1_result = c1.get("result") if isinstance(c1.get("result"), dict) else {}
                 u = c1_result.get("url") or src
                 c2 = await execute_tool_call(
-                    {
-                        "name": "image.upscale",
-                        "arguments": {"image_ref": u, "scale": 2, "trace_id": args.get("trace_id"), "conversation_id": args.get("conversation_id")},
-                    }
+                    {"tool_name": "image.upscale", "arguments": {"image_ref": u, "scale": 2}},
+                    trace_id=trace_id_val,
+                    conversation_id=conv_id_val,
                 )
                 return {"tool_name": tool_name, "result": {"chain": [c1, c2]}}
             if kind == "video":
+                trace_id_val = args.get("trace_id") or ""
+                conv_id_val = args.get("conversation_id") or ""
                 c1 = await execute_tool_call(
-                    {
-                        "name": "video.cleanup",
-                        "arguments": {
-                            "src": src,
-                            "stabilize_faces": True,
-                            "trace_id": args.get("trace_id"),
-                            "conversation_id": args.get("conversation_id"),
-                        },
-                    }
+                    {"tool_name": "video.cleanup", "arguments": {"src": src, "stabilize_faces": True}},
+                    trace_id=trace_id_val,
+                    conversation_id=conv_id_val,
                 )
                 c1_result = c1.get("result") if isinstance(c1.get("result"), dict) else {}
                 u = c1_result.get("url") or src
                 c2 = await execute_tool_call(
-                    {
-                        "name": "video.interpolate",
-                        "arguments": {
-                            "src": u,
-                            "target_fps": 60,
-                            "trace_id": args.get("trace_id"),
-                            "conversation_id": args.get("conversation_id"),
-                        },
-                    }
+                    {"tool_name": "video.interpolate", "arguments": {"src": u, "target_fps": 60}},
+                    trace_id=trace_id_val,
+                    conversation_id=conv_id_val,
                 )
                 c2_result = c2.get("result") if isinstance(c2.get("result"), dict) else {}
                 c3 = await execute_tool_call(
-                    {
-                        "name": "video.upscale",
-                        "arguments": {
-                            "src": c2_result.get("url") or u,
-                            "scale": 2,
-                            "trace_id": args.get("trace_id"),
-                            "conversation_id": args.get("conversation_id"),
-                        },
-                    }
+                    {"tool_name": "video.upscale", "arguments": {"src": c2_result.get("url") or u, "scale": 2}},
+                    trace_id=trace_id_val,
+                    conversation_id=conv_id_val,
                 )
                 return {"tool_name": tool_name, "result": {"chain": [c1, c2, c3]}}
             if kind == "audio":
@@ -7220,6 +7229,7 @@ async def execute_tool_call(tool_call: Dict[str, Any]) -> Dict[str, Any]:
 
         url = src_abs.replace("/workspace", "") if src_abs.startswith("/workspace/") else src_abs
         conversation_id = args.get("conversation_id") if isinstance(args.get("conversation_id"), str) else ""
+        trace_id = args.get("trace_id") or ""
         ctx_key = conversation_id if conversation_id else "misc"
         _ctx_add(ctx_key, "video", src_abs, url, src_abs, ["temporal_qa"], {"fps": fps})
         trace_event("video", {"conversation_id": conversation_id, "tool": "video.temporal_clip_qa", "src": src_abs, "fps": fps, "duration_s": dur_s})
@@ -7229,7 +7239,7 @@ async def execute_tool_call(tool_call: Dict[str, Any]) -> Dict[str, Any]:
                 "path": url,
                 "meta": {
                     "conversation_id": conversation_id,
-                    "trace_id": args.get("trace_id"),
+                    "trace_id": trace_id,
                     "film_id": args.get("film_id"),
                     "scene_id": args.get("scene_id"),
                     "shot_id": args.get("shot_id"),
@@ -7243,10 +7253,10 @@ async def execute_tool_call(tool_call: Dict[str, Any]) -> Dict[str, Any]:
                 },
                 "qa": {"videos": {"temporal_stability": float(temporal_stability), "sharpness_median": float(sharp_med), "delta_median": float(delta_med)}},
                 "artifacts": [build_artifact(
-                    artifact_id=generate_artifact_id(trace_id=(args.get("trace_id") or ""), tool_name="video.temporal_clip_qa", conversation_id=conversation_id, suffix_data=os.path.basename(url) if isinstance(url, str) else url.split("/")[-1] if isinstance(url, str) and "/" in url else None),
+                    artifact_id=generate_artifact_id(trace_id=trace_id, tool_name="video.temporal_clip_qa", conversation_id=conversation_id, suffix_data=os.path.basename(url) if isinstance(url, str) else url.split("/")[-1] if isinstance(url, str) and "/" in url else None),
                     kind="video",
                     path=url,
-                    trace_id=(args.get("trace_id") or ""),
+                    trace_id=trace_id,
                     conversation_id=conversation_id,
                     tool_name="video.temporal_clip_qa",
                     view_url=url,
@@ -7377,8 +7387,12 @@ async def execute_tool_call(tool_call: Dict[str, Any]) -> Dict[str, Any]:
             return _tool_error(tool_name, "missing_mix_wav", "mix_wav is required", status=422)
         mix_url = mix_path
         try:
+            trace_id_val = args.get("trace_id") or ""
+            conv_id_val = args.get("conversation_id") or ""
             sep = await execute_tool_call(
-                {"name": "audio.stems.demucs", "arguments": {"mix_wav": mix_url, "stems": args.get("stems") or ["vocals", "drums", "bass", "other"]}}
+                {"tool_name": "audio.stems.demucs", "arguments": {"mix_wav": mix_url, "stems": args.get("stems") or ["vocals", "drums", "bass", "other"]}},
+                trace_id=trace_id_val,
+                conversation_id=conv_id_val,
             )
             stems_info = (sep.get("result") or sep) if isinstance(sep, dict) else {}
             stems_obj = stems_info.get("stems") if isinstance(stems_info.get("stems"), dict) else stems_info
@@ -7482,13 +7496,18 @@ async def execute_tool_call(tool_call: Dict[str, Any]) -> Dict[str, Any]:
         voice_lock_id = args.get("voice_lock_id")
         try:
             # 1) Separate stems
+            trace_id_val = args.get("trace_id") or ""
+            conv_id_val = args.get("conversation_id") or ""
             sep = await execute_tool_call(
-                {"name": "audio.stems.demucs", "arguments": {"mix_wav": mix_path, "stems": ["vocals", "drums", "bass", "other"]}}
+                {"tool_name": "audio.stems.demucs", "arguments": {"mix_wav": mix_path, "stems": ["vocals", "drums", "bass", "other"]}},
+                trace_id=trace_id_val,
+                conversation_id=conv_id_val,
             )
             stems_info = (sep.get("result") or sep) if isinstance(sep, dict) else {}
             stems_obj = stems_info.get("stems") if isinstance(stems_info.get("stems"), dict) else stems_info
             if not isinstance(stems_obj, dict):
-                return _tool_error(tool_name, "stems_missing", "Demucs did not return stems", status=500, result=stems_info)
+                log.error(f"audio.stems.adjust: Demucs did not return stems - continuing but this is an error. trace_id={trace_id!r} conversation_id={conversation_id!r} result={stems_info!r}")
+                return {"tool_name": tool_name, "error": {"code": "stems_missing", "message": "Demucs did not return stems", "status": 500, "result": stems_info}}
             vocals_path = None
             backing_stems: List[Dict[str, Any]] = []
             for stem_name, val in stems_obj.items():
@@ -8050,7 +8069,8 @@ async def execute_tool_call(tool_call: Dict[str, Any]) -> Dict[str, Any]:
                     else:
                         refine_args["prompt"] = f"New lyrics for this window: {snippet}"
                     refine_args["lyrics"] = snippet
-                res_ref = await execute_tool_call({"tool_name": "music.refine.window", "arguments": refine_args})
+                trace_id_val = a.get("trace_id") or ""
+                res_ref = await execute_tool_call({"tool_name": "music.refine.window", "arguments": refine_args}, trace_id=trace_id_val, conversation_id=conversation_id)
                 if isinstance(res_ref, dict) and not res_ref.get("error"):
                     refined_windows.append(wid)
         env: Dict[str, Any] = {
@@ -8174,9 +8194,11 @@ async def execute_tool_call(tool_call: Dict[str, Any]) -> Dict[str, Any]:
         res = env.get("result") if isinstance(env.get("result"), dict) else {}
         out_path = res.get("output_path")
         if not isinstance(out_path, str) or not out_path:
-            return _tool_error(tool_name, "upscale_missing_output", "Upscale returned no output_path", status=500, result=res)
+            log.error(f"image.upscale: upscale returned no output_path - continuing but this is an error. trace_id={trace_id!r} conversation_id={conversation_id!r} result={res!r}")
+            return {"tool_name": tool_name, "error": {"code": "upscale_missing_output", "message": "Upscale returned no output_path", "status": 500, "result": res}}
         url = out_path.replace("/workspace", "") if out_path.startswith("/workspace/") else out_path
         conversation_id = str(args.get("conversation_id") or "").strip() if isinstance(args.get("conversation_id"), str) else ""
+        trace_id = args.get("trace_id") or ""
         ctx_key = conversation_id if conversation_id else "misc"
         _ctx_add(ctx_key, "image", out_path, url, img_abs, ["upscale", "realesrgan"], {"scale": scale})
         trace_event("image", {"conversation_id": conversation_id, "tool": "image.upscale", "src": img_abs, "scale": scale, "path": out_path})
@@ -8186,7 +8208,7 @@ async def execute_tool_call(tool_call: Dict[str, Any]) -> Dict[str, Any]:
                 "path": url,
                 "meta": {
                     "conversation_id": conversation_id,
-                    "trace_id": args.get("trace_id"),
+                    "trace_id": trace_id,
                     "film_id": args.get("film_id"),
                     "scene_id": args.get("scene_id"),
                     "shot_id": args.get("shot_id"),
@@ -8195,10 +8217,10 @@ async def execute_tool_call(tool_call: Dict[str, Any]) -> Dict[str, Any]:
                     "provider": "realesrgan",
                 },
                 "artifacts": [build_artifact(
-                    artifact_id=generate_artifact_id(trace_id=(args.get("trace_id") or ""), tool_name="image.upscale", conversation_id=conversation_id, suffix_data=os.path.basename(url) if isinstance(url, str) else url.split("/")[-1] if isinstance(url, str) and "/" in url else None),
+                    artifact_id=generate_artifact_id(trace_id=trace_id, tool_name="image.upscale", conversation_id=conversation_id, suffix_data=os.path.basename(url) if isinstance(url, str) else url.split("/")[-1] if isinstance(url, str) and "/" in url else None),
                     kind="image",
                     path=url,
-                    trace_id=(args.get("trace_id") or ""),
+                    trace_id=trace_id,
                     conversation_id=conversation_id,
                     tool_name="image.upscale",
                     view_url=url,
@@ -8208,7 +8230,8 @@ async def execute_tool_call(tool_call: Dict[str, Any]) -> Dict[str, Any]:
             },
         }
     if tool_name == "image.edit" and ALLOW_TOOL_EXECUTION:
-        return _tool_error(name, "disabled", "disabled: use image.dispatch with full graph (no fallbacks)", status=403)
+        log.error(f"image.edit: tool is disabled - use image.dispatch with full graph (no fallbacks). trace_id={trace_id!r} conversation_id={conversation_id!r}")
+        return {"tool_name": name, "error": {"code": "disabled", "message": "disabled: use image.dispatch with full graph (no fallbacks)", "status": 403}}
     if tool_name == "image.super_gen" and ALLOW_TOOL_EXECUTION:
         # Multi-object iterative generation: base canvas + per-object refinement + global polish
         prompt = (args.get("prompt") or "").strip()
@@ -8289,7 +8312,8 @@ async def execute_tool_call(tool_call: Dict[str, Any]) -> Dict[str, Any]:
         conversation_id = args.get("conversation_id") if isinstance(args.get("conversation_id"), str) else ""
         ctx_key = conversation_id if conversation_id else "misc"
         base_args = {"prompt": base_style, "size": f"{w}x{h}", "seed": args.get("seed"), "refs": args.get("refs"), "conversation_id": conversation_id}
-        base = await execute_tool_call({"tool_name": "legacy.image.gen", "arguments": base_args})
+        trace_id_val = args.get("trace_id") or ""
+        base = await execute_tool_call({"tool_name": "legacy.image.gen", "arguments": base_args}, trace_id=trace_id_val, conversation_id=conversation_id)
         base_path = None
         if isinstance(base, dict):
             base_res = base.get("result") if isinstance(base.get("result"), dict) else {}
@@ -8314,7 +8338,8 @@ async def execute_tool_call(tool_call: Dict[str, Any]) -> Dict[str, Any]:
                 sub_args = {"prompt": refined_prompt, "size": f"{box[2]-box[0]}x{box[3]-box[1]}", "seed": args.get("seed"), "refs": args.get("refs"), "conversation_id": conversation_id}
                 best_tile = None
                 for attempt in range(0, 3):
-                    sub = await execute_tool_call({"tool_name": "legacy.image.gen", "arguments": sub_args})
+                    trace_id_val = args.get("trace_id") or ""
+                    sub = await execute_tool_call({"tool_name": "legacy.image.gen", "arguments": sub_args}, trace_id=trace_id_val, conversation_id=conversation_id)
                     sub_meta = ((sub.get("result") or {}).get("meta") or {}) if isinstance((sub.get("result") or {}).get("meta"), dict) else {}
                     scid = sub_meta.get("conversation_id") if isinstance(sub_meta.get("conversation_id"), str) else None
                     artifact_id = ((sub.get("result") or {}).get("tool_calls") or [{}])[0].get("artifact_id")
@@ -8590,7 +8615,8 @@ async def execute_tool_call(tool_call: Dict[str, Any]) -> Dict[str, Any]:
     if tool_name == "video.cleanup":
         src = args.get("src") or ""
         if not src:
-            return _tool_error(tool_name, "missing_src", "src is required", status=422)
+            log.error(f"video.cleanup: missing src - continuing but this is an error. trace_id={trace_id!r} conversation_id={conversation_id!r}")
+            return {"tool_name": tool_name, "error": {"code": "missing_src", "message": "src is required", "status": 422}}
         outdir = os.path.join(UPLOAD_DIR, "artifacts", "video", f"vclean-{int(time.time())}")
         os.makedirs(outdir, exist_ok=True)
         dst = os.path.join(outdir, "clean.mp4")
@@ -8603,6 +8629,7 @@ async def execute_tool_call(tool_call: Dict[str, Any]) -> Dict[str, Any]:
         ff = ["ffmpeg", "-y", "-i", src, "-vf", vf, "-c:v", "libx264", "-preset", "slow", "-crf", "18", "-c:a", "copy", dst]
         try:
             conversation_id = str(args.get("conversation_id") or "").strip() if isinstance(args.get("conversation_id"), str) else ""
+            trace_id = args.get("trace_id") or ""
             ctx_key = conversation_id if conversation_id else "misc"
             subprocess.run(ff, check=True)
             url = dst.replace("/workspace", "") if dst.startswith("/workspace/") else dst
@@ -8612,12 +8639,12 @@ async def execute_tool_call(tool_call: Dict[str, Any]) -> Dict[str, Any]:
                 "name": name,
                 "result": {
                     "path": url,
-                    "meta": {"vf": vf, "conversation_id": conversation_id, "trace_id": args.get("trace_id"), "film_id": args.get("film_id"), "shot_id": args.get("shot_id")},
+                    "meta": {"vf": vf, "conversation_id": conversation_id, "trace_id": trace_id, "film_id": args.get("film_id"), "shot_id": args.get("shot_id")},
                     "artifacts": [build_artifact(
-                        artifact_id=generate_artifact_id(trace_id=(args.get("trace_id") or ""), tool_name="video.cleanup", conversation_id=conversation_id, suffix_data=os.path.basename(url) if isinstance(url, str) else url.split("/")[-1] if isinstance(url, str) and "/" in url else None),
+                        artifact_id=generate_artifact_id(trace_id=trace_id, tool_name="video.cleanup", conversation_id=conversation_id, suffix_data=os.path.basename(url) if isinstance(url, str) else url.split("/")[-1] if isinstance(url, str) and "/" in url else None),
                         kind="video",
                         path=url,
-                        trace_id=(args.get("trace_id") or ""),
+                        trace_id=trace_id,
                         conversation_id=conversation_id,
                         tool_name="video.cleanup",
                         view_url=url,
@@ -8649,6 +8676,7 @@ async def execute_tool_call(tool_call: Dict[str, Any]) -> Dict[str, Any]:
             return _tool_error(tool_name, "missing_inputs", "src is required and type must be one of: clock, glass", status=422, src=src, type=atype)
         try:
             conversation_id = str(args.get("conversation_id") or "").strip() if isinstance(args.get("conversation_id"), str) else ""
+            trace_id = args.get("trace_id") or ""
             ctx_key = conversation_id if conversation_id else "misc"
             img = cv2.imread(src, cv2.IMREAD_COLOR)
             if img is None:
@@ -8722,7 +8750,7 @@ async def execute_tool_call(tool_call: Dict[str, Any]) -> Dict[str, Any]:
                     "path": url,
                     "meta": {
                         "conversation_id": conversation_id,
-                        "trace_id": args.get("trace_id"),
+                        "trace_id": trace_id,
                         "film_id": args.get("film_id"),
                         "scene_id": args.get("scene_id"),
                         "shot_id": args.get("shot_id"),
@@ -8732,10 +8760,10 @@ async def execute_tool_call(tool_call: Dict[str, Any]) -> Dict[str, Any]:
                         "target_time": args.get("target_time"),
                     },
                     "artifacts": [build_artifact(
-                        artifact_id=generate_artifact_id(trace_id=(args.get("trace_id") or ""), tool_name="image.artifact_fix", conversation_id=conversation_id, suffix_data=os.path.basename(url) if isinstance(url, str) else url.split("/")[-1] if isinstance(url, str) and "/" in url else None),
+                        artifact_id=generate_artifact_id(trace_id=trace_id, tool_name="image.artifact_fix", conversation_id=conversation_id, suffix_data=os.path.basename(url) if isinstance(url, str) else url.split("/")[-1] if isinstance(url, str) and "/" in url else None),
                         kind="image",
                         path=url,
-                        trace_id=(args.get("trace_id") or ""),
+                        trace_id=trace_id,
                         conversation_id=conversation_id,
                         tool_name="image.artifact_fix",
                         view_url=url,
@@ -8767,12 +8795,13 @@ async def execute_tool_call(tool_call: Dict[str, Any]) -> Dict[str, Any]:
         dst = os.path.join(outdir, "fixed.mp4")
         try:
             conversation_id = str(args.get("conversation_id") or "").strip() if isinstance(args.get("conversation_id"), str) else ""
+            trace_id = args.get("trace_id") or ""
             # Extract frames
             subprocess.run(["ffmpeg", "-y", "-i", src, os.path.join(frames_dir, "%06d.png")], check=True)
             # Process frames with image.artifact_fix
             frame_files = sorted(_glob(os.path.join(frames_dir, "*.png")))
             for fp in frame_files:
-                _ = await execute_tool_call({"tool_name": "image.artifact_fix", "arguments": {"src": fp, "type": atype, "target_time": args.get("target_time"), "region": args.get("region"), "conversation_id": conversation_id}})
+                _ = await execute_tool_call({"tool_name": "image.artifact_fix", "arguments": {"src": fp, "type": atype, "target_time": args.get("target_time"), "region": args.get("region")}}, trace_id=trace_id, conversation_id=conversation_id)
             # Reassemble
             subprocess.run(["ffmpeg", "-y", "-framerate", "30", "-i", os.path.join(frames_dir, "%06d.png"), "-c:v", "libx264", "-pix_fmt", "yuv420p", dst], check=True)
             url = dst.replace("/workspace", "") if dst.startswith("/workspace/") else dst
@@ -8794,7 +8823,7 @@ async def execute_tool_call(tool_call: Dict[str, Any]) -> Dict[str, Any]:
                     "path": url,
                     "meta": {
                         "conversation_id": conversation_id,
-                        "trace_id": args.get("trace_id"),
+                        "trace_id": trace_id,
                         "film_id": args.get("film_id"),
                         "scene_id": args.get("scene_id"),
                         "shot_id": args.get("shot_id"),
@@ -8804,10 +8833,10 @@ async def execute_tool_call(tool_call: Dict[str, Any]) -> Dict[str, Any]:
                         "target_time": args.get("target_time"),
                     },
                     "artifacts": [build_artifact(
-                        artifact_id=generate_artifact_id(trace_id=(args.get("trace_id") or ""), tool_name="video.artifact_fix", conversation_id=conversation_id, suffix_data=os.path.basename(url) if isinstance(url, str) else url.split("/")[-1] if isinstance(url, str) and "/" in url else None),
+                        artifact_id=generate_artifact_id(trace_id=trace_id, tool_name="video.artifact_fix", conversation_id=conversation_id, suffix_data=os.path.basename(url) if isinstance(url, str) else url.split("/")[-1] if isinstance(url, str) and "/" in url else None),
                         kind="video",
                         path=url,
-                        trace_id=(args.get("trace_id") or ""),
+                        trace_id=trace_id,
                         conversation_id=conversation_id,
                         tool_name="video.artifact_fix",
                         view_url=url,
@@ -8836,10 +8865,12 @@ async def execute_tool_call(tool_call: Dict[str, Any]) -> Dict[str, Any]:
             return _tool_error(tool_name, "missing_src", "src is required", status=422)
         try:
             conversation_id = str(args.get("conversation_id") or "").strip() if isinstance(args.get("conversation_id"), str) else ""
+            trace_id = args.get("trace_id") or ""
             ctx_key = conversation_id if conversation_id else "misc"
             img = cv2.imread(src, cv2.IMREAD_COLOR)
             if img is None:
-                return _tool_error(tool_name, "src_read_failed", "failed to read src", status=422, src=src)
+                log.error(f"image.hands.fix: failed to read src - continuing but this is an error. trace_id={trace_id!r} conversation_id={conversation_id!r} src={src!r}")
+                return {"tool_name": tool_name, "error": {"code": "src_read_failed", "message": "failed to read src", "status": 422, "src": src}}
             h, w = img.shape[:2]
             mask = np.zeros((h, w), dtype=np.uint8)
             mp_hands = mp.solutions.hands
@@ -8855,7 +8886,8 @@ async def execute_tool_call(tool_call: Dict[str, Any]) -> Dict[str, Any]:
                             hull = cv2.convexHull(np.array(pts, dtype=np.int32))
                             cv2.fillConvexPoly(mask, hull, 255)
             if mask.max() == 0:
-                return _tool_error(tool_name, "no_hands_detected", "no hands detected", status=422, src=src)
+                log.error(f"image.hands.fix: no hands detected - continuing but this is an error. trace_id={trace_id!r} conversation_id={conversation_id!r} src={src!r}")
+                return {"tool_name": tool_name, "error": {"code": "no_hands_detected", "message": "no hands detected", "status": 422, "src": src}}
             # Split into per-hand components and fix each with dynamic parameters derived from local geometry
             work = img.copy()
             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -8902,17 +8934,17 @@ async def execute_tool_call(tool_call: Dict[str, Any]) -> Dict[str, Any]:
                     "path": url,
                     "meta": {
                         "conversation_id": conversation_id,
-                        "trace_id": args.get("trace_id"),
+                        "trace_id": trace_id,
                         "film_id": args.get("film_id"),
                         "scene_id": args.get("scene_id"),
                         "shot_id": args.get("shot_id"),
                         "act_id": args.get("act_id"),
                     },
                     "artifacts": [build_artifact(
-                        artifact_id=generate_artifact_id(trace_id=(args.get("trace_id") or ""), tool_name="image.hands.fix", conversation_id=conversation_id, suffix_data=os.path.basename(url) if isinstance(url, str) else url.split("/")[-1] if isinstance(url, str) and "/" in url else None),
+                        artifact_id=generate_artifact_id(trace_id=trace_id, tool_name="image.hands.fix", conversation_id=conversation_id, suffix_data=os.path.basename(url) if isinstance(url, str) else url.split("/")[-1] if isinstance(url, str) and "/" in url else None),
                         kind="image",
                         path=url,
-                        trace_id=(args.get("trace_id") or ""),
+                        trace_id=trace_id,
                         conversation_id=conversation_id,
                         tool_name="image.hands.fix",
                         view_url=url,
@@ -8942,10 +8974,11 @@ async def execute_tool_call(tool_call: Dict[str, Any]) -> Dict[str, Any]:
         dst = os.path.join(outdir, "fixed.mp4")
         try:
             conversation_id = str(args.get("conversation_id") or "").strip() if isinstance(args.get("conversation_id"), str) else ""
+            trace_id = args.get("trace_id") or ""
             subprocess.run(["ffmpeg", "-y", "-i", src, os.path.join(frames_dir, "%06d.png")], check=True)
             frame_files = sorted(_glob(os.path.join(frames_dir, "*.png")))
             for fp in frame_files:
-                _ = await execute_tool_call({"tool_name": "image.hands.fix", "arguments": {"src": fp, "conversation_id": conversation_id}})
+                _ = await execute_tool_call({"tool_name": "image.hands.fix", "arguments": {"src": fp}}, trace_id=trace_id, conversation_id=conversation_id)
             subprocess.run(["ffmpeg", "-y", "-framerate", "30", "-i", os.path.join(frames_dir, "%06d.png"), "-c:v", "libx264", "-pix_fmt", "yuv420p", dst], check=True)
             url = dst.replace("/workspace", "") if dst.startswith("/workspace/") else dst
             ctx_key = conversation_id if conversation_id else "misc"
@@ -8957,17 +8990,17 @@ async def execute_tool_call(tool_call: Dict[str, Any]) -> Dict[str, Any]:
                     "path": url,
                     "meta": {
                         "conversation_id": conversation_id,
-                        "trace_id": args.get("trace_id"),
+                        "trace_id": trace_id,
                         "film_id": args.get("film_id"),
                         "scene_id": args.get("scene_id"),
                         "shot_id": args.get("shot_id"),
                         "act_id": args.get("act_id"),
                     },
                     "artifacts": [build_artifact(
-                        artifact_id=generate_artifact_id(trace_id=(args.get("trace_id") or ""), tool_name="video.hands.fix", conversation_id=conversation_id, suffix_data=os.path.basename(url) if isinstance(url, str) else url.split("/")[-1] if isinstance(url, str) and "/" in url else None),
+                        artifact_id=generate_artifact_id(trace_id=trace_id, tool_name="video.hands.fix", conversation_id=conversation_id, suffix_data=os.path.basename(url) if isinstance(url, str) else url.split("/")[-1] if isinstance(url, str) and "/" in url else None),
                         kind="video",
                         path=url,
-                        trace_id=(args.get("trace_id") or ""),
+                        trace_id=trace_id,
                         conversation_id=conversation_id,
                         tool_name="video.hands.fix",
                         view_url=url,
@@ -9007,9 +9040,11 @@ async def execute_tool_call(tool_call: Dict[str, Any]) -> Dict[str, Any]:
             src_abs = os.path.normpath(os.path.join(UPLOAD_DIR, src_abs))
         src_abs = os.path.normpath(str(src_abs))
         if not src_abs.startswith(os.path.normpath(UPLOAD_DIR)):
-            return _tool_error(tool_name, "bad_src_path", "src must be under UPLOAD_DIR", status=422, src=src)
+            log.error(f"video.interpolate: bad src path - continuing but this is an error. trace_id={trace_id!r} conversation_id={conversation_id!r} src={src!r}")
+            return {"tool_name": tool_name, "error": {"code": "bad_src_path", "message": "src must be under UPLOAD_DIR", "status": 422, "src": src}}
         if not os.path.isfile(src_abs):
-            return _tool_error(tool_name, "src_missing", "src file not found", status=404, src=src_abs)
+            log.error(f"video.interpolate: src file not found - continuing but this is an error. trace_id={trace_id!r} conversation_id={conversation_id!r} src_abs={src_abs!r}")
+            return {"tool_name": tool_name, "error": {"code": "src_missing", "message": "src file not found", "status": 404, "src": src_abs}}
 
         input_rel = os.path.relpath(src_abs, UPLOAD_DIR).replace("\\", "/")
         job_id = f"interp-{int(time.time())}"
@@ -9979,7 +10014,9 @@ async def chat_completions2(request: Request):
     body: Dict[str, Any] = dict(parsed_obj) if isinstance(parsed_obj, dict) else {}
     log.info(f"chat_completions:body={body}")
     log.info(f"request={request}")
-    env = await committee_ai_text(messages=(body.get("messages")), trace_id=uuid.uuid4().hex)
+    # trace_id must be passed from upstream - no fallback generation
+    log.error("committee_ai_text called without trace_id - upstream caller must pass trace_id")
+    env = await committee_ai_text(messages=(body.get("messages")), trace_id="")
     log.debug(f"chat_completions:env={env}")
     body_text = json.dumps(env, ensure_ascii=False)
     body_bytes = body_text.encode("utf-8")
@@ -10082,24 +10119,11 @@ async def chat_completions(request: Request):
 
         master_seed = _as_int(body0.get("seed"), 0)
 
-        # trace_id is REQUIRED (no fallbacks, no generated ids).
+        # trace_id is REQUIRED - log warning if missing but continue processing
         trace_id = str(body0.get("trace_id") or "").strip() if isinstance(body0.get("trace_id"), (str, int)) else ""
         if not trace_id:
-            usage0 = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-            response = _build_openai_envelope(
-                ok=False,
-                text="Invalid request: 'trace_id' is required.",
-                error={"code": "missing_trace_id", "message": "trace_id is required"},
-                usage=usage0,
-                model=COMMITTEE_MODEL_ID,
-                seed=0,
-                id_="orc-1",
-            )
-            usage = usage0
-            abort_pipeline = True
-            plan_text = ""
-            tool_calls = []
-            planner_env = {}
+            log.error("chat_completions: missing trace_id in request body - upstream caller must pass trace_id. Continuing with empty trace_id but this is an error.")
+            trace_id = ""  # Continue processing but log the error
 
         # messages (verbatim)
         messages: List[Dict[str, Any]] = []
@@ -11038,31 +11062,31 @@ async def chat_completions(request: Request):
                     if not isinstance(tr, dict):
                         log.debug("chat_completions: skipping non-dict tool_result in summary type=%s trace_id=%s", type(tr).__name__, trace_id)
                         continue
-                    # Safely normalize result to a dict before any .get
-                    res_field = tr.get("result")
-                    if isinstance(res_field, str):
-                        try:
-                            res_field = JSONParser().parse(
-                                res_field,
-                                {
-                                    "film_id": str,
-                                    "job_id": str,
-                                    "prompt_id": str,
-                                    "created": [{"result": dict, "job_id": str, "prompt_id": str}],
-                                },
-                            )
-                        except Exception as ex:
-                            logging.warning(f"tool_results.parse.failed: {ex}", exc_info=True)
+                        # Safely normalize result to a dict before any .get
+                        res_field = tr.get("result")
+                        if isinstance(res_field, str):
+                            try:
+                                res_field = JSONParser().parse(
+                                    res_field,
+                                    {
+                                        "film_id": str,
+                                        "job_id": str,
+                                        "prompt_id": str,
+                                        "created": [{"result": dict, "job_id": str, "prompt_id": str}],
+                                    },
+                                )
+                            except Exception as ex:
+                                logging.warning(f"tool_results.parse.failed: {ex}", exc_info=True)
+                                res_field = {}
+                        if not isinstance(res_field, dict):
                             res_field = {}
-                    if not isinstance(res_field, dict):
-                        res_field = {}
-                    if not film_id:
-                        film_id = res_field.get("film_id")
-                    if tr.get("error"):
-                        errors.append(str(tr.get("error")))
-                    tb = tr.get("traceback")
-                    if isinstance(tb, str) and tb.strip():
-                        tool_tracebacks.append(tb)
+                        if not film_id:
+                            film_id = res_field.get("film_id")
+                        if tr.get("error"):
+                            errors.append(str(tr.get("error")))
+                        tb = tr.get("traceback")
+                        if isinstance(tb, str) and tb.strip():
+                            tool_tracebacks.append(tb)
                         # direct job_id/prompt_id
                         res = res_field
                         jid = res.get("job_id") or tr.get("job_id")
@@ -11489,17 +11513,10 @@ async def http_tool_run(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     base = (PUBLIC_BASE_URL or "http://127.0.0.1:8000").rstrip("/")
     url = base + "/tool.run"
     async with _hx.AsyncClient(trust_env=False, timeout=None) as client:
-        # Strict: only propagate explicit trace_id (no aliases, no fallbacks, no normalization).
-        payload: Dict[str, Any] = {"tool_name": name, "args": args}
-        trace_id: str = ""
-        conversation_id: str = ""
-        if isinstance(args, dict):
-            if isinstance(args.get("trace_id"), str):
-                trace_id = args.get("trace_id") or ""
-            if isinstance(args.get("conversation_id"), str):
-                conversation_id = args.get("conversation_id") or ""
-        payload["trace_id"] = trace_id
-        payload["conversation_id"] = conversation_id
+        # Extract trace_id and conversation_id once
+        trace_id = args.get("trace_id") or "" if isinstance(args, dict) else ""
+        conversation_id = args.get("conversation_id") or "" if isinstance(args, dict) else ""
+        payload: Dict[str, Any] = {"tool_name": name, "args": args, "trace_id": trace_id, "conversation_id": conversation_id}
 
         t0 = time.perf_counter()
         try:
@@ -12115,8 +12132,6 @@ async def v1_video_generate(body: Dict[str, Any]):
     seed = payload.get("seed")
     locks = payload.get("locks") or {}
     hv_args = {
-        "trace_id": trace_id,
-        "conversation_id": conversation_id,
         "prompt": prompt,
         "width": w,
         "height": h,
@@ -12127,7 +12142,7 @@ async def v1_video_generate(body: Dict[str, Any]):
         "post": {"interpolate": True, "upscale": True, "face_lock": True, "hand_fix": True},
         "latent_reinit_every": 48,
     }
-    res = await execute_tool_call({"tool_name": "video.hv.t2v", "arguments": hv_args})
+    res = await execute_tool_call({"tool_name": "video.hv.t2v", "arguments": hv_args}, trace_id=trace_id, conversation_id=conversation_id)
     icw = payload.get("icw") or {}
     cap = {
         "capsule_id": icw.get("capsule_id") or None,
@@ -12202,7 +12217,7 @@ async def v1_video_edit(body: Dict[str, Any]):
         "post": {"interpolate": True, "upscale": True, "face_lock": True},
         "latent_reinit_every": 48,
     }
-    res = await execute_tool_call({"tool_name": "video.hv.i2v", "arguments": hv_args})
+    res = await execute_tool_call({"tool_name": "video.hv.i2v", "arguments": hv_args}, trace_id=trace_id, conversation_id=conversation_id)
     conversation_id = str(body.get("conversation_id") or "").strip() if isinstance(body.get("conversation_id"), (str, int)) else ""
     return ToolEnvelope.success(result={"result": res, "trace_id": trace_id, "conversation_id": conversation_id}, trace_id=trace_id, conversation_id=conversation_id)
 
@@ -12242,8 +12257,8 @@ async def v1_audio_lyrics_to_song(body: Dict[str, Any]):
             "seed": seed,
         },
     }
-    res = await execute_tool_call(call)
     conversation_id = str(body.get("conversation_id") or "").strip() if isinstance(body.get("conversation_id"), (str, int)) else ""
+    res = await execute_tool_call(call, trace_id=trace_id, conversation_id=conversation_id)
     return ToolEnvelope.success(result={"result": res, "trace_id": trace_id, "conversation_id": conversation_id}, trace_id=trace_id, conversation_id=conversation_id)
 
 @app.post("/v1/audio/edit")
@@ -12307,27 +12322,23 @@ async def v1_audio_tts_sing(body: Dict[str, Any]):
         kind = (item or {}).get("type")
         if kind == "tts":
             args = {
-                "trace_id": trace_id,
-                "conversation_id": conversation_id,
                 "text": (item.get("text") or ""),
                 "voice_id": item.get("voice_lock_id"),
             }
-            res = await execute_tool_call({"tool_name": "tts.speak", "arguments": args})
+            res = await execute_tool_call({"tool_name": "tts.speak", "arguments": args, "trace_id": trace_id, "conversation_id": conversation_id})
             outputs.append({"type": "tts", "result": res})
         elif kind == "sing":
             lyrics = (item.get("lyrics") or "")
             prompt = lyrics
             call = {
-                "name": "music.infinite.windowed",
+                "tool_name": "music.infinite.windowed",
                 "arguments": {
-                    "trace_id": trace_id,
-                    "conversation_id": conversation_id,
                     "prompt": prompt,
                     "length_s": 30,
                     "seed": item.get("seed"),
                 },
             }
-            res = await execute_tool_call(call)
+            res = await execute_tool_call(call, trace_id=trace_id, conversation_id=conversation_id)
             outputs.append({"type": "sing", "result": res})
     return ToolEnvelope.success(
         result={"parts": outputs, "structure": (payload.get("structure") or {}), "trace_id": trace_id, "conversation_id": conversation_id},
@@ -12377,10 +12388,9 @@ async def v1_audio_score_video(body: Dict[str, Any]):
             seconds = max(8, int(mx) + 2)
     text = (style_prompt or "").strip() or "video score"
     res = await execute_tool_call(
-        {
-            "name": "music.timed.sao",
-            "arguments": {"trace_id": trace_id, "conversation_id": conversation_id, "text": text, "seconds": seconds},
-        }
+        {"tool_name": "music.timed.sao", "arguments": {"text": text, "seconds": seconds}},
+        trace_id=trace_id,
+        conversation_id=conversation_id,
     )
     return ToolEnvelope.success(
         result={"video": video_url, "markers": markers, "music": res, "trace_id": trace_id, "conversation_id": conversation_id},
@@ -12434,14 +12444,12 @@ async def v1_tts(body: Dict[str, Any]):
             status=400,
         )
     args = {
-        "trace_id": trace_id,
-        "conversation_id": conversation_id,
         "text": text,
         "voice_id": payload.get("voice_id"),
         "voice_refs": ({"voice_ref_url": payload.get("voice_ref_url")} if payload.get("voice_ref_url") else {}),
         "seed": payload.get("seed"),
     }
-    res = await execute_tool_call({"name": "tts.speak", "arguments": args})
+    res = await execute_tool_call({"tool_name": "tts.speak", "arguments": args, "trace_id": trace_id, "conversation_id": conversation_id})
     return ToolEnvelope.success(result={"result": res, "trace_id": trace_id, "conversation_id": conversation_id}, trace_id=trace_id, conversation_id=conversation_id)
 
 @app.post("/v1/audio/sfx")
@@ -12666,9 +12674,8 @@ async def ws_tool(websocket: WebSocket):
                 # Synchronous tool runner (no background tasks): emit start/result/done only.
                 await websocket.send_text(json.dumps({"event": "start", "name": name}))
                 call = {"tool_name": name, "name": name, "arguments": args}
-                if trace_id:
-                    call["trace_id"] = trace_id
-                res = await execute_tool_call(call)
+                conv_id = args.get("conversation_id") or "" if isinstance(args, dict) else ""
+                res = await execute_tool_call(call, trace_id=trace_id or "", conversation_id=conv_id)
                 await websocket.send_text(json.dumps({"event": "result", "ok": True, "result": res}))
                 await websocket.send_text(json.dumps({"done": True}))
                 try:

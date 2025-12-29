@@ -30,13 +30,8 @@ class _TTSProvider:
     def speak(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         trace_id = payload.get("trace_id") if isinstance(payload.get("trace_id"), str) else ""
         if not isinstance(trace_id, str) or not trace_id.strip():
-            return _build_error_envelope(
-                "missing_trace_id",
-                "trace_id is required for XTTS provider calls",
-                "MISSING_TRACE_ID",
-                status=422,
-                details={"payload_keys": sorted([str(k) for k in (payload or {}).keys()]), "stack": "".join(traceback.format_stack())},
-            )
+            log.error(f"tools_tts.provider.speak: missing trace_id in payload - upstream caller must pass trace_id. Continuing with empty trace_id but this is an error. payload_keys={sorted([str(k) for k in (payload or {}).keys()])}")
+            trace_id = ""  # Continue processing but log the error
         emit_progress({"stage": "request", "target": "xtts"})
         # Ensure language is always set; default to English if absent.
         # Also normalize locale-style codes like "en-US" to XTTS-compatible "en".

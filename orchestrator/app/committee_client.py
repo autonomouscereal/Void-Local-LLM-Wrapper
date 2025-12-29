@@ -155,7 +155,7 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str):
         parser = JSONParser()
         t_parse = time.monotonic()
         try:
-            parsed_obj = parser.parse(raw_text or "{}", {})
+        parsed_obj = parser.parse(raw_text or "{}", {})
             if not isinstance(parsed_obj, dict):
                 log.warning("[committee] ollama.parsed: JSONParser returned non-dict type=%s trace_id=%s base=%s model=%r", type(parsed_obj).__name__, trace_id, base_url, model)
                 parsed_obj = {}

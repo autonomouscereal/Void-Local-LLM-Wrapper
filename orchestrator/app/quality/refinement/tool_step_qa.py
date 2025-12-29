@@ -114,7 +114,8 @@ async def _segment_qa_for_single_result(
     tool_runner: Optional[Callable[[Dict[str, Any]], Awaitable[Dict[str, Any]]]] = None,
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     if not isinstance(trace_id, str) or not trace_id:
-        log.warning(f"tool_step_qa._segment_qa_for_single_result: missing trace_id tool_name={tool_name!r}")
+        log.error(f"tool_step_qa._segment_qa_for_single_result: missing trace_id tool_name={tool_name!r} - upstream caller must pass trace_id. Continuing with empty trace_id but this is an error.")
+        trace_id = ""  # Continue processing but log the error - NO FALLBACK GENERATION
     if not isinstance(tool_trace_result, dict):
         log.warning(f"tool_step_qa._segment_qa_for_single_result: invalid tool_trace_result type={type(tool_trace_result).__name__!r} tool_name={tool_name!r} trace_id={trace_id!r}")
         return {"segment_committee": {"action": "go", "patch_plan": [], "rationale": f"invalid tool_trace_result type: {type(tool_trace_result).__name__}"}}, []
@@ -159,8 +160,8 @@ async def _qa_film2(
     tool_runner: Optional[Callable[[Dict[str, Any]], Awaitable[Dict[str, Any]]]] = None,
 ) -> List[Dict[str, Any]]:
     if not isinstance(trace_id, str) or not trace_id:
-        log.warning("tool_step_qa._qa_film2: missing trace_id")
-        trace_id = "qa_film2_unknown"
+        log.error("tool_step_qa._qa_film2: missing trace_id - upstream caller must pass trace_id. Continuing with empty trace_id but this is an error.")
+        trace_id = ""  # Continue processing but log the error - NO FALLBACK GENERATION
     if not isinstance(result_obj, dict):
         log.warning(f"tool_step_qa._qa_film2: invalid result_obj type={type(result_obj).__name__!r} trace_id={trace_id!r}")
         return []

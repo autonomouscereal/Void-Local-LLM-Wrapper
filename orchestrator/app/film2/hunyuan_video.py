@@ -217,10 +217,7 @@ def build_hv_tool_args(
         # These are legacy tool args; the HyVideo adapter may ignore some.
         "post": {"interpolate": True, "upscale": True, "face_lock": True, "hand_fix": True},
         "latent_reinit_every": 48,
-        "conversation_id": conversation_id,
     }
-    if isinstance(trace_id, str) and trace_id.strip():
-        args["trace_id"] = trace_id.strip()
     if isinstance(film_id, str) and film_id.strip():
         args["film_id"] = film_id.strip()
     if isinstance(scene_id, str) and scene_id.strip():

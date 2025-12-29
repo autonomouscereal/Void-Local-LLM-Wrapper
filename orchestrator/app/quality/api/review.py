@@ -30,8 +30,8 @@ def review_score(body: Dict[str, Any]):
     path = payload.get("path")
     prompt = payload.get("prompt")
     if not isinstance(trace_id, str) or not trace_id:
-        log.warning(f"review.score: missing trace_id conversation_id={conversation_id!r} kind={kind!r}")
-        return ToolEnvelope.failure(code="missing_trace_id", message="trace_id is required", trace_id="", conversation_id=conversation_id, status=400, details={"field": "trace_id"})
+        log.error(f"review.score: missing trace_id conversation_id={conversation_id!r} kind={kind!r} - upstream caller must pass trace_id. Continuing with empty trace_id but this is an error.")
+        trace_id = ""  # Continue processing but log the error
     if kind not in ("image", "audio", "music", "video", "film2"):
         trace_event("review.score.invalid_kind", {"trace_id": trace_id, "conversation_id": conversation_id, "kind": kind})
         return ToolEnvelope.failure(code="invalid_kind", message="invalid kind", trace_id=trace_id, conversation_id=conversation_id, status=400, details={"kind": kind})
@@ -69,8 +69,8 @@ def review_plan(body: Dict[str, Any]):
     trace_id = payload.get("trace_id")
     conversation_id = payload.get("conversation_id")
     if not isinstance(trace_id, str) or not trace_id:
-        log.warning(f"review.plan: missing trace_id conversation_id={conversation_id!r}")
-        return ToolEnvelope.failure(code="missing_trace_id", message="trace_id is required", trace_id="", conversation_id=conversation_id, status=400, details={"field": "trace_id"})
+        log.error(f"review.plan: missing trace_id conversation_id={conversation_id!r} - upstream caller must pass trace_id. Continuing with empty trace_id but this is an error.")
+        trace_id = ""  # Continue processing but log the error
     try:
         trace_event("review.plan.start", {"trace_id": trace_id, "conversation_id": conversation_id})
         scores_input = payload.get("scores") or {}
@@ -107,10 +107,8 @@ def review_loop(body: Dict[str, Any], *, return_envelope: bool = True):
         log.warning(f"review.loop: invalid created_ms_floor value={payload.get('created_ms_floor')!r} trace_id={trace_id!r} conversation_id={conversation_id!r} ex={ex!r}")
         created_ms_floor = 0
     if not isinstance(trace_id, str) or not trace_id:
-        log.warning(f"review.loop: missing trace_id conversation_id={conversation_id!r}")
-        if return_envelope:
-            return ToolEnvelope.failure(code="missing_trace_id", message="trace_id is required", trace_id="", conversation_id=conversation_id, status=400, details={"field": "trace_id"})
-        return {"loop_idx": 0, "accepted": False, "plan": {}, "scores": {}, "per_item": [], "artifacts_selected": {}, "artifact_updates": [], "artifacts": [], "trace_id": "", "conversation_id": conversation_id}
+        log.error(f"review.loop: missing trace_id conversation_id={conversation_id!r} - upstream caller must pass trace_id. Continuing with empty trace_id but this is an error.")
+        trace_id = ""  # Continue processing but log the error
     try:
         trace_event("review.loop.start", {"trace_id": trace_id, "conversation_id": conversation_id, "artifacts_count": len(payload.get("artifacts") or []), "created_ms_floor": created_ms_floor})
         # Normalize artifacts once (correct datatypes), so the rest of the function can be simple.
@@ -332,7 +330,7 @@ def review_loop(body: Dict[str, Any], *, return_envelope: bool = True):
             log.info(f"review.loop: no scores collected trace_id={trace_id!r} conversation_id={conversation_id!r} per_item_count={len(per_item)}")
         else:
             log.debug(f"review.loop: scores collected trace_id={trace_id!r} conversation_id={conversation_id!r} scores_keys={sorted(scores.keys()) if isinstance(scores, dict) else []} per_item_count={len(per_item)}")
-        
+
         plan = build_delta_plan(scores)
         if not isinstance(plan, dict):
             log.warning(f"review.loop: build_delta_plan returned invalid type={type(plan).__name__!r} trace_id={trace_id!r} conversation_id={conversation_id!r} scores_keys={sorted(scores.keys()) if isinstance(scores, dict) else type(scores).__name__!r}")

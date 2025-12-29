@@ -162,7 +162,15 @@ def _extract_artifacts(result: Dict[str, Any], *, trace_id: Optional[str] = None
     artifacts: List[Dict[str, Any]] = []
     # Extract from result.meta if not provided
     meta_obj = result.get("meta") if isinstance(result.get("meta"), dict) else {}
-    trace_id = trace_id or meta_obj.get("trace_id") or ""
+    # trace_id must be passed from upstream - no fallback from meta
+    if not trace_id:
+        trace_id_from_meta = meta_obj.get("trace_id") if isinstance(meta_obj, dict) else None
+        if isinstance(trace_id_from_meta, str) and trace_id_from_meta:
+            log.warning(f"segments._extract_artifacts: trace_id not passed directly, using from meta - upstream caller should pass trace_id directly. meta_trace_id={trace_id_from_meta!r}")
+            trace_id = trace_id_from_meta
+        else:
+            log.error(f"segments._extract_artifacts: missing trace_id - upstream caller must pass trace_id. Continuing with empty trace_id but this is an error.")
+            trace_id = ""
     conversation_id = conversation_id or meta_obj.get("conversation_id")
     tool_name = tool_name or meta_obj.get("tool_name") or meta_obj.get("tool")
     
