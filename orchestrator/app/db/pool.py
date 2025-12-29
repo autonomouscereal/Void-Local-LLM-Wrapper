@@ -87,7 +87,7 @@ async def get_pg_pool() -> Optional[asyncpg.pool.Pool]:
             """
             CREATE TABLE IF NOT EXISTS tool_call (
               id          BIGSERIAL PRIMARY KEY,
-              trace_id    TEXT NOT NULL,
+              trace_id    TEXT,
               tool_name   TEXT NOT NULL,
               seed        BIGINT NOT NULL,
               args_json   JSONB NOT NULL,
@@ -98,7 +98,7 @@ async def get_pg_pool() -> Optional[asyncpg.pool.Pool]:
             );
             """
         )
-        await conn.execute("CREATE INDEX IF NOT EXISTS tool_run_name_idx ON tool_call(trace_id, tool_name);")
+        # Don't create index here - migrations will handle it
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS icw_log (
@@ -251,9 +251,37 @@ async def get_pg_pool() -> Optional[asyncpg.pool.Pool]:
             );
             """
         )
-        # Run migrations to ensure schema is up to date
+        # Run migrations AFTER all tables are created to ensure schema is up to date
         await _run_migrations(conn)
+        # Create indexes AFTER migrations (migrations may have changed column names)
+        await _create_indexes_after_migrations(conn)
     return pg_pool
+
+
+async def _create_indexes_after_migrations(conn: asyncpg.Connection) -> None:
+    """
+    Create indexes that depend on migrations having run (e.g., trace_id column).
+    """
+    try:
+        # Check if trace_id exists before creating index
+        col_check = await conn.fetchval("""
+            SELECT 1 FROM information_schema.columns 
+            WHERE table_name = 'tool_call' AND column_name = 'trace_id'
+        """)
+        if col_check:
+            await conn.execute("CREATE INDEX IF NOT EXISTS tool_run_name_idx ON tool_call(trace_id, tool_name);")
+        else:
+            # Fallback to run_id if trace_id doesn't exist (shouldn't happen after migrations, but be safe)
+            col_check_run_id = await conn.fetchval("""
+                SELECT 1 FROM information_schema.columns 
+                WHERE table_name = 'tool_call' AND column_name = 'run_id'
+            """)
+            if col_check_run_id:
+                await conn.execute("CREATE INDEX IF NOT EXISTS tool_run_name_idx ON tool_call(run_id, tool_name);")
+            else:
+                log.warning("db.pool: neither trace_id nor run_id found in tool_call table, skipping index creation")
+    except Exception as ex:
+        log.warning(f"db.pool: failed to create tool_run_name_idx: {ex}", exc_info=True)
 
 
 async def _run_migrations(conn: asyncpg.Connection) -> None:
