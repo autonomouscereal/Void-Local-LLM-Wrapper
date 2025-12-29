@@ -35,9 +35,10 @@ def finalize_tool_phase(
     prompt_text = ""
     meta_used: Dict[str, Any] = {}
     if isinstance(tool_results, list) and tool_results:
-        first = (tool_results[0] or {}).get("result") or {}
-        if isinstance(first.get("meta"), dict):
-            meta_used = first.get("meta") or {}
+        first_entry = tool_results[0] or {}
+        first_payload = first_entry["result"] if ("result" in first_entry and isinstance(first_entry["result"], dict)) else {}
+        if "meta" in first_payload and isinstance(first_payload["meta"], dict):
+            meta_used = first_payload["meta"] or {}
             pt = meta_used.get("prompt")
             if isinstance(pt, str) and pt.strip():
                 prompt_text = pt.strip()
@@ -45,21 +46,25 @@ def finalize_tool_phase(
     tool_errors: List[Dict[str, Any]] = []
     for tr in (tool_results or []):
         if not isinstance(tr, dict):
+            log.debug("finalize_tool_phase: skipping non-dict tool_result type=%s trace_id=%s", type(tr).__name__, trace_id)
             continue
-        name_t = (tr.get("name") or tr.get("tool") or "tool")
+        # Support both tool_name (canonical) and tool_call_name (legacy)
+        tool_name = tr.get("tool_name") or tr.get("tool_call_name") or tr.get("name") or ""
+        if not isinstance(tool_name, str):
+            tool_name = ""
         err_obj: Any = None
         if isinstance(tr.get("error"), (str, dict)):
             err_obj = tr.get("error")
-        res_t = tr.get("result") if isinstance(tr.get("result"), dict) else {}
-        if isinstance(res_t.get("error"), (str, dict)):
-            err_obj = res_t.get("error")
+        tool_payload = tr["result"] if ("result" in tr and isinstance(tr["result"], dict)) else {}
+        if "error" in tool_payload and isinstance(tool_payload["error"], (str, dict)):
+            err_obj = tool_payload["error"]
         if err_obj is not None:
             code = (err_obj.get("code") if isinstance(err_obj, dict) else str(err_obj))
             status = None
             if isinstance(err_obj, dict):
                 status = err_obj.get("status") or err_obj.get("_http_status") or err_obj.get("http_status")
-            message = (err_obj.get("message") if isinstance(err_obj, dict) else None) or ""
-            tool_errors.append({"tool": str(name_t), "code": (code or ""), "status": status, "message": message, "error": err_obj})
+            message = (err_obj.get("message") if isinstance(err_obj, dict) else str(err_obj)) or ""
+            tool_errors.append({"tool": str(tool_name), "code": (code or ""), "status": status, "message": message, "error": err_obj})
     warnings = tool_errors[:] if tool_errors else []
     # Compose assistant text (generalized, tool-specific, human-readable)
     summary_lines: List[str] = []
@@ -76,7 +81,7 @@ def finalize_tool_phase(
             domain_metrics = domain_section
     if (not asset_urls) and tool_errors:
         # Lead with the specific failing tool when available
-        first_tool = (tool_errors[0] or {}).get("tool") or "tool"
+        first_tool = (tool_errors[0] or {}).get("tool") or ""
         summary_lines.append(f"The tool `{first_tool}` failed to run.")
         if comm_act == "fail":
             summary_lines.append("Post-run checks could not automatically fix the issues; returning the best available information and errors.")
@@ -103,8 +108,14 @@ def finalize_tool_phase(
         # Provide a short explanation of what was done, not just raw prompt/URLs
         tools_used = []
         for tr in (tool_results or []):
-            if isinstance(tr, dict) and isinstance(tr.get("result"), dict) and not tr.get("error"):
-                tools_used.append(str(tr.get("name") or tr.get("tool") or "tool"))
+            if not isinstance(tr, dict):
+                continue
+            # Support both tool_name (canonical) and tool_call_name (legacy)
+            tool_name = tr.get("tool_name") or tr.get("tool_call_name") or tr.get("name") or ""
+            if not isinstance(tool_name, str) or not tool_name.strip():
+                continue
+            if "result" in tr and isinstance(tr["result"], dict) and not tr.get("error"):
+                tools_used.append(str(tool_name))
         tools_used = list(dict.fromkeys([t for t in tools_used if t]))
         if tools_used:
             summary_lines.append("I completed your request using: " + ", ".join(tools_used) + ".")
@@ -131,7 +142,7 @@ def finalize_tool_phase(
                 domain_notes.append("audio clipping was detected; review loudness/mastering settings")
             if domain_notes:
                 summary_lines.append("Post-run QA notes:")
-                for note in domain_notes[:3]:
+                for note in domain_notes:
                     summary_lines.append(f"- {note}")
         if prompt_text:
             summary_lines.append(f"Summary: generated content aligned to your request.\nPrompt used:\n“{prompt_text}”")
@@ -146,7 +157,7 @@ def finalize_tool_phase(
         if warnings:
             summary_lines.append("")
             summary_lines.append("Warnings:")
-            for e in warnings[:5]:
+            for e in warnings:
                 code = (e.get("error") or {}).get("code") if isinstance(e.get("error"), dict) else (e.get("code") or "tool_error")
                 message = (e.get("error") or {}).get("message") if isinstance(e.get("error"), dict) else (e.get("message") or "")
                 summary_lines.append(f"- {code}: {message}")

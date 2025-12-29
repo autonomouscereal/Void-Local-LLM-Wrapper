@@ -68,9 +68,11 @@ def _extract_palette(image: Image.Image, top_k: int = 4) -> List[Tuple[int, int,
     colors = img.getcolors(96 * 96)
     if not colors:
         return []
-    ranked = sorted(colors, key=lambda c: c[0], reverse=True)
+    ranked_with_count = [(int(color_entry[0]), int(i), color_entry[1]) for i, color_entry in enumerate(colors)]
+    ranked_with_count.sort(reverse=True)
+    ranked = [triple[2] for triple in ranked_with_count]
     selected: List[Tuple[int, int, int]] = []
-    for _, rgb in ranked:
+    for rgb in ranked:
         if not isinstance(rgb, tuple) or len(rgb) != 3:
             continue
         selected.append((int(rgb[0]), int(rgb[1]), int(rgb[2])))
@@ -532,11 +534,11 @@ def apply_audio_mode_updates(bundle: Dict[str, Any], update: Dict[str, Any]) -> 
         for segment in lyrics_segments:
             if not isinstance(segment, dict):
                 continue
-            seg_id = str(segment.get("id") or "").strip()
-            if not seg_id:
+            segment_id = str(segment.get("segment_id") or "").strip()
+            if not segment_id:
                 continue
             normalized_segments.append({
-                "id": seg_id,
+                "segment_id": segment_id,
                 "text": segment.get("text"),
                 "lock_mode": segment.get("lock_mode") or "soft",
             })

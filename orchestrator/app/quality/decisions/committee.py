@@ -193,9 +193,9 @@ def build_delta_plan(scores: Dict[str, Any]) -> Dict[str, Any]:
     any_violation = False
     patch_plan: List[Dict[str, Any]] = []
     segment_threshold = 0.8
-    for seg in segments:
-        seg_id = seg.get("id")
-        qa_block = seg.get("qa") if isinstance(seg.get("qa"), dict) else {}
+    for segment in segments:
+        segment_id = segment.get("segment_id")
+        qa_block = segment.get("qa") if isinstance(segment.get("qa"), dict) else {}
         scores_block = qa_block if isinstance(qa_block, dict) else {}
         worst_score = None
         for val in scores_block.values():
@@ -203,9 +203,9 @@ def build_delta_plan(scores: Dict[str, Any]) -> Dict[str, Any]:
                 v = float(val)
                 if worst_score is None or v < worst_score:
                     worst_score = v
-        if isinstance(seg_id, str) and seg_id and isinstance(worst_score, float) and worst_score < segment_threshold:
+        if isinstance(segment_id, str) and segment_id and isinstance(worst_score, float) and worst_score < segment_threshold:
             any_violation = True
-            domain = seg.get("domain")
+            domain = segment.get("domain")
             tool_name = None
             if domain == "image":
                 tool_name = "image.refine.segment"
@@ -216,7 +216,7 @@ def build_delta_plan(scores: Dict[str, Any]) -> Dict[str, Any]:
             elif domain == "tts":
                 tool_name = "tts.refine.segment"
             if tool_name is not None:
-                patch_plan.append({"tool": tool_name, "segment_id": seg_id, "args": {}})
+                patch_plan.append({"tool_name": tool_name, "tool": tool_name, "segment_id": segment_id, "args": {}})
     if not any_violation:
         return {"accept": True, "reasons": [], "patch_plan": [], "targets": {}}
     return {
@@ -256,17 +256,20 @@ async def postrun_committee_decide(
     tools_used: List[str] = []
     for tr in (tool_results or []):
         if isinstance(tr, dict):
-            nm = (tr.get("name") or tr.get("tool") or "")
-            if isinstance(nm, str) and nm.strip():
-                tools_used.append(nm.strip())
+            tool_name = tr.get("tool_name")
+            if isinstance(tool_name, str) and tool_name.strip():
+                tools_used.append(tool_name.strip())
     tools_used = list(dict.fromkeys(tools_used))
-    artifact_urls = assets_collect_urls(tool_results or [], lambda u: u)
+    artifact_urls = assets_collect_urls(tool_results or [], str)
     allowed_for_mode = _allowed_tools_for_mode(mode)
     sys_hdr = (
         "### [COMMITTEE POSTRUN / SYSTEM]\n"
         "Decide whether to accept artifacts (go) or run one small revision (revise), or fail. "
         "Return strict JSON only: {\"action\":\"go|revise|fail\",\"rationale\":\"...\","
         "\"patch_plan\":[{\"tool\":\"<name>\",\"args\":{...}}]}.\n"
+        "- IMPORTANT: The user payload includes a user_text field. Sometimes this is a JSON blob with scope=\"tool_step_only\". "
+        "When scope=\"tool_step_only\", you MUST evaluate ONLY that single tool step. "
+        "Use original_user_request only as global context; the PRIMARY goal is tool_intent_primary + tool_args_full + locks_and_bundles and the QA metrics/locks.\n"
         "- Inspect qa_metrics.counts and qa_metrics.domain.* to judge quality. Example triggers: "
         "missing required modalities; images hands_ok_ratio < 0.85 or face/id/region/scene locks below profile thresholds; "
         "videos seam_ok_ratio < 0.90; audio clipping_ratio > 0.0, tempo/key/stem/lyrics/voice lock scores below threshold, or LUFS far from -14.\n"
@@ -282,15 +285,17 @@ async def postrun_committee_decide(
     fail_counts: Dict[str, int] = {}
     for tr in (tool_results or []):
         if not isinstance(tr, dict):
+            log.debug("postrun_committee_decide: skipping non-dict tool_result type=%s trace_id=%s", type(tr).__name__, trace_id)
             continue
         err = tr.get("error")
         if not err:
             res_tr = tr.get("result") if isinstance(tr.get("result"), dict) else {}
             err = res_tr.get("error")
         if isinstance(err, (dict, str)):
-            nm = str((tr.get("name") or tr.get("tool") or "")).strip()
-            if nm:
-                fail_counts[nm] = int(fail_counts.get(nm, 0)) + 1
+            tool_name = tr.get("tool_name")
+            if isinstance(tool_name, str) and tool_name.strip():
+                tool_name = tool_name.strip()
+                fail_counts[tool_name] = int(fail_counts.get(tool_name, 0)) + 1
     user_blob = {
         "user_text": (user_text or ""),
         "qa_metrics": (qa_metrics or {}),
@@ -345,8 +350,14 @@ async def postrun_committee_decide(
             temperature=0.0,
         )
         parser = JSONParser()
-        obj = parser.parse(obj_raw if obj_raw is not None else "{}", schema_decide)
-        obj = obj if isinstance(obj, dict) else {}
+        try:
+            obj = parser.parse(obj_raw if obj_raw is not None else "{}", schema_decide)
+            if not isinstance(obj, dict):
+                log.warning("postrun_committee_decide: JSONParser returned non-dict type=%s trace_id=%s", type(obj).__name__, trace_id)
+                obj = {}
+        except Exception as ex:
+            log.warning("postrun_committee_decide: JSONParser.parse failed ex=%s trace_id=%s obj_raw_prefix=%s", ex, trace_id, (str(obj_raw) if obj_raw else "")[:200], exc_info=True)
+            obj = {}
         emit_trace(
             trace_id=trace_id,
             kind="committee",

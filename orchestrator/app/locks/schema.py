@@ -171,7 +171,7 @@ LOCK_BUNDLE_SCHEMA = {
     # and is not exposed as a planner-visible tool surface.
     "music": {
         "global": {
-            "music_id": "main_theme",
+            "artifact_id": None,
             "reference_tracks": [
                 {
                     "role": "primary",

@@ -12,6 +12,8 @@ import shutil
 import logging
 import traceback
 import sys
+import hashlib
+import time
 from typing import Dict, Any, Tuple, List
 
 import numpy as np  # type: ignore
@@ -20,6 +22,7 @@ import torch  # type: ignore
 import httpx  # type: ignore
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
+from void_envelopes import _build_success_envelope, _build_error_envelope
 
 # Import voice miner
 from . import voice_miner
@@ -74,10 +77,9 @@ RVC_TRAINER_BASE = os.getenv("RVC_TRAINER_BASE", "http://127.0.0.1:7070")
 
 # Global state for rvc-python engine
 _ENGINE_DEVICE_SET = False
-_LOADED_MODELS: Dict[str, bool] = {}
 
 
-def ensure_rvc_weights_present() -> None:
+def ensure_rvc_weights_present():
     """
     Verify that Titan RVC weights exist under RVC_MODEL_ROOT.
 
@@ -85,17 +87,17 @@ def ensure_rvc_weights_present() -> None:
     not a missing Python library.
     """
     if not os.path.isdir(RVC_MODEL_ROOT):
-        logging.error("RVC weights missing: RVC_MODEL_ROOT does not exist: %s", RVC_MODEL_ROOT)
+        logging.error(f"RVC weights missing: RVC_MODEL_ROOT does not exist: {RVC_MODEL_ROOT!r}")
         return
     entries = os.listdir(RVC_MODEL_ROOT)
     if not entries:
-        logging.error("RVC weights missing: model directory is empty: %s", RVC_MODEL_ROOT)
+        logging.error(f"RVC weights missing: model directory is empty: {RVC_MODEL_ROOT!r}")
         return
-    logging.info("RVC weights present in %s: %s", RVC_MODEL_ROOT, entries)
+    logging.info(f"RVC weights present in {RVC_MODEL_ROOT!r}: {entries!r}")
 
 
 @app.on_event("startup")
-async def _check_rvc_weights_on_startup() -> None:
+async def _check_rvc_weights_on_startup():
     """
     On service startup, verify that Titan RVC weights are present under RVC_MODEL_ROOT.
     Any failure is logged with a full stack trace; callers should rely on runtime
@@ -103,48 +105,72 @@ async def _check_rvc_weights_on_startup() -> None:
     """
     try:
         ensure_rvc_weights_present()
-    except Exception:
-        logging.error("RVC weights check failed:\n%s", traceback.format_exc())
+    except Exception as e:
+        logging.error(f"RVC weights check failed ex={e!r}\n{traceback.format_exc()}")
 
 
-def ensure_rvc_engine_loaded(cfg: Dict[str, Any]) -> None:
+def ensure_rvc_engine_loaded(cfg: Dict[str, Any]):
     """
     Ensure the external rvc-python engine is ready for the requested voice/model.
 
     - Sets the device once (cuda:0 or cpu) via /set_device.
-    - Loads the requested model via /models/{model_name} once per model.
+    - ALWAYS loads the requested model via /models/{model_name} on every call (required by policy).
     """
-    global _ENGINE_DEVICE_SET, _LOADED_MODELS
+    global _ENGINE_DEVICE_SET
 
+    trace_id = (cfg.get("trace_id") or "") if isinstance(cfg.get("trace_id"), str) else ""
+    conversation_id = (cfg.get("conversation_id") or "") if isinstance(cfg.get("conversation_id"), str) else ""
+    
     model_name = (cfg.get("model_name") or "").strip()
     if not model_name:
         # Let callers surface this as a structured ValidationError instead of
         # raising from the helper.
         logging.error("rvc_engine: cfg['model_name'] missing or empty in ensure_rvc_engine_loaded")
-        return
+        return _build_error_envelope(
+            code="ValidationError",
+            message="cfg['model_name'] missing or empty",
+            trace_id=trace_id,
+            conversation_id=conversation_id,
+            status=400,
+            details={"trace_id": trace_id, "conversation_id": conversation_id, "stack": "".join(traceback.format_stack())},
+        )
 
     base = RVC_ENGINE_BASE.rstrip("/")
 
     if not _ENGINE_DEVICE_SET:
         device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        logging.info(f"rvc_engine.set_device start trace_id={trace_id!r} device={device!r}")
         resp = httpx.post(f"{base}/set_device", json={"device": device}, timeout=None)
         if resp.status_code < 200 or resp.status_code >= 300:
-            logging.error("rvc_engine: /set_device failed: %s %s", resp.status_code, resp.text)
-            return
+            logging.error(f"rvc_engine: /set_device failed: {resp.status_code!r} {resp.text!r}")
+            return _build_error_envelope(
+                code="rvc_engine_set_device_failed",
+                message="rvc_engine /set_device failed",
+                trace_id=trace_id,
+                conversation_id=conversation_id,
+                status=int(resp.status_code or 500),
+                details={"trace_id": trace_id, "conversation_id": conversation_id, "raw": {"body": resp.text}, "stack": "".join(traceback.format_stack())},
+            )
         _ENGINE_DEVICE_SET = True
+        logging.info(f"rvc_engine.set_device done trace_id={trace_id!r} status={resp.status_code!r}")
 
-    if model_name in _LOADED_MODELS and _LOADED_MODELS[model_name]:
-        return
-
+    logging.info(f"rvc_engine.load_model start trace_id={trace_id!r} model={model_name!r}")
     resp = httpx.post(f"{base}/models/{model_name}", timeout=None)
     if resp.status_code < 200 or resp.status_code >= 300:
-        logging.error("rvc_engine: /models/%s failed: %s %s", model_name, resp.status_code, resp.text)
-        return
+        logging.error(f"rvc_engine: /models/{model_name} failed: {resp.status_code!r} {resp.text!r}")
+        return _build_error_envelope(
+            code="rvc_engine_load_model_failed",
+            message="rvc_engine /models load failed",
+            trace_id=trace_id,
+            conversation_id=conversation_id,
+            status=int(resp.status_code or 500),
+            details={"trace_id": trace_id, "conversation_id": conversation_id, "model_name": model_name, "raw": {"body": resp.text}, "stack": "".join(traceback.format_stack())},
+        )
+    logging.info(f"rvc_engine.load_model done trace_id={trace_id!r} model={model_name!r} status={resp.status_code!r}")
+    return _build_success_envelope(result={"loaded": True, "model_name": model_name, "trace_id": trace_id, "conversation_id": conversation_id}, trace_id=trace_id, conversation_id=conversation_id)
 
-    _LOADED_MODELS[model_name] = True
 
-
-def _load_registry() -> Dict[str, Any]:
+def _load_registry():
     if not os.path.exists(REGISTRY_PATH):
         return {}
     try:
@@ -155,43 +181,37 @@ def _load_registry() -> Dict[str, Any]:
         return {}
 
 
-def _save_registry(reg: Dict[str, Any]) -> None:
+def _save_registry(reg: Dict[str, Any]):
     tmp = REGISTRY_PATH + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(reg, f, ensure_ascii=False, separators=(",", ":"))
     os.replace(tmp, REGISTRY_PATH)
 
 
-@app.get("/healthz")
-async def healthz():
-    reg = _load_registry()
-    return {"status": "ok", "voices": list(reg.keys())}
-
-
 @app.post("/v1/voice/register")
 async def register_voice(body: Dict[str, Any]):
+    trace_id = (body.get("trace_id") or "").strip() if isinstance(body.get("trace_id"), str) else ""
+    conversation_id = (body.get("conversation_id") or "").strip() if isinstance(body.get("conversation_id"), str) else ""
     voice_lock_id = (body.get("voice_lock_id") or "").strip()
     if not voice_lock_id:
-        return {
-            "ok": False,
-            "error": {
-                "code": "ValidationError",
-                "message": "voice_lock_id is required",
-                "status": 400,
-                "stack": "".join(traceback.format_stack()),
-            },
-        }
+        return _build_error_envelope(
+            code="ValidationError",
+            message="voice_lock_id is required",
+            trace_id=trace_id,
+            conversation_id=conversation_id,
+            status=400,
+            details={"trace_id": trace_id, "conversation_id": conversation_id, "stack": "".join(traceback.format_stack())},
+        )
     model_name = (body.get("model_name") or "").strip()
     if not model_name:
-        return {
-            "ok": False,
-            "error": {
-                "code": "ValidationError",
-                "message": "model_name is required for rvc-python",
-                "status": 400,
-                "stack": "".join(traceback.format_stack()),
-            },
-        }
+        return _build_error_envelope(
+            code="ValidationError",
+            message="model_name is required for rvc-python",
+            trace_id=trace_id,
+            conversation_id=conversation_id,
+            status=400,
+            details={"trace_id": trace_id, "conversation_id": conversation_id, "voice_lock_id": voice_lock_id, "stack": "".join(traceback.format_stack())},
+        )
     reg = _load_registry()
     ref_b64 = body.get("reference_wav_b64")
     ref_path = body.get("reference_wav_path")
@@ -200,16 +220,14 @@ async def register_voice(body: Dict[str, Any]):
         try:
             data = base64.b64decode(ref_b64)
         except Exception as ex:
-            return {
-                "ok": False,
-                "error": {
-                    "code": "invalid_b64",
-                    "message": str(ex),
-                    "status": 400,
-                    "type": ex.__class__.__name__,
-                    "stack": traceback.format_exc(),
-                },
-            }
+            return _build_error_envelope(
+                code="invalid_b64",
+                message=str(ex),
+                trace_id=trace_id,
+                conversation_id=conversation_id,
+                status=400,
+                details={"trace_id": trace_id, "conversation_id": conversation_id, "voice_lock_id": voice_lock_id, "type": ex.__class__.__name__, "stack": traceback.format_exc()},
+            )
         voices_root = os.getenv("RVC_VOICES_ROOT", "/rvc/assets/voices")
         os.makedirs(voices_root, exist_ok=True)
         out_path = os.path.join(voices_root, f"{voice_lock_id}.wav")
@@ -250,14 +268,18 @@ async def register_voice(body: Dict[str, Any]):
         "protect": float(body.get("protect") or 0.33),
     }
     _save_registry(reg)
-    return {"ok": True, "voice_lock_id": voice_lock_id}
+    return _build_success_envelope(
+        result={"voice_lock_id": voice_lock_id, "model_name": model_name, "trace_id": trace_id, "conversation_id": conversation_id},
+        trace_id=trace_id,
+        conversation_id=conversation_id,
+    )
 
 
-def _decode_wav_from_b64(b64: str) -> bytes:
+def _decode_wav_from_b64(b64: str):
     return base64.b64decode(b64)
 
 
-def _decode_wav_to_mono_float32(data: bytes) -> Tuple[np.ndarray, int]:
+def _decode_wav_to_mono_float32(data: bytes):
     """
     Decode WAV bytes into mono float32 PCM and return (audio, sample_rate).
     """
@@ -268,7 +290,7 @@ def _decode_wav_to_mono_float32(data: bytes) -> Tuple[np.ndarray, int]:
     return audio, int(sr)
 
 
-def _encode_mono_float32_to_wav_bytes(y: np.ndarray, sr: int) -> bytes:
+def _encode_mono_float32_to_wav_bytes(y: np.ndarray, sr: int):
     """
     Encode mono float32 PCM into WAV bytes.
     """
@@ -283,7 +305,7 @@ def _run_rvc_convert(
     ref_y: np.ndarray,
     ref_sr: int,
     cfg: Dict[str, Any],
-) -> np.ndarray:
+):
     """
     RVC conversion using external rvc-python API.
 
@@ -303,8 +325,14 @@ def _run_rvc_convert(
         logging.error("rvc_convert: empty reference audio")
         return src_y
 
-    # Ensure external engine and model are ready
-    ensure_rvc_engine_loaded(cfg)
+    trace_id = (cfg.get("trace_id") or "").strip() if isinstance(cfg.get("trace_id"), str) else ""
+    # Ensure external engine and model are ready (policy: load model before any work)
+    eng = ensure_rvc_engine_loaded(cfg)
+    if isinstance(eng, dict) and not bool(eng.get("ok")):
+        # Policy: never raise; if engine/model load fails, return unmodified source audio.
+        # The caller will determine that conversion failed and surface a structured envelope.
+        logging.error("rvc_convert: engine_load_failed trace_id=%r eng=%r", trace_id, eng)
+        return src_y
 
     # Optional: push per-voice parameters into rvc-python
     params: Dict[str, Any] = {
@@ -317,26 +345,24 @@ def _run_rvc_convert(
         "protect": float(cfg.get("protect") or 0.33),
     }
     base = RVC_ENGINE_BASE.rstrip("/")
-    resp_params = httpx.post(
-        f"{base}/params",
-        json={"params": params},
-        timeout=None,
-    )
+    resp_params = httpx.post(f"{base}/params", json={"params": params}, timeout=None)
     if resp_params.status_code < 200 or resp_params.status_code >= 300:
-        logging.error("rvc_engine: /params failed: %s %s", resp_params.status_code, resp_params.text)
+        logging.error(f"rvc_engine: /params failed: {resp_params.status_code!r} {resp_params.text!r}")
         return src_y
+    logging.info(f"rvc_engine.params ok trace_id={trace_id!r} status={resp_params.status_code!r}")
 
     # Encode source audio to WAV bytes and base64 for /convert
     wav_bytes = _encode_mono_float32_to_wav_bytes(src_y, src_sr)
     audio_b64 = base64.b64encode(wav_bytes).decode("ascii")
+    try:
+        b64_sha = hashlib.sha256(audio_b64.encode("utf-8", errors="replace")).hexdigest()
+    except Exception:
+        b64_sha = ""
+    logging.info(f"rvc_engine.convert start trace_id={trace_id!r} audio_b64_len={len(audio_b64)} sha256={b64_sha!r}")
 
-    resp_conv = httpx.post(
-        f"{base}/convert",
-        json={"audio_data": audio_b64},
-        timeout=None,
-    )
+    resp_conv = httpx.post(f"{base}/convert", json={"audio_data": audio_b64}, timeout=None)
     if resp_conv.status_code < 200 or resp_conv.status_code >= 300:
-        logging.error("rvc_engine: /convert failed: %s %s", resp_conv.status_code, resp_conv.text)
+        logging.error(f"rvc_engine: /convert failed: {resp_conv.status_code!r} {resp_conv.text!r}")
         return src_y
 
     # rvc-python returns raw WAV bytes in the body, not JSON
@@ -344,6 +370,7 @@ def _run_rvc_convert(
     if not out_bytes:
         logging.error("rvc_engine: /convert returned empty body")
         return src_y
+    logging.info(f"rvc_engine.convert done trace_id={trace_id!r} out_bytes={len(out_bytes)} status={resp_conv.status_code!r}")
 
     out_y, out_sr = _decode_wav_to_mono_float32(out_bytes)
     # You can resample to cfg["sample_rate"] later if needed; for now we return what engine produced
@@ -352,7 +379,7 @@ def _run_rvc_convert(
 
 # Note: train_steps computation is now done in trainer_api.py (source of truth)
 # This function is kept for potential future use but trainer handles train_steps
-def compute_total_duration(ref_paths: List[str]) -> float:
+def compute_total_duration(ref_paths: List[str]):
     """
     Compute total duration of all reference audio files.
     
@@ -372,7 +399,7 @@ def compute_total_duration(ref_paths: List[str]) -> float:
     return total_sec
 
 
-def train_rvc_model_blocking(speaker_id: str, model_name: str, ref_paths: List[str], train_steps: int = 4000) -> Dict[str, Any]:
+def train_rvc_model_blocking(speaker_id: str, model_name: str, ref_paths: List[str], train_steps: int = 4000):
     """
     Blocking call to train an RVC model via rvc_trainer.
     
@@ -408,40 +435,41 @@ async def train_voice(body: Dict[str, Any]):
     
     Uses reference audio from the voice registry.
     """
+    trace_id = (body.get("trace_id") or "").strip() if isinstance(body.get("trace_id"), str) else ""
+    conversation_id = (body.get("conversation_id") or "").strip() if isinstance(body.get("conversation_id"), str) else ""
     voice_lock_id = (body.get("voice_lock_id") or "").strip()
     if not voice_lock_id:
-        return {
-            "ok": False,
-            "error": {
-                "code": "ValidationError",
-                "message": "voice_lock_id is required",
-                "status": 400,
-                "stack": "".join(traceback.format_stack()),
-            },
-        }
+        return _build_error_envelope(
+            code="ValidationError",
+            message="voice_lock_id is required",
+            trace_id=trace_id,
+            conversation_id=conversation_id,
+            status=400,
+            details={"trace_id": trace_id, "conversation_id": conversation_id, "stack": "".join(traceback.format_stack())},
+        )
     
     reg = _load_registry()
     voice_cfg = reg.get(voice_lock_id)
     if not isinstance(voice_cfg, dict):
-        return {
-            "ok": False,
-            "error": {
-                "code": "ValidationError",
-                "message": f"no registry entry for {voice_lock_id}",
-                "status": 404,
-            },
-        }
+        return _build_error_envelope(
+            code="ValidationError",
+            message=f"no registry entry for {voice_lock_id}",
+            trace_id=trace_id,
+            conversation_id=conversation_id,
+            status=404,
+            details={"trace_id": trace_id, "conversation_id": conversation_id, "voice_lock_id": voice_lock_id, "stack": "".join(traceback.format_stack())},
+        )
     
     model_name = (voice_cfg.get("model_name") or "").strip()
     if not model_name:
-        return {
-            "ok": False,
-            "error": {
-                "code": "ValidationError",
-                "message": "voice registry entry missing model_name",
-                "status": 400,
-            },
-        }
+        return _build_error_envelope(
+            code="ValidationError",
+            message="voice registry entry missing model_name",
+            trace_id=trace_id,
+            conversation_id=conversation_id,
+            status=400,
+            details={"trace_id": trace_id, "conversation_id": conversation_id, "voice_lock_id": voice_lock_id, "stack": "".join(traceback.format_stack())},
+        )
     
     # Get reference audio paths - collect ALL refs for this voice
     ref_paths = []
@@ -469,28 +497,26 @@ async def train_voice(body: Dict[str, Any]):
                 ref_paths.append(f)
     
     if not ref_paths:
-        return {
-            "ok": False,
-            "error": {
-                "code": "ValidationError",
-                "message": f"No reference audio files found for voice {voice_lock_id}",
-                "status": 400,
-                "stack": "".join(traceback.format_stack()),
-            },
-        }
+        return _build_error_envelope(
+            code="ValidationError",
+            message=f"No reference audio files found for voice {voice_lock_id}",
+            trace_id=trace_id,
+            conversation_id=conversation_id,
+            status=400,
+            details={"trace_id": trace_id, "conversation_id": conversation_id, "voice_lock_id": voice_lock_id, "stack": "".join(traceback.format_stack())},
+        )
     
     # Prevent training on default voices
     model_name = (voice_cfg.get("model_name") or "").strip()
     if model_name in (RVC_DEFAULT_MALE_VOICE_ID, RVC_DEFAULT_FEMALE_VOICE_ID):
-        return {
-            "ok": False,
-            "error": {
-                "code": "ValidationError",
-                "message": f"Voice '{model_name}' is a reserved default and cannot be trained.",
-                "status": 400,
-                "stack": "".join(traceback.format_stack()),
-            },
-        }
+        return _build_error_envelope(
+            code="ValidationError",
+            message=f"Voice '{model_name}' is a reserved default and cannot be trained.",
+            trace_id=trace_id,
+            conversation_id=conversation_id,
+            status=400,
+            details={"trace_id": trace_id, "conversation_id": conversation_id, "voice_lock_id": voice_lock_id, "model_name": model_name, "stack": "".join(traceback.format_stack())},
+        )
     
     # train_steps: pass through if provided, otherwise let trainer compute
     train_steps = body.get("train_steps")
@@ -528,31 +554,61 @@ async def train_voice(body: Dict[str, Any]):
                 _save_registry(reg)
             
             # Return response that bubbles up to orchestrator
-            return {
-                "ok": True,
-                "voice_lock_id": voice_lock_id,
-                "speaker_id": returned_speaker_id,
-                "model_name": returned_model_name,
-                "is_new_speaker": is_new_speaker,
-                "match": match_info,
-                "train_steps": trainer_result.get("train_steps"),
-                "duration_s": trainer_result.get("duration_s"),
-            }
+            return _build_success_envelope(
+                result={
+                    "voice_lock_id": voice_lock_id,
+                    "speaker_id": returned_speaker_id,
+                    "model_name": returned_model_name,
+                    "is_new_speaker": is_new_speaker,
+                    "match": match_info,
+                    "train_steps": trainer_result.get("train_steps"),
+                    "duration_s": trainer_result.get("duration_s"),
+                    "trace_id": trace_id,
+                    "conversation_id": conversation_id,
+                },
+                trace_id=trace_id,
+                conversation_id=conversation_id,
+            )
         
         # If trainer returned error, pass it through
-        return result
+        if isinstance(result, dict) and ("ok" in result):
+            if bool(result.get("ok")):
+                ok_payload = result.get("result") if isinstance(result.get("result"), dict) else result
+                if isinstance(ok_payload, dict):
+                    ok_payload.setdefault("trace_id", trace_id)
+                    ok_payload.setdefault("conversation_id", conversation_id)
+                return _build_success_envelope(
+                    result=(ok_payload if isinstance(ok_payload, dict) else {"_raw": ok_payload, "trace_id": trace_id, "conversation_id": conversation_id}),
+                    trace_id=trace_id,
+                    conversation_id=conversation_id,
+                )
+            err_obj = result.get("error") if isinstance(result.get("error"), dict) else {}
+            return _build_error_envelope(
+                code=str(err_obj.get("code") or "rvc_train_failed"),
+                message=str(err_obj.get("message") or "RVC trainer failed"),
+                trace_id=trace_id,
+                conversation_id=conversation_id,
+                status=int(err_obj.get("status") or 500),
+                details={"trace_id": trace_id, "conversation_id": conversation_id, "raw": result, "stack": err_obj.get("stack") or "".join(traceback.format_stack())},
+            )
+        return _build_error_envelope(
+            code="rvc_train_failed",
+            message="RVC trainer returned an invalid response",
+            trace_id=trace_id,
+            conversation_id=conversation_id,
+            status=500,
+            details={"trace_id": trace_id, "conversation_id": conversation_id, "raw": result, "stack": "".join(traceback.format_stack())},
+        )
         
     except Exception as ex:
-        return {
-            "ok": False,
-            "error": {
-                "code": ex.__class__.__name__ or "InternalError",
-                "message": str(ex),
-                "status": 500,
-                "type": ex.__class__.__name__,
-                "stack": traceback.format_exc(),
-            },
-        }
+        return _build_error_envelope(
+            code=(ex.__class__.__name__ or "InternalError"),
+            message=str(ex),
+            trace_id=trace_id,
+            conversation_id=conversation_id,
+            status=500,
+            details={"trace_id": trace_id, "conversation_id": conversation_id, "type": ex.__class__.__name__, "stack": traceback.format_exc()},
+        )
 
 
 @app.post("/v1/voice/rename")
@@ -565,42 +621,41 @@ async def voice_rename(body: Dict[str, Any]):
     - new_voice_id: str (required)
     - merge_into_existing: bool (optional, defaults to true - always merge if match exists)
     """
+    trace_id = (body.get("trace_id") or "").strip() if isinstance(body.get("trace_id"), str) else ""
+    conversation_id = (body.get("conversation_id") or "").strip() if isinstance(body.get("conversation_id"), str) else ""
     old_voice_id = (body.get("old_voice_id") or "").strip()
     new_voice_id = (body.get("new_voice_id") or "").strip()
     merge_into_existing_flag = bool(body.get("merge_into_existing", True))  # Default to True
     
     if not old_voice_id:
-        return {
-            "ok": False,
-            "error": {
-                "code": "ValidationError",
-                "message": "old_voice_id is required for rename.",
-                "status": 400,
-                "stack": "".join(traceback.format_stack()),
-            },
-        }
+        return _build_error_envelope(
+            code="ValidationError",
+            message="old_voice_id is required for rename.",
+            trace_id=trace_id,
+            conversation_id=conversation_id,
+            status=400,
+            details={"trace_id": trace_id, "conversation_id": conversation_id, "stack": "".join(traceback.format_stack())},
+        )
     
     if not new_voice_id:
-        return {
-            "ok": False,
-            "error": {
-                "code": "ValidationError",
-                "message": "new_voice_id is required for rename.",
-                "status": 400,
-                "stack": "".join(traceback.format_stack()),
-            },
-        }
+        return _build_error_envelope(
+            code="ValidationError",
+            message="new_voice_id is required for rename.",
+            trace_id=trace_id,
+            conversation_id=conversation_id,
+            status=400,
+            details={"trace_id": trace_id, "conversation_id": conversation_id, "stack": "".join(traceback.format_stack())},
+        )
     
     if old_voice_id == new_voice_id:
-        return {
-            "ok": False,
-            "error": {
-                "code": "ValidationError",
-                "message": "old_voice_id and new_voice_id cannot be the same.",
-                "status": 400,
-                "stack": "".join(traceback.format_stack()),
-            },
-        }
+        return _build_error_envelope(
+            code="ValidationError",
+            message="old_voice_id and new_voice_id cannot be the same.",
+            trace_id=trace_id,
+            conversation_id=conversation_id,
+            status=400,
+            details={"trace_id": trace_id, "conversation_id": conversation_id, "old_voice_id": old_voice_id, "new_voice_id": new_voice_id, "stack": "".join(traceback.format_stack())},
+        )
     
     # Load registry
     reg = _load_registry()
@@ -662,7 +717,7 @@ async def voice_rename(body: Dict[str, Any]):
             try:
                 shutil.rmtree(old_dir)
             except Exception as ex:
-                logging.warning("Failed to remove old model directory %s: %s", old_dir, str(ex))
+                logging.warning(f"Failed to remove old model directory {old_dir!r}: {ex!r}")
         
         _save_registry(reg)
         
@@ -691,7 +746,10 @@ async def voice_rename(body: Dict[str, Any]):
                         spk_index[new_voice_id] = {"embedding": merged.tolist(), "count": total}
                 except Exception as ex:
                     # If merge fails, just keep new_entry, but do not be silent.
-                    logging.warning("speaker_index merge failed old=%s new=%s: %s", old_voice_id, new_voice_id, str(ex), exc_info=True)
+                    logging.warning(
+                        f"speaker_index merge failed old={old_voice_id!r} new={new_voice_id!r} ex={ex!r}",
+                        exc_info=True,
+                    )
             elif old_entry and not new_entry:
                 # Move old entry to new key
                 spk_index[new_voice_id] = old_entry
@@ -704,15 +762,13 @@ async def voice_rename(body: Dict[str, Any]):
             with open(spk_index_path, "w", encoding="utf-8") as f:
                 json.dump(spk_index, f, indent=2)
         except Exception as ex:
-            logging.warning("failed to update speaker_index on rename: %s", str(ex))
+            logging.warning(f"failed to update speaker_index on rename: {ex!r}")
         
-        return {
-            "ok": True,
-            "old_voice_id": old_voice_id,
-            "new_voice_id": new_voice_id,
-            "merged": True,
-            "affected_voice_lock_ids": affected,
-        }
+        return _build_success_envelope(
+            result={"ok": True, "old_voice_id": old_voice_id, "new_voice_id": new_voice_id, "merged": True, "affected_voice_lock_ids": affected, "trace_id": trace_id, "conversation_id": conversation_id},
+            trace_id=trace_id,
+            conversation_id=conversation_id,
+        )
     
     else:
         # Simple rename: new_voice_id doesn't exist
@@ -734,15 +790,14 @@ async def voice_rename(body: Dict[str, Any]):
                 else:
                     os.rename(old_dir, new_dir)
             except Exception as ex:
-                return {
-                    "ok": False,
-                    "error": {
-                        "code": ex.__class__.__name__ or "InternalError",
-                        "message": f"Failed to rename model directory: {str(ex)}",
-                        "status": 500,
-                        "stack": traceback.format_exc(),
-                    },
-                }
+                return _build_error_envelope(
+                    code=(ex.__class__.__name__ or "InternalError"),
+                    message=f"Failed to rename model directory: {str(ex)}",
+                    trace_id=trace_id,
+                    conversation_id=conversation_id,
+                    status=500,
+                    details={"trace_id": trace_id, "conversation_id": conversation_id, "old_voice_id": old_voice_id, "new_voice_id": new_voice_id, "stack": traceback.format_exc()},
+                )
         
         # Update all affected registry entries
         for vlk in affected:
@@ -774,15 +829,13 @@ async def voice_rename(body: Dict[str, Any]):
             with open(spk_index_path, "w", encoding="utf-8") as f:
                 json.dump(spk_index, f, indent=2)
         except Exception as ex:
-            logging.warning("failed to update speaker_index on rename: %s", str(ex))
+            logging.warning(f"failed to update speaker_index on rename: {ex!r}")
         
-        return {
-            "ok": True,
-            "old_voice_id": old_voice_id,
-            "new_voice_id": new_voice_id,
-            "merged": False,
-            "affected_voice_lock_ids": affected,
-        }
+        return _build_success_envelope(
+            result={"ok": True, "old_voice_id": old_voice_id, "new_voice_id": new_voice_id, "merged": False, "affected_voice_lock_ids": affected, "trace_id": trace_id, "conversation_id": conversation_id},
+            trace_id=trace_id,
+            conversation_id=conversation_id,
+        )
 
 
 @app.post("/v1/voice/mine/audio")
@@ -798,14 +851,22 @@ async def mine_voices_audio(body: Dict[str, Any]):
     - auto_train: bool (optional, default false) - whether to train immediately
     - language: str (optional) - language hint for transcription
     """
+    trace_id = (body.get("trace_id") or "").strip() if isinstance(body.get("trace_id"), str) else ""
+    conversation_id = (body.get("conversation_id") or "").strip() if isinstance(body.get("conversation_id"), str) else ""
     result = voice_miner.mine_voices_from_audio(body)
-    if result.get("ok"):
-        return result
-    else:
-        return JSONResponse(
-            status_code=400,
-            content=result,
-        )
+    if isinstance(result, dict) and bool(result.get("ok")) is True:
+        return _build_success_envelope(result=result, trace_id=trace_id, conversation_id=conversation_id)
+    code = (result.get("code") if isinstance(result, dict) else None) or "voice_mine_failed"
+    msg = (result.get("message") if isinstance(result, dict) else None) or "voice mining failed"
+    st = int((result.get("status") if isinstance(result, dict) and isinstance(result.get("status"), int) else None) or 422)
+    return _build_error_envelope(
+        code=str(code),
+        message=str(msg),
+        trace_id=trace_id,
+        conversation_id=conversation_id,
+        status=st,
+        details={"raw": result},
+    )
 
 
 @app.post("/v1/voice/mine/video")
@@ -821,39 +882,70 @@ async def mine_voices_video(body: Dict[str, Any]):
     - auto_train: bool (optional, default false) - whether to train immediately
     - language: str (optional) - language hint for transcription
     """
+    trace_id = (body.get("trace_id") or "").strip() if isinstance(body.get("trace_id"), str) else ""
+    conversation_id = (body.get("conversation_id") or "").strip() if isinstance(body.get("conversation_id"), str) else ""
     result = voice_miner.mine_voices_from_video(body)
-    if result.get("ok"):
-        return result
-    else:
-        return JSONResponse(
-            status_code=400,
-            content=result,
-        )
+    if isinstance(result, dict) and bool(result.get("ok")) is True:
+        return _build_success_envelope(result=result, trace_id=trace_id, conversation_id=conversation_id)
+    code = (result.get("code") if isinstance(result, dict) else None) or "voice_mine_failed"
+    msg = (result.get("message") if isinstance(result, dict) else None) or "voice mining failed"
+    st = int((result.get("status") if isinstance(result, dict) and isinstance(result.get("status"), int) else None) or 422)
+    return _build_error_envelope(
+        code=str(code),
+        message=str(msg),
+        trace_id=trace_id,
+        conversation_id=conversation_id,
+        status=st,
+        details={"raw": result},
+    )
 
 
 @app.post("/v1/audio/convert")
 async def convert_v1(body: Dict[str, Any]):
+    t0 = time.perf_counter()
+    trace_id = (body.get("trace_id") or "").strip() if isinstance(body.get("trace_id"), str) else ""
+    conversation_id = (body.get("conversation_id") or "").strip() if isinstance(body.get("conversation_id"), str) else ""
     voice_lock_id = (body.get("voice_lock_id") or "").strip()
+    voice_id_in = (body.get("voice_id") or "").strip() if isinstance(body.get("voice_id"), str) else ""
+    chosen_voice_key = voice_lock_id or voice_id_in
     
     # Accept both source_wav_base64 (preferred) and legacy source_wav_b64.
     src_b64 = body.get("source_wav_base64") or body.get("source_wav_b64")
     if not isinstance(src_b64, str) or not src_b64.strip():
-        return {
-            "ok": False,
-            "error": {
-                "code": "ValidationError",
-                "message": "source_wav_b64 is required",
-                "status": 400,
-                "stack": "".join(traceback.format_stack()),
-            },
-        }
+        return _build_error_envelope(
+            code="ValidationError",
+            message="source_wav_base64/source_wav_b64 is required",
+            trace_id=trace_id,
+            conversation_id=conversation_id,
+            status=400,
+            details={"trace_id": trace_id, "conversation_id": conversation_id, "stack": "".join(traceback.format_stack())},
+        )
     
+    # Log request context (never log the raw base64 itself; log length + sha256 for reproducibility).
+    try:
+        b64_len = int(len(src_b64 or ""))
+    except Exception:
+        b64_len = -1
+    try:
+        b64_sha = hashlib.sha256((src_b64 or "").encode("utf-8", errors="replace")).hexdigest()
+    except Exception:
+        b64_sha = ""
+    logging.info(
+        "rvc.convert_v1 start trace_id=%r voice_lock_id=%r voice_id=%r chosen_voice=%r b64_len=%d b64_sha256=%s",
+        trace_id,
+        voice_lock_id,
+        voice_id_in,
+        chosen_voice_key,
+        b64_len,
+        b64_sha,
+    )
+
     reg = _load_registry()
-    voice_cfg = reg.get(voice_lock_id) if voice_lock_id else None
+    voice_cfg = reg.get(chosen_voice_key) if chosen_voice_key else None
     
     # If no voice_lock_id or no registry entry, use default fallback
     model_name = ""
-    if not voice_lock_id or not isinstance(voice_cfg, dict):
+    if not chosen_voice_key or not isinstance(voice_cfg, dict):
         # Choose default voice (simplistic: prefer female, fallback to male)
         # You can refine this later based on voice_role or other hints
         fallback_model = RVC_DEFAULT_FEMALE_VOICE_ID or RVC_DEFAULT_MALE_VOICE_ID
@@ -869,7 +961,7 @@ async def convert_v1(body: Dict[str, Any]):
             "protect": 0.33,
         }
         model_name = fallback_model
-        logging.info("Using default fallback voice: %s", fallback_model)
+        logging.info(f"rvc.convert_v1 using default fallback voice={fallback_model!r} trace_id={trace_id!r}")
     else:
         # Check if model actually exists
         model_name = (voice_cfg.get("model_name") or "").strip()
@@ -877,7 +969,9 @@ async def convert_v1(body: Dict[str, Any]):
             model_path = os.path.join(RVC_MODELS_ROOT, model_name, f"{model_name}.pth")
             if not os.path.exists(model_path):
                 # Model missing, fallback to default
-                logging.warning("Model %s not found, falling back to default", model_name)
+                logging.warning(
+                    f"rvc.convert_v1 model_missing model={model_name!r} path={model_path!r} trace_id={trace_id!r}; falling back to default"
+                )
                 fallback_model = RVC_DEFAULT_FEMALE_VOICE_ID or RVC_DEFAULT_MALE_VOICE_ID
                 voice_cfg = {
                     "model_name": fallback_model,
@@ -891,35 +985,50 @@ async def convert_v1(body: Dict[str, Any]):
                     "protect": float(voice_cfg.get("protect") or 0.33),
                 }
                 model_name = fallback_model
+        if not model_name:
+            model_name = _DEFAULT_TITAN_VOICE_ID
+            voice_cfg["model_name"] = model_name
+
+    # Policy: ALWAYS load the model for this request BEFORE decoding/processing audio.
+    eng = ensure_rvc_engine_loaded({"model_name": model_name, "trace_id": trace_id, "conversation_id": conversation_id})
+    if isinstance(eng, dict) and eng.get("ok") is False:
+        # Preserve full underlying details; never raise.
+        err = eng.get("error") if isinstance(eng.get("error"), dict) else {"code": "rvc_engine_load_failed", "message": "engine load failed"}
+        return _build_error_envelope(
+            code=str(err.get("code") or "rvc_engine_load_failed"),
+            message=str(err.get("message") or "engine load failed"),
+            trace_id=trace_id,
+            conversation_id=conversation_id,
+            status=int(err.get("status") or 500),
+            details={"trace_id": trace_id, "conversation_id": conversation_id, "model_name": model_name, "engine": eng, "stack": (err.get("stack") or "".join(traceback.format_stack()))},
+        )
     try:
         wav_bytes = _decode_wav_from_b64(src_b64)
     except Exception as ex:
-        return {
-            "ok": False,
-            "error": {
-                "code": ex.__class__.__name__ or "InternalError",
-                "message": str(ex),
-                "status": 400,
-                "type": ex.__class__.__name__,
-                "stack": traceback.format_exc(),
-            },
-        }
+        return _build_error_envelope(
+            code=(ex.__class__.__name__ or "invalid_b64"),
+            message=str(ex),
+            trace_id=trace_id,
+            conversation_id=conversation_id,
+            status=400,
+            details={"trace_id": trace_id, "conversation_id": conversation_id, "type": ex.__class__.__name__, "stack": traceback.format_exc()},
+        )
     # Decode source audio to mono float32.
     try:
         src_y, src_sr = _decode_wav_to_mono_float32(wav_bytes)
     except Exception as ex:
-        return {
-            "ok": False,
-            "error": {
-                "code": ex.__class__.__name__ or "InternalError",
-                "message": str(ex),
-                "status": 400,
-                "type": ex.__class__.__name__,
-                "stack": traceback.format_exc(),
-            },
-        }
+        return _build_error_envelope(
+            code=(ex.__class__.__name__ or "src_decode_error"),
+            message=str(ex),
+            trace_id=trace_id,
+            conversation_id=conversation_id,
+            status=400,
+            details={"trace_id": trace_id, "conversation_id": conversation_id, "type": ex.__class__.__name__, "stack": traceback.format_exc()},
+        )
     # Use voice_cfg we determined above (with fallback if needed)
-    ref_cfg = voice_cfg if isinstance(voice_cfg, dict) else {}
+    ref_cfg = dict(voice_cfg) if isinstance(voice_cfg, dict) else {}
+    ref_cfg.setdefault("model_name", model_name)
+    ref_cfg["trace_id"] = trace_id
     ref_path = ""
     if isinstance(ref_cfg, dict):
         ref_path = (ref_cfg.get("reference_wav_path") or "").strip()
@@ -945,65 +1054,76 @@ async def convert_v1(body: Dict[str, Any]):
                 ref_y = src_y.copy()
                 ref_sr = src_sr
             else:
-                return {
-                    "ok": False,
-                    "error": {
-                        "code": "ref_decode_error",
-                        "message": str(ex),
-                        "status": 400,
-                        "type": ex.__class__.__name__,
-                        "stack": traceback.format_exc(),
-                    },
-                }
+                return _build_error_envelope(
+                    code="ref_decode_error",
+                    message=str(ex),
+                    trace_id=trace_id,
+                    conversation_id=conversation_id,
+                    status=400,
+                    details={"trace_id": trace_id, "conversation_id": conversation_id, "type": ex.__class__.__name__, "ref_path": ref_path, "stack": traceback.format_exc()},
+                )
     elif is_default_voice:
         # Default voices: use source as reference (model is pre-trained)
         ref_y = src_y.copy()
         ref_sr = src_sr
     else:
         # For non-default voices, require a reference
-        return {
-            "ok": False,
-            "error": {
-                "code": "ValidationError",
-                "message": f"No reference_wav_path configured or file not found for voice_lock_id '{voice_lock_id or 'N/A'}'.",
-                "status": 400,
-                "stack": "".join(traceback.format_stack()),
-            },
-        }
+        return _build_error_envelope(
+            code="ValidationError",
+            message=f"No reference_wav_path configured or file not found for voice_lock_id '{voice_lock_id or 'N/A'}'.",
+            trace_id=trace_id,
+            conversation_id=conversation_id,
+            status=400,
+            details={"trace_id": trace_id, "conversation_id": conversation_id, "voice_lock_id": voice_lock_id, "stack": "".join(traceback.format_stack())},
+        )
     try:
         converted_np = _run_rvc_convert(src_y, src_sr, ref_y, ref_sr, ref_cfg)
     except Exception as ex:
-        return {
-            "ok": False,
-            "error": {
-                "code": ex.__class__.__name__ or "InternalError",
-                "message": str(ex),
-                "status": 500,
-                "type": ex.__class__.__name__,
-                "stack": traceback.format_exc(),
-            },
-        }
+        logging.error("rvc.convert_v1 convert_failed trace_id=%r model=%r ex=%r", trace_id, model_name, ex, exc_info=True)
+        return _build_error_envelope(
+            code=(ex.__class__.__name__ or "rvc_convert_failed"),
+            message=str(ex),
+            trace_id=trace_id,
+            conversation_id=conversation_id,
+            status=500,
+            details={"trace_id": trace_id, "conversation_id": conversation_id, "model_name": model_name, "stack": traceback.format_exc()},
+        )
     # Encode back to WAV bytes at the desired sample rate.
     out_sr = int(body.get("sample_rate") or ref_cfg.get("sample_rate") or src_sr or 32000)
     try:
         out_wav_bytes = _encode_mono_float32_to_wav_bytes(converted_np, out_sr)
     except Exception as ex:
-        return {
-            "ok": False,
-            "error": {
-                "code": ex.__class__.__name__ or "InternalError",
-                "message": str(ex),
-                "status": 500,
-                "type": ex.__class__.__name__,
-                "stack": traceback.format_exc(),
-            },
-        }
+        return _build_error_envelope(
+            code=(ex.__class__.__name__ or "encode_error"),
+            message=str(ex),
+            trace_id=trace_id,
+            conversation_id=conversation_id,
+            status=500,
+            details={"trace_id": trace_id, "conversation_id": conversation_id, "type": ex.__class__.__name__, "stack": traceback.format_exc()},
+        )
     out_b64 = base64.b64encode(out_wav_bytes).decode("ascii")
-    return {
-        "ok": True,
-        "audio_wav_base64": out_b64,
-        "sample_rate": out_sr,
-    }
+    logging.info(
+        "rvc.convert_v1 done trace_id=%r voice=%r model=%r out_sr=%d out_b64_len=%d dur_ms=%d",
+        trace_id,
+        chosen_voice_key or model_name,
+        model_name,
+        int(out_sr),
+        int(len(out_b64)),
+        int((time.perf_counter() - t0) * 1000),
+    )
+    return _build_success_envelope(
+        result={
+            "audio_wav_base64": out_b64,
+            "sample_rate": out_sr,
+            "trace_id": trace_id,
+            "conversation_id": conversation_id,
+            "model_name": model_name,
+            "voice_lock_id": voice_lock_id,
+            "voice_id": voice_id_in,
+        },
+        trace_id=trace_id,
+        conversation_id=conversation_id,
+    )
 
 
 @app.post("/convert_path")
@@ -1013,56 +1133,61 @@ async def convert_path(body: Dict[str, Any]):
     Reads wav_path, converts it internally using the same engine as /v1/audio/convert,
     and returns a new wav path on disk.
     """
+    trace_id = (body.get("trace_id") or "").strip() if isinstance(body.get("trace_id"), str) else ""
+    conversation_id = (body.get("conversation_id") or "").strip() if isinstance(body.get("conversation_id"), str) else ""
     wav_path = body.get("wav_path")
     voice_lock_id = (body.get("voice_lock_id") or "").strip()
     if not isinstance(wav_path, str) or not wav_path.strip():
-        return {
-            "ok": False,
-            "error": {
-                "code": "ValidationError",
-                "message": "wav_path is required",
-                "status": 400,
-                "stack": "".join(traceback.format_stack()),
-            },
-        }
+        return _build_error_envelope(
+            code="ValidationError",
+            message="wav_path is required",
+            trace_id=trace_id,
+            conversation_id=conversation_id,
+            status=400,
+            details={"trace_id": trace_id, "conversation_id": conversation_id, "stack": "".join(traceback.format_stack())},
+        )
     if not voice_lock_id:
-        return {
-            "ok": False,
-            "error": {
-                "code": "ValidationError",
-                "message": "voice_lock_id is required",
-                "status": 400,
-                "stack": "".join(traceback.format_stack()),
-            },
-        }
+        return _build_error_envelope(
+            code="ValidationError",
+            message="voice_lock_id is required",
+            trace_id=trace_id,
+            conversation_id=conversation_id,
+            status=400,
+            details={"trace_id": trace_id, "conversation_id": conversation_id, "stack": "".join(traceback.format_stack())},
+        )
     if not os.path.exists(wav_path):
-        return {
-            "ok": False,
-            "error": {
-                "code": "ValidationError",
-                "message": f"wav_path not found: {wav_path}",
-                "status": 404,
-                "stack": "".join(traceback.format_stack()),
-            },
-        }
+        return _build_error_envelope(
+            code="ValidationError",
+            message=f"wav_path not found: {wav_path}",
+            trace_id=trace_id,
+            conversation_id=conversation_id,
+            status=404,
+            details={"trace_id": trace_id, "conversation_id": conversation_id, "wav_path": wav_path, "stack": "".join(traceback.format_stack())},
+        )
     with open(wav_path, "rb") as f:
         src = f.read()
     b64 = base64.b64encode(src).decode("ascii")
-    res = await convert_v1({"source_wav_b64": b64, "voice_lock_id": voice_lock_id})
-    if not isinstance(res, dict) or not res.get("ok"):
-        return {
-            "ok": False,
-            "error": {
-                "code": "InternalError",
-                "detail": res,
-                "status": 500,
-                "stack": "".join(traceback.format_stack()),
-            },
-        }
-    out_bytes = base64.b64decode(res.get("audio_wav_base64") or "")
+    res = await convert_v1({"source_wav_b64": b64, "voice_lock_id": voice_lock_id, "trace_id": trace_id, "conversation_id": conversation_id})
+    if not isinstance(res, dict) or not bool(res.get("ok")):
+        err = res.get("error") if isinstance(res, dict) and isinstance(res.get("error"), dict) else {}
+        return _build_error_envelope(
+            code=str(err.get("code") or "rvc_convert_failed"),
+            message=str(err.get("message") or "RVC convert failed"),
+            trace_id=trace_id,
+            conversation_id=conversation_id,
+            status=int(err.get("status") or 500),
+            details={"trace_id": trace_id, "conversation_id": conversation_id, "voice_lock_id": voice_lock_id, "wav_path": wav_path, "raw": res, "stack": err.get("stack") or "".join(traceback.format_stack())},
+        )
+    inner = res.get("result") if isinstance(res.get("result"), dict) else {}
+    out_b64 = inner.get("audio_wav_base64") if isinstance(inner.get("audio_wav_base64"), str) else ""
+    out_bytes = base64.b64decode(out_b64 or "")
     v_dir, v_name = os.path.dirname(wav_path), os.path.basename(wav_path)
     v_base, v_ext = os.path.splitext(v_name)
     out_path = os.path.join(v_dir, f"{v_base}.rvc{v_ext or '.wav'}")
     with open(out_path, "wb") as f:
         f.write(out_bytes)
-    return {"ok": True, "path": out_path}
+    return _build_success_envelope(
+        result={"path": out_path, "voice_lock_id": voice_lock_id, "source_path": wav_path, "trace_id": trace_id, "conversation_id": conversation_id},
+        trace_id=trace_id,
+        conversation_id=conversation_id,
+    )

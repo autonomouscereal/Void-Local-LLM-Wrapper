@@ -9,7 +9,8 @@ def build_timeline(shots: List[Dict[str, Any]], final_duration: int) -> Dict[str
     events = []
     for s in (shots or []):
         dur = int(s.get("duration_ms", 0))
-        events.append({"at_ms": t, "id": s.get("id"), "dur_ms": dur})
+        shot_id = s.get("shot_id") or s.get("id")
+        events.append({"at_ms": t, "shot_id": shot_id, "dur_ms": dur})
         t += dur
     return {"duration_ms": t, "events": events}
 
@@ -33,7 +34,7 @@ def export_srt(timeline: Dict[str, Any]) -> Dict[str, Any]:
         end = start + int(ev.get("dur_ms", 0))
         lines.append(str(idx))
         lines.append(f"{_fmt_srt_time(start)} --> {_fmt_srt_time(end)}")
-        lines.append(f"{ev.get('id')}")
+        lines.append(f"{ev.get('shot_id') or ev.get('id') or ''}")
         lines.append("")
         idx += 1
         cur = end

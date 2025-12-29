@@ -29,8 +29,8 @@ CREATE TABLE IF NOT EXISTS artifact (
 -- tools executed within a run
 CREATE TABLE IF NOT EXISTS tool_call (
   id          BIGSERIAL PRIMARY KEY,
-  run_id      BIGINT NOT NULL REFERENCES run(id) ON DELETE CASCADE,
-  name        TEXT NOT NULL,
+  trace_id    TEXT NOT NULL,
+  tool_name   TEXT NOT NULL,
   seed        BIGINT NOT NULL,
   args_json   JSONB NOT NULL,
   result_json JSONB,
@@ -38,7 +38,7 @@ CREATE TABLE IF NOT EXISTS tool_call (
   duration_ms INTEGER,
   created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-CREATE INDEX IF NOT EXISTS tool_run_name_idx ON tool_call(run_id, name);
+CREATE INDEX IF NOT EXISTS tool_run_name_idx ON tool_call(trace_id, tool_name);
 
 -- ICW log (inline pack)
 CREATE TABLE IF NOT EXISTS icw_log (

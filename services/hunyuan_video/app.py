@@ -44,7 +44,7 @@ PIPE_MODEL_ID = None
 _PIPE_LOCK = Lock()
 
 
-def _configure_logging() -> None:
+def _configure_logging():
     os.makedirs(LOG_DIR, exist_ok=True)
     level = (os.getenv("LOG_LEVEL", "INFO") or "INFO").upper()
     logging.basicConfig(
@@ -63,24 +63,24 @@ def _dtype_from_str(s: str):
     return torch.float32
 
 
-def _ensure_dirs() -> None:
+def _ensure_dirs():
     os.makedirs(UPLOAD_DIR, exist_ok=True)
     os.makedirs(os.path.join(UPLOAD_DIR, "videos"), exist_ok=True)
 
 
-def _pick_seed(seed: Optional[int]) -> int:
+def _pick_seed(seed: Optional[int]):
     if isinstance(seed, int) and seed >= 0:
         return int(seed)
     return int(time.time() * 1000) ^ (uuid.uuid4().int & 0x7FFFFFFF)
 
 
-def _device() -> str:
+def _device():
     if torch.cuda.is_available():
         return DEFAULT_DEVICE
     return "cpu"
 
 
-def _load_pipe(model_id: str) -> None:
+def _load_pipe(model_id: str):
     global PIPE, PIPE_MODEL_ID
 
     _ensure_dirs()
@@ -101,10 +101,21 @@ def _load_pipe(model_id: str) -> None:
     )
 
     # Service policy: use the single pre-downloaded local model directory.
+    # NEVER raise: on misconfiguration, log loudly and keep PIPE unset so endpoints return pipe_not_ready.
     if not isinstance(model_id, str) or not model_id.strip() or (not model_id.startswith("/opt/models/")):
-        raise RuntimeError(f"HYVIDEO_MODEL_ID must be a local /opt/models path; got: {model_id!r}")
+        logging.getLogger(__name__).error(
+            "hunyuan_video.load invalid_model_id model_id=%r (must be local /opt/models path)\n%s",
+            model_id,
+            traceback.format_exc(),
+        )
+        return
     if not os.path.isdir(model_id) or not os.listdir(model_id):
-        raise RuntimeError(f"HYVIDEO_MODEL_ID directory missing/empty (bootstrap did not download?): {model_id!r}")
+        logging.getLogger(__name__).error(
+            "hunyuan_video.load model_dir_missing_or_empty model_id=%r\n%s",
+            model_id,
+            traceback.format_exc(),
+        )
+        return
 
     transformer = HunyuanVideoTransformer3DModel.from_pretrained(
         model_id,
@@ -132,7 +143,7 @@ def _load_pipe(model_id: str) -> None:
     logging.getLogger(__name__).info("hunyuan_video.load done model_id=%s dur_ms=%d", model_id, int((time.monotonic() - t0) * 1000))
 
 
-def _resolve_local_image(image_ref: str) -> Optional[Image.Image]:
+def _resolve_local_image(image_ref: str):
     """
     Resolve a local image reference into a PIL.Image.
 
@@ -153,7 +164,7 @@ def _resolve_local_image(image_ref: str) -> Optional[Image.Image]:
     return im
 
 
-def _pipe_accepts_image(pipe: Any) -> str | None:
+def _pipe_accepts_image(pipe: Any):
     """
     Return the keyword to pass an init image to this pipeline call, if supported.
     """
@@ -168,7 +179,7 @@ def _pipe_accepts_image(pipe: Any) -> str | None:
     return None
 
 
-def _coerce_int(v: Any, default: int) -> int:
+def _coerce_int(v: Any, default: int):
     if isinstance(v, bool):
         return default
     if isinstance(v, int):
@@ -178,7 +189,7 @@ def _coerce_int(v: Any, default: int) -> int:
     return int(default)
 
 
-def _coerce_float(v: Any, default: float) -> float:
+def _coerce_float(v: Any, default: float):
     if isinstance(v, bool):
         return float(default)
     if isinstance(v, (int, float)):
@@ -186,7 +197,7 @@ def _coerce_float(v: Any, default: float) -> float:
     return float(default)
 
 
-def _run_generate_dict(data: Dict[str, Any]) -> Dict[str, Any] | JSONResponse:
+def _run_generate_dict(data: Dict[str, Any]):
     prompt = data.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip():
         return JSONResponse(status_code=422, content={"ok": False, "error": {"code": "missing_prompt", "message": "prompt (string) is required"}})

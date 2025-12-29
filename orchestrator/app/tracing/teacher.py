@@ -250,19 +250,27 @@ def _normalize_trace_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], s
     ts = _now_iso()
     trace_seed = int(payload.get("seed", 0) or 0)
     workspace = str(payload.get("workspace", "default"))
-    trace_id = payload.get("trace_id") or ("tt_" + _sha256_str("|".join([ts, workspace, str(trace_seed), mhash]))[:16])
+    trace_id = payload.get("trace_id")
 
     # Deterministic seed derivations (kept for backwards-compat with the removed service)
     seed_router = _xx64("router", str(trace_id), str(trace_seed))
     tool_calls = payload.get("tool_calls") or []
     if not isinstance(tool_calls, list):
         tool_calls = []
-    tool_calls = sorted([tc for tc in tool_calls if isinstance(tc, dict)], key=lambda x: x.get("name") or "")
+    tool_calls = [tc for tc in tool_calls if isinstance(tc, dict)]
+    tool_calls = [tc for tc in tool_calls if isinstance(tc.get("tool_name"), str)]
+    ranked_tool_calls: List[tuple[str, int, Dict[str, Any]]] = []
+    for tool_call_index, tool_call in enumerate(tool_calls):
+        ranked_tool_calls.append((str(tool_call.get("tool_name") or ""), int(tool_call_index), tool_call))
+    ranked_tool_calls.sort()
+    tool_calls = [ranked[2] for ranked in ranked_tool_calls]
     seeds_map: Dict[str, Any] = {"master": trace_seed, "router": seed_router, "tools": {}}
-    for tc in tool_calls[:64]:
-        name = tc.get("name") or "tool"
-        seeds_map["tools"][name] = _xx64("tool", str(name), str(trace_id), str(trace_seed))
-        tc.setdefault("seed", seeds_map["tools"][name])
+    for tc in tool_calls:
+        tool_name = tc.get("tool_name")
+        if not isinstance(tool_name, str) or not tool_name:
+            continue
+        seeds_map["tools"][tool_name] = _xx64("tool", str(tool_name), str(trace_id), str(trace_seed))
+        tc.setdefault("seed", seeds_map["tools"][tool_name])
 
     resp = payload.get("response") or {}
     if not isinstance(resp, dict):

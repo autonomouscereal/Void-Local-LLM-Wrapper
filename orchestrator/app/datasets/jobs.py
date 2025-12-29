@@ -43,7 +43,7 @@ def run_export_job(jid: str, args: Dict[str, Any], emit):
     }
     write_index(name, version, index)
     set_state(jid, "done", phase="done", progress=1.0)
-    emit(event("done", "done", 1.0, artifacts=[{"path": os.path.join(dst, "index.json")}]))
+    emit(event("done", "done", 1.0, artifacts=[{"artifact_id": "index.json", "kind": "json", "path": os.path.join(dst, "index.json")}]))
     return {"name": name, "version": version}
 
 

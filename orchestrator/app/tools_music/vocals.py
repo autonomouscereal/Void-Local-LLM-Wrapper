@@ -8,6 +8,7 @@ from typing import Any, Dict, List
 
 from .common import ensure_dir
 from ..tools_tts.speak import run_tts_speak
+from void_artifacts import artifact_id_to_safe_filename
 
 
 def _collect_lyrics_for_section_and_voice(song_graph: Dict[str, Any], section_id: str, voice_id: str) -> List[str]:
@@ -26,8 +27,8 @@ def _collect_lyrics_for_section_and_voice(song_graph: Dict[str, Any], section_id
     for sec in sections:
         if not isinstance(sec, dict):
             continue
-        sid = sec.get("section_id")
-        if not isinstance(sid, str) or sid != section_id:
+        section_id = sec.get("section_id")
+        if not isinstance(section_id, str) or section_id != section_id:
             continue
         lines = sec.get("lines") if isinstance(sec.get("lines"), list) else []
         voice_specific: List[str] = []
@@ -122,14 +123,16 @@ def plan_vocal_segments(song_graph: Dict[str, Any], windows: List[Dict[str, Any]
 
 
 async def render_vocal_stems_for_track(
-    job: Dict[str, Any],
     song_graph: Dict[str, Any],
     windows: List[Dict[str, Any]],
     lock_bundle: Dict[str, Any],
     backing_path: str,
-    cid: str,
+    conversation_id: str,
     manifest: Dict[str, Any],
     tts_provider,
+    seed: Any = None,
+    trace_id: str = "",
+    tts_sample_rate: int = 22050,
 ) -> Dict[str, Any]:
     """
     Render per-voice vocal stems over the given backing track using TTS→RVC→VocalFix.
@@ -146,8 +149,9 @@ async def render_vocal_stems_for_track(
     stems: List[Dict[str, Any]] = []
     if not segments:
         return {"stems": stems}
-    # Directory for vocal stems under the same CID as music.
-    stem_dir = os.path.join(UPLOAD_DIR, "artifacts", "music", cid, "stems")
+    # Directory for vocal stems under the same conversation_id bucket as music.
+    outdir_key = conversation_id
+    stem_dir = os.path.join(UPLOAD_DIR, "artifacts", "music", outdir_key, "stems")
     ensure_dir(stem_dir)
     for idx, seg in enumerate(segments):
         text = seg.get("text")
@@ -164,13 +168,13 @@ async def render_vocal_stems_for_track(
             "voice_lock_id": voice_lock_id,
             "voice_id": seg.get("voice_id"),
             "segment_id": seg.get("segment_id"),
-            "sample_rate": int(job.get("tts_sample_rate") or 22050),
+            "sample_rate": int(tts_sample_rate),
             "max_seconds": max_seconds,
-            "seed": job.get("seed"),
+            "seed": seed,
             "lock_bundle": lock_bundle,
-            "cid": cid,
+            "conversation_id": conversation_id,
         }
-        env = await run_tts_speak(tts_job, tts_provider, manifest)
+        env = await run_tts_speak(job=tts_job, provider=tts_provider, manifest=manifest, trace_id=trace_id, conversation_id=conversation_id)
         # run_tts_speak returns either an error envelope or a normal envelope.
         if not isinstance(env, dict):
             return {
@@ -194,22 +198,33 @@ async def render_vocal_stems_for_track(
         meta = env.get("meta") if isinstance(env.get("meta"), dict) else {}
         artifacts = env.get("artifacts") if isinstance(env.get("artifacts"), list) else []
         stem_path: str | None = None
-        for art in artifacts:
-            if not isinstance(art, dict):
+        for artifact in artifacts:
+            if not isinstance(artifact, dict):
                 continue
-            kind = art.get("kind")
-            art_id = art.get("id")
-            if isinstance(kind, str) and kind == "audio-ref" and isinstance(art_id, str) and art_id:
-                # TTS artifacts live in /workspace/uploads/artifacts/audio/tts/{cid}
-                stem_path = os.path.join(
+            kind = artifact.get("kind")
+            if isinstance(kind, str) and kind == "audio":
+                # Use the actual path from the artifact, not artifact_id (which may contain colons/special chars)
+                path_val = artifact.get("path")
+                if isinstance(path_val, str) and path_val and os.path.exists(path_val):
+                    stem_path = path_val
+                    break
+                # Fallback: try to construct path from artifact_id if path not available
+            artifact_id = artifact.get("artifact_id")
+                if isinstance(artifact_id, str) and artifact_id:
+                # TTS artifacts live in /workspace/uploads/artifacts/audio/tts/{conversation_id}
+                    # Convert artifact_id to safe filename (matching how files are saved)
+                    safe_filename = artifact_id_to_safe_filename(artifact_id, ".wav")
+                    candidate_path = os.path.join(
                     "/workspace",
                     "uploads",
                     "artifacts",
                     "audio",
                     "tts",
-                    meta.get("cid") or cid,
-                    art_id,
+                        meta.get("conversation_id") or conversation_id,
+                        safe_filename,
                 )
+                    if os.path.exists(candidate_path):
+                        stem_path = candidate_path
                 break
         if not stem_path or not os.path.exists(stem_path):
             return {

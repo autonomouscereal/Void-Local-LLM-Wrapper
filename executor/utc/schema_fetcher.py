@@ -45,11 +45,11 @@ def _post(url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         return {}
 
 
-async def fetch(name: str) -> Dict[str, Any]:
+async def fetch(tool_name: str) -> Dict[str, Any]:
     """Fetch tool describe and cache to Postgres (best-effort)."""
     base = os.getenv("ORCHESTRATOR_BASE_URL", "http://127.0.0.1:8000")
     url = base.rstrip("/") + "/tool.describe"
-    obj = _post(url, {"name": name})
+    obj = _post(url=url, payload={"tool_name": tool_name})
     res = (obj or {}).get("result") or {}
     schema = res.get("schema") or {}
     version = res.get("version") or "1"
@@ -60,10 +60,10 @@ async def fetch(name: str) -> Dict[str, Any]:
             try:
                 await conn.execute(
                     "insert into tool_schemas (tool_name, version, schema_hash, schema_json) values ($1,$2,$3,$4) on conflict do nothing",
-                    name, version, schema_hash, json.dumps(schema),
+                    tool_name, version, schema_hash, json.dumps(schema),
                 )
             except Exception as e:
-                logging.error("schema_fetcher.fetch failed to cache schema for tool=%s: %s\n%s", name, e, traceback.format_exc())
-    return {"name": name, "version": version, "schema": (schema or {}), "schema_hash": schema_hash}
+                logging.error("schema_fetcher.fetch failed to cache schema for tool=%s: %s\n%s", tool_name, e, traceback.format_exc())
+    return {"tool_name": tool_name, "version": version, "schema": (schema or {}), "schema_hash": schema_hash}
 
 

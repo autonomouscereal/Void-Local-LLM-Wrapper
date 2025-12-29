@@ -26,7 +26,7 @@ def _log_music_generate_state(
     device: str,
     inputs: dict,
     max_new_tokens: int,
-) -> None:
+):
     """
     Log detailed information about the MusicGen generation call without dumping
     full tensor contents. Intended for debugging around model.generate().
@@ -88,7 +88,7 @@ def _log_music_generate_state(
         logger.exception("Failed to log MusicGen generate state")
 
 
-def _resolve_model_path(model_dir: str, model_id_env: str) -> str:
+def _resolve_model_path(model_dir: str, model_id_env: str):
     """
     Resolve a local model path for MusicGen.
 
@@ -101,7 +101,7 @@ def _resolve_model_path(model_dir: str, model_id_env: str) -> str:
     return model_id or model_id_env
 
 
-def ensure_music_engine_loaded() -> None:
+def ensure_music_engine_loaded():
     """
     Load the primary music generation engine (MusicGen or compatible) exactly
     once into module-level globals. The model object never leaves this module.
@@ -132,7 +132,7 @@ def generate_music(
     seconds: int,
     seed: Optional[int],
     refs: Optional[List[str]],
-) -> bytes:
+):
     """
     Generate music audio using the globally loaded MusicGen-compatible engine.
 

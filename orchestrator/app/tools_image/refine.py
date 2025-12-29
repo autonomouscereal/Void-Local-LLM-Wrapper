@@ -16,7 +16,7 @@ def build_image_refine_dispatch_args(
     - We pass through prompt/seed when provided.
     - We attach the resolved lock bundle and quality_profile so QA/locks behave
       the same way as for a fresh image.dispatch call.
-    - We forward optional cid/trace_id for tracing.
+    - We forward optional conversation_id/trace_id for tracing.
 
     The source_image field is passed through untouched so downstream tooling can
     start to rely on it once the Comfy graph is upgraded to support init images.
@@ -31,9 +31,9 @@ def build_image_refine_dispatch_args(
     seed = args.get("seed")
     if isinstance(seed, int):
         out["seed"] = seed
-    cid = args.get("cid")
-    if isinstance(cid, str) and cid.strip():
-        out["cid"] = cid.strip()
+    conversation_id = args.get("conversation_id")
+    if isinstance(conversation_id, str) and conversation_id.strip():
+        out["conversation_id"] = conversation_id.strip()
     trace_id = args.get("trace_id")
     if isinstance(trace_id, str) and trace_id.strip():
         out["trace_id"] = trace_id.strip()

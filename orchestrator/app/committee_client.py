@@ -37,8 +37,8 @@ STATE_DIR = os.path.join(UPLOAD_DIR, "state")
 os.makedirs(STATE_DIR, exist_ok=True)
 
 
-def _env_int(name: str, default: int, *, min_val: int | None = None, max_val: int | None = None) -> int:
-    raw = os.getenv(name, None)
+def _env_int(env_var_name: str, default: int, *, min_val: int | None = None, max_val: int | None = None) -> int:
+    raw = os.getenv(env_var_name, None)
     val = int(str(raw).strip()) if raw is not None else int(default)
     if min_val is not None and val < min_val:
         val = min_val
@@ -52,7 +52,7 @@ DEFAULT_COMMITTEE_ROUNDS = _env_int("COMMITTEE_ROUNDS", 1, min_val=1, max_val=10
 COMMITTEE_MODEL_ID = os.getenv("COMMITTEE_MODEL_ID") or f"committee:{QWEN_MODEL_ID}+{GLM_MODEL_ID}+{DEEPSEEK_CODER_MODEL_ID}"
 
 PARTICIPANT_MODELS = {"qwen": {"base": QWEN_BASE_URL, "model": QWEN_MODEL_ID}, "glm": {"base": GLM_OLLAMA_BASE_URL, "model": GLM_MODEL_ID}, "deepseek": {"base": DEEPSEEK_CODER_OLLAMA_BASE_URL, "model": DEEPSEEK_CODER_MODEL_ID}}
-COMMITTEE_PARTICIPANTS = [{"id": name, "base": cfg["base"], "model": cfg["model"]} for name, cfg in PARTICIPANT_MODELS.items()]
+COMMITTEE_PARTICIPANTS = [{"id": member_id, "base": cfg["base"], "model": cfg["model"]} for member_id, cfg in PARTICIPANT_MODELS.items()]
 
 
 def _sanitize_mojibake_text(text: str) -> str:
@@ -73,12 +73,12 @@ def _participant_for(member_id: str):
 
 def _normalize_messages(messages: List[Dict[str, Any]]):
     out: List[Dict[str, Any]] = []
-    for m in (messages or []):
-        if not isinstance(m, dict):
+    for message_entry in (messages or []):
+        if not isinstance(message_entry, dict):
             continue
-        role = str(m.get("role") or "user")
-        name = m.get("name")
-        content_val = m.get("content")
+        role = str(message_entry.get("role") or "user")
+        tool_call_name = message_entry.get("tool_call_name") if isinstance(message_entry.get("tool_call_name"), str) else None
+        content_val = message_entry.get("content")
         if isinstance(content_val, list):
             text_parts: List[str] = []
             for part in content_val:
@@ -90,8 +90,8 @@ def _normalize_messages(messages: List[Dict[str, Any]]):
         else:
             content = str(content_val or "")
         msg: Dict[str, Any] = {"role": role, "content": content}
-        if role == "tool" and isinstance(name, str) and name.strip():
-            msg["name"] = name.strip()
+        if role == "tool" and isinstance(tool_call_name, str) and tool_call_name.strip():
+            msg["name"] = tool_call_name.strip()
         out.append(msg)
     return out
 
@@ -154,7 +154,14 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str):
         )
         parser = JSONParser()
         t_parse = time.monotonic()
-        parsed_obj = parser.parse(raw_text or "{}", {})
+        try:
+            parsed_obj = parser.parse(raw_text or "{}", {})
+            if not isinstance(parsed_obj, dict):
+                log.warning("[committee] ollama.parsed: JSONParser returned non-dict type=%s trace_id=%s base=%s model=%r", type(parsed_obj).__name__, trace_id, base_url, model)
+                parsed_obj = {}
+        except Exception as ex:
+            log.warning("[committee] ollama.parse_exception trace_id=%s base=%s model=%r ex=%s raw_text_prefix=%s", trace_id, base_url, model, ex, (raw_text or "")[:200], exc_info=True)
+            parsed_obj = {}
         parsed = parsed_obj if isinstance(parsed_obj, dict) else {}
         log.info(
             "[committee] ollama.parsed trace_id=%s base=%s model=%r status=%d parse_dur_ms=%d parsed=%s",
@@ -351,10 +358,10 @@ async def committee_ai_text(messages: List[Dict[str, Any]], *, trace_id: str, ro
                 if isinstance(otext, str) and otext.strip():
                     ctx_lines.append(f"Answer from {oid}:\n{otext.strip()}")
             crit_blocks: List[str] = []
-            for cid in member_ids:
-                ctext = critiques.get(cid) or ""
+            for member_id in member_ids:
+                ctext = critiques.get(member_id) or ""
                 if isinstance(ctext, str) and ctext.strip():
-                    crit_blocks.append(f"Critique from {cid}:\n{ctext.strip()}")
+                    crit_blocks.append(f"Critique from {member_id}:\n{ctext.strip()}")
             if crit_blocks:
                 ctx_lines.append("\n\n".join(crit_blocks))
             prior = answers.get(mid) or ""
@@ -398,6 +405,7 @@ async def committee_ai_text(messages: List[Dict[str, Any]], *, trace_id: str, ro
         for mid in member_ids:
             ans = answers.get(mid) or ""
             if not isinstance(ans, str):
+                log.debug("[committee] synth.fallback: skipping non-str answer member=%s type=%s trace_id=%s", mid, type(ans).__name__, trace_id)
                 continue
             l = len(ans.strip())
             if l > best_len:
@@ -422,7 +430,14 @@ async def committee_ai_text(messages: List[Dict[str, Any]], *, trace_id: str, ro
         members_status = {mid: {"ok": bool(isinstance(mres, dict) and mres.get("ok", True)), "has_error": bool(isinstance(mres, dict) and mres.get("error")), "error": (mres.get("error") if isinstance(mres, dict) else None)} for mid, mres in member_results.items()}
         log.error(f"[committee] no_answer trace_id={trace_id} backend_errors={backend_errors} members={members_status}")
     result_payload: Dict[str, Any] = {"text": final_text, "members": member_summaries, "critiques": critique_summaries, "backend_errors": backend_errors, "qwen": (member_results.get("qwen") or {}), "glm": (member_results.get("glm") or {}), "deepseek": (member_results.get("deepseek") or {}), "synth": (dict(synth_env) if isinstance(synth_env, dict) else {"response": final_text}), "critique_envelopes": critique_results}
-    return {"schema_version": 1, "trace_id": trace_id, "ok": ok, "result": (result_payload if ok else None), "error": (None if ok else {"code": "committee_no_answer", "message": "Committee did not produce a non-empty answer", "backend_errors": backend_errors})}
+    return {
+        "schema_version": 1,
+        "trace_id": trace_id,
+        "conversation_id": "",
+        "ok": ok,
+        "result": (result_payload if ok else None),
+        "error": (None if ok else {"code": "committee_no_answer", "message": "Committee did not produce a non-empty answer", "backend_errors": backend_errors}),
+    }
 
 
 def _schema_to_template(expected: Any):
@@ -534,8 +549,9 @@ async def committee_jsonify(raw_text: str, expected_schema: Any, *, trace_id: st
             richness = len(voices) + len(instruments) + len(motifs)
             rich.append((idx, num_sections, richness))
         if rich:
-            rich_sorted = sorted(rich, key=lambda t: (-t[1], -t[2], t[0]))
-            best_idx = rich_sorted[0][0]
+            ranked = [(-triple[1], -triple[2], triple[0]) for triple in rich]
+            ranked.sort(reverse=True)
+            best_idx = ranked[0][2]
             reordered: List[Dict[str, Any]] = []
             reordered.append(parsed_candidates[best_idx])
             for i, cand in enumerate(parsed_candidates):

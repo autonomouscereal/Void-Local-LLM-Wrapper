@@ -222,19 +222,19 @@ def _rrf_fuse(results_by_engine: Dict[str, List[Dict[str, Any]]], weights: Dict[
     for engine, items in results_by_engine.items():
         w = float(weights.get(engine, 1.0))
         for rank, it in enumerate(items, start=1):
-            cid = it.get("id") or _canonical_id(it.get("url", ""))
-            if not cid:
+            item_id = it.get("id") or _canonical_id(it.get("url", ""))
+            if not item_id:
                 continue
-            scores[cid] = scores.get(cid, 0.0) + w * (1.0 / (k + rank))
-            if cid not in meta:
-                meta[cid] = {**it, "engine_hits": [engine]}
+            scores[item_id] = scores.get(item_id, 0.0) + w * (1.0 / (k + rank))
+            if item_id not in meta:
+                meta[item_id] = {**it, "engine_hits": [engine]}
             else:
-                meta[cid].setdefault("engine_hits", []).append(engine)
-    for cid in list(scores.keys()):
-        scores[cid] = _round6(scores[cid])
+                meta[item_id].setdefault("engine_hits", []).append(engine)
+    for item_id in list(scores.keys()):
+        scores[item_id] = _round6(scores[item_id])
     fused = []
-    for cid, s in scores.items():
-        row = dict(meta[cid])
+    for item_id, s in scores.items():
+        row = dict(meta[item_id])
         row["fused_score"] = s
         fused.append(row)
     # Tie-break with authority/recency if present; else by sha256/url asc
@@ -294,7 +294,7 @@ class Discoverer:
             items = []
             for rank, it in enumerate(sl, start=1):
                 items.append({
-                    "id": _canonical_id(it["url"]),
+                    "source_id": _canonical_id(it["url"]),
                     "url": it["url"],
                     "title": it.get("title") or it["url"],
                     "engine": eng,
@@ -567,27 +567,27 @@ class Analyzer:
                 has_num = bool(re.search(r"\d", s_compact))
                 keyish = any(k in s_compact.lower() for k in ("increase", "decrease", "causes", "improves", "worse", "better", "significant"))
                 if has_num or keyish:
-                    cid = next_claim_id(cidx)
+                    claim_id = next_claim_id(cidx)
                     stance = "neutral"
                     if any(w in s_compact.lower() for w in ("improves", "better", "increase")):
                         stance = "pro"
                     if any(w in s_compact.lower() for w in ("worse", "decline", "risk")):
                         stance = "con"
                     claim = {
-                        "claim_id": cid,
+                        "claim_id": claim_id,
                         "text": s_compact[:300],
                         "stance": stance,
-                        "evidence": [{"source_id": src.get("id"), "span": s_compact[:200]}],
+                        "evidence": [{"source_id": src.get("source_id") or src.get("id"), "span": s_compact[:200]}],
                         "labels": {},
                         "scores": {"strength": _round6(rnd.random()), "replication": _round6(rnd.random()), "recency": _round6(float(src.get("recency", 0.5))), "authority": _round6(float(src.get("authority", 0.5)))},
                     }
                     claims.append(claim)
                     if stance == "pro":
-                        pro.append(cid)
+                        pro.append(claim_id)
                     elif stance == "con":
-                        con.append(cid)
+                        con.append(claim_id)
                     else:
-                        neutral.append(cid)
+                        neutral.append(claim_id)
                     cidx += 1
                     if cidx > 30:
                         break
@@ -614,13 +614,13 @@ class Analyzer:
                     elif unit == "billion":
                         mul = 1_000_000_000
                     amt = int(n * mul)
-                money_map["funders"].append({"name": "unknown", "role": "grant", "amount_usd": amt, "when": "", "source_id": src.get("id")})
+                money_map["funders"].append({"name": "unknown", "role": "grant", "amount_usd": amt, "when": "", "source_id": src.get("source_id") or src.get("id")})
             if re.search(r"conflict of interest|COI|equity", text, re.I):
-                money_map["coi"].append({"actor": "unknown", "type": "equity", "entity": "unknown", "when": "", "source_id": src.get("id")})
+                money_map["coi"].append({"actor": "unknown", "type": "equity", "entity": "unknown", "when": "", "source_id": src.get("source_id") or src.get("id")})
             if re.search(r"lobbying|lobbyist", text, re.I):
                 m = money_regex.search(text)
                 amt = int(float(m.group(1).replace(",", ""))) if m else None
-                money_map["lobbying"].append({"entity": "unknown", "amount_usd": amt, "period": "", "source_id": src.get("id")})
+                money_map["lobbying"].append({"entity": "unknown", "amount_usd": amt, "period": "", "source_id": src.get("source_id") or src.get("id")})
 
         # Policy timeline dates
         date_regex = re.compile(r"\b(20\d{2}-\d{2}-\d{2})\b")
@@ -629,7 +629,7 @@ class Analyzer:
             if not text:
                 continue
             for m in date_regex.finditer(text):
-                policy_timeline.append({"when": m.group(1), "event": "policy event", "source_id": src.get("id")})
+                policy_timeline.append({"when": m.group(1), "event": "policy event", "source_id": src.get("source_id") or src.get("id")})
                 if len(policy_timeline) >= 10:
                     break
             if len(policy_timeline) >= 10:
@@ -866,7 +866,7 @@ async def research_collect(body: Dict[str, Any]):
         diversity = _diversity_score(owner, owner_counts)
         score = _composite_score(topical, authority, recency, diversity)
         row = {
-            "id": f"src_{len(fetched_rows)+1:03d}",
+            "source_id": f"src_{len(fetched_rows)+1:03d}",
             "url": url,
             "title": title,
             "kind": "primary" if "gov" in dom or "edu" in dom else "secondary",
@@ -967,10 +967,10 @@ async def research_report(body: Dict[str, Any]):
     lines = [f"# Research Report\n", f"Question: {question}\n", f"Goal: {goal}\n\n"]
     lines.append("## Claims\n")
     for cl in claim_ledger:
-        cid = cl.get("claim_id")
+        claim_id = cl.get("claim_id")
         text = cl.get("text")
         stance = cl.get("stance")
-        lines.append(f"- ({stance}) {cid}: {text}\n")
+        lines.append(f"- ({stance}) {claim_id}: {text}\n")
     lines.append("\n## Money Map\n")
     for k, arr in (money_map or {}).items():
         lines.append(f"- {k}: {len(arr or [])} items\n")

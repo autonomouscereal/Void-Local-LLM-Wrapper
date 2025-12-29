@@ -137,7 +137,18 @@ def resolve_media(url: str, wanted: str = "auto", ref_hint: str = "main") -> Dic
                 if f.get("vcodec", "none") == "none" and f.get("acodec") != "none" and f.get("url")
             ]
             if audio_only:
-                direct = sorted(audio_only, key=lambda f: f.get("abr", 0) or 0, reverse=True)[0]["url"]
+                best_format = None
+                best_abr = None
+                for format_entry in audio_only:
+                    if not isinstance(format_entry, dict):
+                        continue
+                    abr = format_entry.get("abr", 0) or 0
+                    abr_val = float(abr) if isinstance(abr, (int, float)) else 0.0
+                    if best_abr is None or abr_val > best_abr:
+                        best_abr = abr_val
+                        best_format = format_entry
+                if isinstance(best_format, dict):
+                    direct = best_format.get("url")
         out_wav = tempfile.NamedTemporaryFile(delete=False, suffix=".wav").name
         _extract_audio_with_ffmpeg(direct or url, out_wav)
         return {

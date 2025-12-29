@@ -37,7 +37,7 @@ def extract_edges(ledger_rows: List[Dict], query: str = "") -> List[Dict]:
                 "ccy": "USD",
                 "vehicle": veh or "unspecified",
                 "date": (dt.group(0) if dt else None),
-                "evidence": [r.get("id")],
+                "evidence": [r.get("ledger_id") or r.get("id")],
             })
     return edges
 

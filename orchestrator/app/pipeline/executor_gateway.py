@@ -4,7 +4,6 @@ from typing import Any, Dict, List, Optional
 
 import logging
 import httpx as _hx  # type: ignore
-import uuid as _uuid
 import traceback
 from ..json_parser import JSONParser
 
@@ -14,9 +13,8 @@ log = logging.getLogger(__name__)
 async def execute(
     tool_calls: List[Dict[str, Any]],
     trace_id: str,
+    conversation_id: str,
     executor_base_url: str,
-    *,
-    request_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     Execute tool calls via the external executor /execute endpoint.
@@ -25,33 +23,39 @@ async def execute(
     """
     steps: List[Dict[str, Any]] = []
     parser = JSONParser()
-    for call in (tool_calls or []):
-        call_dict = call if isinstance(call, dict) else {}
-        name_val = call_dict.get("name") if isinstance(call_dict.get("name"), str) else ""
-        step_id_val = call_dict.get("step_id") if isinstance(call_dict.get("step_id"), str) else None
-        raw_args = call_dict.get("arguments", call_dict.get("args"))
+    for tool_call in (tool_calls or []):
+        tool_call_dict = tool_call if isinstance(tool_call, dict) else {}
+        tool_name = tool_call_dict.get("tool_name")
+        if not isinstance(tool_name, str) or not tool_name.strip():
+            continue
+        tool_name = tool_name.strip()
+        step_id = tool_call_dict.get("step_id") if isinstance(tool_call_dict.get("step_id"), str) else None
+        raw_args = tool_call_dict.get("arguments", tool_call_dict.get("args"))
         # IMPORTANT: never silently drop tool arguments. The executor expects an
         # object for step.args, so when arguments isn't a dict we preserve it
         # under "_raw" rather than coercing to {}.
-        args_val: Dict[str, Any]
+        args: Dict[str, Any]
         if isinstance(raw_args, dict):
-            args_val = dict(raw_args)
+            args = dict(raw_args)
         elif isinstance(raw_args, str):
-            parsed = parser.parse(raw_args, {})
-            args_val = dict(parsed) if isinstance(parsed, dict) else {"_raw": raw_args}
+            parsed = parser.parse(source=raw_args, expected_structure={})
+            args = dict(parsed) if isinstance(parsed, dict) else {"_raw": raw_args}
         elif raw_args is None:
-            args_val = {}
+            args = {}
         else:
-            args_val = {"_raw": raw_args}
-        step_payload: Dict[str, Any] = {"tool": str(name_val or ""), "args": args_val}
+            args = {"_raw": raw_args}
+        # Always propagate trace_id and conversation_id into args
+        if trace_id and isinstance(args, dict) and not args.get("trace_id"):
+            args["trace_id"] = trace_id
+        if conversation_id and isinstance(args, dict) and not args.get("conversation_id"):
+            args["conversation_id"] = conversation_id
+        step_payload: Dict[str, Any] = {"tool": tool_name, "args": args}
         # Preserve planner-provided step_id so executor-produced keys match the plan.
-        if isinstance(step_id_val, str) and step_id_val.strip():
-            step_payload["step_id"] = step_id_val.strip()
+        if isinstance(step_id, str) and step_id:
+            step_payload["step_id"] = step_id
         steps.append(step_payload)
 
-    # request_id (rid) and trace_id are distinct identifiers; never reuse one as the other.
-    rid = str(request_id or _uuid.uuid4().hex)
-    payload = {"schema_version": 1, "request_id": rid, "trace_id": trace_id, "steps": steps}
+    payload = {"schema_version": 1, "trace_id": trace_id, "conversation_id": conversation_id, "steps": steps}
     try:
         # Never log full args payloads (may contain long prompts/base64). Log keys + types only.
         steps_preview = []
@@ -64,14 +68,20 @@ async def execute(
                     "args_types": {str(k): type(v).__name__ for k, v in list(a.items())[:32]},
                 }
             )
-        log.info("executor_gateway.execute start trace_id=%s request_id=%s steps=%s preview=%s", trace_id, rid, len(steps), steps_preview)
+        log.info(
+            "executor_gateway.execute start trace_id=%s conversation_id=%s steps=%d preview=%s",
+            trace_id,
+            conversation_id,
+            int(len(steps)),
+            steps_preview,
+        )
     except Exception:
         log.debug("executor_gateway.execute: failed to emit start log preview", exc_info=True)
     base = (executor_base_url or "").rstrip("/")
     if not base:
         return [
             {
-                "name": "executor",
+                "tool_name": "executor",
                 "error": {
                     "code": "executor_base_url_missing",
                     "message": "executor_base_url is not configured",
@@ -83,18 +93,18 @@ async def execute(
     # be represented as per-step error objects so the caller can continue the run.
     try:
         async with _hx.AsyncClient(timeout=None, trust_env=False) as client:
-            log.info("executor_gateway.execute POST %s/execute trace_id=%s request_id=%s", base, trace_id, rid)
+            log.info("executor_gateway.execute POST %s/execute trace_id=%s conversation_id=%s", base, trace_id, conversation_id)
             r = await client.post(base + "/execute", json=payload)
             raw_body = r.text or ""
     except _hx.TimeoutException as ex:  # type: ignore[attr-defined]
         return [
             {
-                "name": "executor",
+                "tool_name": "executor",
                 "error": {
                     "code": "executor_timeout",
                     "message": str(ex),
                     "status": 0,
-                    "stack": "".join(traceback.format_exc()),
+                    "stack": traceback.format_exc(),
                     "executor_base_url": base,
                 },
             }
@@ -102,12 +112,12 @@ async def execute(
     except _hx.RequestError as ex:  # type: ignore[attr-defined]
         return [
             {
-                "name": "executor",
+                "tool_name": "executor",
                 "error": {
                     "code": "executor_request_error",
                     "message": str(ex),
                     "status": 0,
-                    "stack": "".join(traceback.format_exc()),
+                    "stack": traceback.format_exc(),
                     "executor_base_url": base,
                 },
             }
@@ -115,12 +125,12 @@ async def execute(
     except Exception as ex:
         return [
             {
-                "name": "executor",
+                "tool_name": "executor",
                 "error": {
                     "code": "executor_exception",
                     "message": str(ex),
                     "status": 0,
-                    "stack": "".join(traceback.format_exc()),
+                    "stack": traceback.format_exc(),
                     "executor_base_url": base,
                 },
             }
@@ -134,7 +144,8 @@ async def execute(
     try:
         schema = {"ok": bool, "result": dict, "error": dict}
         env = parser.parse(raw_body or "{}", schema)
-    except Exception:
+    except Exception as ex:
+        log.warning("executor_gateway.execute: JSONParser.parse failed trace_id=%s conversation_id=%s ex=%s raw_body_prefix=%s", trace_id, conversation_id, ex, (raw_body or "")[:200], exc_info=True)
         env = {
             "ok": False,
             "error": {
@@ -161,9 +172,8 @@ async def execute(
         produced_obj = (env.get("result") or {}).get("produced") if isinstance(env, dict) else None
         produced_keys = sorted(list(produced_obj.keys()))[:32] if isinstance(produced_obj, dict) else []
         log.info(
-            "executor_gateway.execute response trace_id=%s request_id=%s http_status=%s ok=%s produced_keys=%s",
+            "executor_gateway.execute response trace_id=%s http_status=%s ok=%s produced_keys=%s",
             trace_id,
-            rid,
             int(r.status_code),
             ok_flag,
             produced_keys,
@@ -183,29 +193,33 @@ async def execute(
         # Instead, build a step-id -> input-step map using the implicit "s{i}"
         # convention used by the executor for list-ordered steps.
         input_step_by_step_id: Dict[str, Dict[str, Any]] = {}
-        for i, st in enumerate(steps):
-            if not isinstance(st, dict):
+        for step_index, input_step in enumerate(steps):
+            if not isinstance(input_step, dict):
                 continue
             # When a step_id is supplied, the executor can use it as the produced key.
-            key = st.get("step_id") if isinstance(st.get("step_id"), str) else None
+            key = input_step.get("step_id") if isinstance(input_step.get("step_id"), str) else None
             if not key:
-                key = f"s{i + 1}"
-            input_step_by_step_id[str(key)] = st
-        for step_id, step in produced.items():
-            if not isinstance(step, dict):
+                key = f"s{step_index + 1}"
+            input_step_by_step_id[str(key)] = input_step
+        for produced_step_id, produced_step in produced.items():
+            if not isinstance(produced_step, dict):
+                log.warning("executor_gateway.execute: skipping non-dict produced_step step_id=%s type=%s trace_id=%s", produced_step_id, type(produced_step).__name__, trace_id)
                 continue
-            step_id_str = str(step_id)
+            step_id_str = str(produced_step_id)
             input_step = input_step_by_step_id.get(step_id_str, {})
             args_out = input_step.get("args") if isinstance(input_step.get("args"), dict) else {}
-            input_tool = input_step.get("tool") if isinstance(input_step.get("tool"), str) else None
-            tool_name = step.get("name") if isinstance(step.get("name"), str) else (input_tool or "tool")
-            res = step.get("result") if isinstance(step.get("result"), dict) else {}
+            tool_name = produced_step.get("tool_name")
+            if not isinstance(tool_name, str) or not tool_name.strip():
+                log.warning("executor_gateway.execute: skipping produced_step with missing/invalid tool_name step_id=%s trace_id=%s", step_id_str, trace_id)
+                continue
+            tool_name = tool_name.strip()
+            tool_payload = produced_step.get("result") if isinstance(produced_step.get("result"), dict) else {}
 
             # Preserve all executor-provided fields (e.g. artifacts/meta/timing),
             # but ensure the canonical tool-result keys are present/normalized.
-            out: Dict[str, Any] = dict(step)
-            out["name"] = tool_name
-            out["result"] = res
+            out: Dict[str, Any] = dict(produced_step)
+            out["tool_name"] = tool_name
+            out["result"] = tool_payload
             out["args"] = args_out
             out["step_id"] = step_id_str
             results.append(out)
@@ -216,7 +230,8 @@ async def execute(
     # can see exactly what the executor returned.
     return [
         {
-            "name": "executor",
+            "tool_name": "executor",
+            "tool_call_name": "executor",  # legacy compatibility
             "error": {
                 "code": err.get("code") or "executor_error",
                 "message": err.get("message") or "executor_error",

@@ -21,7 +21,8 @@ def normalize_sources(sources: List[Dict]) -> List[Dict]:
         ex = distilled_excerpt(s.get("text", ""))
         hid = _hash_excerpt(s.get("url", ""), ex)
         rows.append({
-            "id": hid,
+            "ledger_id": hid,
+            "id": hid,  # Keep for backward compatibility
             "url": s.get("url", ""),
             "title": (s.get("title", "") or "")[:220],
             "excerpt": ex,

@@ -282,7 +282,7 @@ TIERS = [
 
 
 def _compress_text(tier: str, c: Dict[str, Any]) -> str:
-    cid = str(_safe_get(c, "id", ""))
+    chunk_id = str(_safe_get(c, "id", ""))
     title = str(_safe_get(c, "title", ""))
     url = str(_safe_get(c, "url", ""))
     published_at = str(_safe_get(c, "published_at", ""))
@@ -305,7 +305,7 @@ def _compress_text(tier: str, c: Dict[str, Any]) -> str:
         # metadata only
         body = f"title: {title}\nurl: {url}\ndate: {published_at}"
     # Append inline citation
-    return f"{body} [#{cid}]"
+    return f"{body} [#{chunk_id}]"
 
 
 class BudgetAllocator:
@@ -343,51 +343,51 @@ class BudgetAllocator:
             order_ids = [c["id"] for c, _ in chosen[::-1]]  # degrade from least important backward
             levels = ["bullets", "keylines", "metadata"]
             for level in levels:
-                for cid in order_ids:
+                for chunk_id in order_ids:
                     if est <= self.total_budget:
                         break
-                    current = assign[cid]
+                    current = assign[chunk_id]
                     # Only degrade if current is higher than target level
                     idx_cur = [t for t, _ in TIERS].index(current)
                     idx_new = [t for t, _ in TIERS].index(level)
                     if idx_new <= idx_cur:
-                        assign[cid] = level
-                        txt = _compress_text(level, next(c for c, _ in chosen if c["id"] == cid))
-                        old_txt = texts[cid]
+                        assign[chunk_id] = level
+                        txt = _compress_text(level, next(c for c, _ in chosen if c["id"] == chunk_id))
+                        old_txt = texts[chunk_id]
                         # update estimate
                         est -= TokenEstimator.estimate_tokens_from_text(old_txt)
                         est += TokenEstimator.estimate_tokens_from_text(txt)
-                        texts[cid] = txt
+                        texts[chunk_id] = txt
                 if est <= self.total_budget:
                     break
             # Last resort demotions by one step from the tail
             if est > self.total_budget:
                 seq = [c["id"] for c, _ in chosen[::-1]]
                 order = [t for t, _ in TIERS]
-                for cid in seq:
-                    cur = assign[cid]
+                for chunk_id in seq:
+                    cur = assign[chunk_id]
                     idx = order.index(cur)
                     if idx < len(order) - 1:
                         new_level = order[idx + 1]
-                        assign[cid] = new_level
-                        txt = _compress_text(new_level, next(c for c, _ in chosen if c["id"] == cid))
-                        old_txt = texts[cid]
+                        assign[chunk_id] = new_level
+                        txt = _compress_text(new_level, next(c for c, _ in chosen if c["id"] == chunk_id))
+                        old_txt = texts[chunk_id]
                         est -= TokenEstimator.estimate_tokens_from_text(old_txt)
                         est += TokenEstimator.estimate_tokens_from_text(txt)
-                        texts[cid] = txt
+                        texts[chunk_id] = txt
                     if est <= self.total_budget:
                         break
 
         # If budget allows, upgrade top few items to full
         if est + 400 < self.total_budget:
             for c, _ in chosen[: min(3, len(chosen))]:
-                cid = c["id"]
-                if assign.get(cid) == "summary":
+                chunk_id = c["id"]
+                if assign.get(chunk_id) == "summary":
                     txt_new = _compress_text("full", c)
-                    est_delta = TokenEstimator.estimate_tokens_from_text(txt_new) - TokenEstimator.estimate_tokens_from_text(texts[cid])
+                    est_delta = TokenEstimator.estimate_tokens_from_text(txt_new) - TokenEstimator.estimate_tokens_from_text(texts[chunk_id])
                     if est + est_delta + 16 <= self.total_budget:
-                        assign[cid] = "full"
-                        texts[cid] = txt_new
+                        assign[chunk_id] = "full"
+                        texts[chunk_id] = txt_new
                         est += est_delta
 
         # Materialize evidence index
@@ -407,16 +407,16 @@ class BudgetAllocator:
             })
 
         # Build PACK (QUERY/GOAL included in sections later)
-        pack_chunks = [texts[cid] for cid in texts]
+        pack_chunks = [texts[chunk_id] for chunk_id in texts]
         pack_text = "\n\n".join(pack_chunks)
         final_est = TokenEstimator.estimate_tokens_from_text(pack_text) + self.reserve
         if final_est > guard:
             # Hard guard: trim last chunks until under guard
             ids_order = list(texts.keys())[::-1]
-            for cid in ids_order:
+            for chunk_id in ids_order:
                 if final_est <= self.total_budget:
                     break
-                old = texts.pop(cid, "")
+                old = texts.pop(chunk_id, "")
                 final_est -= TokenEstimator.estimate_tokens_from_text(old)
             pack_text = "\n\n".join([texts[k] for k in texts])
         audit = {
@@ -450,18 +450,18 @@ class OutputPlanner:
             per = max(1, int(round(body / body_parts)))
             children = []
             for i in range(body_parts):
-                children.append({"id": f"S2.{i+1}", "title": f"Section {i+1}", "est_tokens": per})
+                children.append({"section_id": f"S2.{i+1}", "title": f"Section {i+1}", "est_tokens": per})
             outline = [
-                {"id": "S1", "title": "Introduction", "est_tokens": intro},
-                {"id": "S2", "title": "Core Sections", "est_tokens": body, "children": children},
-                {"id": "S3", "title": "Conclusion", "est_tokens": concl},
+                {"section_id": "S1", "title": "Introduction", "est_tokens": intro},
+                {"section_id": "S2", "title": "Core Sections", "est_tokens": body, "children": children},
+                {"section_id": "S3", "title": "Conclusion", "est_tokens": concl},
             ]
             if len(outline) < min_sections:
                 # pad with boilerplate sections deterministically
                 for i in range(len(outline) + 1, min_sections + 1):
-                    outline.insert(-1, {"id": f"S{i}", "title": f"Section {i}", "est_tokens": seg_budget})
+                    outline.insert(-1, {"section_id": f"S{i}", "title": f"Section {i}", "est_tokens": seg_budget})
         else:
-            outline = [{"id": "S1", "title": "Body", "est_tokens": seg_budget}]
+            outline = [{"section_id": "S1", "title": "Body", "est_tokens": seg_budget}]
 
         plan_id = f"{_now_iso()}-io-{seed}"
         return {
@@ -469,17 +469,17 @@ class OutputPlanner:
             "seed": seed,
             "outline": outline,
             "segment_budget": seg_budget,
-            "cursor": {"section_id": outline[0]["id"], "offset": 0, "segment_index": 0},
+            "cursor": {"section_id": outline[0].get("section_id") or outline[0].get("id"), "offset": 0, "segment_index": 0},
         }
 
 
 class OutputRenderer:
     @staticmethod
-    def _section_by_id(outline: List[Dict[str, Any]], sid: str) -> Optional[Dict[str, Any]]:
+    def _section_by_id(outline: List[Dict[str, Any]], section_id: str) -> Optional[Dict[str, Any]]:
         queue = list(outline)
         while queue:
             node = queue.pop(0)
-            if node.get("id") == sid:
+            if node.get("section_id") or node.get("id") == section_id:
                 return node
             for ch in node.get("children", []) or []:
                 queue.append(ch)
@@ -487,10 +487,10 @@ class OutputRenderer:
 
     @staticmethod
     def render(seed: int, plan_id: str, segment_budget: int, cursor: Dict[str, Any], style: str, pack: str, goal: str, outline: List[Dict[str, Any]]) -> Dict[str, Any]:
-        sid = str(_safe_get(cursor, "section_id", "S1"))
+        section_id = str(_safe_get(cursor, "section_id", "S1"))
         offset = _to_int(_safe_get(cursor, "offset", 0), 0)
         seg_idx = _to_int(_safe_get(cursor, "segment_index", 0), 0)
-        node = OutputRenderer._section_by_id(outline, sid) or {"title": "Section", "est_tokens": segment_budget}
+        node = OutputRenderer._section_by_id(outline, section_id) or {"title": "Section", "est_tokens": segment_budget}
 
         # Deterministic content: header + a slice of the context pack
         header = ""
@@ -513,7 +513,7 @@ class OutputRenderer:
             piece = piece[:-16]
             est_tokens = TokenEstimator.estimate_tokens_from_text(piece)
 
-        next_cursor = {"section_id": sid, "offset": offset + est_tokens, "segment_index": seg_idx + 1, "done": False}
+        next_cursor = {"section_id": section_id, "offset": offset + est_tokens, "segment_index": seg_idx + 1, "done": False}
 
         # Mark section done if we've consumed estimated section tokens worth of content
         est_total = _to_int(_safe_get(node, "est_tokens", segment_budget), int(segment_budget))
@@ -523,11 +523,11 @@ class OutputRenderer:
             q = list(outline)
             while q:
                 n = q.pop(0)
-                order.append(n.get("id"))
+                order.append(n.get("section_id") or n.get("id"))
                 for ch in n.get("children", []) or []:
                     q.append(ch)
             try:
-                idx = order.index(sid)
+                idx = order.index(section_id)
                 nxt = order[idx + 1] if idx + 1 < len(order) else None
             except ValueError:
                 nxt = None
@@ -622,13 +622,13 @@ async def context_pack(body: Dict[str, Any]):
 
     # Independence/diversity index (owner diversity): unique owners / selected
     selected_ids = [e.get("id") for e in evidence]
-    selected: List[Dict[str, Any]] = [next((c for c in prefiltered if c.get("id") == sid), {}) for sid in selected_ids]
+    selected: List[Dict[str, Any]] = [next((c for c in prefiltered if c.get("id") == chunk_id), {}) for chunk_id in selected_ids]
     owners = [(_safe_get(_safe_get(c, "source", {}) or {}, "owner") or "") for c in selected]
     uniq_owners = len(set(owners)) if owners else 0
     independence_index = 0.0 if not selected else _round6(_clamp01(uniq_owners / max(1.0, len(selected))))
 
     # Dup rate among selected
-    sel_hashes = [str(_safe_get(next((c for c in prefiltered if c.get("id") == sid), {}), "hash", "") or "") for sid in selected_ids]
+    sel_hashes = [str(_safe_get(next((c for c in prefiltered if c.get("id") == chunk_id), {}), "hash", "") or "") for chunk_id in selected_ids]
     dup_rate = 0.0
     if sel_hashes:
         total_pairs = len(sel_hashes) * (len(sel_hashes) - 1) / 2.0
@@ -742,7 +742,7 @@ async def output_render(body: Dict[str, Any]):
     outline = _safe_get(body, "outline", []) or _safe_get(body, "_outline", []) or []
     # If outline not provided, synthesize a trivial one matching the plan_id semantics
     if not outline:
-        outline = [{"id": cursor.get("section_id", "S1"), "title": "Section", "est_tokens": segment_budget}]
+        outline = [{"section_id": cursor.get("section_id", "S1"), "title": "Section", "est_tokens": segment_budget}]
 
     result = OutputRenderer.render(seed, plan_id, segment_budget, cursor, style, pack, goal, outline)
     return result

@@ -7,7 +7,7 @@ This replaces the older `app/context/index.py` implementation by moving the same
 capability under `app/artifacts/` (the correct domain for tracing/distillation).
 
 Responsibilities:
-- In-process recent artifact cache per conversation (`cid`)
+- In-process recent artifact cache per conversation (`conversation_id`)
 - Append-only persistent global index (sharded JSONL + index.json)
 - Heuristic resolution for "last image", color mentions, stems, etc.
 - Optional prompt/text embeddings for retrieval (SentenceTransformers)
@@ -36,7 +36,7 @@ try:
 except Exception:  # pragma: no cover
     SentenceTransformer = None  # type: ignore
 
-# In-memory per-cid cache (fast-path for "last"/"previous" in an active run).
+# In-memory per-conversation_id cache (fast-path for "last"/"previous" in an active run).
 _CTX: Dict[str, List[Dict[str, Any]]] = {}
 
 # Persistent global index (single system: lives under uploads/artifacts/).
@@ -141,7 +141,7 @@ def _ensure_global_shard() -> Optional[dict]:
 
 
 def add_artifact(
-    cid: str,
+    conversation_id: str,
     kind: str,
     path: str,
     url: Optional[str] = None,
@@ -150,18 +150,40 @@ def add_artifact(
     meta: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
-    Record an artifact into the in-memory cid cache and persistent global index.
+    Record an artifact into the in-memory conversation_id cache and persistent global index.
     """
-    if not isinstance(cid, str) or not cid:
-        _LOG.warning("artifacts.index.add_artifact.invalid_cid cid=%r kind=%r path=%r", cid, kind, path)
+    if not isinstance(conversation_id, str) or not conversation_id:
+        _LOG.warning("artifacts.index.add_artifact.invalid_conversation_id conversation_id=%r kind=%r path=%r", conversation_id, kind, path)
         return
+    # Normalize canonical creation timestamps.
+    now_ms = int(time.time() * 1000)
+    meta_obj: Dict[str, Any] = dict(meta or {})
+    created_ms = meta_obj.get("created_ms")
+    if not isinstance(created_ms, int):
+        created_at = meta_obj.get("created_at")
+        if isinstance(created_at, int) and created_at > 0:
+            created_ms = int(created_at) * 1000
+        else:
+            created_ms = int(now_ms)
+    meta_obj.setdefault("created_ms", int(created_ms))
+    meta_obj.setdefault("created_at", int(int(created_ms) // 1000))
+
+    base_tags: List[str] = list(tags or [])
+    # Add stable, searchable time tags so callers can always find newest artifacts.
+    created_tag = f"created_ms:{int(created_ms)}"
+    created_at_tag = f"created_at:{int(int(created_ms)//1000)}"
+    if created_tag not in base_tags:
+        base_tags.append(created_tag)
+    if created_at_tag not in base_tags:
+        base_tags.append(created_at_tag)
+
     rec: Dict[str, Any] = {
         "kind": kind,
         "path": path,
         "url": url,
         "parent": parent,
-        "tags": list(tags or []),
-        "meta": dict(meta or {}),
+        "tags": base_tags,
+        "meta": meta_obj,
     }
     # Optional text embedding from prompt/text.
     try:
@@ -170,7 +192,7 @@ def add_artifact(
         if tvec:
             rec.setdefault("emb", {})["text"] = tvec
     except Exception as ex:
-        _LOG.warning("artifacts.index.add_artifact.embed_error", extra={"cid": cid, "kind": kind, "path": path}, exc_info=ex)
+        _LOG.warning("artifacts.index.add_artifact.embed_error", extra={"conversation_id": conversation_id, "kind": kind, "path": path}, exc_info=ex)
     # Image color heuristic
     try:
         if isinstance(kind, str) and kind.startswith("image") and isinstance(path, str) and os.path.exists(path):
@@ -178,9 +200,9 @@ def add_artifact(
             if dc:
                 rec["dominant_rgb"] = dc
     except Exception as ex:
-        _LOG.warning("artifacts.index.add_artifact.color_error", extra={"cid": cid, "kind": kind, "path": path}, exc_info=ex)
+        _LOG.warning("artifacts.index.add_artifact.color_error", extra={"conversation_id": conversation_id, "kind": kind, "path": path}, exc_info=ex)
 
-    _CTX.setdefault(cid, []).append(rec)
+    _CTX.setdefault(conversation_id, []).append(rec)
 
     # Persist
     sh = _ensure_global_shard()
@@ -188,7 +210,9 @@ def add_artifact(
         return
     row = {
         "ts": int(time.time()),
-        "cid": cid,
+        "created_ms": int(created_ms),
+        "created_at": int(int(created_ms) // 1000),
+        "conversation_id": conversation_id,
         "kind": kind,
         "path": path,
         "url": url,
@@ -203,18 +227,18 @@ def add_artifact(
     except Exception as ex:
         _LOG.error(
             "artifacts.index.append_failed",
-            extra={"cid": cid, "kind": kind, "path": path, "root": _GLOBAL_ROOT, "name": _GLOBAL_NAME},
+            extra={"conversation_id": conversation_id, "kind": kind, "path": path, "root": _GLOBAL_ROOT, "name": _GLOBAL_NAME},
             exc_info=ex,
         )
 
 
-def resolve_reference(cid: str, text: str, kind_hint: Optional[str] = None) -> Optional[Dict[str, Any]]:
+def resolve_reference(conversation_id: str, text: str, kind_hint: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """
-    Resolve a reference within a cid session (fast in-memory).
+    Resolve a reference within a conversation_id session (fast in-memory).
     """
-    if not isinstance(cid, str) or not cid:
+    if not isinstance(conversation_id, str) or not conversation_id:
         return None
-    items = list(_CTX.get(cid) or [])
+    items = list(_CTX.get(conversation_id) or [])
     if not items:
         return None
     if kind_hint:
@@ -231,7 +255,7 @@ def resolve_reference(cid: str, text: str, kind_hint: Optional[str] = None) -> O
                 if dc:
                     scored.append((it, _color_distance(tuple(dc), rgb)))
             if scored:
-                scored.sort(key=lambda x: x[1])
+                scored = sorted(scored, key=lambda x: x[1])
                 return scored[0][0]
             break
     # Stems mention for music/audio
@@ -254,8 +278,8 @@ def resolve_reference(cid: str, text: str, kind_hint: Optional[str] = None) -> O
     return items[-1]
 
 
-def list_recent(cid: str, limit: int = 10, kind_hint: Optional[str] = None) -> List[Dict[str, Any]]:
-    items = list(_CTX.get(cid) or [])
+def list_recent(conversation_id: str, limit: int = 10, kind_hint: Optional[str] = None) -> List[Dict[str, Any]]:
+    items = list(_CTX.get(conversation_id) or [])
     if kind_hint:
         items = [it for it in items if str(it.get("kind", "")).startswith(kind_hint)]
     return items[-limit:]

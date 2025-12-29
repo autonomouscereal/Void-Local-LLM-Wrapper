@@ -6,7 +6,7 @@ from .fsview import list_files, read_text
 
 def recent_and_neighbors(root: str, n: int = 50, neighbor_radius: int = 2):
     files = list_files(root)
-    files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    files.sort(key=os.path.getmtime, reverse=True)
     recent = files[:n]
     neighbors = set()
     for p in recent:

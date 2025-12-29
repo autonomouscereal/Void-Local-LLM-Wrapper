@@ -2,15 +2,17 @@ from __future__ import annotations
 
 import os
 import json
+import time
 from typing import Any, Dict
 
 from .indexer import build_index
 from .prompts import build_architect_input, build_implementer_input, build_reviewer_input
 from .diffutil import apply_patch_in_memory
 from .fsview import read_text
-from .envelope import make_artifact, make_envelope
 from ..committee_client import committee_ai_text, committee_jsonify
 from ..json_parser import JSONParser
+from void_artifacts import generate_artifact_id, build_artifact
+from void_envelopes import normalize_envelope, bump_envelope, assert_envelope
 
 
 ARCH_SCHEMA: Dict[str, Any] = {
@@ -106,14 +108,70 @@ async def run_super_loop(task: str, repo_root: str, *, trace_id: str, step_token
     verify = apply_patch_in_memory(repo_root, final_patch)
     if not verify.ok:
         decisions.append(f"verify failed: {verify.errmsg}")
-    # Build envelope + artifacts
-    arts = [
-        make_artifact("plan.json", "json", "architect plan"),
-        make_artifact("patch.diff", "code", "unified diff", bytes_count=len((final_patch or "").encode())),
+    # Generate unique artifact_ids BEFORE building artifacts
+    plan_artifact_id = generate_artifact_id(trace_id=trace_id, tool_name="code.super_loop.plan", suffix_data=len(json.dumps(plan, ensure_ascii=False)))
+    patch_artifact_id = generate_artifact_id(trace_id=trace_id, tool_name="code.super_loop.patch", suffix_data=len(final_patch or ""))
+    # Build canonical assistant envelope (no local envelope helpers).
+    plan_json_str = json.dumps(plan, ensure_ascii=False)
+    artifacts_list = [
+        build_artifact(
+            artifact_id=plan_artifact_id,
+            kind="json",
+            path="",  # In-memory artifact, no file path
+            trace_id=trace_id,
+            conversation_id="",
+            tool_name="code.super_loop",
+            summary="architect plan",
+            bytes=int(len(plan_json_str.encode("utf-8"))),
+            tags=[],
+        ),
+        build_artifact(
+            artifact_id=patch_artifact_id,
+            kind="code",
+            path="",  # In-memory artifact, no file path
+            trace_id=trace_id,
+            conversation_id="",
+            tool_name="code.super_loop",
+            summary="unified diff",
+            bytes=int(len((final_patch or "").encode("utf-8"))),
+            tags=[],
+        ),
     ]
-    tool_calls = [{"tool": "code.super_loop", "args": {"task": task, "repo_root": repo_root}, "status": "done", "result_ref": "patch.diff"}]
-    env = make_envelope("committee", final_patch, arts, tool_calls, decisions)
-    env["artifacts_data"] = {"patch.diff": final_patch or "", "plan.json": json.dumps(plan, ensure_ascii=False)}
+    tool_calls = [
+        {
+            "tool": "code.super_loop",
+            "tool_name": "code.super_loop",
+            "args": {"task": task, "repo_root": repo_root, "trace_id": trace_id},
+            "arguments": {"task": task, "repo_root": repo_root, "trace_id": trace_id},
+            "status": "done",
+            "artifact_id": patch_artifact_id,
+        }
+    ]
+    env = {
+        "meta": {
+            "schema_version": 1,
+            "model": "committee",
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "conversation_id": "",
+            "trace_id": trace_id,
+            "tool": "code.super_loop",
+        },
+        "reasoning": {"goal": "code change", "constraints": ["diff-only", "json-only"], "decisions": (decisions or [])[-20:]},
+        "evidence": [],
+        "message": {"role": "assistant", "type": "tool", "content": final_patch or ""},
+        "tool_calls": tool_calls,
+        "artifacts": artifacts_list,
+        "telemetry": {
+            "window": {"input_bytes": int(len((final_patch or "").encode("utf-8"))), "output_target_tokens": 0},
+            "compression_passes": [],
+            "notes": [],
+        },
+    }
+    env = normalize_envelope(env)
+    env = bump_envelope(env)
+    assert_envelope(env)
+    # Store artifact data by artifact_id (not hardcoded filenames)
+    env["artifacts_data"] = {patch_artifact_id: final_patch or "", plan_artifact_id: plan_json_str}
     return env
 
 

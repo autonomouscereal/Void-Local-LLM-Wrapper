@@ -64,7 +64,7 @@ def get_builtin_tools_schema() -> List[Dict[str, Any]]:
                         "scale": {"oneOf": [{"type": "integer"}, {"type": "number"}]},
                         "quality_profile": {"type": "string"},
                         "locks": {"type": "object"},
-                        "cid": {"type": "string"},
+                        "conversation_id": {"type": "string"},
                         "trace_id": {"type": "string"},
                         "film_id": {"type": "string"},
                         "duration_seconds": {"oneOf": [{"type": "integer"}, {"type": "number"}]},
@@ -380,7 +380,7 @@ def get_builtin_tools_schema() -> List[Dict[str, Any]]:
         {"type": "function", "function": {"name": "image.edit", "parameters": {"type": "object", "properties": {"image_ref": {"type": "string"}, "mask_ref": {"type": "string"}, "prompt": {"type": "string"}, "negative": {"type": "string"}, "size": {"type": "string"}, "seed": {"type": "integer"}, "refs": {"type": "object"}}, "required": ["image_ref", "prompt"]}}},
         {"type": "function", "function": {"name": "image.upscale", "parameters": {"type": "object", "properties": {"image_ref": {"type": "string"}, "scale": {"type": "integer"}, "denoise": {"type": "number"}, "seed": {"type": "integer"}}, "required": ["image_ref"]}}},
         {"type": "function", "function": {"name": "image.super_gen", "parameters": {"type": "object", "properties": {"prompt": {"type": "string"}, "size": {"type": "string"}, "refs": {"type": "object"}, "seed": {"type": "integer"}}, "required": ["prompt"]}}},
-        {"type": "function", "function": {"name": "music.variation", "parameters": {"type": "object", "properties": {"variation_of": {"type": "string"}, "n": {"type": "integer"}, "intensity": {"type": "number"}, "music_id": {"type": "string"}, "music_refs": {"type": "object"}, "seed": {"type": "integer"}}, "required": ["variation_of"]}}},
+        {"type": "function", "function": {"name": "music.variation", "parameters": {"type": "object", "properties": {"variation_of": {"type": "string"}, "n": {"type": "integer"}, "intensity": {"type": "number"}, "artifact_id": {"type": "string"}, "music_refs": {"type": "object"}, "seed": {"type": "integer"}}, "required": ["variation_of"]}}},
         {"type": "function", "function": {"name": "music.mixdown", "parameters": {"type": "object", "properties": {"stems": {"type": "array", "items": {"type": "object"}}, "sample_rate": {"type": "integer"}, "channels": {"type": "integer"}, "seed": {"type": "integer"}}, "required": ["stems"]}}},
         {
             "type": "function",
@@ -425,8 +425,8 @@ def get_builtin_tools_schema() -> List[Dict[str, Any]]:
         },
         {"type": "function", "function": {"name": "video.interpolate", "parameters": {"type": "object", "properties": {"src": {"type": "string"}, "target_fps": {"type": "integer"}}, "required": ["src"]}}},
         {"type": "function", "function": {"name": "video.flow.derive", "parameters": {"type": "object", "properties": {"src": {"type": "string"}, "frame_a": {"type": "string"}, "frame_b": {"type": "string"}, "step": {"type": "integer"}}, "required": []}}},
-        {"type": "function", "function": {"name": "video.hv.t2v", "parameters": {"type": "object", "properties": {"prompt": {"type": "string"}, "negative": {"type": "string"}, "width": {"type": "integer"}, "height": {"type": "integer"}, "fps": {"type": "integer"}, "seconds": {"type": "integer"}, "seed": {"type": "integer"}, "locks": {"type": "object"}, "post": {"type": "object"}, "latent_reinit_every": {"type": "integer"}, "cid": {"type": "string"}, "trace_id": {"type": "string"}}, "required": ["prompt"]}}},
-        {"type": "function", "function": {"name": "video.hv.i2v", "parameters": {"type": "object", "properties": {"init_image": {"type": "string"}, "prompt": {"type": "string"}, "negative": {"type": "string"}, "width": {"type": "integer"}, "height": {"type": "integer"}, "fps": {"type": "integer"}, "seconds": {"type": "integer"}, "seed": {"type": "integer"}, "locks": {"type": "object"}, "post": {"type": "object"}, "latent_reinit_every": {"type": "integer"}, "cid": {"type": "string"}, "trace_id": {"type": "string"}}, "required": ["prompt"]}}},
+        {"type": "function", "function": {"name": "video.hv.t2v", "parameters": {"type": "object", "properties": {"prompt": {"type": "string"}, "negative": {"type": "string"}, "width": {"type": "integer"}, "height": {"type": "integer"}, "fps": {"type": "integer"}, "seconds": {"type": "integer"}, "seed": {"type": "integer"}, "locks": {"type": "object"}, "post": {"type": "object"}, "latent_reinit_every": {"type": "integer"}, "conversation_id": {"type": "string"}, "trace_id": {"type": "string"}}, "required": ["prompt"]}}},
+        {"type": "function", "function": {"name": "video.hv.i2v", "parameters": {"type": "object", "properties": {"init_image": {"type": "string"}, "prompt": {"type": "string"}, "negative": {"type": "string"}, "width": {"type": "integer"}, "height": {"type": "integer"}, "fps": {"type": "integer"}, "seconds": {"type": "integer"}, "seed": {"type": "integer"}, "locks": {"type": "object"}, "post": {"type": "object"}, "latent_reinit_every": {"type": "integer"}, "conversation_id": {"type": "string"}, "trace_id": {"type": "string"}}, "required": ["prompt"]}}},
         {"type": "function", "function": {"name": "video.upscale", "parameters": {"type": "object", "properties": {"src": {"type": "string"}, "scale": {"type": "integer"}, "width": {"type": "integer"}, "height": {"type": "integer"}}, "required": ["src"]}}},
         {"type": "function", "function": {"name": "video.text.overlay", "parameters": {"type": "object", "properties": {"src": {"type": "string"}, "texts": {"type": "array", "items": {"type": "object"}}}, "required": ["src", "texts"]}}},
         {"type": "function", "function": {"name": "image.cleanup", "parameters": {"type": "object", "properties": {"src": {"type": "string"}, "denoise": {"type": "boolean"}, "sharpen": {"type": "boolean"}, "dehalo": {"type": "boolean"}, "clahe": {"type": "boolean"}}, "required": ["src"]}}},
@@ -451,7 +451,7 @@ def get_builtin_tools_schema() -> List[Dict[str, Any]]:
                         "sample_rate": {"type": "integer"},
                         "max_seconds": {"type": "integer"},
                         "seed": {"type": "integer"},
-                        "cid": {"type": "string"},
+                        "conversation_id": {"type": "string"},
                         "edge": {"type": "boolean"},
                         "language": {"type": "string"},
                         "voice_gender": {"type": "string"},
@@ -474,7 +474,7 @@ def get_builtin_tools_schema() -> List[Dict[str, Any]]:
                         "length_s": {"oneOf": [{"type": "integer"}, {"type": "number"}]},
                         "pitch": {"oneOf": [{"type": "integer"}, {"type": "number"}]},
                         "seed": {"type": "integer"},
-                        "cid": {"type": "string"},
+                        "conversation_id": {"type": "string"},
                         "trace_id": {"type": "string"},
                         "lock_bundle": {"type": "object"},
                         "sfx_event_ids": {"type": "array", "items": {"type": "string"}},
@@ -675,6 +675,7 @@ def get_tool_introspection_registry(tool_names: Optional[Iterable[str]] = None) 
         fn = t.get("function") if isinstance(t.get("function"), dict) else {}
         params = fn.get("parameters") if isinstance(fn.get("parameters"), dict) else {}
         out[nm_clean] = {
+            "tool_name": nm_clean,
             "name": nm_clean,
             "version": "1",
             "kind": _infer_tool_kind(nm_clean),
@@ -801,15 +802,19 @@ def build_compact_tool_catalog() -> str:
     merged: dict[str, dict] = {}
     for t in (builtins or []):
         fn = (t.get("function") or {}) if isinstance(t, dict) else {}
-        nm = fn.get("name")
-        if not nm:
+        tool_call_name = fn.get("name")
+        if not tool_call_name:
             continue
         params = (fn.get("parameters") or {})
         reqs = list((params.get("required") or [])) if isinstance(params, dict) else []
-        merged[nm] = {"name": nm, "required": reqs}
+        merged[tool_call_name] = {"tool_call_name": tool_call_name, "required_args": reqs}
     tools_list: list[dict] = list(merged.values())
-    tools_list.sort(key=lambda d: d.get("name", ""))
-    names_list = [t.get("name") for t in tools_list if isinstance(t, dict) and isinstance(t.get("name"), str)]
+    ranked_tools: list[tuple[str, int, dict]] = []
+    for tool_index, tool_entry in enumerate(tools_list):
+        ranked_tools.append((str(tool_entry.get("tool_call_name") or ""), int(tool_index), tool_entry))
+    ranked_tools.sort()
+    tools_list = [ranked[2] for ranked in ranked_tools]
+    names_list = [t.get("tool_call_name") for t in tools_list if isinstance(t, dict) and isinstance(t.get("tool_call_name"), str)]
     catalog = {
         "names": names_list,
         "tools": tools_list,

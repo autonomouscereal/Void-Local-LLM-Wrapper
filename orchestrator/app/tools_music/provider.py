@@ -56,12 +56,12 @@ class RestMusicProvider:
             try:
                 sample_rate = int(args.get("sample_rate") or 44100)
             except Exception as exc:
-                log.warning("music.provider: bad sample_rate=%r; defaulting to 44100", args.get("sample_rate"), exc_info=True)
+                log.warning(f"music.provider: bad sample_rate={args.get('sample_rate')!r}; defaulting to 44100", exc_info=True)
                 sample_rate = 44100
             try:
                 channels = int(args.get("channels") or 2)
             except Exception as exc:
-                log.warning("music.provider: bad channels=%r; defaulting to 2", args.get("channels"), exc_info=True)
+                log.warning(f"music.provider: bad channels={args.get('channels')!r}; defaulting to 2", exc_info=True)
                 channels = 2
             return {
                 "wav_bytes": b"",
@@ -76,17 +76,17 @@ class RestMusicProvider:
         try:
             seconds = int(args.get("length_s") or 30)
         except Exception as exc:
-            log.warning("music.provider: bad length_s=%r; defaulting to 30", args.get("length_s"), exc_info=True)
+            log.warning(f"music.provider: bad length_s={args.get('length_s')!r}; defaulting to 30", exc_info=True)
             seconds = 30
         try:
             sample_rate = int(args.get("sample_rate") or 44100)
         except Exception as exc:
-            log.warning("music.provider: bad sample_rate=%r; defaulting to 44100", args.get("sample_rate"), exc_info=True)
+            log.warning(f"music.provider: bad sample_rate={args.get('sample_rate')!r}; defaulting to 44100", exc_info=True)
             sample_rate = 44100
         try:
             channels = int(args.get("channels") or 2)
         except Exception as exc:
-            log.warning("music.provider: bad channels=%r; defaulting to 2", args.get("channels"), exc_info=True)
+            log.warning(f"music.provider: bad channels={args.get('channels')!r}; defaulting to 2", exc_info=True)
             channels = 2
         payload: Dict[str, Any] = {
             "prompt": str(args.get("prompt") or ""),
@@ -99,27 +99,18 @@ class RestMusicProvider:
             "style": args.get("style"),
         }
         # Correlation IDs for end-to-end logging (music service will log these).
-        if isinstance(args.get("cid"), (str, int)) and str(args.get("cid")).strip():
-            payload["cid"] = str(args.get("cid")).strip()
+        if isinstance(args.get("conversation_id"), (str, int)) and str(args.get("conversation_id")).strip():
+            payload["conversation_id"] = str(args.get("conversation_id")).strip()
         if isinstance(args.get("trace_id"), str) and args.get("trace_id").strip():
             payload["trace_id"] = args.get("trace_id").strip()
-        if isinstance(args.get("request_id"), (str, int)) and str(args.get("request_id")).strip():
-            payload["request_id"] = str(args.get("request_id")).strip()
 
         url = self._base + "/generate"
         # Keep logs dense but safe: never dump full prompt, only a preview + length.
         prompt_preview = payload.get("prompt")[:120] if isinstance(payload.get("prompt"), str) else ""
         log.info(
-            "music.provider.compose.request url=%s seconds=%s sr=%s ch=%s seed=%r cid=%r trace_id=%r prompt_len=%s prompt_preview=%r",
-            url,
-            seconds,
-            sample_rate,
-            channels,
-            payload.get("seed"),
-            payload.get("cid"),
-            payload.get("trace_id"),
-            (len(payload.get("prompt")) if isinstance(payload.get("prompt"), str) else 0),
-            prompt_preview,
+            f"music.provider.compose.request url={url!r} seconds={seconds} sr={sample_rate} ch={channels} seed={payload.get('seed')!r} "
+            f"conversation_id={payload.get('conversation_id')!r} trace_id={payload.get('trace_id')!r} "
+            f"prompt_len={(len(payload.get('prompt')) if isinstance(payload.get('prompt'), str) else 0)} prompt_preview={prompt_preview!r}"
         )
         with httpx.Client(timeout=None, trust_env=False) as client:  # type: ignore[arg-type]
             resp = client.post(url, json=payload)
@@ -129,13 +120,7 @@ class RestMusicProvider:
         ctype = resp.headers.get("content-type") or ""
         if ctype.startswith("audio/") or ctype == "application/octet-stream":
             wav_bytes = resp.content or b""
-            log.info(
-                "music.provider.compose.response kind=raw_audio status=%s ctype=%r bytes=%s ms=%s",
-                int(resp.status_code),
-                ctype,
-                len(wav_bytes),
-                dur_ms,
-            )
+            log.info(f"music.provider.compose.response kind=raw_audio status={int(resp.status_code)} ctype={ctype!r} bytes={len(wav_bytes)} ms={dur_ms}")
             return {
                 "wav_bytes": wav_bytes,
                 "sample_rate": sample_rate,
@@ -153,13 +138,7 @@ class RestMusicProvider:
             inner = data.get("result") if isinstance(data.get("result"), dict) else data
             if not (200 <= int(resp.status_code) < 300):
                 # Preserve response body shape for callers; still return empty wav_bytes.
-                log.warning(
-                    "music.provider.compose.http_error status=%s ctype=%r ms=%s keys=%r",
-                    int(resp.status_code),
-                    ctype,
-                    dur_ms,
-                    sorted(list(inner.keys())) if isinstance(inner, dict) else [],
-                )
+                log.warning(f"music.provider.compose.http_error status={int(resp.status_code)} ctype={ctype!r} ms={dur_ms} keys={sorted(list(inner.keys())) if isinstance(inner, dict) else []!r}")
             b64 = (
                 inner.get("wav_bytes_b64")
                 or inner.get("wav_base64")
@@ -177,21 +156,14 @@ class RestMusicProvider:
             try:
                 out_sr = int(_sr_raw)
             except Exception as exc:
-                log.warning("music.provider: bad inner.sample_rate=%r; using %d", _sr_raw, int(sample_rate), exc_info=True)
+                log.warning(f"music.provider: bad inner.sample_rate={_sr_raw!r}; using {int(sample_rate)}", exc_info=True)
                 out_sr = int(sample_rate)
             try:
                 out_ch = int(_ch_raw)
             except Exception as exc:
-                log.warning("music.provider: bad inner.channels=%r; using %d", _ch_raw, int(channels), exc_info=True)
+                log.warning(f"music.provider: bad inner.channels={_ch_raw!r}; using {int(channels)}", exc_info=True)
                 out_ch = int(channels)
-            log.info(
-                "music.provider.compose.response kind=json status=%s ctype=%r bytes=%s ms=%s model=%r",
-                int(resp.status_code),
-                ctype,
-                len(wav_bytes),
-                dur_ms,
-                inner.get("model") if isinstance(inner, dict) else None,
-            )
+            log.info(f"music.provider.compose.response kind=json status={int(resp.status_code)} ctype={ctype!r} bytes={len(wav_bytes)} ms={dur_ms} model={inner.get('model') if isinstance(inner, dict) else None!r}")
             return {
                 "wav_bytes": wav_bytes,
                 "sample_rate": out_sr,
@@ -202,14 +174,7 @@ class RestMusicProvider:
 
         # Fallback: unknown format; return empty audio so callers can surface a structured error.
         body_preview = (resp.text or "") if hasattr(resp, "text") else ""
-        log.warning(
-            "music.provider.compose.unknown_response status=%s ctype=%r bytes=%s ms=%s body_preview=%r",
-            int(resp.status_code),
-            ctype,
-            len(resp.content or b""),
-            dur_ms,
-            body_preview,
-        )
+        log.warning(f"music.provider.compose.unknown_response status={int(resp.status_code)} ctype={ctype!r} bytes={len(resp.content or b'')} ms={dur_ms} body_preview={body_preview!r}")
         return {
             "wav_bytes": b"",
             "sample_rate": sample_rate,

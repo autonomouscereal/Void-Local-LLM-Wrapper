@@ -47,9 +47,9 @@ def _move(args: Dict[str, Any], errors: List[Dict[str, Any]]) -> Tuple[Dict[str,
     for e in errors:
         if e.get("code") == "required_missing":
             need = (e.get("path") or "").lstrip("/")
-            for k in list(out.keys()):
-                if _norm(k) == _norm(need) and k != need and need not in out:
-                    out[need] = out.pop(k); ops.append({"op": "move", "from": k, "to": need}); break
+            for key in list(out.keys()):
+                if _norm(s=key) == _norm(s=need) and key != need and need not in out:
+                    out[need] = out.pop(key); ops.append({"op": "move", "from": key, "to": need}); break
     return out, ops
 
 
@@ -102,9 +102,16 @@ def _enum_map(args: Dict[str, Any], errors: List[Dict[str, Any]]) -> Tuple[Dict[
             allowed = e.get("allowed") or []
             val = out.get(path)
             if isinstance(val, str) and allowed:
-                nv = max(allowed, key=lambda a: (_norm(a) == _norm(val), -abs(len(a) - len(val))))
-                if nv != val:
-                    out[path] = nv; ops.append({"op": "enum_map", "path": path, "from": val, "to": nv})
+                best_value = None
+                best_score = None
+                norm_val = _norm(s=val)
+                for allowed_value in allowed:
+                    score = (_norm(s=allowed_value) == norm_val, -abs(len(allowed_value) - len(val)))
+                    if best_score is None or score > best_score:
+                        best_score = score
+                        best_value = allowed_value
+                if best_value is not None and best_value != val:
+                    out[path] = best_value; ops.append({"op": "enum_map", "path": path, "from": val, "to": best_value})
     return out, ops
 
 

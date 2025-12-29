@@ -41,12 +41,12 @@ async def get_pg_pool() -> Optional[asyncpg.pool.Pool]:
     async with pg_pool.acquire() as conn:
         await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
         # Orchestrator-owned conversation registry:
-        # - External callers may *suggest* a cid, but only the orchestrator may mint and authorize it.
-        # - We keep a lightweight table so we can reject/overwrite unknown cids deterministically.
+        # - External callers may *suggest* a conversation_id, but only the orchestrator may mint and authorize it.
+        # - We keep a lightweight table so we can reject/overwrite unknown conversation_id values deterministically.
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS orc_conversation (
-              cid        TEXT PRIMARY KEY,
+              conversation_id TEXT PRIMARY KEY,
               created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
               updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
             );
@@ -87,8 +87,8 @@ async def get_pg_pool() -> Optional[asyncpg.pool.Pool]:
             """
             CREATE TABLE IF NOT EXISTS tool_call (
               id          BIGSERIAL PRIMARY KEY,
-              run_id      BIGINT NOT NULL REFERENCES run(id) ON DELETE CASCADE,
-              name        TEXT NOT NULL,
+              trace_id    TEXT NOT NULL,
+              tool_name   TEXT NOT NULL,
               seed        BIGINT NOT NULL,
               args_json   JSONB NOT NULL,
               result_json JSONB,
@@ -98,7 +98,7 @@ async def get_pg_pool() -> Optional[asyncpg.pool.Pool]:
             );
             """
         )
-        await conn.execute("CREATE INDEX IF NOT EXISTS tool_run_name_idx ON tool_call(run_id, name);")
+        await conn.execute("CREATE INDEX IF NOT EXISTS tool_run_name_idx ON tool_call(trace_id, tool_name);")
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS icw_log (

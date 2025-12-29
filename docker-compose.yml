@@ -44,6 +44,7 @@ services:
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - PYTHONUNBUFFERED=1
       - LOG_DIR=/workspace/logs
+      - LOG_LEVEL=${RVC_LOG_LEVEL:-DEBUG}
     volumes:
       # RVC models live here; one subdir per model (trained voice models)
       - rvc_models:/srv/rvc_models
@@ -71,6 +72,7 @@ services:
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - PYTHONUNBUFFERED=1
       - LOG_DIR=/workspace/logs
+      - LOG_LEVEL=${RVC_LOG_LEVEL:-DEBUG}
       - RVC_TRAIN_DATA_ROOT=/srv/data
       - RVC_MODELS_ROOT=/srv/rvc_models
       - RVC_WEBUI_ROOT=/srv/rvc_webui
@@ -124,6 +126,7 @@ services:
       - WHISPER_API_URL=http://127.0.0.1:7861
       - VOCALFIX_API_URL=http://127.0.0.1:7866
       - LOG_DIR=/workspace/logs
+      - LOG_LEVEL=${RVC_LOG_LEVEL:-DEBUG}
     network_mode: host
     expose:
       - "7863"
@@ -696,8 +699,8 @@ services:
   executor:
     
     build:
-      context: ./executor
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: executor/Dockerfile
     container_name: void_executor
     restart: unless-stopped
     network_mode: host

@@ -170,7 +170,7 @@ def _update_meta(kind: str, payload: Dict[str, Any]) -> None:
             "id": "string uuid",
             "kind": "string",
             "modality": "string? (for training_sample)",
-            "cid": "string?",
+            "conversation_id": "string?",
             "trace_id": "string?",
             "tool": "string?",
             "tags": "list[string]",
@@ -209,7 +209,7 @@ def append_row(kind: str, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
     Row envelope (recommended):
       {
-        "cid": "...",
+        "conversation_id": "...",
         "trace_id": "...",
         "tool": "...",
         "inputs": {...},
@@ -233,7 +233,7 @@ def append_row(kind: str, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "t": now_ms,
         "id": rid,
         "kind": str(kind or "event"),
-        "cid": payload.get("cid"),
+        "conversation_id": payload.get("conversation_id"),
         "trace_id": payload.get("trace_id"),
         "tool": payload.get("tool"),
         "modality": payload.get("modality"),

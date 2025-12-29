@@ -34,25 +34,40 @@ from ..tracing.runtime import trace_event
 log = logging.getLogger(__name__)
 
 
-def _apply_ref(ref_id: str | None) -> Dict[str, Any]:
-    if not ref_id:
+def _apply_ref_library_ref(ref_library_ref_id: str | None) -> Dict[str, Any]:
+    """
+    Apply a reference library ref_id to get a ref pack.
+    
+    Args:
+        ref_library_ref_id: A ref_id from the ref_library system (not an artifact_id)
+    
+    Returns:
+        Dict with ref pack (e.g., {"images": [...]} or {"track": ..., "stems": [...]})
+    """
+    if not ref_library_ref_id:
         return {}
-    return ref_pack_for_ref_id(ref_id)
+    return ref_pack_for_ref_id(ref_library_ref_id)
 
 
 def build_ref_pack(char_meta: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Build a ref pack from character metadata.
+    
+    All IDs here are ref_library ref_ids (not artifact_ids).
+    They point to ref library manifests that contain multiple files.
+    """
     pack: Dict[str, Any] = {"image": {}, "voice": {}, "music": {}}
     if not isinstance(char_meta, dict):
         return pack
-    img_id = char_meta.get("image_ref_id")
-    voc_id = char_meta.get("voice_ref_id")
-    mus_id = char_meta.get("music_ref_id")
-    if img_id:
-        pack["image"] = _apply_ref(img_id)
-    if voc_id:
-        pack["voice"] = _apply_ref(voc_id)
-    if mus_id:
-        pack["music"] = _apply_ref(mus_id)
+    image_ref_library_ref_id = char_meta.get("image_ref_id")
+    voice_ref_library_ref_id = char_meta.get("voice_ref_id")
+    music_ref_library_ref_id = char_meta.get("music_ref_id")
+    if image_ref_library_ref_id:
+        pack["image"] = _apply_ref_library_ref(image_ref_library_ref_id)
+    if voice_ref_library_ref_id:
+        pack["voice"] = _apply_ref_library_ref(voice_ref_library_ref_id)
+    if music_ref_library_ref_id:
+        pack["music"] = _apply_ref_library_ref(music_ref_library_ref_id)
     return pack
 
 
@@ -76,11 +91,13 @@ def apply_animatic_vo_locks(line: Dict[str, Any], ref_pack: Dict[str, Any], seed
 
 
 def apply_music_cue_locks(cue: Dict[str, Any], ref_pack: Dict[str, Any], seed: int) -> Dict[str, Any]:
+    # artifact_id is the music identifier
+    artifact_id = cue.get("artifact_id")
     return {
         "prompt": cue.get("prompt") or "",
         "bpm": cue.get("bpm"),
         "length_s": cue.get("length_s", 30),
-        "music_id": cue.get("music_ref_id"),
+        "artifact_id": artifact_id,
         "music_refs": (ref_pack or {}).get("music") or {},
         "seed": seed,
     }
@@ -98,9 +115,9 @@ async def ensure_story_character_bundles(locks_arg: Dict[str, Any]) -> Dict[str,
     character_entries = locks_arg.get("characters") if isinstance(locks_arg.get("characters"), list) else []
     character_ids: List[str] = []
     for entry in character_entries:
-        char_id = entry.get("id")
-        if isinstance(char_id, str) and char_id.strip():
-            character_ids.append(char_id.strip())
+        character_id = entry.get("character_id")
+        if isinstance(character_id, str) and character_id.strip():
+            character_ids.append(character_id.strip())
     out: Dict[str, Dict[str, Any]] = {}
     for character_id in character_ids:
         bundle_existing = await _lock_load(character_id)
@@ -154,35 +171,35 @@ async def ensure_visual_locks_for_story(
         char_entries = []
         updated["characters"] = char_entries
     existing_ids = {
-        c.get("id")
-        for c in char_entries
-        if isinstance(c, dict) and isinstance(c.get("id"), str) and c.get("id").strip()
+        character.get("character_id")
+        for character in char_entries
+        if isinstance(character, dict) and isinstance(character.get("character_id"), str) and character.get("character_id").strip()
     }
     # Characters declared on the story graph (story.engine)
-    story_chars = story.get("characters") if isinstance(story.get("characters"), list) else []
-    for c in story_chars:
-        if not isinstance(c, dict):
+    story_characters = story.get("characters") if isinstance(story.get("characters"), list) else []
+    for character in story_characters:
+        if not isinstance(character, dict):
             continue
-        cid = c.get("char_id") or c.get("id")
-        if not isinstance(cid, str) or not cid.strip():
+        character_id = character.get("character_id")
+        if not isinstance(character_id, str) or not character_id.strip():
             continue
-        cid = cid.strip()
-        if cid in existing_ids:
+        character_id = character_id.strip()
+        if character_id in existing_ids:
             continue
         # Create a best-effort character entry using story metadata so that
         # downstream visual/music/TTS pipelines can lock against it.
-        entry: Dict[str, Any] = {"id": cid}
-        name = c.get("name")
-        descr = c.get("description")
-        traits = c.get("traits")
-        if isinstance(name, str) and name.strip():
-            entry["name"] = name.strip()
+        entry: Dict[str, Any] = {"character_id": character_id}
+        character_name = character.get("name")
+        descr = character.get("description")
+        traits = character.get("traits")
+        if isinstance(character_name, str) and character_name.strip():
+            entry["name"] = character_name.strip()
         if isinstance(descr, str) and descr.strip():
             entry["description"] = descr.strip()
         if isinstance(traits, dict):
             entry["traits"] = traits
         char_entries.append(entry)
-        existing_ids.add(cid)
+        existing_ids.add(character_id)
     # Also scan beat-level character references to catch any IDs not present
     # in the top-level story.characters list (defensive).
     acts = story.get("acts") if isinstance(story.get("acts"), list) else []
@@ -198,14 +215,14 @@ async def ensure_visual_locks_for_story(
                 if not isinstance(beat, dict):
                     continue
                 char_ids = beat.get("characters") if isinstance(beat.get("characters"), list) else []
-                for cid in char_ids:
-                    if not isinstance(cid, str) or not cid.strip():
+                for character_id in char_ids:
+                    if not isinstance(character_id, str) or not character_id.strip():
                         continue
-                    cid = cid.strip()
-                    if cid in existing_ids:
+                    character_id = character_id.strip()
+                    if character_id in existing_ids:
                         continue
-                    char_entries.append({"id": cid})
-                    existing_ids.add(cid)
+                    char_entries.append({"character_id": character_id})
+                    existing_ids.add(character_id)
 
     # ------------------------------------------------------------------
     # 2) Ensure persisted per-character bundles exist and are migrated

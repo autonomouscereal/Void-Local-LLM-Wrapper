@@ -16,7 +16,7 @@ def append_training_sample(modality: str, row: Dict[str, Any] | Any) -> Optional
       <uploads>/datasets/stream/dataset.part*.jsonl (indexed by dataset.index.json)
 
     This must NOT be used for generic logging events. If the input doesn't look
-    like a real sample (no tool, no output path/url, no cid/trace_id), we reject
+    like a real sample (no tool, no output path/url, no conversation_id/trace_id), we reject
     it and instead emit a runtime trace describing the rejection.
     """
     mod = str(modality or "").strip().lower()
@@ -30,8 +30,8 @@ def append_training_sample(modality: str, row: Dict[str, Any] | Any) -> Optional
     has_tool = isinstance(row.get("tool"), str) and bool(str(row.get("tool") or "").strip())
     has_id = isinstance(row.get("trace_id"), str) and bool(str(row.get("trace_id") or "").strip())
     if not has_id:
-        cid = row.get("cid")
-        has_id = isinstance(cid, str) and bool(cid.strip())
+        conversation_id = row.get("conversation_id")
+        has_id = isinstance(conversation_id, str) and bool(conversation_id.strip())
     has_output = any(isinstance(row.get(k), str) and bool(str(row.get(k) or "").strip()) for k in _OUTPUT_KEYS)
 
     if not (has_tool and has_id and has_output):
@@ -42,7 +42,7 @@ def append_training_sample(modality: str, row: Dict[str, Any] | Any) -> Optional
                 "reason": "invalid_sample_shape",
                 "missing": {
                     "tool": (not has_tool),
-                    "cid_or_trace_id": (not has_id),
+                    "conversation_id_or_trace_id": (not has_id),
                     "output_path_or_url": (not has_output),
                 },
                 # Include a trimmed view of the row keys for debugging shape drift.

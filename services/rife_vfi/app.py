@@ -155,22 +155,26 @@ async def interpolate(request: Request):
     if not isinstance(data, dict):
         data = {}
 
+    trace_id = str(data.get("trace_id") or "").strip() if isinstance(data.get("trace_id"), (str, int)) else ""
+    conversation_id = str(data.get("conversation_id") or "").strip() if isinstance(data.get("conversation_id"), (str, int)) else ""
+
     input_path = data.get("input_path")
     if not isinstance(input_path, str) or not input_path.strip():
-        return ToolEnvelope.failure("missing_input_path", "input_path is required", status=422)
+        return ToolEnvelope.failure(code="missing_input_path", message="input_path is required", trace_id=trace_id, conversation_id=conversation_id, status=422, details={"trace_id": trace_id, "conversation_id": conversation_id})
 
     target_fps_raw = data.get("target_fps")
     if not isinstance(target_fps_raw, (int, float)) or float(target_fps_raw) <= 0.0:
-        return ToolEnvelope.failure("missing_target_fps", "target_fps must be > 0", status=422)
+        return ToolEnvelope.failure(code="missing_target_fps", message="target_fps must be > 0", trace_id=trace_id, conversation_id=conversation_id, status=422, details={"trace_id": trace_id, "conversation_id": conversation_id})
     target_fps = float(target_fps_raw)
 
     job_id = data.get("job_id")
     job = str(job_id).strip() if isinstance(job_id, str) and job_id.strip() else uuid.uuid4().hex
+    # trace_id must be provided by caller; do not derive from job_id or other ids.
 
     rel_in = input_path.strip()
     abs_in = _safe_join(UPLOAD_DIR, rel_in)
     if not os.path.isfile(abs_in):
-        return ToolEnvelope.failure("input_not_found", f"input not found: {rel_in}", status=404, details={"input_path": rel_in})
+        return ToolEnvelope.failure(code="input_not_found", message=f"input not found: {rel_in}", trace_id=trace_id, conversation_id=conversation_id, status=404, details={"trace_id": trace_id, "conversation_id": conversation_id, "input_path": rel_in})
 
     out_dir = os.path.join(UPLOAD_DIR, "vfi", job)
     os.makedirs(out_dir, exist_ok=True)
@@ -195,7 +199,7 @@ async def interpolate(request: Request):
     if src_fps <= 0.0:
         src_fps = 24.0
     if target_fps < 1.0:
-        return ToolEnvelope.failure("bad_target_fps", "target_fps must be >= 1", status=422)
+        return ToolEnvelope.failure(code="bad_target_fps", message="target_fps must be >= 1", trace_id=trace_id, conversation_id=conversation_id, status=422, details={"trace_id": trace_id, "conversation_id": conversation_id, "target_fps": target_fps})
 
     chosen = _pick_multi(
         src_fps=src_fps,
@@ -250,10 +254,13 @@ async def interpolate(request: Request):
             else:
                 ok = False
                 return ToolEnvelope.failure(
-                    "duration_drift",
-                    "interpolation produced longer output and trim failed",
+                    code="duration_drift",
+                    message="interpolation produced longer output and trim failed",
+                    trace_id=trace_id,
+                    conversation_id=conversation_id,
                     status=500,
                     details={
+                        "trace_id": trace_id,
                         "src_duration_s": src_dur,
                         "out_duration_s": out_dur,
                         "drift_s": drift_s,
@@ -271,10 +278,13 @@ async def interpolate(request: Request):
 
     if not ok:
         return ToolEnvelope.failure(
-            "vfi_failed",
-            "interpolation failed or output missing",
+            code="vfi_failed",
+            message="interpolation failed or output missing",
+            trace_id=trace_id,
+            conversation_id=conversation_id,
             status=500,
             details={
+                "trace_id": trace_id,
                 "job_id": job,
                 "input_path": abs_in,
                 "output_path": out_path,
@@ -290,7 +300,7 @@ async def interpolate(request: Request):
         )
 
     return ToolEnvelope.success(
-        {
+        result={
             "job_id": job,
             "input_path": abs_in,
             "output_path": out_path,
@@ -308,7 +318,11 @@ async def interpolate(request: Request):
             "stdout": p.stdout,
             "stderr": p.stderr,
             "returncode": int(p.returncode),
-        }
+            "trace_id": trace_id,
+            "conversation_id": conversation_id,
+        },
+        trace_id=trace_id,
+        conversation_id=conversation_id,
     )
 
 

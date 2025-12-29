@@ -14,18 +14,18 @@ from ..json_parser import JSONParser
 log = logging.getLogger(__name__)
 
 
-def _env_int(name: str, default: int, *, min_val: int = 1, max_val: int = 1000) -> int:
+def _env_int(name: str, default: int, *, min_value: int = 1, max_value: int = 1000) -> int:
     raw = os.getenv(name, None)
     s = str(raw).strip() if raw is not None else ""
     val = int(s) if (s and s.lstrip("+-").isdigit()) else int(default)
-    if val < min_val:
-        val = min_val
-    if val > max_val:
-        val = max_val
+    if val < min_value:
+        val = min_value
+    if val > max_value:
+        val = max_value
     return val
 
 
-def _env_float(name: str, default: float, *, min_val: float = 0.0, max_val: float = 2.0) -> float:
+def _env_float(name: str, default: float, *, min_value: float = 0.0, max_value: float = 2.0) -> float:
     raw = os.getenv(name, None)
     s = str(raw).strip() if raw is not None else ""
     # Avoid exceptions: only accept simple float forms.
@@ -36,17 +36,17 @@ def _env_float(name: str, default: float, *, min_val: float = 0.0, max_val: floa
         t = t.replace("+", "", 1).replace("-", "", 1)
         ok = t.isdigit()
     val = float(s) if ok else float(default)
-    if val < min_val:
-        val = min_val
-    if val > max_val:
-        val = max_val
+    if val < min_value:
+        val = min_value
+    if val > max_value:
+        val = max_value
     return val
 
 
-STORY_COMMITTEE_ROUNDS = _env_int("STORY_COMMITTEE_ROUNDS", 1, min_val=1, max_val=10)
+STORY_COMMITTEE_ROUNDS = _env_int("STORY_COMMITTEE_ROUNDS", 1, min_value=1, max_value=10)
 # By default, do NOT hard-cap story iterations. If you want a cap, set STORY_MAX_PASSES > 0.
-STORY_MAX_PASSES = _env_int("STORY_MAX_PASSES", 0, min_val=0, max_val=1000)
-STORY_TEMPERATURE = _env_float("STORY_TEMPERATURE", 0.5, min_val=0.0, max_val=2.0)
+STORY_MAX_PASSES = _env_int("STORY_MAX_PASSES", 0, min_value=0, max_value=1000)
+STORY_TEMPERATURE = _env_float("STORY_TEMPERATURE", 0.5, min_value=0.0, max_value=2.0)
 
 
 def _story_schema() -> Dict[str, Any]:
@@ -110,8 +110,15 @@ async def _jsonify_then_parse(raw_text: str, expected_schema: Any, *, trace_id: 
         temperature=temperature,
     )
     parser = JSONParser()
-    obj = parser.parse(candidate if candidate is not None else "{}", expected_schema)
-    return obj if isinstance(obj, dict) else {}
+    try:
+        obj = parser.parse(candidate if candidate is not None else "{}", expected_schema)
+        if not isinstance(obj, dict):
+            log.warning("_jsonify_then_parse: JSONParser returned non-dict type=%s trace_id=%s", type(obj).__name__, trace_id)
+            obj = {}
+    except Exception as ex:
+        log.warning("_jsonify_then_parse: JSONParser.parse failed ex=%s trace_id=%s candidate_prefix=%s", ex, trace_id, (str(candidate) if candidate else "")[:200], exc_info=True)
+        obj = {}
+    return obj
 
 
 async def _committee_generate_story_raw(user_prompt: str, duration_hint_s: float, *, trace_id: Optional[str]) -> str:
@@ -209,7 +216,7 @@ async def _committee_audit_story(story: Dict[str, Any], user_prompt: str, *, tra
         "- must_fix: bool (true if severe issues exist)\n"
         "- summary: string\n"
         "- issues: list of issue objects (code, severity, message, pointers, suggested_fix)\n"
-        "Return issues with precise pointers (act_id/scene_id/beat_id/line_id/char_id/obj_id).\n"
+        "Return issues with precise pointers (act_id/scene_id/beat_id/line_id/character_id/object_id).\n"
     )
     user_msg = json.dumps(
         {
@@ -297,6 +304,50 @@ async def _committee_revise_story(story: Dict[str, Any], user_prompt: str, audit
     return parsed if parsed else dict(story or {})
 
 
+def _story_measure_coverage(story: Dict[str, Any]):
+    """
+    Compute coverage and beat counts for a story graph.
+    Returns: (total_hint_s, total_beats_time_s, total_beats_count, coverage_ratio)
+    """
+    total_hint = float(story.get("duration_hint_s") or 0.0) if isinstance(story, dict) else 0.0
+    total_beats_time = 0.0
+    total_beats_count = 0
+    acts = story.get("acts") if isinstance(story, dict) and isinstance(story.get("acts"), list) else []
+    for act in acts:
+        if not isinstance(act, dict):
+            continue
+        scenes = act.get("scenes") if isinstance(act.get("scenes"), list) else []
+        for scene in scenes:
+            if not isinstance(scene, dict):
+                continue
+            beats = scene.get("beats") if isinstance(scene.get("beats"), list) else []
+            for beat in beats:
+                if not isinstance(beat, dict):
+                    continue
+                total_beats_count += 1
+                total_beats_time += float(beat.get("time_hint_s") or 0.0)
+    ratio = (total_beats_time / total_hint) if (total_hint > 0.0 and total_beats_time > 0.0) else 0.0
+    return total_hint, total_beats_time, total_beats_count, ratio
+
+
+def _story_update_stall_guard(
+    *,
+    prior_beats_time_s: Optional[float],
+    prior_beats_count: Optional[int],
+    cur_beats_time_s: float,
+    cur_beats_count: int,
+    consecutive_no_progress: int,
+):
+    grew = True
+    if prior_beats_time_s is not None and prior_beats_count is not None:
+        grew = (float(cur_beats_time_s) > float(prior_beats_time_s)) or (int(cur_beats_count) > int(prior_beats_count))
+    if not grew:
+        consecutive_no_progress = int(consecutive_no_progress) + 1
+    else:
+        consecutive_no_progress = 0
+    return grew, consecutive_no_progress, float(cur_beats_time_s), int(cur_beats_count)
+
+
 async def draft_story_graph(user_prompt: str, duration_hint_s: Optional[float], trace_id: Optional[str] = None) -> Dict[str, Any]:
     """
     Committee-driven story generator.
@@ -309,7 +360,7 @@ async def draft_story_graph(user_prompt: str, duration_hint_s: Optional[float], 
     duration = float(duration_hint_s) if isinstance(duration_hint_s, (int, float)) else 0.0
     if duration <= 0.0:
         duration = 600.0
-    log.info("story.draft start trace_id=%s duration_hint_s=%s prompt_len=%d", trace_id, float(duration), len(prompt_text))
+    log.info(f"story.draft start trace_id={trace_id!r} duration_hint_s={float(duration)} prompt_len={len(prompt_text)}")
     raw = await _committee_generate_story_raw(prompt_text, duration, trace_id=(trace_id or "film2.story_draft"))
     story = await _jsonify_then_parse(
         raw_text=raw,
@@ -333,29 +384,12 @@ async def draft_story_graph(user_prompt: str, duration_hint_s: Optional[float], 
     last_beats_time_s: Optional[float] = None
     last_beats_count: Optional[int] = None
     max_passes = int(STORY_MAX_PASSES)
-    while True:
-        if max_passes > 0 and pass_index >= max_passes:
-            trace_event("story.max_passes_reached", {"trace_id": trace_id, "max_passes": int(max_passes)})
-            break
+    stop_requested = False
+    stop_reason = ""
+    # No `break`: the loop exits only via its condition.
+    while (not stop_requested) and (max_passes <= 0 or pass_index < max_passes):
         # Measure current duration coverage (sum beat time hints) for logging + context.
-        total_hint = float(story.get("duration_hint_s") or 0.0)
-        total_beats_time = 0.0
-        total_beats_count = 0
-        acts = story.get("acts") if isinstance(story.get("acts"), list) else []
-        for act in acts:
-            if not isinstance(act, dict):
-                continue
-            scenes = act.get("scenes") if isinstance(act.get("scenes"), list) else []
-            for scene in scenes:
-                if not isinstance(scene, dict):
-                    continue
-                beats = scene.get("beats") if isinstance(scene.get("beats"), list) else []
-                for beat in beats:
-                    if not isinstance(beat, dict):
-                        continue
-                    total_beats_count += 1
-                    total_beats_time += float(beat.get("time_hint_s") or 0.0)
-        ratio = (total_beats_time / total_hint) if (total_hint > 0.0 and total_beats_time > 0.0) else 0.0
+        total_hint, total_beats_time, total_beats_count, ratio = _story_measure_coverage(story)
 
         log.info(
             "story.draft.pass start trace_id=%s pass_index=%d beats_time_s=%.2f duration_hint_s=%.2f ratio=%.3f",
@@ -391,20 +425,26 @@ async def draft_story_graph(user_prompt: str, duration_hint_s: Optional[float], 
 
         # Authoritative stop: committee says accept.
         if done and next_action_s == "accept":
-            break
+            stop_requested = True
+            stop_reason = "accept"
 
         # Fix pass when committee requests revision (or marks must_fix).
-        if must_fix or next_action_s in ("revise", "extend_then_revise"):
-            story = await _committee_revise_story(story, prompt_text, audit, trace_id=(trace_id or f"film2.story_revise.{pass_index}"))
+        if (not stop_requested) and (must_fix or next_action_s in ("revise", "extend_then_revise")):
+            story = await _committee_revise_story(
+                story,
+                prompt_text,
+                audit,
+                trace_id=(trace_id or f"film2.story_revise.{pass_index}"),
+            )
             if not isinstance(story, dict):
-                break
+                # Never break: stop deterministically with the best available state.
+                stop_requested = True
+                stop_reason = "revise_failed"
             story.setdefault("prompt", prompt_text)
             story.setdefault("duration_hint_s", float(duration))
-            pass_index += 1
-            continue
 
         # Extend pass when committee requests extension (or says length not ok).
-        if (not length_ok) or next_action_s in ("extend", "extend_then_revise"):
+        if (not stop_requested) and ((not length_ok) or next_action_s in ("extend", "extend_then_revise")):
             sys_msg = (
                 "You are the Story Engine continuation pass.\n"
                 "You MUST EXTEND the existing story graph to meet the requested duration and depth.\n"
@@ -459,15 +499,13 @@ async def draft_story_graph(user_prompt: str, duration_hint_s: Optional[float], 
                     },
                 )
                 # Stall guard: if committee keeps asking to extend but the story doesn't grow, prevent infinite loops.
-                grew = True
-                if last_beats_time_s is not None and last_beats_count is not None:
-                    grew = (float(total_beats_time) > float(last_beats_time_s)) or (int(total_beats_count) > int(last_beats_count))
-                if not grew:
-                    consecutive_no_progress += 1
-                else:
-                    consecutive_no_progress = 0
-                last_beats_time_s = float(total_beats_time)
-                last_beats_count = int(total_beats_count)
+                grew, consecutive_no_progress, last_beats_time_s, last_beats_count = _story_update_stall_guard(
+                    prior_beats_time_s=last_beats_time_s,
+                    prior_beats_count=last_beats_count,
+                    cur_beats_time_s=float(total_beats_time),
+                    cur_beats_count=int(total_beats_count),
+                    consecutive_no_progress=int(consecutive_no_progress),
+                )
                 if consecutive_no_progress >= 5:
                     trace_event(
                         "story.stalled",
@@ -478,12 +516,23 @@ async def draft_story_graph(user_prompt: str, duration_hint_s: Optional[float], 
                             "last_audit": audit,
                         },
                     )
-                    break
-                pass_index += 1
-                continue
+                    stop_requested = True
+                    stop_reason = "stalled"
+            else:
+                stop_requested = True
+                stop_reason = "extend_failed"
 
         # Default: if committee doesn't require fix/extend, stop.
-        break
+        if not stop_requested and not (must_fix or (not length_ok) or next_action_s in ("extend", "extend_then_revise", "revise", "extend_then_revise")):
+            stop_requested = True
+            stop_reason = "no_action"
+
+        if not stop_requested:
+            pass_index += 1
+
+    if not stop_reason and max_passes > 0 and pass_index >= max_passes:
+        stop_reason = "max_passes"
+        trace_event("story.max_passes_reached", {"trace_id": trace_id, "max_passes": int(max_passes)})
     acts_n = len(story.get("acts") or []) if isinstance(story.get("acts"), list) else 0
     chars_n = len(story.get("characters") or []) if isinstance(story.get("characters"), list) else 0
     log.info(
@@ -566,15 +615,15 @@ async def check_story_consistency(story: Dict[str, Any], user_prompt: str, trace
                         continue
                     state_entry = character_state.get(target) or {}
                     for key, val in state_delta.items():
-                        prev_val = state_entry.get(key)
-                        if prev_val is not None and prev_val != val:
+                        prev = state_entry.get(key)
+                        if prev is not None and prev != val:
                             issues.append(
                                 {
                                     "code": "state_inconsistent",
                                     "message": "Conflicting state change for target.",
                                     "target": target,
                                     "state_key": key,
-                                    "prev": prev_val,
+                                    "prev": prev,
                                     "new": val,
                                     "act_id": act_id,
                                     "scene_id": scene_id,
@@ -605,8 +654,10 @@ async def ensure_tts_locks_and_dialogue_audio(
     story: Dict[str, Any],
     locks_arg: Dict[str, Any],
     profile_name: str,
-    trace_id: Optional[str],
+    trace_id: str,
+    conversation_id: str,
     tts_runner: Callable[[Dict[str, Any]], Awaitable[Dict[str, Any]]],
+    character_bundles: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """
     Ensure basic TTS lock entries and pre-generate dialogue audio for lines in the story.
@@ -619,7 +670,7 @@ async def ensure_tts_locks_and_dialogue_audio(
         return updated_locks, dialogue_index
     acts = story.get("acts") if isinstance(story.get("acts"), list) else []
     characters = story.get("characters") if isinstance(story.get("characters"), list) else []
-    character_ids = [c.get("char_id") for c in characters if isinstance(c, dict) and isinstance(c.get("char_id"), str)]
+    character_ids = [character.get("character_id") for character in characters if isinstance(character, dict) and isinstance(character.get("character_id"), str)]
     # Ensure a basic TTS lock branch exists per character
     tts_branch = updated_locks.get("tts")
     if not isinstance(tts_branch, dict):
@@ -629,14 +680,14 @@ async def ensure_tts_locks_and_dialogue_audio(
     if not isinstance(char_voice_locks, dict):
         char_voice_locks = {}
         tts_branch["characters"] = char_voice_locks
-    for c_id in character_ids:
-        if not isinstance(c_id, str) or not c_id:
+    for temp_character_id in character_ids:
+        if not isinstance(temp_character_id, str) or not temp_character_id:
             continue
-        if c_id not in char_voice_locks:
-            char_voice_locks[c_id] = {
-                "char_id": c_id,
+        if temp_character_id not in char_voice_locks:
+            char_voice_locks[temp_character_id] = {
+                "character_id": temp_character_id,
                 "voice_profile": {
-                    "description": f"Default voice profile for {c_id} based on story context",
+                    "description": f"Default voice profile for {temp_character_id} based on story context",
                 },
             }
     # Collect dialogue lines
@@ -657,7 +708,7 @@ async def ensure_tts_locks_and_dialogue_audio(
                     if not isinstance(speaker, str) or not speaker:
                         continue
                     dialogue_index[line_id] = {
-                        "char_id": speaker,
+                        "character_id": speaker,
                         "text": text,
                         "audio_path": None,
                         "duration_s": None,
@@ -667,24 +718,29 @@ async def ensure_tts_locks_and_dialogue_audio(
         return updated_locks, dialogue_index
     # Pre-generate audio via tts.speak for each unique line
     for line_id, entry in dialogue_index.items():
-        speaker = entry.get("char_id")
+        speaker = entry.get("character_id")
         text = entry.get("text")
         if not isinstance(speaker, str) or not isinstance(text, str):
             continue
         args_tts: Dict[str, Any] = {
             "text": text,
             "trace_id": trace_id,
+            "conversation_id": conversation_id,
             "quality_profile": profile_name,
         }
-        if isinstance(updated_locks, dict) and updated_locks:
+        # Prefer per-character bundles (stable voices/locks); fallback to story-level locks bundle.
+        if isinstance(character_bundles, dict) and isinstance(character_bundles.get(speaker), dict) and character_bundles.get(speaker):
+            args_tts["lock_bundle"] = character_bundles.get(speaker)
+            args_tts.setdefault("voice_id", speaker)
+        elif isinstance(updated_locks, dict) and updated_locks:
             args_tts["lock_bundle"] = updated_locks
         args_tts["character_id"] = speaker
         res = await tts_runner({"name": "tts.speak", "arguments": args_tts})
         if isinstance(res, Dict) and isinstance(res.get("result"), dict):
             r = res.get("result") or {}
             meta_audio = r.get("meta") if isinstance(r.get("meta"), dict) else {}
-            ids_audio = r.get("ids") if isinstance(r.get("ids"), dict) else {}
-            audio_id = ids_audio.get("audio_id")
+            external_ids = r.get("ids") if isinstance(r.get("ids"), dict) else {}  # external API identifiers
+            audio_id = external_ids.get("audio_id")
             url = meta_audio.get("url")
             if isinstance(audio_id, str) and audio_id:
                 entry["audio_path"] = audio_id
@@ -698,7 +754,7 @@ async def ensure_tts_locks_and_dialogue_audio(
                 {
                     "trace_id": trace_id,
                     "line_id": line_id,
-                    "char_id": speaker,
+                    "character_id": speaker,
                     "text": (text if isinstance(text, str) else ""),
                     "audio_path": entry.get("audio_path"),
                     "duration_s": entry.get("duration_s"),
@@ -712,7 +768,7 @@ async def ensure_tts_locks_and_dialogue_audio(
                 {
                     "trace_id": trace_id,
                     "line_id": line_id,
-                    "char_id": speaker,
+                    "character_id": speaker,
                     "error": str(res.get("error")),
                 },
             )
@@ -753,12 +809,12 @@ async def fix_story(story: Dict[str, Any], issues: List[Dict[str, Any]], user_pr
             continue
         target = issue.get("target")
         state_key = issue.get("state_key")
-        prev_val = issue.get("prev")
-        new_val = issue.get("new")
+        prev = issue.get("prev")
+        new = issue.get("new")
         if not isinstance(target, str) or not isinstance(state_key, str):
             continue
         # Normalize by keeping the earliest value and updating later state_delta entries.
-        canonical_val = prev_val
+        canonical = prev
         for act in acts:
             scenes = act.get("scenes") if isinstance(act.get("scenes"), list) else []
             for scene in scenes:
@@ -774,7 +830,7 @@ async def fix_story(story: Dict[str, Any], issues: List[Dict[str, Any]], user_pr
                             continue
                         state_delta = ev.get("state_delta") if isinstance(ev.get("state_delta"), dict) else {}
                         if state_key in state_delta:
-                            state_delta[state_key] = canonical_val
+                            state_delta[state_key] = canonical
                             ev["state_delta"] = state_delta
     adjusted["acts"] = acts
     # Committee revision using the issues we found (and the prompt if available)
@@ -834,9 +890,9 @@ def derive_scenes_and_shots(story: Dict[str, Any]) -> Tuple[List[Dict[str, Any]]
                 duration_s = float(beat.get("time_hint_s") or 0.0)
                 char_ids = beat.get("characters") or []
                 shot_states: Dict[str, Dict[str, Any]] = {}
-                for cid in char_ids:
-                    if isinstance(cid, str) and cid in character_state:
-                        shot_states[cid] = dict(character_state[cid])
+                for character_id in char_ids:
+                    if isinstance(character_id, str) and character_id in character_state:
+                        shot_states[character_id] = dict(character_state[character_id])
                 shot_entry: Dict[str, Any] = {
                     "shot_id": shot_id,
                     "scene_id": scene_id,

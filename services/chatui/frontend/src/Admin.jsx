@@ -8,7 +8,7 @@ export default function AdminTab(){
   const [jobs,setJobs]=useState([]);
   const [replay,setReplay]=useState(null);
   const refreshJobs = async()=> setJobs((await jget("/jobs.list")).jobs || []);
-  const replayJob = async(cid)=> setReplay((await jget(`/jobs.replay?id=${encodeURIComponent(cid)}`)).events || []);
+  const replayJob = async(job_id)=> setReplay((await jget(`/jobs.replay?id=${encodeURIComponent(job_id)}`)).events || []);
 
   const [ttl,setTtl]=useState(30*24*3600);
   const [maxB,setMaxB]=useState(200*1024**3);

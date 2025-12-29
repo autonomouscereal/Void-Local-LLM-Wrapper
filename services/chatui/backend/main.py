@@ -85,18 +85,18 @@ async def init_pool() -> asyncpg.pool.Pool:
             CREATE TABLE IF NOT EXISTS conversations (
               id BIGSERIAL PRIMARY KEY,
               title TEXT,
-              orch_cid TEXT,
+              orchestrator_conversation_id TEXT,
               created_at TIMESTAMPTZ DEFAULT NOW(),
               updated_at TIMESTAMPTZ DEFAULT NOW()
             );
             """
         )
-        # Forward-compatible: if the table already existed, add orch_cid without needing a migration.
+        # Forward-compatible: if the table already existed, add orchestrator_conversation_id without needing a migration.
         try:
-            await conn.execute("ALTER TABLE conversations ADD COLUMN IF NOT EXISTS orch_cid TEXT;")
+            await conn.execute("ALTER TABLE conversations ADD COLUMN IF NOT EXISTS orchestrator_conversation_id TEXT;")
         except Exception:
             # Non-fatal (column may already exist), but never swallow silently.
-            log.warning("db.init: ALTER TABLE conversations ADD COLUMN orch_cid failed", exc_info=True)
+            log.warning("db.init: ALTER TABLE conversations ADD COLUMN orchestrator_conversation_id failed", exc_info=True)
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS messages (
@@ -191,7 +191,7 @@ async def _unhandled_exception_handler(request: Request, exc: Exception):
 # WHAT WE TRIED (CHRONOLOGICAL SUMMARY)
 # 1) CORS everywhere
 #    - Added global CORS middleware stamping headers on all responses; OPTIONS short-circuit for any path.
-#    - Added explicit OPTIONS endpoints for /api/chat and /api/conversations/{cid}/chat.
+#    - Added explicit OPTIONS endpoints for /api/chat and /api/conversations/{conversation_id}/chat.
 #    - Tried both narrow header sets (Content-Type/Accept) and permissive '*' for methods/headers/expose.
 #    - Current: permissive '*' in global middleware; per-endpoint CORS headers removed to avoid conflicts.
 #
@@ -285,34 +285,63 @@ async def global_cors_middleware(request: Request, call_next):
 async def create_conversation(body: Dict[str, Any]):
     title = (body or {}).get("title") or "New Conversation"
     async with _pool().acquire() as conn:
-        row = await conn.fetchrow("INSERT INTO conversations (title, orch_cid) VALUES ($1, $2) RETURNING id, orch_cid", title, None)
-    return {"id": row[0], "title": title, "orch_cid": row[1]}
+        row = await conn.fetchrow(
+            "INSERT INTO conversations (title, orchestrator_conversation_id) VALUES ($1, $2) RETURNING id, orchestrator_conversation_id",
+            title,
+            None,
+        )
+    return {"id": row[0], "title": title, "orchestrator_conversation_id": row[1]}
 
 
 @app.get("/api/conversations")
 async def list_conversations():
     async with _pool().acquire() as conn:
-        rows = await conn.fetch("SELECT id, title, orch_cid, created_at, updated_at FROM conversations ORDER BY updated_at DESC LIMIT 100")
-        data = [{"id": r["id"], "title": r["title"], "orch_cid": r["orch_cid"], "created_at": str(r["created_at"]), "updated_at": str(r["updated_at"]) } for r in rows]
+        rows = await conn.fetch(
+            "SELECT id, title, orchestrator_conversation_id, created_at, updated_at FROM conversations ORDER BY updated_at DESC LIMIT 100"
+        )
+        data = [
+            {
+                "id": r["id"],
+                "title": r["title"],
+                "orchestrator_conversation_id": r["orchestrator_conversation_id"],
+                "created_at": str(r["created_at"]),
+                "updated_at": str(r["updated_at"]),
+            }
+            for r in rows
+        ]
     return {"data": data}
 
 
-@app.post("/api/conversations/{cid}/orch_cid")
-async def set_orch_cid(cid: int, body: Dict[str, Any]):
-    orch_cid = (body or {}).get("orch_cid")
-    orch_cid = str(orch_cid).strip() if orch_cid is not None else ""
-    if not orch_cid:
-        return JSONResponse(status_code=400, content={"error": "missing orch_cid"})
+@app.post("/api/conversations/{conversation_id}/orchestrator_conversation_id")
+async def set_orchestrator_conversation_id(conversation_id: int, body: Dict[str, Any]):
+    orchestrator_conversation_id = (body or {}).get("orchestrator_conversation_id")
+    orchestrator_conversation_id = (
+        str(orchestrator_conversation_id).strip() if orchestrator_conversation_id is not None else ""
+    )
+    if not orchestrator_conversation_id:
+        return JSONResponse(status_code=400, content={"error": "missing orchestrator_conversation_id"})
     async with _pool().acquire() as conn:
-        await conn.execute("UPDATE conversations SET orch_cid=$1, updated_at=NOW() WHERE id=$2", orch_cid, cid)
-    return {"ok": True, "orch_cid": orch_cid}
+        await conn.execute(
+            "UPDATE conversations SET orchestrator_conversation_id=$1, updated_at=NOW() WHERE id=$2",
+            orchestrator_conversation_id,
+            conversation_id,
+        )
+    return {"ok": True, "orchestrator_conversation_id": orchestrator_conversation_id}
 
 
-@app.get("/api/conversations/{cid}/messages")
-async def list_messages(cid: int):
+@app.get("/api/conversations/{conversation_id}/messages")
+async def list_messages(conversation_id: int):
     async with _pool().acquire() as conn:
-        rows = await conn.fetch("SELECT id, role, content, created_at FROM messages WHERE conversation_id=$1 ORDER BY id ASC", cid)
-        return {"data": [{"id": r["id"], "role": r["role"], "content": _decode_json(r["content"]), "created_at": str(r["created_at"]) } for r in rows]}
+        rows = await conn.fetch(
+            "SELECT id, role, content, created_at FROM messages WHERE conversation_id=$1 ORDER BY id ASC",
+            conversation_id,
+        )
+        return {
+            "data": [
+                {"id": r["id"], "role": r["role"], "content": _decode_json(r["content"]), "created_at": str(r["created_at"])}
+                for r in rows
+            ]
+        }
 
 
 @app.post("/api/upload")
@@ -322,30 +351,43 @@ async def upload(conversation_id: int = Form(...), file: UploadFile = File(...))
 
 @app.post("/api/attachments.add")
 async def attachments_add(body: Dict[str, Any]):
-    cid = int((body or {}).get("conversation_id") or 0)
-    name = (body or {}).get("name") or ""
+    conversation_id = int((body or {}).get("conversation_id") or 0)
+    attachment_name = (body or {}).get("attachment_name") or ""
+    if not attachment_name and isinstance(body, dict) and "name" in body and isinstance(body["name"], str):
+        attachment_name = body["name"]
     url = (body or {}).get("url") or ""
     mime = (body or {}).get("mime") or "application/octet-stream"
-    if not cid or not url:
+    if not conversation_id or not url:
         return JSONResponse(status_code=400, content={"error": "missing conversation_id or url"})
     async with _pool().acquire() as conn:
-        await conn.execute("INSERT INTO attachments (conversation_id, name, url, mime) VALUES ($1, $2, $3, $4)", cid, name, url, mime)
+        await conn.execute(
+            "INSERT INTO attachments (conversation_id, name, url, mime) VALUES ($1, $2, $3, $4)",
+            conversation_id,
+            attachment_name,
+            url,
+            mime,
+        )
     return {"ok": True}
 
 
-@app.get("/api/conversations/{cid}/attachments")
-async def list_attachments(cid: int):
+@app.get("/api/conversations/{conversation_id}/attachments")
+async def list_attachments(conversation_id: int):
     async with _pool().acquire() as conn:
-        rows = await conn.fetch("SELECT id, name, url, mime FROM attachments WHERE conversation_id=$1 ORDER BY id", cid)
-        return {"data": [{"id": r["id"], "name": r["name"], "url": r["url"], "mime": r["mime"] } for r in rows]}
+        rows = await conn.fetch("SELECT id, name, url, mime FROM attachments WHERE conversation_id=$1 ORDER BY id", conversation_id)
+        return {"data": [{"attachment_id": r["id"], "attachment_name": r["name"], "url": r["url"], "mime": r["mime"] } for r in rows]}
 
 
-@app.post("/api/conversations/{cid}/message")
-async def add_message(cid: int, body: Dict[str, Any]):
+@app.post("/api/conversations/{conversation_id}/message")
+async def add_message(conversation_id: int, body: Dict[str, Any]):
     role = (body or {}).get("role") or "user"
     content = (body or {}).get("content") or ""
     async with _pool().acquire() as conn:
-        await conn.execute("INSERT INTO messages (conversation_id, role, content) VALUES ($1, $2, $3::jsonb)", cid, role, json.dumps({"text": content}))
+        await conn.execute(
+            "INSERT INTO messages (conversation_id, role, content) VALUES ($1, $2, $3::jsonb)",
+            conversation_id,
+            role,
+            json.dumps({"text": content}),
+        )
     return {"ok": True}
 
 

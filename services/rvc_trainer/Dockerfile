@@ -33,6 +33,7 @@ RUN python3 -m pip install --no-cache-dir "pip<24.1" && \
     python3 -m pip install --no-cache-dir \
         "torch==2.7.1+cu118" \
         "torchaudio==2.7.1+cu118" \
+        "torchvision==0.22.1+cu118" \
         --index-url https://download.pytorch.org/whl/cu118 && \
     python3 -m pip install --no-cache-dir -r requirements.txt && \
     python3 -m pip install --no-cache-dir "speechbrain==0.5.16"

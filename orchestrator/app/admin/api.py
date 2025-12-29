@@ -14,9 +14,9 @@ def get_jobs_list():
     return {"jobs": out}
 
 
-def get_jobs_replay(cid: str):
-    events = read_all("/workspace/uploads/state/traces", cid)
-    return {"cid": cid, "events": events[-500:]}
+def get_jobs_replay(conversation_id: str):
+    events = read_all("/workspace/uploads/state/traces", conversation_id)
+    return {"conversation_id": conversation_id, "events": events}
 
 
 def post_artifacts_gc(body: Dict[str, Any]):

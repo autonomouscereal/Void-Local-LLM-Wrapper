@@ -12,9 +12,9 @@ import numpy as np
 import soundfile as sf
 import torch
 from fastapi import FastAPI
-from fastapi.responses import JSONResponse
 from TTS.api import TTS  # type: ignore
 from void_json.json_parser import JSONParser
+from void_envelopes import ToolEnvelope
 
 
 MODEL_NAME = os.getenv("XTTS_MODEL_NAME", "tts_models/multilingual/multi-dataset/xtts_v2")
@@ -33,7 +33,7 @@ _TTS_ENGINES: Dict[str, TTS] = {}
 _TTS_MODEL_MAP: Dict[str, str] = {}
 
 
-def _load_voice_model_map() -> None:
+def _load_voice_model_map():
     """
     Initialize _TTS_MODEL_MAP from XTTS_VOICE_MODEL_MAP when present.
 
@@ -72,7 +72,7 @@ def _load_voice_model_map() -> None:
             os.replace(tmp, map_path)
             return
         else:
-            logging.warning("xtts.voice_model_map.invalid_type type=%s", type(obj))
+            logging.warning(f"xtts.voice_model_map.invalid_type type={type(obj)!r}")
             _TTS_MODEL_MAP = {}
             return
 
@@ -105,7 +105,7 @@ def _load_voice_model_map() -> None:
 _load_voice_model_map()
 
 
-def _normalize_language(lang: Any, supported: Optional[list[str]] = None) -> str:
+def _normalize_language(lang: Any, supported: Optional[list[str]] = None):
     """
     XTTS expects short language codes (e.g. "en", "zh-cn").
 
@@ -143,7 +143,7 @@ def _normalize_language(lang: Any, supported: Optional[list[str]] = None) -> str
     return base or "en"
 
 
-def _canonical_voice_key(voice_id: Optional[str]) -> str:
+def _canonical_voice_key(voice_id: Optional[str]):
     """
     Map the incoming logical voice_id to a canonical cache key.
 
@@ -157,7 +157,7 @@ def _canonical_voice_key(voice_id: Optional[str]) -> str:
     return "default"
 
 
-def _resolve_model_identifier(voice_key: str) -> str:
+def _resolve_model_identifier(voice_key: str):
     """
     Resolve the concrete model identifier for a canonical voice key.
 
@@ -170,7 +170,7 @@ def _resolve_model_identifier(voice_key: str) -> str:
     return MODEL_NAME
 
 
-def _get_engine_for_voice(voice_id: Optional[str]) -> Tuple[TTS, str, str, str]:
+def _get_engine_for_voice(voice_id: Optional[str]):
     """
     Look up or create a TTS engine for the given logical voice_id.
 
@@ -222,6 +222,7 @@ async def healthz():
 @app.post("/tts")
 async def tts(body: Dict[str, Any]):
     trace_id = body.get("trace_id") if isinstance(body.get("trace_id"), str) else "tt_xtts_unknown"
+    conversation_id = body.get("conversation_id") if isinstance(body.get("conversation_id"), str) else ""
     segment_id = (body.get("segment_id") or "").strip() if isinstance(body.get("segment_id"), str) else ""
     text_raw = body.get("text") or ""
     text = text_raw.strip()
@@ -235,22 +236,13 @@ async def tts(body: Dict[str, Any]):
         # This service will still select a safe speaker below.
         voice_id = "default"
     if not text:
-        # Always return a canonical envelope; do not rely on HTTP status codes or
-        # raised exceptions for control flow. Include a synthetic stack trace so
-        # upstream callers can debug even validation failures.
-        return JSONResponse(
-            status_code=200,
-            content={
-                "schema_version": 1,
-                "trace_id": trace_id,
-                "ok": False,
-                "result": None,
-                "error": {
-                    "code": "ValidationError",
-                    "message": "Missing 'text' for TTS.",
-                    "stack": "".join(traceback.format_stack()),
-                },
-            },
+        return ToolEnvelope.failure(
+            code="validation_error",
+            message="Missing 'text' for TTS.",
+            trace_id=trace_id,
+            conversation_id=conversation_id,
+            status=422,
+            details={"stack": "".join(traceback.format_stack())},
         )
 
     try:
@@ -298,12 +290,15 @@ async def tts(body: Dict[str, Any]):
                     speaker_id_to_use = str(speakers[0])
         except Exception:
             speaker_id_to_use = None
+        wav = None
+        err_first = None
         try:
             if speaker_id_to_use:
                 wav = engine.tts(text=text, speaker_id=speaker_id_to_use, language=language)  # type: ignore[call-arg]
             else:
                 wav = engine.tts(text=text, language=language)  # type: ignore[call-arg]
-        except Exception:
+        except Exception as ex:
+            err_first = ex
             # One more guard: if a speaker-related error occurs and we have
             # speakers available, retry with the first speaker.
             try:
@@ -311,53 +306,55 @@ async def tts(body: Dict[str, Any]):
                 if isinstance(speakers, (list, tuple)) and speakers:
                     wav = engine.tts(text=text, speaker_id=str(speakers[0]), language=language)  # type: ignore[call-arg]
                 else:
-                    raise
-            except Exception:
-                raise
+                    wav = None
+            except Exception as ex2:
+                logging.exception("xtts.tts.error trace_id=%s", trace_id)
+                return ToolEnvelope.failure(
+                    code="tts_generation_failed",
+                    message=str(ex2),
+                    trace_id=trace_id,
+                    conversation_id=conversation_id,
+                    status=500,
+                    details={"first_error": str(err_first) if err_first is not None else None, "stack": traceback.format_exc()},
+                )
+        if wav is None:
+            logging.exception("xtts.tts.error trace_id=%s", trace_id)
+            return ToolEnvelope.failure(
+                code="tts_generation_failed",
+                message=str(err_first) if err_first is not None else "tts generation failed",
+                trace_id=trace_id,
+                conversation_id=conversation_id,
+                status=500,
+                details={"stack": "".join(traceback.format_stack())},
+            )
         wav_arr = np.array(wav, dtype=np.float32)
         buf = io.BytesIO()
         sample_rate = 22050
         sf.write(buf, wav_arr, sample_rate, format="WAV")
         buf.seek(0)
         b64 = base64.b64encode(buf.read()).decode("utf-8")
-        return JSONResponse(
-            status_code=200,
-            content={
-                "schema_version": 1,
-                "trace_id": trace_id,
-                "ok": True,
-                "result": {
-                    "audio_wav_base64": b64,
-                    "sample_rate": sample_rate,
-                    "language": language,
-                    "voice_id": voice_id,
-                    "xtts_model_key": voice_key,
-                    # Optional segment identifier from upstream orchestrator; echoed back
-                    # so downstream RVC/mixer code can attribute this chunk.
-                    "segment_id": segment_id or None,
-                    # Derived duration in seconds; XTTS core may not return this directly.
-                    "duration_s": float(len(wav_arr)) / float(sample_rate) if sample_rate > 0 else 0.0,
-                    "model": model_identifier,
-                },
-                "error": None,
+        return ToolEnvelope.success(
+            result={
+                "audio_wav_base64": b64,
+                "sample_rate": sample_rate,
+                "language": language,
+                "voice_id": voice_id,
+                "xtts_model_key": voice_key,
+                "segment_id": segment_id or None,
+                "duration_s": float(len(wav_arr)) / float(sample_rate) if sample_rate > 0 else 0.0,
+                "model": model_identifier,
             },
+            trace_id=trace_id,
+            conversation_id=conversation_id,
         )
     except Exception as ex:
         logging.exception("xtts.tts.error trace_id=%s", trace_id)
-        # Surface all internal failures as a structured envelope instead of
-        # letting exceptions or HTTP 500s leak to the caller.
-        return JSONResponse(
-            status_code=200,
-            content={
-                "schema_version": 1,
-                "trace_id": trace_id,
-                "ok": False,
-                "result": None,
-                "error": {
-                    "code": ex.__class__.__name__ or "InternalError",
-                    "message": str(ex),
-                    "stack": traceback.format_exc(),
-                },
-            },
+        return ToolEnvelope.failure(
+            code=ex.__class__.__name__ or "internal_error",
+            message=str(ex),
+            trace_id=trace_id,
+            conversation_id=conversation_id,
+            status=500,
+            details={"stack": traceback.format_exc()},
         )
 

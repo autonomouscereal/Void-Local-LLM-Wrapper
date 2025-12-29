@@ -66,7 +66,7 @@ async def generate(body: Dict[str, Any]):
             "seconds": int,
             "seed": Optional[int],
             "refs": Optional[list],
-            "cid": Optional[str]
+            "conversation_id": str
           }
       - Response JSON on success:
           {
@@ -78,50 +78,37 @@ async def generate(body: Dict[str, Any]):
             "relative_url": str,
             "duration_s": int
           }
-    The file is persisted under UPLOAD_DIR/artifacts/music/{cid}/{artifact_id}.wav
+    The file is persisted under UPLOAD_DIR/artifacts/music/{conversation_id}/{artifact_id}.wav
     so the orchestrator/UI can serve it via /uploads/.
     """
     t0 = time.time()
     prompt = body.get("prompt") or ""
     seconds = int(body.get("seconds", 8))
-    cid = str(body.get("cid") or "music")
-    trace_id = body.get("trace_id") if isinstance(body.get("trace_id"), str) else "music_unknown"
-    request_id = (
-        str(body.get("request_id")).strip()
-        if isinstance(body.get("request_id"), (str, int)) and str(body.get("request_id")).strip()
-        else None
-    )
+    trace_id = body.get("trace_id")
+    conversation_id = body.get("conversation_id")
     seed = body.get("seed")
     logger.info(
-        "music.generate.request prompt_preview=%r prompt_len=%s seconds=%s seed=%s cid=%r trace_id=%r request_id=%r",
-        (prompt[:80] if isinstance(prompt, str) else ""),
-        (len(prompt) if isinstance(prompt, str) else 0),
-        seconds,
-        seed,
-        cid,
-        trace_id,
-        request_id,
+        f"music.generate.request prompt_preview={prompt} "
+        f"prompt_len={len(prompt)} "
+        f"conversation_id={conversation_id} trace_id={trace_id}"
     )
     if not prompt:
         # Surface validation errors as structured JSON with a synthetic stack for debugging.
-        logger.warning(
-            "music.generate.validation_error missing_prompt cid=%r trace_id=%r",
-            cid,
-            trace_id,
-        )
+        logger.warning(f"music.generate.validation_error missing_prompt conversation_id={conversation_id} trace_id={trace_id}")
         return ToolEnvelope.failure(
-            "ValidationError",
-            "prompt is required for music generation",
+            code="ValidationError",
+            message="prompt is required for music generation",
+            trace_id=trace_id,
+            conversation_id=conversation_id,
             status=400,
             details={
-                "cid": cid,
                 "trace_id": trace_id,
+                "conversation_id": conversation_id,
                 "stack": "".join(traceback.format_stack()),
             },
-            request_id=request_id,
         )
     try:
-        logger.info("music.generate.invoke_engine cid=%r trace_id=%r request_id=%r", cid, trace_id, request_id)
+        logger.info(f"music.generate.invoke_engine conversation_id={conversation_id} trace_id={trace_id}")
         wav = generate_music(
             prompt=prompt,
             seconds=seconds,
@@ -139,7 +126,8 @@ async def generate(body: Dict[str, Any]):
 
         # Persist clip to disk so orchestrator/UI have a stable artifact URL.
         upload_root = os.getenv("UPLOAD_DIR", "/workspace/uploads")
-        outdir = os.path.join(upload_root, "artifacts", "music", cid)
+        outdir_key = conversation_id
+        outdir = os.path.join(upload_root, "artifacts", "music", outdir_key)
         os.makedirs(outdir, exist_ok=True)
         artifact_id = f"clip_{int(time.time())}"
         path = os.path.join(outdir, f"{artifact_id}.wav")
@@ -150,15 +138,8 @@ async def generate(body: Dict[str, Any]):
         relative_url = f"/uploads/{rel}"
 
         logger.info(
-            "music.generate.saved cid=%s trace_id=%r request_id=%r artifact_id=%s path=%s url=%s bytes=%s total_ms=%s",
-            cid,
-            trace_id,
-            request_id,
-            artifact_id,
-            path,
-            relative_url,
-            len(wav),
-            int((time.time() - t0) * 1000.0),
+            f"music.generate.saved conversation_id={conversation_id} trace_id={trace_id} artifact_id={artifact_id} "
+            f"path={path} url={relative_url} bytes={len(wav)} total_ms={int((time.time() - t0) * 1000.0)}"
         )
 
         b64 = base64.b64encode(wav).decode("utf-8")
@@ -173,26 +154,22 @@ async def generate(body: Dict[str, Any]):
             "relative_url": relative_url,
             "duration_s": seconds,
             "path": path,
-            "cid": cid,
+            "trace_id": trace_id,
+            "conversation_id": conversation_id,
         }
-        return ToolEnvelope.success(result, request_id=request_id)
+        return ToolEnvelope.success(result=result, trace_id=trace_id, conversation_id=conversation_id)
     except Exception as ex:  # surface full error as structured JSON
-        logger.exception(
-            "music.generate error cid=%r trace_id=%r request_id=%r total_ms=%s",
-            cid,
-            trace_id,
-            request_id,
-            int((time.time() - t0) * 1000.0),
-        )
+        logger.exception(f"music.generate error conversation_id={conversation_id} trace_id={trace_id} total_ms={int((time.time() - t0) * 1000.0)}")
         return ToolEnvelope.failure(
-            ex.__class__.__name__ or "InternalError",
-            str(ex),
+            code=(ex.__class__.__name__ or "InternalError"),
+            message=str(ex),
+            trace_id=trace_id,
+            conversation_id=conversation_id,
             status=500,
             details={
-                "cid": cid,
                 "trace_id": trace_id,
+                "conversation_id": conversation_id,
                 "stack": traceback.format_exc(),
             },
-            request_id=request_id,
         )
 

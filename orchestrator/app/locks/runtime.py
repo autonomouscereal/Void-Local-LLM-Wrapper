@@ -594,23 +594,23 @@ def summarize_music_bundle_for_context(
         for sec in sections:
             if not isinstance(sec, dict):
                 continue
-            sid = sec.get("section_id")
-            if not isinstance(sid, str) or not sid:
+            section_id = sec.get("section_id")
+            if not isinstance(section_id, str) or not section_id:
                 continue
             stype = sec.get("type") or ""
             tags = ["music.section"]
             if isinstance(stype, str) and stype:
                 tags.append(f"type:{stype}")
-            text_desc = f"music section {sid} ({stype}) for character {character_id}"
+            text_desc = f"music section {section_id} ({stype}) for character {character_id}"
             meta = {
                 "text": text_desc,
-                "section_id": sid,
+                "section_id": section_id,
                 "type": stype,
                 "order_index": sec.get("order_index"),
                 "bar_start": sec.get("bar_start"),
                 "bar_end": sec.get("bar_end"),
             }
-            ctx_add(character_id, "audio.section", sid, None, None, tags, meta)
+            ctx_add(character_id, "audio.section", section_id, None, None, tags, meta)
     # Motifs
     motifs = mus.get("motifs")
     if isinstance(motifs, list):
@@ -671,42 +671,44 @@ def summarize_tts_bundle_for_context(
     # Styles
     styles = tts.get("styles")
     if isinstance(styles, list):
-        for s in styles:
-            if not isinstance(s, dict):
+        for style_entry in styles:
+            if not isinstance(style_entry, dict):
                 continue
-            sid = s.get("style_id")
-            if not isinstance(sid, str) or not sid:
+            style_id = style_entry.get("style_id")
+            if not isinstance(style_id, str) or not style_id:
                 continue
-            name = s.get("name") or ""
+            style_name = style_entry.get("style_name")
+            if not isinstance(style_name, str):
+                style_name = ""
             tags = ["tts.style"]
-            text_desc = f"tts style {sid} ({name})"
+            text_desc = f"tts style {style_id} ({style_name})"
             meta = {
                 "text": text_desc,
-                "style_id": sid,
-                "name": name,
-                "tags": list(s.get("tags") or []),
+                "style_id": style_id,
+                "style_name": style_name,
+                "tags": list(style_entry.get("tags") or []),
             }
-            ctx_add(character_id, "tts.style", sid, None, None, tags, meta)
+            ctx_add(character_id, "tts.style", style_id, None, None, tags, meta)
     # Segments
     segments = tts.get("segments")
     if isinstance(segments, list):
-        for seg in segments:
-            if not isinstance(seg, dict):
+        for segment_entry in segments:
+            if not isinstance(segment_entry, dict):
                 continue
-            seg_id = seg.get("segment_id")
-            if not isinstance(seg_id, str) or not seg_id:
+            segment_id = segment_entry.get("segment_id")
+            if not isinstance(segment_id, str) or not segment_id:
                 continue
-            text_ref = seg.get("text_ref") if isinstance(seg.get("text_ref"), dict) else {}
+            text_ref = segment_entry.get("text_ref") if isinstance(segment_entry.get("text_ref"), dict) else {}
             txt = text_ref.get("text") or ""
             tags = ["tts.segment"]
-            text_desc = f"tts segment {seg_id} text={txt!r}"
+            text_desc = f"tts segment {segment_id} text={txt}"
             meta = {
                 "text": text_desc,
-                "segment_id": seg_id,
-                "scene_id": seg.get("scene_id"),
-                "line_index": seg.get("line_index"),
+                "segment_id": segment_id,
+                "scene_id": segment_entry.get("scene_id"),
+                "line_index": segment_entry.get("line_index"),
             }
-            ctx_add(character_id, "tts.segment", seg_id, None, None, tags, meta)
+            ctx_add(character_id, "tts.segment", segment_id, None, None, tags, meta)
 
 
 def summarize_sfx_bundle_for_context(
@@ -818,19 +820,19 @@ def summarize_film2_bundle_for_context(
         for sc in scenes:
             if not isinstance(sc, dict):
                 continue
-            sid = sc.get("scene_id")
-            if not isinstance(sid, str) or not sid:
+            scene_id = sc.get("scene_id")
+            if not isinstance(scene_id, str) or not scene_id:
                 continue
             slug = ((sc.get("script_ref") or {}) or {}).get("slugline")
             tags = ["film2.scene"]
-            text_desc = f"film2 scene {sid} slugline={slug!r}"
+            text_desc = f"film2 scene {scene_id} slugline={slug!r}"
             meta = {
                 "text": text_desc,
-                "scene_id": sid,
+                "scene_id": scene_id,
                 "sequence_id": sc.get("sequence_id"),
                 "tags": sc.get("tags"),
             }
-            ctx_add(character_id, "film2.scene", sid, None, None, tags, meta)
+            ctx_add(character_id, "film2.scene", scene_id, None, None, tags, meta)
     shots = film2.get("shots")
     if isinstance(shots, list):
         for sh in shots:
@@ -851,22 +853,22 @@ def summarize_film2_bundle_for_context(
             ctx_add(character_id, "film2.shot", shot_id, None, None, tags, meta)
     segments = film2.get("segments")
     if isinstance(segments, list):
-        for seg in segments:
-            if not isinstance(seg, dict):
+        for segment in segments:
+            if not isinstance(segment, dict):
                 continue
-            seg_id = seg.get("segment_id")
-            if not isinstance(seg_id, str) or not seg_id:
+            segment_id = segment.get("segment_id")
+            if not isinstance(segment_id, str) or not segment_id:
                 continue
-            shot_id = seg.get("shot_id")
+            shot_id = segment.get("shot_id")
             tags = ["film2.segment"]
-            text_desc = f"film2 segment {seg_id} (shot {shot_id})"
+            text_desc = f"film2 segment {segment_id} (shot {shot_id})"
             meta = {
                 "text": text_desc,
-                "segment_id": seg_id,
+                "segment_id": segment_id,
                 "shot_id": shot_id,
-                "scene_id": seg.get("scene_id"),
+                "scene_id": segment.get("scene_id"),
             }
-            ctx_add(character_id, "film2.segment", seg_id, None, None, tags, meta)
+            ctx_add(character_id, "film2.segment", segment_id, None, None, tags, meta)
 
 
 def summarize_all_locks_for_context(
@@ -1099,9 +1101,9 @@ def bundle_to_image_locks(bundle: Dict[str, Any]) -> Dict[str, Any]:
                         img_path = ref.get("image_path")
                         break
                 constraints = face_ent.get("constraints") if isinstance(face_ent.get("constraints"), dict) else {}
-                strength_val = constraints.get("strength")
-                if isinstance(strength_val, (int, float)):
-                    weight = float(strength_val)
+                strength = constraints.get("strength")
+                if isinstance(strength, (int, float)):
+                    weight = float(strength)
                 else:
                     weight = 0.75
                 face_locks.append(
@@ -1121,8 +1123,8 @@ def bundle_to_image_locks(bundle: Dict[str, Any]) -> Dict[str, Any]:
         pose_block = vis.get("pose") if isinstance(vis.get("pose"), dict) else {}
         if pose_block.get("skeleton"):
             constraints = pose_block.get("constraints") if isinstance(pose_block.get("constraints"), dict) else {}
-            strength_val = constraints.get("strength")
-            strength = float(strength_val) if isinstance(strength_val, (int, float)) else 0.7
+            strength = constraints.get("strength")
+            strength = float(strength) if isinstance(strength, (int, float)) else 0.7
             locks["poses"] = [
                 {
                     "ref_b64": None,
@@ -1152,8 +1154,8 @@ def bundle_to_image_locks(bundle: Dict[str, Any]) -> Dict[str, Any]:
                 mask_path = region.get("mask_path")
                 if not isinstance(mask_path, str):
                     continue
-                strength_val = (ent.get("constraints") or {}).get("strength")
-                strength = float(strength_val) if isinstance(strength_val, (int, float)) else 0.75
+                strength = (ent.get("constraints") or {}).get("strength")
+                strength = float(strength) if isinstance(strength, (int, float)) else 0.75
                 region_locks[str(ent_id or mask_path)] = {
                     "mask_b64": _read_file_b64(mask_path),
                     "role": ent.get("role"),

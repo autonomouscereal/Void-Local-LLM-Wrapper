@@ -5,12 +5,12 @@ from .checkpoints import read_all, last_event
 from .ids import short_hash
 
 
-def reconstruct_window_state(root: str, cid: str) -> Tuple[Dict[str, Any], List[str]]:
+def reconstruct_window_state(root: str, conversation_id: str) -> Tuple[Dict[str, Any], List[str]]:
     """
     Build a minimal state for WindowedSolver: anchor_text, candidates, entities.
     Also returns partials so we can continue CONT/HALT.
     """
-    evs = read_all(root, cid)
+    evs = read_all(root, conversation_id)
     partials: List[str] = []
     entities: Set[str] = set()
     candidates: List[str] = []
@@ -45,15 +45,14 @@ def reconstruct_window_state(root: str, cid: str) -> Tuple[Dict[str, Any], List[
     return state, partials
 
 
-def reconstruct_film_checkpoint(root: str, cid: str) -> Dict[str, Any]:
-    ev = last_event(root, cid, "phase") or {"data": {"phase": 0}}
+def reconstruct_film_checkpoint(root: str, conversation_id: str) -> Dict[str, Any]:
+    ev = last_event(root, conversation_id, "phase") or {"data": {"phase": 0}}
     phase = int(ev.get("data", {}).get("phase", 0))
     shots_done: Set[str] = set()
-    for e in read_all(root, cid):
+    for e in read_all(root, conversation_id):
         if e.get("kind") == "shot_done":
-            sid = (e.get("data", {}) or {}).get("shot_id")
-            if isinstance(sid, str):
-                shots_done.add(sid)
+            shot_id = (e.get("data", {}) or {}).get("shot_id")
+            shots_done.add(shot_id)
     return {"phase": phase, "shots_done": sorted(shots_done)}
 
 

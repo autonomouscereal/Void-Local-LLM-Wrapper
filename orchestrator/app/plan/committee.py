@@ -239,8 +239,13 @@ async def produce_tool_plan(
     )
     # Always run a final JSONParser coercion pass to guarantee expected types/shape.
     parser_steps = JSONParser()
-    parsed = parser_steps.parse(parsed_raw if parsed_raw is not None else "{}", schema_steps)
-    if not isinstance(parsed, dict):
+    try:
+        parsed = parser_steps.parse(parsed_raw if parsed_raw is not None else "{}", schema_steps)
+        if not isinstance(parsed, dict):
+            log.warning("produce_tool_plan: JSONParser returned non-dict type=%s trace_id=%s", type(parsed).__name__, trace_id)
+            parsed = {}
+    except Exception as ex:
+        log.warning("produce_tool_plan: JSONParser.parse failed ex=%s trace_id=%s parsed_raw_prefix=%s", ex, trace_id, (str(parsed_raw) if parsed_raw else "")[:200], exc_info=True)
         parsed = {}
     parse_ms = int((time.perf_counter() - t_parse) * 1000)
 
@@ -252,11 +257,18 @@ async def produce_tool_plan(
     for st in steps_raw or []:
         if not isinstance(st, dict):
             rejected += 1
+            log.debug("produce_tool_plan: skipping non-dict step type=%s trace_id=%s", type(st).__name__, trace_id)
             continue
         step_id_val = st.get("step_id")
-        tool_name = str(st.get("tool") or st.get("name") or "").strip()
-        if not tool_name or tool_name not in allowed_set:
+        tool_name = st.get("tool_name")
+        if not isinstance(tool_name, str) or not tool_name.strip():
             rejected += 1
+            log.debug("produce_tool_plan: skipping step with missing/invalid tool_name trace_id=%s", trace_id)
+            continue
+        tool_name = tool_name.strip()
+        if tool_name not in allowed_set:
+            rejected += 1
+            log.debug("produce_tool_plan: skipping step with disallowed tool_name=%s trace_id=%s", tool_name, trace_id)
             continue
         args_val = st.get("args") if ("args" in st) else st.get("arguments")
         # Keep args always JSON-object-ish; downstream hardeners expect an object.
@@ -280,7 +292,7 @@ async def produce_tool_plan(
         if not step_id_str:
             # Defensive fallback: keep tool_calls stable even if planner omitted step_id.
             step_id_str = f"s{len(tool_calls) + 1}"
-        tool_calls.append({"name": tool_name, "arguments": args_val, "step_id": step_id_str})
+        tool_calls.append({"tool_name": tool_name, "arguments": args_val, "step_id": step_id_str})
 
     dt_ms = int((time.perf_counter() - t0) * 1000)
     log.info(

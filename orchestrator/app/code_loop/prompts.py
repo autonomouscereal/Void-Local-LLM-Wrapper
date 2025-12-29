@@ -58,7 +58,7 @@ Do NOT weaken, ignore, or interpret them.
 - Public APIs use JSON-only envelopes; no magic schema layers.
 - /v1/chat/completions: always HTTP 200 with OpenAI-compatible JSON; choices[0].message.content must be present and non-empty on success.
 - Tool-ish routes (chat-adjacent tools like image, film/video, audio/music/tts, /tool.run, http.request/api.request shims) must ALWAYS return HTTP 200 with a canonical envelope:
-  - {{\"schema_version\":1,\"request_id\":\"...\",\"ok\":true|false,\"result\":{{...}} or null,\"error\":{{\"code\":\"...\",\"message\":\"...\",\"status\":int,\"details\":{{...}}}} or null}}.
+  - {{\"schema_version\":1,\"trace_id\":\"...\",\"ok\":true|false,\"result\":{{...}} or null,\"error\":{{\"code\":\"...\",\"message\":\"...\",\"status\":int,\"details\":{{...}}}} or null}}.
 - `ok` is the ONLY source of truth for success/failure; `error.status` carries semantic status (400/422/500/remote HTTP codes) but never becomes the HTTP status for these routes.
 - Tool/executor args MUST be JSON objects at execution time; if planning emits strings, include explicit json.parse before execution; executors assume proper objects.
 

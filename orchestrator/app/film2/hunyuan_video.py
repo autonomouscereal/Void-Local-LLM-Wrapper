@@ -13,11 +13,14 @@ This module centralizes:
 import logging
 import os
 import time
+import hashlib
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import httpx  # type: ignore
 
 from ..json_parser import JSONParser
+from ..tracing.runtime import trace_event
+from void_artifacts import build_artifact
 
 
 log = logging.getLogger(__name__)
@@ -80,7 +83,7 @@ def hv_args_to_generate_payload(args: Dict[str, Any], *, upload_dir: str, job_pr
 
     # Preserve the full hv tool args for distillation/debugging without affecting the service pipeline call.
     req_meta: Dict[str, Any] = {}
-    for k in ("cid", "trace_id", "step_id", "film_id", "scene_id", "shot_id", "act_id", "locks", "post", "latent_reinit_every", "quality", "adapter"):
+    for k in ("conversation_id", "trace_id", "step_id", "film_id", "scene_id", "shot_id", "act_id", "locks", "post", "latent_reinit_every", "quality", "adapter"):
         v = args.get(k)
         if v is not None:
             req_meta[k] = v
@@ -124,7 +127,15 @@ async def hyvideo_generate(api_url: str, payload: Dict[str, Any]) -> Dict[str, A
     return out
 
 
-def normalize_generate_response(resp: Dict[str, Any], *, upload_dir: str) -> Dict[str, Any]:
+def normalize_generate_response(
+    resp: Dict[str, Any],
+    *,
+    upload_dir: str,
+    trace_id: Optional[str] = None,
+    conversation_id: Optional[str] = None,
+    shot_id: Optional[str] = None,
+    artifact_id: Optional[str] = None,
+) -> Dict[str, Any]:
     """
     Normalize service response into the legacy tool shape:
       - path/view_url for simple callers
@@ -143,7 +154,32 @@ def normalize_generate_response(resp: Dict[str, Any], *, upload_dir: str) -> Dic
     meta = dict(result) if isinstance(result, dict) else {}
     artifacts: List[Dict[str, Any]] = []
     if abs_path:
-        artifacts.append({"kind": "video", "path": abs_path, "view_url": view_url})
+        # Generate unique artifact_id if not provided: trace_id + tool_name + shot_id + unique suffix
+        # Note: File is created by external service, so we derive artifact_id from the returned path
+        if not artifact_id:
+            file_basename = os.path.basename(abs_path)
+            file_size = os.path.getsize(abs_path) if os.path.exists(abs_path) else 0
+            from void_artifacts import generate_artifact_id
+            artifact_id = generate_artifact_id(
+                trace_id=(trace_id or ""),
+                tool_name="film2.hunyuan_video",
+                conversation_id=(conversation_id or ""),
+                suffix_data=f"{shot_id or 'none'}:{file_basename}:{file_size}",
+            )
+        artifacts.append(
+            build_artifact(
+                artifact_id=artifact_id,
+                kind="video",
+                path=abs_path,
+                trace_id=trace_id if isinstance(trace_id, str) else "",
+                conversation_id=conversation_id if isinstance(conversation_id, str) else None,
+                tool_name="film2.hunyuan_video",
+                view_url=view_url,
+                url=view_url,
+                tags=[],
+                shot_id=shot_id if isinstance(shot_id, str) else None,
+            )
+        )
     return {
         "path": abs_path,
         "view_url": view_url,
@@ -162,7 +198,7 @@ def build_hv_tool_args(
     seconds: int,
     locks: Dict[str, Any] | None,
     seed: Any,
-    cid: str,
+    conversation_id: str,
     trace_id: Optional[str] = None,
     film_id: Optional[str] = None,
     scene_id: Optional[str] = None,
@@ -181,7 +217,7 @@ def build_hv_tool_args(
         # These are legacy tool args; the HyVideo adapter may ignore some.
         "post": {"interpolate": True, "upscale": True, "face_lock": True, "hand_fix": True},
         "latent_reinit_every": 48,
-        "cid": cid,
+        "conversation_id": conversation_id,
     }
     if isinstance(trace_id, str) and trace_id.strip():
         args["trace_id"] = trace_id.strip()
@@ -207,7 +243,6 @@ async def film2_generate_video(
     hv_tool_args: Dict[str, Any],
     upload_dir: str,
     log_fn,
-    trace_append: Callable[[str, Dict[str, Any]], None],
     http_tool_run,
     artifact_video: Optional[Callable[[Optional[str], str], None]] = None,
 ) -> Tuple[Optional[str], List[Dict[str, Any]]]:
@@ -216,13 +251,13 @@ async def film2_generate_video(
     on the produced video to compute lock metrics/frames for hero selection.
     """
     segment_log: List[Dict[str, Any]] = []
-    cid = hv_tool_args.get("cid") if isinstance(hv_tool_args.get("cid"), str) else None
+    conversation_id = hv_tool_args.get("conversation_id")
 
     adapter = "hv.i2v" if isinstance(hv_tool_args.get("init_image"), str) and hv_tool_args.get("init_image") else "hv.t2v"
     if isinstance(trace_id, str) and trace_id and log_fn:
         # main._log signature: _log(kind, trace_id=..., **fields)
         log_fn("film2.pass_gen_start", trace_id=trace_id, adapter=adapter, shot_id=shot_id)
-    trace_append(
+    trace_event(
         "film2.hv_call_start",
         {
             "trace_id": trace_id,
@@ -251,7 +286,7 @@ async def film2_generate_video(
             video_obj = gvr.get("video") if isinstance(gvr.get("video"), dict) else {}
             gen_path = video_obj.get("path") if isinstance(video_obj.get("path"), str) else None
     if isinstance(gen_path, str) and gen_path:
-        trace_append(
+        trace_event(
             "film2.hv_call_success",
             {
                 "trace_id": trace_id,
@@ -276,8 +311,8 @@ async def film2_generate_video(
         # Optional upscale pass: run before interpolation so interpolation never changes duration/scale unexpectedly.
         if bool(post.get("upscale")) and isinstance(current_path, str) and current_path:
             up_args: Dict[str, Any] = {"src": current_path}
-            if isinstance(cid, str) and cid:
-                up_args["cid"] = cid
+            
+            up_args["conversation_id"] = conversation_id
             if isinstance(trace_id, str) and trace_id:
                 up_args["trace_id"] = trace_id
             for k in ("film_id", "scene_id", "shot_id", "act_id"):
@@ -286,7 +321,7 @@ async def film2_generate_video(
                     up_args[k] = str(v).strip()
             if log_fn and isinstance(trace_id, str) and trace_id:
                 log_fn("film2.pass_upscale_start", trace_id=trace_id, shot_id=shot_id)
-            trace_append("film2.fix.upscale.start", {"trace_id": trace_id, "shot_id": shot_id, "scene_id": scene_id, "act_id": act_id})
+            trace_event("film2.fix.upscale.start", {"trace_id": trace_id, "shot_id": shot_id, "scene_id": scene_id, "act_id": act_id})
             uc = await http_tool_run("video.upscale", up_args)
             if isinstance(uc, dict):
                 segment_log.append(uc)
@@ -294,7 +329,7 @@ async def film2_generate_video(
             up_path = ucr.get("path") if isinstance(ucr, dict) else None
             if log_fn and isinstance(trace_id, str) and trace_id:
                 log_fn("film2.pass_upscale_finish", trace_id=trace_id, shot_id=shot_id, out_path=up_path)
-            trace_append("film2.fix.upscale.finish", {"trace_id": trace_id, "shot_id": shot_id, "scene_id": scene_id, "act_id": act_id, "out_path": up_path})
+            trace_event("film2.fix.upscale.finish", {"trace_id": trace_id, "shot_id": shot_id, "scene_id": scene_id, "act_id": act_id, "out_path": up_path})
             if isinstance(up_path, str) and up_path:
                 current_path = up_path
                 if artifact_video:
@@ -305,8 +340,7 @@ async def film2_generate_video(
         # whether model-tied stabilization actually ran (stabilize_attempted/applied).
         if bool(post.get("interpolate")) or bool(post.get("face_lock")):
             interp_args: Dict[str, Any] = {"src": current_path, "target_fps": int(hv_tool_args.get("fps") or 24)}
-            if isinstance(cid, str) and cid:
-                interp_args["cid"] = cid
+            interp_args["conversation_id"] = conversation_id
             if isinstance(trace_id, str) and trace_id:
                 interp_args["trace_id"] = trace_id
             # Provide deterministic refs when available, but do not gate the pass.
@@ -328,7 +362,7 @@ async def film2_generate_video(
                     has_face_refs=bool(face_images),
                     face_refs_n=(len(face_images) if isinstance(face_images, list) else 0),
                 )
-            trace_append(
+            trace_event(
                 "film2.fix.interpolate.start",
                 {"trace_id": trace_id, "shot_id": shot_id, "scene_id": scene_id, "act_id": act_id, "target_fps": interp_args.get("target_fps"), "has_face_refs": bool(face_images), "face_refs_n": len(face_images or [])},
             )
@@ -347,7 +381,7 @@ async def film2_generate_video(
                     stabilize_attempted=(meta.get("stabilize_attempted") if isinstance(meta, dict) else None),
                     stabilize_applied=(meta.get("stabilize_applied") if isinstance(meta, dict) else None),
                 )
-            trace_append(
+            trace_event(
                 "film2.fix.interpolate.finish",
                 {"trace_id": trace_id, "shot_id": shot_id, "scene_id": scene_id, "act_id": act_id, "out_path": ip, "tool_result_meta": (icr.get("meta") if isinstance(icr, dict) else None)},
             )
@@ -359,8 +393,7 @@ async def film2_generate_video(
         # Hand repair pass (per-frame mediapipe mask + inpaint).
         if bool(post.get("hand_fix")) and isinstance(current_path, str) and current_path:
             hf_args: Dict[str, Any] = {"src": current_path}
-            if isinstance(cid, str) and cid:
-                hf_args["cid"] = cid
+            hf_args["conversation_id"] = conversation_id
             if isinstance(trace_id, str) and trace_id:
                 hf_args["trace_id"] = trace_id
             for k in ("film_id", "scene_id", "shot_id", "act_id"):
@@ -369,7 +402,7 @@ async def film2_generate_video(
                     hf_args[k] = str(v).strip()
             if log_fn and isinstance(trace_id, str) and trace_id:
                 log_fn("film2.pass_handsfix_start", trace_id=trace_id, shot_id=shot_id)
-            trace_append("film2.fix.hands.start", {"trace_id": trace_id, "shot_id": shot_id, "scene_id": scene_id, "act_id": act_id})
+            trace_event("film2.fix.hands.start", {"trace_id": trace_id, "shot_id": shot_id, "scene_id": scene_id, "act_id": act_id})
             hf = await http_tool_run("video.hands.fix", hf_args)
             if isinstance(hf, dict):
                 segment_log.append(hf)
@@ -377,7 +410,7 @@ async def film2_generate_video(
             hp = hfr.get("path") if isinstance(hfr, dict) else None
             if log_fn and isinstance(trace_id, str) and trace_id:
                 log_fn("film2.pass_handsfix_finish", trace_id=trace_id, shot_id=shot_id, out_path=hp)
-            trace_append("film2.fix.hands.finish", {"trace_id": trace_id, "shot_id": shot_id, "scene_id": scene_id, "act_id": act_id, "out_path": hp})
+            trace_event("film2.fix.hands.finish", {"trace_id": trace_id, "shot_id": shot_id, "scene_id": scene_id, "act_id": act_id, "out_path": hp})
             if isinstance(hp, str) and hp:
                 current_path = hp
                 if artifact_video:
@@ -386,8 +419,7 @@ async def film2_generate_video(
     # Post-pass: compute lock metrics/frames using cleanup so Film2 QA can operate on the FINAL path.
     if isinstance(current_path, str) and current_path:
         cc_args: Dict[str, Any] = {"src": current_path}
-        if isinstance(cid, str) and cid:
-            cc_args["cid"] = cid
+        cc_args["conversation_id"] = conversation_id
         if isinstance(trace_id, str) and trace_id:
             cc_args["trace_id"] = trace_id
         # Preserve Film2 identifiers for distillation joins.
@@ -400,7 +432,7 @@ async def film2_generate_video(
             cc_args["lock_bundle"] = hv_tool_args.get("locks")
         if log_fn and isinstance(trace_id, str) and trace_id:
             log_fn("film2.pass_cleanup_start", trace_id=trace_id, shot_id=shot_id, src=current_path)
-        trace_append("film2.fix.cleanup.start", {"trace_id": trace_id, "shot_id": shot_id, "scene_id": scene_id, "act_id": act_id, "src": current_path})
+        trace_event("film2.fix.cleanup.start", {"trace_id": trace_id, "shot_id": shot_id, "scene_id": scene_id, "act_id": act_id, "src": current_path})
         cc = await http_tool_run("video.cleanup", cc_args)
         if isinstance(cc, dict):
             segment_log.append(cc)
@@ -408,7 +440,7 @@ async def film2_generate_video(
         outp = ccr.get("path") if isinstance(ccr, dict) else None
         if log_fn and isinstance(trace_id, str) and trace_id:
             log_fn("film2.pass_cleanup_finish", trace_id=trace_id, shot_id=shot_id, out_path=outp)
-        trace_append("film2.fix.cleanup.finish", {"trace_id": trace_id, "shot_id": shot_id, "scene_id": scene_id, "act_id": act_id, "out_path": outp})
+        trace_event("film2.fix.cleanup.finish", {"trace_id": trace_id, "shot_id": shot_id, "scene_id": scene_id, "act_id": act_id, "out_path": outp})
 
     if log_fn and isinstance(trace_id, str) and trace_id:
         log_fn(
@@ -418,7 +450,7 @@ async def film2_generate_video(
             final_path=current_path,
             segment_results=len(segment_log),
         )
-    trace_append(
+    trace_event(
         "film2.video.complete",
         {"trace_id": trace_id, "shot_id": shot_id, "scene_id": scene_id, "act_id": act_id, "final_path": current_path, "segment_results": len(segment_log)},
     )

@@ -70,7 +70,7 @@ SPK_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 SPK_INDEX_PATH = os.path.join(RVC_MODELS_ROOT, "speaker_index.json")
 
 
-def get_speaker_encoder() -> Any:
+def get_speaker_encoder():
     """
     Lazily load the speaker embedding model (ECAPA-TDNN).
     This runs only once per process.
@@ -88,7 +88,7 @@ def get_speaker_encoder() -> Any:
     return _SPKREC_MODEL
 
 
-def compute_speaker_embedding(wav_path: str) -> np.ndarray:
+def compute_speaker_embedding(wav_path: str):
     """
     Compute a speaker embedding for a single WAV file using the ECAPA encoder.
     """
@@ -115,7 +115,7 @@ def compute_speaker_embedding(wav_path: str) -> np.ndarray:
     return emb_np
 
 
-def load_speaker_index() -> Dict[str, Any]:
+def load_speaker_index():
     """
     Load the speaker index mapping speaker_id -> {"embedding": [...], "count": int}.
     """
@@ -135,7 +135,7 @@ def load_speaker_index() -> Dict[str, Any]:
         return {}
 
 
-def save_speaker_index(index: Dict[str, Any]) -> None:
+def save_speaker_index(index: Dict[str, Any]):
     """Save the speaker index to disk."""
     os.makedirs(os.path.dirname(SPK_INDEX_PATH), exist_ok=True)
     tmp_path = SPK_INDEX_PATH + ".tmp"
@@ -145,7 +145,7 @@ def save_speaker_index(index: Dict[str, Any]) -> None:
     log.info(f"speaker_index saved path={SPK_INDEX_PATH!r} speakers={len(index)}")
 
 
-def update_speaker_embedding(index: Dict[str, Any], speaker_id: str, new_emb: np.ndarray) -> Dict[str, Any]:
+def update_speaker_embedding(index: Dict[str, Any], speaker_id: str, new_emb: np.ndarray):
     """
     Maintain a running average embedding per speaker_id.
     Always merges if speaker_id exists.
@@ -166,7 +166,7 @@ def update_speaker_embedding(index: Dict[str, Any], speaker_id: str, new_emb: np
     return index
 
 
-def find_best_matching_speaker(new_emb: np.ndarray, index: Dict[str, Any]) -> Tuple[str, float]:
+def find_best_matching_speaker(new_emb: np.ndarray, index: Dict[str, Any]):
     """
     Return (speaker_id, cosine_similarity) for the best match in the index.
     If index is empty, returns ("", 0.0).
@@ -184,7 +184,7 @@ def find_best_matching_speaker(new_emb: np.ndarray, index: Dict[str, Any]) -> Tu
     return best_id, best_score
 
 
-def setup_dataset(speaker_id: str, ref_paths: List[str]) -> str:
+def setup_dataset(speaker_id: str, ref_paths: List[str]):
     """
     Set up training dataset structure for RVC WebUI.
     
@@ -259,7 +259,7 @@ def setup_dataset(speaker_id: str, ref_paths: List[str]) -> str:
     return dataset_root
 
 
-def generate_training_config(dataset_root: str, model_name: str, train_steps: int, is_finetune: bool, pretrain_path: str | None) -> str:
+def generate_training_config(dataset_root: str, model_name: str, train_steps: int, is_finetune: bool, pretrain_path: str | None):
     """
     Generate a per-speaker training config JSON.
     
@@ -292,7 +292,7 @@ def generate_training_config(dataset_root: str, model_name: str, train_steps: in
     return config_path
 
 
-def find_latest_model(model_name: str) -> str | None:
+def find_latest_model(model_name: str):
     """
     Find the latest trained model checkpoint in WebUI logs.
     

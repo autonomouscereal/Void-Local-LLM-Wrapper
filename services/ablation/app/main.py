@@ -182,8 +182,8 @@ def _evidence_score(cand: Dict[str, Any]) -> float:
 def _independence_score(cand: Dict[str, Any], evidence_index: List[Dict[str, Any]]) -> float:
     owners = []
     for z in cand.get("citations") or []:
-        sid = z.get("id")
-        src = next((e for e in evidence_index if e.get("id") == sid), None)
+        source_id = z.get("id")
+        src = next((e for e in evidence_index if e.get("id") == source_id), None)
         if src and src.get("owner"):
             owners.append(src.get("owner"))
     uniq = len(set(owners))
@@ -234,7 +234,7 @@ async def ablate(body: Dict[str, Any]):
     # Precompute signatures
     sigs: Dict[str, List[int]] = {}
     for c in candidates:
-        sigs[c.get("id") or "?"] = _minhash_signature(c.get("text") or "", 64, seed)
+        sigs[c.get("claim_id") or c.get("id") or "?"] = _minhash_signature(c.get("text") or "", 64, seed)
 
     min_citations = int(cfg.get("min_citations", 0) or 0)
     require_money = bool(cfg.get("require_money_map", False))
@@ -259,22 +259,22 @@ async def ablate(body: Dict[str, Any]):
     evid_owners = set([e.get("owner") for e in evidence_index if e.get("owner")])
 
     for c, E, I in prelim_sorted:
-        cid = c.get("id")
+        claim_id = c.get("claim_id") or c.get("id")
         text = c.get("text") or ""
-        sig = sigs.get(cid)
+        sig = sigs.get(claim_id)
         # Dedup exact
         tnorm = " ".join((text or "").split()).lower()
         thash = _sha256_str(tnorm)
         if thash in dedup_index:
-            _append_ndjson(drops_path, {"id": cid, "drop_reason": f"exact_duplicate_of:{dedup_index[thash]}"})
+            _append_ndjson(drops_path, {"claim_id": claim_id, "drop_reason": f"exact_duplicate_of:{dedup_index[thash]}"})
             drops += 1
             continue
         # Near-dup against kept
         N = _novelty_score(sig, peer_sigs)
         if (1.0 - N) >= dedup_threshold:
             near_dups += 1
-            canonical = kept_ids[-1] if kept_ids else (cid or "")
-            _append_ndjson(drops_path, {"id": cid, "drop_reason": f"near_duplicate_of:{canonical}"})
+            canonical = kept_ids[-1] if kept_ids else (claim_id or "")
+            _append_ndjson(drops_path, {"claim_id": claim_id, "drop_reason": f"near_duplicate_of:{canonical}"})
             drops += 1
             continue
 
@@ -282,7 +282,7 @@ async def ablate(body: Dict[str, Any]):
         n_top = int(cfg.get("nli_top_peers", 10) or 10)
         peers = []
         for pc, pE, pI in prelim_sorted:
-            if pc.get("id") == cid:
+            if (pc.get("claim_id") or pc.get("id")) == claim_id:
                 continue
             peers.append(pc)
             if len(peers) >= n_top:
@@ -308,11 +308,11 @@ async def ablate(body: Dict[str, Any]):
         # Evidence/constraints
         cites = c.get("citations") or []
         if min_citations and len(cites) < min_citations:
-            _append_ndjson(drops_path, {"id": cid, "drop_reasons": ["weak_evidence"]})
+            _append_ndjson(drops_path, {"claim_id": claim_id, "drop_reasons": ["weak_evidence"]})
             drops += 1
             continue
         if require_money and not (c.get("money_map") and any((c.get("money_map") or {}).values())):
-            _append_ndjson(drops_path, {"id": cid, "drop_reasons": ["missing_money_map"]})
+            _append_ndjson(drops_path, {"claim_id": claim_id, "drop_reasons": ["missing_money_map"]})
             drops += 1
             continue
 
@@ -327,12 +327,12 @@ async def ablate(body: Dict[str, Any]):
 
         if keep:
             kept_items.append({**c, "_scores": {"E": E, "I": I, "C": C, "N": N, "B": B, "S": S}})
-            kept_ids.append(cid)
+            kept_ids.append(claim_id)
             peer_sigs.append(sig)
-            dedup_index[thash] = cid
+            dedup_index[thash] = claim_id
             kept += 1
         else:
-            _append_ndjson(drops_path, {"id": cid, "drop_reasons": ["below_threshold"], "scores": {"E": E, "I": I, "C": C, "N": N}})
+            _append_ndjson(drops_path, {"claim_id": claim_id, "drop_reasons": ["below_threshold"], "scores": {"E": E, "I": I, "C": C, "N": N}})
             drops += 1
 
     # Sort kept by tie-breaker
@@ -345,7 +345,7 @@ async def ablate(body: Dict[str, Any]):
         citations = c.get("citations") or []
         # Compression cache
         policy_hash = _sha256_str(json.dumps(comp_policy, sort_keys=True, separators=(",", ":")))
-        comp_key = f"{c.get('id')}|{policy_hash}"
+        comp_key = f"{c.get('claim_id') or c.get('id')}|{policy_hash}"
         comp_index = {}
         if os.path.exists(comp_index_path):
             try:
@@ -374,7 +374,7 @@ async def ablate(body: Dict[str, Any]):
     # Write clean.jsonl
     for c in kept_items:
         rec = {
-            "id": c.get("id"),
+            "claim_id": c.get("claim_id") or c.get("id"),
             "keep": True,
             "score": c["_scores"]["S"],
             "signals": {"evidence": c["_scores"]["E"], "independence": c["_scores"]["I"], "consistency": c["_scores"]["C"], "novelty": c["_scores"]["N"], "stance_balance": 1.0},

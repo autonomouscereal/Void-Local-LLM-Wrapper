@@ -173,21 +173,25 @@ async def upscale(request: Request):
     if not isinstance(payload, dict):
         payload = {}
 
+    trace_id = str(payload.get("trace_id") or "").strip() if isinstance(payload.get("trace_id"), (str, int)) else ""
+    conversation_id = str(payload.get("conversation_id") or "").strip() if isinstance(payload.get("conversation_id"), (str, int)) else ""
+
     input_path = payload.get("input_path")
     if not isinstance(input_path, str) or not input_path.strip():
-        return ToolEnvelope.failure("missing_input_path", "input_path is required", status=422)
+        return ToolEnvelope.failure(code="missing_input_path", message="input_path is required", trace_id=trace_id, conversation_id=conversation_id, status=422, details={"trace_id": trace_id, "conversation_id": conversation_id})
 
     job_id = payload.get("job_id")
     job = str(job_id).strip() if isinstance(job_id, str) and job_id.strip() else uuid.uuid4().hex
+    # trace_id must be provided by caller; do not derive from job_id or other ids.
 
     abs_in = _safe_join(UPLOAD_DIR, input_path.strip())
     if not os.path.isfile(abs_in):
-        return ToolEnvelope.failure("input_not_found", f"input not found: {input_path.strip()}", status=404, details={"input_path": input_path.strip()})
+        return ToolEnvelope.failure(code="input_not_found", message=f"input not found: {input_path.strip()}", trace_id=trace_id, conversation_id=conversation_id, status=404, details={"trace_id": trace_id, "conversation_id": conversation_id, "input_path": input_path.strip()})
 
     # Ensure weights are present in repo (inference script expects ./weights).
     weights_copy = _copy_weights_into_repo()
     if int(weights_copy.get("count") or 0) <= 0:
-        return ToolEnvelope.failure("weights_missing", "Real-ESRGAN weights not found", status=500, details=weights_copy)
+        return ToolEnvelope.failure(code="weights_missing", message="Real-ESRGAN weights not found", trace_id=trace_id, conversation_id=conversation_id, status=500, details={"trace_id": trace_id, "conversation_id": conversation_id, **weights_copy})
 
     model_name = payload.get("model_name") if isinstance(payload.get("model_name"), str) and str(payload.get("model_name")).strip() else DEFAULT_MODEL_NAME
     tile = int(payload.get("tile")) if isinstance(payload.get("tile"), int) else DEFAULT_TILE
@@ -230,14 +234,16 @@ async def upscale(request: Request):
         per_pass.append(res)
         if not bool(res.get("ok")):
             return ToolEnvelope.failure(
-                "upscale_failed",
-                "Real-ESRGAN pass failed",
+                code="upscale_failed",
+                message=f"Real-ESRGAN pass failed {str(res)}",
+                trace_id=trace_id,
+                conversation_id=conversation_id,
                 status=500,
-                details={"pass_index": idx, "weights_copy": weights_copy, "passes": passes, "per_pass": per_pass},
+                details={"trace_id": trace_id, "pass_index": idx, "weights_copy": weights_copy, "passes": passes, "per_pass": per_pass},
             )
         cur_in = str(res.get("output_path") or "")
         if not cur_in:
-            return ToolEnvelope.failure("upscale_failed", "Real-ESRGAN produced no output_path", status=500, details={"per_pass": per_pass})
+            return ToolEnvelope.failure(code="upscale_failed", message="Real-ESRGAN produced no output_path", trace_id=trace_id, conversation_id=conversation_id, status=500, details={"trace_id": trace_id, "conversation_id": conversation_id, "per_pass": per_pass})
 
     final_out = cur_in
     public_base = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
@@ -245,7 +251,7 @@ async def upscale(request: Request):
     out_url = (public_base + out_rel) if public_base and out_rel.startswith("/") else (out_rel if out_rel.startswith("/") else None)
 
     return ToolEnvelope.success(
-        {
+        result={
             "job_id": job,
             "input_path": abs_in,
             "input_size": {"w": w, "h": h},
@@ -258,8 +264,12 @@ async def upscale(request: Request):
             "per_pass": per_pass,
             "output_path": final_out,
             "output_url": out_url,
-            "artifacts": [{"kind": "image", "path": out_rel, "view_url": out_rel}],
-        }
+            "artifacts": [{"artifact_id": os.path.basename(out_rel) if isinstance(out_rel, str) and os.path.basename(out_rel) else (out_rel.split("/")[-1] if isinstance(out_rel, str) and "/" in out_rel else None), "kind": "image", "path": out_rel, "view_url": out_rel}],
+            "trace_id": trace_id,
+            "conversation_id": conversation_id,
+        },
+        trace_id=trace_id,
+        conversation_id=conversation_id,
     )
 
 

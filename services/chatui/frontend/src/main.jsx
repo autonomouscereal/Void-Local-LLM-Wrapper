@@ -14,8 +14,8 @@ import AdminTab from './Admin.jsx'
 function App() {
   const ORCH_BASE = ((window.__ORCH_BASE__ || window.localStorage.getItem('ORCH_BASE') || (window.location.protocol + '//' + window.location.hostname + ':8000')) + '').replace(/\/$/, '')
   const [convos, setConvos] = useState([])
-  const [cid, setCid] = useState(null) // UI conversation id (ChatUI backend BIGSERIAL)
-  const [orchCid, setOrchCid] = useState(null) // Orchestrator-owned cid (uuid string)
+  const [uiConversationId, setUiConversationId] = useState(null) // UI conversation id (ChatUI backend BIGSERIAL)
+  const [orchestratorConversationId, setOrchestratorConversationId] = useState(null) // Orchestrator-owned conversation_id (uuid string)
   const [msgs, setMsgs] = useState([])
   const [text, setText] = useState('')
   const fileRef = useRef()
@@ -153,7 +153,7 @@ function App() {
         try {
           const textBody = xhr.responseText || ''
           let finalText = String(textBody || '').trim()
-          let returnedOrchCid = null
+          let returnedOrchestratorConversationId = null
           // Try to parse as JSON to extract OpenAI message content; never throw on parse
           try {
             const obj = textBody ? JSON.parse(textBody) : null
@@ -162,19 +162,19 @@ function App() {
               finalText = String(msgObj.content).trim() || finalText
             }
             const metaObj = obj && obj._meta
-            if (metaObj && (typeof metaObj.cid === 'string' || typeof metaObj.cid === 'number')) {
-              returnedOrchCid = String(metaObj.cid).trim()
+            if (metaObj && (typeof metaObj.conversation_id === 'string' || typeof metaObj.conversation_id === 'number')) {
+              returnedOrchestratorConversationId = String(metaObj.conversation_id).trim()
             }
           } catch {}
           updateThinking(finalText || '(no content)')
-          // Persist orchestrator-owned cid for this UI conversation (best-effort).
+          // Persist orchestrator-owned conversation_id for this UI conversation (best-effort).
           try {
-            if (returnedOrchCid && conversationId) {
-              setOrchCid(returnedOrchCid)
-              await fetch(`/api/conversations/${conversationId}/orch_cid`, {
+            if (returnedOrchestratorConversationId && conversationId) {
+              setOrchestratorConversationId(returnedOrchestratorConversationId)
+              await fetch(`/api/conversations/${conversationId}/orchestrator_conversation_id`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ orch_cid: returnedOrchCid })
+                body: JSON.stringify({ orchestrator_conversation_id: returnedOrchestratorConversationId })
               })
               await refreshConvos()
             }
@@ -199,9 +199,9 @@ function App() {
         setSending(false)
         resolve()
       }
-      // cid is orchestrator-owned; UI may send the last known orchCid, but the orchestrator will validate/overwrite it.
+      // conversation_id is orchestrator-owned; UI may send the last known orchestratorConversationId, but the orchestrator will validate/overwrite it.
       const payload = { messages: [{ role: 'user', content: userText }], stream: false }
-      if (orchCid && String(orchCid).trim()) payload.cid = String(orchCid).trim()
+      if (orchestratorConversationId && String(orchestratorConversationId).trim()) payload.conversation_id = String(orchestratorConversationId).trim()
       const body = JSON.stringify(payload)
       try { xhr.send(body) } catch { xhr.abort(); updateThinking('Network unreachable'); setSending(false); resolve() }
     })
@@ -347,11 +347,11 @@ function App() {
 
   async function openConversation(id) {
     if (!id) return
-    setCid(id)
+    setUiConversationId(id)
     try {
       const found = (convos || []).find(c => c && String(c.id) === String(id))
-      setOrchCid((found && found.orch_cid) ? String(found.orch_cid) : null)
-    } catch { setOrchCid(null) }
+      setOrchestratorConversationId((found && found.orchestrator_conversation_id) ? String(found.orchestrator_conversation_id) : null)
+    } catch { setOrchestratorConversationId(null) }
     const r = await fetch(`/api/conversations/${id}/messages`)
     const j = await r.json()
     setMsgs(j.data || [])
@@ -367,7 +367,7 @@ function App() {
 
   async function send() {
     if (!text.trim()) return
-    let conversationId = cid
+    let conversationId = uiConversationId
     if (!conversationId) {
       conversationId = await newConversation()
     }
@@ -435,13 +435,18 @@ function App() {
   }
 
   async function uploadFile(e) {
-    if (!cid || !fileRef.current?.files?.length) return
-    const f = fileRef.current.files[0]
+    if (!uiConversationId || !fileRef.current?.files?.length) return
+    const selectedFile = fileRef.current.files[0]
     const fd = new FormData()
-    fd.append('file', f)
+    fd.append('file', selectedFile)
     const rr = await fetch(ORCH_BASE + '/upload', { method: 'POST', body: fd })
     const info = await rr.json()
-    try { await fetch('/api/attachments.add', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ conversation_id: cid, name: info?.name || f.name, url: info?.url || '', mime: f.type || 'application/octet-stream' }) }) } catch {}
+    const uploadedAttachmentName = info?.attachment_name
+    const uploadedUrl = info?.url
+    const uploadMime = selectedFile.type || 'application/octet-stream'
+    const uploadFilename = String(selectedFile?.name || '')
+    const attachmentNameOut = (uploadedAttachmentName || uploadFilename)
+    try { await fetch('/api/attachments.add', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ conversation_id: uiConversationId, attachment_name: attachmentNameOut, url: uploadedUrl || '', mime: uploadMime }) }) } catch {}
     fileRef.current.value = ''
     alert('Uploaded! The orchestrator will see it in conversation context.')
   }
@@ -454,7 +459,11 @@ function App() {
     const j = await r.json()
     const url = (j && typeof j.url === 'string') ? j.url : ''
     if (url) {
-      try { await fetch('/api/attachments.add', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ conversation_id: cid, name: j?.name || file.name, url, mime: file.type || 'application/octet-stream' }) }) } catch {}
+      const uploadedAttachmentName = j?.attachment_name
+      const uploadMime = file.type || 'application/octet-stream'
+      const uploadFilename = String(file?.name || '')
+      const attachmentNameOut = (uploadedAttachmentName || uploadFilename)
+      try { await fetch('/api/attachments.add', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ conversation_id: uiConversationId, attachment_name: attachmentNameOut, url, mime: uploadMime }) }) } catch {}
     }
     return url
   }
@@ -466,8 +475,8 @@ function App() {
     }
     return out
   }
-  async function callTool(name, args) {
-    const r = await fetch(ORCH_BASE + '/tool.run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, args }) })
+  async function callTool(tool_call_name, args) {
+    const r = await fetch(ORCH_BASE + '/tool.run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ tool_call_name, args }) })
     const j = await r.json()
     return j
   }
@@ -489,15 +498,15 @@ function App() {
     if (resp && resp.result) {
       const meta = resp.result.meta || {}
       const arts = Array.isArray(resp.result.artifacts) ? resp.result.artifacts : []
-      const cid = meta.cid
+      const conversation_id = meta.conversation_id
       let lines = []
-      if (cid && arts.length > 0) {
+      if (conversation_id && arts.length > 0) {
         for (const a of arts) {
           const aid = a && a.id
-          if (aid) lines.push(`/uploads/artifacts/image/${cid}/${aid}`)
+          if (aid) lines.push(`/uploads/artifacts/image/${conversation_id}/${aid}`)
         }
-      } else if (resp.result.tool_calls && resp.result.tool_calls[0] && resp.result.tool_calls[0].result_ref && cid) {
-        lines.push(`/uploads/artifacts/image/${cid}/${resp.result.tool_calls[0].result_ref}`)
+      } else if (resp.result.tool_calls && resp.result.tool_calls[0] && resp.result.tool_calls[0].result_ref && conversation_id) {
+        lines.push(`/uploads/artifacts/image/${conversation_id}/${resp.result.tool_calls[0].result_ref}`)
       }
       const textOut = lines.length ? ('Generated:\n' + lines.map(u => `- ${u}`).join('\n')) : JSON.stringify(resp.result)
       setMsgs(prev => ([...prev, { id: nextLocalId(), role: 'assistant', content: { text: textOut } }]))
@@ -517,15 +526,15 @@ function App() {
     if (resp && resp.result) {
       const meta = resp.result.meta || {}
       const arts = Array.isArray(resp.result.artifacts) ? resp.result.artifacts : []
-      const cid = meta.cid
+      const conversation_id = meta.conversation_id
       let lines = []
-      if (cid && arts.length > 0) {
+      if (conversation_id && arts.length > 0) {
         for (const a of arts) {
           const aid = a && a.id
-          if (aid) lines.push(`/uploads/artifacts/audio/tts/${cid}/${aid}`)
+          if (aid) lines.push(`/uploads/artifacts/audio/tts/${conversation_id}/${aid}`)
         }
-      } else if (resp.result.tool_calls && resp.result.tool_calls[0] && resp.result.tool_calls[0].result_ref && cid) {
-        lines.push(`/uploads/artifacts/audio/tts/${cid}/${resp.result.tool_calls[0].result_ref}`)
+      } else if (resp.result.tool_calls && resp.result.tool_calls[0] && resp.result.tool_calls[0].result_ref && conversation_id) {
+        lines.push(`/uploads/artifacts/audio/tts/${conversation_id}/${resp.result.tool_calls[0].result_ref}`)
       }
       const textOut = lines.length ? ('Spoken:\n' + lines.map(u => `- ${u}`).join('\n')) : JSON.stringify(resp.result)
       setMsgs(prev => ([...prev, { id: nextLocalId(), role: 'assistant', content: { text: textOut } }]))
@@ -544,15 +553,15 @@ function App() {
     if (resp && resp.result) {
       const meta = resp.result.meta || {}
       const arts = Array.isArray(resp.result.artifacts) ? resp.result.artifacts : []
-      const cid = meta.cid
+      const conversation_id = meta.conversation_id
       let lines = []
-      if (cid && arts.length > 0) {
+      if (conversation_id && arts.length > 0) {
         for (const a of arts) {
           const aid = a && a.id
-          if (aid) lines.push(`/uploads/artifacts/music/${cid}/${aid}`)
+          if (aid) lines.push(`/uploads/artifacts/music/${conversation_id}/${aid}`)
         }
-      } else if (resp.result.tool_calls && resp.result.tool_calls[0] && resp.result.tool_calls[0].result_ref && cid) {
-        lines.push(`/uploads/artifacts/music/${cid}/${resp.result.tool_calls[0].result_ref}`)
+      } else if (resp.result.tool_calls && resp.result.tool_calls[0] && resp.result.tool_calls[0].result_ref && conversation_id) {
+        lines.push(`/uploads/artifacts/music/${conversation_id}/${resp.result.tool_calls[0].result_ref}`)
       }
       const textOut = lines.length ? ('Track:\n' + lines.map(u => `- ${u}`).join('\n')) : JSON.stringify(resp.result)
       setMsgs(prev => ([...prev, { id: nextLocalId(), role: 'assistant', content: { text: textOut } }]))
@@ -671,7 +680,7 @@ function App() {
         <button onClick={newConversation} style={{ width: '100%', padding: 10, background: '#1f2937', color: '#fff', border: 'none', borderRadius: 6, marginBottom: 12 }}>New Conversation</button>
         <div style={{ overflowY: 'auto', maxHeight: 'calc(100vh - 80px)' }}>
           {(convos || []).map(c => (
-            <div key={c.id} onClick={() => openConversation(c.id)} style={{ padding: 10, borderRadius: 6, marginBottom: 8, background: cid === c.id ? '#374151' : '#111827', cursor: 'pointer' }}>
+            <div key={c.id} onClick={() => openConversation(c.id)} style={{ padding: 10, borderRadius: 6, marginBottom: 8, background: uiConversationId === c.id ? '#374151' : '#111827', cursor: 'pointer' }}>
               <div style={{ fontWeight: 600 }}>{c.title}</div>
               <div style={{ fontSize: 12, color: '#9ca3af' }}>{new Date(c.updated_at).toLocaleString()}</div>
             </div>

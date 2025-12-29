@@ -59,7 +59,7 @@ def merge_envelopes(step_envs: List[Dict[str, Any]]) -> Dict[str, Any]:
     seen, arr = set(), []
     for e in step_envs:
         for a in e.get("artifacts", []) or []:
-            aid = a.get("id") if isinstance(a, dict) else None
+            aid = a.get("artifact_id") if isinstance(a, dict) else None
             if not aid or aid in seen:
                 continue
             seen.add(aid)
@@ -109,7 +109,7 @@ def build_openai_envelope(
         "error": (error or None),
         "seed": seed,
     }
-    # cid/trace_id are injected by orchestrator callers (e.g., finalize_response)
+    # conversation_id/trace_id are injected by orchestrator callers (e.g., finalize_response)
     # via an out-of-band _meta block to keep the OpenAI schema surface stable.
     return env
 

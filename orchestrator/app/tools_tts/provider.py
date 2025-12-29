@@ -5,7 +5,6 @@ import os
 import base64
 import logging
 import traceback
-import uuid
 
 import httpx as _hxsync  # type: ignore
 
@@ -29,9 +28,15 @@ class _TTSProvider:
         self._base_url = url.rstrip("/") if isinstance(url, str) else ""
 
     def speak(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        trace_id = payload.get("trace_id") if isinstance(payload.get("trace_id"), str) else "tt_xtts_unknown"
-        request_id = payload.get("request_id") if isinstance(payload.get("request_id"), str) and payload.get("request_id") else None
-        rid = request_id or uuid.uuid4().hex
+        trace_id = payload.get("trace_id") if isinstance(payload.get("trace_id"), str) else ""
+        if not isinstance(trace_id, str) or not trace_id.strip():
+            return _build_error_envelope(
+                "missing_trace_id",
+                "trace_id is required for XTTS provider calls",
+                "MISSING_TRACE_ID",
+                status=422,
+                details={"payload_keys": sorted([str(k) for k in (payload or {}).keys()]), "stack": "".join(traceback.format_stack())},
+            )
         emit_progress({"stage": "request", "target": "xtts"})
         # Ensure language is always set; default to English if absent.
         # Also normalize locale-style codes like "en-US" to XTTS-compatible "en".
@@ -52,7 +57,7 @@ class _TTSProvider:
             return _build_error_envelope(
                 "xtts_unconfigured",
                 "XTTS_API_URL is not configured for TTS provider.",
-                rid,
+                trace_id,
                 status=500,
                 details={"trace_id": trace_id, "stack": "".join(traceback.format_stack())},
             )
@@ -100,7 +105,7 @@ class _TTSProvider:
                 try:
                     sample_rate = int(_sr_raw)
                 except Exception as exc:
-                    log.warning("tts.provider: bad sample_rate=%r; defaulting to 22050", _sr_raw, exc_info=True)
+                    log.warning(f"tts.provider: bad sample_rate={_sr_raw!r}; defaulting to 22050", exc_info=True)
                     sample_rate = 22050
                 language = inner.get("language") or payload.get("language") or "en"
                 voice_id = inner.get("voice_id") or payload.get("voice_id") or payload.get("voice")
@@ -112,7 +117,7 @@ class _TTSProvider:
                     if _dur_raw is not None and not isinstance(_dur_raw, (dict, list)):
                         duration_s = float(_dur_raw)
                 except Exception as exc:
-                    log.warning("tts.provider: bad duration_s=%r; defaulting to 0.0", _dur_raw, exc_info=True)
+                    log.warning(f"tts.provider: bad duration_s={_dur_raw!r}; defaulting to 0.0", exc_info=True)
                     duration_s = 0.0
                 result = {
                     "wav_bytes": wav,
@@ -125,7 +130,7 @@ class _TTSProvider:
                     "segment_id": segment_id,
                     "trace_id": trace_id,
                 }
-                return _build_success_envelope(result, rid)
+                return _build_success_envelope(result, trace_id)
             # Any non-ok env from XTTS is wrapped as a tool error.
             #
             # Retry once for the common locale-code mismatch (e.g. en-US) by forcing English.
@@ -163,12 +168,12 @@ class _TTSProvider:
                             "segment_id": inner.get("segment_id") or retry_payload.get("segment_id"),
                             "trace_id": trace_id,
                         }
-                        return _build_success_envelope(result, rid)
+                        return _build_success_envelope(result, trace_id)
 
             return _build_error_envelope(
                 "tts_invalid_envelope",
                 "XTTS /tts returned non-ok envelope",
-                rid,
+                trace_id,
                 status=status,
                 details={"trace_id": trace_id, "raw": env, "stack": "".join(traceback.format_stack())},
             )
@@ -183,7 +188,7 @@ class _TTSProvider:
         return _build_error_envelope(
             "tts_http_error",
             "XTTS /tts returned non-2xx or invalid body",
-            rid,
+            trace_id,
             status=status,
             details={
                 "trace_id": trace_id,

@@ -10,7 +10,7 @@ def build_timeline(ledger_rows: List[Dict]) -> Dict:
         out.append({
             "date": dt,
             "title": (r.get("title", "") or "")[:160],
-            "id": r.get("id"),
+            "ledger_id": r.get("ledger_id") or r.get("id"),
             "url": r.get("url", ""),
         })
     out.sort(key=lambda x: (x.get("date") or 0))

@@ -29,6 +29,7 @@ COPY orchestrator/app /app/app
 COPY void_json /app/void_json
 COPY void_envelopes /app/void_envelopes
 COPY void_quality /app/void_quality
+COPY void_artifacts /app/void_artifacts
 
 # IMPORTANT (policy): Module import path is fixed to 'app.*' within /app.
 # Do NOT rely on external workpath or PYTHONPATH overrides from compose.

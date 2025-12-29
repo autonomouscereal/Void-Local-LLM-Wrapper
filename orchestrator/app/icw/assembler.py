@@ -181,15 +181,19 @@ def assemble_window(request_msg: dict, state: dict, in_limit_bytes: int, step_ou
         footer = "[RAG] evidence temporarily unavailable due to error."
 
     # Rank by relevance
-    ranked = sorted(candidates, key=lambda t: score_chunk(t, goal), reverse=True)
+    ranked_scored: List[tuple[float, int, Any]] = []
+    for i, candidate_entry in enumerate(candidates):
+        ranked_scored.append((float(score_chunk(candidate_entry, goal)), int(i), candidate_entry))
+    ranked_scored.sort(reverse=True)
+    ranked = [triple[2] for triple in ranked_scored]
     # Build parts in priority order
     system_hint = make_system_hint(out_tokens, state.get("state_hash", ""))
     parts: list[str] = [system_hint, render_anchor(anchor), render_header(header)]
     # Artifacts preference (research ledger): include newest shard summary if present (best-effort)
-    cid = state.get("cid") if isinstance(state, dict) else None
+    conversation_id = state.get("conversation_id")
     try:
-        if cid:
-            root = os.path.join(os.getenv("UPLOAD_DIR", "/workspace/uploads"), "artifacts", "research", str(cid))
+        if conversation_id:
+            root = os.path.join(os.getenv("UPLOAD_DIR", "/workspace/uploads"), "artifacts", "research", str(conversation_id))
             latest = newest_part(root, "ledger")
             if latest:
                 _bytes_raw = latest.get("bytes") if isinstance(latest, dict) else None
@@ -207,10 +211,10 @@ def assemble_window(request_msg: dict, state: dict, in_limit_bytes: int, step_ou
                         render_chunk(f"[Ledger older] {p.get('path')} sha256:{sha[:8]}")
                     )
     except Exception as exc:  # defensive logging
-        log.error(f"icw.assembler ledger summary build failed for cid={cid!r}: {exc}", exc_info=True)
+        log.error(f"icw.assembler ledger summary build failed for conversation_id={conversation_id!r}: {exc}", exc_info=True)
 
     log.info(
-        f"icw.assembler assemble_window start cid={cid!r} budget_bytes={budget_bytes} goal_len={len(goal)} anchor_len={len(anchor)} "
+        f"icw.assembler assemble_window start conversation_id={conversation_id!r} budget_bytes={budget_bytes} goal_len={len(goal)} anchor_len={len(anchor)} "
         f"candidates={len(ranked)} retrieved={(len(retrieved) if isinstance(retrieved, list) else 0)}"
     )
     for c in ranked:
@@ -235,7 +239,7 @@ def assemble_window(request_msg: dict, state: dict, in_limit_bytes: int, step_ou
 def pack_icw_system_frame_from_messages(
     messages: list[dict],
     *,
-    cid: str | None,
+    conversation_id: str,
     goals: str,
     model_ctx_limit_tokens: int,
     pct_budget: float = 0.65,
@@ -252,7 +256,7 @@ def pack_icw_system_frame_from_messages(
     t0 = time.perf_counter()
     last_user = str(goals or "").strip()
     if not last_user:
-        log.warning("icw.assembler pack empty_goals cid=%r", cid)
+        log.warning("icw.assembler pack empty_goals conversation_id=%r", conversation_id)
         return None, None, {"ok": True, "reason": "empty_goals"}
 
     msgs = messages or []
@@ -307,7 +311,7 @@ def pack_icw_system_frame_from_messages(
             candidates.append(f"{role}: {content}")
 
     icw_state: dict = {
-        "cid": cid,
+        "conversation_id": conversation_id,
         "entities": [],
         "goals": last_user,
         "anchor_text": anchor_text,
@@ -317,7 +321,7 @@ def pack_icw_system_frame_from_messages(
     try:
         icw_state["state_hash"] = state_hash_from(icw_state)
     except Exception as exc:  # pragma: no cover - defensive logging
-        log.error(f"icw.assembler pack state_hash_from failed cid={cid!r}: {exc}", exc_info=True)
+        log.error(f"icw.assembler pack state_hash_from failed conversation_id={conversation_id!r}: {exc}", exc_info=True)
         return None, None, {"ok": False, "reason": "state_hash_failed"}
 
     req = {"role": "user", "content": last_user}
@@ -333,12 +337,12 @@ def pack_icw_system_frame_from_messages(
     try:
         window = assemble_window(req, icw_state, int(icw_budget_bytes), int(_step_out))
     except Exception as exc:
-        log.error(f"icw.assembler pack assemble_window failed cid={cid!r}: {exc}", exc_info=True)
+        log.error(f"icw.assembler pack assemble_window failed conversation_id={conversation_id!r}: {exc}", exc_info=True)
         return None, None, {"ok": False, "reason": "assemble_window_failed"}
     prompt = getattr(window, "prompt", "") if window is not None else ""
     prompt = str(prompt or "").strip()
     if not prompt:
-        log.error(f"icw.assembler pack empty_prompt cid={cid!r} budget_bytes={icw_budget_bytes}")
+        log.error(f"icw.assembler pack empty_prompt conversation_id={conversation_id!r} budget_bytes={icw_budget_bytes}")
         return None, None, {"ok": False, "reason": "empty_prompt"}
 
     pack_hash = "sha256:" + hashlib.sha256(prompt.encode("utf-8")).hexdigest()
@@ -358,7 +362,7 @@ def pack_icw_system_frame_from_messages(
     }
     dt_ms = int((time.perf_counter() - t0) * 1000)
     log.info(
-        f"icw.assembler pack ok cid={cid!r} msg_count={len(msgs)} bytes={bytes_len(prompt)} budget_bytes={int(icw_budget_bytes)} ms={dt_ms}"
+        f"icw.assembler pack ok conversation_id={conversation_id!r} msg_count={len(msgs)} bytes={bytes_len(prompt)} budget_bytes={int(icw_budget_bytes)} ms={dt_ms}"
     )
     return frame, pack_hash, meta
 

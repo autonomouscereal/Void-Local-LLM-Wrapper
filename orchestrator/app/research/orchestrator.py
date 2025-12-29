@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 import os
 import time
 import json
@@ -30,19 +30,21 @@ except Exception as exc:
     RAG_TTL = 3600
 
 
-async def run_research(job: Dict[str, Any]) -> Dict[str, Any]:
+async def run_research(job: Dict[str, Any], *, trace_id: Optional[str] = None, conversation_id: Optional[str] = None) -> Dict[str, Any]:
     """
-    job: {"query": str, "scope": "public|internal", "since": str|None, "until": str|None, "cid": str}
-    Returns: {"phase": "done", "artifacts": [...], "cid": str}
+    job: {"query": str, "scope": "public|internal", "since": str|None, "until": str|None, "conversation_id": str}
+    Returns: {"phase": "done", "artifacts": [...], "conversation_id": str}
     """
     q = (job.get("query") or "").strip()
     if not q:
-        return {"phase": "done", "artifacts": [], "cid": job.get("cid")}
-    cid = job.get("cid") or f"rs-{int(time.time())}"
-    root = os.path.join("/workspace", "uploads", "artifacts", "research", str(cid))
+        conv_id = conversation_id or job.get("conversation_id") or f"rs-{int(time.time())}"
+        return {"phase": "done", "artifacts": [], "conversation_id": conv_id}
+    conversation_id = conversation_id or job.get("conversation_id") or f"rs-{int(time.time())}"
+    trace_id = trace_id or job.get("trace_id") or ""
+    root = os.path.join("/workspace", "uploads", "artifacts", "research", str(conversation_id))
     # Ensure root exists
     os.makedirs(root, exist_ok=True)
-    manifest: Dict[str, Any] = {"cid": cid, "items": []}
+    manifest: Dict[str, Any] = {"conversation_id": conversation_id, "items": []}
 
     # Optionally register job in in-memory state
     jid = job.get("job_id")
@@ -77,14 +79,14 @@ async def run_research(job: Dict[str, Any]) -> Dict[str, Any]:
             set_state(jid, "cancelled", phase="normalize", progress=0.0)
             _append_job_event(jid, progress_event("cancelled", "normalize", 0.0, artifacts=[]))
             write_manifest_atomic(root, manifest)
-            return {"phase": "cancelled", "artifacts": manifest.get("items", []), "cid": cid}
+            return {"phase": "cancelled", "artifacts": manifest.get("items", []), "conversation_id": conversation_id}
         sh = append_jsonl(sh, row)
     _finalize_shard(sh)
     add_manifest_row(manifest, os.path.join(root, "ledger.index.json"), step_id="normalize")
     if jid:
         try:
             set_state(jid, "running", phase="analyze", progress=0.4)
-            _append_job_event(jid, progress_event("running", "normalize", 0.4, artifacts=[{"path": os.path.join(root, "ledger.index.json")}]))
+            _append_job_event(jid, progress_event("running", "normalize", 0.4, artifacts=[{"artifact_id": "ledger.index.json", "kind": "json", "path": os.path.join(root, "ledger.index.json")}]))
         except Exception as exc:
             log.debug("research.run: failed to update job state jid=%s phase=analyze: %s", jid, exc, exc_info=True)
 
@@ -96,7 +98,7 @@ async def run_research(job: Dict[str, Any]) -> Dict[str, Any]:
     if jid:
         try:
             set_state(jid, "running", phase="timeline", progress=0.6)
-            _append_job_event(jid, progress_event("running", "analyze", 0.6, artifacts=[{"path": os.path.join(root, "money_map.json")}]))
+            _append_job_event(jid, progress_event("running", "analyze", 0.6, artifacts=[{"artifact_id": "money_map.json", "kind": "json", "path": os.path.join(root, "money_map.json")}]))
         except Exception as exc:
             log.debug("research.run: failed to update job state jid=%s phase=timeline: %s", jid, exc, exc_info=True)
 
@@ -107,7 +109,7 @@ async def run_research(job: Dict[str, Any]) -> Dict[str, Any]:
     if jid:
         try:
             set_state(jid, "running", phase="judge", progress=0.75)
-            _append_job_event(jid, progress_event("running", "timeline", 0.75, artifacts=[{"path": os.path.join(root, "timeline.json")}]))
+            _append_job_event(jid, progress_event("running", "timeline", 0.75, artifacts=[{"artifact_id": "timeline.json", "kind": "json", "path": os.path.join(root, "timeline.json")}]))
         except Exception as exc:
             log.debug("research.run: failed to update job state jid=%s phase=judge: %s", jid, exc, exc_info=True)
 
@@ -118,7 +120,7 @@ async def run_research(job: Dict[str, Any]) -> Dict[str, Any]:
     if jid:
         try:
             set_state(jid, "running", phase="report", progress=0.9)
-            _append_job_event(jid, progress_event("running", "judge", 0.9, artifacts=[{"path": os.path.join(root, "judge.json")}]))
+            _append_job_event(jid, progress_event("running", "judge", 0.9, artifacts=[{"artifact_id": "judge.json", "kind": "json", "path": os.path.join(root, "judge.json")}]))
         except Exception as exc:
             log.debug("research.run: failed to update job state jid=%s phase=report: %s", jid, exc, exc_info=True)
 
@@ -131,7 +133,7 @@ async def run_research(job: Dict[str, Any]) -> Dict[str, Any]:
     if jid:
         try:
             set_state(jid, "done", phase="done", progress=1.0)
-            _append_job_event(jid, progress_event("done", "done", 1.0, artifacts=[{"path": os.path.join(root, "report.json")}]))
+            _append_job_event(jid, progress_event("done", "done", 1.0, artifacts=[{"artifact_id": "report.json", "kind": "json", "path": os.path.join(root, "report.json")}]))
         except Exception as exc:
             log.debug("research.run: failed to finalize job state jid=%s: %s", jid, exc, exc_info=True)
     # Inline summary for chat surfaces
@@ -145,8 +147,11 @@ async def run_research(job: Dict[str, Any]) -> Dict[str, Any]:
                     src_count[u] = src_count.get(u, 0) + 1
             except Exception:
                 continue
-        top_srcs = sorted(src_count.items(), key=lambda kv: kv[1], reverse=True)[:5]
-        sources = [{"url": u, "count": c} for (u, c) in top_srcs]
+        ranked_sources: List[tuple[int, int, str]] = []
+        for i, source_url in enumerate(src_count.keys()):
+            ranked_sources.append((int(src_count.get(source_url, 0)), int(i), str(source_url)))
+        ranked_sources.sort(reverse=True)
+        sources = [{"url": triple[2], "count": triple[0]} for triple in ranked_sources]
         # Findings summary
         findings = list(report.get("findings", []) or [])
         bullets = []
@@ -163,7 +168,7 @@ async def run_research(job: Dict[str, Any]) -> Dict[str, Any]:
         trace_event(
             "research.summary",
             {
-                "cid": cid,
+                "conversation_id": conversation_id,
                 "query": q,
                 "summary": summary_text,
                 "sources": sources,
@@ -171,8 +176,8 @@ async def run_research(job: Dict[str, Any]) -> Dict[str, Any]:
             },
         )
     except Exception as exc:
-        log.debug("research.run: runtime trace emit failed (non-fatal) cid=%s: %s", cid, exc, exc_info=True)
-    return {"phase": "done", "artifacts": manifest.get("items", []), "cid": cid, "report": report, "summary_text": summary_text, "sources": sources}
+        log.debug(f"research.run: runtime trace emit failed (non-fatal) conversation_id={conversation_id!r} exc={exc!r}", exc_info=True)
+    return {"phase": "done", "artifacts": manifest.get("items", []), "conversation_id": conversation_id, "report": report, "summary_text": summary_text, "sources": sources}
 
 
 def _append_job_event(jid: str, ev: Dict[str, Any]) -> None:

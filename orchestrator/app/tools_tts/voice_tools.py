@@ -10,7 +10,7 @@ from ..json_parser import JSONParser
 from ..locks.voice_identity import resolve_voice_identity
 
 
-async def run_voice_register(args: Dict[str, Any]) -> Dict[str, Any]:
+async def run_voice_register(args: Dict[str, Any]):
     """
     Register or update a voice in the RVC registry from reference samples.
     Returns either {"result": {...}} or {"error": {...}} for the dispatcher.
@@ -62,7 +62,7 @@ async def run_voice_register(args: Dict[str, Any]) -> Dict[str, Any]:
         r = await client.post(rvc_url.rstrip("/") + "/v1/voice/register", json=payload_reg)
         raw = r.text or ""
         parser = JSONParser()
-        env = parser.parse(raw or "{}", {"ok": bool, "error": dict})
+        env = parser.parse(raw or "{}", {"schema_version": int, "trace_id": str, "ok": bool, "result": dict, "error": dict})
     if isinstance(env, dict) and env.get("ok"):
         return {
             "result": {
@@ -84,7 +84,7 @@ async def run_voice_register(args: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-async def run_voice_train(args: Dict[str, Any]) -> Dict[str, Any]:
+async def run_voice_train(args: Dict[str, Any]):
     """
     Train or retrain the RVC model for a given voice_id using all registered refs.
     Returns either {"result": {...}} or {"error": {...}} for the dispatcher.
@@ -113,7 +113,7 @@ async def run_voice_train(args: Dict[str, Any]) -> Dict[str, Any]:
         r = await client.post(rvc_url.rstrip("/") + "/v1/voice/train", json=payload_train)
         raw = r.text or ""
         parser = JSONParser()
-        env = parser.parse(raw or "{}", {"ok": bool, "error": dict})
+        env = parser.parse(raw or "{}", {"schema_version": int, "trace_id": str, "ok": bool, "result": dict, "error": dict})
     if isinstance(env, dict) and env.get("ok"):
         return {"result": env}
     err_obj = env.get("error") if isinstance(env, dict) else {}

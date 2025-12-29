@@ -442,10 +442,10 @@ async def committee_ai_text(
                     ctx_lines.append(f"Answer from {oid}:\n{otext.strip()}")
 
             crit_blocks: List[str] = []
-            for cid in member_ids:
-                ctext = critiques.get(cid) or ""
+            for member_id in member_ids:
+                ctext = critiques.get(member_id) or ""
                 if isinstance(ctext, str) and ctext.strip():
-                    crit_blocks.append(f"Critique from {cid}:\n{ctext.strip()}")
+                    crit_blocks.append(f"Critique from {member_id}:\n{ctext.strip()}")
             if crit_blocks:
                 ctx_lines.append("\n\n".join(crit_blocks))
 

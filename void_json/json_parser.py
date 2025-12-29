@@ -942,13 +942,13 @@ class JSONParser:
             for child_key, child_schema in expected.items():
                 if not isinstance(child_schema, dict) or not child_schema:
                     continue
-                child_val = out.get(child_key)
-                if not isinstance(child_val, dict):
-                    child_val = {} if child_val is None else {"_raw": child_val}
-                    out[child_key] = child_val
+                child = out.get(child_key)
+                if not isinstance(child, dict):
+                    child = {} if child is None else {"_raw": child}
+                    out[child_key] = child
                 for ck, cschema in child_schema.items():
-                    if ck in out and ck not in child_val:
-                        child_val[ck] = self._coerce_node(out.get(ck), cschema)
+                    if ck in out and ck not in child:
+                        child[ck] = self._coerce_node(out.get(ck), cschema)
                         del out[ck]
         except Exception as exc:
             self._err(f"pack_children_from_parent:{type(exc).__name__}:{exc}")

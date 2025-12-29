@@ -8,6 +8,7 @@ from tool results. This used to live in `pipeline/assets.py` but is logically QA
 """
 
 from typing import Any, Callable, Dict, List, Optional
+from void_artifacts import artifact_id_to_safe_filename
 
 # Use relative imports to avoid relying on the top-level package name being `app`
 # (this file is imported both in-container and in some local/dev contexts).
@@ -22,32 +23,42 @@ def collect_urls(tool_results: List[Dict[str, Any]], absolutize_url: Callable[[s
     Relies only on structured artifact metadata and orch_view_urls to avoid stale paths.
     """
     urls: List[str] = []
-    for tr in tool_results or []:
-        res = (tr or {}).get("result") or {}
+    for tool_result_entry in tool_results or []:
+        res = (tool_result_entry or {}).get("result") or {}
         if not isinstance(res, dict):
             continue
         # envelope-based tools: artifacts + orch_view_urls
         meta = res.get("meta")
-        arts = res.get("artifacts")
-        if isinstance(meta, dict) and isinstance(arts, list):
-            cid = meta.get("cid")
-            for a in arts:
-                aid = (a or {}).get("id")
-                kind = (a or {}).get("kind") or ""
+        artifact_entries = res.get("artifacts")
+        if isinstance(meta, dict) and isinstance(artifact_entries, list):
+            conversation_id = meta.get("conversation_id")
+            for artifact_entry in artifact_entries:
+                if not isinstance(artifact_entry, dict):
+                    continue
+                # artifact_id accepts any type (str, int, etc.) - unified handling
+                artifact_id = artifact_entry.get("artifact_id")
+                kind = (artifact_entry or {}).get("kind") or ""
                 # Always collect explicit URLs/paths when present; some tools
-                # emit view_url/url/path without a stable (cid,id) pair.
-                direct = (a or {}).get("view_url") or (a or {}).get("url") or (a or {}).get("path")
+                # emit view_url/url/path without a stable (conversation_id,id) pair.
+                direct = (artifact_entry or {}).get("view_url") or (artifact_entry or {}).get("url") or (artifact_entry or {}).get("path")
                 if isinstance(direct, str) and direct.strip():
                     urls.append(direct.strip())
-                if cid and aid:
+                # artifact_id accepts any type (str, int, etc.) - unified handling
+                # Convert artifact_id to safe filename for URL construction
+                if isinstance(conversation_id, str) and conversation_id and artifact_id:
+                    safe_filename = artifact_id_to_safe_filename(artifact_id)
                     if kind.startswith("image"):
-                        urls.append(f"/uploads/artifacts/image/{cid}/{aid}")
+                        # Determine extension from kind or default to .png
+                        ext = ".png"  # Default for images
+                        urls.append(f"/uploads/artifacts/image/{conversation_id}/{safe_filename}{ext}")
                     elif kind.startswith("tts") or ("tts" in kind):
-                        # TTS artifacts live under /artifacts/audio/tts/<cid>/<file>
-                        urls.append(f"/uploads/artifacts/audio/tts/{cid}/{aid}")
+                        # TTS artifacts live under /artifacts/audio/tts/<conversation_id>/<file>
+                        ext = ".wav"  # Default for TTS audio
+                        urls.append(f"/uploads/artifacts/audio/tts/{conversation_id}/{safe_filename}{ext}")
                     elif kind.startswith("music") or ("music" in kind):
-                        # Music artifacts (windowed + mixes) live under /artifacts/music/<cid>/<file>
-                        urls.append(f"/uploads/artifacts/music/{cid}/{aid}")
+                        # Music artifacts (windowed + mixes) live under /artifacts/music/<conversation_id>/<file>
+                        ext = ".wav"  # Default for music audio
+                        urls.append(f"/uploads/artifacts/music/{conversation_id}/{safe_filename}{ext}")
                     elif kind.startswith("audio"):
                         # Generic audio artifacts: do not guess a subfolder (tts/music/sfx/etc)
                         # because it varies by tool. Prefer explicit url/path above.
@@ -68,24 +79,24 @@ def count_images(tool_results: List[Dict[str, Any]]) -> int:
     No I/O.
     """
     count = 0
-    for tr in tool_results or []:
-        res = (tr or {}).get("result") or {}
+    for tool_result_entry in tool_results or []:
+        res = (tool_result_entry or {}).get("result") or {}
         if not isinstance(res, dict):
             continue
         # flat images array
         if isinstance(res.get("images"), list):
             count += len(res.get("images") or [])
         # canonical artifacts array
-        arts = res.get("artifacts")
-        if isinstance(arts, list):
-            for a in arts:
-                kind = (a or {}).get("kind")
+        artifact_entries = res.get("artifacts")
+        if isinstance(artifact_entries, list):
+            for artifact_entry in artifact_entries:
+                kind = (artifact_entry or {}).get("kind")
                 if isinstance(kind, str) and kind.startswith("image"):
                     count += 1
-        # ids.images from Comfy bridge
-        ids_obj = res.get("ids") if isinstance(res, dict) else {}
-        if isinstance(ids_obj, dict) and isinstance(ids_obj.get("images"), list):
-            count += len(ids_obj.get("images") or [])
+        # external_ids.images from Comfy bridge
+        external_ids = res.get("ids") if isinstance(res, dict) else {}
+        if isinstance(external_ids, dict) and isinstance(external_ids.get("image_ids"), list):
+            count += len(external_ids.get("image_ids") or [])
     return count
 
 
@@ -95,19 +106,19 @@ def count_video(tool_results: List[Dict[str, Any]]) -> int:
     No I/O.
     """
     count = 0
-    for tr in tool_results or []:
-        res = (tr or {}).get("result") or {}
+    for tool_result_entry in tool_results or []:
+        res = (tool_result_entry or {}).get("result") or {}
         if not isinstance(res, dict):
             continue
-        arts = res.get("artifacts")
-        if isinstance(arts, list):
-            for a in arts:
-                kind = (a or {}).get("kind")
+        artifact_entries = res.get("artifacts")
+        if isinstance(artifact_entries, list):
+            for artifact_entry in artifact_entries:
+                kind = (artifact_entry or {}).get("kind")
                 if isinstance(kind, str) and kind.startswith("video"):
                     count += 1
-        ids_obj = res.get("ids") if isinstance(res, dict) else {}
-        if isinstance(ids_obj, dict) and isinstance(ids_obj.get("videos"), list):
-            count += len(ids_obj.get("videos") or [])
+        external_ids = res.get("ids") if isinstance(res, dict) else {}
+        if isinstance(external_ids, dict) and isinstance(external_ids.get("video_ids"), list):
+            count += len(external_ids.get("video_ids") or [])
     return count
 
 
@@ -117,23 +128,23 @@ def count_audio(tool_results: List[Dict[str, Any]]) -> int:
     No I/O.
     """
     count = 0
-    for tr in tool_results or []:
-        res = (tr or {}).get("result") or {}
+    for tool_result_entry in tool_results or []:
+        res = (tool_result_entry or {}).get("result") or {}
         if not isinstance(res, dict):
             continue
-        arts = res.get("artifacts")
-        if isinstance(arts, list):
-            for a in arts:
-                kind = (a or {}).get("kind")
+        artifact_entries = res.get("artifacts")
+        if isinstance(artifact_entries, list):
+            for artifact_entry in artifact_entries:
+                kind = (artifact_entry or {}).get("kind")
                 if isinstance(kind, str) and (kind.startswith("audio") or kind.startswith("music") or kind.startswith("tts")):
                     count += 1
-        ids_obj = res.get("ids") if isinstance(res, dict) else {}
-        if isinstance(ids_obj, dict) and isinstance(ids_obj.get("audios"), list):
-            count += len(ids_obj.get("audios") or [])
-        if isinstance(ids_obj, dict) and isinstance(ids_obj.get("music"), list):
-            count += len(ids_obj.get("music") or [])
-        if isinstance(ids_obj, dict) and isinstance(ids_obj.get("tts"), list):
-            count += len(ids_obj.get("tts") or [])
+        external_ids = res.get("ids") if isinstance(res, dict) else {}
+        if isinstance(external_ids, dict) and isinstance(external_ids.get("audio_ids"), list):
+            count += len(external_ids.get("audio_ids") or [])
+        if isinstance(external_ids, dict) and isinstance(external_ids.get("music_ids"), list):
+            count += len(external_ids.get("music_ids") or [])
+        if isinstance(external_ids, dict) and isinstance(external_ids.get("tts_ids"), list):
+            count += len(external_ids.get("tts_ids") or [])
     return count
 
 
@@ -235,10 +246,10 @@ def compute_domain_qa(tool_results: List[Dict[str, Any]]) -> Dict[str, Any]:
     for tr in tool_results or []:
         if not isinstance(tr, dict):
             continue
-        name_raw = tr.get("name") or tr.get("tool") or ""
-        if not isinstance(name_raw, str):
+        tool_name = tr.get("tool_name")
+        if not isinstance(tool_name, str) or not tool_name.strip():
             continue
-        name = name_raw.strip().lower()
+        tool_name = tool_name.strip().lower()
         res = tr.get("result") if isinstance(tr.get("result"), dict) else {}
         meta = _get_dict(res, "meta")
         qa_block = _get_dict(meta, "qa")
@@ -252,7 +263,7 @@ def compute_domain_qa(tool_results: List[Dict[str, Any]]) -> Dict[str, Any]:
 
         # Film2 embeds hero-frame lock metrics inside its film2.run result.meta / shot_meta.meta.locks.
         # Treat film2.run as an image-metric producer so downstream QA sees those scores.
-        if name.startswith("image.") or name == "film2.run":
+        if tool_name.startswith("image.") or tool_name == "film2.run":
             face_candidates = _collect_key_values(root_candidates, ["face_lock", "face_cos", "face_score"])
             for val in face_candidates:
                 if isinstance(val, (int, float)):
@@ -264,17 +275,17 @@ def compute_domain_qa(tool_results: List[Dict[str, Any]]) -> Dict[str, Any]:
             hands_dicts = _collect_key_values(root_candidates, ["hands"])
             for hd in hands_dicts:
                 if isinstance(hd, dict):
-                    ok_val = hd.get("ok")
-                    total_val = hd.get("total")
-                    if isinstance(ok_val, (int, float)) and isinstance(total_val, (int, float)) and total_val:
-                        image_hands_true += float(ok_val)
-                        image_hands_total += float(total_val)
-                    bad_val = hd.get("bad")
-                    if isinstance(bad_val, (int, float)):
+                    ok = hd.get("ok")
+                    total = hd.get("total")
+                    if isinstance(ok, (int, float)) and isinstance(total, (int, float)) and total:
+                        image_hands_true += float(ok)
+                        image_hands_total += float(total)
+                    bad = hd.get("bad")
+                    if isinstance(bad, (int, float)):
                         # if only ok + bad provided
-                        if isinstance(ok_val, (int, float)) and not isinstance(total_val, (int, float)):
-                            image_hands_true += float(ok_val)
-                            image_hands_total += float(ok_val) + float(bad_val)
+                        if isinstance(ok, (int, float)) and not isinstance(total, (int, float)):
+                            image_hands_true += float(ok)
+                            image_hands_total += float(ok) + float(bad)
             hands_ratio_values = _collect_key_values(root_candidates, ["hands_ok_ratio", "hands_ratio"])
             for val in hands_ratio_values:
                 if isinstance(val, (int, float)):
@@ -290,11 +301,11 @@ def compute_domain_qa(tool_results: List[Dict[str, Any]]) -> Dict[str, Any]:
             artifact_dicts = _collect_key_values(root_candidates, ["artifacts", "artifact"])
             for ad in artifact_dicts:
                 if isinstance(ad, dict):
-                    ok_val = ad.get("ok")
-                    total_val = ad.get("total")
-                    if isinstance(ok_val, (int, float)) and isinstance(total_val, (int, float)) and total_val:
-                        image_art_true += float(ok_val)
-                        image_art_total += float(total_val)
+                    ok = ad.get("ok")
+                    total = ad.get("total")
+                    if isinstance(ok, (int, float)) and isinstance(total, (int, float)) and total:
+                        image_art_true += float(ok)
+                        image_art_total += float(total)
             artifact_ratio = _collect_key_values(root_candidates, ["artifact_ok_ratio", "artifacts_ok_ratio"])
             for val in artifact_ratio:
                 if isinstance(val, (int, float)):
@@ -396,15 +407,15 @@ def compute_domain_qa(tool_results: List[Dict[str, Any]]) -> Dict[str, Any]:
             if isinstance(qp, str) and qp.strip() and image_quality_profile is None:
                 image_quality_profile = qp.strip().lower()
 
-        if name.startswith("video.") or name == "film2.run":
+        if tool_name.startswith("video.") or tool_name == "film2.run":
             seam_dicts = _collect_key_values(root_candidates, ["seam", "seams"])
             for sd in seam_dicts:
                 if isinstance(sd, dict):
-                    ok_val = sd.get("ok")
-                    total_val = sd.get("total")
-                    if isinstance(ok_val, (int, float)) and isinstance(total_val, (int, float)) and total_val:
-                        video_seam_true += float(ok_val)
-                        video_seam_total += float(total_val)
+                    ok = sd.get("ok")
+                    total = sd.get("total")
+                    if isinstance(ok, (int, float)) and isinstance(total, (int, float)) and total:
+                        video_seam_true += float(ok)
+                        video_seam_total += float(total)
             seam_ratio_values = _collect_key_values(root_candidates, ["seam_ok_ratio", "seams_ok_ratio"])
             for val in seam_ratio_values:
                 if isinstance(val, (int, float)):
@@ -420,11 +431,11 @@ def compute_domain_qa(tool_results: List[Dict[str, Any]]) -> Dict[str, Any]:
             video_art_dicts = _collect_key_values(root_candidates, ["artifact", "artifacts"])
             for ad in video_art_dicts:
                 if isinstance(ad, dict):
-                    ok_val = ad.get("ok")
-                    total_val = ad.get("total")
-                    if isinstance(ok_val, (int, float)) and isinstance(total_val, (int, float)) and total_val:
-                        video_art_true += float(ok_val)
-                        video_art_total += float(total_val)
+                    ok = ad.get("ok")
+                    total = ad.get("total")
+                    if isinstance(ok, (int, float)) and isinstance(total, (int, float)) and total:
+                        video_art_true += float(ok)
+                        video_art_total += float(total)
             video_art_ratio_values = _collect_key_values(root_candidates, ["artifact_ok_ratio", "artifacts_ok_ratio"])
             for val in video_art_ratio_values:
                 if isinstance(val, (int, float)):
@@ -438,40 +449,40 @@ def compute_domain_qa(tool_results: List[Dict[str, Any]]) -> Dict[str, Any]:
                 elif isinstance(val, (int, float)):
                     video_art_ratio_vals.append(float(val))
             # Optional film/video-specific metrics
-            fvd_val = _collect_key_values(root_candidates, ["fvd"])
-            for v in fvd_val:
+            fvd_values = _collect_key_values(root_candidates, ["fvd"])
+            for v in fvd_values:
                 if isinstance(v, (int, float)):
                     video_fvd_vals.append(float(v))
-            fvmd_val = _collect_key_values(root_candidates, ["fvmd"])
-            for v in fvmd_val:
+            fvmd_values = _collect_key_values(root_candidates, ["fvmd"])
+            for v in fvmd_values:
                 if isinstance(v, (int, float)):
                     video_fvmd_vals.append(float(v))
-            frame_lpips_val = _collect_key_values(root_candidates, ["frame_lpips_mean"])
-            for v in frame_lpips_val:
+            frame_lpips_values = _collect_key_values(root_candidates, ["frame_lpips_mean"])
+            for v in frame_lpips_values:
                 if isinstance(v, (int, float)):
                     video_frame_lpips_vals.append(float(v))
-            temp_lpips_val = _collect_key_values(root_candidates, ["temporal_lpips_mean"])
-            for v in temp_lpips_val:
+            temporal_lpips_values = _collect_key_values(root_candidates, ["temporal_lpips_mean"])
+            for v in temporal_lpips_values:
                 if isinstance(v, (int, float)):
                     video_temporal_lpips_vals.append(float(v))
-            flow_cons_val = _collect_key_values(root_candidates, ["optical_flow_consistency"])
-            for v in flow_cons_val:
+            flow_consistency_values = _collect_key_values(root_candidates, ["optical_flow_consistency"])
+            for v in flow_consistency_values:
                 if isinstance(v, (int, float)):
                     video_flow_consistency_vals.append(float(v))
-            face_drift_val = _collect_key_values(root_candidates, ["face_track_drift_mean"])
-            for v in face_drift_val:
+            face_drift_values = _collect_key_values(root_candidates, ["face_track_drift_mean"])
+            for v in face_drift_values:
                 if isinstance(v, (int, float)):
                     video_face_drift_vals.append(float(v))
-            obj_drift_val = _collect_key_values(root_candidates, ["object_track_drift_mean"])
-            for v in obj_drift_val:
+            object_drift_values = _collect_key_values(root_candidates, ["object_track_drift_mean"])
+            for v in object_drift_values:
                 if isinstance(v, (int, float)):
                     video_object_drift_vals.append(float(v))
-            color_cons_val = _collect_key_values(root_candidates, ["color_grade_consistency"])
-            for v in color_cons_val:
+            color_consistency_values = _collect_key_values(root_candidates, ["color_grade_consistency"])
+            for v in color_consistency_values:
                 if isinstance(v, (int, float)):
                     video_color_consistency_vals.append(float(v))
 
-        if name.startswith("music.") or name.startswith("audio.") or name.startswith("tts."):
+        if tool_name.startswith("music.") or tool_name.startswith("audio.") or tool_name.startswith("tts."):
             committee_values = _collect_key_values(root_candidates, ["peak_normalize", "hard_trim", "qa", "committee"])
             for cv in committee_values:
                 if isinstance(cv, dict):
@@ -499,81 +510,81 @@ def compute_domain_qa(tool_results: List[Dict[str, Any]]) -> Dict[str, Any]:
                         if cv.get("seam_ok"):
                             audio_seam_true += 1.0
             # top-level meta falls back
-            lufs_val = meta.get("lufs")
-            if isinstance(lufs_val, (int, float)):
-                audio_lufs_vals.append(float(lufs_val))
-            clipping_val = meta.get("clipping")
-            if isinstance(clipping_val, bool):
+            lufs = meta.get("lufs")
+            if isinstance(lufs, (int, float)):
+                audio_lufs_vals.append(float(lufs))
+            clipping = meta.get("clipping")
+            if isinstance(clipping, bool):
                 audio_clip_total += 1.0
-                if clipping_val:
+                if clipping:
                     audio_clip_true += 1.0
-            elif isinstance(clipping_val, (int, float)):
-                audio_clip_true += float(clipping_val)
+            elif isinstance(clipping, (int, float)):
+                audio_clip_true += float(clipping)
                 audio_clip_total += 1.0
-            seam_val = meta.get("seam_ok")
-            if isinstance(seam_val, bool):
+            seam_ok = meta.get("seam_ok")
+            if isinstance(seam_ok, bool):
                 audio_seam_total += 1.0
-                if seam_val:
+                if seam_ok:
                     audio_seam_true += 1.0
-            elif isinstance(seam_val, (int, float)):
-                audio_seam_ratio_vals.append(float(seam_val))
-            voice_score_val = meta.get("voice_score") or locks_block.get("voice_score")
-            if isinstance(voice_score_val, (int, float)):
-                audio_voice_vals.append(float(voice_score_val))
-            tempo_score_val = meta.get("tempo_score") or locks_block.get("tempo_score")
-            if isinstance(tempo_score_val, (int, float)):
-                audio_tempo_vals.append(float(tempo_score_val))
-            key_score_val = meta.get("key_score") or locks_block.get("key_score")
-            if isinstance(key_score_val, (int, float)):
-                audio_key_vals.append(float(key_score_val))
-            stem_score_val = meta.get("stem_balance_score") or locks_block.get("stem_balance_score")
-            if isinstance(stem_score_val, (int, float)):
-                audio_stem_vals.append(float(stem_score_val))
-            lyrics_score_val = meta.get("lyrics_score") or locks_block.get("lyrics_score")
-            if isinstance(lyrics_score_val, (int, float)):
-                audio_lyrics_vals.append(float(lyrics_score_val))
+            elif isinstance(seam_ok, (int, float)):
+                audio_seam_ratio_vals.append(float(seam_ok))
+            voice_score = meta.get("voice_score") or locks_block.get("voice_score")
+            if isinstance(voice_score, (int, float)):
+                audio_voice_vals.append(float(voice_score))
+            tempo_score = meta.get("tempo_score") or locks_block.get("tempo_score")
+            if isinstance(tempo_score, (int, float)):
+                audio_tempo_vals.append(float(tempo_score))
+            key_score = meta.get("key_score") or locks_block.get("key_score")
+            if isinstance(key_score, (int, float)):
+                audio_key_vals.append(float(key_score))
+            stem_balance_score = meta.get("stem_balance_score") or locks_block.get("stem_balance_score")
+            if isinstance(stem_balance_score, (int, float)):
+                audio_stem_vals.append(float(stem_balance_score))
+            lyrics_score = meta.get("lyrics_score") or locks_block.get("lyrics_score")
+            if isinstance(lyrics_score, (int, float)):
+                audio_lyrics_vals.append(float(lyrics_score))
             # Optional motif-level lock scores if tools emit them
-            motif_score_val = meta.get("motif_lock") or locks_block.get("motif_lock")
-            if isinstance(motif_score_val, (int, float)):
-                audio_motif_vals.append(float(motif_score_val))
+            motif_lock = meta.get("motif_lock") or locks_block.get("motif_lock")
+            if isinstance(motif_lock, (int, float)):
+                audio_motif_vals.append(float(motif_lock))
             # Optional TTS prosody/emotion/style/timing locks
-            pros_pitch_val = meta.get("prosody_pitch_lock") or locks_block.get("prosody_pitch_lock")
-            if isinstance(pros_pitch_val, (int, float)):
-                audio_prosody_pitch_vals.append(float(pros_pitch_val))
-            pros_energy_val = meta.get("prosody_energy_lock") or locks_block.get("prosody_energy_lock")
-            if isinstance(pros_energy_val, (int, float)):
-                audio_prosody_energy_vals.append(float(pros_energy_val))
-            pros_dur_val = meta.get("prosody_duration_lock") or locks_block.get("prosody_duration_lock")
-            if isinstance(pros_dur_val, (int, float)):
-                audio_prosody_duration_vals.append(float(pros_dur_val))
-            emotion_val = meta.get("emotion_lock") or locks_block.get("emotion_lock")
-            if isinstance(emotion_val, (int, float)):
-                audio_emotion_vals.append(float(emotion_val))
-            style_val = meta.get("style_lock") or locks_block.get("style_lock")
-            if isinstance(style_val, (int, float)):
-                audio_style_vals.append(float(style_val))
-            timing_val = meta.get("timing_lock") or locks_block.get("timing_lock")
-            if isinstance(timing_val, (int, float)):
-                audio_timing_vals.append(float(timing_val))
+            prosody_pitch_lock = meta.get("prosody_pitch_lock") or locks_block.get("prosody_pitch_lock")
+            if isinstance(prosody_pitch_lock, (int, float)):
+                audio_prosody_pitch_vals.append(float(prosody_pitch_lock))
+            prosody_energy_lock = meta.get("prosody_energy_lock") or locks_block.get("prosody_energy_lock")
+            if isinstance(prosody_energy_lock, (int, float)):
+                audio_prosody_energy_vals.append(float(prosody_energy_lock))
+            prosody_duration_lock = meta.get("prosody_duration_lock") or locks_block.get("prosody_duration_lock")
+            if isinstance(prosody_duration_lock, (int, float)):
+                audio_prosody_duration_vals.append(float(prosody_duration_lock))
+            emotion_lock = meta.get("emotion_lock") or locks_block.get("emotion_lock")
+            if isinstance(emotion_lock, (int, float)):
+                audio_emotion_vals.append(float(emotion_lock))
+            style_lock = meta.get("style_lock") or locks_block.get("style_lock")
+            if isinstance(style_lock, (int, float)):
+                audio_style_vals.append(float(style_lock))
+            timing_lock = meta.get("timing_lock") or locks_block.get("timing_lock")
+            if isinstance(timing_lock, (int, float)):
+                audio_timing_vals.append(float(timing_lock))
             # Optional SFX-specific locks
-            sfx_timbre_val = meta.get("sfx_timbre_lock") or locks_block.get("sfx_timbre_lock")
-            if isinstance(sfx_timbre_val, (int, float)):
-                audio_sfx_timbre_vals.append(float(sfx_timbre_val))
-            sfx_env_val = meta.get("sfx_envelope_lock") or locks_block.get("sfx_envelope_lock")
-            if isinstance(sfx_env_val, (int, float)):
-                audio_sfx_envelope_vals.append(float(sfx_env_val))
-            sfx_spatial_val = meta.get("sfx_spatial_lock") or locks_block.get("sfx_spatial_lock")
-            if isinstance(sfx_spatial_val, (int, float)):
-                audio_sfx_spatial_vals.append(float(sfx_spatial_val))
-            sfx_timing_val = meta.get("sfx_timing_lock") or locks_block.get("sfx_timing_lock")
-            if isinstance(sfx_timing_val, (int, float)):
-                audio_sfx_timing_vals.append(float(sfx_timing_val))
-            sfx_loud_val = meta.get("sfx_loudness_lock") or locks_block.get("sfx_loudness_lock")
-            if isinstance(sfx_loud_val, (int, float)):
-                audio_sfx_loudness_vals.append(float(sfx_loud_val))
-            sfx_density_val = meta.get("sfx_density_lock") or locks_block.get("sfx_density_lock")
-            if isinstance(sfx_density_val, (int, float)):
-                audio_sfx_density_vals.append(float(sfx_density_val))
+            sfx_timbre_lock = meta.get("sfx_timbre_lock") or locks_block.get("sfx_timbre_lock")
+            if isinstance(sfx_timbre_lock, (int, float)):
+                audio_sfx_timbre_vals.append(float(sfx_timbre_lock))
+            sfx_envelope_lock = meta.get("sfx_envelope_lock") or locks_block.get("sfx_envelope_lock")
+            if isinstance(sfx_envelope_lock, (int, float)):
+                audio_sfx_envelope_vals.append(float(sfx_envelope_lock))
+            sfx_spatial_lock = meta.get("sfx_spatial_lock") or locks_block.get("sfx_spatial_lock")
+            if isinstance(sfx_spatial_lock, (int, float)):
+                audio_sfx_spatial_vals.append(float(sfx_spatial_lock))
+            sfx_timing_lock = meta.get("sfx_timing_lock") or locks_block.get("sfx_timing_lock")
+            if isinstance(sfx_timing_lock, (int, float)):
+                audio_sfx_timing_vals.append(float(sfx_timing_lock))
+            sfx_loudness_lock = meta.get("sfx_loudness_lock") or locks_block.get("sfx_loudness_lock")
+            if isinstance(sfx_loudness_lock, (int, float)):
+                audio_sfx_loudness_vals.append(float(sfx_loudness_lock))
+            sfx_density_lock = meta.get("sfx_density_lock") or locks_block.get("sfx_density_lock")
+            if isinstance(sfx_density_lock, (int, float)):
+                audio_sfx_density_vals.append(float(sfx_density_lock))
 
     image_face_avg = sum(image_face_vals) / len(image_face_vals) if image_face_vals else None
     image_id_avg = sum(image_id_vals) / len(image_id_vals) if image_id_vals else None

@@ -429,8 +429,18 @@ def mine_voices_from_audio(job: Dict[str, Any]) -> Dict[str, Any]:
                 continue
                 
             # Determine best matching speaker
-            longest_seg = max(valid_segs, key=lambda s: float(s.get("end", 0.0)) - float(s.get("start", 0.0)))
-            embedding = compute_speaker_embedding(longest_seg["wav_path"])
+            longest_seg = None
+            longest_dur = None
+            for segment_entry in valid_segs:
+                if not isinstance(segment_entry, dict):
+                    continue
+                end_val = float(segment_entry.get("end", 0.0) or 0.0)
+                start_val = float(segment_entry.get("start", 0.0) or 0.0)
+                dur = end_val - start_val
+                if longest_dur is None or dur > longest_dur:
+                    longest_dur = dur
+                    longest_seg = segment_entry
+            embedding = compute_speaker_embedding(longest_seg["wav_path"] if isinstance(longest_seg, dict) else "")
             
             best_id = None
             best_score = 0.0
@@ -588,10 +598,10 @@ def mine_voices_from_video(job: Dict[str, Any]) -> Dict[str, Any]:
             
             # Check textual hints
             for hint in character_hints:
-                char_id = hint.get("character_id")
+                character_id = hint.get("character_id")
                 hint_text = str(hint.get("hint", "")).lower()
-                if char_id and hint_text and hint_text in seg_text:
-                    assigned_char = char_id
+                if character_id and hint_text and hint_text in seg_text:
+                    assigned_char = character_id
                     break
             
             # Fallback to speaker label if no hint match
@@ -603,7 +613,7 @@ def mine_voices_from_video(job: Dict[str, Any]) -> Dict[str, Any]:
         
         # Step 5: Process per character
         results = []
-        for char_id, segs in character_clusters.items():
+        for character_id, segs in character_clusters.items():
             if not segs:
                 continue
             
@@ -612,11 +622,21 @@ def mine_voices_from_video(job: Dict[str, Any]) -> Dict[str, Any]:
                 continue
             
             # Speaker ID is the character ID
-            speaker_id = char_id
+            speaker_id = character_id
             
             # Check against existing index to see if this character is actually a known speaker
-            longest_seg = max(valid_segs, key=lambda s: float(s.get("end", 0.0)) - float(s.get("start", 0.0)))
-            embedding = compute_speaker_embedding(longest_seg["wav_path"])
+            longest_seg = None
+            longest_dur = None
+            for segment_entry in valid_segs:
+                if not isinstance(segment_entry, dict):
+                    continue
+                end_val = float(segment_entry.get("end", 0.0) or 0.0)
+                start_val = float(segment_entry.get("start", 0.0) or 0.0)
+                dur = end_val - start_val
+                if longest_dur is None or dur > longest_dur:
+                    longest_dur = dur
+                    longest_seg = segment_entry
+            embedding = compute_speaker_embedding(longest_seg["wav_path"] if isinstance(longest_seg, dict) else "")
             
             best_id = None
             best_score = 0.0

@@ -30,7 +30,8 @@ DEFAULT_ENV: Dict[str, Any] = {
         "schema_version": 1,
         "model": "unknown",
         "ts": _iso_now(),
-        "cid": "",
+        "conversation_id": "",
+        "trace_id": "",
         "step": 0,
         "state": "running",
         "cont": {"present": False, "state_hash": None, "reason": None},
@@ -89,7 +90,8 @@ def normalize_envelope(obj: Dict[str, Any]) -> Dict[str, Any]:
     meta.setdefault("schema_version", 1)
     meta.setdefault("model", "")
     meta.setdefault("ts", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
-    meta.setdefault("cid", "")
+    meta.setdefault("conversation_id", "")
+    meta.setdefault("trace_id", "")
     meta.setdefault("step", 0)
     meta.setdefault("state", "running")
     meta.setdefault("cont", {"present": False, "state_hash": None, "reason": None})

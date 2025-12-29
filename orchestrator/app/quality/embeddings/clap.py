@@ -54,7 +54,9 @@ if not CLAP_MODEL_DIR_MISSING:
 
 def embed_music_clap(path: str) -> List[float]:
     if CLAP_MODEL_DIR_MISSING or _CLAP_MODEL is None:
-        raise MusicEvalError("CLAP model dir missing/unavailable")
+        # Never raise: this is QA-only. Degrade to empty embedding and let callers score as 0.
+        log.error("CLAP model dir missing/unavailable; returning empty embedding path=%r", path)
+        return []
     y, sr = _load_audio(path)
     if not y or not sr:
         return []

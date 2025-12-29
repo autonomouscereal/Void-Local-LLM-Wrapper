@@ -16,8 +16,8 @@ class Job:
     state: JobState = "queued"
     phase: str = "init"
     progress: float = 0.0
-    created_at: float = field(default_factory=lambda: time.time())
-    updated_at: float = field(default_factory=lambda: time.time())
+    created_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
     cancel_flag: bool = False
     error: Optional[str] = None
 

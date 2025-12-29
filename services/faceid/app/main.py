@@ -85,7 +85,7 @@ def _get_app(model_name: Optional[str] = None, model_root: Optional[str] = None)
         # Keep det_size aligned with orchestrator-side expectations.
         app0.prepare(ctx_id=ctx, det_size=(640, 640))
         _APPS[key] = app0
-        log.info("faceid: loaded insightface model=%s root=%s ctx_id=%s", name, root, ctx)
+        log.info(f"faceid: loaded insightface model={name!r} root={root!r} ctx_id={ctx!r}")
         return app0
     except Exception:
         log.exception("faceid: failed to init FaceAnalysis model=%s root=%s ctx_id=%s", name, root, ctx)
@@ -170,28 +170,27 @@ async def healthz():
 
 @app.post("/embed")
 async def embed(body: Dict[str, Any]):
-    request_id = (
-        str(body.get("request_id")).strip()
-        if isinstance(body.get("request_id"), (str, int)) and str(body.get("request_id")).strip()
-        else None
-    )
+    trace_id = str(body.get("trace_id") or "").strip() if isinstance(body.get("trace_id"), (str, int)) else ""
+    conversation_id = str(body.get("conversation_id") or "").strip() if isinstance(body.get("conversation_id"), (str, int)) else ""
     image_bytes, src_meta = await _load_image_bytes(body or {})
     if not image_bytes:
         return ToolEnvelope.failure(
-            "ValidationError",
-            "missing image input (provide image_path, image_url, or image_b64)",
+            code="ValidationError",
+            message="missing image input (provide image_path, image_url, or image_b64)",
+            trace_id=trace_id,
+            conversation_id=conversation_id,
             status=400,
-            details={"source": src_meta, "stack": "".join(traceback.format_stack())},
-            request_id=request_id,
+            details={"trace_id": trace_id, "conversation_id": conversation_id, "source": src_meta, "stack": "".join(traceback.format_stack())},
         )
     img_bgr = _image_bytes_to_bgr(image_bytes)
     if img_bgr is None:
         return ToolEnvelope.failure(
-            "ValidationError",
-            "failed to decode image bytes",
+            code="ValidationError",
+            message="failed to decode image bytes",
+            trace_id=trace_id,
+            conversation_id=conversation_id,
             status=400,
-            details={"source": src_meta, "bytes": len(image_bytes), "stack": "".join(traceback.format_stack())},
-            request_id=request_id,
+            details={"trace_id": trace_id, "conversation_id": conversation_id, "source": src_meta, "bytes": len(image_bytes), "stack": "".join(traceback.format_stack())},
         )
 
     model_root = body.get("model_root") if isinstance(body.get("model_root"), str) else None
@@ -207,11 +206,12 @@ async def embed(body: Dict[str, Any]):
     app0 = _get_app(model_name=model_name, model_root=model_root)
     if app0 is None:
         return ToolEnvelope.failure(
-            "ModelError",
-            "failed to initialize InsightFace FaceAnalysis",
+            code="ModelError",
+            message="failed to initialize InsightFace FaceAnalysis",
+            trace_id=trace_id,
+            conversation_id=conversation_id,
             status=500,
-            details={"model_name": model_name, "model_root": model_root, "source": src_meta, "stack": traceback.format_exc()},
-            request_id=request_id,
+            details={"trace_id": trace_id, "model_name": model_name, "model_root": model_root, "source": src_meta, "stack": traceback.format_exc()},
         )
 
     try:
@@ -219,11 +219,12 @@ async def embed(body: Dict[str, Any]):
     except Exception:
         log.exception("faceid.embed: app.get failed model=%s source=%s", model_name, src_meta)
         return ToolEnvelope.failure(
-            "InferenceError",
-            "face detection/embedding failed",
+            code="InferenceError",
+            message="face detection/embedding failed",
+            trace_id=trace_id,
+            conversation_id=conversation_id,
             status=500,
-            details={"model_name": model_name, "source": src_meta, "stack": traceback.format_exc()},
-            request_id=request_id,
+            details={"trace_id": trace_id, "model_name": model_name, "source": src_meta, "stack": traceback.format_exc()},
         )
 
     out_faces: List[Dict[str, Any]] = []
@@ -248,7 +249,13 @@ async def embed(body: Dict[str, Any]):
         except Exception:
             continue
 
-    out_faces.sort(key=lambda d: float(d.get("det_score") or 0.0), reverse=True)
+    ranked_faces: List[tuple[float, int, Dict[str, Any]]] = []
+    for i, face_entry in enumerate(out_faces):
+        det_score = face_entry.get("det_score")
+        det_score_val = float(det_score) if isinstance(det_score, (int, float)) else 0.0
+        ranked_faces.append((det_score_val, int(i), face_entry))
+    ranked_faces.sort(reverse=True)
+    out_faces = [triple[2] for triple in ranked_faces]
     if max_faces > 0:
         out_faces = out_faces[: int(max_faces)]
 
@@ -266,7 +273,9 @@ async def embed(body: Dict[str, Any]):
         "model": (model_name or best_available_face_model(model_root)),
         "max_faces": max_faces,
         "source": src_meta,
+        "trace_id": trace_id,
+        "conversation_id": conversation_id,
     }
-    return ToolEnvelope.success(result, request_id=request_id)
+    return ToolEnvelope.success(result=result, trace_id=trace_id, conversation_id=conversation_id)
 
 

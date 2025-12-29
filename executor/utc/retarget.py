@@ -6,6 +6,7 @@ import urllib.error
 import re
 
 from void_json.json_parser import JSONParser
+from void_envelopes import _build_error_envelope
 
 
 def _get(url: str) -> Dict[str, Any]:
@@ -20,10 +21,17 @@ def _get(url: str) -> Dict[str, Any]:
         except Exception:
             return {}
     except urllib.error.HTTPError as e:
-        return {"schema_version": 1, "ok": False, "code": "not_supported", "status": e.code}
+        return _build_error_envelope(
+            code="not_supported",
+            message=f"GET {url} returned HTTPError",
+            trace_id="",
+            conversation_id="",
+            status=int(getattr(e, "code", 0) or 0),
+            details={"url": url},
+        )
 
 
-def find_candidate(name: str) -> Optional[Dict[str, Any]]:
+def find_candidate(tool_name: str) -> Optional[Dict[str, Any]]:
     """
     Best-effort tool name discovery.
 
@@ -34,7 +42,7 @@ def find_candidate(name: str) -> Optional[Dict[str, Any]]:
 
     We use GET for simplicity and to avoid adding a POST helper here.
     """
-    nm = (name or "").strip()
+    nm = (tool_name or "").strip()
     if not nm:
         return None
     base = os.getenv("ORCHESTRATOR_BASE_URL", "http://127.0.0.1:8000")
@@ -57,13 +65,13 @@ def find_candidate(name: str) -> Optional[Dict[str, Any]]:
     for t in tools:
         if not isinstance(t, dict):
             continue
-        tname = t.get("name")
-        if not isinstance(tname, str) or not tname.strip():
+        tool_name = t.get("tool_name") or t.get("name")
+        if not isinstance(tool_name, str) or not tool_name.strip():
             continue
-        if tname == nm:
-            return {"name": tname, "version": t.get("version"), "kind": t.get("kind")}
-        if _norm(tname) == target:
-            best = {"name": tname, "version": t.get("version"), "kind": t.get("kind")}
+        if tool_name == nm:
+            return {"tool_name": tool_name, "version": t.get("version"), "kind": t.get("kind")}
+        if _norm(tool_name) == target:
+            best = {"tool_name": tool_name, "version": t.get("version"), "kind": t.get("kind")}
             break
     return best
 

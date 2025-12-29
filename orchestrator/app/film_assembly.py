@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+import traceback
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx  # type: ignore
@@ -20,35 +21,87 @@ from void_envelopes import _build_success_envelope, _build_error_envelope
 log = logging.getLogger(__name__)
 
 
-def _run_ffmpeg(cmd: List[str]) -> None:
+def _run_ffmpeg(cmd: List[str], *, trace_id: str, conversation_id: str):
     """
-    Blocking ffmpeg runner. Raises on non-zero exit.
+    Blocking ffmpeg runner.
+    NEVER raises. Always returns an envelope (success or error) with full details.
     """
     if not shutil.which("ffmpeg"):
-        raise RuntimeError("ffmpeg_not_found")
+        log.error(f"ffmpeg_not_found cmd={cmd!r}")
+        return _build_error_envelope(
+            code="ffmpeg_not_found",
+            message="ffmpeg was not found on PATH",
+            trace_id=trace_id,
+            conversation_id=conversation_id,
+            status=500,
+            details={"cmd": cmd},
+        )
     t0 = time.perf_counter()
     try:
-        subprocess.run(cmd, check=True)
-    except Exception:
-        log.error("ffmpeg.failed cmd=%r", cmd, exc_info=True)
-        raise
-    finally:
-        log.info("ffmpeg.ok dur_ms=%d cmd0=%r", int((time.perf_counter() - t0) * 1000), cmd[:6])
+        # Capture output for full debugging (do not truncate).
+        proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
+        dur_ms = int((time.perf_counter() - t0) * 1000)
+        ok = (int(proc.returncode) == 0)
+        log.info(f"ffmpeg.done ok={bool(ok)} dur_ms={int(dur_ms)} cmd0={cmd[:6]!r}")
+        if ok:
+            return _build_success_envelope(
+                result={
+                    "cmd": cmd,
+                    "returncode": int(proc.returncode),
+                    "stdout": proc.stdout,
+                    "stderr": proc.stderr,
+                    "dur_ms": int(dur_ms),
+                },
+                trace_id=trace_id,
+                conversation_id=conversation_id,
+            )
+        log.error(f"ffmpeg.failed rc={proc.returncode!r} cmd={cmd!r} stdout={proc.stdout!r} stderr={proc.stderr!r}")
+        return _build_error_envelope(
+            code="ffmpeg_failed",
+            message="ffmpeg exited non-zero",
+            trace_id=trace_id,
+            conversation_id=conversation_id,
+            status=500,
+            details={
+                "cmd": cmd,
+                "returncode": int(proc.returncode),
+                "stdout": proc.stdout,
+                "stderr": proc.stderr,
+                "dur_ms": int(dur_ms),
+            },
+        )
+    except Exception as e:
+        dur_ms = int((time.perf_counter() - t0) * 1000)
+        log.error(f"ffmpeg.exception cmd={cmd!r} ex={e!r}", exc_info=True)
+        return _build_error_envelope(
+            code="ffmpeg_exception",
+            message="Exception while running ffmpeg",
+            trace_id=trace_id,
+            conversation_id=conversation_id,
+            status=500,
+            details={
+                "cmd": cmd,
+                "dur_ms": int(dur_ms),
+                "exception": repr(e),
+                "exception_type": type(e).__name__,
+                "stack": traceback.format_exc(),
+            },
+        )
 
 
-def _write_bytes(path: str, data: bytes) -> None:
+def _write_bytes(path: str, data: bytes):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "wb") as f:
         f.write(data)
 
 
-def _write_text(path: str, text: str) -> None:
+def _write_text(path: str, text: str):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         f.write(text)
 
 
-def _safe_public_url(public_base_url: str, abs_upload_path: str, *, upload_dir: str) -> str:
+def _safe_public_url(public_base_url: str, abs_upload_path: str, *, upload_dir: str):
     if not isinstance(abs_upload_path, str) or not abs_upload_path:
         return ""
     if abs_upload_path.startswith("/workspace/uploads/"):
@@ -62,7 +115,7 @@ def _safe_public_url(public_base_url: str, abs_upload_path: str, *, upload_dir: 
     return abs_upload_path
 
 
-def _parse_assets(assets: Any) -> Dict[str, Any]:
+def _parse_assets(assets: Any):
     if isinstance(assets, dict):
         return assets
     if isinstance(assets, str) and assets.strip():
@@ -75,7 +128,7 @@ def _parse_assets(assets: Any) -> Dict[str, Any]:
     return {}
 
 
-def _mix_audio_wav(out_wav: str, *, tracks: List[str]) -> Optional[str]:
+def _mix_audio_wav(out_wav: str, *, tracks: List[str], trace_id: str, conversation_id: str):
     tracks = [p for p in (tracks or []) if isinstance(p, str) and p and os.path.exists(p)]
     if not tracks:
         return None
@@ -100,7 +153,9 @@ def _mix_audio_wav(out_wav: str, *, tracks: List[str]) -> Optional[str]:
         "pcm_s16le",
         out_wav,
     ]
-    _run_ffmpeg(cmd)
+    ff = _run_ffmpeg(cmd, trace_id=trace_id, conversation_id=conversation_id)
+    if not (isinstance(ff, dict) and bool(ff.get("ok"))):
+        return tracks[0]
     return out_wav
 
 
@@ -114,12 +169,16 @@ def _mux_frames_to_video(
     upscale_scale: Optional[int],
     target_fps: Optional[int],
     audio_normalize: bool,
-) -> None:
+    trace_id: str,
+    conversation_id: str,
+):
     # Validate frames exist up-front; ffmpeg glob otherwise fails late and opaquely.
     if not isinstance(frames_glob, str) or not frames_glob:
-        raise ValueError("missing_frames_glob")
+        log.error("mux_frames_to_video missing_frames_glob out=%r", out_path)
+        return
     if not glob.glob(frames_glob.replace("\\", "/")):
-        raise FileNotFoundError(f"no_frames_for_glob:{frames_glob}")
+        log.error("mux_frames_to_video no_frames_for_glob glob=%r out=%r", frames_glob, out_path)
+        return
     filters: List[str] = []
     if isinstance(upscale_scale, int) and upscale_scale in (2, 3, 4):
         filters.append(f"scale=iw*{upscale_scale}:ih*{upscale_scale}:flags=lanczos")
@@ -159,41 +218,91 @@ def _mux_frames_to_video(
     if audio_wav_path and os.path.exists(audio_wav_path) and audio_normalize:
         cmd += ["-filter:a", "loudnorm=I=-16:TP=-1.5:LRA=11"]
     cmd += ["-shortest", out_path]
-    _run_ffmpeg(cmd)
+    ff = _run_ffmpeg(cmd, trace_id=trace_id, conversation_id=conversation_id)
+    if not (isinstance(ff, dict) and bool(ff.get("ok"))):
+        err = ff.get("error") if isinstance(ff, dict) else {}
+        log.error(f"mux_frames_to_video.ffmpeg_failed out={out_path!r} err={err!r}")
 
 
-def _concat_videos_reencode(inputs: List[str], out_path: str) -> None:
+def _concat_videos_reencode(inputs: List[str], out_path: str, *, trace_id: str, conversation_id: str):
     inputs = [p for p in (inputs or []) if isinstance(p, str) and p and os.path.exists(p)]
     if not inputs:
-        raise ValueError("no_inputs")
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    with tempfile.TemporaryDirectory() as tmpd:
-        listfile = os.path.join(tmpd, "list.txt")
-        with open(listfile, "w", encoding="utf-8") as f:
-            for p in inputs:
-                # ffmpeg concat demuxer file quoting: escape single quotes in the path.
-                safe = p.replace("'", "'\\''")
-                f.write("file '" + safe + "'\n")
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            listfile,
-            "-c:v",
-            "libx264",
-            "-pix_fmt",
-            "yuv420p",
-            "-c:a",
-            "aac",
-            "-movflags",
-            "+faststart",
-            out_path,
-        ]
-        _run_ffmpeg(cmd)
+        log.error(f"concat_videos_reencode no_inputs out_path={out_path!r}")
+        return _build_error_envelope(
+            code="concat_no_inputs",
+            message="No input videos were available to concatenate",
+            trace_id=trace_id,
+            conversation_id=conversation_id,
+            status=422,
+            details={"out_path": out_path, "inputs": inputs},
+        )
+    try:
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    except Exception as e:
+        return _build_error_envelope(
+            code="concat_mkdir_failed",
+            message="Failed to create output directory for concatenation",
+            trace_id=trace_id,
+            conversation_id=conversation_id,
+            status=500,
+            details={"out_path": out_path, "exception": repr(e), "exception_type": type(e).__name__, "stack": traceback.format_exc()},
+        )
+    try:
+        with tempfile.TemporaryDirectory() as tmpd:
+            listfile = os.path.join(tmpd, "list.txt")
+            with open(listfile, "w", encoding="utf-8") as f:
+                for p in inputs:
+                    # ffmpeg concat demuxer file quoting: escape single quotes in the path.
+                    safe = p.replace("'", "'\\''")
+                    f.write("file '" + safe + "'\n")
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                listfile,
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-movflags",
+                "+faststart",
+                out_path,
+            ]
+            ff = _run_ffmpeg(cmd, trace_id=trace_id, conversation_id=conversation_id)
+            if not (isinstance(ff, dict) and bool(ff.get("ok"))):
+                return _build_error_envelope(
+                    code="concat_ffmpeg_failed",
+                    message="ffmpeg concat failed",
+                    trace_id=trace_id,
+                    conversation_id=conversation_id,
+                    status=500,
+                    details={"out_path": out_path, "inputs": inputs, "ffmpeg": ff},
+                )
+    except Exception as e:
+        return _build_error_envelope(
+            code="concat_exception",
+            message="Exception while concatenating videos",
+            trace_id=trace_id,
+            conversation_id=conversation_id,
+            status=500,
+            details={"out_path": out_path, "inputs": inputs, "exception": repr(e), "exception_type": type(e).__name__, "stack": traceback.format_exc()},
+        )
+    if not (isinstance(out_path, str) and out_path and os.path.exists(out_path) and os.path.getsize(out_path) > 0):
+        return _build_error_envelope(
+            code="concat_missing_output",
+            message="Concatenation produced no output file",
+            trace_id=trace_id,
+            conversation_id=conversation_id,
+            status=500,
+            details={"out_path": out_path, "inputs": inputs},
+        )
+    return _build_success_envelope(result={"out_path": out_path, "inputs": inputs}, trace_id=trace_id, conversation_id=conversation_id)
 
 
 def _mux_audio_into_video(
@@ -202,7 +311,9 @@ def _mux_audio_into_video(
     out_path: str,
     audio_path: str,
     policy: str,
-) -> None:
+    trace_id: str,
+    conversation_id: str,
+):
     """
     policy:
       - 'replace': replace video audio with audio_path
@@ -210,14 +321,21 @@ def _mux_audio_into_video(
       - 'keep': no-op (caller should just use video_path)
     """
     if not (isinstance(video_path, str) and video_path and os.path.exists(video_path)):
-        raise FileNotFoundError(f"missing_video:{video_path}")
+        log.error(f"mux_audio_into_video missing_video video_path={video_path!r} out={out_path!r}")
+        return
     if policy == "keep":
         if video_path != out_path:
-            _run_ffmpeg(["ffmpeg", "-y", "-i", video_path, "-c", "copy", out_path])
+            ff = _run_ffmpeg(["ffmpeg", "-y", "-i", video_path, "-c", "copy", out_path], trace_id=trace_id, conversation_id=conversation_id)
+            if not (isinstance(ff, dict) and bool(ff.get("ok"))):
+                err = ff.get("error") if isinstance(ff, dict) else {}
+                log.error(f"mux_audio_into_video.keep.ffmpeg_failed video={video_path!r} out={out_path!r} err={err!r}")
         return
     if not (isinstance(audio_path, str) and audio_path and os.path.exists(audio_path)):
         if video_path != out_path:
-            _run_ffmpeg(["ffmpeg", "-y", "-i", video_path, "-c", "copy", out_path])
+            ff = _run_ffmpeg(["ffmpeg", "-y", "-i", video_path, "-c", "copy", out_path], trace_id=trace_id, conversation_id=conversation_id)
+            if not (isinstance(ff, dict) and bool(ff.get("ok"))):
+                err = ff.get("error") if isinstance(ff, dict) else {}
+                log.error(f"mux_audio_into_video.no_audio.ffmpeg_failed video={video_path!r} out={out_path!r} err={err!r}")
         return
     if policy == "replace":
         cmd = [
@@ -238,7 +356,10 @@ def _mux_audio_into_video(
             "-shortest",
             out_path,
         ]
-        _run_ffmpeg(cmd)
+        ff = _run_ffmpeg(cmd, trace_id=trace_id, conversation_id=conversation_id)
+        if not (isinstance(ff, dict) and bool(ff.get("ok"))):
+            err = ff.get("error") if isinstance(ff, dict) else {}
+            log.error(f"mux_audio_into_video.replace.ffmpeg_failed video={video_path!r} audio={audio_path!r} out={out_path!r} err={err!r}")
         return
     # mix
     cmd = [
@@ -262,10 +383,9 @@ def _mux_audio_into_video(
         out_path,
     ]
     # If the input video has no audio stream, this will fail; caller can fall back to replace.
-    try:
-        _run_ffmpeg(cmd)
-    except Exception:
-        _mux_audio_into_video(video_path=video_path, out_path=out_path, audio_path=audio_path, policy="replace")
+    ff = _run_ffmpeg(cmd, trace_id=trace_id, conversation_id=conversation_id)
+    if not (isinstance(ff, dict) and bool(ff.get("ok"))):
+        _mux_audio_into_video(video_path=video_path, out_path=out_path, audio_path=audio_path, policy="replace", trace_id=trace_id, conversation_id=conversation_id)
 
 
 def _burn_subtitles(
@@ -273,12 +393,18 @@ def _burn_subtitles(
     video_path: str,
     out_path: str,
     subtitles_srt_path: str,
-) -> None:
+    trace_id: str,
+    conversation_id: str,
+):
     if not (isinstance(video_path, str) and video_path and os.path.exists(video_path)):
-        raise FileNotFoundError(f"missing_video:{video_path}")
+        log.error(f"burn_subtitles missing_video video_path={video_path!r} out={out_path!r}")
+        return
     if not (isinstance(subtitles_srt_path, str) and subtitles_srt_path and os.path.exists(subtitles_srt_path)):
         if video_path != out_path:
-            _run_ffmpeg(["ffmpeg", "-y", "-i", video_path, "-c", "copy", out_path])
+            ff = _run_ffmpeg(["ffmpeg", "-y", "-i", video_path, "-c", "copy", out_path], trace_id=trace_id, conversation_id=conversation_id)
+            if not (isinstance(ff, dict) and bool(ff.get("ok"))):
+                err = ff.get("error") if isinstance(ff, dict) else {}
+                log.error(f"burn_subtitles.no_subtitles.ffmpeg_failed video={video_path!r} out={out_path!r} err={err!r}")
         return
     srt_posix = subtitles_srt_path.replace("\\", "/")
     cmd = [
@@ -298,10 +424,13 @@ def _burn_subtitles(
         "+faststart",
         out_path,
     ]
-    _run_ffmpeg(cmd)
+    ff = _run_ffmpeg(cmd, trace_id=trace_id, conversation_id=conversation_id)
+    if not (isinstance(ff, dict) and bool(ff.get("ok"))):
+        err = ff.get("error") if isinstance(ff, dict) else {}
+        log.error(f"burn_subtitles.ffmpeg_failed video={video_path!r} srt={subtitles_srt_path!r} out={out_path!r} err={err!r}")
 
 
-def build_srt_from_dialogue_index(dialogue_index: Dict[str, Any]) -> str:
+def build_srt_from_dialogue_index(dialogue_index: Dict[str, Any]):
     """
     Build an SRT file from a dialogue_index mapping that contains entries with:
       - text
@@ -327,7 +456,7 @@ def build_srt_from_dialogue_index(dialogue_index: Dict[str, Any]) -> str:
         rows.append((float(s0), float(s1), txt.strip()))
     rows.sort(key=lambda r: (r[0], r[1]))
 
-    def _fmt(t: float) -> str:
+    def _fmt(t: float):
         if t < 0:
             t = 0.0
         h = int(t // 3600)
@@ -355,9 +484,10 @@ async def assemble_film_from_scene_rows(
     upload_dir: str,
     public_base_url: str,
     preferences: Optional[Dict[str, Any]] = None,
-    trace_id: str | None = None,
+    trace_id: str,
+    conversation_id: str,
     state_dir: str | None = None,
-) -> Dict[str, Any]:
+):
     """
     Canonical film assembly for the legacy scene-based pipeline.
 
@@ -420,8 +550,8 @@ async def assemble_film_from_scene_rows(
                         continue
                     try:
                         r = await client.get(fu)
-                    except Exception:
-                        log.warning("film.compile.frame_download_failed url=%r", fu, exc_info=True)
+                    except Exception as e:
+                        log.warning(f"film.compile.frame_download_failed url={fu!r} ex={e!r}", exc_info=True)
                         continue
                     if int(r.status_code) != 200:
                         continue
@@ -444,11 +574,16 @@ async def assemble_film_from_scene_rows(
                             p = os.path.join(tmpd, f"{kind}.wav")
                             try:
                                 _write_bytes(p, base64.b64decode(b64))
-                            except Exception:
-                                log.warning("film.compile.audio_decode_failed kind=%s", kind, exc_info=True)
+                            except Exception as e:
+                                log.warning(f"film.compile.audio_decode_failed kind={kind!r} ex={e!r}", exc_info=True)
                                 continue
                             wav_paths.append(p)
-                    mixed = _mix_audio_wav(os.path.join(tmpd, "mix.wav"), tracks=wav_paths)
+                    mixed = _mix_audio_wav(
+                        os.path.join(tmpd, "mix.wav"),
+                        tracks=wav_paths,
+                        trace_id=trace_id,
+                        conversation_id=conversation_id,
+                    )
                     audio_wav = mixed if isinstance(mixed, str) else None
 
                 # subtitles (optional)
@@ -470,6 +605,8 @@ async def assemble_film_from_scene_rows(
                     upscale_scale=upscale_scale,
                     target_fps=target_fps,
                     audio_normalize=audio_normalize,
+                    trace_id=trace_id,
+                    conversation_id=conversation_id,
                 )
                 scene_clip_paths.append(scene_out)
                 if isinstance(state_dir, str) and state_dir and isinstance(trace_id, str) and trace_id:
@@ -481,7 +618,7 @@ async def assemble_film_from_scene_rows(
                             {
                                 "film_id": film_id,
                                 "scene_index": idx,
-                                "scene_id": sc.get("id"),
+                                "scene_id": sc.get("scene_id") or sc.get("id"),
                                 "clip_path": scene_out,
                                 "frames": frame_idx - 1,
                                 "has_audio": bool(audio_wav),
@@ -493,7 +630,7 @@ async def assemble_film_from_scene_rows(
                 scene_outputs.append(
                     {
                         "scene_index": idx,
-                        "scene_id": sc.get("id"),
+                        "scene_id": sc.get("scene_id") or sc.get("id"),
                         "index_num": sc.get("index_num"),
                         "clip_path": scene_out,
                         "clip_url": _safe_public_url(public_base_url, scene_out, upload_dir=upload_dir),
@@ -510,20 +647,24 @@ async def assemble_film_from_scene_rows(
             except Exception:
                 log.debug("film.compile.failed trace failed (non-fatal)", exc_info=True)
         return _build_error_envelope(
-            "no_scenes_with_frames",
-            "No scenes contained downloadable frames in assets.urls",
-            f"film.compile:{film_id}",
+            code="no_scenes_with_frames",
+            message="No scenes contained downloadable frames in assets.urls",
+            trace_id=trace_id,
+            conversation_id=conversation_id,
             status=422,
             details={"film_id": film_id},
         )
 
     # Canonical output under artifacts; best-effort convenience copy under uploads root.
     final_out_art = os.path.join(base_out, "film.mp4")
-    _concat_videos_reencode(scene_clip_paths, final_out_art)
+    concat_film = _concat_videos_reencode(scene_clip_paths, final_out_art, trace_id=trace_id, conversation_id=conversation_id)
+    if not (isinstance(concat_film, dict) and bool(concat_film.get("ok"))):
+        # Degrade: fall back to the first scene clip so the pipeline can continue.
+        log.error(f"film.compile.concat_failed film_id={film_id!r} err={concat_film!r}")
+        final_out_art = scene_clip_paths[0]
     final_out_public = os.path.join(upload_dir, f"film_{film_id}.mp4")
-    try:
-        _run_ffmpeg(["ffmpeg", "-y", "-i", final_out_art, "-c", "copy", final_out_public])
-    except Exception:
+    ff_copy = _run_ffmpeg(["ffmpeg", "-y", "-i", final_out_art, "-c", "copy", final_out_public], trace_id=trace_id, conversation_id=conversation_id)
+    if not (isinstance(ff_copy, dict) and bool(ff_copy.get("ok"))):
         final_out_public = final_out_art
 
     if isinstance(state_dir, str) and state_dir and isinstance(trace_id, str) and trace_id:
@@ -531,9 +672,8 @@ async def assemble_film_from_scene_rows(
             emit_trace(state_dir, trace_id, "film.compile.done", {"film_id": film_id, "path": final_out_art, "public_path": final_out_public, "scenes": len(scene_clip_paths)})
         except Exception:
             log.debug("film.compile.done trace failed (non-fatal)", exc_info=True)
-    rid = f"film.compile:{film_id}"
     return _build_success_envelope(
-        {
+        result={
             "film_id": film_id,
             "url": _safe_public_url(public_base_url, final_out_public, upload_dir=upload_dir),
             "path": final_out_art,
@@ -547,7 +687,8 @@ async def assemble_film_from_scene_rows(
                 "upscale_scale": upscale_scale,
             },
         },
-        rid,
+        trace_id=trace_id,
+        conversation_id=conversation_id,
     )
 
 
@@ -560,9 +701,10 @@ def assemble_film_from_shots(
     audio_path: Optional[str] = None,
     audio_policy: str = "replace",
     subtitles_srt_path: Optional[str] = None,
-    trace_id: str | None = None,
+    trace_id: str,
+    conversation_id: str,
     state_dir: str | None = None,
-) -> Dict[str, Any]:
+):
     """
     Canonical assembly for Film2: take ordered shot video paths and produce:
       - per-scene clips (grouped by scene_id when available)
@@ -584,8 +726,8 @@ def assemble_film_from_shots(
     for sh in (shots or []):
         if not isinstance(sh, dict):
             continue
-        sid = sh.get("scene_id")
-        scene_id = sid if isinstance(sid, str) and sid else "scene_0"
+        scene_id = sh.get("scene_id")
+        scene_id = scene_id if isinstance(scene_id, str) and scene_id else "scene_0"
         # choose best available per-shot path
         p = (
             sh.get("best_path")
@@ -610,7 +752,11 @@ def assemble_film_from_shots(
         if not parts:
             continue
         out_scene = os.path.join(base_out, f"{scene_id}_{idx:03d}.mp4")
-        _concat_videos_reencode(parts, out_scene)
+        concat_scene = _concat_videos_reencode(parts, out_scene, trace_id=trace_id, conversation_id=conversation_id)
+        if not (isinstance(concat_scene, dict) and bool(concat_scene.get("ok"))):
+            log.error(f"film2.assemble.scene_concat_failed film_id={film_id!r} scene_id={scene_id!r} err={concat_scene!r}")
+            # Degrade: keep first shot video as the scene clip.
+            out_scene = parts[0]
         scene_clip_paths.append(out_scene)
         if isinstance(state_dir, str) and state_dir and isinstance(trace_id, str) and trace_id:
             try:
@@ -634,34 +780,55 @@ def assemble_film_from_shots(
             except Exception:
                 log.debug("film2.assemble.failed trace failed (non-fatal)", exc_info=True)
         return _build_error_envelope(
-            "no_shot_videos",
-            "No shot videos were available to assemble",
-            f"film2.assemble:{film_id}",
+            code="no_shot_videos",
+            message="No shot videos were available to assemble",
+            trace_id=trace_id,
+            conversation_id=conversation_id,
             status=422,
             details={"film_id": film_id},
         )
 
     stitched = os.path.join(base_out, "film_noaudio.mp4")
-    _concat_videos_reencode(scene_clip_paths, stitched)
+    concat_stitched = _concat_videos_reencode(scene_clip_paths, stitched, trace_id=trace_id, conversation_id=conversation_id)
+    if not (isinstance(concat_stitched, dict) and bool(concat_stitched.get("ok"))):
+        log.error(f"film2.assemble.concat_failed film_id={film_id!r} err={concat_stitched!r}")
+        stitched = scene_clip_paths[0]
 
     final_out = os.path.join(upload_dir, "artifacts", "video", "film2_assemble", str(film_id), "film.mp4")
     os.makedirs(os.path.dirname(final_out), exist_ok=True)
     tmp_mux = os.path.join(base_out, "film_mux.mp4")
-    _mux_audio_into_video(video_path=stitched, out_path=tmp_mux, audio_path=(audio_path or ""), policy=str(audio_policy or "replace"))
+    _mux_audio_into_video(
+        video_path=stitched,
+        out_path=tmp_mux,
+        audio_path=(audio_path or ""),
+        policy=str(audio_policy or "replace"),
+        trace_id=trace_id,
+        conversation_id=conversation_id,
+    )
     if subtitles_srt_path and isinstance(subtitles_srt_path, str) and subtitles_srt_path:
-        _burn_subtitles(video_path=tmp_mux, out_path=final_out, subtitles_srt_path=subtitles_srt_path)
+        _burn_subtitles(
+            video_path=tmp_mux,
+            out_path=final_out,
+            subtitles_srt_path=subtitles_srt_path,
+            trace_id=trace_id,
+            conversation_id=conversation_id,
+        )
     else:
         if tmp_mux != final_out:
-            _run_ffmpeg(["ffmpeg", "-y", "-i", tmp_mux, "-c", "copy", final_out])
+            ff = _run_ffmpeg(["ffmpeg", "-y", "-i", tmp_mux, "-c", "copy", final_out], trace_id=trace_id, conversation_id=conversation_id)
+            if not (isinstance(ff, dict) and bool(ff.get("ok"))):
+                err = ff.get("error") if isinstance(ff, dict) else {}
+                log.error(f"film2_assemble.copy_failed tmp_mux={tmp_mux!r} final_out={final_out!r} err={err!r}")
+                # Fallback: use tmp_mux as final output if copy fails
+                final_out = tmp_mux
 
     if isinstance(state_dir, str) and state_dir and isinstance(trace_id, str) and trace_id:
         try:
             emit_trace(state_dir, trace_id, "film2.assemble.done", {"film_id": film_id, "path": final_out, "scenes": len(scene_clip_paths)})
         except Exception:
             log.debug("film2.assemble.done trace failed (non-fatal)", exc_info=True)
-    rid2 = f"film2.assemble:{film_id}"
     return _build_success_envelope(
-        {
+        result={
             "film_id": film_id,
             "path": final_out,
             "url": _safe_public_url(public_base_url, final_out, upload_dir=upload_dir),
@@ -669,7 +836,8 @@ def assemble_film_from_shots(
             "audio_policy": audio_policy,
             "audio_path": audio_path,
         },
-        rid2,
+        trace_id=trace_id,
+        conversation_id=conversation_id,
     )
 
 

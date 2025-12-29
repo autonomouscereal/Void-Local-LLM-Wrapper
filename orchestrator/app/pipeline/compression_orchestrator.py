@@ -10,6 +10,10 @@ from ..icw.tokenizer import byte_budget_for_model, bytes_len
 _LOG = logging.getLogger(__name__)
 
 
+def _mid(a: int, b: int) -> int:
+    return int(round((int(a) + int(b)) / 2))
+
+
 def _pick_alloc_within_ranges(ranges: Dict[str, Any]) -> Dict[str, int]:
     """
     Choose fixed representative percentages within provided ranges.
@@ -20,13 +24,10 @@ def _pick_alloc_within_ranges(ranges: Dict[str, Any]) -> Dict[str, int]:
     misc_lo, misc_hi = int(ranges.get("misc_pct", [3, 5])[0]), int(ranges.get("misc_pct", [3, 5])[1])
     buffer_pct = int(ranges.get("buffer_pct", 5))
 
-    def mid(a: int, b: int) -> int:
-        return int(round((a + b) / 2))
-
     alloc = {
-        "icw": mid(icw_lo, icw_hi),
-        "tools": mid(tools_lo, tools_hi),
-        "misc": mid(misc_lo, misc_hi),
+        "icw": _mid(icw_lo, icw_hi),
+        "tools": _mid(tools_lo, tools_hi),
+        "misc": _mid(misc_lo, misc_hi),
         "buffer": buffer_pct,
     }
     total = sum(alloc.values())

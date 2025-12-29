@@ -14,7 +14,7 @@ def _faceid_base_url() -> str:
 
 _EXPECTED_ENVELOPE: Dict[str, Any] = {
     "schema_version": int,
-    "request_id": str,
+    "trace_id": str,
     "ok": bool,
     "result": {
         "faces": [
@@ -30,6 +30,7 @@ _EXPECTED_ENVELOPE: Dict[str, Any] = {
         "model": str,
         "max_faces": int,
         "source": dict,
+        "trace_id": str,
     },
     "error": dict,
 }
@@ -60,7 +61,7 @@ async def faceid_embed(
     model_name: Optional[str] = None,
     model_root: Optional[str] = None,
     max_faces: int = 16,
-    request_id: Optional[str] = None,
+    trace_id: str,
 ) -> Tuple[List[Dict[str, Any]], Optional[str], Dict[str, Any]]:
     """
     Call the faceid service and return:
@@ -82,9 +83,8 @@ async def faceid_embed(
         "model_name": model_name,
         "model_root": model_root,
         "max_faces": int(max_faces) if isinstance(max_faces, int) else 16,
+        "trace_id": trace_id,
     }
-    if request_id:
-        payload["request_id"] = request_id
 
     url = base.rstrip("/") + "/embed"
     async with httpx.AsyncClient(timeout=None, follow_redirects=True) as client:
@@ -106,7 +106,7 @@ async def faceid_best_embedding(
     image_b64: Optional[str] = None,
     model_name: Optional[str] = None,
     model_root: Optional[str] = None,
-    request_id: Optional[str] = None,
+    trace_id: str,
 ) -> Tuple[Optional[List[float]], Optional[str], Dict[str, Any]]:
     faces, model, env = await faceid_embed(
         image_path=image_path,
@@ -115,7 +115,7 @@ async def faceid_best_embedding(
         model_name=model_name,
         model_root=model_root,
         max_faces=1,
-        request_id=request_id,
+        trace_id=trace_id,
     )
     if not faces:
         return (None, model, env)

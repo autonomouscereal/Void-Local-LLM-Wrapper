@@ -11,6 +11,8 @@ from ...committee_client import committee_ai_text  # type: ignore
 from ...committee_client import committee_jsonify  # type: ignore
 from ..embeddings.clap import embed_music_clap as _embed_music_clap, cos_sim as _cos_sim, MusicEvalError
 from void_quality.thresholds import get_music_acceptance_thresholds as _get_music_acceptance_thresholds
+from void_envelopes import _build_success_envelope, _build_error_envelope
+from ...tracing.runtime import trace_event
 
 log = logging.getLogger(__name__)
 
@@ -19,7 +21,7 @@ MUSIC_HERO_FIT_MIN = 0.85
 _MUSIC_ACCEPT_THRESHOLDS: Dict[str, float] | None = None
 
 
-def _map_technical_to_score(metrics: Dict[str, Any]) -> float:
+def _map_technical_to_score(metrics: Dict[str, Any]):
     lufs = metrics.get("lufs")
     tempo = metrics.get("tempo_bpm")
     key = metrics.get("key")
@@ -41,7 +43,7 @@ def _map_technical_to_score(metrics: Dict[str, Any]) -> float:
     return float(sum(score_components) / float(len(score_components)))
 
 
-def _compute_extra_technical(path: str) -> Dict[str, Any]:
+def _compute_extra_technical(path: str):
     y, sr = _load_audio(path)
     if not y or not sr:
         return {"crest_factor": None, "rms": None, "dynamic_range": None}
@@ -52,7 +54,7 @@ def _compute_extra_technical(path: str) -> Dict[str, Any]:
     return {"crest_factor": crest, "rms": rms, "dynamic_range": None}
 
 
-def eval_technical(track_path: str) -> Dict[str, Any]:
+def eval_technical(track_path: str):
     base = analyze_audio(track_path)
     extra = _compute_extra_technical(track_path)
     out: Dict[str, Any] = {}
@@ -62,7 +64,7 @@ def eval_technical(track_path: str) -> Dict[str, Any]:
     return out
 
 
-def eval_motif_locks(track_path: str, *, tempo_target: Optional[float], key_target: Optional[str]) -> Dict[str, Any]:
+def eval_motif_locks(track_path: str, *, tempo_target: Optional[float], key_target: Optional[str]):
     ainfo = analyze_audio(track_path)
     tempo_detected = ainfo.get("tempo_bpm")
     key_detected = ainfo.get("key")
@@ -86,14 +88,21 @@ def eval_motif_locks(track_path: str, *, tempo_target: Optional[float], key_targ
     return ainfo
 
 
-def eval_style(track_path: str, style_pack: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+def eval_style(track_path: str, style_pack: Optional[Dict[str, Any]]):
     try:
         if style_pack is None:
             embed = _embed_music_clap(track_path)
             return {"style_score": 0.0, "track_embed": embed, "per_ref_scores": {}, "style_eval_ok": True}
         style_embed = style_pack.get("style_embed")
         if not isinstance(style_embed, list) or not style_embed:
-            raise MusicEvalError("malformed style_pack: missing style_embed")
+            return {
+                "style_score": 0.0,
+                "track_embed": None,
+                "per_ref_scores": {},
+                "style_eval_ok": False,
+                "reason": "malformed style_pack: missing style_embed",
+                "stack": "".join(traceback.format_stack()),
+            }
         track_embed = _embed_music_clap(track_path)
         raw_sim = _cos_sim(style_embed, track_embed)
         style_score = 0.5 * (raw_sim + 1.0)
@@ -121,7 +130,7 @@ def eval_style(track_path: str, style_pack: Optional[Dict[str, Any]]) -> Dict[st
         }
 
 
-def _eval_structure_from_song_graph(track_path: str, song_graph: Dict[str, Any]) -> Dict[str, Any]:
+def _eval_structure_from_song_graph(track_path: str, song_graph: Dict[str, Any]):
     sections = song_graph.get("sections") if isinstance(song_graph.get("sections"), list) else []
     if not sections:
         return {"energy_alignment_score": 0.0, "repetition_score": 0.0, "transition_score": 0.0}
@@ -176,11 +185,11 @@ def _eval_structure_from_song_graph(track_path: str, song_graph: Dict[str, Any])
     return {"energy_alignment_score": energy_alignment_score, "repetition_score": repetition_score, "transition_score": transition_score}
 
 
-def eval_structure(track_path: str, song_graph: Dict[str, Any]) -> Dict[str, Any]:
+def eval_structure(track_path: str, song_graph: Dict[str, Any]):
     return _eval_structure_from_song_graph(track_path, song_graph or {})
 
 
-def eval_emotion(track_path: str) -> Dict[str, Any]:
+def eval_emotion(track_path: str):
     base = analyze_audio(track_path)
     emotion = base.get("emotion")
     tempo = base.get("tempo_bpm")
@@ -205,7 +214,7 @@ def eval_emotion(track_path: str) -> Dict[str, Any]:
     return {"emotion_guess": emotion, "tempo_bpm": tempo, "valence": valence, "arousal": arousal}
 
 
-def _build_music_eval_summary(all_axes: Dict[str, Any], film_context: Optional[Dict[str, Any]]) -> str:
+def _build_music_eval_summary(all_axes: Dict[str, Any], film_context: Optional[Dict[str, Any]]):
     axes_slim: Dict[str, Any] = {}
     for key, val in (all_axes or {}).items():
         if not isinstance(val, dict):
@@ -222,7 +231,7 @@ def _build_music_eval_summary(all_axes: Dict[str, Any], film_context: Optional[D
     return json.dumps(payload, ensure_ascii=False)
 
 
-async def _call_music_eval_committee(summary: str) -> Dict[str, Any]:
+async def _call_music_eval_committee(summary: str):
     messages = [
         {
             "role": "system",
@@ -264,12 +273,12 @@ async def _call_music_eval_committee(summary: str) -> Dict[str, Any]:
     return result_payload
 
 
-async def eval_aesthetic(all_axes: Dict[str, Any], film_context: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+async def eval_aesthetic(all_axes: Dict[str, Any], film_context: Optional[Dict[str, Any]]):
     summary = _build_music_eval_summary(all_axes, film_context)
     return await _call_music_eval_committee(summary)
 
 
-def _axes_are_effectively_empty(all_axes: Dict[str, Any]) -> bool:
+def _axes_are_effectively_empty(all_axes: Dict[str, Any]):
     tech = all_axes.get("technical") if isinstance(all_axes.get("technical"), dict) else {}
     style = all_axes.get("style") if isinstance(all_axes.get("style"), dict) else {}
     struct = all_axes.get("structure") if isinstance(all_axes.get("structure"), dict) else {}
@@ -289,29 +298,54 @@ def _axes_are_effectively_empty(all_axes: Dict[str, Any]) -> bool:
     return True
 
 
-async def compute_music_eval(track_path: str, song_graph: Dict[str, Any], style_pack: Optional[Dict[str, Any]], film_context: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    technical = eval_technical(track_path)
-    style = eval_style(track_path, style_pack)
-    structure = eval_structure(track_path, song_graph)
-    emotion = eval_emotion(track_path)
-    all_axes = {"technical": technical, "style": style, "structure": structure, "emotion": emotion}
-    if _axes_are_effectively_empty(all_axes):
-        aesthetic = {
-            "overall_quality_score": 0.0,
-            "fit_score": 0.0,
-            "originality_score": 0.0,
-            "cohesion_score": 0.0,
-            "issues": ["music.eval: skipped (no usable features)"],
-        }
-    else:
-        aesthetic = await eval_aesthetic(all_axes, film_context)
-    overall_quality = float(aesthetic.get("overall_quality_score") or 0.0)
-    fit_score = float(aesthetic.get("fit_score") or 0.0)
-    overall = {"overall_quality_score": overall_quality, "fit_score": fit_score}
-    return {"technical": technical, "style": style, "structure": structure, "emotion": emotion, "aesthetic": aesthetic, "overall": overall}
+async def compute_music_eval(track_path: str, song_graph: Dict[str, Any], style_pack: Optional[Dict[str, Any]], film_context: Optional[Dict[str, Any]], trace_id: Optional[str] = None, conversation_id: Optional[str] = None):
+    """
+    Canonical music eval entrypoint.
+    NEVER raises; always returns a structured envelope with full details.
+    """
+    
+    conversation_id = conversation_id if isinstance(conversation_id, str) else ""
+    try:
+        trace_event("music.eval.start", {"trace_id": trace_id, "conversation_id": conversation_id, "track_path": track_path})
+        technical = eval_technical(track_path)
+        style = eval_style(track_path, style_pack)
+        structure = eval_structure(track_path, song_graph)
+        emotion = eval_emotion(track_path)
+        all_axes = {"technical": technical, "style": style, "structure": structure, "emotion": emotion}
+        if _axes_are_effectively_empty(all_axes):
+            aesthetic = {
+                "overall_quality_score": 0.0,
+                "fit_score": 0.0,
+                "originality_score": 0.0,
+                "cohesion_score": 0.0,
+                "issues": ["music.eval: skipped (no usable features)"],
+            }
+            trace_event("music.eval.skipped", {"trace_id": trace_id, "conversation_id": conversation_id, "track_path": track_path, "reason": "no_usable_features"})
+        else:
+            aesthetic = await eval_aesthetic(all_axes, film_context)
+        overall_quality = float(aesthetic.get("overall_quality_score") or 0.0)
+        fit_score = float(aesthetic.get("fit_score") or 0.0)
+        overall = {"overall_quality_score": overall_quality, "fit_score": fit_score}
+        trace_event("music.eval.complete", {"trace_id": trace_id, "conversation_id": conversation_id, "track_path": track_path, "overall_quality": overall_quality, "fit_score": fit_score})
+        return _build_success_envelope(
+            result={"technical": technical, "style": style, "structure": structure, "emotion": emotion, "aesthetic": aesthetic, "overall": overall},
+            trace_id=trace_id,
+            conversation_id=conversation_id,
+        )
+    except Exception as ex:
+        log.error(f"music.eval.exception trace_id={trace_id!r} conversation_id={conversation_id!r} track_path={track_path!r} ex={ex!r}", exc_info=True)
+        trace_event("music.eval.exception", {"trace_id": trace_id, "conversation_id": conversation_id, "track_path": track_path, "exception": str(ex)})
+        return _build_error_envelope(
+            code="music_eval_exception",
+            message=f"Exception while computing music eval: {ex}",
+            trace_id=trace_id,
+            conversation_id=conversation_id,
+            status=500,
+            details={"track_path": track_path, "stack": traceback.format_exc()},
+        )
 
 
-def get_music_acceptance_thresholds() -> Dict[str, float]:
+def get_music_acceptance_thresholds():
     global _MUSIC_ACCEPT_THRESHOLDS
     if _MUSIC_ACCEPT_THRESHOLDS is None:
         _MUSIC_ACCEPT_THRESHOLDS = dict(_get_music_acceptance_thresholds() or {})

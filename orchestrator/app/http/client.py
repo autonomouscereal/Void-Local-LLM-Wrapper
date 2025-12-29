@@ -60,7 +60,7 @@ def _coerce_query_map(query: Dict[str, Any]) -> Dict[str, str]:
 
 def _truncate_text(text: str, limit: int = BODY_PREVIEW_BYTES) -> str:
     # Full-fidelity: never truncate remote bodies (required for debugging/training).
-    return text
+        return text
 
 
 def _subset_headers(headers: Iterable[Tuple[str, str]]) -> Dict[str, str]:
