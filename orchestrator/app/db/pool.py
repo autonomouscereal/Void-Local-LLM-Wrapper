@@ -251,6 +251,39 @@ async def get_pg_pool() -> Optional[asyncpg.pool.Pool]:
             );
             """
         )
+        # Run migrations to ensure schema is up to date
+        await _run_migrations(conn)
     return pg_pool
+
+
+async def _run_migrations(conn: asyncpg.Connection) -> None:
+    """
+    Run database migrations in order. Best-effort; failures are logged but don't break startup.
+    """
+    try:
+        migrations_dir = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+            "db",
+            "migrations",
+        )
+        if not os.path.isdir(migrations_dir):
+            return
+        # Get all migration files and sort them by name (0001, 0002, etc.)
+        migration_files = sorted([f for f in os.listdir(migrations_dir) if f.endswith('.sql')])
+        if not migration_files:
+            return
+        for migration_file in migration_files:
+            migration_path = os.path.join(migrations_dir, migration_file)
+            try:
+                with open(migration_path, "r", encoding="utf-8") as f:
+                    sql = f.read()
+                if sql.strip():
+                    # Execute the whole SQL (migrations may contain DO blocks and multi-statement SQL)
+                    await conn.execute(sql)
+            except Exception as ex:
+                # Log but continue - some migrations may fail if already applied
+                log.warning(f"db.pool: migration {migration_file} failed (may already be applied): {ex}", exc_info=True)
+    except Exception as ex:
+        log.warning(f"db.pool: migration runner failed: {ex}", exc_info=True)
 
 

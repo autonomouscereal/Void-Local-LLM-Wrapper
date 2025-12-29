@@ -13,23 +13,33 @@ async def _ensure_base_schema(pool: asyncpg.pool.Pool) -> None:
     """
     Best-effort bootstrap for the core Postgres schema.
 
-    This executes the bundled SQL migration (0001_init.sql) against the
-    current database connection. The file is intentionally plain SQL with
-    IF NOT EXISTS guards so it can be safely re-run.
+    This executes all bundled SQL migrations in order (0001_init.sql, 0002_*.sql, etc.)
+    against the current database connection. The files are intentionally plain SQL with
+    IF NOT EXISTS guards so they can be safely re-run.
     """
     try:
-        migrations_path = os.path.join(
+        migrations_dir = os.path.join(
             os.path.dirname(__file__),
             "migrations",
-            "0001_init.sql",
         )
-        if not os.path.exists(migrations_path):
+        if not os.path.isdir(migrations_dir):
+            return
+        # Get all migration files and sort them by name (0001, 0002, etc.)
+        migration_files = sorted([f for f in os.listdir(migrations_dir) if f.endswith('.sql')])
+        if not migration_files:
             return
         async with pool.acquire() as conn:
-            with open(migrations_path, "r", encoding="utf-8") as f:
-                sql = f.read()
-            if sql.strip():
-                await conn.execute(sql)
+            for migration_file in migration_files:
+                migration_path = os.path.join(migrations_dir, migration_file)
+                try:
+                    with open(migration_path, "r", encoding="utf-8") as f:
+                        sql = f.read()
+                    if sql.strip():
+                        await conn.execute(sql)
+                except Exception as ex:
+                    # Log but continue - some migrations may fail if already applied
+                    import logging
+                    logging.warning(f"db.core: migration {migration_file} failed (may already be applied): {ex}", exc_info=True)
     except Exception:
         # Schema bootstrap is best-effort; never break the caller on failure.
         return
