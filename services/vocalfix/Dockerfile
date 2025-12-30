@@ -13,7 +13,10 @@ RUN pip install --no-cache-dir --upgrade pip \
 ENV TORCH_CUDA_ARCH_LIST="6.1;7.5;8.0;8.6;8.9"
 
 WORKDIR /app
-COPY app /app/app
+# Repo-root build context: copy the vocalfix service code from its subdir.
+COPY services/vocalfix/app /app/app
+# Copy shared packages so the service can return canonical ToolEnvelopes
+COPY void_envelopes /app/void_envelopes
 
 EXPOSE 7864
 CMD ["uvicorn","app.main:app","--host","0.0.0.0","--port","7864","--log-level","info","--access-log","--use-colors"]

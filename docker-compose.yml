@@ -96,8 +96,10 @@ services:
 
   rvc:
     build:
-      context: ./services/rvc
-      dockerfile: Dockerfile
+      # Build from repo root so we can COPY shared packages like `void_envelopes/`
+      # and `void_json/` into the image (rvc does not mount the whole repo at runtime).
+      context: .
+      dockerfile: services/rvc/Dockerfile
     container_name: rvc_service
     restart: unless-stopped
     runtime: nvidia
@@ -145,8 +147,10 @@ services:
 
   vocalfix:
     build:
-      context: ./services/vocalfix
-      dockerfile: Dockerfile
+      # Build from repo root so we can COPY shared packages like `void_envelopes/`
+      # into the image (vocalfix does not mount the whole repo at runtime).
+      context: .
+      dockerfile: services/vocalfix/Dockerfile
     container_name: vocalfix_service
     restart: unless-stopped
     runtime: nvidia
@@ -718,8 +722,10 @@ services:
 
   drt:
     build:
-      context: ./services/drt
-      dockerfile: Dockerfile
+      # Build from repo root so we can COPY shared packages like `void_json/`
+      # into the image (drt does not mount the whole repo at runtime).
+      context: .
+      dockerfile: services/drt/Dockerfile
     container_name: deep_research_tool
     restart: unless-stopped
     shm_size: "1gb"
@@ -738,8 +744,10 @@ services:
 
   ablation:
     build:
-      context: ./services/ablation
-      dockerfile: Dockerfile
+      # Build from repo root so we can COPY shared packages like `void_json/`
+      # into the image (ablation does not mount the whole repo at runtime).
+      context: .
+      dockerfile: services/ablation/Dockerfile
     container_name: ablation_layer
     restart: unless-stopped
     network_mode: host
@@ -756,8 +764,10 @@ services:
 
   hunyuan_video:
     build:
-      context: ./services/hunyuan_video
-      dockerfile: Dockerfile
+      # Build from repo root so we can COPY shared packages like `void_envelopes/`
+      # and `void_json/` into the image (hunyuan_video does not mount the whole repo at runtime).
+      context: .
+      dockerfile: services/hunyuan_video/Dockerfile
       args:
         <<: *cu118_args
     container_name: hunyuan_video_service

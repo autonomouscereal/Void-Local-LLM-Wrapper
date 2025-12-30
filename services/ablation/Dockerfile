@@ -5,10 +5,15 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-COPY requirements.txt /app/requirements.txt
+# Repo-root build context: copy the ablation service requirements from its subdir.
+COPY services/ablation/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-COPY app /app/app
+# Copy shared packages so the service can use JSONParser
+COPY void_json /app/void_json
+
+# Service code
+COPY services/ablation/app /app/app
 
 EXPOSE 8096
 

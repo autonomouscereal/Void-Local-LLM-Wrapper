@@ -9,13 +9,15 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends libxml2 libxslt1.1 ffmpeg ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt /app/requirements.txt
+# Repo-root build context: copy the drt service requirements from its subdir.
+COPY services/drt/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
 # Copy shared packages so the service can use JSONParser
 COPY void_json /app/void_json
 
-COPY app /app/app
+# Service code
+COPY services/drt/app /app/app
 
 EXPOSE 8086
 
