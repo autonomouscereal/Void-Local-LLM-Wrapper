@@ -510,6 +510,40 @@ async def _committee_revision_phase(
         if isinstance(prior, str) and prior.strip():
             context_msgs.append({"role": "user", "content": f"### Your Current Answer\n\n{prior.strip()}"})
         
+        # For Story Engine tasks, add critical reminder about structure
+        if original_sys_msgs:
+            combined_sys = "\n".join(original_sys_msgs)
+            if "Story Engine" in combined_sys or "story" in combined_sys.lower():
+                # Extract schema template from original user messages if available
+                user_msgs = _extract_user_messages(messages)
+                schema_reminder = ""
+                for um in user_msgs:
+                    content = str(um.get("content", "") or "")
+                    if "EXACT JSON STRUCTURE REQUIRED" in content or "story graph" in content.lower():
+                        # Extract the schema section if present
+                        if "### [EXACT JSON STRUCTURE REQUIRED]" in content:
+                            schema_start = content.find("### [EXACT JSON STRUCTURE REQUIRED]")
+                            schema_end = content.find("### [KEY REQUIREMENTS]", schema_start)
+                            if schema_end == -1:
+                                schema_end = content.find("### [USER REQUEST]", schema_start)
+                            if schema_end == -1:
+                                schema_end = content.find("### [YOUR TASK]", schema_start)
+                            if schema_end > schema_start:
+                                schema_reminder = content[schema_start:schema_end].strip()
+                                break
+                
+                if schema_reminder:
+                    context_msgs.append({
+                        "role": "user",
+                        "content": f"""### [CRITICAL REMINDER - YOUR OUTPUT MUST MATCH THIS STRUCTURE]
+
+{schema_reminder}
+
+CRITICAL: Your revision MUST be a complete story graph matching the exact structure above. Do NOT output notes, animation scripts, or any other format. Output ONLY the JSON story graph object.
+
+CRITICAL: Do NOT wrap your output in wrapper keys like 'response', 'data', 'result', 'output', 'content', or 'json'. Output the story object directly at the top level."""
+                    })
+        
         # Replace ALL system messages with revision system message, keep only user messages from original
         user_msgs = _extract_user_messages(messages)
         # Structure: system message, then context messages, then original user messages

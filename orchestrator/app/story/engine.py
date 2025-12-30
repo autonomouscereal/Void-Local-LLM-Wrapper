@@ -131,8 +131,8 @@ def _story_schema_template() -> Dict[str, Any]:
                                 "events": [
                                     {
                                         "event_type": "string: 'state_change' or other event types",
-                                        "event_target": "string: character_id or object_name (for state_change events)",
-                                        "state_delta": {"key": "value"}  # for state_change events only
+                                        "event_target": "string: character_id or object_name (for state_change events only - REQUIRED for state_change, optional for other event types)",
+                                        "state_delta": {"health": 50, "stance": "ready"}  # for state_change events only - dict with arbitrary key-value pairs representing state changes (e.g. {\"health\": 50, \"energy\": \"high\"}, NOT {\"key\": \"health\", \"value\": 50})
                                     }
                                 ],
                                 "dialogue": [
@@ -481,7 +481,13 @@ You MUST match this exact structure. All field names and nesting must be identic
 - Acts: array of objects with act_id (string, optional - generated if missing) and scenes (array)
 - Scenes: array of objects with scene_id (string, optional - generated if missing), scene_summary (string, optional), music_hint (object with scene_mood, scene_tone, scene_energy, scene_location_atmosphere - for music matching), and beats (array)
 - Beats: array of objects with beat_description (string, optional), time_hint_s (float, REQUIRED), characters (array, OPTIONAL - can be empty [] if no characters), locations (array, OPTIONAL - can be empty [] if no locations), objects (array, OPTIONAL - can be empty [] if no objects), events (array), dialogue (array), music_hint (object with beat_mood, beat_tone, beat_energy - optional, inherits from scene)
-- Events: array of objects with event_type (string). For state_change events: event_target (string - character_id or object_name) and state_delta (dict)
+- Events: array of objects with event_type (string, REQUIRED). 
+  * For state_change events: event_target (string, REQUIRED - must be a character_id from characters array OR an object_name from objects array, NOT a location_name) and state_delta (dict, REQUIRED)
+  * state_delta structure: A dictionary with direct key-value pairs representing the state changes. The keys are the state property names (e.g. "health", "stance", "energy_level") and values are the new state values.
+  * CORRECT state_delta examples: {"health": 50}, {"stance": "ready", "energy_level": "high"}, {"eruption_level": "medium"}
+  * INCORRECT state_delta examples: {"key": "health", "value": 50} (WRONG - don't use nested "key"/"value" structure), {"key": "position", "value": "mid-battle stance"} (WRONG)
+  * event_target MUST be a character_id (e.g. "shadow", "charizard") OR an object_name (e.g. "Volcanic Fissure (Active)"), NOT a location_name
+  * For non-state_change events: event_target is optional (can be omitted or empty string)
 - Dialogue: array of objects with line_id (string, REQUIRED - unique identifier for TTS dialogue_index mapping), speaker (string, REQUIRED - must be a character_id from characters array), dialogue_text (string)
 - Music: Music is created AFTER story generation. Music matching uses descriptive information from scenes/beats: scene_mood, scene_tone, scene_energy, scene_location_atmosphere. Do NOT include actual music in story structure, only music_hint objects.
 
@@ -635,6 +641,29 @@ Example issue for invalid reference:
   "beat_id": "beat_12",
   "location_name": "Ancient Temple",
   "suggested_fix": "Add location with location_name 'Ancient Temple' to locations array, or fix the reference in beat_12"
+}}
+
+Example issue for invalid state_delta structure:
+{{
+  "code": "invalid_reference",
+  "severity": "major",
+  "message": "Event in beat_2 has invalid state_delta structure: uses {{'key': 'position', 'value': 'mid-battle stance'}} instead of direct key-value pairs like {{'position': 'mid-battle stance'}}",
+  "act_id": "act_1",
+  "scene_id": "scene_1",
+  "beat_id": "beat_2",
+  "suggested_fix": "Change state_delta from {{'key': 'position', 'value': 'mid-battle stance'}} to {{'position': 'mid-battle stance'}}"
+}}
+
+Example issue for invalid event_target:
+{{
+  "code": "invalid_reference",
+  "severity": "major",
+  "message": "Event in beat_3 has event_target 'Shattered Battlefield' which is a location_name, not a character_id or object_name. event_target can only be character_id or object_name, not location_name.",
+  "act_id": "act_1",
+  "scene_id": "scene_1",
+  "beat_id": "beat_3",
+  "location_name": "Shattered Battlefield",
+  "suggested_fix": "Remove this event_target or change it to a valid character_id or object_name. If you want to track location state, create an object with object_name matching the location and use that as event_target."
 }}
 
 ### [DATA]
@@ -833,7 +862,13 @@ Your delta MUST match this exact structure. All field names and nesting must be 
 - Locations and objects in beats: arrays of strings (location_name/object_name values that MUST match location_name/object_name from the locations/objects arrays). Can be empty arrays [] if no characters/locations/objects.
 - Scenes: scene_summary (string, optional), music_hint (object with scene_mood, scene_tone, scene_energy, scene_location_atmosphere - for music matching)
 - Beats: beat_description (string, optional), time_hint_s (float, REQUIRED), characters (array, OPTIONAL - can be empty []), locations (array, OPTIONAL - can be empty []), objects (array, OPTIONAL - can be empty []), events (array), dialogue (array), music_hint (object with beat_mood, beat_tone, beat_energy - optional, inherits from scene)
-- Events: array of objects with event_type (string, REQUIRED). For state_change events: event_target (string, REQUIRED - character_id or object_name) and state_delta (dict, REQUIRED)
+- Events: array of objects with event_type (string, REQUIRED). 
+  * For state_change events: event_target (string, REQUIRED - must be a character_id from characters array OR an object_name from objects array, NOT a location_name) and state_delta (dict, REQUIRED)
+  * state_delta structure: A dictionary with direct key-value pairs representing the state changes. The keys are the state property names (e.g. "health", "stance", "energy_level") and values are the new state values.
+  * CORRECT state_delta examples: {{"health": 50}}, {{"stance": "ready", "energy_level": "high"}}, {{"eruption_level": "medium"}}
+  * INCORRECT state_delta examples: {{"key": "health", "value": 50}} (WRONG - don't use nested "key"/"value" structure), {{"key": "position", "value": "mid-battle stance"}} (WRONG)
+  * event_target MUST be a character_id (e.g. "shadow", "charizard") OR an object_name (e.g. "Volcanic Fissure (Active)"), NOT a location_name
+  * For non-state_change events: event_target is optional (can be omitted or empty string)
 - Dialogue: array of objects with line_id (string, REQUIRED - unique identifier for TTS dialogue_index mapping), speaker (string, REQUIRED - must be a character_id from characters array), dialogue_text (string, REQUIRED)
 - Music: Music is created AFTER story generation. Music matching uses descriptive information from scenes/beats: scene_mood, scene_tone, scene_energy, scene_location_atmosphere. Do NOT include actual music in story structure, only music_hint objects.
 
@@ -863,6 +898,60 @@ Example delta fixing a state inconsistency:
     }}
   ]
 }}
+
+Example delta fixing invalid state_delta structure:
+{{
+  "acts": [
+    {{
+      "act_id": "act_1",
+      "scenes": [
+        {{
+          "scene_id": "scene_1",
+          "beats": [
+            {{
+              "beat_id": "beat_2",
+              "events": [
+                {{
+                  "event_type": "state_change",
+                  "event_target": "shadow",
+                  "state_delta": {{"position": "mid-battle stance"}}
+                }}
+              ]
+            }}
+          ]
+        }}
+      ]
+    }}
+  ]
+}}
+Note: state_delta uses direct key-value pairs: {{"position": "mid-battle stance"}}, NOT nested structure like {{"key": "position", "value": "mid-battle stance"}}
+
+Example delta fixing invalid event_target:
+{{
+  "acts": [
+    {{
+      "act_id": "act_1",
+      "scenes": [
+        {{
+          "scene_id": "scene_1",
+          "beats": [
+            {{
+              "beat_id": "beat_3",
+              "events": [
+                {{
+                  "event_type": "state_change",
+                  "event_target": "Volcanic Fissure (Active)",
+                  "state_delta": {{"eruption_level": "medium"}}
+                }}
+              ]
+            }}
+          ]
+        }}
+      ]
+    }}
+  ]
+}}
+Note: event_target "Volcanic Fissure (Active)" is valid because it's an object_name. If it were "Shattered Battlefield" (a location_name), it would be INVALID.
 
 Example delta adding missing location:
 {{
@@ -1213,7 +1302,13 @@ Your merged story MUST match this exact structure. All field names and nesting m
 - Locations and objects in beats: arrays of strings (location_name/object_name values that MUST match location_name/object_name from the locations/objects arrays). Can be empty arrays [] if no characters/locations/objects.
 - Scenes: scene_summary (string, optional), music_hint (object with scene_mood, scene_tone, scene_energy, scene_location_atmosphere - for music matching)
 - Beats: beat_description (string, optional), time_hint_s (float, REQUIRED), characters (array, OPTIONAL - can be empty []), locations (array, OPTIONAL - can be empty []), objects (array, OPTIONAL - can be empty []), events (array), dialogue (array), music_hint (object with beat_mood, beat_tone, beat_energy - optional, inherits from scene)
-- Events: array of objects with event_type (string, REQUIRED). For state_change events: event_target (string, REQUIRED - character_id or object_name) and state_delta (dict, REQUIRED)
+- Events: array of objects with event_type (string, REQUIRED). 
+  * For state_change events: event_target (string, REQUIRED - must be a character_id from characters array OR an object_name from objects array, NOT a location_name) and state_delta (dict, REQUIRED)
+  * state_delta structure: A dictionary with direct key-value pairs representing the state changes. The keys are the state property names (e.g. "health", "stance", "energy_level") and values are the new state values.
+  * CORRECT state_delta examples: {{"health": 50}}, {{"stance": "ready", "energy_level": "high"}}, {{"eruption_level": "medium"}}
+  * INCORRECT state_delta examples: {{"key": "health", "value": 50}} (WRONG - don't use nested "key"/"value" structure), {{"key": "position", "value": "mid-battle stance"}} (WRONG)
+  * event_target MUST be a character_id (e.g. "shadow", "charizard") OR an object_name (e.g. "Volcanic Fissure (Active)"), NOT a location_name
+  * For non-state_change events: event_target is optional (can be omitted or empty string)
 - Dialogue: array of objects with line_id (string, REQUIRED - unique identifier for TTS dialogue_index mapping), speaker (string, REQUIRED - must be a character_id from characters array), dialogue_text (string, REQUIRED)
 - Music: Music is created AFTER story generation. Music matching uses descriptive information from scenes/beats: scene_mood, scene_tone, scene_energy, scene_location_atmosphere. Do NOT include actual music in story structure, only music_hint objects.
 
@@ -1650,7 +1745,13 @@ Your extension delta MUST match this exact structure. All field names and nestin
 - Locations and objects in beats: arrays of strings (location_name/object_name values that MUST match location_name/object_name from the locations/objects arrays). Can be empty arrays [] if no characters/locations/objects.
 - Scenes: scene_summary (string, optional), music_hint (object with scene_mood, scene_tone, scene_energy, scene_location_atmosphere - for music matching)
 - Beats: beat_description (string, optional), time_hint_s (float, REQUIRED), characters (array, OPTIONAL - can be empty []), locations (array, OPTIONAL - can be empty []), objects (array, OPTIONAL - can be empty []), events (array), dialogue (array), music_hint (object with beat_mood, beat_tone, beat_energy - optional, inherits from scene)
-- Events: array of objects with event_type (string, REQUIRED). For state_change events: event_target (string, REQUIRED - character_id or object_name) and state_delta (dict, REQUIRED)
+- Events: array of objects with event_type (string, REQUIRED). 
+  * For state_change events: event_target (string, REQUIRED - must be a character_id from characters array OR an object_name from objects array, NOT a location_name) and state_delta (dict, REQUIRED)
+  * state_delta structure: A dictionary with direct key-value pairs representing the state changes. The keys are the state property names (e.g. "health", "stance", "energy_level") and values are the new state values.
+  * CORRECT state_delta examples: {{"health": 50}}, {{"stance": "ready", "energy_level": "high"}}, {{"eruption_level": "medium"}}
+  * INCORRECT state_delta examples: {{"key": "health", "value": 50}} (WRONG - don't use nested "key"/"value" structure), {{"key": "position", "value": "mid-battle stance"}} (WRONG)
+  * event_target MUST be a character_id (e.g. "shadow", "charizard") OR an object_name (e.g. "Volcanic Fissure (Active)"), NOT a location_name
+  * For non-state_change events: event_target is optional (can be omitted or empty string)
 - Dialogue: array of objects with line_id (string, REQUIRED - unique identifier for TTS dialogue_index mapping), speaker (string, REQUIRED - must be a character_id from characters array), dialogue_text (string, REQUIRED)
 - Music: Music is created AFTER story generation. Music matching uses descriptive information from scenes/beats: scene_mood, scene_tone, scene_energy, scene_location_atmosphere. Do NOT include actual music in story structure, only music_hint objects.
 
