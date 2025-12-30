@@ -170,22 +170,13 @@ def _story_schema_template() -> Dict[str, Any]:
     }
 
 
-def _issue_schema() -> Dict[str, Any]:
-    return {
-        "issues": list,
-        "summary": str,
-        "must_fix": bool,
-        # "done" is the authoritative committee signal for whether the story meets user intent + length.
-        "done": bool,
-        "length_ok": bool,
-        "coverage_ratio": float,
-        "next_action": str,
-    }
+
 
 
 def _issue_schema_template() -> Dict[str, Any]:
     """
     Returns a complete template showing the exact JSON structure expected for audit responses.
+    This includes both chunk-level results and final synthesis results.
     """
     return {
         "issues": [
@@ -207,8 +198,15 @@ def _issue_schema_template() -> Dict[str, Any]:
                 "suggested_fix": "string: optional - suggested fix for the issue"
             }
         ],
-        "local_summary": "string: brief summary of this act's quality and issues found",
-        "continuity_concerns": ["string: list of potential continuity issues with other acts"]
+        "summary": "string: overall audit summary (REQUIRED for final synthesis)",
+        "must_fix": "bool: true if severe issues exist that must be fixed (REQUIRED for final synthesis)",
+        "done": "bool: authoritative signal - true ONLY if story is ready to proceed, complete for requested duration, all continuity issues resolved, follows user intent, no critical issues remain (REQUIRED for final synthesis)",
+        "length_ok": "bool: true if duration/content depth matches the request (REQUIRED for final synthesis)",
+        "coverage_ratio": "float: ratio of current duration to requested duration (REQUIRED for final synthesis)",
+        "next_action": "string: one of 'accept'|'extend'|'revise'|'extend_then_revise' - MUST be 'accept' when done=true (REQUIRED for final synthesis)",
+        # Chunk-level fields (optional, only present in per-act chunk results):
+        "local_summary": "string: optional - brief summary of this act's quality and issues found (for chunk results only)",
+        "continuity_concerns": ["string: optional - list of potential continuity issues with other acts (for chunk results only)"]
     }
 
 
@@ -664,10 +662,9 @@ Output ONLY the JSON object matching the exact structure above. Include ALL issu
         result_block = env.get("result") if isinstance(env, dict) else {}
         if isinstance(result_block, dict) and isinstance(result_block.get("text"), str):
             raw = str(result_block.get("text") or "")
-        issue_schema = _issue_schema()
         chunk_parsed = await _jsonify_then_parse(
             raw_text=raw,
-            expected_schema=issue_schema,
+            expected_schema=issue_schema_template,
             trace_id=trace_id,
             rounds=STORY_COMMITTEE_ROUNDS,
             temperature=0.0,
@@ -756,7 +753,7 @@ Output ONLY the JSON object with the fields above. No other text."""
         raw_synth = str(result_block_synth.get("text") or "")
     parsed = await _jsonify_then_parse(
         raw_text=raw_synth,
-        expected_schema=_issue_schema(),
+        expected_schema=_issue_schema_template(),
         trace_id=trace_id,
         rounds=STORY_COMMITTEE_ROUNDS,
         temperature=0.0,
