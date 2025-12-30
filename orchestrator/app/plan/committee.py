@@ -182,21 +182,43 @@ async def produce_tool_plan(
 
     planner_rules = (
         "### [PLANNER / SYSTEM]\n"
-        "Return ONLY strict JSON: {\"steps\":[{\"step_id\":\"s1\",\"tool\":\"<name>\",\"args\":{...}}]} — no extra keys.\n"
+        "Return ONLY strict JSON: {\"steps\":[{\"step_id\":\"s1\",\"tool_name\":\"<name>\",\"args\":{...}}]} — no extra keys.\n"
         "For pure chat answers with no tool use, return {\"steps\":[]}.\n"
         "Rules:\n"
         f"- mode: {effective_mode}\n"
         f"- allowed_tools: {', '.join(allowed_tools) if allowed_tools else '(none)'}\n"
         "- Each step MUST include a unique string field step_id (e.g., \"s1\", \"s2\", ...).\n"
-        "- Do NOT invent tool names.\n"
+        "- Each step MUST include a string field tool_name (use one of the allowed_tools listed above).\n"
+        "- Do NOT invent tool names. Use ONLY tools from the catalog above.\n"
         "- If the user asks for any images/video/music/audio/TTS, you MUST include at least one tool step.\n"
+        "- You are a PLANNER. Your job is to plan tool calls, not to refuse or explain limitations.\n"
+        "- The system has tools available to create videos, images, music, and audio. Plan the tool calls needed to fulfill the user's request.\n"
     )
 
-    plan_messages = [
-        {"role": "system", "content": mode_system},
-        tool_catalog_frame,
-        {"role": "system", "content": planner_rules},
-    ] + messages
+    # Combine all planner instructions into a single comprehensive instruction block
+    # This will be embedded in the user message to ensure it's not filtered out
+    planner_instructions = f"""{mode_system}
+
+{tool_catalog_frame.get("content", "")}
+
+{planner_rules}"""
+
+    # Embed planner instructions in the first user message to ensure they're not filtered
+    plan_messages = []
+    if messages:
+        first_user_msg = messages[0] if messages[0].get("role") == "user" else None
+        if first_user_msg:
+            # Prepend planner instructions to the user's message
+            enhanced_content = f"""{planner_instructions}
+
+### [USER REQUEST]
+{first_user_msg.get("content", "")}"""
+            plan_messages = [{"role": "user", "content": enhanced_content}] + messages[1:]
+        else:
+            # No user message found, add instructions as a user message
+            plan_messages = [{"role": "user", "content": planner_instructions}] + messages
+    else:
+        plan_messages = [{"role": "user", "content": planner_instructions}]
 
     t_call = time.perf_counter()
     
