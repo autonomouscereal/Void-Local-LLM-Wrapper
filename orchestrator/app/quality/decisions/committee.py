@@ -266,7 +266,7 @@ async def postrun_committee_decide(
         "### [COMMITTEE POSTRUN / SYSTEM]\n"
         "Decide whether to accept artifacts (go) or run one small revision (revise), or fail. "
         "Return strict JSON only: {\"action\":\"go|revise|fail\",\"rationale\":\"...\","
-        "\"patch_plan\":[{\"tool\":\"<name>\",\"args\":{...}}]}.\n"
+        "\"patch_plan\":[{\"tool_name\":\"<name>\",\"args\":{...}}]}.\n"
         "- IMPORTANT: The user payload includes a user_text field. Sometimes this is a JSON blob with scope=\"tool_step_only\". "
         "When scope=\"tool_step_only\", you MUST evaluate ONLY that single tool step. "
         "Use original_user_request only as global context; the PRIMARY goal is tool_intent_primary + tool_args_full + locks_and_bundles and the QA metrics/locks.\n"
@@ -334,7 +334,7 @@ async def postrun_committee_decide(
             "rationale": str,
             "patch_plan": [
                 {
-                    "tool": str,
+                    "tool_name": str,
                     "name": str,
                     "id": str,
                     "args": object,

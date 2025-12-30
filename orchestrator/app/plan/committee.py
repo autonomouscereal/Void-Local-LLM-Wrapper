@@ -220,7 +220,7 @@ async def produce_tool_plan(
         "steps": [
             {
                 "step_id": str,
-                "tool": str,
+                "tool_name": str,
                 "name": str,
                 "args": object,
                 "arguments": object,
@@ -250,8 +250,10 @@ async def produce_tool_plan(
     parse_ms = int((time.perf_counter() - t_parse) * 1000)
 
     steps_raw = parsed.get("steps") if isinstance(parsed, dict) else []
+    log.info("produce_tool_plan: parsed steps_raw_len=%s trace_id=%s parsed_keys=%s", len(steps_raw) if isinstance(steps_raw, list) else 0, trace_id, list(parsed.keys()) if isinstance(parsed, dict) else [])
     tool_calls: List[Dict[str, Any]] = []
     allowed_set = set(allowed_tools)
+    log.info("produce_tool_plan: allowed_tools=%s trace_id=%s", sorted(list(allowed_set)), trace_id)
     rejected = 0
     coerced_args = 0
     for st in steps_raw or []:
@@ -260,15 +262,16 @@ async def produce_tool_plan(
             log.debug("produce_tool_plan: skipping non-dict step type=%s trace_id=%s", type(st).__name__, trace_id)
             continue
         step_id_val = st.get("step_id")
+        # Use tool_name (schema defines tool_name, not tool)
         tool_name = st.get("tool_name")
         if not isinstance(tool_name, str) or not tool_name.strip():
             rejected += 1
-            log.debug("produce_tool_plan: skipping step with missing/invalid tool_name trace_id=%s", trace_id)
+            log.warning("produce_tool_plan: skipping step with missing/invalid tool_name trace_id=%s step_keys=%s", trace_id, list(st.keys()) if isinstance(st, dict) else [])
             continue
         tool_name = tool_name.strip()
         if tool_name not in allowed_set:
             rejected += 1
-            log.debug("produce_tool_plan: skipping step with disallowed tool_name=%s trace_id=%s", tool_name, trace_id)
+            log.warning("produce_tool_plan: skipping step with disallowed tool_name=%s trace_id=%s allowed_tools=%s", tool_name, trace_id, sorted(list(allowed_set)))
             continue
         args_val = st.get("args") if ("args" in st) else st.get("arguments")
         # Keep args always JSON-object-ish; downstream hardeners expect an object.

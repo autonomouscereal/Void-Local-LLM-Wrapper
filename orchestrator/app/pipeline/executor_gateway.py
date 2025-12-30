@@ -45,11 +45,12 @@ async def execute(
         else:
             args = {"_raw": raw_args}
         # Always propagate trace_id and conversation_id into args
-        # Ensure trace_id is always set (even if empty, it will be handled by execute_tool_call)
+        # CRITICAL: trace_id MUST be passed from chat_completions - always inject it
         if isinstance(args, dict):
-            if not args.get("trace_id") and trace_id:
+            # Always inject trace_id if provided (even if empty string, it should be passed through)
+            if trace_id and not args.get("trace_id"):
                 args["trace_id"] = trace_id
-            if not args.get("conversation_id") and conversation_id:
+            if conversation_id and not args.get("conversation_id"):
                 args["conversation_id"] = conversation_id
         step_payload: Dict[str, Any] = {"tool": tool_name, "args": args}
         # Preserve planner-provided step_id so executor-produced keys match the plan.

@@ -841,7 +841,7 @@ async def _generate_scene_storyboards(
         if isinstance(locks_arg, dict) and locks_arg:
             args_img["lock_bundle"] = locks_arg
         storyboard_path: Optional[str] = None
-        res = await execute_tool_call({"tool_name": "image.dispatch", "arguments": args_img}, trace_id=trace_id or "", conversation_id="")
+        res = await execute_tool_call({"tool_name": "image.dispatch", "arguments": args_img}, trace_id=trace_id, conversation_id="")
         if isinstance(res, dict) and isinstance(res.get("result"), dict):
             r = res.get("result") or {}
             arts = r.get("artifacts") if isinstance(r.get("artifacts"), list) else []
@@ -1358,8 +1358,10 @@ async def tool_list_post(request: Request) -> Any:
     raw = await request.body()
     raw_text = raw.decode("utf-8", errors="replace") if isinstance(raw, (bytes, bytearray)) else str(raw or "")
     parser = JSONParser()
-    body = parser.parse(raw_text or "{}", {"trace_id": str, "conversation_id": str})
-    trace_id = str(body.get("trace_id") or "").strip() if isinstance(body, dict) else ""
+    body = parser.parse(raw_text or "{}", {})
+    # trace_id is NEVER in request body - it's generated in chat_completions only
+    # For tool.list endpoint, use empty string (this endpoint doesn't need trace_id)
+    trace_id = ""
     conversation_id = str(body.get("conversation_id") or "").strip() if isinstance(body, dict) else ""
     return ToolEnvelope.success(result=_legacy_tool_list_payload(), trace_id=trace_id, conversation_id=conversation_id)
 
@@ -1402,15 +1404,14 @@ async def tool_describe(request: Request) -> Any:
     raw = await request.body()
     raw_text = raw.decode("utf-8", errors="replace") if isinstance(raw, (bytes, bytearray)) else str(raw or "")
     parser = JSONParser()
-    body = parser.parse(raw_text, {"trace_id": str, "conversation_id": str, "tool_call_name": str, "tool": str, "tool_name": str})
+    body = parser.parse(raw_text, {"conversation_id": str, "tool_call_name": str, "tool": str, "tool_name": str})
     if not isinstance(body, dict):
         log.error("tool_list_get: invalid_body_type - Body must be a JSON object. Continuing with empty body but this is an error.")
         body = {}
-    trace_id = str(body.get("trace_id") or "").strip() if isinstance(body, dict) else ""
+    # trace_id is NEVER in request body - it's generated in chat_completions only
+    # For tool.describe endpoint, use empty string (this endpoint doesn't need trace_id)
+    trace_id = ""
     conversation_id = str(body.get("conversation_id") or "").strip() if isinstance(body, dict) else ""
-    if not trace_id:
-        log.error(f"tool_list_get: missing trace_id in request body - upstream caller must pass trace_id. Continuing with empty trace_id but this is an error.")
-        trace_id = ""
     tool_name = body.get("tool_name") if isinstance(body, dict) else None
     if not isinstance(tool_name, str):
         tool_name = body.get("tool") if isinstance(body, dict) else None
@@ -1506,11 +1507,14 @@ async def tool_run(request: Request) -> Any:
     if not isinstance(body, dict):
         log.error("tool_run: invalid_body_type - Body must be a JSON object. Continuing with empty body but this is an error.")
         body = {}
+    # trace_id is NEVER in request body - it's generated in chat_completions only
+    # tool_run endpoint receives trace_id from executor which gets it from chat_completions
+    # For now, extract from body for backwards compatibility but log error
     trace_id = body.get("trace_id") if isinstance(body, dict) else None
     conversation_id = body.get("conversation_id") if isinstance(body, dict) else None
     tool_name = body.get("tool_name") if isinstance(body, dict) else None
     if not isinstance(trace_id, str) or not trace_id:
-        log.error(f"tool_run: missing trace_id in request body - upstream caller must pass trace_id. Continuing with empty trace_id but this is an error. tool_name={tool_name!r}")
+        log.error(f"tool_run: missing trace_id in request body - executor should pass trace_id from chat_completions. Continuing with empty trace_id but this is an error. tool_name={tool_name!r}")
         trace_id = ""
     if not isinstance(tool_name, str) or not tool_name.strip():
         log.error(f"tool_run: missing_tool_name - tool_name is required. Continuing with empty tool_name but this is an error. trace_id={trace_id!r}")
@@ -1864,7 +1868,9 @@ async def v1_image_generate(request: Request):
     if not isinstance(body, dict):
         log.error(f"v1_image_generate: body is not a dict - continuing but this is an error. body_type={type(body).__name__!r}")
         body = {}
-    trace_id = str(body.get("trace_id") or "").strip() if isinstance(body, dict) and isinstance(body.get("trace_id"), (str, int)) else ""
+    # trace_id is NEVER in request body - it's generated in chat_completions only
+    # For v1_image_generate endpoint, generate a new trace_id (this is a direct API endpoint)
+    trace_id = _generate_trace_id(seed=str(conversation_id) if conversation_id else "")
     conversation_id = str(body.get("conversation_id") or "").strip() if isinstance(body, dict) and isinstance(body.get("conversation_id"), (str, int)) else ""
     prompt = body.get("prompt") or body.get("text") or "" if isinstance(body, dict) else ""
     if not isinstance(prompt, str):
@@ -2078,7 +2084,6 @@ async def post_image_dispatch(request: Request):
     body_text = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw or "")
     parser = JSONParser()
     expected = {
-        "trace_id": (str),
         "prompt": (str),
         "negative": (str),
         "seed": (int),
@@ -2092,10 +2097,11 @@ async def post_image_dispatch(request: Request):
         "cfg": (float),
     }
     obj = parser.parse(body_text, expected)
-    trace_id = (obj.get("trace_id") if isinstance(obj, dict) and isinstance(obj.get("trace_id"), str) else "") if isinstance(obj, dict) else ""
-    trace_id = str(trace_id or "").strip()
-    conversation_id = (obj.get("conversation_id") if isinstance(obj, dict) and isinstance(obj.get("conversation_id"), str) else "") if isinstance(obj, dict) else ""
-    conversation_id = str(conversation_id or "").strip()
+    # trace_id is NEVER in request body - it's generated in chat_completions only
+    # For v1_image_generate_direct endpoint, generate a new trace_id (this is a direct API endpoint)
+    conversation_id_for_trace = (obj.get("conversation_id") if isinstance(obj, dict) and isinstance(obj.get("conversation_id"), str) else "") if isinstance(obj, dict) else ""
+    trace_id = _generate_trace_id(seed=conversation_id_for_trace if conversation_id_for_trace else "")
+    conversation_id = str(conversation_id_for_trace or "").strip()
     # core fields
     prompt = obj.get("prompt")
     negative = obj.get("negative")
@@ -2640,14 +2646,17 @@ def _iso(val: Any) -> Optional[str]:
 
 async def _send_trace_stream_async(payload: Dict[str, Any]) -> None:
     t0 = time.time()
-    trace_id = str((payload or {}).get("trace_id") or "")
+    # trace_id MUST be in payload - NO FALLBACKS, NO EXTRACTING FROM RESPONSE
+    trace_id = str((payload or {}).get("trace_id") or "") if isinstance(payload, dict) else ""
+    if not trace_id:
+        log.error("_send_trace_stream_async: missing trace_id in payload - trace_id must be passed from chat_completions")
     try:
         # In-process teacher tap (removed external `services/teacher` HTTP service).
         res = await _teacher_tap_trace(payload or {})
         dt_ms = int((time.time() - t0) * 1000.0)
         _log(
             "teacher.tap",
-            trace_id=str(trace_id or (res or {}).get("trace_id") or ""),
+            trace_id=trace_id,
             ms=dt_ms,
             ok=bool((res or {}).get("ok")),
             label=(res or {}).get("label"),
@@ -2655,7 +2664,7 @@ async def _send_trace_stream_async(payload: Dict[str, Any]) -> None:
     except Exception as ex:
         # Teacher tap failures should not ruin the whole run - log and continue
         dt_ms = int((time.time() - t0) * 1000.0)
-        _log("teacher.tap.exception", trace_id=str(trace_id), ms=dt_ms, error=str(ex))
+        _log("teacher.tap.exception", trace_id=trace_id, ms=dt_ms, error=str(ex))
         logging.warning(f"teacher.tap failed (non-fatal): {ex}", exc_info=True)
         # Do not raise - allow the run to continue
 
@@ -2994,20 +3003,10 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
     # IMPORTANT: do not use `or {}` here; falsy values (e.g. "" or 0) should
     # still be preserved and routed through normalization below.
     raw_args = tool_call.get("arguments")
-    # Use canonical trace_id and conversation_id from parameters (fallback to tool_call dict for backwards compatibility)
+    # trace_id MUST be passed as parameter from chat_completions - NO FALLBACKS
     if not trace_id:
-        trace_id_val = tool_call.get("trace_id")
-        if isinstance(trace_id_val, str) and trace_id_val:
-            trace_id = trace_id_val
-        else:
-            meta = tool_call.get("meta")
-            if isinstance(meta, dict):
-                trace_id_val = meta.get("trace_id")
-                if isinstance(trace_id_val, str) and trace_id_val:
-                    trace_id = trace_id_val
-            if not trace_id:
-                log.error(f"execute_tool_call: missing trace_id - trace_id must be passed from chat_completions. tool_name={tool_name!r} conversation_id={conversation_id!r}")
-                trace_id = ""  # Do not generate - trace_id must come from chat_completions
+        log.error(f"execute_tool_call: missing trace_id parameter - trace_id must be passed from chat_completions. tool_name={tool_name!r} conversation_id={conversation_id!r}")
+        trace_id = ""  # Do not generate - trace_id must come from chat_completions
     if not conversation_id:
         conv_id_val = tool_call.get("conversation_id")
         if isinstance(conv_id_val, str) and conv_id_val:
@@ -3300,7 +3299,7 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
     if tool_name == "locks.update_region_modes":
         a = args if isinstance(args, dict) else {}
         character_id = str(a.get("character_id") or "").strip()
-        updates = a.get("updates") if isinstance(a.get("updates"), list) else []
+        updates_raw = a.get("updates")
         bundle_arg = a.get("lock_bundle") if isinstance(a.get("lock_bundle"), dict) else None
         # Allow callers to either target a persisted character lock bundle via
         # character_id or operate on an explicit lock_bundle payload without
@@ -3318,7 +3317,47 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
         existing = _lock_migrate_tts(existing)
         existing = _lock_migrate_sfx(existing)
         existing = _lock_migrate_film2(existing)
-        updated_bundle = _apply_region_mode_updates(existing, updates)
+        
+        # Handle both dict format (from committee: {"face": "hard", "regions": "hard", ...}) and list format
+        if isinstance(updates_raw, dict):
+            # Simplified format: update top-level lock modes directly
+            updated_bundle = dict(existing)
+            if "face" in updates_raw and isinstance(updates_raw["face"], str):
+                # Update face block lock mode if it exists
+                face_block = updated_bundle.get("face", {})
+                if isinstance(face_block, dict):
+                    face_block["lock_mode"] = updates_raw["face"]
+                    updated_bundle["face"] = face_block
+            if "regions" in updates_raw and isinstance(updates_raw["regions"], str):
+                # Update all regions' lock modes
+                regions = updated_bundle.get("regions", {})
+                if isinstance(regions, dict):
+                    for region_id, region_data in regions.items():
+                        if isinstance(region_data, dict):
+                            lock_mode = region_data.get("lock_mode", {})
+                            if not isinstance(lock_mode, dict):
+                                lock_mode = {}
+                            lock_mode["overall"] = updates_raw["regions"]
+                            region_data["lock_mode"] = lock_mode
+                            regions[region_id] = region_data
+                    updated_bundle["regions"] = regions
+            if "scene" in updates_raw and isinstance(updates_raw["scene"], str):
+                # Update scene block lock mode
+                scene_block = updated_bundle.get("scene", {})
+                if isinstance(scene_block, dict):
+                    scene_block["lock_mode"] = updates_raw["scene"]
+                    updated_bundle["scene"] = scene_block
+            if "style" in updates_raw and isinstance(updates_raw["style"], str):
+                # Update style block lock mode if it exists
+                style_block = updated_bundle.get("style", {})
+                if isinstance(style_block, dict):
+                    style_block["lock_mode"] = updates_raw["style"]
+                    updated_bundle["style"] = style_block
+        elif isinstance(updates_raw, list):
+            # List format: use _apply_region_mode_updates
+            updated_bundle = _apply_region_mode_updates(existing, updates_raw)
+        else:
+            updated_bundle = existing
         # Persist and summarize only when operating on a character-scoped bundle.
         if character_id:
             _lock_summarize_all_locks_for_context(_ctx_add, character_id, updated_bundle)
@@ -3327,7 +3366,8 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
     if tool_name == "locks.update_audio_modes":
         a = args if isinstance(args, dict) else {}
         character_id = str(a.get("character_id") or "").strip()
-        update_payload = a.get("update") if isinstance(a.get("update"), dict) else {}
+        # Handle both "update" (singular, expected) and "updates" (plural, from committee)
+        update_payload = a.get("update") if isinstance(a.get("update"), dict) else (a.get("updates") if isinstance(a.get("updates"), dict) else {})
         if not character_id:
             log.error(f"locks.update_audio_modes: missing character_id - continuing but this is an error. trace_id={trace_id!r} conversation_id={conversation_id!r}")
             return {"tool_name": tool_name, "error": {"code": "missing_character_id", "message": "character_id is required"}}
@@ -3373,8 +3413,8 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
         # lock bundle model even when the caller omits character metadata.
         char_key = str(a.get("character_id") or a.get("lock_character_id") or "").strip()
         if not char_key:
-            trace_id = a.get("trace_id")
-            if isinstance(trace_id, str) and trace_id.strip():
+            # trace_id MUST be passed as parameter - NO EXTRACTING FROM ARGS
+            if trace_id and isinstance(trace_id, str) and trace_id.strip():
                 char_key = f"char_{trace_id.strip()}"
         if char_key and "character_id" not in a:
             a["character_id"] = char_key
@@ -3450,7 +3490,7 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
             "quality_profile": quality_profile,
             "steps": steps,
             "cfg": cfg_num,
-            "trace_id": a.get("trace_id") if isinstance(a.get("trace_id"), str) else None,
+            "trace_id": trace_id,
         }
         # Execute image generation in-process via ComfyUI (no /tool.run HTTP recursion).
         try:
@@ -3556,14 +3596,14 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
                 orch_urls.append(orch_url)
                 now_ms = int(time.time() * 1000)
                 now_at = int(time.time())
-                dispatch_trace_id = dispatch_args.get("trace_id") if isinstance(dispatch_args, dict) else None
+                # trace_id MUST be passed as parameter - NO EXTRACTING FROM ARGS
                 dispatch_conversation_id = dispatch_args.get("conversation_id") if isinstance(dispatch_args, dict) else None
                 # Generate unique artifact_id: trace_id + tool_name + unique suffix
                 # Note: File is created by external service, so we derive artifact_id from the returned filename
                 artifact_id = generate_artifact_id(
-                    trace_id=(dispatch_trace_id or ""),
+                    trace_id=trace_id,
                     tool_name="image.dispatch.upscale",
-                    conversation_id=(dispatch_conversation_id or ""),
+                    conversation_id=(dispatch_conversation_id or conversation_id or ""),
                     suffix_data=safe_fn,
                 )
                 artifacts_out.append(
@@ -3571,8 +3611,8 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
                         artifact_id=artifact_id,
                         kind="image",
                         path=f"/uploads/{rel}",
-                        trace_id=(dispatch_trace_id or ""),
-                        conversation_id=(dispatch_conversation_id or ""),
+                        trace_id=trace_id,
+                        conversation_id=(dispatch_conversation_id or conversation_id or ""),
                         tool_name="image.dispatch.upscale",
                         view_url=orch_url,
                         url=orch_url,
@@ -3703,14 +3743,14 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
                         orch_urls.append(orch_url)
                         now_ms = int(time.time() * 1000)
                         now_at = int(time.time())
-                        dispatch_trace_id = dispatch_args.get("trace_id") if isinstance(dispatch_args, dict) else None
+                        # trace_id MUST be passed as parameter - NO EXTRACTING FROM ARGS
                         dispatch_conversation_id = dispatch_args.get("conversation_id") if isinstance(dispatch_args, dict) else None
                         # Generate unique artifact_id: trace_id + tool_name + unique suffix
                         # Note: File is created by external service, so we derive artifact_id from the returned filename
                         artifact_id = generate_artifact_id(
-                            trace_id=(dispatch_trace_id or ""),
+                            trace_id=trace_id,
                             tool_name="image.dispatch",
-                            conversation_id=(dispatch_conversation_id or ""),
+                            conversation_id=(dispatch_conversation_id or conversation_id or ""),
                             suffix_data=safe_fn,
                         )
                         artifacts_out.append(
@@ -3718,8 +3758,8 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
                                 artifact_id=artifact_id,
                                 kind="image",
                                 path=f"/uploads/{rel}",
-                                trace_id=(dispatch_trace_id or ""),
-                                conversation_id=(dispatch_conversation_id or ""),
+                                trace_id=trace_id,
+                                conversation_id=(dispatch_conversation_id or conversation_id or ""),
                                 tool_name="image.dispatch",
                                 view_url=orch_url,
                                 url=orch_url,
@@ -3754,7 +3794,7 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
                 locks_scored = await score_image_dispatch_outputs(
                     saved_paths=saved_paths,
                     lock_bundle=lock_bundle if isinstance(lock_bundle, dict) else None,
-                    trace_id=dispatch_args.get("trace_id") if isinstance(dispatch_args, dict) else None,
+                    trace_id=trace_id,
                     artifact_group_id=artifact_group_id,
                     quality_profile=str(quality_profile or ""),
                 )
@@ -3820,9 +3860,10 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
             lock_bundle = _lock_migrate_visual(lock_bundle)
         dispatch_args = build_image_refine_dispatch_args(a, lock_bundle, str(quality_profile or "standard"))
         # Execute in-process (no /tool.run recursion)
-        trace_id_val = a.get("trace_id") or ""
-        conv_id_val = a.get("conversation_id") or ""
-        res = await execute_tool_call({"tool_name": "image.dispatch", "arguments": dispatch_args}, trace_id=trace_id_val, conversation_id=conv_id_val)
+        # trace_id MUST be passed as parameter - NO FALLBACKS, NO EXTRACTING FROM ARGS
+        if not trace_id:
+            log.error(f"image.refine: missing trace_id parameter - trace_id must be passed from chat_completions. conversation_id={conversation_id!r}")
+        res = await execute_tool_call({"tool_name": "image.dispatch", "arguments": dispatch_args}, trace_id=trace_id, conversation_id=conversation_id)
         if isinstance(res, dict) and isinstance(res.get("result"), dict):
             env = res.get("result") or {}
         else:
@@ -4021,8 +4062,8 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
                             "locks": locks,
                         },
                     },
-                    trace_id=trace_id or "",
-                    conversation_id=conversation_id or "",
+                    trace_id=trace_id,
+                    conversation_id=conversation_id,
                 )
                 det_out = det_res.get("result") if isinstance(det_res, dict) else {}
                 regions: List[Dict[str, Any]] = []
@@ -4062,7 +4103,7 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
                         },
                     )
                     rep_args: Dict[str, Any] = {"src": fp, "regions": regions, "mode": refine_mode, "locks": locks}
-                    rep_res = await execute_tool_call({"tool_name": "image.repair", "arguments": rep_args}, trace_id=trace_id or "", conversation_id=conversation_id or "")
+                    rep_res = await execute_tool_call({"tool_name": "image.repair", "arguments": rep_args}, trace_id=trace_id, conversation_id=conversation_id)
                     rep_out = rep_res.get("result") if isinstance(rep_res, dict) else {}
                     if isinstance(rep_out, dict):
                         rp = rep_out.get("repaired_image_path")
@@ -4073,8 +4114,8 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
             if cleaned_path == fp:
                 im_res = await execute_tool_call(
                     {"tool_name": "image.cleanup", "arguments": {"src": fp}},
-                    trace_id=trace_id or "",
-                    conversation_id=conversation_id or "",
+                    trace_id=trace_id,
+                    conversation_id=conversation_id,
                 )
                 if isinstance(im_res, dict) and isinstance(im_res.get("result"), dict):
                     r = im_res.get("result") or {}
@@ -4160,7 +4201,7 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
                 lock_bundle=lock_bundle,
                 lock_quality_presets=LOCK_QUALITY_PRESETS,
                 quality_profile=quality_profile,
-                trace_id=trace_id if isinstance(trace_id, str) else None,
+                trace_id=trace_id,
                 context={"segment_id": segment_id, "film_id": film_id, "scene_id": scene_id, "shot_id": shot_id, "refine_mode": refine_mode},
             )
             if isinstance(qa_env, dict):
@@ -4183,13 +4224,13 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
                 locks=locks if isinstance(locks, dict) else {},
                 seed=a.get("seed"),
                 conversation_id=conversation_id,
-                trace_id=trace_id if isinstance(trace_id, str) else None,
+                trace_id=trace_id,
                 film_id=str(film_id) if isinstance(film_id, str) else None,
                 scene_id=str(scene_id) if isinstance(scene_id, str) else None,
                 shot_id=str(shot_id) if isinstance(shot_id, str) else None,
                 act_id=str(act_id) if isinstance(act_id, str) else None,
             )
-            hv_res = await execute_tool_call({"tool_name": "video.hv.t2v", "arguments": hv_args}, trace_id=trace_id or "", conversation_id=conversation_id or "")
+            hv_res = await execute_tool_call({"tool_name": "video.hv.t2v", "arguments": hv_args}, trace_id=trace_id, conversation_id=conversation_id)
             if isinstance(hv_res, dict) and hv_res.get("error") is not None:
                 return hv_res
             hv_result_raw = hv_res.get("result") if isinstance(hv_res, dict) else hv_res
@@ -4260,10 +4301,12 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
         t_film2 = time.perf_counter()
         a = raw_args if isinstance(raw_args, dict) else {}
         prompt = (a.get("prompt") or "").strip()
-        trace_id = a.get("trace_id")
-        # Use trace_id only (no derived/fallback trace keys, no normalization).
+        # trace_id MUST be passed as parameter - NO FALLBACKS, NO EXTRACTING FROM ARGS
+        if not trace_id:
+            log.error(f"film2.run: missing trace_id parameter - trace_id must be passed from chat_completions. conversation_id={conversation_id!r}")
         # conversation_id is the conversation/client id. film_id is a separate identifier for a film run.
-        conversation_id = a.get("conversation_id")
+        if not conversation_id:
+            conversation_id = a.get("conversation_id")
 
         _film_id_raw = a.get("film_id")
         if isinstance(_film_id_raw, (str, int)) and str(_film_id_raw).strip():
@@ -4897,7 +4940,7 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
                     lock_bundle=locks_arg if isinstance(locks_arg, dict) else {},
                     thresholds_lock=thresholds_lock if isinstance(thresholds_lock, dict) else {},
                     upload_dir=UPLOAD_DIR,
-                    trace_id=trace_id if isinstance(trace_id, str) else None,
+                    trace_id=trace_id,
                     event_kind="film2.best_select",
                     context={"film_id": film_id, "shot_index": i},
                 )
@@ -5032,7 +5075,7 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
                         locks=locks_arg,
                         seed=a.get("seed"),
                         conversation_id=(conversation_id if isinstance(conversation_id, str) else ""),
-                        trace_id=trace_id if isinstance(trace_id, str) else None,
+                        trace_id=trace_id,
                         film_id=film_id,
                         scene_id=str(scene_id) if isinstance(scene_id, str) else None,
                         shot_id=str(shot_id) if isinstance(shot_id, str) else None,
@@ -5161,7 +5204,7 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
                                 lock_bundle=locks_arg if isinstance(locks_arg, dict) else {},
                                 thresholds_lock=thresholds_lock if isinstance(thresholds_lock, dict) else {},
                                 upload_dir=UPLOAD_DIR,
-                                trace_id=trace_id if isinstance(trace_id, str) else None,
+                                trace_id=trace_id,
                                 event_kind="film2.best_select_story",
                                 context={"film_id": film_id, "shot_id": shot_id},
                             )
@@ -5247,7 +5290,7 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
                         locks=locks_arg,
                         seed=a.get("seed"),
                         conversation_id=(conversation_id if isinstance(conversation_id, str) else ""),
-                        trace_id=trace_id if isinstance(trace_id, str) else None,
+                        trace_id=trace_id,
                         film_id=film_id,
                         shot_id=f"shot_{i}",
                         init_image=img,
@@ -5360,7 +5403,7 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
                     locks=locks_arg,
                     seed=a.get("seed"),
                     conversation_id=(conversation_id if isinstance(conversation_id, str) else ""),
-                    trace_id=trace_id if isinstance(trace_id, str) else None,
+                    trace_id=trace_id,
                     film_id=film_id,
                     shot_id="shot_0",
                 )
@@ -6482,13 +6525,12 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
         a = args if isinstance(args, dict) else {}
         quality_profile = (a.get("quality_profile") or "standard")
 
-        # Propagate trace_id from function parameter first, then fall back to args
-        # This ensures trace_id is always available even when called directly (not through executor)
-        trace_id_from_args = str(a.get("trace_id") or "").strip()
-        effective_trace_id = trace_id if trace_id else trace_id_from_args
-        if effective_trace_id and isinstance(a, dict) and not a.get("trace_id"):
-            a["trace_id"] = effective_trace_id
-        trace_id = effective_trace_id
+        # trace_id MUST be passed as parameter from chat_completions - NO FALLBACKS
+        # Ensure trace_id is in args for downstream tools
+        if trace_id and isinstance(a, dict) and not a.get("trace_id"):
+            a["trace_id"] = trace_id
+        if not trace_id:
+            log.error(f"music.infinite.windowed: missing trace_id parameter - trace_id must be passed from chat_completions. conversation_id={conversation_id!r}")
 
         # Derive a stable character identity for music locks when possible.
         character_id = str(a.get("character_id") or "").strip()
@@ -10032,15 +10074,10 @@ async def chat_completions2(request: Request):
     log.info(f"chat_completions:body={body}")
     log.info(f"request={request}")
     # Extract trace_id from request headers or body if available
-    trace_id = ""
-    if isinstance(body, dict):
-        trace_id = str(body.get("trace_id") or "").strip()
-    if not trace_id:
-        # Try to get from headers
-        trace_id = str(request.headers.get("X-Trace-Id") or "").strip()
-    if not trace_id:
-        log.error("committee_ai_text called without trace_id - upstream caller must pass trace_id")
-        trace_id = "missing_trace_id"
+    # trace_id is NEVER in request body or headers - it's generated in chat_completions only
+    # For chat_completions2 endpoint, generate a new trace_id (this is a direct API endpoint)
+    conversation_id_for_trace = str(body.get("conversation_id") or "").strip() if isinstance(body, dict) else ""
+    trace_id = _generate_trace_id(seed=conversation_id_for_trace)
     env = await committee_ai_text(messages=(body.get("messages")), trace_id=trace_id)
     log.debug(f"chat_completions:env={env}")
     body_text = json.dumps(env, ensure_ascii=False)
@@ -10249,13 +10286,17 @@ async def chat_completions(request: Request):
         tool_calls: List[Dict[str, Any]] = []
         planner_env: Dict[str, Any] = {"ok": False, "error": {"code": "planner_not_run", "message": "planner did not run"}}
         try:
+            # Pass tools schema to planner (planner also uses catalog, but tools param provides context)
+            tools_schema = get_builtin_tools_schema()
+            logging.info(f"chat_completions:produce_tool_plan calling with tools_schema_len={len(tools_schema) if isinstance(tools_schema, list) else 0} trace_id={trace_id} mode={effective_mode}")
             plan_text, tool_calls, planner_env = await produce_tool_plan(
                 messages=messages,
-                tools=None,
+                tools=tools_schema,
                 temperature=exec_temperature,
                 trace_id=trace_id,
                 mode=effective_mode,
             )
+            logging.info(f"chat_completions:produce_tool_plan returned plan_text_len={len(plan_text) if isinstance(plan_text, str) else 0} tool_calls_len={len(tool_calls) if isinstance(tool_calls, list) else 0} planner_env_ok={bool((planner_env or {}).get('ok'))}")
         except Exception as e:
             log.error(f"chat_completions:produce_tool_plan failed trace_id={trace_id} ex={e}", exc_info=True)
             # Preserve a structured envelope so downstream logic can surface a
@@ -10413,6 +10454,7 @@ async def chat_completions(request: Request):
         logging.debug("chat_completions:trace_append decision done")
 
         if not isinstance(planner_env, dict) or not planner_env.get("ok"):
+            log.error(f"chat_completions:planner failed planner_env={planner_env!r} trace_id={trace_id}")
             usage0 = estimate_usage(messages, "")
             err_block = planner_env.get("error") if isinstance(planner_env, dict) else None
             if not isinstance(err_block, dict):
@@ -10433,6 +10475,7 @@ async def chat_completions(request: Request):
             tool_calls = []
             plan_text = ""
             _cat_hash = ""
+            log.error(f"chat_completions:planner failed - aborting pipeline trace_id={trace_id} abort_pipeline={abort_pipeline}")
         else:
             _cat_hash = compute_tools_hash(body, planner_visible_only=False, planner_visible_tools=set(PLANNER_VISIBLE_TOOLS))
         # Planner OK: continue into the full pipeline below (CO/RAG/QA/retry/compose),
@@ -10469,9 +10512,7 @@ async def chat_completions(request: Request):
 
         if (not abort_pipeline) and tool_calls:
             _log("tools.exec.start", trace_id=trace_id, count=len(tool_calls or []))
-            logging.debug(
-                f"chat_completions:tools.exec.start abort_pipeline={abort_pipeline!r} tool_calls_len={len(tool_calls or [])}"
-            )
+            logging.info(f"chat_completions:tools.exec.start abort_pipeline={abort_pipeline!r} tool_calls_len={len(tool_calls or [])} executor_endpoint={executor_endpoint!r}")
             _inject_execution_context(tool_calls, trace_id, effective_mode, conversation_id)
             logging.debug(f"chat_completions:_inject_execution_context done trace_id={trace_id!r} effective_mode={effective_mode!r}")
             for tc in tool_calls:
@@ -10723,6 +10764,8 @@ async def chat_completions(request: Request):
                     if extra_results:
                         tool_results.extend(extra_results)
                         logging.debug(f"chat_completions:tool_loop:tool_results extended with extra_results len={len(tool_results)}")
+        else:
+            log.warning(f"chat_completions:tools.exec SKIPPED abort_pipeline={abort_pipeline!r} tool_calls_len={len(tool_calls or [])} trace_id={trace_id}")
 
         _log("flow.after_execute", trace_id=trace_id, tool_results_count=len(tool_results or []))
         logging.debug(
@@ -10783,13 +10826,13 @@ async def chat_completions(request: Request):
         # Optional one-pass revision
         if committee_action == "revise" and isinstance(patch_plan, list) and patch_plan:
             logging.debug(f"chat_completions:committee revise branch entered patch_plan_len={len(patch_plan)}")
-            # Filter patch plan by front-door + mode rules
-            _allowed_mode_set = set(_allowed_tools_for_mode(effective_mode))
-            logging.debug(f"chat_completions:committee _allowed_mode_set_len={len(_allowed_mode_set)}")
+            # Filter patch plan: use full catalog (not just planner-visible) since patch_plan can include internal refinement tools like locks.*
+            _allowed_patch_tools = set(catalog_allowed(get_builtin_tools_schema))
+            logging.debug(f"chat_completions:committee _allowed_patch_tools_len={len(_allowed_patch_tools)}")
             patch_calls = _normalize_patch_plan_to_tool_calls(
                 patch_plan,
                 planner_visible_tools=PLANNER_VISIBLE_TOOLS,
-                allowed_tools=_allowed_mode_set,
+                allowed_tools=_allowed_patch_tools,
             )
             if patch_calls:
                 _inject_execution_context(patch_calls, trace_id, effective_mode, conversation_id)
@@ -11924,8 +11967,11 @@ async def datasets_index(name: str, version: str):
 # ---------- Film-2 QA (Step 23) ----------
 @app.post("/film2/qa")
 async def film2_qa(body: Dict[str, Any]):
-    trace_id = str(body.get("trace_id") or "").strip() if isinstance(body.get("trace_id"), (str, int)) else ""
-    conversation_id = str(body.get("conversation_id") or "").strip() if isinstance(body.get("conversation_id"), (str, int)) else ""
+    # trace_id is NEVER in request body - it's generated in chat_completions only
+    # For film2/qa endpoint, generate a new trace_id (this is a direct API endpoint)
+    conversation_id_for_trace = str(body.get("conversation_id") or "").strip() if isinstance(body.get("conversation_id"), (str, int)) else ""
+    trace_id = _generate_trace_id(seed=conversation_id_for_trace)
+    conversation_id = conversation_id_for_trace
     film_id = str(body.get("film_id") or "").strip() if isinstance(body.get("film_id"), (str, int)) else ""
     if not film_id:
         return ToolEnvelope.failure(
@@ -12143,8 +12189,11 @@ async def v1_video_state(capsule_id: str):
 
 @app.post("/v1/video/generate")
 async def v1_video_generate(body: Dict[str, Any]):
-    trace_id = str(body.get("trace_id") or "").strip() if isinstance(body.get("trace_id"), (str, int)) else ""
-    conversation_id = str(body.get("conversation_id") or "").strip() if isinstance(body.get("conversation_id"), (str, int)) else ""
+    # trace_id is NEVER in request body - it's generated in chat_completions only
+    # For v1_video_generate endpoint, generate a new trace_id (this is a direct API endpoint)
+    conversation_id_for_trace = str(body.get("conversation_id") or "").strip() if isinstance(body.get("conversation_id"), (str, int)) else ""
+    trace_id = _generate_trace_id(seed=conversation_id_for_trace)
+    conversation_id = conversation_id_for_trace
     if not HYVIDEO_API_URL:
         return ToolEnvelope.failure(
             code="hunyuan_not_configured",
@@ -12208,8 +12257,11 @@ async def v1_video_generate(body: Dict[str, Any]):
 
 @app.post("/v1/video/edit")
 async def v1_video_edit(body: Dict[str, Any]):
-    trace_id = str(body.get("trace_id") or "").strip() if isinstance(body.get("trace_id"), (str, int)) else ""
-    conversation_id = str(body.get("conversation_id") or "").strip() if isinstance(body.get("conversation_id"), (str, int)) else ""
+    # trace_id is NEVER in request body - it's generated in chat_completions only
+    # For v1_video_edit endpoint, generate a new trace_id (this is a direct API endpoint)
+    conversation_id_for_trace = str(body.get("conversation_id") or "").strip() if isinstance(body.get("conversation_id"), (str, int)) else ""
+    trace_id = _generate_trace_id(seed=conversation_id_for_trace)
+    conversation_id = conversation_id_for_trace
     if not HYVIDEO_API_URL:
         return ToolEnvelope.failure(
             code="hunyuan_not_configured",
@@ -12262,14 +12314,16 @@ async def v1_video_edit(body: Dict[str, Any]):
         "latent_reinit_every": 48,
     }
     res = await execute_tool_call({"tool_name": "video.hv.i2v", "arguments": hv_args}, trace_id=trace_id, conversation_id=conversation_id)
-    conversation_id = str(body.get("conversation_id") or "").strip() if isinstance(body.get("conversation_id"), (str, int)) else ""
     return ToolEnvelope.success(result={"result": res, "trace_id": trace_id, "conversation_id": conversation_id}, trace_id=trace_id, conversation_id=conversation_id)
 
 
 @app.post("/v1/audio/lyrics-to-song")
 async def v1_audio_lyrics_to_song(body: Dict[str, Any]):
-    trace_id = str(body.get("trace_id") or "").strip() if isinstance(body.get("trace_id"), (str, int)) else ""
-    conversation_id = str(body.get("conversation_id") or "").strip() if isinstance(body.get("conversation_id"), (str, int)) else ""
+    # trace_id is NEVER in request body - it's generated in chat_completions only
+    # For v1_audio_lyrics_to_song endpoint, generate a new trace_id (this is a direct API endpoint)
+    conversation_id_for_trace = str(body.get("conversation_id") or "").strip() if isinstance(body.get("conversation_id"), (str, int)) else ""
+    trace_id = _generate_trace_id(seed=conversation_id_for_trace)
+    conversation_id = conversation_id_for_trace
     expected = {"lyrics": str, "style_prompt": str, "ref_audio_ids": list, "lock_ids": list, "duration_s": int, "seed": int, "bpm": int, "key": str}
     parser = JSONParser()
     payload = parser.parse(json.dumps(body or {}), expected)

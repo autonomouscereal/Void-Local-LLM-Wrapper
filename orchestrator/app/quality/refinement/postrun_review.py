@@ -143,14 +143,13 @@ def normalize_patch_plan_to_tool_calls(
 ) -> List[Dict[str, Any]]:
     """
     Normalize committee patch_plan into internal tool_calls shape:
-      [{"name": <tool>, "arguments": <dict>}]
+      [{"tool_name": <tool>, "arguments": <dict>}]
 
     Enforces:
-    - Tool must be planner-visible AND allowed by mode.
+    - Accepts any tool name (patch_plan tools can be internal refinement tools like locks.*).
+    - Tool validity is checked downstream by execute_tool_call/gateway_execute.
     - Args may be dict, JSON string, None, or arbitrary; unknown types are preserved under _raw.
     """
-    visible = {n for n in (planner_visible_tools or []) if isinstance(n, str) and n.strip()}
-    allowed = {n for n in (allowed_tools or set()) if isinstance(n, str) and n.strip()}
     out: List[Dict[str, Any]] = []
     if not isinstance(patch_plan, list):
         return out
@@ -158,9 +157,12 @@ def normalize_patch_plan_to_tool_calls(
     for st in patch_plan:
         if not isinstance(st, dict):
             continue
-        tl = (st.get("tool") or "").strip() if isinstance(st.get("tool"), str) else ""
-        if not tl or tl not in visible or tl not in allowed:
+        # Use tool_name (consistent with planner schema), fallback to "tool" for backward compatibility
+        tl = (st.get("tool_name") or st.get("tool") or "").strip() if isinstance(st.get("tool_name") or st.get("tool"), str) else ""
+        if not tl:
             continue
+        # Accept any tool - validity will be checked by execute_tool_call/gateway_execute
+        # Patch plan tools can be internal refinement tools (locks.*) that aren't in the catalog
         args_raw = st.get("args") if ("args" in st) else st.get("arguments")
         args_st: Dict[str, Any]
         if isinstance(args_raw, dict):
@@ -172,7 +174,14 @@ def normalize_patch_plan_to_tool_calls(
             args_st = {}
         else:
             args_st = {"_raw": args_raw}
-        out.append({"name": tl, "arguments": args_st})
+        
+        # Normalize argument formats for lock tools to match what execute_tool_call expects
+        if tl == "locks.update_audio_modes":
+            # execute_tool_call expects "update" (singular), but committee may generate "updates" (plural)
+            if "updates" in args_st and "update" not in args_st:
+                args_st["update"] = args_st.pop("updates")
+        
+        out.append({"tool_name": tl, "arguments": args_st})
     return out
 
 

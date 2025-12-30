@@ -232,8 +232,10 @@ def _build_music_eval_summary(all_axes: Dict[str, Any], film_context: Optional[D
 
 
 async def _call_music_eval_committee(summary: str, trace_id: str = ""):
-    # Use provided trace_id or fallback to "music_eval" for backwards compatibility
-    effective_trace_id = trace_id if trace_id and trace_id.strip() else "music_eval"
+    # trace_id MUST be passed from chat_completions - NO FALLBACKS
+    if not trace_id:
+        log.error(f"_call_music_eval_committee: missing trace_id parameter - trace_id must be passed from chat_completions")
+        trace_id = ""
     messages = [
         {
             "role": "system",
@@ -256,7 +258,7 @@ async def _call_music_eval_committee(summary: str, trace_id: str = ""):
         {"role": "user", "content": summary},
     ]
     schema = {"overall_quality_score": float, "fit_score": float, "originality_score": float, "cohesion_score": float, "issues": [str]}
-    env = await committee_ai_text(messages=messages, trace_id=effective_trace_id)
+    env = await committee_ai_text(messages=messages, trace_id=trace_id)
     result_payload: Dict[str, Any] = {
         "overall_quality_score": 0.0,
         "fit_score": 0.0,
@@ -267,7 +269,7 @@ async def _call_music_eval_committee(summary: str, trace_id: str = ""):
     if isinstance(env, dict) and env.get("ok"):
         res = env.get("result") or {}
         txt = res.get("text") or ""
-        parsed = await committee_jsonify(raw_text=txt or "{}", expected_schema=schema, trace_id=effective_trace_id, temperature=0.0)
+        parsed = await committee_jsonify(raw_text=txt or "{}", expected_schema=schema, trace_id=trace_id, temperature=0.0)
         parser = JSONParser()
         coerced = parser.parse(parsed if parsed is not None else "{}", schema)
         if isinstance(coerced, dict):
@@ -324,8 +326,10 @@ async def compute_music_eval(track_path: str, song_graph: Dict[str, Any], style_
             }
             trace_event("music.eval.skipped", {"trace_id": trace_id, "conversation_id": conversation_id, "track_path": track_path, "reason": "no_usable_features"})
         else:
-            effective_trace_id = str(trace_id or "").strip()
-            aesthetic = await eval_aesthetic(all_axes, film_context, trace_id=effective_trace_id)
+            # trace_id MUST be passed from chat_completions - NO MUTATION
+            if not trace_id:
+                log.error(f"compute_music_eval: missing trace_id parameter - trace_id must be passed from chat_completions")
+            aesthetic = await eval_aesthetic(all_axes, film_context, trace_id=(trace_id or ""))
         overall_quality = float(aesthetic.get("overall_quality_score") or 0.0)
         fit_score = float(aesthetic.get("fit_score") or 0.0)
         overall = {"overall_quality_score": overall_quality, "fit_score": fit_score}

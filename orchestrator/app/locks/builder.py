@@ -510,6 +510,8 @@ def apply_audio_mode_updates(bundle: Dict[str, Any], update: Dict[str, Any]) -> 
     if next_bundle.get("schema_version", 1) < 2:
         next_bundle["schema_version"] = 2
     audio = dict(next_bundle.get("audio") or {})
+    if isinstance(update.get("voice_lock_mode"), str):
+        audio["voice_lock_mode"] = update["voice_lock_mode"]
     if update.get("tempo_bpm") is not None:
         tempo_val = update.get("tempo_bpm")
         if isinstance(tempo_val, (int, float, str)):
@@ -528,6 +530,8 @@ def apply_audio_mode_updates(bundle: Dict[str, Any], update: Dict[str, Any]) -> 
         audio["stem_profile"] = {k: float(v) for k, v in stem_profile.items() if isinstance(v, (int, float))}
     if isinstance(update.get("stem_lock_mode"), str):
         audio["stem_lock_mode"] = update["stem_lock_mode"]
+    if isinstance(update.get("lyrics_lock_mode"), str):
+        audio["lyrics_lock_mode"] = update["lyrics_lock_mode"]
     lyrics_segments = update.get("lyrics_segments")
     if isinstance(lyrics_segments, list):
         normalized_segments: List[Dict[str, Any]] = []
