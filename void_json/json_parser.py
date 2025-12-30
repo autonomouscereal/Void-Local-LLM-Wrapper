@@ -265,15 +265,57 @@ class JSONParser:
 
     def _strip_fence_tokens(self, s: str) -> str:
         try:
+            # First, strip markdown code fences
             out = s.replace("```json", "").replace("```JSON", "").replace("```", "")
             out = out.replace("'''json", "").replace("'''JSON", "").replace("'''", "")
 
-            lines = out.splitlines()
+            # Strip common prefixes that models add before JSON (case-insensitive)
+            out_stripped = out.strip()
+            prefixes_to_remove = [
+                "JSONFixer:",
+                "JSONFixer",
+                "jsonfixer:",
+                "jsonfixer",
+                "JSON response:",
+                "JSON response",
+                "json response:",
+                "json response",
+                "JSON:",
+                "JSON",
+                "json:",
+                "json",
+            ]
+            # Try case-insensitive matching
+            out_lower = out_stripped.lower()
+            for prefix in prefixes_to_remove:
+                prefix_lower = prefix.lower()
+                if out_lower.startswith(prefix_lower):
+                    # Find the actual prefix in the original string (preserving case)
+                    prefix_len = len(prefix)
+                    # Try to find the prefix at the start (case-insensitive)
+                    actual_prefix = out_stripped[:prefix_len]
+                    if actual_prefix.lower() == prefix_lower:
+                        out_stripped = out_stripped[prefix_len:].strip()
+                        # Also handle case where prefix is followed by a colon or newline
+                        if out_stripped.startswith(":"):
+                            out_stripped = out_stripped[1:].strip()
+                        break
+
+            # Find the first '{' or '[' which should be the start of JSON
+            first_brace = out_stripped.find("{")
+            first_bracket = out_stripped.find("[")
+            if first_brace != -1 and (first_bracket == -1 or first_brace < first_bracket):
+                out_stripped = out_stripped[first_brace:]
+            elif first_bracket != -1:
+                out_stripped = out_stripped[first_bracket:]
+
+            lines = out_stripped.splitlines()
             kept: List[str] = []
             i = 0
             while i < len(lines):
                 t = lines[i].strip().lower()
-                if t == "json":
+                # Skip lines that are just "json" or empty
+                if t == "json" or not t:
                     i += 1
                     continue
                 kept.append(lines[i])

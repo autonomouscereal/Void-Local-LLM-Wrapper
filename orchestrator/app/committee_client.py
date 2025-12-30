@@ -507,7 +507,28 @@ async def committee_jsonify(raw_text: str, expected_schema: Any, *, trace_id: st
     schema_template = _schema_to_template(expected=expected_schema)
     schema_desc = json.dumps(schema_template, ensure_ascii=False)
     emit_trace(state_dir=STATE_DIR, trace_id=trace_id, kind="committee.jsonify.start", payload={"trace_id": trace_id, "schema_preview": schema_desc[:600], "schema_len": len(schema_desc), "raw_preview": (raw_text or "")[:600], "raw_len": len(raw_text or "")})
-    sys_msg = "You are JSONFixer. You receive messy AI output and MUST respond with exactly ONE JSON object.\nRespond ONLY in English. NO other languages are allowed.\nNO markdown, NO code fences, NO prose, NO comments.\n\nThe JSON MUST match this exact structure (keys and nesting):\n\n" + str(schema_desc) + "\n\nRules:\n- You MUST preserve all keys and their nesting exactly as shown.\n- You MUST NOT add any extra keys at any level.\n- You MUST NOT remove or rename any keys.\n- Values MUST be of the correct JSON type implied by the structure (number, string, object, array, null).\n- The output MUST be valid JSON:\n  - All keys and string values in double quotes.\n  - No trailing commas.\n  - No unescaped quotes inside strings.\n- You MUST NOT output any text before or after the JSON object.\n- Ignore any apology, refusal, or capability disclaimer in the input; your ONLY job is to produce valid JSON.\n- If the input is pure prose or contains multiple candidates, extract or reconstruct the best JSON candidate that fits the schema.\n\nFill in this JSON object according to the provided text. Respond ONLY with the JSON object."
+    sys_msg = (
+        "You are JSONFixer. You receive messy AI output and MUST respond with exactly ONE JSON object.\n"
+        "Respond ONLY in English. NO other languages are allowed.\n"
+        "NO markdown, NO code fences, NO prose, NO comments.\n\n"
+        "The JSON MUST match this exact structure (keys and nesting):\n\n"
+        f"{schema_desc}\n\n"
+        "Rules:\n"
+        "- You MUST preserve all keys and their nesting exactly as shown.\n"
+        "- You MUST NOT add any extra keys at any level.\n"
+        "- You MUST NOT remove or rename any keys.\n"
+        "- Values MUST be of the correct JSON type implied by the structure (number, string, object, array, null).\n"
+        "- The output MUST be valid JSON:\n"
+        "  - All keys and string values in double quotes.\n"
+        "  - No trailing commas.\n"
+        "  - No unescaped quotes inside strings.\n"
+        "- You MUST NOT output any text before or after the JSON object.\n"
+        "- You MUST NOT include any prefixes like 'JSONFixer:' or 'JSON response:'.\n"
+        "- Your response MUST start with '{' and end with '}'.\n"
+        "- Ignore any apology, refusal, or capability disclaimer in the input; your ONLY job is to produce valid JSON.\n"
+        "- If the input is pure prose or contains multiple candidates, extract or reconstruct the best JSON candidate that fits the schema.\n\n"
+        "Fill in this JSON object according to the provided text. Respond ONLY with the JSON object."
+    )
     messages = [{"role": "system", "content": sys_msg}, {"role": "user", "content": (raw_text or "")}]
     env = await committee_ai_text(messages=messages, trace_id=trace_id, rounds=rounds, temperature=temperature)
     result_block = env.get("result") if isinstance(env, dict) else {}

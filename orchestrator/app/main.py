@@ -10444,8 +10444,8 @@ async def chat_completions(request: Request):
             f"chat_completions:catalog_validate tool_calls_len={len(tool_calls or [])} unknown_tools={unknown_tools!r}"
         )
         if unknown_tools:
-            _log("tools.unknown.filtered", trace_id=trace_id, unknown=unknown_tools)
-            logging.debug(f"chat_completions:tools.unknown.filtered unknown_tools={unknown_tools!r}")
+            _log("tools.unknown.warning", trace_id=trace_id, unknown=unknown_tools)
+            logging.warning(f"chat_completions:tools.unknown.warning unknown_tools={unknown_tools!r} (these tools will still be executed)")
         _log("planner.done", trace_id=trace_id, tool_count=len(tool_calls or []), ok=bool((planner_env or {}).get("ok")))
         logging.debug(
             f"chat_completions:planner.done tool_count={len(tool_calls or [])} ok={bool((planner_env or {}).get('ok'))}"
