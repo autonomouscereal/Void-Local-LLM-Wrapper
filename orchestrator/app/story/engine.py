@@ -99,9 +99,14 @@ async def _jsonify_then_parse(raw_text: str, expected_schema: Any, *, trace_id: 
     """
     Required JSON flow for any LLM output used as structured data:
       1) LLM produces raw text (possibly messy)
-      2) committee_jsonify(raw_text, expected_schema) -> best-effort structured JSON candidate
+      2) committee_jsonify(raw_text, expected_schema) -> best-effort structured JSON candidate (uses JSONFixer committee)
       3) JSONParser.parse(candidate, expected_schema) -> schema-coerced dict (100% JSON-safe)
+    
+    This ensures proper JSON structure at every step using the committee system.
+    NOTE: trace_id must be provided - no generation, no fallback, no failure.
     """
+    # Step 1: Use committee_jsonify to get structured JSON from potentially messy LLM output
+    # committee_jsonify uses the JSONFixer committee to clean and structure the JSON
     candidate = await committee_jsonify(
         raw_text=(raw_text or "{}"),
         expected_schema=expected_schema,
@@ -109,9 +114,14 @@ async def _jsonify_then_parse(raw_text: str, expected_schema: Any, *, trace_id: 
         rounds=rounds,
         temperature=temperature,
     )
+    
+    # Step 2: Use JSONParser to validate and coerce to exact schema
+    # This provides final validation and schema coercion
     parser = JSONParser()
     try:
-        obj = parser.parse(candidate if candidate is not None else "{}", expected_schema)
+        # Convert candidate back to JSON string for parser (if it's a dict)
+        candidate_str = json.dumps(candidate, ensure_ascii=False) if isinstance(candidate, dict) else (str(candidate) if candidate else "{}")
+        obj = parser.parse(candidate_str, expected_schema)
         if not isinstance(obj, dict):
             log.warning("_jsonify_then_parse: JSONParser returned non-dict type=%s trace_id=%s", type(obj).__name__, trace_id)
             obj = {}
@@ -123,38 +133,50 @@ async def _jsonify_then_parse(raw_text: str, expected_schema: Any, *, trace_id: 
 
 async def _committee_generate_story_raw(user_prompt: str, duration_hint_s: float, *, trace_id: Optional[str]) -> str:
     """
-    Ask the committee to propose a story graph. We intentionally ask for JSON-only, then run committee_jsonify
-    to get strict structure for downstream consumers.
+    Ask the committee to propose a story graph. Uses committee_jsonify to ensure proper JSON structure.
+    NOTE: Critical instructions are in USER message because committee overrides system messages.
+    NOTE: trace_id must be provided - no generation, no fallback, no failure.
     """
     prompt_text = _norm_prompt(user_prompt)
     dur = float(duration_hint_s) if isinstance(duration_hint_s, (int, float)) else 0.0
     if dur <= 0.0:
         dur = 600.0
-    sys_msg = (
-        "You are the Story Engine for a film generator.\n"
-        "You MUST produce a story that follows the user's request exactly, but you may fill in missing details.\n"
-        "Continuity is critical: injuries, inventory, relationships, time travel rules, and causal consequences MUST remain consistent.\n"
-        "Output MUST be a single JSON object (no markdown, no code fences, no prose) describing a full story graph.\n"
-        "The story MUST be temporally coherent end-to-end.\n"
-        "If the user requests a short duration, keep the story tight. If long, include deeper arcs.\n"
-    )
-    user_msg = json.dumps(
-        {
-            "user_prompt": prompt_text,
-            "duration_hint_s": dur,
-            "requirements": {
-                "acts": "3+ acts as needed; each act has scenes; each scene has beats; each beat has dialogue and events",
-                "continuity": "explicitly track character and object state changes via events; ensure later beats reflect them",
-                "film_plan": "include optional per-beat shot prompts usable by image/video tools",
-                "ids": "stable ids for acts/scenes/beats/lines/characters/objects/locations",
-            },
-        },
-        ensure_ascii=False,
-    )
+    # Minimal system message - committee will override it anyway
+    sys_msg = "You are the Story Engine for a film generator."
+    # ALL CRITICAL INSTRUCTIONS IN USER MESSAGE (committee overrides system)
+    user_msg_content = f"""### [CRITICAL INSTRUCTIONS - READ CAREFULLY]
+
+You MUST produce a story that follows the user's request exactly, but you may fill in missing details.
+
+Continuity is critical: injuries, inventory, relationships, time travel rules, and causal consequences MUST remain consistent.
+
+Output MUST be a single JSON object (no markdown, no code fences, no prose) describing a full story graph.
+
+The story MUST be temporally coherent end-to-end.
+
+If the user requests a short duration, keep the story tight. If long, include deeper arcs.
+
+CRITICAL: Use ONLY ASCII characters. NO emojis, NO special Unicode symbols, NO non-ASCII characters. Replace any non-ASCII with ASCII equivalents.
+
+### [REQUIREMENTS]
+- Acts: 3+ acts as needed; each act has scenes; each scene has beats; each beat has dialogue and events
+- Continuity: explicitly track character and object state changes via events; ensure later beats reflect them
+- Film plan: include optional per-beat shot prompts usable by image/video tools
+- IDs: stable ids for acts/scenes/beats/lines/characters/objects/locations
+
+### [USER REQUEST]
+{json.dumps({
+    "user_prompt": prompt_text,
+    "duration_hint_s": dur,
+}, ensure_ascii=False)}
+
+### [YOUR TASK]
+Produce the complete story graph as a single JSON object. Output ONLY the JSON object, no other text."""
+    user_msg = user_msg_content
     t0 = time.perf_counter()
     env = await committee_ai_text(
         messages=[{"role": "system", "content": sys_msg}, {"role": "user", "content": user_msg}],
-        trace_id=(trace_id or "story_draft"),
+        trace_id=trace_id,
         rounds=STORY_COMMITTEE_ROUNDS,
         temperature=STORY_TEMPERATURE,
     )
@@ -164,18 +186,32 @@ async def _committee_generate_story_raw(user_prompt: str, duration_hint_s: float
         txt = str(result_block.get("text") or "")
     else:
         txt = str(env.get("text") or "")
+    
+    # Use committee_jsonify to ensure proper JSON structure before returning
+    # Keep trace_id constant - don't mutate it
+    structured = await committee_jsonify(
+        raw_text=txt,
+        expected_schema=_story_schema(),
+        trace_id=trace_id,
+        rounds=STORY_COMMITTEE_ROUNDS,
+        temperature=0.0,
+    )
+    # Convert back to JSON string for return (will be parsed again in draft_story_graph)
+    txt_structured = json.dumps(structured, ensure_ascii=False) if isinstance(structured, dict) else txt
+    
     log.info(
-        "story.committee.draft_raw done trace_id=%s dur_ms=%d raw=%s",
+        "story.committee.draft_raw done trace_id=%s dur_ms=%d",
         trace_id,
         int((time.perf_counter() - t0) * 1000),
-        txt,
     )
-    return txt
+    return txt_structured
 
 
 async def _committee_audit_story(story: Dict[str, Any], user_prompt: str, *, trace_id: Optional[str]) -> Dict[str, Any]:
     """
-    Committee-based continuity + intent audit. Returns {issues: [...], summary: str, must_fix: bool}.
+    Committee-based continuity + intent audit with chunked evaluation for large stories.
+    Evaluates full story in chunks, then synthesizes results.
+    Returns {issues: [...], summary: str, must_fix: bool, done: bool}.
     """
     # Provide basic quantitative coverage, but rely on committee judgement for "done".
     total_hint = float(story.get("duration_hint_s") or 0.0) if isinstance(story, dict) else 0.0
@@ -195,91 +231,229 @@ async def _committee_audit_story(story: Dict[str, Any], user_prompt: str, *, tra
                 total_beats_time += float(beat.get("time_hint_s") or 0.0)
     ratio = (total_beats_time / total_hint) if (total_hint > 0.0 and total_beats_time > 0.0) else 0.0
 
-    sys_msg = (
-        "You are a strict story continuity AND completion auditor.\n"
-        "Given a story graph JSON and the user prompt, find ALL violations:\n"
-        "- breaks user intent\n"
-        "- continuity contradictions (injuries, objects, locations, relationships)\n"
-        "- temporal contradictions and time travel inconsistencies\n"
-        "- missing causal links / dangling plot threads that will confuse viewers\n"
-        "- character motives that don't track\n"
-        "\n"
-        "You must ALSO judge whether the story is COMPLETE for the requested duration.\n"
-        "A 20-second story can be simple; a 2-hour story must have appropriately deep arcs.\n"
-        "You will be given duration_hint_s and current_beats_time_s/coverage_ratio, but you MUST decide completion.\n"
-        "\n"
-        "Return JSON only with fields:\n"
-        "- done: bool (authoritative: true ONLY if story is ready to proceed)\n"
-        "- length_ok: bool (true if duration/content depth matches the request)\n"
-        "- coverage_ratio: float (echo the provided ratio or your estimate)\n"
-        "- next_action: string one of: 'accept'|'extend'|'revise'|'extend_then_revise'\n"
-        "- must_fix: bool (true if severe issues exist)\n"
-        "- summary: string\n"
-        "- issues: list of issue objects (code, severity, message, pointers, suggested_fix)\n"
-        "Return issues with precise pointers (act_id/scene_id/beat_id/line_id/character_id/object_id).\n"
-    )
-    user_msg = json.dumps(
-        {
-            "user_prompt": _norm_prompt(user_prompt),
-            "duration_hint_s": float(total_hint),
-            "current_beats_time_s": float(total_beats_time),
-            "coverage_ratio": float(ratio),
-            "story": story,
-        },
-        ensure_ascii=False,
-    )
-    t0 = time.perf_counter()
-    env = await committee_ai_text(
-        messages=[{"role": "system", "content": sys_msg}, {"role": "user", "content": user_msg}],
-        trace_id=(trace_id or "story_audit"),
+    story_summary = _story_extract_summary(story)
+    
+    # For large stories, evaluate in chunks. For small stories, evaluate full story.
+    all_issues = []
+    chunk_results = []
+    
+    # Process story in act-sized chunks
+    for act_idx, act in enumerate(acts):
+        if not isinstance(act, dict):
+            continue
+        act_id = act.get("act_id") or ""
+        act_chunk = _story_get_chunk_by_ids(story, act_ids=[act_id] if act_id else None)
+        
+        # Minimal system message - committee overrides it
+        sys_msg = "You are a strict story continuity AND completion auditor."
+        # ALL CRITICAL INSTRUCTIONS IN USER MESSAGE (committee overrides system)
+        user_msg_content = f"""### [CRITICAL INSTRUCTIONS - READ CAREFULLY]
+
+You are evaluating ONE ACT of a larger story.
+
+Given the story summary (full structure) and this act's full content, find ALL violations:
+- breaks user intent
+- continuity contradictions (injuries, objects, locations, relationships)
+- temporal contradictions and time travel inconsistencies
+- missing causal links / dangling plot threads
+- character motives that don't track
+- inconsistencies with other acts (check summary for context)
+
+CRITICAL: Use ONLY ASCII characters. NO emojis, NO special Unicode symbols, NO non-ASCII characters.
+
+### [OUTPUT FORMAT]
+Return JSON ONLY with these exact fields:
+- issues: list of issue objects (code, severity, message, pointers, suggested_fix)
+- local_summary: string (brief summary of this act's quality)
+- continuity_concerns: list of strings (potential issues with other acts)
+
+Return issues with precise pointers (act_id/scene_id/beat_id/line_id/character_id/object_id).
+
+### [DATA]
+{json.dumps({
+    "user_prompt": _norm_prompt(user_prompt),
+    "duration_hint_s": float(total_hint),
+    "current_beats_time_s": float(total_beats_time),
+    "coverage_ratio": float(ratio),
+    "story_summary": story_summary,
+    "act_chunk": act_chunk,
+}, ensure_ascii=False)}
+
+### [YOUR RESPONSE]
+Output ONLY the JSON object with the fields above. No other text."""
+        user_msg = user_msg_content
+        # Keep trace_id constant - don't mutate it
+        t0_chunk = time.perf_counter()
+        env = await committee_ai_text(
+            messages=[{"role": "system", "content": sys_msg}, {"role": "user", "content": user_msg}],
+            trace_id=trace_id,
+            rounds=STORY_COMMITTEE_ROUNDS,
+            temperature=0.2,
+        )
+        raw = ""
+        result_block = env.get("result") if isinstance(env, dict) else {}
+        if isinstance(result_block, dict) and isinstance(result_block.get("text"), str):
+            raw = str(result_block.get("text") or "")
+        chunk_parsed = await _jsonify_then_parse(
+            raw_text=raw,
+            expected_schema={"issues": list, "local_summary": str, "continuity_concerns": list},
+            trace_id=trace_id,
+            rounds=STORY_COMMITTEE_ROUNDS,
+            temperature=0.0,
+        )
+        if isinstance(chunk_parsed, dict):
+            chunk_issues = chunk_parsed.get("issues") if isinstance(chunk_parsed.get("issues"), list) else []
+            all_issues.extend(chunk_issues)
+            chunk_results.append({
+                "act_id": act_id,
+                "act_idx": act_idx,
+                "issues_count": len(chunk_issues),
+                "local_summary": chunk_parsed.get("local_summary") or "",
+                "continuity_concerns": chunk_parsed.get("continuity_concerns") or [],
+            })
+        log.info(
+            "story.audit.chunk done trace_id=%s act_idx=%d act_id=%s issues=%d dur_ms=%d",
+            trace_id,
+            act_idx,
+            act_id,
+            len(chunk_parsed.get("issues") or []) if isinstance(chunk_parsed, dict) else 0,
+            int((time.perf_counter() - t0_chunk) * 1000),
+        )
+    
+    # Synthesize chunk results into final audit
+    # Minimal system message - committee overrides it
+    sys_msg_synth = "You are synthesizing story audit results."
+    # ALL CRITICAL INSTRUCTIONS IN USER MESSAGE (committee overrides system)
+    user_msg_synth_content = f"""### [CRITICAL INSTRUCTIONS - READ CAREFULLY]
+
+You are synthesizing story audit results from multiple act evaluations.
+
+You have received:
+- Story summary (full structure)
+- Per-act audit results with issues and continuity concerns
+- Overall metrics (duration_hint_s, current_beats_time_s, coverage_ratio)
+
+### [YOUR TASK]
+1. Synthesize all issues into a coherent audit
+2. Judge whether the story is COMPLETE for the requested duration
+3. Determine if story is ready to proceed
+
+### [OUTPUT FORMAT - CRITICAL]
+Return JSON ONLY with these exact fields:
+- done: bool (authoritative: true ONLY if story is ready to proceed - set this to true when story is complete and meets all requirements)
+- length_ok: bool (true if duration/content depth matches the request)
+- coverage_ratio: float (echo the provided ratio or your estimate)
+- next_action: string one of: 'accept'|'extend'|'revise'|'extend_then_revise' (use 'accept' when done=true)
+- must_fix: bool (true if severe issues exist)
+- summary: string (overall audit summary)
+- issues: list of ALL issue objects from all chunks (consolidated, deduplicated)
+
+### [DONE FLAG RULES]
+- Set done=true ONLY when:
+  * Story is complete for requested duration
+  * All continuity issues are resolved
+  * Story follows user intent
+  * No critical issues remain
+- When done=true, next_action MUST be 'accept'
+- When done=false, next_action should be 'extend' (if length not ok) or 'revise' (if issues exist)
+
+### [DATA]
+{json.dumps({
+    "user_prompt": _norm_prompt(user_prompt),
+    "duration_hint_s": float(total_hint),
+    "current_beats_time_s": float(total_beats_time),
+    "coverage_ratio": float(ratio),
+    "story_summary": story_summary,
+    "chunk_results": chunk_results,
+    "all_issues": all_issues,
+}, ensure_ascii=False)}
+
+### [YOUR RESPONSE]
+Output ONLY the JSON object with the fields above. No other text."""
+    user_msg_synth = user_msg_synth_content
+    # Keep trace_id constant - don't mutate it
+    t0_synth = time.perf_counter()
+    env_synth = await committee_ai_text(
+        messages=[{"role": "system", "content": sys_msg_synth}, {"role": "user", "content": user_msg_synth}],
+        trace_id=trace_id,
         rounds=STORY_COMMITTEE_ROUNDS,
         temperature=0.2,
     )
-    raw = ""
-    result_block = env.get("result") if isinstance(env, dict) else {}
-    if isinstance(result_block, dict) and isinstance(result_block.get("text"), str):
-        raw = str(result_block.get("text") or "")
+    raw_synth = ""
+    result_block_synth = env_synth.get("result") if isinstance(env_synth, dict) else {}
+    if isinstance(result_block_synth, dict) and isinstance(result_block_synth.get("text"), str):
+        raw_synth = str(result_block_synth.get("text") or "")
     parsed = await _jsonify_then_parse(
-        raw_text=raw,
+        raw_text=raw_synth,
         expected_schema=_issue_schema(),
-        trace_id=(trace_id or "story_audit.jsonify"),
+        trace_id=trace_id,
         rounds=STORY_COMMITTEE_ROUNDS,
         temperature=0.0,
     )
     if not parsed:
-        return {"issues": [], "summary": "", "must_fix": False, "done": False, "length_ok": False, "coverage_ratio": float(ratio), "next_action": "extend"}
-    issues = parsed.get("issues") if isinstance(parsed.get("issues"), list) else []
+        return {"issues": all_issues, "summary": "", "must_fix": False, "done": False, "length_ok": False, "coverage_ratio": float(ratio), "next_action": "extend"}
+    # Use synthesized issues if provided, otherwise use collected issues
+    if isinstance(parsed.get("issues"), list) and parsed.get("issues"):
+        issues = parsed.get("issues")
+    else:
+        issues = all_issues
+    parsed["issues"] = issues
     parsed.setdefault("coverage_ratio", float(ratio))
     if not isinstance(parsed.get("next_action"), str):
         parsed["next_action"] = "revise" if bool(parsed.get("must_fix")) else ("accept" if bool(parsed.get("done")) else "extend")
     log.info(
-        "story.committee.audit done trace_id=%s issues=%d must_fix=%s dur_ms=%d",
+        "story.committee.audit done trace_id=%s chunks=%d issues=%d must_fix=%s dur_ms=%d",
         trace_id,
+        len(chunk_results),
         len(issues),
         bool(parsed.get("must_fix")) if isinstance(parsed, dict) else False,
-        int((time.perf_counter() - t0) * 1000),
+        int((time.perf_counter() - t0_synth) * 1000),
     )
     return parsed
 
 
 async def _committee_revise_story(story: Dict[str, Any], user_prompt: str, audit: Dict[str, Any], *, trace_id: Optional[str]) -> Dict[str, Any]:
     """
-    Committee revision step. Produces a full updated story graph (same schema).
+    Committee revision step. Returns ONLY the changes/deltas, not the full story.
+    NOTE: Critical instructions are in USER message because committee overrides system messages.
+    NOTE: trace_id must be provided - no generation, no fallback, no failure.
     """
-    sys_msg = (
-        "You are the Story Engine revision pass.\n"
-        "You MUST fix the issues while preserving the user's intent and improving coherence.\n"
-        "Do not hand-wave: update the story graph so later beats reflect state changes.\n"
-        "Output JSON only."
-    )
-    user_msg = json.dumps(
-        {"user_prompt": _norm_prompt(user_prompt), "story": story, "audit": audit},
-        ensure_ascii=False,
-    )
+    story_summary = _story_extract_summary(story)
+    # Minimal system message - committee overrides it
+    sys_msg = "You are the Story Engine revision pass."
+    # ALL CRITICAL INSTRUCTIONS IN USER MESSAGE (committee overrides system)
+    user_msg_content = f"""### [CRITICAL INSTRUCTIONS - READ CAREFULLY]
+
+You MUST fix the issues while preserving the user's intent and improving coherence.
+
+Do not hand-wave: update the story graph so later beats reflect state changes.
+
+CRITICAL: Return ONLY the changes/deltas, not the full story.
+- For modified acts/scenes/beats: include them with their IDs (they will be merged by ID).
+- For new acts/scenes/beats: include them with new unique IDs.
+- Only include fields that are being changed or added.
+- Do NOT include unchanged acts/scenes/beats.
+
+CRITICAL: Use ONLY ASCII characters. NO emojis, NO special Unicode symbols, NO non-ASCII characters.
+
+### [OUTPUT FORMAT]
+Output JSON ONLY. The JSON should contain only the changes/deltas, structured the same way as the story schema but with only modified/new items.
+
+### [DATA]
+{json.dumps({
+    "user_prompt": _norm_prompt(user_prompt),
+    "story_summary": story_summary,
+    "audit": audit,
+}, ensure_ascii=False)}
+
+### [YOUR TASK]
+Fix the issues identified in the audit. Return ONLY the JSON delta with changes. No other text."""
+    user_msg = user_msg_content
+    # Keep trace_id constant - don't mutate it
     t0 = time.perf_counter()
     env = await committee_ai_text(
         messages=[{"role": "system", "content": sys_msg}, {"role": "user", "content": user_msg}],
-        trace_id=(trace_id or "story_revise"),
+        trace_id=trace_id,
         rounds=STORY_COMMITTEE_ROUNDS,
         temperature=STORY_TEMPERATURE,
     )
@@ -287,21 +461,25 @@ async def _committee_revise_story(story: Dict[str, Any], user_prompt: str, audit
     result_block = env.get("result") if isinstance(env, dict) else {}
     if isinstance(result_block, dict) and isinstance(result_block.get("text"), str):
         raw = str(result_block.get("text") or "")
+    # Use a more flexible schema for deltas (all fields optional)
+    delta_schema = {k: type(v) if isinstance(v, type) else type(v) if v is not None else Any for k, v in _story_schema().items()}
     parsed = await _jsonify_then_parse(
         raw_text=raw,
-        expected_schema=_story_schema(),
-        trace_id=(trace_id or "story_revise.jsonify"),
+        expected_schema=delta_schema,
+        trace_id=trace_id,
         rounds=STORY_COMMITTEE_ROUNDS,
         temperature=STORY_TEMPERATURE,
     )
-    acts_n = len(parsed.get("acts") or []) if isinstance(parsed, dict) and isinstance(parsed.get("acts"), list) else 0
+    delta_acts = parsed.get("acts") if isinstance(parsed, dict) and isinstance(parsed.get("acts"), list) else []
+    acts_n = len(delta_acts)
     log.info(
-        "story.committee.revise done trace_id=%s acts=%d dur_ms=%d",
+        "story.committee.revise done trace_id=%s delta_acts=%d dur_ms=%d",
         trace_id,
         acts_n,
         int((time.perf_counter() - t0) * 1000),
     )
-    return parsed if parsed else dict(story or {})
+    # Return delta (may be empty dict if no changes)
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def _story_measure_coverage(story: Dict[str, Any]):
@@ -328,6 +506,352 @@ def _story_measure_coverage(story: Dict[str, Any]):
                 total_beats_time += float(beat.get("time_hint_s") or 0.0)
     ratio = (total_beats_time / total_hint) if (total_hint > 0.0 and total_beats_time > 0.0) else 0.0
     return total_hint, total_beats_time, total_beats_count, ratio
+
+
+def _story_extract_summary(story: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Extract a structured summary of the story with metadata and structure.
+    Used for context when LLM needs overview but not full details.
+    """
+    if not isinstance(story, dict):
+        return {}
+    acts = story.get("acts") if isinstance(story.get("acts"), list) else []
+    characters = story.get("characters") if isinstance(story.get("characters"), list) else []
+    locations = story.get("locations") if isinstance(story.get("locations"), list) else []
+    objects = story.get("objects") if isinstance(story.get("objects"), list) else []
+    
+    # Build structured summary with IDs and brief metadata
+    act_summaries = []
+    for act in acts:
+        if not isinstance(act, dict):
+            continue
+        act_id = act.get("act_id") or ""
+        act_title = act.get("title") or ""
+        scenes = act.get("scenes") if isinstance(act.get("scenes"), list) else []
+        scene_summaries = []
+        for scene in scenes:
+            if not isinstance(scene, dict):
+                continue
+            scene_id = scene.get("scene_id") or ""
+            scene_title = scene.get("title") or ""
+            beats = scene.get("beats") if isinstance(scene.get("beats"), list) else []
+            beat_summaries = []
+            for beat in beats:
+                if not isinstance(beat, dict):
+                    continue
+                beat_id = beat.get("beat_id") or ""
+                beat_summary = beat.get("summary") or beat.get("description") or ""
+                beat_summaries.append({"beat_id": beat_id, "summary": beat_summary[:200] if beat_summary else ""})
+            scene_summaries.append({
+                "scene_id": scene_id,
+                "title": scene_title,
+                "beat_count": len(beats),
+                "beats": beat_summaries
+            })
+        act_summaries.append({
+            "act_id": act_id,
+            "title": act_title,
+            "scene_count": len(scenes),
+            "scenes": scene_summaries
+        })
+    
+    char_summaries = [{"character_id": char.get("character_id"), "name": char.get("name")} for char in characters if isinstance(char, dict) and char.get("character_id")]
+    loc_summaries = [{"location_id": loc.get("location_id"), "name": loc.get("name")} for loc in locations if isinstance(loc, dict) and loc.get("location_id")]
+    obj_summaries = [{"object_id": obj.get("object_id"), "name": obj.get("name")} for obj in objects if isinstance(obj, dict) and obj.get("object_id")]
+    
+    return {
+        "prompt": story.get("prompt") or "",
+        "duration_hint_s": story.get("duration_hint_s") or 0.0,
+        "logline": story.get("logline") or "",
+        "genre": story.get("genre") or [],
+        "tone": story.get("tone") or "",
+        "themes": story.get("themes") or [],
+        "act_count": len(acts),
+        "acts": act_summaries,
+        "characters": char_summaries,
+        "locations": loc_summaries,
+        "objects": obj_summaries,
+    }
+
+
+def _story_get_chunk_by_ids(story: Dict[str, Any], act_ids: List[str] = None, scene_ids: List[str] = None, beat_ids: List[str] = None) -> Dict[str, Any]:
+    """
+    Extract specific chunks of the story by IDs for detailed evaluation.
+    Returns full content for specified acts/scenes/beats.
+    """
+    if not isinstance(story, dict):
+        return {}
+    acts = story.get("acts") if isinstance(story.get("acts"), list) else []
+    
+    chunk_acts = []
+    for act in acts:
+        if not isinstance(act, dict):
+            continue
+        act_id = act.get("act_id") or ""
+        if act_ids and act_id not in act_ids:
+            continue
+        
+        scenes = act.get("scenes") if isinstance(act.get("scenes"), list) else []
+        chunk_scenes = []
+        for scene in scenes:
+            if not isinstance(scene, dict):
+                continue
+            scene_id = scene.get("scene_id") or ""
+            if scene_ids and scene_id not in scene_ids:
+                continue
+            
+            beats = scene.get("beats") if isinstance(scene.get("beats"), list) else []
+            chunk_beats = []
+            for beat in beats:
+                if not isinstance(beat, dict):
+                    continue
+                beat_id = beat.get("beat_id") or ""
+                if beat_ids and beat_id not in beat_ids:
+                    continue
+                chunk_beats.append(beat)
+            
+            if chunk_beats or (not beat_ids and not scene_ids):
+                chunk_scene = dict(scene)
+                chunk_scene["beats"] = chunk_beats
+                chunk_scenes.append(chunk_scene)
+        
+        if chunk_scenes or (not scene_ids and not act_ids):
+            chunk_act = dict(act)
+            chunk_act["scenes"] = chunk_scenes
+            chunk_acts.append(chunk_act)
+    
+    return {"acts": chunk_acts}
+
+
+def _story_get_merge_context(story: Dict[str, Any], delta: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Get full context needed for merging: affected acts/scenes/beats from base story + delta.
+    Returns full content of items that will be merged, plus summary of rest.
+    """
+    if not isinstance(story, dict) or not isinstance(delta, dict):
+        return {"summary": _story_extract_summary(story), "delta": delta}
+    
+    # Find all IDs mentioned in delta
+    delta_acts = delta.get("acts") if isinstance(delta.get("acts"), list) else []
+    affected_act_ids = []
+    affected_scene_ids = []
+    affected_beat_ids = []
+    
+    for act in delta_acts:
+        if not isinstance(act, dict):
+            continue
+        act_id = act.get("act_id")
+        if act_id:
+            affected_act_ids.append(act_id)
+        scenes = act.get("scenes") if isinstance(act.get("scenes"), list) else []
+        for scene in scenes:
+            if not isinstance(scene, dict):
+                continue
+            scene_id = scene.get("scene_id")
+            if scene_id:
+                affected_scene_ids.append(scene_id)
+            beats = scene.get("beats") if isinstance(scene.get("beats"), list) else []
+            for beat in beats:
+                if not isinstance(beat, dict):
+                    continue
+                beat_id = beat.get("beat_id")
+                if beat_id:
+                    affected_beat_ids.append(beat_id)
+    
+    # Get full chunks for affected items
+    affected_chunks = _story_get_chunk_by_ids(story, act_ids=affected_act_ids, scene_ids=affected_scene_ids, beat_ids=affected_beat_ids)
+    
+    return {
+        "summary": _story_extract_summary(story),
+        "affected_chunks": affected_chunks,
+        "delta": delta,
+    }
+
+
+async def _story_merge_delta_with_llm(base_story: Dict[str, Any], delta: Dict[str, Any], user_prompt: str, *, trace_id: Optional[str]) -> Dict[str, Any]:
+    """
+    Use LLM to intelligently merge delta into base story with full context.
+    NOTE: Critical instructions are in USER message because committee overrides system messages.
+    NOTE: trace_id must be provided - no generation, no fallback, no failure.
+    """
+    merge_context = _story_get_merge_context(base_story, delta)
+    
+    # Minimal system message - committee overrides it
+    sys_msg = "You are the Story Engine merge coordinator."
+    # ALL CRITICAL INSTRUCTIONS IN USER MESSAGE (committee overrides system)
+    user_msg_content = f"""### [CRITICAL INSTRUCTIONS - READ CAREFULLY]
+
+You will receive:
+- A summary of the full story structure
+- Full content of story chunks that are being modified/merged
+- A delta containing changes/extensions to apply
+
+### [YOUR TASK]
+1. Merge the delta into the base story intelligently
+2. Preserve all unchanged content from base story
+3. Apply changes from delta (update by ID, append new items)
+4. Maintain continuity and coherence
+5. Return the FULL merged story (not just changes)
+
+### [MERGE RULES]
+- If delta contains an act/scene/beat with an existing ID, update that item
+- If delta contains an act/scene/beat with a new ID, append it
+- Preserve all items from base story that aren't in delta
+- Maintain all IDs and structure
+- Ensure continuity is preserved across the merge
+
+CRITICAL: Use ONLY ASCII characters. NO emojis, NO special Unicode symbols, NO non-ASCII characters.
+
+### [OUTPUT FORMAT]
+Output JSON ONLY with the complete merged story. The output must be a valid JSON object matching the story schema.
+
+### [DATA]
+{json.dumps({
+    "user_prompt": _norm_prompt(user_prompt),
+    "merge_context": merge_context,
+}, ensure_ascii=False)}
+
+### [YOUR RESPONSE]
+Output ONLY the complete merged story as JSON. No other text."""
+    user_msg = user_msg_content
+    
+    # Keep trace_id constant - don't mutate it
+    t0 = time.perf_counter()
+    env = await committee_ai_text(
+        messages=[{"role": "system", "content": sys_msg}, {"role": "user", "content": user_msg}],
+        trace_id=trace_id,
+        rounds=STORY_COMMITTEE_ROUNDS,
+        temperature=0.2,
+    )
+    raw = ""
+    result_block = env.get("result") if isinstance(env, dict) else {}
+    if isinstance(result_block, dict) and isinstance(result_block.get("text"), str):
+        raw = str(result_block.get("text") or "")
+    else:
+        raw = str(env.get("text") or "")
+    
+    merged = await _jsonify_then_parse(
+        raw_text=raw,
+        expected_schema=_story_schema(),
+        trace_id=trace_id,
+        rounds=STORY_COMMITTEE_ROUNDS,
+        temperature=0.0,
+    )
+    
+    log.info(
+        "story.merge.llm done trace_id=%s dur_ms=%d",
+        trace_id,
+        int((time.perf_counter() - t0) * 1000),
+    )
+    
+    return merged if isinstance(merged, dict) and merged else base_story
+
+
+def _story_merge_delta(base_story: Dict[str, Any], delta: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Merge a story delta (changes/extensions) into the base story.
+    Delta can contain:
+    - New acts/scenes/beats (to append)
+    - Modified acts/scenes/beats (to update by ID)
+    - New characters/locations/objects (to append)
+    - Modified characters/locations/objects (to update by ID)
+    - Top-level field updates
+    """
+    if not isinstance(base_story, dict):
+        base_story = {}
+    if not isinstance(delta, dict) or not delta:
+        return dict(base_story)
+    
+    merged = dict(base_story)
+    
+    # Merge top-level fields (delta overrides base)
+    for key in ("prompt", "duration_hint_s", "logline", "tone", "continuity", "film_plan", "notes"):
+        if key in delta:
+            merged[key] = delta[key]
+    
+    # Merge lists that are additive (genre, themes, constraints)
+    for key in ("genre", "themes", "constraints"):
+        base_list = merged.get(key) if isinstance(merged.get(key), list) else []
+        delta_list = delta.get(key) if isinstance(delta.get(key), list) else []
+        # Add new items that aren't already in base
+        for item in delta_list:
+            if item not in base_list:
+                base_list.append(item)
+        merged[key] = base_list
+    
+    # Merge acts: update by act_id, or append if new
+    base_acts = merged.get("acts") if isinstance(merged.get("acts"), list) else []
+    delta_acts = delta.get("acts") if isinstance(delta.get("acts"), list) else []
+    act_by_id = {act.get("act_id"): act for act in base_acts if isinstance(act, dict) and act.get("act_id")}
+    
+    for delta_act in delta_acts:
+        if not isinstance(delta_act, dict):
+            continue
+        act_id = delta_act.get("act_id")
+        if act_id and act_id in act_by_id:
+            # Merge into existing act
+            base_act = act_by_id[act_id]
+            # Merge scenes within act
+            base_scenes = base_act.get("scenes") if isinstance(base_act.get("scenes"), list) else []
+            delta_scenes = delta_act.get("scenes") if isinstance(delta_act.get("scenes"), list) else []
+            scene_by_id = {scene.get("scene_id"): scene for scene in base_scenes if isinstance(scene, dict) and scene.get("scene_id")}
+            
+            for delta_scene in delta_scenes:
+                if not isinstance(delta_scene, dict):
+                    continue
+                scene_id = delta_scene.get("scene_id")
+                if scene_id and scene_id in scene_by_id:
+                    # Merge into existing scene
+                    base_scene = scene_by_id[scene_id]
+                    # Merge beats within scene
+                    base_beats = base_scene.get("beats") if isinstance(base_scene.get("beats"), list) else []
+                    delta_beats = delta_scene.get("beats") if isinstance(delta_scene.get("beats"), list) else []
+                    beat_by_id = {beat.get("beat_id"): beat for beat in base_beats if isinstance(beat, dict) and beat.get("beat_id")}
+                    
+                    for delta_beat in delta_beats:
+                        if not isinstance(delta_beat, dict):
+                            continue
+                        beat_id = delta_beat.get("beat_id")
+                        if beat_id and beat_id in beat_by_id:
+                            # Update existing beat
+                            beat_by_id[beat_id].update(delta_beat)
+                        else:
+                            # New beat, append
+                            base_beats.append(delta_beat)
+                    base_scene["beats"] = base_beats
+                else:
+                    # New scene, append
+                    base_scenes.append(delta_scene)
+            base_act["scenes"] = base_scenes
+        else:
+            # New act, append
+            base_acts.append(delta_act)
+            if act_id:
+                act_by_id[act_id] = delta_act
+    
+    merged["acts"] = base_acts
+    
+    # Merge characters/locations/objects: update by ID or append
+    for key, id_key in (("characters", "character_id"), ("locations", "location_id"), ("objects", "object_id")):
+        base_list = merged.get(key) if isinstance(merged.get(key), list) else []
+        delta_list = delta.get(key) if isinstance(delta.get(key), list) else []
+        item_by_id = {item.get(id_key): item for item in base_list if isinstance(item, dict) and item.get(id_key)}
+        
+        for delta_item in delta_list:
+            if not isinstance(delta_item, dict):
+                continue
+            item_id = delta_item.get(id_key)
+            if item_id and item_id in item_by_id:
+                # Update existing item
+                item_by_id[item_id].update(delta_item)
+            else:
+                # New item, append
+                base_list.append(delta_item)
+                if item_id:
+                    item_by_id[item_id] = delta_item
+        merged[key] = base_list
+    
+    return merged
 
 
 def _story_update_stall_guard(
@@ -360,12 +884,14 @@ async def draft_story_graph(user_prompt: str, duration_hint_s: Optional[float], 
     duration = float(duration_hint_s) if isinstance(duration_hint_s, (int, float)) else 0.0
     if duration <= 0.0:
         duration = 600.0
+    # NOTE: trace_id must be provided - no generation, no fallback, no failure
     log.info(f"story.draft start trace_id={trace_id!r} duration_hint_s={float(duration)} prompt_len={len(prompt_text)}")
-    raw = await _committee_generate_story_raw(prompt_text, duration, trace_id=(trace_id or "film2.story_draft"))
+    raw = await _committee_generate_story_raw(prompt_text, duration, trace_id=trace_id)
+    # Keep trace_id constant - don't mutate it
     story = await _jsonify_then_parse(
         raw_text=raw,
         expected_schema=_story_schema(),
-        trace_id=(trace_id or "film2.story_draft.jsonify"),
+        trace_id=trace_id,
         rounds=STORY_COMMITTEE_ROUNDS,
         temperature=STORY_TEMPERATURE,
     )
@@ -400,8 +926,9 @@ async def draft_story_graph(user_prompt: str, duration_hint_s: Optional[float], 
             float(ratio),
         )
 
-        # Audit after each iteration (authoritative "done" signal).
-        audit = await _committee_audit_story(story, prompt_text, trace_id=(trace_id or f"film2.story_audit.{pass_index}"))
+        # Audit at start of each iteration (authoritative "done" signal).
+        # Keep trace_id constant - don't mutate it
+        audit = await _committee_audit_story(story, prompt_text, trace_id=trace_id)
         issues = audit.get("issues") if isinstance(audit, dict) and isinstance(audit.get("issues"), list) else []
         must_fix = bool(audit.get("must_fix")) if isinstance(audit, dict) else False
         done = bool(audit.get("done")) if isinstance(audit, dict) else False
@@ -427,48 +954,72 @@ async def draft_story_graph(user_prompt: str, duration_hint_s: Optional[float], 
         if done and next_action_s == "accept":
             stop_requested = True
             stop_reason = "accept"
+            break
 
         # Fix pass when committee requests revision (or marks must_fix).
         if (not stop_requested) and (must_fix or next_action_s in ("revise", "extend_then_revise")):
-            story = await _committee_revise_story(
+            # Keep trace_id constant - don't mutate it
+            delta = await _committee_revise_story(
                 story,
                 prompt_text,
                 audit,
-                trace_id=(trace_id or f"film2.story_revise.{pass_index}"),
+                trace_id=trace_id,
             )
+            if isinstance(delta, dict) and delta:
+                # Use LLM to intelligently merge delta into base story
+                story = await _story_merge_delta_with_llm(
+                    base_story=story,
+                    delta=delta,
+                    user_prompt=prompt_text,
+                    trace_id=trace_id,
+                )
             if not isinstance(story, dict):
                 # Never break: stop deterministically with the best available state.
                 stop_requested = True
                 stop_reason = "revise_failed"
+                break
             story.setdefault("prompt", prompt_text)
             story.setdefault("duration_hint_s", float(duration))
 
         # Extend pass when committee requests extension (or says length not ok).
         if (not stop_requested) and ((not length_ok) or next_action_s in ("extend", "extend_then_revise")):
-            sys_msg = (
-                "You are the Story Engine continuation pass.\n"
-                "You MUST EXTEND the existing story graph to meet the requested duration and depth.\n"
-                "Rules:\n"
-                "- Keep all existing acts/scenes/beats/dialogue/events unchanged unless required for continuity.\n"
-                "- Add NEW acts/scenes/beats to reach the duration. Deeper arcs for long films.\n"
-                "- Maintain strict continuity: state_change events must be reflected later.\n"
-                "- Maintain stable ids: never change existing ids; new ids must be unique and stable.\n"
-                "- Output MUST be a single JSON object (no markdown, no prose).\n"
-            )
-            user_msg = json.dumps(
-                {
-                    "user_prompt": prompt_text,
-                    "duration_hint_s": float(total_hint),
-                    "current_beats_time_s": float(total_beats_time),
-                    "coverage_ratio": float(ratio),
-                    "audit_summary": audit,
-                    "story": story,
-                },
-                ensure_ascii=False,
-            )
+            story_summary = _story_extract_summary(story)
+            # Minimal system message - committee overrides it
+            sys_msg = "You are the Story Engine continuation pass."
+            # ALL CRITICAL INSTRUCTIONS IN USER MESSAGE (committee overrides system)
+            user_msg_content = f"""### [CRITICAL INSTRUCTIONS - READ CAREFULLY]
+
+You MUST EXTEND the existing story graph to meet the requested duration and depth.
+
+CRITICAL: Return ONLY the new content/extensions, not the full story.
+- Add NEW acts/scenes/beats to reach the duration. Deeper arcs for long films.
+- Maintain strict continuity: state_change events must be reflected later.
+- Maintain stable ids: never change existing ids; new ids must be unique and stable.
+- Only include NEW acts/scenes/beats with new unique IDs.
+- Do NOT include existing acts/scenes/beats.
+
+CRITICAL: Use ONLY ASCII characters. NO emojis, NO special Unicode symbols, NO non-ASCII characters.
+
+### [OUTPUT FORMAT]
+Output MUST be a single JSON object (no markdown, no prose). The JSON should contain only new/extended content, structured the same way as the story schema but with only new items.
+
+### [DATA]
+{json.dumps({
+    "user_prompt": prompt_text,
+    "duration_hint_s": float(total_hint),
+    "current_beats_time_s": float(total_beats_time),
+    "coverage_ratio": float(ratio),
+    "audit_summary": audit,
+    "story_summary": story_summary,
+}, ensure_ascii=False)}
+
+### [YOUR TASK]
+Extend the story to meet the duration requirements. Return ONLY the JSON delta with new content. No other text."""
+            user_msg = user_msg_content
+            # Keep trace_id constant - don't mutate it
             env2 = await committee_ai_text(
                 messages=[{"role": "system", "content": sys_msg}, {"role": "user", "content": user_msg}],
-                trace_id=(trace_id or f"film2.story_extend.{pass_index}"),
+                trace_id=trace_id,
                 rounds=STORY_COMMITTEE_ROUNDS,
                 temperature=STORY_TEMPERATURE,
             )
@@ -478,15 +1029,23 @@ async def draft_story_graph(user_prompt: str, duration_hint_s: Optional[float], 
                 raw2 = str(rb2.get("text") or "")
             else:
                 raw2 = str(env2.get("text") or "")
-            extended = await _jsonify_then_parse(
+            # Use flexible schema for delta (all fields optional)
+            delta_schema = {k: type(v) if isinstance(v, type) else type(v) if v is not None else Any for k, v in _story_schema().items()}
+            extended_delta = await _jsonify_then_parse(
                 raw_text=raw2,
-                expected_schema=_story_schema(),
-                trace_id=(trace_id or f"film2.story_extend.jsonify.{pass_index}"),
+                expected_schema=delta_schema,
+                trace_id=trace_id,
                 rounds=STORY_COMMITTEE_ROUNDS,
                 temperature=STORY_TEMPERATURE,
             )
-            if isinstance(extended, dict) and extended:
-                story = extended
+            if isinstance(extended_delta, dict) and extended_delta:
+                # Use LLM to intelligently merge extension delta into base story
+                story = await _story_merge_delta_with_llm(
+                    base_story=story,
+                    delta=extended_delta,
+                    user_prompt=prompt_text,
+                    trace_id=trace_id,
+                )
                 story.setdefault("prompt", prompt_text)
                 story.setdefault("duration_hint_s", float(duration))
                 trace_event(
@@ -518,6 +1077,17 @@ async def draft_story_graph(user_prompt: str, duration_hint_s: Optional[float], 
                     )
                     stop_requested = True
                     stop_reason = "stalled"
+                else:
+                    # CRITICAL: Audit immediately after extend to check if done, don't wait for next loop iteration
+                    # Keep trace_id constant - don't mutate it
+                    post_extend_audit = await _committee_audit_story(story, prompt_text, trace_id=trace_id)
+                    post_done = bool(post_extend_audit.get("done")) if isinstance(post_extend_audit, dict) else False
+                    post_next_action = post_extend_audit.get("next_action") if isinstance(post_extend_audit, dict) else None
+                    post_next_action_s = str(post_next_action) if isinstance(post_next_action, str) else ""
+                    if post_done and post_next_action_s == "accept":
+                        stop_requested = True
+                        stop_reason = "accept"
+                        audit = post_extend_audit  # Use the post-extend audit as the final audit
             else:
                 stop_requested = True
                 stop_reason = "extend_failed"
@@ -632,7 +1202,8 @@ async def check_story_consistency(story: Dict[str, Any], user_prompt: str, trace
                         state_entry[key] = val
                     character_state[target] = state_entry
     # Committee audit (deep continuity + intent). Merge issues.
-    audit = await _committee_audit_story(story if isinstance(story, dict) else {}, _norm_prompt(user_prompt), trace_id=(trace_id or "story_check.audit"))
+    # NOTE: trace_id must be provided - no generation, no fallback, no failure
+    audit = await _committee_audit_story(story if isinstance(story, dict) else {}, _norm_prompt(user_prompt), trace_id=trace_id)
     ci = audit.get("issues") if isinstance(audit, dict) and isinstance(audit.get("issues"), list) else []
     for it in ci:
         if isinstance(it, dict):
@@ -836,7 +1407,8 @@ async def fix_story(story: Dict[str, Any], issues: List[Dict[str, Any]], user_pr
     # Committee revision using the issues we found (and the prompt if available)
     prompt_txt = _norm_prompt(user_prompt or adjusted.get("prompt") or "")
     audit = {"issues": issues, "summary": "deterministic_consistency_issues", "must_fix": True}
-    revised = await _committee_revise_story(adjusted, prompt_txt, audit, trace_id=(trace_id or "story_fix"))
+    # NOTE: trace_id must be provided - no generation, no fallback, no failure
+    revised = await _committee_revise_story(adjusted, prompt_txt, audit, trace_id=trace_id)
     if isinstance(revised, dict) and revised:
         return revised
     return adjusted

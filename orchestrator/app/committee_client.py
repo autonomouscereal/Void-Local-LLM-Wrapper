@@ -17,6 +17,7 @@ import logging
 import os
 import json
 import time
+import unicodedata
 
 import httpx  # type: ignore
 
@@ -58,11 +59,54 @@ COMMITTEE_PARTICIPANTS = [{"id": member_id, "base": cfg["base"], "model": cfg["m
 def _sanitize_mojibake_text(text: str) -> str:
     if not isinstance(text, str) or not text:
         return text
+    # Fix common mojibake issues
     replacements = (("Ã¢Â\x80Â\x99", "'"), ("Ã¢ÂÂ", "'"), ("â\x80\x99", "'"), ("â€™", "'"), ("â", "'"))
     out = text
     for bad, good in replacements:
         if bad in out:
             out = out.replace(bad, good)
+    # Convert emojis and non-ASCII to ASCII equivalents
+    try:
+        # Normalize unicode (NFD decomposes characters, then we can remove combining marks)
+        normalized = unicodedata.normalize("NFD", out)
+        # Remove combining diacritical marks and convert to ASCII
+        ascii_chars = []
+        for char in normalized:
+            # Skip combining marks (accents, etc.)
+            if unicodedata.category(char) == "Mn":
+                continue
+            # Keep ASCII printable characters
+            if ord(char) < 128 and char.isprintable():
+                ascii_chars.append(char)
+            elif char.isspace():
+                ascii_chars.append(" ")
+            # For non-ASCII: try to get ASCII equivalent or replace
+            else:
+                # Try to get ASCII name (e.g., "LATIN SMALL LETTER E WITH ACUTE" -> "e")
+                try:
+                    name = unicodedata.name(char, "")
+                    # Extract base character from name if possible
+                    if "LATIN" in name or "DIGIT" in name:
+                        # Try to find base character
+                        base_char = char
+                        for base in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789":
+                            if base.lower() in name.lower():
+                                base_char = base
+                                break
+                        ascii_chars.append(base_char if base_char != char else "")
+                    else:
+                        # For emojis and other symbols, replace with empty string
+                        ascii_chars.append("")
+                except Exception:
+                    # Fallback: replace with empty string
+                    ascii_chars.append("")
+        out = "".join(ascii_chars)
+    except Exception:
+        # Fallback: just encode/decode with errors='replace' (replaces with '?')
+        try:
+            out = out.encode("ascii", "replace").decode("ascii")
+        except Exception:
+            pass
     return out
 
 
@@ -148,8 +192,10 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str):
     async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
         t_http = time.monotonic()
         resp = await client.post(url=f"{base_url.rstrip('/')}/api/chat", json=dict(payload))
-        raw_text = resp.text or ""
         status_code = int(resp.status_code)
+        raw_content = resp.content or b""
+        encoding = resp.encoding or "utf-8"
+        raw_text = raw_content.decode(encoding, errors="replace") if raw_content else ""
         log.info(
             "[committee] ollama.http.response trace_id=%s base=%s model=%r status=%d http_dur_ms=%d content_type=%r raw=%s",
             trace_id,
@@ -336,6 +382,7 @@ def _build_revision_system_message(member_id: str, round_num: int, original_sys_
     
     sys_msg_parts.append("Revise your answer using the critiques. Output ONLY your full final answer.")
     sys_msg_parts.append("All content must be written in English only. Do NOT respond in any other language.")
+    sys_msg_parts.append("CRITICAL: Use ONLY ASCII characters. NO emojis, NO special Unicode symbols, NO non-ASCII characters. Replace any non-ASCII with ASCII equivalents.")
     
     return "\n".join(sys_msg_parts)
 
@@ -356,7 +403,7 @@ async def _committee_draft_phase(
     member_results: Dict[str, Dict[str, Any]] = {}
     for mid in member_ids:
         log.info(f"[committee] member_draft.start trace_id={trace_id} round={round_num} member={mid}")
-        sys_txt = f"You are committee member {mid}. Provide your best answer to the user.\nAll content must be written in English only. Do NOT respond in any other language."
+        sys_txt = f"You are committee member {mid}. Provide your best answer to the user.\nAll content must be written in English only. Do NOT respond in any other language.\nCRITICAL: Use ONLY ASCII characters. NO emojis, NO special Unicode symbols, NO non-ASCII characters. Replace any non-ASCII with ASCII equivalents."
         user_msgs = _extract_user_messages(messages)
         member_msgs = [{"role": "system", "content": sys_txt}] + user_msgs
         emit_trace(state_dir=STATE_DIR, trace_id=trace_id, kind="committee.member_draft", payload={"trace_id": trace_id, "round": round_num, "member": mid})
@@ -397,7 +444,8 @@ async def _committee_critique_phase(
             f"Critique the other answers. Identify concrete mistakes, missing considerations, and specific improvements.\n"
             f"Return a concise bullet list.\n"
             + ("\n\n".join(other_blocks) if other_blocks else "")
-            + "\nAll content must be written in English only. Do NOT respond in any other language."
+            + "\nAll content must be written in English only. Do NOT respond in any other language.\n"
+            + "CRITICAL: Use ONLY ASCII characters. NO emojis, NO special Unicode symbols, NO non-ASCII characters. Replace any non-ASCII with ASCII equivalents."
         )
         user_msgs = _extract_user_messages(messages)
         member_msgs = [{"role": "system", "content": critique_txt}] + user_msgs
@@ -470,8 +518,10 @@ async def _committee_revision_phase(
         res = await committee_member_text(member_id=mid, messages=member_msgs, trace_id=trace_id, temperature=temperature)
         member_results[mid] = res if isinstance(res, dict) else {}
         txt = str(res.get("response") or "").strip() if isinstance(res, dict) and res.get("ok") is not False else ""
-        answers[mid] = txt
-        log.info(f"[committee] member_revision.finish trace_id={trace_id} round={round_num} member={mid} ok={bool(isinstance(res, dict) and res.get('ok', True))} answer_chars={len(txt)} has_error={bool(isinstance(res, dict) and res.get('error'))}")
+        # Only update if we got a non-empty response; preserve previous answer if revision failed
+        if txt:
+            answers[mid] = txt
+        log.info(f"[committee] member_revision.finish trace_id={trace_id} round={round_num} member={mid} ok={bool(isinstance(res, dict) and res.get('ok', True))} answer_chars={len(txt)} has_error={bool(isinstance(res, dict) and res.get('error'))} preserved_previous={bool(not txt and answers.get(mid))}")
     
     return answers, member_results
 
@@ -491,6 +541,7 @@ async def _committee_synthesis_phase(
     synth_parts: List[str] = []
     synth_parts.append("You are the committee synthesizer. Produce one final answer.")
     synth_parts.append("Rules: resolve conflicts by correctness; do not mention the committee or multiple models; output English only.")
+    synth_parts.append("CRITICAL: Use ONLY ASCII characters. NO emojis, NO special Unicode symbols, NO non-ASCII characters. Replace any non-ASCII with ASCII equivalents.")
     synth_parts.append("### Candidate Answers")
     for mid in member_ids:
         ans = answers.get(mid) or ""
@@ -724,6 +775,7 @@ async def committee_jsonify(raw_text: str, expected_schema: Any, *, trace_id: st
     sys_msg = (
         "You are JSONFixer. You receive messy AI output and MUST respond with exactly ONE JSON object.\n"
         "Respond ONLY in English. NO other languages are allowed.\n"
+        "CRITICAL: Use ONLY ASCII characters. NO emojis, NO special Unicode symbols, NO non-ASCII characters. Replace any non-ASCII with ASCII equivalents.\n"
         "NO markdown, NO code fences, NO prose, NO comments.\n\n"
         "The JSON MUST match this exact structure (keys and nesting):\n\n"
         f"{schema_desc}\n\n"
