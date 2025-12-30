@@ -560,8 +560,30 @@ async def committee_jsonify(raw_text: str, expected_schema: Any, *, trace_id: st
         rich: List[tuple[int, int, int]] = []
         for idx, cand in enumerate(parsed_candidates):
             song_obj = cand.get("song")
-            if (not isinstance(song_obj, dict)) or _is_empty_song_candidate(obj=song_obj):
+            if not isinstance(song_obj, dict):
+                log.debug(f"[committee.jsonify] candidate {idx} missing song object trace_id={trace_id}")
                 continue
+            if _is_empty_song_candidate(obj=song_obj):
+                log.debug(f"[committee.jsonify] candidate {idx} is empty song trace_id={trace_id}")
+                continue
+            # Ensure all required fields exist with proper defaults
+            if "global" not in song_obj or not isinstance(song_obj.get("global"), dict):
+                song_obj["global"] = {}
+            if "sections" not in song_obj or not isinstance(song_obj.get("sections"), list):
+                song_obj["sections"] = []
+            if "lyrics" not in song_obj or not isinstance(song_obj.get("lyrics"), dict):
+                song_obj["lyrics"] = {"sections": []}
+            if "voices" not in song_obj or not isinstance(song_obj.get("voices"), list):
+                song_obj["voices"] = []
+            if "instruments" not in song_obj or not isinstance(song_obj.get("instruments"), list):
+                song_obj["instruments"] = []
+            if "motifs" not in song_obj or not isinstance(song_obj.get("motifs"), list):
+                song_obj["motifs"] = []
+            # Ensure lyrics.sections exists
+            lyrics_obj = song_obj.get("lyrics") if isinstance(song_obj.get("lyrics"), dict) else {}
+            if "sections" not in lyrics_obj or not isinstance(lyrics_obj.get("sections"), list):
+                lyrics_obj["sections"] = []
+                song_obj["lyrics"] = lyrics_obj
             sections = song_obj.get("sections") if isinstance(song_obj.get("sections"), list) else []
             voices = song_obj.get("voices") if isinstance(song_obj.get("voices"), list) else []
             instruments = song_obj.get("instruments") if isinstance(song_obj.get("instruments"), list) else []

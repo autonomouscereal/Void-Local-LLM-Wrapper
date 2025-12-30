@@ -192,8 +192,11 @@ async def plan_song_graph(
         + f"Preferred bpm (0 = auto): {bpm_val}\n"
         + f"Preferred key (empty = auto): {key_txt}\n"
         + (("\nReference music profile (blend these characteristics):\n" + profile_txt + "\n") if profile_txt else "")
+        + "CRITICAL: You MUST include ALL required fields: global, sections, lyrics, voices, instruments, and motifs.\n"
+        + "The JSON MUST be complete and valid. Do NOT truncate or omit any fields.\n"
         + "Fill in global, sections, lyrics, voices, instruments, and motifs. "
         + "Use section_ids and motif_ids that are stable and reusable.\n"
+        + "If a field should be empty, use an empty array [] or empty object {} as appropriate, but DO include the field.\n"
     )
 
     log.info(
@@ -241,8 +244,25 @@ async def plan_song_graph(
             # Normalize textual fields (lyrics, section names, motif descriptions, etc.)
             # to clean up common UTF-8 mojibake before downstream tools consume them.
             song_obj = _normalize_text_fields(obj=song_obj)
-            sections = song_obj.get("sections") if isinstance(song_obj.get("sections"), list) else []
+            # Ensure all required fields exist with proper defaults
+            if "global" not in song_obj or not isinstance(song_obj.get("global"), dict):
+                song_obj["global"] = {}
+            if "sections" not in song_obj or not isinstance(song_obj.get("sections"), list):
+                song_obj["sections"] = []
+            if "lyrics" not in song_obj or not isinstance(song_obj.get("lyrics"), dict):
+                song_obj["lyrics"] = {"sections": []}
+            if "voices" not in song_obj or not isinstance(song_obj.get("voices"), list):
+                song_obj["voices"] = []
+            if "instruments" not in song_obj or not isinstance(song_obj.get("instruments"), list):
+                song_obj["instruments"] = []
+            if "motifs" not in song_obj or not isinstance(song_obj.get("motifs"), list):
+                song_obj["motifs"] = []
+            # Ensure lyrics.sections exists
             lyrics_obj = song_obj.get("lyrics") if isinstance(song_obj.get("lyrics"), dict) else {}
+            if "sections" not in lyrics_obj or not isinstance(lyrics_obj.get("sections"), list):
+                lyrics_obj["sections"] = []
+                song_obj["lyrics"] = lyrics_obj
+            sections = song_obj.get("sections") if isinstance(song_obj.get("sections"), list) else []
             lyrics_sections = lyrics_obj.get("sections") if isinstance(lyrics_obj.get("sections"), list) else []
             motifs = song_obj.get("motifs") if isinstance(song_obj.get("motifs"), list) else []
             voices = song_obj.get("voices") if isinstance(song_obj.get("voices"), list) else []
@@ -263,10 +283,20 @@ async def plan_song_graph(
             song = song_obj
         else:
             log.warning(
-                "plan_song_graph parsed missing song trace_id=%s parsed_keys=%s",
+                "plan_song_graph parsed missing song trace_id=%s parsed_keys=%s parser_errors=%s",
                 trace_id,
                 sorted(list(parsed.keys())) if isinstance(parsed, dict) else type(parsed).__name__,
+                parser.errors[-5:] if parser.errors else [],
             )
+            # Return a minimal valid song structure instead of empty dict
+            song = {
+                "global": {"bpm": bpm_val if bpm_val > 0 else 120, "time_signature": "4/4", "approx_length_s": approx_len, "key": key_txt if key_txt else "C Major", "style_tags": [], "energy_curve": [], "emotion_curve": []},
+                "sections": [],
+                "lyrics": {"sections": []},
+                "voices": [],
+                "instruments": [],
+                "motifs": [],
+            }
     log.info("plan_song_graph.done trace_id=%s ok=%s dur_ms=%d keys=%s", trace_id, bool(song), int((time.perf_counter() - t0) * 1000), sorted(list(song.keys())) if isinstance(song, dict) else type(song).__name__)
     return song
 

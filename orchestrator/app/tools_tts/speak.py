@@ -256,6 +256,7 @@ async def run_tts_speak(
     voice_lock_id_resolved: str | None = None
     locks_meta: Dict[str, Any] = {}
     ainfo_pre: Any = None
+    artifact_id_generated: str = ""  # Initialize early to avoid UnboundLocalError
     # If no explicit refs were provided, try to infer reference samples for the
     # requested voice_id from recent context so that music/film pipelines and
     # prior TTS runs automatically feed into voice matching/training.
@@ -910,6 +911,15 @@ async def run_tts_speak(
     except Exception:
         rel = None
         view_url = None
+    # Ensure artifact_id_generated is set even if there was an early error
+    if not artifact_id_generated:
+        artifact_id_generated = generate_artifact_id(
+            trace_id=trace_id,
+            tool_name="tts.speak",
+            conversation_id=conversation_id,
+            suffix_data=len(wav_bytes) if wav_bytes else 0,
+            existing_id=artifact_id,
+        )
     env = {
         "meta": {
             "model": model,
