@@ -2926,7 +2926,8 @@ async def propose_search_queries(messages: List[Dict[str, Any]]) -> List[str]:
         "Given the conversation, propose up to 3 concise web search queries that would most improve the answer. "
         "Return each query on its own line with no extra text."
     )
-    prompt_messages = messages + [{"role": "user", "content": guidance}]
+    # Use full conversation for search suggestions - needs context to understand what queries would help
+    prompt_messages = list(messages or []) + [{"role": "user", "content": guidance}]
     try:
         env = await committee_ai_text(messages=prompt_messages, trace_id="search_suggest", temperature=DEFAULT_TEMPERATURE)
     except Exception as ex:
@@ -11015,19 +11016,26 @@ async def chat_completions(request: Request):
         # Make full tool results (including internal error stacks) available to the
         # final COMPOSE pass so the committee can explain failures and partial
         # successes directly to the user instead of using a prebuilt summary.
+        # Only pass the user's original request, not the entire message history
+        user_request_content = ""
+        for m in reversed(messages or []):
+            if isinstance(m, dict) and m.get("role") == "user" and isinstance(m.get("content"), str):
+                user_request_content = m.get("content", "").strip()
+                if user_request_content:
+                    break
+        
+        compose_messages = []
         if tool_results:
-            messages = [{"role": "system", "content": "Tool results:\n" + json.dumps(tool_results, indent=2)}] + messages
-
-        # No context orchestration: pass messages directly to committee.
-        exec_messages = list(messages or [])
-        exec_messages_current = exec_messages
+            compose_messages.append({"role": "system", "content": "Tool results:\n" + json.dumps(tool_results, indent=2)})
+        if user_request_content:
+            compose_messages.append({"role": "user", "content": user_request_content})
 
         # Idempotency fast-path disabled to prevent early returns; defer any cached reuse to finalization if desired
 
         # Use the central committee path to derive a single merged LLM view over exec_messages.
         try:
             llm_env = await committee_ai_text(
-                messages=exec_messages,
+                messages=compose_messages,
                 trace_id=trace_id,
                 temperature=exec_temperature,
             )

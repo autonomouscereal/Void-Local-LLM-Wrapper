@@ -43,15 +43,81 @@ async def get_pg_pool() -> Optional[asyncpg.pool.Pool]:
         # Orchestrator-owned conversation registry:
         # - External callers may *suggest* a conversation_id, but only the orchestrator may mint and authorize it.
         # - We keep a lightweight table so we can reject/overwrite unknown conversation_id values deterministically.
-        await conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS orc_conversation (
-              conversation_id TEXT PRIMARY KEY,
-              created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-              updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-            );
-            """
-        )
+        # Migration: ensure conversation_id column exists (for tables created with old schema)
+        # First, check if table exists and what columns it has
+        table_exists = await conn.fetchval("""
+            SELECT 1 FROM information_schema.tables 
+            WHERE table_schema = 'public' AND table_name = 'orc_conversation'
+        """)
+        
+        if table_exists:
+            # Table exists - check if conversation_id column exists
+            col_check = await conn.fetchval("""
+                SELECT 1 FROM information_schema.columns 
+                WHERE table_schema = 'public' AND table_name = 'orc_conversation' AND column_name = 'conversation_id'
+            """)
+            if not col_check:
+                # Table exists but conversation_id column doesn't - need to migrate
+                try:
+                    row_count = await conn.fetchval("SELECT COUNT(*) FROM orc_conversation")
+                    if row_count and row_count > 0:
+                        # Table has existing rows - drop and recreate (safe for lightweight registry)
+                        log.warning(f"db.pool: orc_conversation table has {row_count} rows but missing conversation_id column. Dropping and recreating.")
+                        await conn.execute("DROP TABLE IF EXISTS orc_conversation CASCADE")
+                        await conn.execute(
+                            """
+                            CREATE TABLE orc_conversation (
+                              conversation_id TEXT PRIMARY KEY,
+                              created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                              updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                            );
+                            """
+                        )
+                    else:
+                        # Table is empty - safe to modify
+                        log.warning("db.pool: orc_conversation table exists but no conversation_id column and is empty. Adding column.")
+                        # Check for existing primary key constraint
+                        pk_constraint = await conn.fetchval("""
+                            SELECT constraint_name FROM information_schema.table_constraints 
+                            WHERE table_schema = 'public' AND table_name = 'orc_conversation' AND constraint_type = 'PRIMARY KEY'
+                        """)
+                        if pk_constraint:
+                            await conn.execute(f"ALTER TABLE orc_conversation DROP CONSTRAINT IF EXISTS {pk_constraint}")
+                        # Add the conversation_id column
+                        await conn.execute("ALTER TABLE orc_conversation ADD COLUMN conversation_id TEXT")
+                        # Make it the primary key
+                        await conn.execute("ALTER TABLE orc_conversation ADD PRIMARY KEY (conversation_id)")
+                        # Ensure created_at and updated_at exist
+                        await conn.execute("ALTER TABLE orc_conversation ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now()")
+                        await conn.execute("ALTER TABLE orc_conversation ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now()")
+                except Exception as ex:
+                    log.warning(f"db.pool: failed to migrate orc_conversation table: {ex}", exc_info=True)
+                    # If migration fails, drop and recreate as fallback
+                    try:
+                        log.warning("db.pool: attempting to drop and recreate orc_conversation table as fallback")
+                        await conn.execute("DROP TABLE IF EXISTS orc_conversation CASCADE")
+                        await conn.execute(
+                            """
+                            CREATE TABLE orc_conversation (
+                              conversation_id TEXT PRIMARY KEY,
+                              created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                              updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                            );
+                            """
+                        )
+                    except Exception as ex2:
+                        log.error(f"db.pool: failed to recreate orc_conversation table: {ex2}", exc_info=True)
+        else:
+            # Table doesn't exist - create it
+            await conn.execute(
+                """
+                CREATE TABLE orc_conversation (
+                  conversation_id TEXT PRIMARY KEY,
+                  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                );
+                """
+            )
         await conn.execute("CREATE INDEX IF NOT EXISTS orc_conversation_updated_idx ON orc_conversation(updated_at DESC);")
         await conn.execute(
             """

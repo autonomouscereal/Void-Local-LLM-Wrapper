@@ -316,7 +316,9 @@ async def committee_ai_text(messages: List[Dict[str, Any]], *, trace_id: str, ro
         for mid in member_ids:
             log.info(f"[committee] member_draft.start trace_id={trace_id} round={int(r + 1)} member={mid}")
             sys_txt = f"You are committee member {mid}. Provide your best answer to the user.\nAll content must be written in English only. Do NOT respond in any other language."
-            member_msgs = list(messages or []) + [{"role": "system", "content": sys_txt}]
+            # Replace system messages with draft system message, keep user messages
+            user_msgs = [m for m in (messages or []) if isinstance(m, dict) and m.get("role") == "user"]
+            member_msgs = [{"role": "system", "content": sys_txt}] + user_msgs
             emit_trace(state_dir=STATE_DIR, trace_id=trace_id, kind="committee.member_draft", payload={"trace_id": trace_id, "round": int(r + 1), "member": mid})
             res = await committee_member_text(member_id=mid, messages=member_msgs, trace_id=trace_id, temperature=temp_run)
             member_results[mid] = res if isinstance(res, dict) else {}
@@ -336,7 +338,9 @@ async def committee_ai_text(messages: List[Dict[str, Any]], *, trace_id: str, ro
                 if isinstance(otext, str) and otext.strip():
                     other_blocks.append(f"Answer from {oid}:\n{otext.strip()}")
             critique_txt = f"You are committee member {mid}. This is cross-critique for debate round {r + 1}.\nCritique the other answers. Identify concrete mistakes, missing considerations, and specific improvements.\nReturn a concise bullet list.\n" + ("\n\n".join(other_blocks) if other_blocks else "") + "\nAll content must be written in English only. Do NOT respond in any other language."
-            member_msgs = list(messages or []) + [{"role": "system", "content": critique_txt}]
+            # Replace system messages with critique system message, keep user messages
+            user_msgs = [m for m in (messages or []) if isinstance(m, dict) and m.get("role") == "user"]
+            member_msgs = [{"role": "system", "content": critique_txt}] + user_msgs
             emit_trace(state_dir=STATE_DIR, trace_id=trace_id, kind="committee.member_critique", payload={"trace_id": trace_id, "round": int(r + 1), "member": mid})
             res = await committee_member_text(member_id=mid, messages=member_msgs, trace_id=trace_id, temperature=temp_run)
             critique_results[mid] = res if isinstance(res, dict) else {}
@@ -368,7 +372,9 @@ async def committee_ai_text(messages: List[Dict[str, Any]], *, trace_id: str, ro
             if isinstance(prior, str) and prior.strip():
                 ctx_lines.append(f"Your current answer is:\n{prior.strip()}")
             ctx_lines.append("All content must be written in English only. Do NOT respond in any other language.")
-            member_msgs = list(messages or []) + [{"role": "system", "content": "\n\n".join(ctx_lines)}]
+            # Replace system messages with revision system message, keep user messages
+            user_msgs = [m for m in (messages or []) if isinstance(m, dict) and m.get("role") == "user"]
+            member_msgs = [{"role": "system", "content": "\n\n".join(ctx_lines)}] + user_msgs
             emit_trace(state_dir=STATE_DIR, trace_id=trace_id, kind="committee.member_revision", payload={"trace_id": trace_id, "round": int(r + 1), "member": mid})
             res = await committee_member_text(member_id=mid, messages=member_msgs, trace_id=trace_id, temperature=temp_run)
             member_results[mid] = res if isinstance(res, dict) else {}
