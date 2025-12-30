@@ -231,7 +231,9 @@ def _build_music_eval_summary(all_axes: Dict[str, Any], film_context: Optional[D
     return json.dumps(payload, ensure_ascii=False)
 
 
-async def _call_music_eval_committee(summary: str):
+async def _call_music_eval_committee(summary: str, trace_id: str = ""):
+    # Use provided trace_id or fallback to "music_eval" for backwards compatibility
+    effective_trace_id = trace_id if trace_id and trace_id.strip() else "music_eval"
     messages = [
         {
             "role": "system",
@@ -254,7 +256,7 @@ async def _call_music_eval_committee(summary: str):
         {"role": "user", "content": summary},
     ]
     schema = {"overall_quality_score": float, "fit_score": float, "originality_score": float, "cohesion_score": float, "issues": [str]}
-    env = await committee_ai_text(messages=messages, trace_id="music_eval")
+    env = await committee_ai_text(messages=messages, trace_id=effective_trace_id)
     result_payload: Dict[str, Any] = {
         "overall_quality_score": 0.0,
         "fit_score": 0.0,
@@ -265,7 +267,7 @@ async def _call_music_eval_committee(summary: str):
     if isinstance(env, dict) and env.get("ok"):
         res = env.get("result") or {}
         txt = res.get("text") or ""
-        parsed = await committee_jsonify(raw_text=txt or "{}", expected_schema=schema, trace_id="music_eval", temperature=0.0)
+        parsed = await committee_jsonify(raw_text=txt or "{}", expected_schema=schema, trace_id=effective_trace_id, temperature=0.0)
         parser = JSONParser()
         coerced = parser.parse(parsed if parsed is not None else "{}", schema)
         if isinstance(coerced, dict):
@@ -273,9 +275,9 @@ async def _call_music_eval_committee(summary: str):
     return result_payload
 
 
-async def eval_aesthetic(all_axes: Dict[str, Any], film_context: Optional[Dict[str, Any]]):
+async def eval_aesthetic(all_axes: Dict[str, Any], film_context: Optional[Dict[str, Any]], trace_id: str = ""):
     summary = _build_music_eval_summary(all_axes, film_context)
-    return await _call_music_eval_committee(summary)
+    return await _call_music_eval_committee(summary, trace_id=trace_id)
 
 
 def _axes_are_effectively_empty(all_axes: Dict[str, Any]):
@@ -322,7 +324,8 @@ async def compute_music_eval(track_path: str, song_graph: Dict[str, Any], style_
             }
             trace_event("music.eval.skipped", {"trace_id": trace_id, "conversation_id": conversation_id, "track_path": track_path, "reason": "no_usable_features"})
         else:
-            aesthetic = await eval_aesthetic(all_axes, film_context)
+            effective_trace_id = str(trace_id or "").strip()
+            aesthetic = await eval_aesthetic(all_axes, film_context, trace_id=effective_trace_id)
         overall_quality = float(aesthetic.get("overall_quality_score") or 0.0)
         fit_score = float(aesthetic.get("fit_score") or 0.0)
         overall = {"overall_quality_score": overall_quality, "fit_score": fit_score}

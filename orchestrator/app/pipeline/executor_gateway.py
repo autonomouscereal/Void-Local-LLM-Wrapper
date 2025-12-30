@@ -45,10 +45,12 @@ async def execute(
         else:
             args = {"_raw": raw_args}
         # Always propagate trace_id and conversation_id into args
-        if trace_id and isinstance(args, dict) and not args.get("trace_id"):
-            args["trace_id"] = trace_id
-        if conversation_id and isinstance(args, dict) and not args.get("conversation_id"):
-            args["conversation_id"] = conversation_id
+        # Ensure trace_id is always set (even if empty, it will be handled by execute_tool_call)
+        if isinstance(args, dict):
+            if not args.get("trace_id") and trace_id:
+                args["trace_id"] = trace_id
+            if not args.get("conversation_id") and conversation_id:
+                args["conversation_id"] = conversation_id
         step_payload: Dict[str, Any] = {"tool": tool_name, "args": args}
         # Preserve planner-provided step_id so executor-produced keys match the plan.
         if isinstance(step_id, str) and step_id:

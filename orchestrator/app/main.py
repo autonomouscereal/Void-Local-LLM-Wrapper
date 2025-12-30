@@ -234,7 +234,7 @@ from .ablation.export import write_facts_jsonl as ablate_write_facts
 from .code_loop.super_loop import run_super_loop
 from .state.checkpoints import append_event as _append_event
 # manifest helpers imported below as _art_manifest_add/_art_manifest_write
-from .state.ids import step_id as _step_id
+from .state.ids import step_id as _step_id, trace_id as _generate_trace_id
 from .research.orchestrator import run_research
 from .jobs.state import get_job as _get_orcjob, request_cancel as _orcjob_cancel
 from void_envelopes import bump_envelope as _env_bump, assert_envelope as _env_assert
@@ -621,12 +621,21 @@ def _inject_execution_context(tool_calls: List[Dict[str, Any]], trace_id: str, e
             continue
         args_tc = tc.get("arguments")
         if isinstance(args_tc, dict):
-            if trace_id and not args_tc.get("trace_id"):
+            # ALWAYS inject trace_id (trace_id is always generated in chat_completions, never empty)
+            if trace_id:
                 args_tc["trace_id"] = trace_id
             args_tc.setdefault("_effective_mode", effective_mode)
             # Enforce orchestrator-owned conversation_id end-to-end: never allow planner/client to force it.
             if isinstance(conversation_id, str) and conversation_id.strip():
                 args_tc["conversation_id"] = conversation_id.strip()
+        elif args_tc is None:
+            # Create arguments dict if missing
+            tc["arguments"] = {}
+            if trace_id:
+                tc["arguments"]["trace_id"] = trace_id
+            tc["arguments"]["_effective_mode"] = effective_mode
+            if isinstance(conversation_id, str) and conversation_id.strip():
+                tc["arguments"]["conversation_id"] = conversation_id.strip()
 
 
 async def _resolve_or_create_conversation_id(requested_conversation_id: str | None) -> str:
@@ -2631,21 +2640,24 @@ def _iso(val: Any) -> Optional[str]:
 
 async def _send_trace_stream_async(payload: Dict[str, Any]) -> None:
     t0 = time.time()
+    trace_id = str((payload or {}).get("trace_id") or "")
     try:
         # In-process teacher tap (removed external `services/teacher` HTTP service).
         res = await _teacher_tap_trace(payload or {})
         dt_ms = int((time.time() - t0) * 1000.0)
         _log(
             "teacher.tap",
-            trace_id=str((payload or {}).get("trace_id") or (res or {}).get("trace_id") or ""),
+            trace_id=str(trace_id or (res or {}).get("trace_id") or ""),
             ms=dt_ms,
             ok=bool((res or {}).get("ok")),
             label=(res or {}).get("label"),
         )
     except Exception as ex:
+        # Teacher tap failures should not ruin the whole run - log and continue
         dt_ms = int((time.time() - t0) * 1000.0)
-        _log("teacher.tap.exception", trace_id=str((payload or {}).get("trace_id") or ""), ms=dt_ms, error=str(ex))
-        logging.warning(f"teacher.tap failed: {ex}", exc_info=True)
+        _log("teacher.tap.exception", trace_id=str(trace_id), ms=dt_ms, error=str(ex))
+        logging.warning(f"teacher.tap failed (non-fatal): {ex}", exc_info=True)
+        # Do not raise - allow the run to continue
 
 
 async def _orcjob_stream_gen(job_id: str, interval_ms: Optional[int] = None):
@@ -2994,7 +3006,8 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
                 if isinstance(trace_id_val, str) and trace_id_val:
                     trace_id = trace_id_val
             if not trace_id:
-                trace_id = "tt_unknown"
+                log.error(f"execute_tool_call: missing trace_id - trace_id must be passed from chat_completions. tool_name={tool_name!r} conversation_id={conversation_id!r}")
+                trace_id = ""  # Do not generate - trace_id must come from chat_completions
     if not conversation_id:
         conv_id_val = tool_call.get("conversation_id")
         if isinstance(conv_id_val, str) and conv_id_val:
@@ -6469,10 +6482,17 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
         a = args if isinstance(args, dict) else {}
         quality_profile = (a.get("quality_profile") or "standard")
 
+        # Propagate trace_id from function parameter first, then fall back to args
+        # This ensures trace_id is always available even when called directly (not through executor)
+        trace_id_from_args = str(a.get("trace_id") or "").strip()
+        effective_trace_id = trace_id if trace_id else trace_id_from_args
+        if effective_trace_id and isinstance(a, dict) and not a.get("trace_id"):
+            a["trace_id"] = effective_trace_id
+        trace_id = effective_trace_id
+
         # Derive a stable character identity for music locks when possible.
         character_id = str(a.get("character_id") or "").strip()
         if not character_id:
-            trace_id = a.get("trace_id")
             if isinstance(trace_id, str) and trace_id.strip():
                 character_id = f"char_{trace_id.strip()}"
         if character_id and "character_id" not in a:
@@ -6526,9 +6546,6 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
             prof = _refs_music_profile({"ref_ids": ref_ids})
             if isinstance(prof, dict) and prof.get("ok") and isinstance(prof.get("profile"), dict):
                 music_profile = prof.get("profile")
-
-        # Propagate the tool-level trace_id into Song Graph planning and tracing.
-        trace_id = str(a.get("trace_id") or "").strip()
 
         if needs_song_graph:
             song_graph = await plan_song_graph(
@@ -6657,7 +6674,7 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
                     logging.warning(f"music_rag.insert_failed: {ex}", exc_info=True)
 
         # Trace: standalone music.infinite.windowed finish
-        trace_id = str(a.get("trace_id") or "").strip()
+        # Use the trace_id we already extracted earlier (don't re-extract from args)
         if trace_id:
             meta_env2 = env.get("meta") if isinstance(env, dict) else {}
             trace_event("music.infinite.windowed.finish", {
@@ -10014,9 +10031,17 @@ async def chat_completions2(request: Request):
     body: Dict[str, Any] = dict(parsed_obj) if isinstance(parsed_obj, dict) else {}
     log.info(f"chat_completions:body={body}")
     log.info(f"request={request}")
-    # trace_id must be passed from upstream - no fallback generation
-    log.error("committee_ai_text called without trace_id - upstream caller must pass trace_id")
-    env = await committee_ai_text(messages=(body.get("messages")), trace_id="")
+    # Extract trace_id from request headers or body if available
+    trace_id = ""
+    if isinstance(body, dict):
+        trace_id = str(body.get("trace_id") or "").strip()
+    if not trace_id:
+        # Try to get from headers
+        trace_id = str(request.headers.get("X-Trace-Id") or "").strip()
+    if not trace_id:
+        log.error("committee_ai_text called without trace_id - upstream caller must pass trace_id")
+        trace_id = "missing_trace_id"
+    env = await committee_ai_text(messages=(body.get("messages")), trace_id=trace_id)
     log.debug(f"chat_completions:env={env}")
     body_text = json.dumps(env, ensure_ascii=False)
     body_bytes = body_text.encode("utf-8")
@@ -10066,6 +10091,10 @@ async def chat_completions(request: Request):
     planner_env: Dict[str, Any] = {}
     # Executor routing knobs are used in multiple places; define once.
     executor_endpoint: str = EXECUTOR_BASE_URL or "http://127.0.0.1:8081"
+    # Ensure executor_endpoint is never empty - executor must always be called
+    if not executor_endpoint or not executor_endpoint.strip():
+        executor_endpoint = "http://127.0.0.1:8081"
+        logging.warning(f"executor_endpoint was empty, using default: {executor_endpoint}")
     
     # *****************************END INITIALIZE VARIABLES*****************************
 
@@ -10119,11 +10148,10 @@ async def chat_completions(request: Request):
 
         master_seed = _as_int(body0.get("seed"), 0)
 
-        # trace_id is REQUIRED - log warning if missing but continue processing
-        trace_id = str(body0.get("trace_id") or "").strip() if isinstance(body0.get("trace_id"), (str, int)) else ""
-        if not trace_id:
-            log.error("chat_completions: missing trace_id in request body - upstream caller must pass trace_id. Continuing with empty trace_id but this is an error.")
-            trace_id = ""  # Continue processing but log the error
+        # trace_id: ALWAYS generate in chat_completions (never comes from request)
+        # THIS IS THE ONLY PLACE trace_id SHOULD EVER BE GENERATED
+        trace_id = _generate_trace_id(seed=str(conversation_id))
+        log.info(f"chat_completions: generated trace_id={trace_id!r} conversation_id={conversation_id!r}")
 
         # messages (verbatim)
         messages: List[Dict[str, Any]] = []
@@ -10278,12 +10306,19 @@ async def chat_completions(request: Request):
                     else:
                         args_obj = {"_raw": raw_inner}
                     # Overlay any explicit keys alongside _raw (do not drop them).
+                    # CRITICAL: Preserve trace_id and conversation_id if they exist in raw_args
                     for k, v in raw_args.items():
                         if k == "_raw":
                             continue
                         args_obj[k] = v
+                    # Ensure trace_id is preserved (it will be injected later by _inject_execution_context, but preserve if already there)
+                    if trace_id and not args_obj.get("trace_id"):
+                        args_obj["trace_id"] = trace_id
                 else:
                     args_obj = dict(raw_args)
+                    # Ensure trace_id is preserved
+                    if trace_id and not args_obj.get("trace_id"):
+                        args_obj["trace_id"] = trace_id
             elif isinstance(raw_args, str):
                 try:
                     parsed = parser_tc.parse(raw_args or "", {})
@@ -10293,10 +10328,19 @@ async def chat_completions(request: Request):
                     )
                     parsed = {}
                 args_obj = dict(parsed) if isinstance(parsed, dict) else {"_raw": raw_args}
+                # Ensure trace_id is preserved (it will be injected later by _inject_execution_context, but preserve if already there)
+                if trace_id and not args_obj.get("trace_id"):
+                    args_obj["trace_id"] = trace_id
             elif raw_args is None:
                 args_obj = {}
+                # Ensure trace_id is injected even when args is None
+                if trace_id:
+                    args_obj["trace_id"] = trace_id
             else:
                 args_obj = {"_raw": raw_args}
+                # Ensure trace_id is preserved
+                if trace_id and not args_obj.get("trace_id"):
+                    args_obj["trace_id"] = trace_id
 
             if tool_name == "image.dispatch":
                 # Defaults-first, then overlay any provided values.
