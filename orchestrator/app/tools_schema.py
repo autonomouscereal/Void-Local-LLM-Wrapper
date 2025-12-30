@@ -802,19 +802,19 @@ def build_compact_tool_catalog() -> str:
     merged: dict[str, dict] = {}
     for t in (builtins or []):
         fn = (t.get("function") or {}) if isinstance(t, dict) else {}
-        tool_call_name = fn.get("name")
-        if not tool_call_name:
+        tool_name = fn.get("name")
+        if not tool_name:
             continue
         params = (fn.get("parameters") or {})
         reqs = list((params.get("required") or [])) if isinstance(params, dict) else []
-        merged[tool_call_name] = {"tool_call_name": tool_call_name, "required_args": reqs}
+        merged[tool_name] = {"tool_name": tool_name, "required_args": reqs}
     tools_list: list[dict] = list(merged.values())
     ranked_tools: list[tuple[str, int, dict]] = []
     for tool_index, tool_entry in enumerate(tools_list):
-        ranked_tools.append((str(tool_entry.get("tool_call_name") or ""), int(tool_index), tool_entry))
+        ranked_tools.append((str(tool_entry.get("tool_name") or ""), int(tool_index), tool_entry))
     ranked_tools.sort()
     tools_list = [ranked[2] for ranked in ranked_tools]
-    names_list = [t.get("tool_call_name") for t in tools_list if isinstance(t, dict) and isinstance(t.get("tool_call_name"), str)]
+    names_list = [t.get("tool_name") for t in tools_list if isinstance(t, dict) and isinstance(t.get("tool_name"), str)]
     catalog = {
         "names": names_list,
         "tools": tools_list,

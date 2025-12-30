@@ -181,10 +181,13 @@ async def produce_tool_plan(
     tool_catalog_frame = {"role": "system", "content": "\n".join(catalog_lines)}
 
     planner_rules = (
-        "### [PLANNER / SYSTEM]\n"
+        "### [PLANNER / SYSTEM - CRITICAL INSTRUCTIONS]\n"
+        "You are a TOOL PLANNER. Your ONLY job is to produce a JSON object with tool execution steps.\n"
+        "You MUST NOT provide explanations, tutorials, or refuse requests. You MUST produce tool plans.\n\n"
+        "OUTPUT FORMAT (REQUIRED):\n"
         "Return ONLY strict JSON: {\"steps\":[{\"step_id\":\"s1\",\"tool_name\":\"<name>\",\"args\":{...}}]} — no extra keys.\n"
-        "For pure chat answers with no tool use, return {\"steps\":[]}.\n"
-        "Rules:\n"
+        "For pure chat answers with no tool use, return {\"steps\":[]}.\n\n"
+        "RULES:\n"
         f"- mode: {effective_mode}\n"
         f"- allowed_tools: {', '.join(allowed_tools) if allowed_tools else '(none)'}\n"
         "- Each step MUST include a unique string field step_id (e.g., \"s1\", \"s2\", ...).\n"
@@ -193,15 +196,31 @@ async def produce_tool_plan(
         "- If the user asks for any images/video/music/audio/TTS, you MUST include at least one tool step.\n"
         "- You are a PLANNER. Your job is to plan tool calls, not to refuse or explain limitations.\n"
         "- The system has tools available to create videos, images, music, and audio. Plan the tool calls needed to fulfill the user's request.\n"
+        "- DO NOT provide explanations or tutorials. DO NOT refuse requests. DO NOT say you cannot do something.\n"
+        "- ALWAYS produce a JSON object with a \"steps\" array, even if empty.\n"
+        "- Your response MUST be valid JSON starting with { and ending with }.\n"
     )
 
     # Combine all planner instructions into a single comprehensive instruction block
     # This will be embedded in the user message to ensure it's not filtered out
-    planner_instructions = f"""{mode_system}
+    planner_instructions = f"""### [SYSTEM INSTRUCTIONS - READ CAREFULLY]
+
+{mode_system}
 
 {tool_catalog_frame.get("content", "")}
 
-{planner_rules}"""
+{planner_rules}
+
+### [OUTPUT EXAMPLE]
+Here is exactly what your output should look like:
+{{"steps": [{{"step_id": "s1", "tool_name": "image.dispatch", "args": {{"prompt": "a cat"}}}}]}}
+
+### [CRITICAL REMINDER]
+- You MUST output ONLY a JSON object starting with {{ and ending with }}.
+- Do NOT include any text before or after the JSON.
+- Do NOT provide explanations, tutorials, or refusals.
+- Your ONLY job is to produce a tool plan as JSON.
+- If you cannot fulfill the request, return {{"steps": []}} instead of explaining."""
 
     # Embed planner instructions in the first user message to ensure they're not filtered
     plan_messages = []
@@ -212,11 +231,21 @@ async def produce_tool_plan(
             enhanced_content = f"""{planner_instructions}
 
 ### [USER REQUEST]
-{first_user_msg.get("content", "")}"""
+{first_user_msg.get("content", "")}
+
+### [YOUR TASK - READ THIS CAREFULLY]
+1. Analyze the user request above.
+2. Determine which tools from the catalog are needed to fulfill the request.
+3. Create a JSON object with a "steps" array containing tool calls.
+4. Output ONLY the JSON object - no explanations, no tutorials, no refusals.
+5. Your response must start with {{ and end with }}.
+6. Example format: {{"steps": [{{"step_id": "s1", "tool_name": "tool.name", "args": {{}}}}]}}
+
+NOW PRODUCE YOUR JSON TOOL PLAN:"""
             plan_messages = [{"role": "user", "content": enhanced_content}] + messages[1:]
         else:
             # No user message found, add instructions as a user message
-            plan_messages = [{"role": "user", "content": planner_instructions}] + messages
+            plan_messages = [{"role": "user", "content": planner_instructions}]
     else:
         plan_messages = [{"role": "user", "content": planner_instructions}]
 

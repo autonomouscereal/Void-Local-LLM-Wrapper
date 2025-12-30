@@ -252,7 +252,6 @@ async def execute(
     return [
         {
             "tool_name": "executor",
-            "tool_call_name": "executor",  # legacy compatibility
             "error": {
                 "code": err.get("code") or "executor_error",
                 "message": err.get("message") or "executor_error",

@@ -321,8 +321,8 @@ async def segment_qa_and_committee(
         updated_segments, patch_results = await apply_patch_plan(enriched_patch_plan, segments_for_committee, tool_runner, trace_id, tool_name)
 
         for pr in patch_results or []:
-            # Accept tool_name (preferred), name (backward compat), or tool_call_name (backward compat)
-            patch_tool_name = str((pr or {}).get("tool_name") or (pr or {}).get("name") or (pr or {}).get("tool_call_name") or "tool")
+            # Check tool_name (canonical) first, then name (OpenAI format) as fallback
+            patch_tool_name = str((pr or {}).get("tool_name") or (pr or {}).get("name") or "tool")
             result_obj = (pr or {}).get("result") if isinstance((pr or {}).get("result"), dict) else {}
             err_obj = (pr or {}).get("error") or (result_obj.get("error") if isinstance(result_obj, dict) else None)
             if isinstance(err_obj, (str, dict)):

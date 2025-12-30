@@ -48,8 +48,8 @@ def finalize_tool_phase(
         if not isinstance(tr, dict):
             log.debug("finalize_tool_phase: skipping non-dict tool_result type=%s trace_id=%s", type(tr).__name__, trace_id)
             continue
-        # Support both tool_name (canonical) and tool_call_name (legacy)
-        tool_name = tr.get("tool_name") or tr.get("tool_call_name") or tr.get("name") or ""
+        # Check tool_name (canonical) first, then name (OpenAI format) as fallback
+        tool_name = tr.get("tool_name") or tr.get("name") or ""
         if not isinstance(tool_name, str):
             tool_name = ""
         err_obj: Any = None
@@ -110,8 +110,8 @@ def finalize_tool_phase(
         for tr in (tool_results or []):
             if not isinstance(tr, dict):
                 continue
-            # Support both tool_name (canonical) and tool_call_name (legacy)
-            tool_name = tr.get("tool_name") or tr.get("tool_call_name") or tr.get("name") or ""
+            # Check tool_name (canonical) first, then name (OpenAI format) as fallback
+            tool_name = tr.get("tool_name") or tr.get("name") or ""
             if not isinstance(tool_name, str) or not tool_name.strip():
                 continue
             if "result" in tr and isinstance(tr["result"], dict) and not tr.get("error"):

@@ -12,14 +12,17 @@ def build_omni_context(plan_text: str | None, tool_exec_meta: List[Dict[str, Any
     if isinstance(tool_exec_meta, list) and tool_exec_meta:
         lines: List[str] = []
         for m in tool_exec_meta[:20]:
-            tool_call_name = (m or {}).get("tool_call_name")
-            if not isinstance(tool_call_name, str):
-                tool_call_name = (m or {}).get("tool")
-            if not isinstance(tool_call_name, str):
-                tool_call_name = "tool"
+            # Check tool_name (canonical) first, then name (OpenAI format), then tool as fallback
+            tool_name = (m or {}).get("tool_name")
+            if not isinstance(tool_name, str):
+                tool_name = (m or {}).get("name")
+            if not isinstance(tool_name, str):
+                tool_name = (m or {}).get("tool")
+            if not isinstance(tool_name, str):
+                tool_name = "tool"
             dur = int((m or {}).get("duration_ms") or 0)
             ak = ", ".join(((m or {}).get("args") or {}).keys()) if isinstance((m or {}).get("args"), dict) else ""
-            lines.append(f"- {tool_call_name} ({dur} ms){' — ' + ak if ak else ''}")
+            lines.append(f"- {tool_name} ({dur} ms){' — ' + ak if ak else ''}")
         if lines:
             sections.append("### Tools\n" + "\n".join(lines))
 

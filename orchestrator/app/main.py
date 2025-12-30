@@ -799,11 +799,14 @@ async def _run_patch_call(
         return patch_failure_results[0]
     # If nothing executed or failed, echo a simple error payload; the caller is
     # responsible for wrapping this in a canonical envelope.
-    tool_call_name = call.get("tool_call_name") if isinstance(call, dict) else None
-    if not isinstance(tool_call_name, str):
-        tool_call_name = ""
+    # Check tool_name (canonical) first, then name (OpenAI format) as fallback
+    tool_name = ""
+    if isinstance(call, dict):
+        tool_name = call.get("tool_name") or call.get("name") or ""
+        if isinstance(tool_name, str):
+            tool_name = tool_name.strip()
     return {
-        "tool_call_name": tool_call_name,
+        "tool_name": tool_name,
         "result": {},
         "error": {
             "code": "no_result",
@@ -1404,7 +1407,7 @@ async def tool_describe(request: Request) -> Any:
     raw = await request.body()
     raw_text = raw.decode("utf-8", errors="replace") if isinstance(raw, (bytes, bytearray)) else str(raw or "")
     parser = JSONParser()
-    body = parser.parse(raw_text, {"conversation_id": str, "tool_call_name": str, "tool": str, "tool_name": str})
+    body = parser.parse(raw_text, {"conversation_id": str, "tool": str, "tool_name": str})
     if not isinstance(body, dict):
         log.error("tool_list_get: invalid_body_type - Body must be a JSON object. Continuing with empty body but this is an error.")
         body = {}
@@ -1412,11 +1415,12 @@ async def tool_describe(request: Request) -> Any:
     # For tool.describe endpoint, use empty string (this endpoint doesn't need trace_id)
     trace_id = ""
     conversation_id = str(body.get("conversation_id") or "").strip() if isinstance(body, dict) else ""
+    # Check tool_name (canonical) first, then tool, then name (OpenAI format) as fallback
     tool_name = body.get("tool_name") if isinstance(body, dict) else None
     if not isinstance(tool_name, str):
         tool_name = body.get("tool") if isinstance(body, dict) else None
     if not isinstance(tool_name, str):
-        tool_name = body.get("tool_call_name") if isinstance(body, dict) else None
+        tool_name = body.get("name") if isinstance(body, dict) else None
     if not isinstance(tool_name, str):
         tool_name = ""
     tool_name = tool_name.strip()
@@ -1494,8 +1498,7 @@ async def tool_run(request: Request) -> Any:
     parser = JSONParser()
     schema = {
         "tool_name": str,
-        "tool_call_name": str,  # backward compatibility
-        "name": str,  # backward compatibility
+        "name": str,  # OpenAI format fallback
         "args": object,
         "arguments": object,
         "trace_id": str,
@@ -1512,7 +1515,10 @@ async def tool_run(request: Request) -> Any:
     # For now, extract from body for backwards compatibility but log error
     trace_id = body.get("trace_id") if isinstance(body, dict) else None
     conversation_id = body.get("conversation_id") if isinstance(body, dict) else None
+    # Check tool_name (canonical) first, then name (OpenAI format) as fallback
     tool_name = body.get("tool_name") if isinstance(body, dict) else None
+    if not isinstance(tool_name, str) or not tool_name.strip():
+        tool_name = body.get("name") if isinstance(body, dict) else None
     if not isinstance(trace_id, str) or not trace_id:
         log.error(f"tool_run: missing trace_id in request body - executor should pass trace_id from chat_completions. Continuing with empty trace_id but this is an error. tool_name={tool_name!r}")
         trace_id = ""
@@ -7129,7 +7135,7 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
             except Exception as ex:
                 logging.warning(f"creative.alts.asset_collect_failed: {ex}", exc_info=True)
                 continue
-        return {"tool_call_name": name, "result": {"variants": len(results), "assets": urls, "best": (urls[0] if urls else None)}}
+        return {"tool_name": name, "result": {"variants": len(results), "assets": urls, "best": (urls[0] if urls else None)}}
     if tool_name == "creative.pro_polish" and ALLOW_TOOL_EXECUTION:
         # Run a default quality chain based on kind
         kind = (args.get("kind") or "").strip().lower()

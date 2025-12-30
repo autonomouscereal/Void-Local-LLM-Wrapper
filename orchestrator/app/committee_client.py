@@ -12,7 +12,7 @@ committee_client.py: Committee client for text generation (CHAT /api/chat).
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 import logging
 import os
 import json
@@ -72,12 +72,15 @@ def _participant_for(member_id: str):
 
 
 def _normalize_messages(messages: List[Dict[str, Any]]):
+    """Normalize messages to OpenAI format.
+    
+    For tool messages (role="tool"), we use tool_name (canonical) first, then name (OpenAI format) as fallback.
+    """
     out: List[Dict[str, Any]] = []
     for message_entry in (messages or []):
         if not isinstance(message_entry, dict):
             continue
         role = str(message_entry.get("role") or "user")
-        tool_call_name = message_entry.get("tool_call_name") if isinstance(message_entry.get("tool_call_name"), str) else None
         content_val = message_entry.get("content")
         if isinstance(content_val, list):
             text_parts: List[str] = []
@@ -90,8 +93,13 @@ def _normalize_messages(messages: List[Dict[str, Any]]):
         else:
             content = str(content_val or "")
         msg: Dict[str, Any] = {"role": role, "content": content}
-        if role == "tool" and isinstance(tool_call_name, str) and tool_call_name.strip():
-            msg["name"] = tool_call_name.strip()
+        # For tool messages, use tool_name (canonical) first, then name (OpenAI format) as fallback
+        if role == "tool":
+            tool_name = message_entry.get("tool_name")
+            if not isinstance(tool_name, str) or not tool_name.strip():
+                tool_name = message_entry.get("name")
+            if isinstance(tool_name, str) and tool_name.strip():
+                msg["name"] = tool_name.strip()
         out.append(msg)
     return out
 
@@ -293,108 +301,193 @@ async def committee_synth_text(messages: List[Dict[str, Any]], *, trace_id: str,
     return await committee_member_text(member_id=synth_member, messages=messages, trace_id=trace_id, temperature=temperature)
 
 
-async def committee_ai_text(messages: List[Dict[str, Any]], *, trace_id: str, rounds: int | None = None, temperature: float | None = None):
-    effective_rounds = int(rounds if rounds is not None else DEFAULT_COMMITTEE_ROUNDS)
-    effective_rounds = max(1, int(effective_rounds))
-    temp_run = temperature
-    if isinstance(temp_run, (int, float)):
-        if float(temp_run) < 0.0:
-            temp_run = 0.0
-        if float(temp_run) > 2.0:
-            temp_run = 2.0
-        temp_run = float(temp_run)
-    member_ids = [p.get("id") or "member" for p in COMMITTEE_PARTICIPANTS]
+def _extract_user_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Extract only user messages from a message list."""
+    return [m for m in (messages or []) if isinstance(m, dict) and str(m.get("role") or "").strip() == "user"]
+
+
+def _extract_system_messages(messages: List[Dict[str, Any]]) -> List[str]:
+    """Extract system message content from a message list."""
+    sys_msgs: List[str] = []
+    for m in (messages or []):
+        if isinstance(m, dict) and str(m.get("role") or "").strip() == "system":
+            content = m.get("content")
+            if isinstance(content, str) and content.strip():
+                sys_msgs.append(content.strip())
+    return sys_msgs
+
+
+def _build_revision_system_message(member_id: str, round_num: int, original_sys_msgs: List[str]) -> str:
+    """Build the revision system message with task context preserved."""
+    sys_msg_parts: List[str] = [f"You are committee member {member_id}. This is revision for debate round {round_num}."]
+    
+    # Include key context from original system message if it contains task-specific instructions
+    if original_sys_msgs:
+        combined_sys = "\n".join(original_sys_msgs)
+        if "Story Engine" in combined_sys or "story" in combined_sys.lower():
+            sys_msg_parts.append("Your task is to produce a story graph in JSON format.")
+            sys_msg_parts.append("Output MUST be a single JSON object (no markdown, no code fences, no prose).")
+        elif "JSONFixer" in combined_sys:
+            sys_msg_parts.append("Your task is to fix and return valid JSON matching the expected schema.")
+            sys_msg_parts.append("Output ONLY the JSON object, no prefixes or markdown.")
+        elif "PlannerOps" in combined_sys or ("tool" in combined_sys.lower() and "plan" in combined_sys.lower()):
+            sys_msg_parts.append("Your task is to produce a tool execution plan in JSON format.")
+            sys_msg_parts.append("Output MUST be a JSON object with a 'steps' array.")
+    
+    sys_msg_parts.append("Revise your answer using the critiques. Output ONLY your full final answer.")
+    sys_msg_parts.append("All content must be written in English only. Do NOT respond in any other language.")
+    
+    return "\n".join(sys_msg_parts)
+
+
+async def _committee_draft_phase(
+    member_ids: List[str],
+    messages: List[Dict[str, Any]],
+    round_num: int,
+    trace_id: str,
+    temperature: float | None,
+) -> Tuple[Dict[str, str], Dict[str, Dict[str, Any]]]:
+    """Run the draft phase where each member produces their initial answer.
+    
+    Returns:
+        Tuple of (answers dict, member_results dict)
+    """
     answers: Dict[str, str] = {}
-    critiques: Dict[str, str] = {}
     member_results: Dict[str, Dict[str, Any]] = {}
+    for mid in member_ids:
+        log.info(f"[committee] member_draft.start trace_id={trace_id} round={round_num} member={mid}")
+        sys_txt = f"You are committee member {mid}. Provide your best answer to the user.\nAll content must be written in English only. Do NOT respond in any other language."
+        user_msgs = _extract_user_messages(messages)
+        member_msgs = [{"role": "system", "content": sys_txt}] + user_msgs
+        emit_trace(state_dir=STATE_DIR, trace_id=trace_id, kind="committee.member_draft", payload={"trace_id": trace_id, "round": round_num, "member": mid})
+        res = await committee_member_text(member_id=mid, messages=member_msgs, trace_id=trace_id, temperature=temperature)
+        member_results[mid] = res if isinstance(res, dict) else {}
+        txt = str(res.get("response") or "").strip() if isinstance(res, dict) and res.get("ok") is not False else ""
+        answers[mid] = txt
+        log.info(f"[committee] member_draft.finish trace_id={trace_id} round={round_num} member={mid} ok={bool(isinstance(res, dict) and res.get('ok', True))} answer_chars={len(txt)} has_error={bool(isinstance(res, dict) and res.get('error'))}")
+    return answers, member_results
+
+
+async def _committee_critique_phase(
+    member_ids: List[str],
+    messages: List[Dict[str, Any]],
+    answers: Dict[str, str],
+    round_num: int,
+    trace_id: str,
+    temperature: float | None,
+) -> Tuple[Dict[str, str], Dict[str, Dict[str, Any]]]:
+    """Run the critique phase where each member critiques other members' answers.
+    
+    Returns:
+        Tuple of (critiques dict, critique_results dict)
+    """
+    critiques: Dict[str, str] = {}
     critique_results: Dict[str, Dict[str, Any]] = {}
-    t0 = time.monotonic()
-    log.info(f"[committee] run.start trace_id={trace_id} rounds={int(effective_rounds)} temperature={(None if temp_run is None else float(temp_run))} participants={member_ids} messages={len(messages or [])}")
-    emit_trace(state_dir=STATE_DIR, trace_id=trace_id, kind="committee.start", payload={"trace_id": trace_id, "rounds": int(effective_rounds), "temperature": (None if temp_run is None else float(temp_run)), "participants": member_ids, "messages": (messages or [])})
-    for r in range(effective_rounds):
-        log.info(f"[committee] round.start trace_id={trace_id} round={int(r + 1)}")
-        for mid in member_ids:
-            log.info(f"[committee] member_draft.start trace_id={trace_id} round={int(r + 1)} member={mid}")
-            sys_txt = f"You are committee member {mid}. Provide your best answer to the user.\nAll content must be written in English only. Do NOT respond in any other language."
-            # Replace ALL system messages with draft system message, keep only user messages
-            user_msgs = [m for m in (messages or []) if isinstance(m, dict) and str(m.get("role") or "").strip() == "user"]
-            member_msgs = [{"role": "system", "content": sys_txt}] + user_msgs
-            emit_trace(state_dir=STATE_DIR, trace_id=trace_id, kind="committee.member_draft", payload={"trace_id": trace_id, "round": int(r + 1), "member": mid})
-            res = await committee_member_text(member_id=mid, messages=member_msgs, trace_id=trace_id, temperature=temp_run)
-            member_results[mid] = res if isinstance(res, dict) else {}
-            txt = str(res.get("response") or "").strip() if isinstance(res, dict) and res.get("ok") is not False else ""
-            answers[mid] = txt
-            log.info(f"[committee] member_draft.finish trace_id={trace_id} round={int(r + 1)} member={mid} ok={bool(isinstance(res, dict) and res.get('ok', True))} answer_chars={len(txt)} has_error={bool(isinstance(res, dict) and res.get('error'))}")
-        answers_chars = {mid: len(answers.get(mid) or "") for mid in member_ids}
-        log.info(f"[committee] round.critique.start trace_id={trace_id} round={int(r + 1)} answers_chars={answers_chars}")
-        critiques = {}
-        for mid in member_ids:
-            log.info(f"[committee] member_critique.start trace_id={trace_id} round={int(r + 1)} member={mid}")
-            other_blocks: List[str] = []
-            for oid in member_ids:
-                if oid == mid:
-                    continue
-                otext = answers.get(oid) or ""
-                if isinstance(otext, str) and otext.strip():
-                    other_blocks.append(f"Answer from {oid}:\n{otext.strip()}")
-            critique_txt = f"You are committee member {mid}. This is cross-critique for debate round {r + 1}.\nCritique the other answers. Identify concrete mistakes, missing considerations, and specific improvements.\nReturn a concise bullet list.\n" + ("\n\n".join(other_blocks) if other_blocks else "") + "\nAll content must be written in English only. Do NOT respond in any other language."
-            # Replace ALL system messages with critique system message, keep only user messages
-            user_msgs = [m for m in (messages or []) if isinstance(m, dict) and str(m.get("role") or "").strip() == "user"]
-            member_msgs = [{"role": "system", "content": critique_txt}] + user_msgs
-            emit_trace(state_dir=STATE_DIR, trace_id=trace_id, kind="committee.member_critique", payload={"trace_id": trace_id, "round": int(r + 1), "member": mid})
-            res = await committee_member_text(member_id=mid, messages=member_msgs, trace_id=trace_id, temperature=temp_run)
-            critique_results[mid] = res if isinstance(res, dict) else {}
-            crit_txt = str(res.get("response") or "").strip() if isinstance(res, dict) and res.get("ok") is not False else ""
-            critiques[mid] = crit_txt
-            others_count = sum(1 for oid in member_ids if oid != mid and (answers.get(oid) or "").strip())
-            log.info(f"[committee] member_critique.finish trace_id={trace_id} round={int(r + 1)} member={mid} ok={bool(isinstance(res, dict) and res.get('ok', True))} critique_chars={len(crit_txt)} has_error={bool(isinstance(res, dict) and res.get('error'))} others_count={int(others_count)}")
-        critiques_chars = {mid: len(critiques.get(mid) or "") for mid in member_ids}
-        log.info(f"[committee] round.revision.start trace_id={trace_id} round={int(r + 1)} critiques_chars={critiques_chars}")
-        for mid in member_ids:
-            log.info(f"[committee] member_revision.start trace_id={trace_id} round={int(r + 1)} member={mid}")
-            # System message: concise revision instructions only
-            sys_msg = f"You are committee member {mid}. This is revision for debate round {r + 1}.\nRevise your answer using the critiques. Output ONLY your full final answer.\nAll content must be written in English only. Do NOT respond in any other language."
-            
-            # Build context as structured user messages
-            context_msgs: List[Dict[str, Any]] = []
-            
-            # Add other members' answers
-            other_answers: List[str] = []
-            for oid in member_ids:
-                if oid == mid:
-                    continue
-                otext = answers.get(oid) or ""
-                if isinstance(otext, str) and otext.strip():
-                    other_answers.append(f"Answer from {oid}:\n{otext.strip()}")
-            if other_answers:
-                context_msgs.append({"role": "user", "content": "### Other Members' Answers\n\n" + "\n\n---\n\n".join(other_answers)})
-            
-            # Add critiques
-            crit_blocks: List[str] = []
-            for member_id in member_ids:
-                ctext = critiques.get(member_id) or ""
-                if isinstance(ctext, str) and ctext.strip():
-                    crit_blocks.append(f"Critique from {member_id}:\n{ctext.strip()}")
-            if crit_blocks:
-                context_msgs.append({"role": "user", "content": "### Critiques\n\n" + "\n\n---\n\n".join(crit_blocks)})
-            
-            # Add current answer
-            prior = answers.get(mid) or ""
-            if isinstance(prior, str) and prior.strip():
-                context_msgs.append({"role": "user", "content": f"### Your Current Answer\n\n{prior.strip()}"})
-            
-            # Replace ALL system messages with revision system message, keep only user messages from original
-            user_msgs = [m for m in (messages or []) if isinstance(m, dict) and str(m.get("role") or "").strip() == "user"]
-            # Structure: system message, then context messages, then original user messages
-            member_msgs = [{"role": "system", "content": sys_msg}] + context_msgs + user_msgs
-            emit_trace(state_dir=STATE_DIR, trace_id=trace_id, kind="committee.member_revision", payload={"trace_id": trace_id, "round": int(r + 1), "member": mid})
-            res = await committee_member_text(member_id=mid, messages=member_msgs, trace_id=trace_id, temperature=temp_run)
-            member_results[mid] = res if isinstance(res, dict) else {}
-            txt = str(res.get("response") or "").strip() if isinstance(res, dict) and res.get("ok") is not False else ""
-            answers[mid] = txt
-            log.info(f"[committee] member_revision.finish trace_id={trace_id} round={int(r + 1)} member={mid} ok={bool(isinstance(res, dict) and res.get('ok', True))} answer_chars={len(txt)} has_error={bool(isinstance(res, dict) and res.get('error'))}")
-    member_summaries = [{"member": mid, "answer": (answers.get(mid) or "")} for mid in member_ids]
-    critique_summaries = [{"member": mid, "critique": (critiques.get(mid) or "")} for mid in member_ids]
+    for mid in member_ids:
+        log.info(f"[committee] member_critique.start trace_id={trace_id} round={round_num} member={mid}")
+        other_blocks: List[str] = []
+        for oid in member_ids:
+            if oid == mid:
+                continue
+            otext = answers.get(oid) or ""
+            if isinstance(otext, str) and otext.strip():
+                other_blocks.append(f"Answer from {oid}:\n{otext.strip()}")
+        critique_txt = (
+            f"You are committee member {mid}. This is cross-critique for debate round {round_num}.\n"
+            f"Critique the other answers. Identify concrete mistakes, missing considerations, and specific improvements.\n"
+            f"Return a concise bullet list.\n"
+            + ("\n\n".join(other_blocks) if other_blocks else "")
+            + "\nAll content must be written in English only. Do NOT respond in any other language."
+        )
+        user_msgs = _extract_user_messages(messages)
+        member_msgs = [{"role": "system", "content": critique_txt}] + user_msgs
+        emit_trace(state_dir=STATE_DIR, trace_id=trace_id, kind="committee.member_critique", payload={"trace_id": trace_id, "round": round_num, "member": mid})
+        res = await committee_member_text(member_id=mid, messages=member_msgs, trace_id=trace_id, temperature=temperature)
+        critique_results[mid] = res if isinstance(res, dict) else {}
+        crit_txt = str(res.get("response") or "").strip() if isinstance(res, dict) and res.get("ok") is not False else ""
+        critiques[mid] = crit_txt
+        others_count = sum(1 for oid in member_ids if oid != mid and (answers.get(oid) or "").strip())
+        log.info(f"[committee] member_critique.finish trace_id={trace_id} round={round_num} member={mid} ok={bool(isinstance(res, dict) and res.get('ok', True))} critique_chars={len(crit_txt)} has_error={bool(isinstance(res, dict) and res.get('error'))} others_count={int(others_count)}")
+    return critiques, critique_results
+
+
+async def _committee_revision_phase(
+    member_ids: List[str],
+    messages: List[Dict[str, Any]],
+    answers: Dict[str, str],
+    critiques: Dict[str, str],
+    round_num: int,
+    trace_id: str,
+    temperature: float | None,
+) -> Tuple[Dict[str, str], Dict[str, Dict[str, Any]]]:
+    """Run the revision phase where each member revises their answer based on critiques.
+    
+    Returns:
+        Tuple of (updated answers dict, member_results dict)
+    """
+    original_sys_msgs = _extract_system_messages(messages)
+    member_results: Dict[str, Dict[str, Any]] = {}
+    
+    for mid in member_ids:
+        log.info(f"[committee] member_revision.start trace_id={trace_id} round={round_num} member={mid}")
+        
+        # Build revision system message with task context
+        sys_msg = _build_revision_system_message(mid, round_num, original_sys_msgs)
+        
+        # Build context as structured user messages
+        context_msgs: List[Dict[str, Any]] = []
+        
+        # Add other members' answers
+        other_answers: List[str] = []
+        for oid in member_ids:
+            if oid == mid:
+                continue
+            otext = answers.get(oid) or ""
+            if isinstance(otext, str) and otext.strip():
+                other_answers.append(f"Answer from {oid}:\n{otext.strip()}")
+        if other_answers:
+            context_msgs.append({"role": "user", "content": "### Other Members' Answers\n\n" + "\n\n---\n\n".join(other_answers)})
+        
+        # Add critiques
+        crit_blocks: List[str] = []
+        for member_id in member_ids:
+            ctext = critiques.get(member_id) or ""
+            if isinstance(ctext, str) and ctext.strip():
+                crit_blocks.append(f"Critique from {member_id}:\n{ctext.strip()}")
+        if crit_blocks:
+            context_msgs.append({"role": "user", "content": "### Critiques\n\n" + "\n\n---\n\n".join(crit_blocks)})
+        
+        # Add current answer
+        prior = answers.get(mid) or ""
+        if isinstance(prior, str) and prior.strip():
+            context_msgs.append({"role": "user", "content": f"### Your Current Answer\n\n{prior.strip()}"})
+        
+        # Replace ALL system messages with revision system message, keep only user messages from original
+        user_msgs = _extract_user_messages(messages)
+        # Structure: system message, then context messages, then original user messages
+        member_msgs = [{"role": "system", "content": sys_msg}] + context_msgs + user_msgs
+        emit_trace(state_dir=STATE_DIR, trace_id=trace_id, kind="committee.member_revision", payload={"trace_id": trace_id, "round": round_num, "member": mid})
+        res = await committee_member_text(member_id=mid, messages=member_msgs, trace_id=trace_id, temperature=temperature)
+        member_results[mid] = res if isinstance(res, dict) else {}
+        txt = str(res.get("response") or "").strip() if isinstance(res, dict) and res.get("ok") is not False else ""
+        answers[mid] = txt
+        log.info(f"[committee] member_revision.finish trace_id={trace_id} round={round_num} member={mid} ok={bool(isinstance(res, dict) and res.get('ok', True))} answer_chars={len(txt)} has_error={bool(isinstance(res, dict) and res.get('error'))}")
+    
+    return answers, member_results
+
+
+async def _committee_synthesis_phase(
+    member_ids: List[str],
+    messages: List[Dict[str, Any]],
+    answers: Dict[str, str],
+    critiques: Dict[str, str],
+    trace_id: str,
+) -> Tuple[str, Dict[str, Any]]:
+    """Run the synthesis phase to produce the final answer.
+    
+    Returns:
+        Tuple of (synthesized text, synth_env dict)
+    """
     synth_parts: List[str] = []
     synth_parts.append("You are the committee synthesizer. Produce one final answer.")
     synth_parts.append("Rules: resolve conflicts by correctness; do not mention the committee or multiple models; output English only.")
@@ -410,14 +503,96 @@ async def committee_ai_text(messages: List[Dict[str, Any]], *, trace_id: str, ro
             if isinstance(crit, str) and crit.strip():
                 synth_parts.append(f"#### {mid}\n{crit.strip()}")
     synth_parts.append("### Task\nSynthesize the best final answer. Output ONLY the final answer.")
-    # Replace ALL system messages with synth system message, keep only user messages
-    user_msgs = [m for m in (messages or []) if isinstance(m, dict) and str(m.get("role") or "").strip() == "user"]
+    user_msgs = _extract_user_messages(messages)
     synth_messages = [{"role": "system", "content": "\n\n".join(synth_parts)}] + user_msgs
     emit_trace(state_dir=STATE_DIR, trace_id=trace_id, kind="committee.synth.request", payload={"trace_id": trace_id, "synth_member": "qwen"})
     t_synth = time.monotonic()
     synth_env = await committee_synth_text(messages=synth_messages, trace_id=trace_id, temperature=0.0, synth_member="qwen")
     synth_text = str(synth_env.get("response") or "").strip() if isinstance(synth_env, dict) and synth_env.get("ok") is not False else ""
     log.info(f"[committee] synth.finish trace_id={trace_id} ok={bool(isinstance(synth_env, dict) and synth_env.get('ok', True))} dur_ms={int((time.monotonic() - t_synth) * 1000.0)} synth_chars={len(synth_text)} has_error={bool(isinstance(synth_env, dict) and synth_env.get('error'))}")
+    return synth_text, (synth_env if isinstance(synth_env, dict) else {})
+
+
+async def committee_ai_text(messages: List[Dict[str, Any]], *, trace_id: str, rounds: int | None = None, temperature: float | None = None):
+    """Main committee AI text generation function with draft, critique, revision, and synthesis phases."""
+    # Normalize parameters
+    effective_rounds = int(rounds if rounds is not None else DEFAULT_COMMITTEE_ROUNDS)
+    effective_rounds = max(1, int(effective_rounds))
+    temp_run = temperature
+    if isinstance(temp_run, (int, float)):
+        if float(temp_run) < 0.0:
+            temp_run = 0.0
+        if float(temp_run) > 2.0:
+            temp_run = 2.0
+        temp_run = float(temp_run)
+    
+    member_ids = [p.get("id") or "member" for p in COMMITTEE_PARTICIPANTS]
+    answers: Dict[str, str] = {}
+    critiques: Dict[str, str] = {}
+    member_results: Dict[str, Dict[str, Any]] = {}
+    critique_results: Dict[str, Dict[str, Any]] = {}
+    
+    t0 = time.monotonic()
+    log.info(f"[committee] run.start trace_id={trace_id} rounds={int(effective_rounds)} temperature={(None if temp_run is None else float(temp_run))} participants={member_ids} messages={len(messages or [])}")
+    emit_trace(state_dir=STATE_DIR, trace_id=trace_id, kind="committee.start", payload={"trace_id": trace_id, "rounds": int(effective_rounds), "temperature": (None if temp_run is None else float(temp_run)), "participants": member_ids, "messages": (messages or [])})
+    
+    # Run rounds: draft -> critique -> revision
+    for r in range(effective_rounds):
+        round_num = r + 1
+        log.info(f"[committee] round.start trace_id={trace_id} round={round_num}")
+        
+        # Draft phase: each member produces initial answer
+        round_answers, round_member_results = await _committee_draft_phase(
+            member_ids=member_ids,
+            messages=messages,
+            round_num=round_num,
+            trace_id=trace_id,
+            temperature=temp_run,
+        )
+        answers.update(round_answers)
+        member_results.update(round_member_results)
+        
+        answers_chars = {mid: len(answers.get(mid) or "") for mid in member_ids}
+        log.info(f"[committee] round.critique.start trace_id={trace_id} round={round_num} answers_chars={answers_chars}")
+        
+        # Critique phase: each member critiques other members' answers
+        round_critiques, round_critique_results = await _committee_critique_phase(
+            member_ids=member_ids,
+            messages=messages,
+            answers=answers,
+            round_num=round_num,
+            trace_id=trace_id,
+            temperature=temp_run,
+        )
+        critiques.update(round_critiques)
+        critique_results.update(round_critique_results)
+        
+        critiques_chars = {mid: len(critiques.get(mid) or "") for mid in member_ids}
+        log.info(f"[committee] round.revision.start trace_id={trace_id} round={round_num} critiques_chars={critiques_chars}")
+        
+        # Revision phase: each member revises their answer based on critiques
+        updated_answers, revision_member_results = await _committee_revision_phase(
+            member_ids=member_ids,
+            messages=messages,
+            answers=answers,
+            critiques=critiques,
+            round_num=round_num,
+            trace_id=trace_id,
+            temperature=temp_run,
+        )
+        answers.update(updated_answers)
+        member_results.update(revision_member_results)
+    
+    # Synthesis phase: produce final answer
+    synth_text, synth_env = await _committee_synthesis_phase(
+        member_ids=member_ids,
+        messages=messages,
+        answers=answers,
+        critiques=critiques,
+        trace_id=trace_id,
+    )
+    
+    # Fallback to best answer if synthesis failed
     final_text = synth_text
     if not final_text:
         best_mid = None
@@ -434,6 +609,11 @@ async def committee_ai_text(messages: List[Dict[str, Any]], *, trace_id: str, ro
         if best_mid:
             final_text = (answers.get(best_mid) or "").strip()
             log.warning(f"[committee] synth.fallback trace_id={trace_id} chosen_member={str(best_mid)} chosen_chars={len(final_text)}")
+    
+    # Build summaries and collect errors
+    member_summaries = [{"member": mid, "answer": (answers.get(mid) or "")} for mid in member_ids]
+    critique_summaries = [{"member": mid, "critique": (critiques.get(mid) or "")} for mid in member_ids]
+    
     ok = bool(isinstance(final_text, str) and final_text.strip())
     backend_errors: List[Dict[str, Any]] = []
     for mid, mres in member_results.items():
@@ -444,12 +624,26 @@ async def committee_ai_text(messages: List[Dict[str, Any]], *, trace_id: str, ro
             backend_errors.append({"member": mid, "phase": "critique", "error": cres.get("error")})
     if isinstance(synth_env, dict) and synth_env.get("ok") is False and isinstance(synth_env.get("error"), dict):
         backend_errors.append({"member": "synth", "phase": "synth", "error": synth_env.get("error")})
+    
     emit_trace(state_dir=STATE_DIR, trace_id=trace_id, kind="committee.finish", payload={"trace_id": trace_id, "ok": ok, "final_text": final_text, "members": member_summaries, "critiques": critique_summaries})
     log.info(f"[committee] run.finish trace_id={trace_id} ok={ok} dur_ms={int((time.monotonic() - t0) * 1000.0)} final_chars={len(final_text or '')} backend_errors={backend_errors}")
+    
     if not ok:
         members_status = {mid: {"ok": bool(isinstance(mres, dict) and mres.get("ok", True)), "has_error": bool(isinstance(mres, dict) and mres.get("error")), "error": (mres.get("error") if isinstance(mres, dict) else None)} for mid, mres in member_results.items()}
         log.error(f"[committee] no_answer trace_id={trace_id} backend_errors={backend_errors} members={members_status}")
-    result_payload: Dict[str, Any] = {"text": final_text, "members": member_summaries, "critiques": critique_summaries, "backend_errors": backend_errors, "qwen": (member_results.get("qwen") or {}), "glm": (member_results.get("glm") or {}), "deepseek": (member_results.get("deepseek") or {}), "synth": (dict(synth_env) if isinstance(synth_env, dict) else {"response": final_text}), "critique_envelopes": critique_results}
+    
+    result_payload: Dict[str, Any] = {
+        "text": final_text,
+        "members": member_summaries,
+        "critiques": critique_summaries,
+        "backend_errors": backend_errors,
+        "qwen": (member_results.get("qwen") or {}),
+        "glm": (member_results.get("glm") or {}),
+        "deepseek": (member_results.get("deepseek") or {}),
+        "synth": (dict(synth_env) if isinstance(synth_env, dict) else {"response": final_text}),
+        "critique_envelopes": critique_results,
+    }
+    
     return {
         "schema_version": 1,
         "trace_id": trace_id,
