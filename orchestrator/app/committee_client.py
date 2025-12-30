@@ -316,8 +316,8 @@ async def committee_ai_text(messages: List[Dict[str, Any]], *, trace_id: str, ro
         for mid in member_ids:
             log.info(f"[committee] member_draft.start trace_id={trace_id} round={int(r + 1)} member={mid}")
             sys_txt = f"You are committee member {mid}. Provide your best answer to the user.\nAll content must be written in English only. Do NOT respond in any other language."
-            # Replace system messages with draft system message, keep user messages
-            user_msgs = [m for m in (messages or []) if isinstance(m, dict) and m.get("role") == "user"]
+            # Replace ALL system messages with draft system message, keep only user messages
+            user_msgs = [m for m in (messages or []) if isinstance(m, dict) and str(m.get("role") or "").strip() == "user"]
             member_msgs = [{"role": "system", "content": sys_txt}] + user_msgs
             emit_trace(state_dir=STATE_DIR, trace_id=trace_id, kind="committee.member_draft", payload={"trace_id": trace_id, "round": int(r + 1), "member": mid})
             res = await committee_member_text(member_id=mid, messages=member_msgs, trace_id=trace_id, temperature=temp_run)
@@ -338,8 +338,8 @@ async def committee_ai_text(messages: List[Dict[str, Any]], *, trace_id: str, ro
                 if isinstance(otext, str) and otext.strip():
                     other_blocks.append(f"Answer from {oid}:\n{otext.strip()}")
             critique_txt = f"You are committee member {mid}. This is cross-critique for debate round {r + 1}.\nCritique the other answers. Identify concrete mistakes, missing considerations, and specific improvements.\nReturn a concise bullet list.\n" + ("\n\n".join(other_blocks) if other_blocks else "") + "\nAll content must be written in English only. Do NOT respond in any other language."
-            # Replace system messages with critique system message, keep user messages
-            user_msgs = [m for m in (messages or []) if isinstance(m, dict) and m.get("role") == "user"]
+            # Replace ALL system messages with critique system message, keep only user messages
+            user_msgs = [m for m in (messages or []) if isinstance(m, dict) and str(m.get("role") or "").strip() == "user"]
             member_msgs = [{"role": "system", "content": critique_txt}] + user_msgs
             emit_trace(state_dir=STATE_DIR, trace_id=trace_id, kind="committee.member_critique", payload={"trace_id": trace_id, "round": int(r + 1), "member": mid})
             res = await committee_member_text(member_id=mid, messages=member_msgs, trace_id=trace_id, temperature=temp_run)
@@ -352,29 +352,41 @@ async def committee_ai_text(messages: List[Dict[str, Any]], *, trace_id: str, ro
         log.info(f"[committee] round.revision.start trace_id={trace_id} round={int(r + 1)} critiques_chars={critiques_chars}")
         for mid in member_ids:
             log.info(f"[committee] member_revision.start trace_id={trace_id} round={int(r + 1)} member={mid}")
-            ctx_lines: List[str] = []
-            ctx_lines.append(f"You are committee member {mid}. This is revision for debate round {r + 1}.")
-            ctx_lines.append("Revise your answer using the critiques. Output ONLY your full final answer.")
+            # System message: concise revision instructions only
+            sys_msg = f"You are committee member {mid}. This is revision for debate round {r + 1}.\nRevise your answer using the critiques. Output ONLY your full final answer.\nAll content must be written in English only. Do NOT respond in any other language."
+            
+            # Build context as structured user messages
+            context_msgs: List[Dict[str, Any]] = []
+            
+            # Add other members' answers
+            other_answers: List[str] = []
             for oid in member_ids:
                 if oid == mid:
                     continue
                 otext = answers.get(oid) or ""
                 if isinstance(otext, str) and otext.strip():
-                    ctx_lines.append(f"Answer from {oid}:\n{otext.strip()}")
+                    other_answers.append(f"Answer from {oid}:\n{otext.strip()}")
+            if other_answers:
+                context_msgs.append({"role": "user", "content": "### Other Members' Answers\n\n" + "\n\n---\n\n".join(other_answers)})
+            
+            # Add critiques
             crit_blocks: List[str] = []
             for member_id in member_ids:
                 ctext = critiques.get(member_id) or ""
                 if isinstance(ctext, str) and ctext.strip():
                     crit_blocks.append(f"Critique from {member_id}:\n{ctext.strip()}")
             if crit_blocks:
-                ctx_lines.append("\n\n".join(crit_blocks))
+                context_msgs.append({"role": "user", "content": "### Critiques\n\n" + "\n\n---\n\n".join(crit_blocks)})
+            
+            # Add current answer
             prior = answers.get(mid) or ""
             if isinstance(prior, str) and prior.strip():
-                ctx_lines.append(f"Your current answer is:\n{prior.strip()}")
-            ctx_lines.append("All content must be written in English only. Do NOT respond in any other language.")
-            # Replace system messages with revision system message, keep user messages
-            user_msgs = [m for m in (messages or []) if isinstance(m, dict) and m.get("role") == "user"]
-            member_msgs = [{"role": "system", "content": "\n\n".join(ctx_lines)}] + user_msgs
+                context_msgs.append({"role": "user", "content": f"### Your Current Answer\n\n{prior.strip()}"})
+            
+            # Replace ALL system messages with revision system message, keep only user messages from original
+            user_msgs = [m for m in (messages or []) if isinstance(m, dict) and str(m.get("role") or "").strip() == "user"]
+            # Structure: system message, then context messages, then original user messages
+            member_msgs = [{"role": "system", "content": sys_msg}] + context_msgs + user_msgs
             emit_trace(state_dir=STATE_DIR, trace_id=trace_id, kind="committee.member_revision", payload={"trace_id": trace_id, "round": int(r + 1), "member": mid})
             res = await committee_member_text(member_id=mid, messages=member_msgs, trace_id=trace_id, temperature=temp_run)
             member_results[mid] = res if isinstance(res, dict) else {}
@@ -398,7 +410,9 @@ async def committee_ai_text(messages: List[Dict[str, Any]], *, trace_id: str, ro
             if isinstance(crit, str) and crit.strip():
                 synth_parts.append(f"#### {mid}\n{crit.strip()}")
     synth_parts.append("### Task\nSynthesize the best final answer. Output ONLY the final answer.")
-    synth_messages = list(messages or []) + [{"role": "system", "content": "\n\n".join(synth_parts)}]
+    # Replace ALL system messages with synth system message, keep only user messages
+    user_msgs = [m for m in (messages or []) if isinstance(m, dict) and str(m.get("role") or "").strip() == "user"]
+    synth_messages = [{"role": "system", "content": "\n\n".join(synth_parts)}] + user_msgs
     emit_trace(state_dir=STATE_DIR, trace_id=trace_id, kind="committee.synth.request", payload={"trace_id": trace_id, "synth_member": "qwen"})
     t_synth = time.monotonic()
     synth_env = await committee_synth_text(messages=synth_messages, trace_id=trace_id, temperature=0.0, synth_member="qwen")

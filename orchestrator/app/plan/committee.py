@@ -80,9 +80,9 @@ def _safe_message_list(messages: Any, *, trace_id: str) -> List[Dict[str, Any]]:
             continue
         # Content can be non-string in some adapter paths; coerce safely.
         if content is not None and not isinstance(content, str):
-            
             content = str(content)
-            out.append({"role": role.strip(), "content": (content or "")})
+        # Always append valid messages (content can be None or empty string)
+        out.append({"role": role.strip(), "content": (content or "") if content is not None else ""})
     if dropped:
         log.warning("planner messages dropped=%s kept=%s trace_id=%s", dropped, len(out), trace_id)
     return out
