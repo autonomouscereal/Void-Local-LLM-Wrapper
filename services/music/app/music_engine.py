@@ -42,7 +42,13 @@ def _log_music_generate_state(
         logger.info("model id=%r", model_id)
 
         generate_attr = getattr(model, "generate", None)
-        logger.info("model.generate attr=%r", generate_attr)
+        # Don't use %r here - it would print the entire model structure via repr() of the bound method
+        generate_attr_str = (
+            f"<bound method {type(model).__name__}.generate>"
+            if generate_attr is not None
+            else "None"
+        )
+        logger.info("model.generate attr=%s", generate_attr_str)
         logger.info("model.generate type=%s", type(generate_attr))
         logger.info("model.generate callable=%s", callable(generate_attr))
 

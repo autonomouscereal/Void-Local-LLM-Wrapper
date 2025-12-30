@@ -12,6 +12,10 @@ COPY requirements.txt /app/requirements.txt
 # All pins live in requirements.txt (policy). Torch wheels come from the cu118 index.
 RUN python -m pip install --extra-index-url "${PIP_EXTRA_INDEX_URL}" -r /app/requirements.txt
 
+# Copy shared packages so the service can return canonical ToolEnvelopes + use JSONParser
+COPY void_envelopes /app/void_envelopes
+COPY void_json /app/void_json
+
 COPY app.py /app/app.py
 
 ENV HYVIDEO_PORT=8094

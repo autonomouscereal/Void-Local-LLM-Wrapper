@@ -12,6 +12,9 @@ RUN apt-get update \
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
+# Copy shared packages so the service can use JSONParser
+COPY void_json /app/void_json
+
 COPY app /app/app
 
 EXPOSE 8086

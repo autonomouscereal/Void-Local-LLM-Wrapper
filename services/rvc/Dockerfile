@@ -16,6 +16,9 @@ COPY app /app/app
 # that still do `from hf_rvc import ...` won't crash on import. The shim
 # itself is a no-op and will raise if actually called.
 COPY hf_rvc /app/hf_rvc
+# Copy shared packages so the service can return canonical ToolEnvelopes
+COPY void_envelopes /app/void_envelopes
+COPY void_json /app/void_json
 
 EXPOSE 7863
 CMD ["uvicorn","app.main:app","--host","0.0.0.0","--port","7863"]
