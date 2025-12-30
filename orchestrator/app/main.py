@@ -10429,17 +10429,15 @@ async def chat_completions(request: Request):
             _log("planner.tool_calls.normalized", trace_id=trace_id, count=len(tool_calls or []), preview=preview)
         except Exception as ex:
             logging.warning(f"planner.tool_calls.normalized log failed trace_id={trace_id}: {ex}", exc_info=True)
-        # Hardening: filter unknown tools against runtime catalog (registry + builtins).
-        allowed_runtime = catalog_allowed(get_builtin_tools_schema)
+        # Hardening: validate tools against runtime catalog (registry + builtins).
+        # catalog_validate should check against ALL allowed tools, not just planner-visible ones.
+        # Planner visibility only affects what tools the planner sees, not what tools can be executed.
+        allowed_runtime_full = catalog_allowed(get_builtin_tools_schema)
         logging.debug(
-            f"chat_completions:catalog_allowed count={len(allowed_runtime) if isinstance(allowed_runtime, (list, set, tuple)) else -1}"
+            f"chat_completions:catalog_allowed count={len(allowed_runtime_full) if isinstance(allowed_runtime_full, (list, set, tuple)) else -1}"
         )
-        # Restrict to planner-visible + mode-allowed tools (single source of truth; do not re-filter later).
-        allowed_runtime = {n for n in allowed_runtime if n in PLANNER_VISIBLE_TOOLS}
-        logging.debug(f"chat_completions:allowed_runtime after planner_visible count={len(allowed_runtime)}")
-        allowed_runtime = {n for n in allowed_runtime if n in set(_allowed_tools_for_mode(effective_mode))}
-        logging.debug(f"chat_completions:allowed_runtime after mode filter count={len(allowed_runtime)}")
-        tool_calls, unknown_tools = catalog_validate(tool_calls or [], allowed_runtime)
+        # Validate against full catalog (catalog_validate is a validation/fixing step, not a blocker)
+        tool_calls, unknown_tools = catalog_validate(tool_calls or [], allowed_runtime_full)
         logging.debug(
             f"chat_completions:catalog_validate tool_calls_len={len(tool_calls or [])} unknown_tools={unknown_tools!r}"
         )

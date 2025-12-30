@@ -32,6 +32,7 @@ class _TTSProvider:
         if not isinstance(trace_id, str) or not trace_id.strip():
             log.error(f"tools_tts.provider.speak: missing trace_id in payload - upstream caller must pass trace_id. Continuing with empty trace_id but this is an error. payload_keys={sorted([str(k) for k in (payload or {}).keys()])}")
             trace_id = ""  # Continue processing but log the error
+        conversation_id = payload.get("conversation_id") if isinstance(payload.get("conversation_id"), str) else ""
         emit_progress({"stage": "request", "target": "xtts"})
         # Ensure language is always set; default to English if absent.
         # Also normalize locale-style codes like "en-US" to XTTS-compatible "en".
@@ -50,9 +51,10 @@ class _TTSProvider:
         base = self._base_url
         if not base:
             return _build_error_envelope(
-                "xtts_unconfigured",
-                "XTTS_API_URL is not configured for TTS provider.",
-                trace_id,
+                code="xtts_unconfigured",
+                message="XTTS_API_URL is not configured for TTS provider.",
+                trace_id=trace_id,
+                conversation_id=conversation_id,
                 status=500,
                 details={"trace_id": trace_id, "stack": "".join(traceback.format_stack())},
             )
@@ -125,7 +127,7 @@ class _TTSProvider:
                     "segment_id": segment_id,
                     "trace_id": trace_id,
                 }
-                return _build_success_envelope(result, trace_id)
+                return _build_success_envelope(result=result, trace_id=trace_id, conversation_id=conversation_id)
             # Any non-ok env from XTTS is wrapped as a tool error.
             #
             # Retry once for the common locale-code mismatch (e.g. en-US) by forcing English.
@@ -163,12 +165,13 @@ class _TTSProvider:
                             "segment_id": inner.get("segment_id") or retry_payload.get("segment_id"),
                             "trace_id": trace_id,
                         }
-                        return _build_success_envelope(result, trace_id)
+                        return _build_success_envelope(result=result, trace_id=trace_id, conversation_id=conversation_id)
 
             return _build_error_envelope(
-                "tts_invalid_envelope",
-                "XTTS /tts returned non-ok envelope",
-                trace_id,
+                code="tts_invalid_envelope",
+                message="XTTS /tts returned non-ok envelope",
+                trace_id=trace_id,
+                conversation_id=conversation_id,
                 status=status,
                 details={"trace_id": trace_id, "raw": env, "stack": "".join(traceback.format_stack())},
             )
@@ -181,9 +184,10 @@ class _TTSProvider:
             parser = JSONParser()
             data = parser.parse(raw_body or "", {})
         return _build_error_envelope(
-            "tts_http_error",
-            "XTTS /tts returned non-2xx or invalid body",
-            trace_id,
+            code="tts_http_error",
+            message="XTTS /tts returned non-2xx or invalid body",
+            trace_id=trace_id,
+            conversation_id=conversation_id,
             status=status,
             details={
                 "trace_id": trace_id,

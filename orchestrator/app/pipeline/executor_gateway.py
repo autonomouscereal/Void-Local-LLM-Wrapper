@@ -25,7 +25,8 @@ async def execute(
     parser = JSONParser()
     for tool_call in (tool_calls or []):
         tool_call_dict = tool_call if isinstance(tool_call, dict) else {}
-        tool_name = tool_call_dict.get("tool_name")
+        # Check both "tool_name" (from planner) and "name" (OpenAI format) for compatibility
+        tool_name = tool_call_dict.get("tool_name") or tool_call_dict.get("name")
         if not isinstance(tool_name, str) or not tool_name.strip():
             continue
         tool_name = tool_name.strip()
