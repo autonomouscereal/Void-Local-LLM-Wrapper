@@ -10598,11 +10598,35 @@ async def chat_completions(request: Request):
                 tool_name = str(tr.get("tool_name") or tr.get("name") or "tool")
                 res = (tr or {}).get("result") if isinstance((tr or {}).get("result"), dict) else {}
                 logging.debug(f"chat_completions:tool_loop:res_keys={sorted(list(res.keys())) if isinstance(res, dict) else None!r}")
+                
+                # ALWAYS extract errors from both top-level and result - be transparent end-to-end
                 err_obj = (tr or {}).get("error")
-                logging.debug(f"chat_completions:tool_loop:err_obj_type={type(err_obj).__name__}")
-                if not err_obj and isinstance(res, dict):
-                    err_obj = res.get("error")
-                    logging.debug(f"chat_completions:tool_loop:err_obj_from_res type={type(err_obj).__name__}")
+                logging.debug(f"chat_completions:tool_loop:err_obj_from_tr type={type(err_obj).__name__}")
+                # Also check result.error (tools can produce results AND errors simultaneously)
+                if isinstance(res, dict) and res.get("error"):
+                    result_err = res.get("error")
+                    if isinstance(result_err, dict):
+                        # Merge result error with top-level error if both exist
+                        if isinstance(err_obj, dict):
+                            # Prefer result error details, but merge codes/messages
+                            err_obj = {
+                                **err_obj,
+                                **result_err,
+                                "code": result_err.get("code") or err_obj.get("code"),
+                                "message": result_err.get("message") or err_obj.get("message"),
+                            }
+                        else:
+                            err_obj = result_err
+                        logging.debug(f"chat_completions:tool_loop:err_obj_from_res type={type(err_obj).__name__}")
+                
+                # ALWAYS log errors for transparency (even if tool succeeded in producing results)
+                if isinstance(err_obj, (dict, str)) and err_obj:
+                    err_code = err_obj.get("code") if isinstance(err_obj, dict) else "unknown"
+                    err_msg = err_obj.get("message") if isinstance(err_obj, dict) else str(err_obj)
+                    logging.warning(
+                        f"chat_completions:tool_loop:tool_execution_error (may have partial results) "
+                        f"tool={tool_name!r} trace_id={trace_id!r} code={err_code!r} msg={err_msg!r}"
+                    )
                 # Executor does not echo args; executor_gateway attaches them back. Fall back to our input args.
                 args_echo = tr.get("args") if isinstance(tr.get("args"), dict) else {}
                 logging.debug(f"chat_completions:tool_loop:args_echo_keys={sorted(list(args_echo.keys())) if isinstance(args_echo, dict) else None!r}")
@@ -10617,6 +10641,8 @@ async def chat_completions(request: Request):
                     result_keys=(sorted(list(res.keys()))[:64] if isinstance(res, dict) else []),
                     args_preview=_args_preview_for_log(args_echo),
                     step_id=(tr.get("step_id") if isinstance(tr.get("step_id"), str) else None),
+                    has_error=bool(isinstance(err_obj, (dict, str)) and err_obj),
+                    error_code=(err_obj.get("code") if isinstance(err_obj, dict) else None),
                 )
                 logging.debug(f"chat_completions:tool_loop:after_exec ok={not isinstance(err_obj, (str, dict))}")
                 # Normalize artifacts in result using Artifact dataclass
@@ -10759,8 +10785,18 @@ async def chat_completions(request: Request):
                             f"chat_completions:tool_loop:tool_step_segment_qa failed tool={tool_name!r} ex={exc!r}",
                             exc_info=True,
                         )
+                    # ALWAYS ensure errors are included in tool_results for AI/UI transparency
+                    # tr already has error at top level from executor_gateway, but also ensure result.error is preserved
+                    if isinstance(tr, dict) and isinstance(res, dict) and res.get("error"):
+                        # Ensure result.error is also in the result (it should be, but double-check)
+                        if not tr.get("error") and res.get("error"):
+                            tr["error"] = res.get("error")
+                        # Also ensure result.error is in tr.result.error
+                        if isinstance(tr.get("result"), dict) and not tr["result"].get("error") and res.get("error"):
+                            tr["result"]["error"] = res.get("error")
+                    
                     tool_results.append(tr)
-                    logging.debug(f"chat_completions:tool_loop:tool_results appended len={len(tool_results)}")
+                    logging.debug(f"chat_completions:tool_loop:tool_results appended len={len(tool_results)} has_error={bool(tr.get('error') if isinstance(tr, dict) else False)}")
                     if extra_results:
                         tool_results.extend(extra_results)
                         logging.debug(f"chat_completions:tool_loop:tool_results extended with extra_results len={len(tool_results)}")
@@ -11444,6 +11480,7 @@ async def chat_completions(request: Request):
             response_text_for_teacher = last_assistant
 
         trace_payload = {
+            "trace_id": trace_id,
             "label": label_cfg or "exp_default",
             "seed": master_seed,
             "request": {"messages": messages, "tools_allowed": tools_allowed},

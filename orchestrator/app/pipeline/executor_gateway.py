@@ -218,13 +218,30 @@ async def execute(
             tool_name = tool_name.strip()
             tool_payload = produced_step.get("result") if isinstance(produced_step.get("result"), dict) else {}
 
-            # Preserve all executor-provided fields (e.g. artifacts/meta/timing),
+            # Preserve all executor-provided fields (e.g. artifacts/meta/timing/errors),
             # but ensure the canonical tool-result keys are present/normalized.
+            # CRITICAL: Always preserve errors from the result - tools can produce results AND errors simultaneously
             out: Dict[str, Any] = dict(produced_step)
             out["tool_name"] = tool_name
             out["result"] = tool_payload
             out["args"] = args_out
             out["step_id"] = step_id_str
+            
+            # ALWAYS preserve errors from the result for transparency (even if ok = True)
+            result_error = tool_payload.get("error") if isinstance(tool_payload, dict) else None
+            if isinstance(result_error, dict) and result_error:
+                # Log error for transparency (even if tool succeeded in producing results)
+                log.warning(
+                    "executor_gateway.execute: tool produced results with errors trace_id=%s tool=%s step_id=%s error_code=%s error_msg=%s",
+                    trace_id,
+                    tool_name,
+                    step_id_str,
+                    result_error.get("code"),
+                    result_error.get("message"),
+                )
+                # Ensure error is in the output (it's already in tool_payload, but also at top level for visibility)
+                out["error"] = result_error
+            
             results.append(out)
         return results
     err = (env or {}).get("error") or (env.get("result") or {}).get("error") or {}

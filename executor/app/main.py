@@ -443,6 +443,16 @@ def _canonical_tool_result(x: Dict[str, Any] | Any):
     qa = data.get("qa")
     if isinstance(qa, dict):
         out["qa"] = qa
+    
+    # ALWAYS preserve errors from the original response - be transparent end-to-end
+    # Errors can coexist with successful results (e.g., partial failures, warnings, etc.)
+    original_error = x.get("error") if isinstance(x, dict) else None
+    if isinstance(original_error, dict) and original_error:
+        out["error"] = original_error
+    # Also preserve status if present
+    original_status = x.get("status") if isinstance(x, dict) else None
+    if isinstance(original_status, int):
+        out["status"] = original_status
 
     return out
 
@@ -673,7 +683,6 @@ async def run_steps(trace_id: str, conversation_id: str, steps: list[dict]):
                         "conversation_id": conversation_id,
                     },
                 }
-                ok = False
                 # Still emit end events below; continue to next step.
                 # (Do not raise.)
                 res = {}
@@ -695,68 +704,101 @@ async def run_steps(trace_id: str, conversation_id: str, steps: list[dict]):
                         "status": 422,
                     },
                 }
-            elif bool(res.get("ok")) is True and res.get("result") is not None:
-                step_outputs_by_step_id[step_id] = {"tool_name": tool_name, "result": _canonical_tool_result(res)}
-                ok = True
-            elif bool(res.get("ok")) is False:
-                # Tool-layer error envelope (from utc_run_tool and/or orchestrator /tool.run).
-                # Prefer fields from the nested error object so logs always show a concrete
-                # code/message/detail instead of falling back to raw HTTP status only.
-                err_obj = res.get("error") if isinstance(res.get("error"), dict) else {}
-                code = err_obj.get("code") if isinstance(err_obj, dict) else None
-                msg = err_obj.get("message") if isinstance(err_obj, dict) else None
-                tb = err_obj.get("traceback") if isinstance(err_obj, dict) else None
-                code = code if isinstance(code, str) and code else "tool_error"
-                msg = msg if isinstance(msg, str) else ""
-                tb = tb if isinstance(tb, (str, bytes)) else ""
-                if tb:
-                    logging.error(tb if isinstance(tb, str) else str(tb))
-                # Capture a compact view of the executor/tool env for debugging.
-                env_fields: Dict[str, Any] = {}
-                for k in ("code", "message", "detail", "_http_status", "status"):
-                    if k in res:
-                        env_fields[k] = res[k]
-                # Also record the shape of the nested error payload so we can see where
-                # fields actually live when debugging.
-                if isinstance(err_obj, dict):
-                    env_fields["error_keys"] = sorted(err_obj.keys())
-                # Log using the normalized error object fields.
-                err_detail = None
-                if isinstance(err_obj, dict):
-                    err_detail = err_obj.get("details") or err_obj.get("detail")
-                logging.error(
-                    f"[executor] step_id={step_id!r} tool={tool_name!r} FAILED code={code!r} msg={msg!r} detail={err_detail!r} env={json.dumps(env_fields, sort_keys=True)!r}"
-                )
-                # Normalize the error payload so it always carries a meaningful message.
-                error_dict: Dict[str, Any] = err_obj if isinstance(err_obj, dict) else {}
-                if not isinstance(error_dict, dict):
-                    error_dict = {}
-                # Prefer status from the tool error payload when present.
-                status = error_dict.get("status") if isinstance(error_dict.get("status"), int) else (
-                    res.get("status") if isinstance(res.get("status"), int) else 422
-                )
-                if "code" not in error_dict and code:
-                    error_dict["code"] = code
-                if not error_dict.get("message"):
-                    error_dict["message"] = msg or f"{tool_name} failed with status {status}"
-                if "status" not in error_dict:
-                    error_dict["status"] = status
-                if tb and not any(k in error_dict for k in ("traceback", "stack", "stacktrace")):
-                    error_dict["traceback"] = tb
-                step_outputs_by_step_id[step_id] = {
-                    "tool_name": tool_name,
-                    "result": {
-                        "ids": {},
-                        "meta": {},
-                        "error": error_dict,
-                        "status": status,
-                        "trace_id": trace_id,
-                        "conversation_id": conversation_id,
-                    },
-                }
             else:
-                step_outputs_by_step_id[step_id] = {"tool_name": tool_name, "result": _canonical_tool_result(res or {})}
-                ok = True
+                # Always canonicalize the result first (this preserves errors from the original response)
+                canonical_result = _canonical_tool_result(res or {})
+                
+                # Check if there's an explicit error in the response - ALWAYS log and preserve it
+                err_obj = res.get("error") if isinstance(res.get("error"), dict) else {}
+                has_error = bool(err_obj and isinstance(err_obj, dict) and (err_obj.get("code") or err_obj.get("message")))
+                
+                # If there's an explicit error, normalize it and ensure it's in the result
+                if has_error:
+                    # Tool-layer error envelope (from utc_run_tool and/or orchestrator /tool.run).
+                    # Prefer fields from the nested error object so logs always show a concrete
+                    # code/message/detail instead of falling back to raw HTTP status only.
+                    code = err_obj.get("code") if isinstance(err_obj, dict) else None
+                    msg = err_obj.get("message") if isinstance(err_obj, dict) else None
+                    tb = err_obj.get("traceback") if isinstance(err_obj, dict) else None
+                    code = code if isinstance(code, str) and code else "tool_error"
+                    msg = msg if isinstance(msg, str) else ""
+                    tb = tb if isinstance(tb, (str, bytes)) else ""
+                    if tb:
+                        logging.error(tb if isinstance(tb, str) else str(tb))
+                    # Capture a compact view of the executor/tool env for debugging.
+                    env_fields: Dict[str, Any] = {}
+                    for k in ("code", "message", "detail", "_http_status", "status"):
+                        if k in res:
+                            env_fields[k] = res[k]
+                    # Also record the shape of the nested error payload so we can see where
+                    # fields actually live when debugging.
+                    if isinstance(err_obj, dict):
+                        env_fields["error_keys"] = sorted(err_obj.keys())
+                    # Log using the normalized error object fields - ALWAYS log errors for transparency
+                    err_detail = None
+                    if isinstance(err_obj, dict):
+                        err_detail = err_obj.get("details") or err_obj.get("detail")
+                    logging.warning(
+                        f"[executor] step_id={step_id!r} tool={tool_name!r} ERROR (may have partial results) code={code!r} msg={msg!r} detail={err_detail!r} env={json.dumps(env_fields, sort_keys=True)!r}"
+                    )
+                    # Normalize the error payload so it always carries a meaningful message.
+                    error_dict: Dict[str, Any] = err_obj if isinstance(err_obj, dict) else {}
+                    if not isinstance(error_dict, dict):
+                        error_dict = {}
+                    # Prefer status from the tool error payload when present.
+                    status = error_dict.get("status") if isinstance(error_dict.get("status"), int) else (
+                        res.get("status") if isinstance(res.get("status"), int) else 422
+                    )
+                    if "code" not in error_dict and code:
+                        error_dict["code"] = code
+                    if not error_dict.get("message"):
+                        error_dict["message"] = msg or f"{tool_name} had error with status {status}"
+                    if "status" not in error_dict:
+                        error_dict["status"] = status
+                    if tb and not any(k in error_dict for k in ("traceback", "stack", "stacktrace")):
+                        error_dict["traceback"] = tb
+                    # ALWAYS inject error into the canonical result (even if ok = True)
+                    if isinstance(canonical_result, dict):
+                        canonical_result["error"] = error_dict
+                        if "status" not in canonical_result:
+                            canonical_result["status"] = status
+                
+                # Store the result (with errors preserved if present)
+                step_outputs_by_step_id[step_id] = {"tool_name": tool_name, "result": canonical_result}
+            
+            # Determine ok based on whether the tool actually produced useful results
+            # (artifacts, ids, or meaningful data), NOT based on errors
+            final_result = step_outputs_by_step_id.get(step_id, {}).get("result", {})
+            if not isinstance(final_result, dict):
+                ok = False
+            else:
+                # Check for artifacts (most reliable indicator of success)
+                artifacts = final_result.get("artifacts")
+                has_artifacts = isinstance(artifacts, list) and len(artifacts) > 0
+                
+                # Check for ids (external identifiers indicate work was done)
+                ids = final_result.get("ids")
+                has_ids = isinstance(ids, dict) and len(ids) > 0
+                
+                # Check for meaningful meta data
+                meta = final_result.get("meta")
+                has_meaningful_meta = isinstance(meta, dict) and len(meta) > 0
+                
+                # Check for other result fields that indicate work was done
+                has_result_data = any(
+                    final_result.get(k) is not None 
+                    for k in ("url", "view_url", "data_url", "relative_url", "master_uri", "artifact_id", "windows", "ids")
+                )
+                
+                # ok = True if tool produced any useful results, regardless of errors
+                ok = has_artifacts or has_ids or has_meaningful_meta or has_result_data
+            # Extract error from final result for end_payload (always include errors for transparency)
+            final_result = step_outputs_by_step_id.get(step_id, {}).get("result", {})
+            final_error = final_result.get("error") if isinstance(final_result, dict) else None
+            final_traceback = None
+            if isinstance(final_error, dict):
+                final_traceback = final_error.get("traceback") or final_error.get("stack") or final_error.get("stacktrace")
+            
             end_payload = {
                 "t": int(time.time()*1000),
                 "event": "end",
@@ -766,9 +808,10 @@ async def run_steps(trace_id: str, conversation_id: str, steps: list[dict]):
                 "trace_id": trace_id,
                 "conversation_id": conversation_id,
                 "step_id": step_id,
-                # IMPORTANT: never emit string-typed errors; downstream expects dict envelopes.
-                "error": None,
-                "traceback": None,
+                # IMPORTANT: always include errors for transparency (even if ok = True)
+                # Downstream (AI, UI) needs to see all errors to make informed decisions
+                "error": final_error if isinstance(final_error, dict) else None,
+                "traceback": final_traceback if isinstance(final_traceback, (str, bytes)) else None,
                 "summary": (_distill_summary(step_outputs_by_step_id.get(step_id)) if ok else None),
             }
             if not ok:
