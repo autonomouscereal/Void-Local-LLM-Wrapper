@@ -59,29 +59,7 @@ STORY_MAX_PASSES = _env_int("STORY_MAX_PASSES", 0, min_value=0, max_value=1000)
 STORY_TEMPERATURE = _env_float("STORY_TEMPERATURE", 0.5, min_value=0.0, max_value=2.0)
 
 
-def _story_schema() -> Dict[str, Any]:
-    """
-    Schema used for committee_jsonify.
 
-    We keep the "classic" keys used by film2.run today (prompt/duration_hint_s/acts/characters/locations/objects),
-    and add richer fields for a real story engine without breaking callers.
-    """
-    return {
-        "prompt": str,
-        "duration_hint_s": float,
-        "logline": str,
-        "genre": list,
-        "tone": str,
-        "themes": list,
-        "constraints": list,
-        "characters": list,
-        "locations": list,
-        "objects": list,
-        "acts": list,
-        "continuity": dict,
-        "film_plan": dict,
-        "notes": dict,
-    }
 
 
 def _story_schema_template() -> Dict[str, Any]:
@@ -516,7 +494,9 @@ You MUST match this exact structure. All field names and nesting must be identic
 }, ensure_ascii=False)}
 
 ### [YOUR TASK]
-Produce the complete story graph as a single JSON object matching the exact structure above. Output ONLY the JSON object, no other text."""
+Produce the complete story graph as a single JSON object matching the exact structure above. Output ONLY the JSON object, no other text.
+
+CRITICAL: Do NOT wrap your output in wrapper keys like 'response', 'data', 'result', 'output', 'content', or 'json'. Output the story object directly at the top level."""
     user_msg = user_msg_content
     t0 = time.perf_counter()
     env = await committee_ai_text(
@@ -536,7 +516,7 @@ Produce the complete story graph as a single JSON object matching the exact stru
     # Keep trace_id constant - don't mutate it
     structured = await committee_jsonify(
         raw_text=txt,
-        expected_schema=_story_schema(),
+        expected_schema=_story_schema_template(),
         trace_id=trace_id,
         rounds=STORY_COMMITTEE_ROUNDS,
         temperature=0.0,
@@ -948,7 +928,9 @@ Example delta fixing missing dialogue fields:
 }, ensure_ascii=False)}
 
 ### [YOUR TASK]
-Fix the issues identified in the audit. Return ONLY the JSON delta with changes matching the exact structure above. No other text."""
+Fix the issues identified in the audit. Return ONLY the JSON delta with changes matching the exact structure above. No other text.
+
+CRITICAL: Do NOT wrap your output in wrapper keys like 'response', 'data', 'result', 'output', 'content', or 'json'. Output the delta object directly at the top level."""
     user_msg = user_msg_content
     # Keep trace_id constant - don't mutate it
     t0 = time.perf_counter()
@@ -962,11 +944,10 @@ Fix the issues identified in the audit. Return ONLY the JSON delta with changes 
     result_block = env.get("result") if isinstance(env, dict) else {}
     if isinstance(result_block, dict) and isinstance(result_block.get("text"), str):
         raw = str(result_block.get("text") or "")
-    # Use a more flexible schema for deltas (all fields optional)
-    delta_schema = {k: type(v) if isinstance(v, type) else type(v) if v is not None else Any for k, v in _story_schema().items()}
+    # Use story schema for deltas (JSONParser handles missing fields gracefully)
     parsed = await _jsonify_then_parse(
         raw_text=raw,
-        expected_schema=delta_schema,
+        expected_schema=_story_schema_template(),
         trace_id=trace_id,
         rounds=STORY_COMMITTEE_ROUNDS,
         temperature=STORY_TEMPERATURE,
@@ -1247,6 +1228,8 @@ Example: If base story has location_name "Ancient Temple" and delta updates it w
 ### [OUTPUT FORMAT]
 Output JSON ONLY with the complete merged story. The output must be a valid JSON object matching the exact structure above. Include ALL acts, scenes, beats, characters, locations, objects from both base and delta.
 
+CRITICAL: Do NOT wrap your output in wrapper keys like 'response', 'data', 'result', 'output', 'content', or 'json'. Output the story object directly at the top level.
+
 ### [DATA]
 {json.dumps({
     "user_prompt": _norm_prompt(user_prompt),
@@ -1274,7 +1257,7 @@ Output ONLY the complete merged story as JSON matching the exact structure above
     
     merged = await _jsonify_then_parse(
         raw_text=raw,
-        expected_schema=_story_schema(),
+        expected_schema=_story_schema_template(),
         trace_id=trace_id,
         rounds=STORY_COMMITTEE_ROUNDS,
         temperature=0.0,
@@ -1499,7 +1482,7 @@ async def draft_story_graph(user_prompt: str, duration_hint_s: Optional[float], 
     # Keep trace_id constant - don't mutate it
     story = await _jsonify_then_parse(
         raw_text=raw,
-        expected_schema=_story_schema(),
+        expected_schema=_story_schema_template(),
         trace_id=trace_id,
         rounds=STORY_COMMITTEE_ROUNDS,
         temperature=STORY_TEMPERATURE,
@@ -1722,6 +1705,8 @@ Example extension adding a new act:
 ### [OUTPUT FORMAT]
 Output MUST be a single JSON object (no markdown, no prose). The JSON should contain only new/extended content, structured the same way as the story schema but with only new items.
 
+CRITICAL: Do NOT wrap your output in wrapper keys like 'response', 'data', 'result', 'output', 'content', or 'json'. Output the extension delta object directly at the top level.
+
 ### [DATA]
 {json.dumps({
     "user_prompt": prompt_text,
@@ -1748,11 +1733,10 @@ Extend the story to meet the duration requirements. Return ONLY the JSON delta w
                 raw2 = str(rb2.get("text") or "")
             else:
                 raw2 = str(env2.get("text") or "")
-            # Use flexible schema for delta (all fields optional)
-            delta_schema = {k: type(v) if isinstance(v, type) else type(v) if v is not None else Any for k, v in _story_schema().items()}
+            # Use story schema for extension delta (JSONParser handles missing fields gracefully)
             extended_delta = await _jsonify_then_parse(
                 raw_text=raw2,
-                expected_schema=delta_schema,
+                expected_schema=_story_schema_template(),
                 trace_id=trace_id,
                 rounds=STORY_COMMITTEE_ROUNDS,
                 temperature=STORY_TEMPERATURE,
