@@ -363,28 +363,6 @@ def _extract_system_messages(messages: List[Dict[str, Any]]) -> List[str]:
     return sys_msgs
 
 
-def _build_revision_system_message(member_id: str, round_num: int, original_sys_msgs: List[str]) -> str:
-    """Build the revision system message with task context preserved."""
-    sys_msg_parts: List[str] = [f"You are committee member {member_id}. This is revision for debate round {round_num}."]
-    
-    # Include key context from original system message if it contains task-specific instructions
-    if original_sys_msgs:
-        combined_sys = "\n".join(original_sys_msgs)
-        if "Story Engine" in combined_sys or "story" in combined_sys.lower():
-            sys_msg_parts.append("Your task is to produce a story graph in JSON format.")
-            sys_msg_parts.append("Output MUST be a single JSON object (no markdown, no code fences, no prose).")
-        elif "JSONFixer" in combined_sys:
-            sys_msg_parts.append("Your task is to fix and return valid JSON matching the expected schema.")
-            sys_msg_parts.append("Output ONLY the JSON object, no prefixes or markdown.")
-        elif "PlannerOps" in combined_sys or ("tool" in combined_sys.lower() and "plan" in combined_sys.lower()):
-            sys_msg_parts.append("Your task is to produce a tool execution plan in JSON format.")
-            sys_msg_parts.append("Output MUST be a JSON object with a 'steps' array.")
-    
-    sys_msg_parts.append("Revise your answer using the critiques. Output ONLY your full final answer.")
-    sys_msg_parts.append("All content must be written in English only. Do NOT respond in any other language.")
-    sys_msg_parts.append("CRITICAL: Use ONLY ASCII characters. NO emojis, NO special Unicode symbols, NO non-ASCII characters. Replace any non-ASCII with ASCII equivalents.")
-    
-    return "\n".join(sys_msg_parts)
 
 
 async def _committee_draft_phase(
@@ -399,13 +377,24 @@ async def _committee_draft_phase(
     Returns:
         Tuple of (answers dict, member_results dict)
     """
+    original_sys_msgs = _extract_system_messages(messages)
+    original_sys_combined = "\n".join(original_sys_msgs) if original_sys_msgs else ""
+    
     answers: Dict[str, str] = {}
     member_results: Dict[str, Dict[str, Any]] = {}
     for mid in member_ids:
         log.info(f"[committee] member_draft.start trace_id={trace_id} round={round_num} member={mid}")
-        sys_txt = f"You are committee member {mid}. Provide your best answer to the user.\nAll content must be written in English only. Do NOT respond in any other language.\nCRITICAL: Use ONLY ASCII characters. NO emojis, NO special Unicode symbols, NO non-ASCII characters. Replace any non-ASCII with ASCII equivalents."
+        
+        # Merge committee prompt with original system messages
+        committee_prompt = f"You are committee member {mid}. Provide your best answer to the user."
+        if original_sys_combined:
+            merged_sys = f"{committee_prompt}\n\n{original_sys_combined}"
+        else:
+            merged_sys = committee_prompt
+        merged_sys += "\nAll content must be written in English only. Do NOT respond in any other language.\nCRITICAL: Use ONLY ASCII characters. NO emojis, NO special Unicode symbols, NO non-ASCII characters. Replace any non-ASCII with ASCII equivalents."
+        
         user_msgs = _extract_user_messages(messages)
-        member_msgs = [{"role": "system", "content": sys_txt}] + user_msgs
+        member_msgs = [{"role": "system", "content": merged_sys}] + user_msgs
         emit_trace(state_dir=STATE_DIR, trace_id=trace_id, kind="committee.member_draft", payload={"trace_id": trace_id, "round": round_num, "member": mid})
         res = await committee_member_text(member_id=mid, messages=member_msgs, trace_id=trace_id, temperature=temperature)
         member_results[mid] = res if isinstance(res, dict) else {}
@@ -428,6 +417,9 @@ async def _committee_critique_phase(
     Returns:
         Tuple of (critiques dict, critique_results dict)
     """
+    original_sys_msgs = _extract_system_messages(messages)
+    original_sys_combined = "\n".join(original_sys_msgs) if original_sys_msgs else ""
+    
     critiques: Dict[str, str] = {}
     critique_results: Dict[str, Dict[str, Any]] = {}
     for mid in member_ids:
@@ -439,16 +431,24 @@ async def _committee_critique_phase(
             otext = answers.get(oid) or ""
             if isinstance(otext, str) and otext.strip():
                 other_blocks.append(f"Answer from {oid}:\n{otext.strip()}")
-        critique_txt = (
+        
+        # Merge committee prompt with original system messages
+        committee_prompt = (
             f"You are committee member {mid}. This is cross-critique for debate round {round_num}.\n"
             f"Critique the other answers. Identify concrete mistakes, missing considerations, and specific improvements.\n"
-            f"Return a concise bullet list.\n"
-            + ("\n\n".join(other_blocks) if other_blocks else "")
-            + "\nAll content must be written in English only. Do NOT respond in any other language.\n"
-            + "CRITICAL: Use ONLY ASCII characters. NO emojis, NO special Unicode symbols, NO non-ASCII characters. Replace any non-ASCII with ASCII equivalents."
+            f"Return a concise bullet list."
         )
+        if other_blocks:
+            committee_prompt += "\n\n" + "\n\n".join(other_blocks)
+        
+        if original_sys_combined:
+            merged_sys = f"{committee_prompt}\n\n{original_sys_combined}"
+        else:
+            merged_sys = committee_prompt
+        merged_sys += "\nAll content must be written in English only. Do NOT respond in any other language.\nCRITICAL: Use ONLY ASCII characters. NO emojis, NO special Unicode symbols, NO non-ASCII characters. Replace any non-ASCII with ASCII equivalents."
+        
         user_msgs = _extract_user_messages(messages)
-        member_msgs = [{"role": "system", "content": critique_txt}] + user_msgs
+        member_msgs = [{"role": "system", "content": merged_sys}] + user_msgs
         emit_trace(state_dir=STATE_DIR, trace_id=trace_id, kind="committee.member_critique", payload={"trace_id": trace_id, "round": round_num, "member": mid})
         res = await committee_member_text(member_id=mid, messages=member_msgs, trace_id=trace_id, temperature=temperature)
         critique_results[mid] = res if isinstance(res, dict) else {}
@@ -474,13 +474,19 @@ async def _committee_revision_phase(
         Tuple of (updated answers dict, member_results dict)
     """
     original_sys_msgs = _extract_system_messages(messages)
+    original_sys_combined = "\n".join(original_sys_msgs) if original_sys_msgs else ""
     member_results: Dict[str, Dict[str, Any]] = {}
     
     for mid in member_ids:
         log.info(f"[committee] member_revision.start trace_id={trace_id} round={round_num} member={mid}")
         
-        # Build revision system message with task context
-        sys_msg = _build_revision_system_message(mid, round_num, original_sys_msgs)
+        # Merge committee prompt with original system messages
+        committee_prompt = f"You are committee member {mid}. This is revision for debate round {round_num}.\nRevise your answer using the critiques. Output ONLY your full final answer."
+        if original_sys_combined:
+            merged_sys = f"{committee_prompt}\n\n{original_sys_combined}"
+        else:
+            merged_sys = committee_prompt
+        merged_sys += "\nAll content must be written in English only. Do NOT respond in any other language.\nCRITICAL: Use ONLY ASCII characters. NO emojis, NO special Unicode symbols, NO non-ASCII characters. Replace any non-ASCII with ASCII equivalents."
         
         # Build context as structured user messages
         context_msgs: List[Dict[str, Any]] = []
@@ -510,44 +516,10 @@ async def _committee_revision_phase(
         if isinstance(prior, str) and prior.strip():
             context_msgs.append({"role": "user", "content": f"### Your Current Answer\n\n{prior.strip()}"})
         
-        # For Story Engine tasks, add critical reminder about structure
-        if original_sys_msgs:
-            combined_sys = "\n".join(original_sys_msgs)
-            if "Story Engine" in combined_sys or "story" in combined_sys.lower():
-                # Extract schema template from original user messages if available
-                user_msgs = _extract_user_messages(messages)
-                schema_reminder = ""
-                for um in user_msgs:
-                    content = str(um.get("content", "") or "")
-                    if "EXACT JSON STRUCTURE REQUIRED" in content or "story graph" in content.lower():
-                        # Extract the schema section if present
-                        if "### [EXACT JSON STRUCTURE REQUIRED]" in content:
-                            schema_start = content.find("### [EXACT JSON STRUCTURE REQUIRED]")
-                            schema_end = content.find("### [KEY REQUIREMENTS]", schema_start)
-                            if schema_end == -1:
-                                schema_end = content.find("### [USER REQUEST]", schema_start)
-                            if schema_end == -1:
-                                schema_end = content.find("### [YOUR TASK]", schema_start)
-                            if schema_end > schema_start:
-                                schema_reminder = content[schema_start:schema_end].strip()
-                                break
-                
-                if schema_reminder:
-                    context_msgs.append({
-                        "role": "user",
-                        "content": f"""### [CRITICAL REMINDER - YOUR OUTPUT MUST MATCH THIS STRUCTURE]
-
-{schema_reminder}
-
-CRITICAL: Your revision MUST be a complete story graph matching the exact structure above. Do NOT output notes, animation scripts, or any other format. Output ONLY the JSON story graph object.
-
-CRITICAL: Do NOT wrap your output in wrapper keys like 'response', 'data', 'result', 'output', 'content', or 'json'. Output the story object directly at the top level."""
-                    })
-        
-        # Replace ALL system messages with revision system message, keep only user messages from original
+        # Keep original user messages from input
         user_msgs = _extract_user_messages(messages)
-        # Structure: system message, then context messages, then original user messages
-        member_msgs = [{"role": "system", "content": sys_msg}] + context_msgs + user_msgs
+        # Structure: merged system message, then context messages, then original user messages
+        member_msgs = [{"role": "system", "content": merged_sys}] + context_msgs + user_msgs
         emit_trace(state_dir=STATE_DIR, trace_id=trace_id, kind="committee.member_revision", payload={"trace_id": trace_id, "round": round_num, "member": mid})
         res = await committee_member_text(member_id=mid, messages=member_msgs, trace_id=trace_id, temperature=temperature)
         member_results[mid] = res if isinstance(res, dict) else {}
@@ -572,10 +544,22 @@ async def _committee_synthesis_phase(
     Returns:
         Tuple of (synthesized text, synth_env dict)
     """
+    original_sys_msgs = _extract_system_messages(messages)
+    original_sys_combined = "\n".join(original_sys_msgs) if original_sys_msgs else ""
+    
+    # Merge committee prompt with original system messages
+    committee_prompt_parts: List[str] = []
+    committee_prompt_parts.append("You are the committee synthesizer. Produce one final answer.")
+    committee_prompt_parts.append("Rules: resolve conflicts by correctness; do not mention the committee or multiple models; output English only.")
+    committee_prompt = "\n".join(committee_prompt_parts)
+    
+    if original_sys_combined:
+        merged_sys = f"{committee_prompt}\n\n{original_sys_combined}"
+    else:
+        merged_sys = committee_prompt
+    merged_sys += "\nCRITICAL: Use ONLY ASCII characters. NO emojis, NO special Unicode symbols, NO non-ASCII characters. Replace any non-ASCII with ASCII equivalents."
+    
     synth_parts: List[str] = []
-    synth_parts.append("You are the committee synthesizer. Produce one final answer.")
-    synth_parts.append("Rules: resolve conflicts by correctness; do not mention the committee or multiple models; output English only.")
-    synth_parts.append("CRITICAL: Use ONLY ASCII characters. NO emojis, NO special Unicode symbols, NO non-ASCII characters. Replace any non-ASCII with ASCII equivalents.")
     synth_parts.append("### Candidate Answers")
     for mid in member_ids:
         ans = answers.get(mid) or ""
@@ -588,8 +572,9 @@ async def _committee_synthesis_phase(
             if isinstance(crit, str) and crit.strip():
                 synth_parts.append(f"#### {mid}\n{crit.strip()}")
     synth_parts.append("### Task\nSynthesize the best final answer. Output ONLY the final answer.")
+    
     user_msgs = _extract_user_messages(messages)
-    synth_messages = [{"role": "system", "content": "\n\n".join(synth_parts)}] + user_msgs
+    synth_messages = [{"role": "system", "content": merged_sys}] + [{"role": "user", "content": "\n\n".join(synth_parts)}] + user_msgs
     emit_trace(state_dir=STATE_DIR, trace_id=trace_id, kind="committee.synth.request", payload={"trace_id": trace_id, "synth_member": "qwen"})
     t_synth = time.monotonic()
     synth_env = await committee_synth_text(messages=synth_messages, trace_id=trace_id, temperature=0.0, synth_member="qwen")

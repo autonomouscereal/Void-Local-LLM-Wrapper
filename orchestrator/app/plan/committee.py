@@ -187,20 +187,125 @@ async def produce_tool_plan(
         "OUTPUT FORMAT (REQUIRED):\n"
         "Return ONLY strict JSON: {\"steps\":[{\"step_id\":\"s1\",\"tool_name\":\"<name>\",\"args\":{...}}]} — no extra keys.\n"
         "For pure chat answers with no tool use, return {\"steps\":[]}.\n\n"
+        "CRITICAL: Each step MUST have EXACTLY these fields:\n"
+        "- \"step_id\": a unique string (e.g., \"s1\", \"s2\", ...)\n"
+        "- \"tool_name\": a string matching one of the allowed_tools from the catalog\n"
+        "- \"args\": an object containing the tool's arguments per its JSON schema\n"
+        "DO NOT use fields like \"description\", \"elements\", \"details\", \"warning\", \"disclaimer\" - these are INVALID.\n"
+        "DO NOT provide conceptual plans or instructions - you MUST call actual tools.\n\n"
         "RULES:\n"
         f"- mode: {effective_mode}\n"
         f"- allowed_tools: {', '.join(allowed_tools) if allowed_tools else '(none)'}\n"
         "- Each step MUST include a unique string field step_id (e.g., \"s1\", \"s2\", ...).\n"
         "- Each step MUST include a string field tool_name (use one of the allowed_tools listed above).\n"
+        "- Each step MUST include an args object with the tool's required parameters.\n"
         "- Do NOT invent tool names. Use ONLY tools from the catalog above.\n"
         "- If the user asks for any images/video/music/audio/TTS, you MUST include at least one tool step.\n"
+        "- For video/film requests, you MUST call \"film2.run\" with appropriate args (prompt, duration_seconds, etc.).\n"
+        "- For music/audio requests, you MUST call \"music.infinite.windowed\" or other audio tools.\n"
         "- You are a PLANNER. Your job is to plan tool calls, not to refuse or explain limitations.\n"
         "- The system has tools available to create videos, images, music, and audio. Plan the tool calls needed to fulfill the user's request.\n"
         "- DO NOT provide explanations or tutorials. DO NOT refuse requests. DO NOT say you cannot do something.\n"
+        "- DO NOT return conceptual steps with \"description\" or \"elements\" - these are NOT tool calls.\n"
         "- ALWAYS produce a JSON object with a \"steps\" array, even if empty.\n"
         "- Your response MUST be valid JSON starting with { and ending with }.\n"
     )
 
+    # Build comprehensive examples based on common use cases
+    examples = []
+    
+    # Example 1: Video/Film request
+    if "film2.run" in allowed_tools:
+        examples.append("""### [EXAMPLE 1: Video/Film Request]
+User: "make a 20 second film of shadow the hedgehog fighting charizard"
+Output:
+{
+  "steps": [
+    {
+      "step_id": "s1",
+      "tool_name": "film2.run",
+      "args": {
+        "prompt": "Shadow the Hedgehog and Charizard engaged in a high-energy battle on a shattered battlefield under a stormy sky. Dynamic camera angles include rapid close-ups during strikes, wide shots for aerial maneuvers, and low-angle shots for dramatic impact.",
+        "duration_seconds": 20.0,
+        "fps": 60,
+        "width": 1920,
+        "height": 1080
+      }
+    }
+  ]
+}""")
+    
+    # Example 2: Music request
+    if "music.infinite.windowed" in allowed_tools:
+        examples.append("""### [EXAMPLE 2: Music Request]
+User: "create a 30 second epic battle theme"
+Output:
+{
+  "steps": [
+    {
+      "step_id": "s1",
+      "tool_name": "music.infinite.windowed",
+      "args": {
+        "prompt": "epic battle theme with intense electronic beats, orchestral hits, and dramatic crescendos",
+        "length_s": 30,
+        "window_bars": 8,
+        "overlap_bars": 1,
+        "mode": "start",
+        "instrumental_only": true
+      }
+    }
+  ]
+}""")
+    
+    # Example 3: Image request
+    if "image.dispatch" in allowed_tools:
+        examples.append("""### [EXAMPLE 3: Image Request]
+User: "generate an image of a cyberpunk cityscape"
+Output:
+{
+  "steps": [
+    {
+      "step_id": "s1",
+      "tool_name": "image.dispatch",
+      "args": {
+        "prompt": "cyberpunk cityscape with neon lights, flying cars, and towering skyscrapers at night"
+      }
+    }
+  ]
+}""")
+    
+    # Example 4: Combined video + music
+    if "film2.run" in allowed_tools and "music.infinite.windowed" in allowed_tools:
+        examples.append("""### [EXAMPLE 4: Video + Music Request]
+User: "make a 20 second film with epic music"
+Output:
+{
+  "steps": [
+    {
+      "step_id": "s1",
+      "tool_name": "film2.run",
+      "args": {
+        "prompt": "epic battle scene with dynamic camera movements and intense action",
+        "duration_seconds": 20.0
+      }
+    },
+    {
+      "step_id": "s2",
+      "tool_name": "music.infinite.windowed",
+      "args": {
+        "prompt": "epic battle theme matching the film's intensity and pacing",
+        "length_s": 20,
+        "window_bars": 8,
+        "overlap_bars": 1,
+        "mode": "start",
+        "instrumental_only": true
+      }
+    }
+  ]
+}""")
+    
+    examples_text = "\n\n".join(examples) if examples else ""
+    
     # Combine all planner instructions into a single comprehensive instruction block
     # This will be embedded in the user message to ensure it's not filtered out
     planner_instructions = f"""### [SYSTEM INSTRUCTIONS - READ CAREFULLY]
@@ -211,22 +316,54 @@ async def produce_tool_plan(
 
 {planner_rules}
 
-### [OUTPUT EXAMPLE]
-Here is exactly what your output should look like:
-{{"steps": [{{"step_id": "s1", "tool_name": "image.dispatch", "args": {{"prompt": "a cat"}}}}]}}
+{examples_text}
+
+### [VALID vs INVALID EXAMPLES]
+
+VALID (CORRECT):
+{{
+  "steps": [
+    {{
+      "step_id": "s1",
+      "tool_name": "film2.run",
+      "args": {{
+        "prompt": "a battle scene",
+        "duration_seconds": 20.0
+      }}
+    }}
+  ]
+}}
+
+INVALID (WRONG - DO NOT DO THIS):
+{{
+  "steps": [
+    {{
+      "description": "Create a conceptual script for a 20-second film",
+      "elements": [
+        "A dark, eerie forest where characters engage in combat"
+      ]
+    }}
+  ]
+}}
 
 ### [CRITICAL REMINDER]
 - You MUST output ONLY a JSON object starting with {{ and ending with }}.
 - Do NOT include any text before or after the JSON.
 - Do NOT provide explanations, tutorials, or refusals.
-- Your ONLY job is to produce a tool plan as JSON.
+- Do NOT use fields like "description", "elements", "details", "warning", "disclaimer".
+- Your ONLY job is to produce a tool plan as JSON with "step_id", "tool_name", and "args" fields.
 - If you cannot fulfill the request, return {{"steps": []}} instead of explaining."""
 
     # Embed planner instructions in the first user message to ensure they're not filtered
+    # Preserve system messages from input and merge with planner instructions
     plan_messages = []
     if messages:
-        first_user_msg = messages[0] if messages[0].get("role") == "user" else None
-        if first_user_msg:
+        # Extract system messages from input
+        sys_msgs = [m for m in messages if isinstance(m, dict) and m.get("role") == "system"]
+        user_msgs = [m for m in messages if isinstance(m, dict) and m.get("role") == "user"]
+        
+        if user_msgs:
+            first_user_msg = user_msgs[0]
             # Prepend planner instructions to the user's message
             enhanced_content = f"""{planner_instructions}
 
@@ -236,16 +373,31 @@ Here is exactly what your output should look like:
 ### [YOUR TASK - READ THIS CAREFULLY]
 1. Analyze the user request above.
 2. Determine which tools from the catalog are needed to fulfill the request.
-3. Create a JSON object with a "steps" array containing tool calls.
-4. Output ONLY the JSON object - no explanations, no tutorials, no refusals.
-5. Your response must start with {{ and end with }}.
-6. Example format: {{"steps": [{{"step_id": "s1", "tool_name": "tool.name", "args": {{}}}}]}}
+3. Create a JSON object with EXACTLY this structure:
+   {{
+     "steps": [
+       {{
+         "step_id": "s1",
+         "tool_name": "tool.name",
+         "args": {{
+           "arg1": "value1",
+           "arg2": "value2"
+         }}
+       }}
+     ]
+   }}
+4. For video/film requests: use "film2.run" with "prompt" and "duration_seconds" in args.
+5. For music requests: use "music.infinite.windowed" with "prompt" and "length_s" in args.
+6. Output ONLY the JSON object - no explanations, no tutorials, no refusals.
+7. Your response must start with {{ and end with }}.
+8. DO NOT use "description", "elements", "details", or any other fields - ONLY "step_id", "tool_name", and "args".
 
 NOW PRODUCE YOUR JSON TOOL PLAN:"""
-            plan_messages = [{"role": "user", "content": enhanced_content}] + messages[1:]
+            # Preserve system messages, then enhanced user message, then remaining user messages
+            plan_messages = sys_msgs + [{"role": "user", "content": enhanced_content}] + user_msgs[1:]
         else:
-            # No user message found, add instructions as a user message
-            plan_messages = [{"role": "user", "content": planner_instructions}]
+            # No user message found, preserve system messages and add instructions as a user message
+            plan_messages = sys_msgs + [{"role": "user", "content": planner_instructions}]
     else:
         plan_messages = [{"role": "user", "content": planner_instructions}]
 

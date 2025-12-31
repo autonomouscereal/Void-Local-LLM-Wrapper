@@ -91,8 +91,6 @@ def _is_transient(err: Dict[str, Any]):
     return False
 
 
-def _stack_str():
-    return "".join(traceback.format_stack())
 
 
 async def utc_run_tool(trace_id: str, conversation_id: str, step_id: Optional[str], tool_name: str, args: Dict[str, Any]):
@@ -126,13 +124,23 @@ async def utc_run_tool(trace_id: str, conversation_id: str, step_id: Optional[st
 
     # If orchestrator returned a non-dict, surface that as a structured error envelope.
     if not isinstance(res, dict):
+        logging.error(
+            f"[utc_runner] non_dict_response tool_name={tool_name!r} trace_id={trace_id} conversation_id={conversation_id} res_type={type(res).__name__} res_repr={repr(res)[:500]}"
+        )
+        exc_tb = traceback.format_exc()
         return _build_error_envelope(
             code="utc_non_dict_response",
             message=f"_post returned non-dict for tool {tool_name}",
             trace_id=trace_id,
             conversation_id=conversation_id,
             status=422,
-            details={"raw": res, "stack": _stack_str()},
+            details={
+                "raw": res,
+                "res_type": type(res).__name__,
+                "res_repr": repr(res)[:1000],
+                "stack": exc_tb,
+                "traceback": exc_tb,
+            },
         )
 
     # Ensure we always attach a trace_id to the response envelope.
@@ -146,13 +154,22 @@ async def utc_run_tool(trace_id: str, conversation_id: str, step_id: Optional[st
     # and message instead of (code=None, msg=None, detail=None).
     if "ok" not in res:
         status = int(res.get("status") or res.get("_http_status") or 422)
+        logging.error(
+            f"[utc_runner] tool_missing_ok tool_name={tool_name!r} trace_id={trace_id} conversation_id={conversation_id} status={status} res_keys={sorted(list(res.keys())) if isinstance(res, dict) else []}"
+        )
+        exc_tb = traceback.format_exc()
         return _build_error_envelope(
             code="tool_missing_ok",
             message=f"orchestrator /tool.run did not return an 'ok' field for tool {tool_name}",
             trace_id=trace_id,
             conversation_id=conversation_id,
             status=status,
-            details={"raw": res, "stack": _stack_str()},
+            details={
+                "raw": res,
+                "res_keys": sorted(list(res.keys())) if isinstance(res, dict) else [],
+                "stack": exc_tb,
+                "traceback": exc_tb,
+            },
         )
 
     # If orchestrator indicates success (ok != False), pass envelope through.
@@ -224,9 +241,20 @@ async def utc_run_tool(trace_id: str, conversation_id: str, step_id: Optional[st
                 break
         if tool_stack is not None:
             break
-    # Always include a human-readable stack string as `stack`; preserve any structured tool stack
-    # separately so downstream callers can safely do `.get(...)` on it.
-    final_stack = tool_stack if isinstance(tool_stack, (str, bytes)) and tool_stack else _stack_str()
+    # Preserve any structured tool stack separately so downstream callers can safely do `.get(...)` on it.
+    # Always include stack/traceback - use tool_stack if available, otherwise generate one.
+    final_stack = tool_stack if isinstance(tool_stack, (str, bytes)) and tool_stack else None
+    if not final_stack:
+        try:
+            final_stack = traceback.format_exc()
+        except Exception:
+            final_stack = "<stack trace unavailable>"
+    
+    # Log the error with full context
+    logging.error(
+        f"[utc_runner] tool_error tool_name={tool_name!r} trace_id={trace_id} conversation_id={conversation_id} code={err_obj.get('code')} message={err_obj.get('message')} status={status}"
+    )
+    
     return _build_error_envelope(
         code=str(err_obj.get("code") or "tool_error"),
         message=str(err_obj.get("message") or f"tool {tool_name} failed"),
@@ -237,6 +265,7 @@ async def utc_run_tool(trace_id: str, conversation_id: str, step_id: Optional[st
             "raw": res,
             "tool_stack": (tool_stack if isinstance(tool_stack, (dict, list)) else None),
             "stack": final_stack,
+            "traceback": final_stack,
         },
     )
 

@@ -2933,7 +2933,12 @@ async def propose_search_queries(messages: List[Dict[str, Any]]) -> List[str]:
         "Return each query on its own line with no extra text."
     )
     # Use full conversation for search suggestions - needs context to understand what queries would help
-    prompt_messages = list(messages or []) + [{"role": "user", "content": guidance}]
+    # Preserve system messages from input, add task system message if none exist
+    sys_msgs = [m for m in (messages or []) if isinstance(m, dict) and m.get("role") == "system"]
+    user_msgs = [m for m in (messages or []) if isinstance(m, dict) and m.get("role") != "system"]
+    if not sys_msgs:
+        sys_msgs = [{"role": "system", "content": "You are a search query assistant. Analyze the conversation and propose helpful search queries."}]
+    prompt_messages = sys_msgs + user_msgs + [{"role": "user", "content": guidance}]
     try:
         env = await committee_ai_text(messages=prompt_messages, trace_id="search_suggest", temperature=DEFAULT_TEMPERATURE)
     except Exception as ex:
@@ -10085,7 +10090,12 @@ async def chat_completions2(request: Request):
     # For chat_completions2 endpoint, generate a new trace_id (this is a direct API endpoint)
     conversation_id_for_trace = str(body.get("conversation_id") or "").strip() if isinstance(body, dict) else ""
     trace_id = _generate_trace_id(seed=conversation_id_for_trace)
-    env = await committee_ai_text(messages=(body.get("messages")), trace_id=trace_id)
+    # Preserve messages from request, ensure it's a list
+    request_messages = body.get("messages") if isinstance(body, dict) else None
+    if not isinstance(request_messages, list):
+        request_messages = []
+    # Preserve system messages from request - committee will merge them with committee prompts
+    env = await committee_ai_text(messages=request_messages, trace_id=trace_id)
     log.debug(f"chat_completions:env={env}")
     body_text = json.dumps(env, ensure_ascii=False)
     body_bytes = body_text.encode("utf-8")
@@ -11031,8 +11041,11 @@ async def chat_completions(request: Request):
                     break
         
         compose_messages = []
+        # Always include a system message describing the task
+        sys_content = "You are composing a final response to the user based on tool execution results."
         if tool_results:
-            compose_messages.append({"role": "system", "content": "Tool results:\n" + json.dumps(tool_results, indent=2)})
+            sys_content += "\n\nTool results:\n" + json.dumps(tool_results, indent=2)
+        compose_messages.append({"role": "system", "content": sys_content})
         if user_request_content:
             compose_messages.append({"role": "user", "content": user_request_content})
 

@@ -56,9 +56,6 @@ except Exception as _ex:
 log = logging.getLogger(__name__)
 
 
-def _stack_str():
-    """Return a best-effort string representation of the current call stack."""
-    return "".join(traceback.format_stack())
 
 
 @app.on_event("startup")
@@ -467,14 +464,18 @@ async def execute_plan(body: Dict[str, Any]):
     conversation_id = str(body.get("conversation_id") or "").strip() if isinstance(body, dict) and isinstance(body.get("conversation_id"), (str, int)) else ""
 
     if not isinstance(plan_obj, dict):
-        stk = _stack_str()
+        logging.error(
+            f"[executor] invalid_plan_body trace_id={trace_id} conversation_id={conversation_id} body_type={type(body).__name__} body_keys={sorted(list(body.keys())) if isinstance(body, dict) else []}"
+        )
         err_env = {
             "code": "invalid_plan_body",
-            "message": stk,
+            "message": "missing_or_invalid_plan",
             "status": 400,
-            "details": {"reason": "missing_or_invalid_plan"},
-            "traceback": stk,
-            "stack": stk,
+            "details": {
+                "reason": "missing_or_invalid_plan",
+                "body_type": type(body).__name__,
+                "body_keys": sorted(list(body.keys())) if isinstance(body, dict) else [],
+            },
             "trace_id": trace_id,
             "conversation_id": conversation_id,
         }
@@ -482,14 +483,18 @@ async def execute_plan(body: Dict[str, Any]):
     else:
         raw_steps = plan_obj.get("plan") or []
         if not isinstance(raw_steps, list):
-            stk = _stack_str()
+            logging.error(
+                f"[executor] invalid_plan_type trace_id={trace_id} conversation_id={conversation_id} plan_type={type(raw_steps).__name__} plan_repr={repr(raw_steps)[:500]}"
+            )
             err_env = {
                 "code": "invalid_plan_type",
-                "message": stk,
+                "message": "plan.plan must be a list",
                 "status": 422,
-                "details": {"reason": "plan.plan must be a list"},
-                "traceback": stk,
-                "stack": stk,
+                "details": {
+                    "reason": "plan.plan must be a list",
+                    "plan_type": type(raw_steps).__name__,
+                    "plan_repr": repr(raw_steps)[:500],
+                },
                 "trace_id": trace_id,
                 "conversation_id": conversation_id,
             }
@@ -605,6 +610,9 @@ async def run_steps(trace_id: str, conversation_id: str, steps: list[dict]):
         runnable = [step_id for step_id in pending if dependencies[step_id].issubset(satisfied)]
         if not runnable:
             # Deadlock or missing dependency: synthesize a tool-style error for the whole plan.
+            logging.error(
+                f"[executor] deadlock_or_missing trace_id={trace_id} conversation_id={conversation_id} pending={sorted(list(pending))} runnable={sorted(list(runnable))} norm_steps_keys={sorted(list(norm_steps.keys()))}"
+            )
             step_outputs_by_step_id["__plan__"] = {
                 "tool_name": "executor",
                 "result": {
@@ -613,9 +621,14 @@ async def run_steps(trace_id: str, conversation_id: str, steps: list[dict]):
                     "error": {
                         "code": "deadlock_or_missing",
                         "message": "executor detected a dependency deadlock or missing dependency",
-                        "stack": _stack_str(),
                         "trace_id": trace_id,
                         "conversation_id": conversation_id,
+                        "status": 422,
+                        "details": {
+                            "pending": sorted(list(pending)),
+                            "runnable": sorted(list(runnable)),
+                            "norm_steps_keys": sorted(list(norm_steps.keys())),
+                        },
                     },
                     "status": 422,
                 },
@@ -634,6 +647,9 @@ async def run_steps(trace_id: str, conversation_id: str, steps: list[dict]):
             step = norm_steps[step_id]
             tool_name = (step.get("tool") or "").strip()
             if not tool_name:
+                logging.error(
+                    f"[executor] missing_tool step_id={step_id!r} trace_id={trace_id} conversation_id={conversation_id} step_keys={sorted(list(step.keys())) if isinstance(step, dict) else []}"
+                )
                 step_outputs_by_step_id[step_id] = {
                     "tool_name": "executor",
                     "result": {
@@ -642,9 +658,13 @@ async def run_steps(trace_id: str, conversation_id: str, steps: list[dict]):
                         "error": {
                             "code": "missing_tool",
                             "message": f"missing tool for step_id {step_id}",
-                            "stack": _stack_str(),
                             "trace_id": trace_id,
                             "conversation_id": conversation_id,
+                            "status": 422,
+                            "details": {
+                                "step_keys": sorted(list(step.keys())) if isinstance(step, dict) else [],
+                                "step_repr": repr(step)[:500] if isinstance(step, dict) else str(step)[:500],
+                            },
                         },
                         "status": 422,
                     },
@@ -666,6 +686,11 @@ async def run_steps(trace_id: str, conversation_id: str, steps: list[dict]):
             try:
                 res = await utc_run_tool(trace_id, conversation_id, step_id, tool_name, args)
             except Exception as ex:
+                exc_tb = traceback.format_exc()
+                logging.error(
+                    f"[executor] utc_run_tool exception step_id={step_id!r} tool={tool_name!r} trace_id={trace_id} conversation_id={conversation_id} exception_type={type(ex).__name__} exception={ex!r}",
+                    exc_info=True
+                )
                 step_outputs_by_step_id[step_id] = {
                     "tool_name": tool_name,
                     "result": {
@@ -674,10 +699,18 @@ async def run_steps(trace_id: str, conversation_id: str, steps: list[dict]):
                         "error": {
                             "code": "utc_exception",
                             "message": f"utc_run_tool raised: {ex}",
-                            "stack": _stack_str(),
                             "trace_id": trace_id,
                             "conversation_id": conversation_id,
-                            "details": {"tool": tool_name, "step_id": step_id},
+                            "status": 500,
+                            "details": {
+                                "tool": tool_name,
+                                "step_id": step_id,
+                                "exception": str(ex),
+                                "exception_type": type(ex).__name__,
+                                "exception_repr": repr(ex),
+                            },
+                            "traceback": exc_tb,
+                            "stack": exc_tb,
                         },
                         "status": 500,
                         "trace_id": trace_id,
@@ -690,8 +723,11 @@ async def run_steps(trace_id: str, conversation_id: str, steps: list[dict]):
                 # Exception occurred, so ok = False
                 ok = False
             # Guard: utc_run_tool must never return None/non-dict; if it does, wrap in a result block
-            # that matches existing executor result structure (ids/meta/error/status), with a stack.
+            # that matches existing executor result structure (ids/meta/error/status).
             if not isinstance(res, dict):
+                logging.error(
+                    f"[executor] non_dict_result step_id={step_id!r} tool={tool_name!r} trace_id={trace_id} conversation_id={conversation_id} result_type={type(res).__name__} result_repr={repr(res)[:500]}"
+                )
                 step_outputs_by_step_id[step_id] = {
                     "tool_name": tool_name,
                     "result": {
@@ -700,9 +736,13 @@ async def run_steps(trace_id: str, conversation_id: str, steps: list[dict]):
                         "error": {
                             "code": "executor_non_dict_result",
                             "message": f"utc_run_tool returned {type(res).__name__} for tool {tool_name}",
-                            "stack": _stack_str(),
                             "trace_id": trace_id,
                             "conversation_id": conversation_id,
+                            "status": 422,
+                            "details": {
+                                "result_type": type(res).__name__,
+                                "result_repr": repr(res)[:1000],
+                            },
                         },
                         "status": 422,
                     },
@@ -807,7 +847,11 @@ async def run_steps(trace_id: str, conversation_id: str, steps: list[dict]):
                         ok = has_artifacts or has_ids or has_meaningful_meta or has_result_data
                 except Exception as ex:
                     # If processing the result fails, log it and set ok = False
-                    logging.error(f"[executor] step_id={step_id!r} tool={tool_name!r} result processing failed: {ex}", exc_info=True)
+                    exc_tb = traceback.format_exc()
+                    logging.error(
+                        f"[executor] result processing exception step_id={step_id!r} tool={tool_name!r} trace_id={trace_id} conversation_id={conversation_id} exception_type={type(ex).__name__} exception={ex!r}",
+                        exc_info=True
+                    )
                     step_outputs_by_step_id[step_id] = {
                         "tool_name": tool_name,
                         "result": {
@@ -816,9 +860,16 @@ async def run_steps(trace_id: str, conversation_id: str, steps: list[dict]):
                             "error": {
                                 "code": "result_processing_exception",
                                 "message": f"Failed to process tool result: {ex}",
-                                "stack": _stack_str(),
                                 "trace_id": trace_id,
                                 "conversation_id": conversation_id,
+                                "status": 500,
+                                "details": {
+                                    "exception": str(ex),
+                                    "exception_type": type(ex).__name__,
+                                    "exception_repr": repr(ex),
+                                },
+                                "traceback": exc_tb,
+                                "stack": exc_tb,
                             },
                             "status": 500,
                         },
@@ -916,17 +967,20 @@ async def execute_http(body: Dict[str, Any]):
     error_obj: Dict[str, Any] | None = None
 
     if not steps:
-        # No steps: synthesize an explicit invalid_plan error, but keep the
-        # human-friendly message separate from the low-level stack trace.
+        # No steps: synthesize an explicit invalid_plan error.
+        logging.error(
+            f"[executor] invalid_plan_no_steps trace_id={trace_id} conversation_id={conversation_id} body_keys={sorted(list(body.keys())) if isinstance(body, dict) else []} body_type={type(body).__name__}"
+        )
         step_outputs_by_step_id = {}
-        stk = _stack_str()
         error_obj = {
             "code": "invalid_plan",
             "message": "no steps provided to executor; 'steps' field is required",
             "status": 422,
-            "details": {"reason": "steps required"},
-            "traceback": stk,
-            "stack": stk,
+            "details": {
+                "reason": "steps required",
+                "body_keys": sorted(list(body.keys())) if isinstance(body, dict) else [],
+                "body_type": type(body).__name__,
+            },
         }
     else:
         step_outputs_by_step_id = await run_steps(trace_id, conversation_id, steps)
@@ -976,19 +1030,26 @@ async def execute_http(body: Dict[str, Any]):
                 if isinstance(msg, str) and msg and msg.strip()
                 else f"step {first_sid} ({tool_name or 'tool'}) failed with status {status}"
             )
-            stk = (
-                traceback_text
-                if isinstance(traceback_text, (str, bytes)) and traceback_text
-                else _stack_str()
-            )
+            stk = traceback_text if isinstance(traceback_text, (str, bytes)) and traceback_text else None
+            if not stk:
+                try:
+                    stk = traceback.format_exc()
+                except Exception:
+                    stk = "<stack trace unavailable>"
             status_int = int(status) if isinstance(status, int) else 422
+            logging.error(
+                f"[executor] step_failed trace_id={trace_id} conversation_id={conversation_id} step_id={first_sid} tool={tool_name!r} code={code!r} message={human_msg!r} status={status_int}"
+            )
             error_obj = {
                 "code": code,
                 "message": human_msg,
                 "status": status_int,
                 "tool": tool_name,
                 "step": first_sid,
-                "details": {"summary": human_msg, "tool_error": err_obj or {}},
+                "details": {
+                    "summary": human_msg,
+                    "tool_error": err_obj or {},
+                },
                 # Full underlying traceback/stack from the failing tool is still present here.
                 "traceback": stk,
                 "stack": stk,
