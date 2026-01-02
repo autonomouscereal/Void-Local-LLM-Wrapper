@@ -193,122 +193,167 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str):
         kind="committee.ollama.request",
         payload={"trace_id": trace_id, "base_url": base_url, "model": model, "payload": payload},
     )
-    async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
-        t_http = time.monotonic()
-        resp = await client.post(url=f"{base_url.rstrip('/')}/api/chat", json=dict(payload))
-        status_code = int(resp.status_code)
-        raw_content = resp.content or b""
-        encoding = resp.encoding or "utf-8"
-        raw_text = raw_content.decode(encoding, errors="replace") if raw_content else ""
-        log.info(
-            "[committee] ollama.http.response trace_id=%s base=%s model=%r status=%d http_dur_ms=%d content_type=%r raw=%s",
-            trace_id,
-            base_url,
-            model,
-            status_code,
-            int((time.monotonic() - t_http) * 1000.0),
-            resp.headers.get("content-type"),
-            raw_text,
-        )
-        parser = JSONParser()
-        t_parse = time.monotonic()
-        try:
-            parsed_obj = parser.parse(raw_text or "{}", {})
-            if not isinstance(parsed_obj, dict):
-                log.warning("[committee] ollama.parsed: JSONParser returned non-dict type=%s trace_id=%s base=%s model=%r", type(parsed_obj).__name__, trace_id, base_url, model)
-                parsed_obj = {}
-        except Exception as ex:
-            log.warning("[committee] ollama.parse_exception trace_id=%s base=%s model=%r ex=%s raw_text_prefix=%s", trace_id, base_url, model, ex, (raw_text or "")[:200], exc_info=True)
-            parsed_obj = {}
-        parsed = parsed_obj if isinstance(parsed_obj, dict) else {}
-        log.info(
-            "[committee] ollama.parsed trace_id=%s base=%s model=%r status=%d parse_dur_ms=%d parsed=%s",
-            trace_id,
-            base_url,
-            model,
-            status_code,
-            int((time.monotonic() - t_parse) * 1000.0),
-            json.dumps(parsed, ensure_ascii=False, default=str),
-        )
-        if parser.errors:
-            log.warning(
-                "[committee] ollama.parser_errors trace_id=%s base=%s model=%r status=%d last_error=%r errors=%s",
+    try:
+        async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
+            t_http = time.monotonic()
+            try:
+                resp = await client.post(url=f"{base_url.rstrip('/')}/api/chat", json=dict(payload))
+            except Exception as req_ex:
+                dur_ms = int((time.monotonic() - t_http) * 1000.0)
+                log.error(
+                    "[committee] ollama.request_exception trace_id=%s base=%s model=%r dur_ms=%d ex=%s ex_type=%s",
+                    trace_id, base_url, model, dur_ms, req_ex, type(req_ex).__name__, exc_info=True
+                )
+                emit_trace(
+                    state_dir=STATE_DIR,
+                    trace_id=trace_id,
+                    kind="committee.ollama.request_exception",
+                    payload={"trace_id": trace_id, "base_url": base_url, "dur_ms": dur_ms, "error": str(req_ex), "error_type": type(req_ex).__name__},
+                )
+                return {"ok": False, "error": {"code": "ollama_request_exception", "message": f"Request failed: {str(req_ex)}", "base_url": base_url, "error_type": type(req_ex).__name__}}
+            status_code = int(resp.status_code)
+            raw_content = resp.content or b""
+            encoding = resp.encoding or "utf-8"
+            try:
+                raw_text = raw_content.decode(encoding, errors="replace") if raw_content else ""
+            except Exception as decode_ex:
+                log.error(
+                    "[committee] ollama.decode_error trace_id=%s base=%s model=%r status=%d encoding=%s ex=%s",
+                    trace_id, base_url, model, status_code, encoding, decode_ex, exc_info=True
+                )
+                raw_text = raw_content.decode("utf-8", errors="replace") if raw_content else ""
+            log.info(
+                "[committee] ollama.http.response trace_id=%s base=%s model=%r status=%d http_dur_ms=%d content_type=%r raw=%s",
                 trace_id,
                 base_url,
                 model,
                 status_code,
-                parser.last_error,
-                json.dumps(list(parser.errors), ensure_ascii=False, default=str),
+                int((time.monotonic() - t_http) * 1000.0),
+                resp.headers.get("content-type"),
+                raw_text,
             )
-        if not (200 <= status_code < 300):
-            err_text = parsed.get("error") if isinstance(parsed.get("error"), str) else raw_text
+            parser = JSONParser()
+            t_parse = time.monotonic()
+            try:
+                parsed_obj = parser.parse(raw_text or "{}", {})
+                if not isinstance(parsed_obj, dict):
+                    log.warning("[committee] ollama.parsed: JSONParser returned non-dict type=%s trace_id=%s base=%s model=%r", type(parsed_obj).__name__, trace_id, base_url, model)
+                    parsed_obj = {}
+            except Exception as ex:
+                log.warning("[committee] ollama.parse_exception trace_id=%s base=%s model=%r ex=%s raw_text_prefix=%s", trace_id, base_url, model, ex, (raw_text or "")[:200], exc_info=True)
+                parsed_obj = {}
+            parsed = parsed_obj if isinstance(parsed_obj, dict) else {}
+            log.info(
+                "[committee] ollama.parsed trace_id=%s base=%s model=%r status=%d parse_dur_ms=%d parsed=%s",
+                trace_id,
+                base_url,
+                model,
+                status_code,
+                int((time.monotonic() - t_parse) * 1000.0),
+                json.dumps(parsed, ensure_ascii=False, default=str),
+            )
+            if parser.errors:
+                log.warning(
+                    "[committee] ollama.parser_errors trace_id=%s base=%s model=%r status=%d last_error=%r errors=%s",
+                    trace_id,
+                    base_url,
+                    model,
+                    status_code,
+                    parser.last_error,
+                    json.dumps(list(parser.errors), ensure_ascii=False, default=str),
+                )
+            if not (200 <= status_code < 300):
+                err_text = parsed.get("error") if isinstance(parsed.get("error"), str) else raw_text
+                emit_trace(
+                    state_dir=STATE_DIR,
+                    trace_id=trace_id,
+                    kind="committee.ollama.http_error",
+                    payload={"trace_id": trace_id, "base_url": base_url, "status_code": status_code, "error": err_text, "raw": raw_text, "parsed": parsed},
+                )
+                log.error(
+                    "[committee] ollama.http_error trace_id=%s base=%s model=%r status=%d dur_ms=%d error=%s raw=%s",
+                    trace_id,
+                    base_url,
+                    model,
+                    status_code,
+                    int((time.monotonic() - t_all) * 1000.0),
+                    err_text,
+                    raw_text,
+                )
+                return {"ok": False, "error": {"code": "ollama_http_error", "message": f"ollama returned HTTP {status_code}", "status": status_code, "base_url": base_url, "details": {"error": err_text}}}
+            response_str = ""
+            try:
+                msg = parsed.get("message") if isinstance(parsed.get("message"), dict) else {}
+                if isinstance(msg.get("content"), str):
+                    response_str = str(msg.get("content") or "")
+                elif isinstance(parsed.get("response"), str):
+                    response_str = str(parsed.get("response") or "")
+                response_str = _sanitize_mojibake_text(response_str or "")
+            except Exception as extract_ex:
+                log.error(
+                    "[committee] ollama.extract_response_error trace_id=%s base=%s model=%r ex=%s",
+                    trace_id, base_url, model, extract_ex, exc_info=True
+                )
+                response_str = ""
+            prompt_eval_val = parsed.get("prompt_eval_count")
+            eval_count_val = parsed.get("eval_count")
+            prompt_eval = int(prompt_eval_val) if isinstance(prompt_eval_val, (int, float)) else 0
+            eval_count = int(eval_count_val) if isinstance(eval_count_val, (int, float)) else 0
+            data: Dict[str, Any] = {"ok": True, "response": response_str, "prompt_eval_count": prompt_eval, "eval_count": eval_count}
+            usage = None
+            if prompt_eval or eval_count:
+                usage = {"prompt_tokens": int(prompt_eval), "completion_tokens": int(eval_count)}
+                usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
+                data["_usage"] = usage
+            log.info(
+                "[committee] ollama.response base=%s model=%r trace_id=%s status=%d usage=%s response=%s",
+                base_url,
+                model,
+                trace_id,
+                status_code,
+                usage,
+                response_str,
+            )
+            log.info(
+                "[committee] ollama.call.finish trace_id=%s ok=true dur_ms=%d status=%d usage=%s response=%s",
+                trace_id,
+                int((time.monotonic() - t_all) * 1000.0),
+                status_code,
+                usage,
+                response_str,
+            )
             emit_trace(
                 state_dir=STATE_DIR,
                 trace_id=trace_id,
-                kind="committee.ollama.http_error",
-                payload={"trace_id": trace_id, "base_url": base_url, "status_code": status_code, "error": err_text, "raw": raw_text, "parsed": parsed},
+                kind="committee.ollama.response",
+                payload={
+                    "trace_id": trace_id,
+                    "status_code": status_code,
+                    "usage": (usage or {}),
+                    "payload": payload,
+                    "raw": raw_text,
+                    "parsed": parsed,
+                    "response_text": response_str,
+                    "response_obj": data,
+                },
             )
-            log.error(
-                "[committee] ollama.http_error trace_id=%s base=%s model=%r status=%d dur_ms=%d error=%s raw=%s",
-                trace_id,
-                base_url,
-                model,
-                status_code,
-                int((time.monotonic() - t_all) * 1000.0),
-                err_text,
-                raw_text,
+            return data
+    except Exception as outer_ex:
+        dur_ms = int((time.monotonic() - t_all) * 1000.0)
+        log.error(
+            "[committee] ollama.unhandled_exception trace_id=%s base=%s model=%r dur_ms=%d ex=%s ex_type=%s",
+            trace_id, base_url, model, dur_ms, outer_ex, type(outer_ex).__name__, exc_info=True
+        )
+        try:
+            emit_trace(
+                state_dir=STATE_DIR,
+                trace_id=trace_id,
+                kind="committee.ollama.unhandled_exception",
+                payload={"trace_id": trace_id, "base_url": base_url, "model": model, "dur_ms": dur_ms, "error": str(outer_ex), "error_type": type(outer_ex).__name__},
             )
-            return {"ok": False, "error": {"code": "ollama_http_error", "message": f"ollama returned HTTP {status_code}", "status": status_code, "base_url": base_url, "details": {"error": err_text}}}
-        response_str = ""
-        msg = parsed.get("message") if isinstance(parsed.get("message"), dict) else {}
-        if isinstance(msg.get("content"), str):
-            response_str = str(msg.get("content") or "")
-        elif isinstance(parsed.get("response"), str):
-            response_str = str(parsed.get("response") or "")
-        response_str = _sanitize_mojibake_text(response_str or "")
-        prompt_eval_val = parsed.get("prompt_eval_count")
-        eval_count_val = parsed.get("eval_count")
-        prompt_eval = int(prompt_eval_val) if isinstance(prompt_eval_val, (int, float)) else 0
-        eval_count = int(eval_count_val) if isinstance(eval_count_val, (int, float)) else 0
-        data: Dict[str, Any] = {"ok": True, "response": response_str, "prompt_eval_count": prompt_eval, "eval_count": eval_count}
-        usage = None
-        if prompt_eval or eval_count:
-            usage = {"prompt_tokens": int(prompt_eval), "completion_tokens": int(eval_count)}
-            usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
-            data["_usage"] = usage
-        log.info(
-            "[committee] ollama.response base=%s model=%r trace_id=%s status=%d usage=%s response=%s",
-            base_url,
-            model,
-            trace_id,
-            status_code,
-            usage,
-            response_str,
-        )
-        log.info(
-            "[committee] ollama.call.finish trace_id=%s ok=true dur_ms=%d status=%d usage=%s response=%s",
-            trace_id,
-            int((time.monotonic() - t_all) * 1000.0),
-            status_code,
-            usage,
-            response_str,
-        )
-        emit_trace(
-            state_dir=STATE_DIR,
-            trace_id=trace_id,
-            kind="committee.ollama.response",
-            payload={
-                "trace_id": trace_id,
-                "status_code": status_code,
-                "usage": (usage or {}),
-                "payload": payload,
-                "raw": raw_text,
-                "parsed": parsed,
-                "response_text": response_str,
-                "response_obj": data,
-            },
-        )
-        return data
+        except Exception:
+            pass
+        return {"ok": False, "error": {"code": "ollama_unhandled_exception", "message": f"Unhandled exception in call_ollama: {str(outer_ex)}", "base_url": base_url, "error_type": type(outer_ex).__name__}}
 
 
 async def committee_member_text(member_id: str, messages: List[Dict[str, Any]], *, trace_id: str, temperature: float | None = None):

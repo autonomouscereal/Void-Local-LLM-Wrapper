@@ -276,6 +276,23 @@ def _load_sr_components(sr_root: str) -> Tuple[Optional[torch.nn.Module], Option
         sr_transformer_path = os.path.join(sr_root, SR_TRANSFORMER_SUBFOLDER)
         if not os.path.isdir(sr_transformer_path):
             raise RuntimeError(f"SR transformer path does not exist: {sr_transformer_path}")
+        
+        # Check for config.json and fix patch_size if it's a list instead of tuple
+        config_path = os.path.join(sr_transformer_path, "config.json")
+        if os.path.isfile(config_path):
+            try:
+                with open(config_path, "r", encoding="utf-8") as f:
+                    config_data = json.load(f)
+                # Fix patch_size if it's a list
+                if "patch_size" in config_data and isinstance(config_data["patch_size"], list):
+                    config_data["patch_size"] = tuple(config_data["patch_size"])
+                    logging.getLogger(__name__).info("SR transformer: fixed patch_size from list to tuple in config.json")
+                    # Write back the fixed config
+                    with open(config_path, "w", encoding="utf-8") as f:
+                        json.dump(config_data, f, indent=2)
+            except Exception as config_fix_ex:
+                logging.getLogger(__name__).warning("SR transformer: failed to fix config.json, will try loading anyway: %s", config_fix_ex)
+        
         sr_transformer = HunyuanVideo15Transformer3DModel.from_pretrained(
             sr_transformer_path,
             torch_dtype=t_dtype,
