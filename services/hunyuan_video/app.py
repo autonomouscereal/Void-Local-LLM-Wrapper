@@ -12,6 +12,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import torch
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from PIL import Image
@@ -26,7 +27,36 @@ from diffusers.utils import export_to_video
 
 from void_json.json_parser import JSONParser
 
-APP = FastAPI(title="HunyuanVideo Service", version="1.5+sr")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    _configure_logging()
+    _ensure_dirs()
+
+    global PIPE, PIPE_MODEL_ID, SR_TRANSFORMER, SR_UPSAMPLER, SR_SCHEDULER
+
+    PIPE = _load_base_pipe(model_id=DEFAULT_MODEL_ID)
+    PIPE_MODEL_ID = DEFAULT_MODEL_ID if PIPE is not None else None
+
+    # Load SR components
+    SR_TRANSFORMER, SR_UPSAMPLER, SR_SCHEDULER = _load_sr_components(SR_ROOT)
+
+    logging.getLogger(__name__).info(
+        "startup complete base_loaded=%s sr_loaded=%s base_model=%s sr_root=%s",
+        bool(PIPE),
+        bool(SR_TRANSFORMER and SR_UPSAMPLER and SR_SCHEDULER),
+        PIPE_MODEL_ID,
+        SR_ROOT,
+    )
+    
+    yield
+    
+    # Shutdown (if needed)
+    pass
+
+
+APP = FastAPI(title="HunyuanVideo Service", version="1.5+sr", lifespan=lifespan)
 
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/workspace/uploads")
 LOG_DIR = os.getenv("LOG_DIR", "/workspace/logs")
@@ -188,18 +218,17 @@ def _load_base_pipe(model_id: str) -> Optional[HunyuanVideo15Pipeline]:
 
     t0 = time.monotonic()
     try:
-        transformer = HunyuanVideo15Transformer3DModel.from_pretrained(
-            model_id,
-            subfolder="transformer",
-            torch_dtype=t_dtype,
-            local_files_only=True,
-        )
+        # Load pipeline normally - it will load all components including guider
+        # We can optionally override transformer dtype after loading
         pipe = HunyuanVideo15Pipeline.from_pretrained(
             model_id,
-            transformer=transformer,
             torch_dtype=p_dtype,
             local_files_only=True,
         )
+        
+        # Override transformer dtype if different from pipe dtype
+        if t_dtype != p_dtype and hasattr(pipe, "transformer"):
+            pipe.transformer = pipe.transformer.to(dtype=t_dtype)
 
         _maybe_set_attention_backend(pipe, DEFAULT_ATTENTION_BACKEND)
         _maybe_enable_tiling_and_offload(pipe, dev)
@@ -243,25 +272,31 @@ def _load_sr_components(sr_root: str) -> Tuple[Optional[torch.nn.Module], Option
     )
 
     try:
-        # SR transformer
+        # SR transformer - load from subfolder, but construct full path to avoid root config.json issues
+        sr_transformer_path = os.path.join(sr_root, SR_TRANSFORMER_SUBFOLDER)
+        if not os.path.isdir(sr_transformer_path):
+            raise RuntimeError(f"SR transformer path does not exist: {sr_transformer_path}")
         sr_transformer = HunyuanVideo15Transformer3DModel.from_pretrained(
-            sr_root,
-            subfolder=SR_TRANSFORMER_SUBFOLDER,
+            sr_transformer_path,
             torch_dtype=t_dtype,
             local_files_only=True,
         )
 
-        # SR scheduler (FlowMatch Euler)
+        # SR scheduler - load from subfolder
+        sr_scheduler_path = os.path.join(sr_root, SR_SCHEDULER_SUBFOLDER)
+        if not os.path.isdir(sr_scheduler_path):
+            raise RuntimeError(f"SR scheduler path does not exist: {sr_scheduler_path}")
         sr_scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-            sr_root,
-            subfolder=SR_SCHEDULER_SUBFOLDER,
+            sr_scheduler_path,
             local_files_only=True,
         )
 
-        # SR upsampler (AutoModel chooses the correct class from config)
+        # SR upsampler - load from subfolder
+        sr_upsampler_path = os.path.join(sr_root, SR_UPSAMPLER_SUBFOLDER)
+        if not os.path.isdir(sr_upsampler_path):
+            raise RuntimeError(f"SR upsampler path does not exist: {sr_upsampler_path}")
         sr_upsampler = AutoModel.from_pretrained(
-            sr_root,
-            subfolder=SR_UPSAMPLER_SUBFOLDER,
+            sr_upsampler_path,
             torch_dtype=p_dtype,
             local_files_only=True,
         )
@@ -790,26 +825,6 @@ def _run_generate_dict(data: Dict[str, Any]):
     }
 
 
-@APP.on_event("startup")
-def _startup():
-    _configure_logging()
-    _ensure_dirs()
-
-    global PIPE, PIPE_MODEL_ID, SR_TRANSFORMER, SR_UPSAMPLER, SR_SCHEDULER
-
-    PIPE = _load_base_pipe(model_id=DEFAULT_MODEL_ID)
-    PIPE_MODEL_ID = DEFAULT_MODEL_ID if PIPE is not None else None
-
-    # Load SR components
-    SR_TRANSFORMER, SR_UPSAMPLER, SR_SCHEDULER = _load_sr_components(SR_ROOT)
-
-    logging.getLogger(__name__).info(
-        "startup complete base_loaded=%s sr_loaded=%s base_model=%s sr_root=%s",
-        bool(PIPE),
-        bool(SR_TRANSFORMER and SR_UPSAMPLER and SR_SCHEDULER),
-        PIPE_MODEL_ID,
-        SR_ROOT,
-    )
 
 
 @APP.get("/healthz")
