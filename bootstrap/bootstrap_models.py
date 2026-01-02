@@ -1,12 +1,19 @@
-'''
-bootstrap models script
-'''
+"""
+bootstrap models script (HunyuanVideo-1.5 + official 1080p SR)
+
+Key behaviors:
+- OFFLINE runtime: services must load from /opt/models/*
+- Hunyuan dirs are VERSIONED:
+  - If existing content != expected repo/patterns => DELETE and re-download
+- Other model dirs remain idempotent "if non-empty => skip" (no forced redownload)
+"""
 
 import os
 import sys
 import json
 import subprocess
 import time
+import shutil
 from pathlib import Path
 
 
@@ -29,16 +36,40 @@ HF_MAX_WORKERS = int(os.environ.get("HF_MAX_WORKERS", "4"))
 STATUS_PATH = os.path.join(MODELS_DIR, "manifests", "bootstrap_status.json")
 STATUS: dict[str, dict[str, dict[str, str]]] = {"hf": {}, "git": {}}
 
+META_FILE = ".bootstrap_meta.json"
+
 def write_status() -> None:
     os.makedirs(os.path.dirname(STATUS_PATH), exist_ok=True)
     with open(STATUS_PATH, "w", encoding="utf-8") as f:
         json.dump(STATUS, f, indent=2)
 
 
-HF_MODELS = [
-    ("tencent/HunyuanVideo",                  "hunyuan",        None),
-    # Diffusers-format weights used by services/hunyuan_video (preferred for diffusers pipelines)
-    ("hunyuanvideo-community/HunyuanVideo",   "hunyuan_diffusers", None),
+# --- HunyuanVideo-1.5 targets ---
+# Keep directory names stable for your compose mounts/env:
+# - /opt/models/hunyuan_diffusers => diffusers-format 720p T2V checkpoint
+# - /opt/models/hunyuan => official Tencent repo subset containing SR weights (1080p SR + upsampler + scheduler + VAE)
+HUNYUAN15_DIFFUSERS_720P_T2V = "hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v"
+HUNYUAN15_TENCENT = "tencent/HunyuanVideo-1.5"
+
+# Version-enforced keys: if mismatch => delete + redownload
+VERSIONED_KEYS = {
+    "hunyuan",           # SR subset from Tencent repo
+    "hunyuan_diffusers", # 720p T2V diffusers weights
+}
+
+HF_MODELS: list[tuple[str, str, list[str] | None]] = [
+    # Official Tencent SR assets for 720->1080.
+    # NOTE: allow_patterns prevents downloading the entire Tencent repo.
+    (HUNYUAN15_TENCENT, "hunyuan", [
+        "transformer/1080p_sr_distilled/*",
+        "upsampler/1080p_sr_distilled/*",
+        "scheduler/*",
+        "vae/*",
+        "model_index.json",
+        "*.json",
+    ]),
+    # Diffusers-format 720p T2V checkpoint (what the service loads as HYVIDEO_MODEL_ID).
+    (HUNYUAN15_DIFFUSERS_720P_T2V, "hunyuan_diffusers", None),
     ("Lightricks/LTX-Video",                  "ltx_video",      None),
     ("InstantX/InstantID",                    "instantid",      None),
     ("h94/IP-Adapter",                        "ip_adapter",     None),
@@ -125,6 +156,39 @@ def log(*a: object) -> None:
     print("[bootstrap]", *a, flush=True)
 
 
+def _meta_expected(repo_id: str, allow_patterns: list[str] | None) -> dict:
+    return {
+        "repo_id": repo_id,
+        "allow_patterns": allow_patterns or None,
+    }
+
+
+def _read_meta(tgt: str) -> dict | None:
+    p = os.path.join(tgt, META_FILE)
+    if not os.path.isfile(p):
+        return None
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _write_meta(tgt: str, meta: dict) -> None:
+    p = os.path.join(tgt, META_FILE)
+    try:
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2)
+    except Exception as ex:
+        log("WARN: failed to write meta", p, ex)
+
+
+def _rm_tree(path: str) -> None:
+    if not path or path in ("/", "/opt", "/opt/models"):
+        raise RuntimeError(f"refusing to delete unsafe path: {path!r}")
+    shutil.rmtree(path, ignore_errors=True)
+
+
 def human(n: float) -> str:
     units = ["B", "KB", "MB", "GB", "TB"]
     v = float(n)
@@ -145,13 +209,32 @@ def ensure_pkg() -> None:
 def snapshot(repo_id: str, local_key: str, allow_patterns: list[str] | None = None) -> None:
     from huggingface_hub import snapshot_download
     tgt = os.path.join(MODELS_DIR, local_key)
-    if os.path.isdir(tgt) and os.listdir(tgt):
-        log("exists", local_key, "->", tgt)
-        return
-    # Guard: skip invalid repo ids (paths/env-like assignments)
+
+    # Guard: skip invalid repo ids
     if not isinstance(repo_id, str) or "=" in repo_id or repo_id.strip().startswith(("/", "./", "../")):
         log("skip-invalid-repo-id", repo_id, "->", tgt)
         return
+
+    # Versioned behavior for hunyuan dirs: mismatch => delete + redownload
+    if local_key in VERSIONED_KEYS and os.path.isdir(tgt) and os.listdir(tgt):
+        expected = _meta_expected(repo_id, allow_patterns)
+        meta = _read_meta(tgt)
+        if meta != expected:
+            log("VERSION-MISMATCH", local_key)
+            log("  expected:", expected)
+            log("  found   :", meta)
+            log("  deleting:", tgt)
+            _rm_tree(tgt)
+        else:
+            log("exists", local_key, "->", tgt, "(version ok)")
+            return
+
+    # Legacy behavior for non-versioned: if non-empty, skip
+    if local_key not in VERSIONED_KEYS:
+        if os.path.isdir(tgt) and os.listdir(tgt):
+            log("exists", local_key, "->", tgt)
+            return
+
     log("START-HF", repo_id, "->", tgt)
     os.makedirs(tgt, exist_ok=True)
     STATUS.setdefault("hf", {})[local_key] = {"repo": repo_id, "state": "downloading"}
@@ -179,6 +262,11 @@ def snapshot(repo_id: str, local_key: str, allow_patterns: list[str] | None = No
             snapshot_download(**kw)
     STATUS["hf"][local_key]["state"] = "done"
     write_status()
+
+    # Write meta for versioned keys
+    if local_key in VERSIONED_KEYS:
+        _write_meta(tgt, _meta_expected(repo_id, allow_patterns))
+
     log("DONE-HF", repo_id, "->", tgt)
 
 

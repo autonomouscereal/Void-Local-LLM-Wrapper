@@ -27,11 +27,11 @@ from .trace_utils import emit_trace
 log = logging.getLogger(__name__)
 
 QWEN_BASE_URL = os.getenv("QWEN_BASE_URL", "http://localhost:11435")
-QWEN_MODEL_ID = os.getenv("QWEN_MODEL_ID", "qwen3:30b-a3b-instruct-2507-q4_K_M")
+QWEN_MODEL_ID = os.getenv("QWEN_MODEL_ID", "huihui_ai/qwen3-abliterated:30b-a3b-q4_K_M")
 GLM_OLLAMA_BASE_URL = os.getenv("GLM_OLLAMA_BASE_URL", "http://localhost:11433")
-GLM_MODEL_ID = os.getenv("GLM_MODEL_ID", "glm4:9b")
+GLM_MODEL_ID = os.getenv("GLM_MODEL_ID", "alibilge/Huihui-GLM-4.6V-Flash-abliterated:fp16")
 DEEPSEEK_CODER_OLLAMA_BASE_URL = os.getenv("DEEPSEEK_CODER_OLLAMA_BASE_URL", "http://localhost:11436")
-DEEPSEEK_CODER_MODEL_ID = os.getenv("DEEPSEEK_CODER_OLLAMA_BASE_URL", None) and os.getenv("DEEPSEEK_CODER_MODEL_ID", "deepseek-coder-v2:lite") or os.getenv("DEEPSEEK_CODER_MODEL_ID", "deepseek-coder-v2:lite")
+DEEPSEEK_CODER_MODEL_ID = os.getenv("DEEPSEEK_CODER_OLLAMA_BASE_URL", None) and os.getenv("DEEPSEEK_CODER_MODEL_ID", "huihui_ai/deepseek-v3.2-lite-abliterated:latest") or os.getenv("DEEPSEEK_CODER_MODEL_ID", "huihui_ai/deepseek-v3.2-lite-abliterated:latest")
 
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/workspace/uploads")
 STATE_DIR = os.path.join(UPLOAD_DIR, "state")
@@ -67,6 +67,10 @@ def _sanitize_mojibake_text(text: str) -> str:
             out = out.replace(bad, good)
     # Convert emojis and non-ASCII to ASCII equivalents
     try:
+        # More aggressive: encode to ASCII with errors='ignore' first to remove all non-ASCII
+        # Then decode back to string - this removes ALL non-ASCII including emojis
+        ascii_bytes = out.encode("ascii", "ignore")
+        out = ascii_bytes.decode("ascii")
         # Normalize unicode (NFD decomposes characters, then we can remove combining marks)
         normalized = unicodedata.normalize("NFD", out)
         # Remove combining diacritical marks and convert to ASCII
@@ -102,9 +106,9 @@ def _sanitize_mojibake_text(text: str) -> str:
                     ascii_chars.append("")
         out = "".join(ascii_chars)
     except Exception:
-        # Fallback: just encode/decode with errors='replace' (replaces with '?')
+        # Fallback: just encode/decode with errors='ignore' (removes non-ASCII completely)
         try:
-            out = out.encode("ascii", "replace").decode("ascii")
+            out = out.encode("ascii", "ignore").decode("ascii")
         except Exception:
             pass
     return out

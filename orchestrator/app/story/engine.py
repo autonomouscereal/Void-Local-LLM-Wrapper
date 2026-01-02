@@ -244,14 +244,14 @@ async def _ensure_story_character_lock_bundles(story: Dict[str, Any], *, trace_i
         if not isinstance(act, dict):
             log.debug("_ensure_story_character_lock_bundles skipping invalid act act_idx=%d trace_id=%s", act_idx, trace_id)
             continue
-        act_id = act.get("act_id") or f"act_{act_idx}"
+        act_id = act.get("act_id") or ("act_%d" % act_idx)
         scenes = act.get("scenes") if isinstance(act.get("scenes"), list) else []
         log.debug("_ensure_story_character_lock_bundles act act_id=%s scenes_count=%d trace_id=%s", act_id, len(scenes), trace_id)
         for scene_idx, scene in enumerate(scenes):
             if not isinstance(scene, dict):
                 log.debug("_ensure_story_character_lock_bundles skipping invalid scene act_id=%s scene_idx=%d trace_id=%s", act_id, scene_idx, trace_id)
                 continue
-            scene_id = scene.get("scene_id") or f"scene_{scene_idx}"
+            scene_id = scene.get("scene_id") or ("scene_%d" % scene_idx)
             beats = scene.get("beats") if isinstance(scene.get("beats"), list) else []
             log.debug("_ensure_story_character_lock_bundles scene act_id=%s scene_id=%s beats_count=%d trace_id=%s", act_id, scene_id, len(beats), trace_id)
             for beat_idx, beat in enumerate(beats):
@@ -366,6 +366,222 @@ async def _ensure_story_character_lock_bundles(story: Dict[str, Any], *, trace_i
     )
 
 
+async def _apply_story_state_changes_to_locks(story: Dict[str, Any], *, trace_id: Optional[str]) -> None:
+    """
+    Process all state_change events in the story and apply visual state changes to character lock bundles.
+    This ensures that character appearance changes (missing arms, age, injuries, etc.) are reflected in lock bundles.
+    
+    NOTE: trace_id must be provided - no generation, no fallback, no failure.
+    """
+    log.info("_apply_story_state_changes_to_locks start trace_id=%s", trace_id)
+    if not isinstance(story, dict):
+        log.warning("_apply_story_state_changes_to_locks: story is not a dict trace_id=%s story_type=%s", trace_id, type(story).__name__)
+        return
+    
+    # Collect all state changes by character_id
+    character_state_changes: Dict[str, Dict[str, Any]] = {}
+    acts = story.get("acts") if isinstance(story.get("acts"), list) else []
+    log.debug("_apply_story_state_changes_to_locks scanning acts_count=%d trace_id=%s", len(acts), trace_id)
+    
+    for act_idx, act in enumerate(acts):
+        if not isinstance(act, dict):
+            continue
+        act_id = act.get("act_id") or ("act_%d" % act_idx)
+        scenes = act.get("scenes") if isinstance(act.get("scenes"), list) else []
+        for scene_idx, scene in enumerate(scenes):
+            if not isinstance(scene, dict):
+                continue
+            scene_id = scene.get("scene_id") or ("scene_%d" % scene_idx)
+            beats = scene.get("beats") if isinstance(scene.get("beats"), list) else []
+            for beat_idx, beat in enumerate(beats):
+                if not isinstance(beat, dict):
+                    continue
+                beat_id = beat.get("beat_id") or ("beat_%d" % beat_idx)
+                events = beat.get("events") if isinstance(beat.get("events"), list) else []
+                for ev_idx, ev in enumerate(events):
+                    if not isinstance(ev, dict):
+                        continue
+                    event_type = ev.get("event_type") or ev.get("type") or ""
+                    if event_type != "state_change":
+                        continue
+                    event_target = ev.get("event_target") or ev.get("target") or ""
+                    state_delta = ev.get("state_delta") if isinstance(ev.get("state_delta"), dict) else {}
+                    if not isinstance(event_target, str) or not event_target.strip() or not state_delta:
+                        continue
+                    character_id = event_target.strip()
+                    # Only process character state changes (not object state changes)
+                    characters = story.get("characters") if isinstance(story.get("characters"), list) else []
+                    is_character = any(
+                        char.get("character_id") == character_id 
+                        for char in characters 
+                        if isinstance(char, dict) and isinstance(char.get("character_id"), str)
+                    )
+                    if not is_character:
+                        log.debug("_apply_story_state_changes_to_locks skipping non-character target character_id=%s act_id=%s scene_id=%s beat_id=%s trace_id=%s", 
+                                 character_id, act_id, scene_id, beat_id, trace_id)
+                        continue
+                    # Merge state changes (later events override earlier ones)
+                    if character_id not in character_state_changes:
+                        character_state_changes[character_id] = {}
+                    character_state_changes[character_id].update(state_delta)
+                    log.debug("_apply_story_state_changes_to_locks found state_change character_id=%s state_delta=%s act_id=%s scene_id=%s beat_id=%s trace_id=%s", 
+                             character_id, state_delta, act_id, scene_id, beat_id, trace_id)
+                    # Trace individual state change events
+                    trace_event(
+                        "story.state_change_detected",
+                        {
+                            "trace_id": trace_id,
+                            "character_id": character_id,
+                            "state_delta": state_delta,
+                            "act_id": act_id,
+                            "scene_id": scene_id,
+                            "beat_id": beat_id,
+                        }
+                    )
+    
+    if not character_state_changes:
+        log.info("_apply_story_state_changes_to_locks no character state changes found trace_id=%s", trace_id)
+        return
+    
+    log.info("_apply_story_state_changes_to_locks processing state_changes characters_count=%d trace_id=%s", len(character_state_changes), trace_id)
+    t0 = time.perf_counter()
+    updated_count = 0
+    
+    for character_id, state_updates in character_state_changes.items():
+        char_t0 = time.perf_counter()
+        log.info("_apply_story_state_changes_to_locks processing character_id=%s state_updates=%s trace_id=%s", character_id, state_updates, trace_id)
+        try:
+            # Load existing bundle
+            existing_bundle = await get_lock_bundle(character_id)
+            if not isinstance(existing_bundle, dict):
+                log.warning("_apply_story_state_changes_to_locks no existing bundle for character_id=%s trace_id=%s", character_id, trace_id)
+                continue
+            
+            # Apply visual state changes to lock bundle
+            # Map state_delta keys to visual lock fields
+            visual_updates = {}
+            state_tags = []
+            if "left_arm" in state_updates:
+                visual_updates["left_arm"] = state_updates["left_arm"]
+                if state_updates["left_arm"] == "missing":
+                    state_tags.append("missing-left-arm")
+                elif state_updates["left_arm"] == "robot":
+                    state_tags.append("robotic-left-arm")
+            if "right_arm" in state_updates:
+                visual_updates["right_arm"] = state_updates["right_arm"]
+                if state_updates["right_arm"] == "missing":
+                    state_tags.append("missing-right-arm")
+                elif state_updates["right_arm"] == "robot":
+                    state_tags.append("robotic-right-arm")
+            if "age" in state_updates:
+                age_val = state_updates["age"]
+                visual_updates["age"] = age_val
+                if isinstance(age_val, (int, float)) and age_val > 0:
+                    state_tags.append("age-%d" % int(age_val))
+            if "appearance" in state_updates:
+                visual_updates["appearance"] = state_updates["appearance"]
+                app_val = str(state_updates["appearance"]).lower().replace(" ", "-")
+                if app_val:
+                    state_tags.append("appearance-%s" % app_val)
+            # Add other visual state fields as needed
+            # Health, stance, energy_level are state but not visual - skip for visual updates
+            for key in ["health", "stance", "energy_level", "inventory", "relationships"]:
+                if key in state_updates:
+                    # Store in state_changes but don't add to visual_updates
+                    pass
+            
+            if visual_updates:
+                # Update visual branch of lock bundle
+                visual_branch = existing_bundle.get("visual") if isinstance(existing_bundle.get("visual"), dict) else {}
+                if not visual_branch:
+                    visual_branch = {}
+                    existing_bundle["visual"] = visual_branch
+                
+                # Store state changes in visual branch (store ALL state changes, not just visual)
+                state_changes = visual_branch.get("state_changes") if isinstance(visual_branch.get("state_changes"), dict) else {}
+                state_changes.update(state_updates)  # Store all state changes for reference
+                visual_branch["state_changes"] = state_changes
+                log.debug("_apply_story_state_changes_to_locks stored state_changes character_id=%s state_changes=%s trace_id=%s", 
+                         character_id, list(state_changes.keys()), trace_id)
+                
+                # Update style to reflect visual changes
+                style = visual_branch.get("style") if isinstance(visual_branch.get("style"), dict) else {}
+                if not style:
+                    style = {}
+                    visual_branch["style"] = style
+                
+                # Update style_tags to include state information for prompt visibility
+                style_tags = style.get("style_tags") if isinstance(style.get("style_tags"), list) else []
+                if not isinstance(style_tags, list):
+                    style_tags = []
+                # Add state tags if not already present
+                for tag in state_tags:
+                    if tag not in style_tags:
+                        style_tags.append(tag)
+                style["style_tags"] = style_tags
+                log.debug("_apply_story_state_changes_to_locks updated style_tags character_id=%s style_tags=%s trace_id=%s", 
+                         character_id, style_tags, trace_id)
+                
+                # Build description from state changes for human readability
+                desc_parts = []
+                if state_changes.get("left_arm") == "missing":
+                    desc_parts.append("missing left arm")
+                elif state_changes.get("left_arm") == "robot":
+                    desc_parts.append("robotic left arm")
+                if state_changes.get("right_arm") == "missing":
+                    desc_parts.append("missing right arm")
+                elif state_changes.get("right_arm") == "robot":
+                    desc_parts.append("robotic right arm")
+                if "age" in state_changes and isinstance(state_changes["age"], (int, float)):
+                    desc_parts.append("age %d" % int(state_changes["age"]))
+                if state_changes.get("appearance"):
+                    desc_parts.append(str(state_changes["appearance"]))
+                
+                if desc_parts:
+                    # Store in a metadata field for reference (not in style.description as that's for rendering style)
+                    metadata = visual_branch.get("metadata") if isinstance(visual_branch.get("metadata"), dict) else {}
+                    if not isinstance(metadata, dict):
+                        metadata = {}
+                    metadata["character_state_description"] = ", ".join(desc_parts)
+                    visual_branch["metadata"] = metadata
+                    log.debug("_apply_story_state_changes_to_locks updated metadata description character_id=%s description=%s trace_id=%s", 
+                             character_id, metadata["character_state_description"], trace_id)
+                
+                # Migrate bundle to ensure schema consistency
+                existing_bundle = migrate_visual_bundle(existing_bundle)
+                existing_bundle = migrate_music_bundle(existing_bundle)
+                existing_bundle = migrate_tts_bundle(existing_bundle)
+                existing_bundle = migrate_sfx_bundle(existing_bundle)
+                existing_bundle = migrate_film2_bundle(existing_bundle)
+                
+                # Save updated bundle
+                await upsert_lock_bundle(character_id, existing_bundle)
+                updated_count += 1
+                log.info("_apply_story_state_changes_to_locks updated bundle character_id=%s visual_updates=%s state_tags=%s dur_ms=%d trace_id=%s", 
+                        character_id, visual_updates, state_tags, int((time.perf_counter() - char_t0) * 1000), trace_id)
+            else:
+                log.debug("_apply_story_state_changes_to_locks no visual updates for character_id=%s state_updates=%s trace_id=%s", 
+                         character_id, state_updates, trace_id)
+        except Exception as ex:
+            log.warning("_apply_story_state_changes_to_locks failed character_id=%s state_updates=%s dur_ms=%d trace_id=%s ex=%s", 
+                       character_id, state_updates, int((time.perf_counter() - char_t0) * 1000), trace_id, ex, exc_info=True)
+    
+    log.info("_apply_story_state_changes_to_locks done trace_id=%s characters_updated=%d dur_ms=%d", 
+            trace_id, updated_count, int((time.perf_counter() - t0) * 1000))
+    
+    # Trace state changes for monitoring
+    if updated_count > 0:
+        trace_event(
+            "story.state_changes_applied",
+            {
+                "trace_id": trace_id,
+                "characters_updated": updated_count,
+                "total_state_changes": len(character_state_changes),
+                "dur_ms": int((time.perf_counter() - t0) * 1000),
+            }
+        )
+
+
 async def _jsonify_then_parse(raw_text: str, expected_schema: Any, *, trace_id: Optional[str], rounds: int | None = None, temperature: float | None = None) -> Dict[str, Any]:
     """
     Required JSON flow for any LLM output used as structured data:
@@ -474,17 +690,21 @@ You MUST match this exact structure. All field names and nesting must be identic
 
 ### [KEY REQUIREMENTS]
 - Top level: prompt, duration_hint_s, logline, genre, tone, themes, constraints, characters, locations, objects, acts, continuity, film_plan, notes
-- Characters: array of objects with character_id (string, REQUIRED) and character_name (string) - character_id is used for TTS locks and dialogue speaker field
-- Locations: array of objects with location_name (string, REQUIRED - fully descriptive name used as key for matching, e.g. 'Post-Apocalyptic Urban Ruin'), location_description (string), location_atmosphere (string - used for music matching, e.g. 'stormy', 'eerie')
-- Objects: array of objects with object_name (string, REQUIRED - fully descriptive name used as key for matching, e.g. 'Chaos Emerald (Red)'), object_description (string)
+- **CRITICAL: CREATE characters, locations, and objects as needed for your story.** If the user mentions characters, locations, or objects that don't exist yet, you MUST add them to the top-level arrays. Do not reference characters/locations/objects that aren't in the arrays.
+- Characters: array of objects with character_id (string, REQUIRED) and character_name (string) - character_id is used for TTS locks and dialogue speaker field. **CREATE new characters as needed for the story. Each character that appears in dialogue or events MUST have an entry in the characters array.**
+- Locations: array of objects with location_name (string, REQUIRED - fully descriptive name used as key for matching, e.g. 'Post-Apocalyptic Urban Ruin'), location_description (string), location_atmosphere (string - used for music matching, e.g. 'stormy', 'eerie'). **CREATE new locations as needed for the story. Each location referenced in beats MUST have an entry in the locations array.**
+- Objects: array of objects with object_name (string, REQUIRED - fully descriptive name used as key for matching, e.g. 'Chaos Emerald (Red)'), object_description (string). **CREATE new objects as needed for the story. Each object referenced in beats or state_change events MUST have an entry in the objects array.**
 - Locations and objects in beats: arrays of strings (location_name/object_name values that MUST match location_name/object_name from the locations/objects arrays)
 - Acts: array of objects with act_id (string, optional - generated if missing) and scenes (array)
 - Scenes: array of objects with scene_id (string, optional - generated if missing), scene_summary (string, optional), music_hint (object with scene_mood, scene_tone, scene_energy, scene_location_atmosphere - for music matching), and beats (array)
 - Beats: array of objects with beat_description (string, optional), time_hint_s (float, REQUIRED), characters (array, OPTIONAL - can be empty [] if no characters), locations (array, OPTIONAL - can be empty [] if no locations), objects (array, OPTIONAL - can be empty [] if no objects), events (array), dialogue (array), music_hint (object with beat_mood, beat_tone, beat_energy - optional, inherits from scene)
 - Events: array of objects with event_type (string, REQUIRED). 
   * For state_change events: event_target (string, REQUIRED - must be a character_id from characters array OR an object_name from objects array, NOT a location_name) and state_delta (dict, REQUIRED)
-  * state_delta structure: A dictionary with direct key-value pairs representing the state changes. The keys are the state property names (e.g. "health", "stance", "energy_level") and values are the new state values.
-  * CORRECT state_delta examples: {"health": 50}, {"stance": "ready", "energy_level": "high"}, {"eruption_level": "medium"}
+  * state_delta structure: A dictionary with direct key-value pairs representing the state changes. The keys are the state property names (e.g. "health", "stance", "energy_level", "left_arm", "age", "appearance") and values are the new state values.
+  * **IMPORTANT: Use state_delta to track visual/physical changes that affect character appearance:**
+    - Physical changes: "left_arm": "missing" or "left_arm": "robot" (for prosthetic limbs), "right_arm": "missing", "age": 25 (for aging), "appearance": "scarred" (for injuries/scars)
+    - State changes: "health": 50, "stance": "ready", "energy_level": "high"
+  * CORRECT state_delta examples: {"health": 50}, {"stance": "ready", "energy_level": "high"}, {"left_arm": "missing"}, {"age": 30, "appearance": "weathered"}, {"eruption_level": "medium"}
   * INCORRECT state_delta examples: {"key": "health", "value": 50} (WRONG - don't use nested "key"/"value" structure), {"key": "position", "value": "mid-battle stance"} (WRONG)
   * event_target MUST be a character_id (e.g. "shadow", "charizard") OR an object_name (e.g. "Volcanic Fissure (Active)"), NOT a location_name
   * For non-state_change events: event_target is optional (can be omitted or empty string)
@@ -499,6 +719,11 @@ You MUST match this exact structure. All field names and nesting must be identic
 
 ### [YOUR TASK]
 Produce the complete story graph as a single JSON object matching the exact structure above. Output ONLY the JSON object, no other text.
+
+**CRITICAL REMINDERS:**
+1. **CREATE all characters, locations, and objects that appear in your story** - do not reference entities that aren't in the top-level arrays
+2. **Use state_change events to track character appearance changes** - if a character loses an arm, ages, gets injured, etc., add a state_change event with appropriate state_delta (e.g., {"left_arm": "missing"} or {"age": 45})
+3. **Ensure continuity** - if a character's state changes (e.g., loses an arm), that change must be reflected in all subsequent beats where that character appears
 
 CRITICAL: Do NOT wrap your output in wrapper keys like 'response', 'data', 'result', 'output', 'content', or 'json'. Output the story object directly at the top level."""
     user_msg = user_msg_content
@@ -518,6 +743,8 @@ CRITICAL: Do NOT wrap your output in wrapper keys like 'response', 'data', 'resu
     
     # Use committee_jsonify to ensure proper JSON structure before returning
     # Keep trace_id constant - don't mutate it
+    log.info("story.committee.draft_raw calling committee_jsonify trace_id=%s txt_len=%d", trace_id, len(txt))
+    jsonify_t0 = time.perf_counter()
     structured = await committee_jsonify(
         raw_text=txt,
         expected_schema=_story_schema_template(),
@@ -525,6 +752,9 @@ CRITICAL: Do NOT wrap your output in wrapper keys like 'response', 'data', 'resu
         rounds=STORY_COMMITTEE_ROUNDS,
         temperature=0.0,
     )
+    jsonify_dur = time.perf_counter() - jsonify_t0
+    structured_ok = isinstance(structured, dict)
+    log.info("story.committee.draft_raw committee_jsonify done trace_id=%s ok=%r dur_ms=%d", trace_id, structured_ok, int(jsonify_dur * 1000))
     # Convert back to JSON string for return (will be parsed again in draft_story_graph)
     txt_structured = json.dumps(structured, ensure_ascii=False) if isinstance(structured, dict) else txt
     
@@ -573,7 +803,7 @@ async def _committee_audit_story(story: Dict[str, Any], user_prompt: str, *, tra
         if not isinstance(act, dict):
             log.debug("_committee_audit_story skipping invalid act in chunk loop act_idx=%d trace_id=%s", act_idx, trace_id)
             continue
-        act_id = act.get("act_id") or f"act_{act_idx}"
+        act_id = act.get("act_id") or ("act_%d" % act_idx)
         log.debug("_committee_audit_story processing chunk act_idx=%d act_id=%s trace_id=%s", act_idx, act_id, trace_id)
         act_chunk = _story_get_chunk_by_ids(story, act_ids=[act_id] if act_id else None)
         act_chunk_type = type(act_chunk).__name__
@@ -845,7 +1075,7 @@ CRITICAL: Return ONLY the changes/deltas, not the full story.
 - Only include fields that are being changed or added.
 - Do NOT include unchanged acts/scenes/beats.
 - If fixing a state inconsistency: add state_change events or update later beats to reflect the state
-- If fixing invalid references: add missing locations/objects to top-level arrays OR fix the references
+- **CRITICAL: CREATE missing characters, locations, and objects.** If fixing invalid references: add missing locations/objects/characters to top-level arrays OR fix the references. Do not leave dangling references.
 - If fixing missing fields: add the required fields (line_id, speaker, dialogue_text for dialogue; event_type, event_target for events)
 
 CRITICAL: Use ONLY ASCII characters. NO emojis, NO special Unicode symbols, NO non-ASCII characters.
@@ -873,6 +1103,39 @@ Your delta MUST match this exact structure. All field names and nesting must be 
 - Music: Music is created AFTER story generation. Music matching uses descriptive information from scenes/beats: scene_mood, scene_tone, scene_energy, scene_location_atmosphere. Do NOT include actual music in story structure, only music_hint objects.
 
 ### [DELTA EXAMPLES]
+Example delta creating a new character:
+{{
+  "characters": [
+    {{
+      "character_id": "new_character",
+      "character_name": "New Character Name"
+    }}
+  ],
+  "acts": [
+    {{
+      "act_id": "act_1",
+      "scenes": [
+        {{
+          "scene_id": "scene_1",
+          "beats": [
+            {{
+              "beat_id": "beat_3",
+              "characters": ["new_character"],
+              "dialogue": [
+                {{
+                  "line_id": "line_010",
+                  "speaker": "new_character",
+                  "dialogue_text": "Hello, I'm a new character."
+                }}
+              ]
+            }}
+          ]
+        }}
+      ]
+    }}
+  ]
+}}
+
 Example delta fixing a state inconsistency:
 {{
   "acts": [
@@ -1284,9 +1547,17 @@ You will receive:
 - Preserve all items from base story that aren't in delta
 - Maintain all IDs and structure
 - Ensure continuity is preserved across the merge
+- **CRITICAL: For characters/locations/objects:**
+  - If delta contains a character with an existing character_id, update that character (merge fields)
+  - If delta contains a character with a new character_id, append it to the characters array
+  - If delta contains a location with an existing location_name, update that location (merge fields)
+  - If delta contains a location with a new location_name, append it to the locations array
+  - If delta contains an object with an existing object_name, update that object (merge fields)
+  - If delta contains an object with a new object_name, append it to the objects array
 - For locations/objects: match by location_name/object_name (not IDs)
 - For characters: match by character_id
 - Merge arrays intelligently (e.g., combine dialogue arrays, don't replace)
+- **CRITICAL: Preserve all state_change events from both base and delta.** State changes are cumulative - later events override earlier ones for the same character.
 
 CRITICAL: Use ONLY ASCII characters. NO emojis, NO special Unicode symbols, NO non-ASCII characters.
 
@@ -1355,10 +1626,27 @@ Output ONLY the complete merged story as JSON matching the exact structure above
         temperature=0.0,
     )
     
-    log.info(
-        "story.merge.llm done trace_id=%s dur_ms=%d",
-        trace_id,
-        int((time.perf_counter() - t0) * 1000),
+    merge_dur = time.perf_counter() - t0
+    
+    # Log merge results
+    merged_acts = merged.get("acts") if isinstance(merged, dict) and isinstance(merged.get("acts"), list) else []
+    merged_characters = merged.get("characters") if isinstance(merged, dict) and isinstance(merged.get("characters"), list) else []
+    merged_locations = merged.get("locations") if isinstance(merged, dict) and isinstance(merged.get("locations"), list) else []
+    merged_objects = merged.get("objects") if isinstance(merged, dict) and isinstance(merged.get("objects"), list) else []
+    log.info("_story_merge_delta_with_llm done trace_id=%s dur_ms=%d merged_type=%s acts=%d characters=%d locations=%d objects=%d", 
+            trace_id, int(merge_dur * 1000), type(merged).__name__, len(merged_acts), len(merged_characters), len(merged_locations), len(merged_objects))
+    
+    # Trace merge completion
+    trace_event(
+        "story.merge_delta_complete",
+        {
+            "trace_id": trace_id,
+            "dur_ms": int(merge_dur * 1000),
+            "acts_count": len(merged_acts),
+            "characters_count": len(merged_characters),
+            "locations_count": len(merged_locations),
+            "objects_count": len(merged_objects),
+        }
     )
     
     return merged if isinstance(merged, dict) and merged else base_story
@@ -1452,17 +1740,23 @@ def _story_merge_delta(base_story: Dict[str, Any], delta: Dict[str, Any]) -> Dic
     base_characters = merged.get("characters") if isinstance(merged.get("characters"), list) else []
     delta_characters = delta.get("characters") if isinstance(delta.get("characters"), list) else []
     char_by_id = {char.get("character_id"): char for char in base_characters if isinstance(char, dict) and char.get("character_id")}
+    new_characters_count = 0
+    updated_characters_count = 0
     for delta_char in delta_characters:
         if not isinstance(delta_char, dict):
             continue
         char_id = delta_char.get("character_id")
         if char_id and char_id in char_by_id:
             char_by_id[char_id].update(delta_char)
+            updated_characters_count += 1
         else:
             base_characters.append(delta_char)
             if char_id:
                 char_by_id[char_id] = delta_char
+                new_characters_count += 1
     merged["characters"] = base_characters
+    if new_characters_count > 0 or updated_characters_count > 0:
+        log.debug("_story_merge_delta characters merged new=%d updated=%d total=%d", new_characters_count, updated_characters_count, len(base_characters))
     
     # Merge locations: update by name (descriptive name used as key) or append
     # Locations can be objects with name field, or strings (for backwards compatibility)
@@ -1483,6 +1777,8 @@ def _story_merge_delta(base_story: Dict[str, Any], delta: Dict[str, Any]) -> Dic
             normalized_base_locations.append(loc_obj)
             loc_by_name[loc] = loc_obj
     # Merge delta locations
+    new_locations_count = 0
+    updated_locations_count = 0
     for delta_loc in delta_locations:
         if isinstance(delta_loc, str):
             # Backwards compatibility: convert string to object
@@ -1490,13 +1786,22 @@ def _story_merge_delta(base_story: Dict[str, Any], delta: Dict[str, Any]) -> Dic
         if not isinstance(delta_loc, dict):
             continue
         loc_name = delta_loc.get("location_name") or delta_loc.get("name")
-        if loc_name and loc_name in loc_by_name:
-            loc_by_name[loc_name].update(delta_loc)
+        if not isinstance(loc_name, str) or not loc_name.strip():
+            continue
+        loc_name = loc_name.strip()
+        if loc_name in loc_by_name:
+            # Update existing location (merge fields, don't replace)
+            existing_loc = loc_by_name[loc_name]
+            existing_loc.update(delta_loc)
+            updated_locations_count += 1
         else:
+            # New location, append
             normalized_base_locations.append(delta_loc)
-            if loc_name:
-                loc_by_name[loc_name] = delta_loc
+            loc_by_name[loc_name] = delta_loc
+            new_locations_count += 1
     merged["locations"] = normalized_base_locations
+    if new_locations_count > 0 or updated_locations_count > 0:
+        log.debug("_story_merge_delta locations merged new=%d updated=%d total=%d", new_locations_count, updated_locations_count, len(normalized_base_locations))
     
     # Merge objects: update by name (descriptive name used as key) or append
     # Objects can be objects with name field, or strings (for backwards compatibility)
@@ -1517,6 +1822,8 @@ def _story_merge_delta(base_story: Dict[str, Any], delta: Dict[str, Any]) -> Dic
             normalized_base_objects.append(obj_obj)
             obj_by_name[obj] = obj_obj
     # Merge delta objects
+    new_objects_count = 0
+    updated_objects_count = 0
     for delta_obj in delta_objects:
         if isinstance(delta_obj, str):
             # Backwards compatibility: convert string to object
@@ -1524,13 +1831,22 @@ def _story_merge_delta(base_story: Dict[str, Any], delta: Dict[str, Any]) -> Dic
         if not isinstance(delta_obj, dict):
             continue
         obj_name = delta_obj.get("object_name") or delta_obj.get("name")
-        if obj_name and obj_name in obj_by_name:
-            obj_by_name[obj_name].update(delta_obj)
+        if not isinstance(obj_name, str) or not obj_name.strip():
+            continue
+        obj_name = obj_name.strip()
+        if obj_name in obj_by_name:
+            # Update existing object (merge fields, don't replace)
+            existing_obj = obj_by_name[obj_name]
+            existing_obj.update(delta_obj)
+            updated_objects_count += 1
         else:
+            # New object, append
             normalized_base_objects.append(delta_obj)
-            if obj_name:
-                obj_by_name[obj_name] = delta_obj
+            obj_by_name[obj_name] = delta_obj
+            new_objects_count += 1
     merged["objects"] = normalized_base_objects
+    if new_objects_count > 0 or updated_objects_count > 0:
+        log.debug("_story_merge_delta objects merged new=%d updated=%d total=%d", new_objects_count, updated_objects_count, len(normalized_base_objects))
     
     return merged
 
@@ -1594,11 +1910,35 @@ async def draft_story_graph(user_prompt: str, duration_hint_s: Optional[float], 
     story_objects_count = len(story.get("objects") or [])
     log.info("draft_story_graph initial story parsed trace_id=%s acts_count=%d characters_count=%d locations_count=%d objects_count=%d", 
             trace_id, story_acts_count, story_characters_count, story_locations_count, story_objects_count)
+    if story_characters_count > 0:
+        character_ids = [char.get("character_id") for char in story.get("characters", []) if isinstance(char, dict) and char.get("character_id")]
+        log.info("draft_story_graph initial characters trace_id=%s character_ids=%s", trace_id, character_ids[:10])
+    if story_locations_count > 0:
+        location_names = [loc.get("location_name") for loc in story.get("locations", []) if isinstance(loc, dict) and loc.get("location_name")]
+        log.info("draft_story_graph initial locations trace_id=%s location_names=%s", trace_id, location_names[:10])
+    if story_objects_count > 0:
+        object_names = [obj.get("object_name") for obj in story.get("objects", []) if isinstance(obj, dict) and obj.get("object_name")]
+        log.info("draft_story_graph initial objects trace_id=%s object_names=%s", trace_id, object_names[:10])
+    
+    # Trace initial story creation
+    trace_event(
+        "story.initial_created",
+        {
+            "trace_id": trace_id,
+            "acts_count": story_acts_count,
+            "characters_count": story_characters_count,
+            "locations_count": story_locations_count,
+            "objects_count": story_objects_count,
+        }
+    )
     
     # Ensure lock bundles exist for all characters
     log.debug("draft_story_graph ensuring character lock bundles trace_id=%s", trace_id)
     await _ensure_story_character_lock_bundles(story, trace_id=trace_id)
     log.debug("draft_story_graph character lock bundles ensured trace_id=%s", trace_id)
+    # Apply state changes from story to lock bundles
+    await _apply_story_state_changes_to_locks(story, trace_id=trace_id)
+    log.debug("draft_story_graph initial state changes applied to locks trace_id=%s", trace_id)
     
     # Iterative expansion + audit/revise loop (can be large).
     # We stop ONLY when the committee audit says to accept (authoritative), not after an arbitrary number of loops.
@@ -1626,7 +1966,7 @@ async def draft_story_graph(user_prompt: str, duration_hint_s: Optional[float], 
 
         # Audit at start of each iteration (authoritative "done" signal).
         # Keep trace_id constant - don't mutate it
-        log.debug("draft_story_graph calling audit trace_id=%s pass_index=%d", trace_id, pass_index)
+        log.info("draft_story_graph calling audit trace_id=%s pass_index=%d", trace_id, pass_index)
         audit = await _committee_audit_story(story, prompt_text, trace_id=trace_id)
         issues = audit.get("issues") if isinstance(audit, dict) and isinstance(audit.get("issues"), list) else []
         must_fix = bool(audit.get("must_fix")) if isinstance(audit, dict) else False
@@ -1666,31 +2006,96 @@ async def draft_story_graph(user_prompt: str, duration_hint_s: Optional[float], 
             log.info("draft_story_graph starting revision trace_id=%s pass_index=%d must_fix=%s next_action=%s", 
                     trace_id, pass_index, must_fix, next_action_s)
             # Keep trace_id constant - don't mutate it
+            log.info("draft_story_graph calling _committee_revise_story trace_id=%s pass_index=%d", trace_id, pass_index)
+            revise_t0 = time.perf_counter()
             delta = await _committee_revise_story(
                 story,
                 prompt_text,
                 audit,
                 trace_id=trace_id,
             )
+            revise_dur = time.perf_counter() - revise_t0
+            log.info("draft_story_graph _committee_revise_story done trace_id=%s pass_index=%d dur_ms=%d", trace_id, pass_index, int(revise_dur * 1000))
             delta_type = type(delta).__name__
             delta_keys = list(delta.keys()) if isinstance(delta, dict) else []
             delta_acts = delta.get("acts") if isinstance(delta, dict) and isinstance(delta.get("acts"), list) else []
             delta_characters = delta.get("characters") if isinstance(delta, dict) and isinstance(delta.get("characters"), list) else []
-            log.info("draft_story_graph revision delta received trace_id=%s pass_index=%d delta_type=%s delta_keys_count=%d delta_acts_count=%d delta_characters_count=%d", 
-                    trace_id, pass_index, delta_type, len(delta_keys), len(delta_acts), len(delta_characters))
+            delta_locations = delta.get("locations") if isinstance(delta, dict) and isinstance(delta.get("locations"), list) else []
+            delta_objects = delta.get("objects") if isinstance(delta, dict) and isinstance(delta.get("objects"), list) else []
+            log.info("draft_story_graph revision delta received trace_id=%s pass_index=%d delta_type=%s delta_keys_count=%d delta_acts_count=%d delta_characters_count=%d delta_locations_count=%d delta_objects_count=%d", 
+                    trace_id, pass_index, delta_type, len(delta_keys), len(delta_acts), len(delta_characters), len(delta_locations), len(delta_objects))
+            if delta_characters:
+                new_character_ids = [char.get("character_id") for char in delta_characters if isinstance(char, dict) and char.get("character_id")]
+                log.info("draft_story_graph revision new characters trace_id=%s pass_index=%d character_ids=%s", trace_id, pass_index, new_character_ids[:10])
+                # Trace new character creation
+                trace_event(
+                    "story.characters_created",
+                    {
+                        "trace_id": trace_id,
+                        "pass_index": pass_index,
+                        "context": "revision",
+                        "character_ids": new_character_ids[:20],  # Limit to first 20
+                        "count": len(new_character_ids),
+                    }
+                )
+            if delta_locations:
+                new_location_names = [loc.get("location_name") for loc in delta_locations if isinstance(loc, dict) and loc.get("location_name")]
+                log.info("draft_story_graph revision new locations trace_id=%s pass_index=%d location_names=%s", trace_id, pass_index, new_location_names[:10])
+                # Trace new location creation
+                trace_event(
+                    "story.locations_created",
+                    {
+                        "trace_id": trace_id,
+                        "pass_index": pass_index,
+                        "context": "revision",
+                        "location_names": new_location_names[:20],  # Limit to first 20
+                        "count": len(new_location_names),
+                    }
+                )
+            if delta_objects:
+                new_object_names = [obj.get("object_name") for obj in delta_objects if isinstance(obj, dict) and obj.get("object_name")]
+                log.info("draft_story_graph revision new objects trace_id=%s pass_index=%d object_names=%s", trace_id, pass_index, new_object_names[:10])
+                # Trace new object creation
+                trace_event(
+                    "story.objects_created",
+                    {
+                        "trace_id": trace_id,
+                        "pass_index": pass_index,
+                        "context": "revision",
+                        "object_names": new_object_names[:20],  # Limit to first 20
+                        "count": len(new_object_names),
+                    }
+                )
             if isinstance(delta, dict) and delta:
                 # Use LLM to intelligently merge delta into base story
-                log.debug("draft_story_graph merging revision delta trace_id=%s pass_index=%d", trace_id, pass_index)
+                log.info("draft_story_graph merging revision delta trace_id=%s pass_index=%d", trace_id, pass_index)
+                merge_t0 = time.perf_counter()
                 story = await _story_merge_delta_with_llm(
                     base_story=story,
                     delta=delta,
                     user_prompt=prompt_text,
                     trace_id=trace_id,
                 )
-                log.debug("draft_story_graph revision merge complete trace_id=%s pass_index=%d", trace_id, pass_index)
+                merge_dur = time.perf_counter() - merge_t0
+                log.info("draft_story_graph revision merge complete trace_id=%s pass_index=%d dur_ms=%d", trace_id, pass_index, int(merge_dur * 1000))
                 # Ensure lock bundles exist for any new characters added during revision merge
                 await _ensure_story_character_lock_bundles(story, trace_id=trace_id)
                 log.debug("draft_story_graph revision lock bundles ensured trace_id=%s pass_index=%d", trace_id, pass_index)
+                # Apply state changes from story to lock bundles
+                await _apply_story_state_changes_to_locks(story, trace_id=trace_id)
+                log.debug("draft_story_graph revision state changes applied trace_id=%s pass_index=%d", trace_id, pass_index)
+                
+                # Trace revision merge
+                trace_event(
+                    "story.revision_merged",
+                    {
+                        "trace_id": trace_id,
+                        "pass_index": pass_index,
+                        "dur_ms": int(merge_dur * 1000),
+                        "acts_count": len(story.get("acts") or []),
+                        "characters_count": len(story.get("characters") or []),
+                    }
+                )
             else:
                 log.warning("draft_story_graph revision delta invalid trace_id=%s pass_index=%d delta_type=%s", 
                            trace_id, pass_index, delta_type)
@@ -1739,9 +2144,10 @@ Your extension delta MUST match this exact structure. All field names and nestin
 {json.dumps(schema_template, ensure_ascii=False, indent=2)}
 
 ### [KEY REQUIREMENTS]
-- Characters: array of objects with character_id (string, REQUIRED) and character_name (string) - character_id is used for TTS locks and dialogue speaker field. Only add NEW characters not already in story.
-- Locations: array of objects with location_name (string, REQUIRED - fully descriptive name used as key for matching, e.g. 'Post-Apocalyptic Urban Ruin'), location_description (string), location_atmosphere (string - used for music matching, e.g. 'stormy', 'eerie'). Only add NEW locations not already in story.
-- Objects: array of objects with object_name (string, REQUIRED - fully descriptive name used as key for matching, e.g. 'Chaos Emerald (Red)'), object_description (string). Only add NEW objects not already in story.
+- **CRITICAL: CREATE new characters, locations, and objects as needed for extensions.** If your extension requires new characters, locations, or objects, you MUST add them to the top-level arrays. Do not reference entities that aren't in the arrays.
+- Characters: array of objects with character_id (string, REQUIRED) and character_name (string) - character_id is used for TTS locks and dialogue speaker field. **CREATE new characters as needed for the extension. Each new character that appears in dialogue or events MUST have an entry in the characters array.**
+- Locations: array of objects with location_name (string, REQUIRED - fully descriptive name used as key for matching, e.g. 'Post-Apocalyptic Urban Ruin'), location_description (string), location_atmosphere (string - used for music matching, e.g. 'stormy', 'eerie'). **CREATE new locations as needed for the extension. Each new location referenced in beats MUST have an entry in the locations array.**
+- Objects: array of objects with object_name (string, REQUIRED - fully descriptive name used as key for matching, e.g. 'Chaos Emerald (Red)'), object_description (string). **CREATE new objects as needed for the extension. Each new object referenced in beats or state_change events MUST have an entry in the objects array.**
 - Locations and objects in beats: arrays of strings (location_name/object_name values that MUST match location_name/object_name from the locations/objects arrays). Can be empty arrays [] if no characters/locations/objects.
 - Scenes: scene_summary (string, optional), music_hint (object with scene_mood, scene_tone, scene_energy, scene_location_atmosphere - for music matching)
 - Beats: beat_description (string, optional), time_hint_s (float, REQUIRED), characters (array, OPTIONAL - can be empty []), locations (array, OPTIONAL - can be empty []), objects (array, OPTIONAL - can be empty []), events (array), dialogue (array), music_hint (object with beat_mood, beat_tone, beat_energy - optional, inherits from scene)
@@ -1819,12 +2225,15 @@ CRITICAL: Do NOT wrap your output in wrapper keys like 'response', 'data', 'resu
 Extend the story to meet the duration requirements. Return ONLY the JSON delta with new content matching the exact structure above. No other text."""
             user_msg = user_msg_content
             # Keep trace_id constant - don't mutate it
+            log.info("draft_story_graph calling committee_ai_text for extension trace_id=%s pass_index=%d", trace_id, pass_index)
             env2 = await committee_ai_text(
                 messages=[{"role": "system", "content": sys_msg}, {"role": "user", "content": user_msg}],
                 trace_id=trace_id,
                 rounds=STORY_COMMITTEE_ROUNDS,
                 temperature=STORY_TEMPERATURE,
             )
+            env2_ok = env2.get("ok") is not False if isinstance(env2, dict) else False
+            log.info("draft_story_graph committee_ai_text for extension done trace_id=%s pass_index=%d ok=%r", trace_id, pass_index, env2_ok)
             raw2 = ""
             rb2 = env2.get("result") if isinstance(env2, dict) else {}
             if isinstance(rb2, dict) and isinstance(rb2.get("text"), str):
@@ -1832,6 +2241,7 @@ Extend the story to meet the duration requirements. Return ONLY the JSON delta w
             else:
                 raw2 = str(env2.get("text") or "")
             # Use story schema for extension delta (JSONParser handles missing fields gracefully)
+            log.info("draft_story_graph calling _jsonify_then_parse for extension trace_id=%s pass_index=%d", trace_id, pass_index)
             extended_delta = await _jsonify_then_parse(
                 raw_text=raw2,
                 expected_schema=_story_schema_template(),
@@ -1843,19 +2253,83 @@ Extend the story to meet the duration requirements. Return ONLY the JSON delta w
             extended_delta_keys = list(extended_delta.keys()) if isinstance(extended_delta, dict) else []
             extended_delta_acts = extended_delta.get("acts") if isinstance(extended_delta, dict) and isinstance(extended_delta.get("acts"), list) else []
             extended_delta_characters = extended_delta.get("characters") if isinstance(extended_delta, dict) and isinstance(extended_delta.get("characters"), list) else []
-            log.info("draft_story_graph extension delta received trace_id=%s pass_index=%d delta_type=%s delta_keys_count=%d delta_acts_count=%d delta_characters_count=%d", 
-                    trace_id, pass_index, extended_delta_type, len(extended_delta_keys), len(extended_delta_acts), len(extended_delta_characters))
+            extended_delta_locations = extended_delta.get("locations") if isinstance(extended_delta, dict) and isinstance(extended_delta.get("locations"), list) else []
+            extended_delta_objects = extended_delta.get("objects") if isinstance(extended_delta, dict) and isinstance(extended_delta.get("objects"), list) else []
+            log.info("draft_story_graph extension delta received trace_id=%s pass_index=%d delta_type=%s delta_keys_count=%d delta_acts_count=%d delta_characters_count=%d delta_locations_count=%d delta_objects_count=%d", 
+                    trace_id, pass_index, extended_delta_type, len(extended_delta_keys), len(extended_delta_acts), len(extended_delta_characters), len(extended_delta_locations), len(extended_delta_objects))
+            if extended_delta_characters:
+                new_character_ids = [char.get("character_id") for char in extended_delta_characters if isinstance(char, dict) and char.get("character_id")]
+                log.info("draft_story_graph extension new characters trace_id=%s pass_index=%d character_ids=%s", trace_id, pass_index, new_character_ids[:10])
+                # Trace new character creation
+                trace_event(
+                    "story.characters_created",
+                    {
+                        "trace_id": trace_id,
+                        "pass_index": pass_index,
+                        "context": "extension",
+                        "character_ids": new_character_ids[:20],  # Limit to first 20
+                        "count": len(new_character_ids),
+                    }
+                )
+            if extended_delta_locations:
+                new_location_names = [loc.get("location_name") for loc in extended_delta_locations if isinstance(loc, dict) and loc.get("location_name")]
+                log.info("draft_story_graph extension new locations trace_id=%s pass_index=%d location_names=%s", trace_id, pass_index, new_location_names[:10])
+                # Trace new location creation
+                trace_event(
+                    "story.locations_created",
+                    {
+                        "trace_id": trace_id,
+                        "pass_index": pass_index,
+                        "context": "extension",
+                        "location_names": new_location_names[:20],  # Limit to first 20
+                        "count": len(new_location_names),
+                    }
+                )
+            if extended_delta_objects:
+                new_object_names = [obj.get("object_name") for obj in extended_delta_objects if isinstance(obj, dict) and obj.get("object_name")]
+                log.info("draft_story_graph extension new objects trace_id=%s pass_index=%d object_names=%s", trace_id, pass_index, new_object_names[:10])
+                # Trace new object creation
+                trace_event(
+                    "story.objects_created",
+                    {
+                        "trace_id": trace_id,
+                        "pass_index": pass_index,
+                        "context": "extension",
+                        "object_names": new_object_names[:20],  # Limit to first 20
+                        "count": len(new_object_names),
+                    }
+                )
             if isinstance(extended_delta, dict) and extended_delta:
                 # Use LLM to intelligently merge extension delta into base story
+                log.info("draft_story_graph merging extension delta trace_id=%s pass_index=%d", trace_id, pass_index)
+                merge_ext_t0 = time.perf_counter()
                 story = await _story_merge_delta_with_llm(
                     base_story=story,
                     delta=extended_delta,
                     user_prompt=prompt_text,
                     trace_id=trace_id,
                 )
+                merge_ext_dur = time.perf_counter() - merge_ext_t0
+                log.info("draft_story_graph extension merge complete trace_id=%s pass_index=%d dur_ms=%d", trace_id, pass_index, int(merge_ext_dur * 1000))
                 # Ensure lock bundles exist for any new characters added during extension merge
                 await _ensure_story_character_lock_bundles(story, trace_id=trace_id)
+                # Apply state changes from story to lock bundles
+                await _apply_story_state_changes_to_locks(story, trace_id=trace_id)
                 story.setdefault("prompt", prompt_text)
+                
+                # Trace extension merge
+                trace_event(
+                    "story.extension_merged",
+                    {
+                        "trace_id": trace_id,
+                        "pass_index": pass_index,
+                        "dur_ms": int(merge_ext_dur * 1000),
+                        "acts_count": len(story.get("acts") or []),
+                        "characters_count": len(story.get("characters") or []),
+                        "locations_count": len(story.get("locations") or []),
+                        "objects_count": len(story.get("objects") or []),
+                    }
+                )
                 story.setdefault("duration_hint_s", float(duration))
                 trace_event(
                     "story.extended",
@@ -1940,6 +2414,26 @@ Extend the story to meet the duration requirements. Return ONLY the JSON delta w
             trace_id, total_dur, pass_index, stop_reason, final_acts, final_characters, final_locations, final_objects, final_total_beats_count, final_total_beats_time, final_total_hint, final_ratio)
     log.debug("draft_story_graph final story structure trace_id=%s story_keys=%s", 
              trace_id, list(story.keys())[:20] if isinstance(story, dict) else [])
+    
+    # Trace final story completion
+    trace_event(
+        "story.draft_complete",
+        {
+            "trace_id": trace_id,
+            "total_dur_s": float(total_dur),
+            "passes": pass_index,
+            "stop_reason": stop_reason,
+            "acts_count": final_acts,
+            "characters_count": final_characters,
+            "locations_count": final_locations,
+            "objects_count": final_objects,
+            "beats_count": final_total_beats_count,
+            "beats_time_s": float(final_total_beats_time),
+            "duration_hint_s": float(final_total_hint),
+            "coverage_ratio": float(final_ratio),
+        }
+    )
+    
     return story
 
 
@@ -2223,9 +2717,11 @@ async def fix_story(story: Dict[str, Any], issues: List[Dict[str, Any]], user_pr
                     for ev in events:
                         if not isinstance(ev, dict):
                             continue
-                        if ev.get("type") != "state_change":
+                        event_type = ev.get("event_type") or ev.get("type") or ""
+                        if event_type != "state_change":
                             continue
-                        if ev.get("target") != target:
+                        event_target = ev.get("event_target") or ev.get("target") or ""
+                        if event_target != target:
                             continue
                         state_delta = ev.get("state_delta") if isinstance(ev.get("state_delta"), dict) else {}
                         if state_key in state_delta:
@@ -2242,24 +2738,38 @@ async def fix_story(story: Dict[str, Any], issues: List[Dict[str, Any]], user_pr
     return adjusted
 
 
-def derive_scenes_and_shots(story: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+def derive_scenes_and_shots(story: Dict[str, Any], trace_id: Optional[str] = None) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
     Derive flat scene and shot lists from the story graph.
 
     Scenes are flattened from acts[*].scenes. Shots are derived by creating one shot per beat.
+    Character state is tracked across beats and included in shot character_states.
+    
+    Args:
+        story: Story graph dictionary
+        trace_id: Optional trace ID for logging
     """
     scenes_out: List[Dict[str, Any]] = []
     shots_out: List[Dict[str, Any]] = []
     acts = story.get("acts") if isinstance(story.get("acts"), list) else []
+    log.debug("derive_scenes_and_shots start trace_id=%s acts_count=%d", trace_id, len(acts))
     scene_order = 0
     shot_index = 0
     # Maintain a simple per-character state timeline while deriving shots.
     character_state: Dict[str, Dict[str, Any]] = {}
-    for act in acts:
-        act_id = act.get("act_id") or f"act_{len(scenes_out)+1}"
+    state_change_events_processed = 0
+    for act_idx, act in enumerate(acts):
+        if not isinstance(act, dict):
+            log.debug("derive_scenes_and_shots skipping invalid act act_idx=%d trace_id=%s", act_idx, trace_id)
+            continue
+        act_id = act.get("act_id") or ("act_%d" % (act_idx + 1))
         scenes = act.get("scenes") if isinstance(act.get("scenes"), list) else []
-        for scene in scenes:
-            scene_id = scene.get("scene_id") or f"{act_id}_sc_{scene_order+1}"
+        log.debug("derive_scenes_and_shots processing act act_id=%s scenes_count=%d trace_id=%s", act_id, len(scenes), trace_id)
+        for scene_idx, scene in enumerate(scenes):
+            if not isinstance(scene, dict):
+                log.debug("derive_scenes_and_shots skipping invalid scene act_id=%s scene_idx=%d trace_id=%s", act_id, scene_idx, trace_id)
+                continue
+            scene_id = scene.get("scene_id") or ("%s_sc_%d" % (act_id, scene_order + 1))
             scene_order += 1
             scene_entry: Dict[str, Any] = {
                 "scene_id": scene_id,
@@ -2269,7 +2779,8 @@ def derive_scenes_and_shots(story: Dict[str, Any]) -> Tuple[List[Dict[str, Any]]
             }
             scenes_out.append(scene_entry)
             beats = scene.get("beats") if isinstance(scene.get("beats"), list) else []
-            for beat in beats:
+            for beat_idx, beat in enumerate(beats):
+                beat_id = beat.get("beat_id") or ("beat_%d" % beat_idx)
                 events = beat.get("events") if isinstance(beat.get("events"), list) else []
                 for ev in events:
                     if not isinstance(ev, dict):
@@ -2279,13 +2790,17 @@ def derive_scenes_and_shots(story: Dict[str, Any]) -> Tuple[List[Dict[str, Any]]
                         continue
                     target = ev.get("event_target") or ev.get("target") or ""
                     state_delta = ev.get("state_delta") if isinstance(ev.get("state_delta"), dict) else {}
-                    if not isinstance(target, str) or not state_delta:
+                    if not isinstance(target, str) or not target.strip() or not state_delta:
                         continue
+                    target = target.strip()
                     state_entry = character_state.get(target) or {}
                     for key, val in state_delta.items():
                         state_entry[key] = val
                     character_state[target] = state_entry
-                shot_id = f"{scene_id}_sh_{shot_index+1}"
+                    state_change_events_processed += 1
+                    log.debug("derive_scenes_and_shots processed state_change trace_id=%s target=%s state_delta=%s scene_id=%s beat_id=%s", 
+                             trace_id, target, state_delta, scene_id, beat_id)
+                shot_id = "%s_sh_%d" % (scene_id, shot_index + 1)
                 shot_index += 1
                 description = beat.get("beat_description") or beat.get("description") or ""
                 duration_s = float(beat.get("time_hint_s") or 0.0)
@@ -2308,6 +2823,38 @@ def derive_scenes_and_shots(story: Dict[str, Any]) -> Tuple[List[Dict[str, Any]]
                     "character_states": shot_states,
                 }
                 shots_out.append(shot_entry)
+    # Count shots with character states
+    shots_with_states = sum(1 for shot in shots_out if isinstance(shot, dict) and shot.get("character_states"))
+    
+    if state_change_events_processed > 0:
+        log.info("derive_scenes_and_shots state_changes_processed=%d characters_with_state=%d shots_with_states=%d trace_id=%s", 
+                state_change_events_processed, len(character_state), shots_with_states, trace_id)
+        # Trace state changes in shot derivation
+        trace_event(
+            "story.shots_derived_with_state",
+            {
+                "trace_id": trace_id,
+                "state_changes_processed": state_change_events_processed,
+                "characters_with_state": len(character_state),
+                "scenes_count": len(scenes_out),
+                "shots_count": len(shots_out),
+                "shots_with_states": shots_with_states,
+            }
+        )
+    log.info("derive_scenes_and_shots done trace_id=%s scenes=%d shots=%d shots_with_states=%d", 
+            trace_id, len(scenes_out), len(shots_out), shots_with_states)
+    
+    # Trace shot derivation completion
+    trace_event(
+        "story.shots_derived",
+        {
+            "trace_id": trace_id,
+            "scenes_count": len(scenes_out),
+            "shots_count": len(shots_out),
+            "shots_with_states": shots_with_states,
+        }
+    )
+    
     return scenes_out, shots_out
 
 

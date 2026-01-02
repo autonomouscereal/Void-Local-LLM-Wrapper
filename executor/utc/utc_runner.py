@@ -242,19 +242,48 @@ async def utc_run_tool(trace_id: str, conversation_id: str, step_id: Optional[st
         if tool_stack is not None:
             break
     # Preserve any structured tool stack separately so downstream callers can safely do `.get(...)` on it.
-    # Always include stack/traceback - use tool_stack if available, otherwise generate one.
-    final_stack = tool_stack if isinstance(tool_stack, (str, bytes)) and tool_stack else None
-    if not final_stack:
-        try:
-            final_stack = traceback.format_exc()
-        except Exception:
+    # Always include stack/traceback - use tool_stack if available, otherwise try to get from error response.
+    final_stack: Any = None
+    if isinstance(tool_stack, (str, bytes)) and tool_stack:
+        final_stack = tool_stack
+    elif isinstance(tool_stack, (dict, list)):
+        # Keep structured tool_stack separate
+        pass
+    else:
+        # Try to extract stack from error response
+        if isinstance(err_obj, dict):
+            final_stack = err_obj.get("stack") or err_obj.get("traceback") or err_obj.get("stacktrace")
+        if not final_stack and isinstance(res, dict):
+            details = res.get("details") if isinstance(res.get("details"), dict) else {}
+            if isinstance(details, dict):
+                final_stack = details.get("stack") or details.get("traceback") or details.get("stacktrace")
+        # If still no stack, generate one using traceback.format_stack() which works outside exception handlers
+        if not final_stack:
+            try:
+                final_stack = "".join(traceback.format_stack())
+            except Exception:
+                try:
+                    final_stack = traceback.format_exc()
+                except Exception:
+                    final_stack = "<stack trace unavailable>"
+    
+    # Ensure final_stack is a string
+    if not isinstance(final_stack, str):
+        if isinstance(final_stack, bytes):
+            try:
+                final_stack = final_stack.decode("utf-8", errors="replace")
+            except Exception:
+                final_stack = "<stack trace unavailable>"
+        else:
             final_stack = "<stack trace unavailable>"
     
-    # Log the error with full context
+    # Log the error with full context - use exc_info to capture current exception if any
     logging.error(
-        f"[utc_runner] tool_error tool_name={tool_name!r} trace_id={trace_id} conversation_id={conversation_id} code={err_obj.get('code')} message={err_obj.get('message')} status={status}"
+        f"[utc_runner] tool_error tool_name={tool_name!r} trace_id={trace_id} conversation_id={conversation_id} code={err_obj.get('code')!r} message={err_obj.get('message')!r} status={status}",
+        exc_info=False  # Don't log current exception context since error came from orchestrator
     )
     
+    # Build error envelope - NEVER raise exceptions, always return error envelope
     return _build_error_envelope(
         code=str(err_obj.get("code") or "tool_error"),
         message=str(err_obj.get("message") or f"tool {tool_name} failed"),
@@ -266,6 +295,9 @@ async def utc_run_tool(trace_id: str, conversation_id: str, step_id: Optional[st
             "tool_stack": (tool_stack if isinstance(tool_stack, (dict, list)) else None),
             "stack": final_stack,
             "traceback": final_stack,
+            "exception": str(err_obj.get("message") or ""),
+            "exception_type": "ToolError",
+            "exception_repr": repr(err_obj.get("message") or ""),
         },
     )
 

@@ -272,7 +272,9 @@ async def film2_generate_video(
     )
 
     # Single tool entrypoint: `init_image` inside hv_tool_args toggles i2v behavior.
+    logging.debug("film2_generate_video: calling video.hv.t2v trace_id=%r shot_id=%r conversation_id=%r", trace_id, shot_id, conversation_id)
     gv = await http_tool_run("video.hv.t2v", hv_tool_args)
+    logging.debug("film2_generate_video: video.hv.t2v returned trace_id=%r shot_id=%r has_result=%r", trace_id, shot_id, isinstance(gv, dict))
     if isinstance(gv, dict):
         segment_log.append(gv)
     gvr = (gv.get("result") or {}) if isinstance(gv, dict) else {}
@@ -451,6 +453,7 @@ async def film2_generate_video(
         "film2.video.complete",
         {"trace_id": trace_id, "shot_id": shot_id, "scene_id": scene_id, "act_id": act_id, "final_path": current_path, "segment_results": len(segment_log)},
     )
+    logging.debug("film2_generate_video: returning trace_id=%r shot_id=%r gen_path=%r segment_log_len=%d", trace_id, shot_id, current_path, len(segment_log) if isinstance(segment_log, list) else 0)
     return current_path, segment_log
 
 

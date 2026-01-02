@@ -211,7 +211,7 @@ services:
     depends_on:
       - ollama_qwen
     environment:
-      - QWEN_MODEL_ID=${QWEN_MODEL_ID:-qwen3:30b-a3b-instruct-2507-q4_K_M}
+      - QWEN_MODEL_ID=${QWEN_MODEL_ID:-huihui_ai/qwen3-abliterated:30b-a3b-q4_K_M}
     command: ["sh","-lc","until curl -sf http://127.0.0.1:11435/api/tags >/dev/null; do sleep 2; done; echo Pulling $QWEN_MODEL_ID; curl -sf -X POST http://127.0.0.1:11435/api/pull -H 'Content-Type: application/json' -d '{\"name\":\"${QWEN_MODEL_ID}\"}'; echo Pulled $QWEN_MODEL_ID"]
 
   glm_ollama:
@@ -258,8 +258,8 @@ services:
     depends_on:
       - glm_ollama
     environment:
-      - GLM_MODEL_ID=${GLM_MODEL_ID:-glm4:9b}
-    command: ["sh","-lc","until curl -s http://127.0.0.1:11433/api/tags >/dev/null; do sleep 2; done; echo Pulling $GLM_MODEL_ID; curl -s -X POST http://127.0.0.1:11433/api/pull -H 'Content-Type: application/json' -d '{\"name\":\"${GLM_MODEL_ID:-glm4:9b}\"}'; echo Pulled $GLM_MODEL_ID"]
+      - GLM_MODEL_ID=${GLM_MODEL_ID:-alibilge/Huihui-GLM-4.6V-Flash-abliterated:fp16}
+    command: ["sh","-lc","until curl -s http://127.0.0.1:11433/api/tags >/dev/null; do sleep 2; done; echo Pulling $GLM_MODEL_ID; curl -s -X POST http://127.0.0.1:11433/api/pull -H 'Content-Type: application/json' -d '{\"name\":\"${GLM_MODEL_ID:-alibilge/Huihui-GLM-4.6V-Flash-abliterated:fp16}\"}'; echo Pulled $GLM_MODEL_ID"]
 
 
   init_deepseek:
@@ -269,8 +269,8 @@ services:
     depends_on:
       - deepseek_ollama
     environment:
-      - DEEPSEEK_CODER_MODEL_ID=${DEEPSEEK_CODER_MODEL_ID:-deepseek-coder-v2:lite}
-    command: ["sh","-lc","until curl -s http://127.0.0.1:11436/api/tags >/dev/null; do sleep 2; done; echo Pulling $DEEPSEEK_CODER_MODEL_ID; curl -s -X POST http://127.0.0.1:11436/api/pull -H 'Content-Type: application/json' -d '{\"name\":\"${DEEPSEEK_CODER_MODEL_ID:-deepseek-coder-v2:lite}\"}'; echo Pulled $DEEPSEEK_CODER_MODEL_ID"]
+      - DEEPSEEK_CODER_MODEL_ID=${DEEPSEEK_CODER_MODEL_ID:-huihui_ai/deepseek-v3.2-lite-abliterated:latest}
+    command: ["sh","-lc","until curl -s http://127.0.0.1:11436/api/tags >/dev/null; do sleep 2; done; echo Pulling $DEEPSEEK_CODER_MODEL_ID; curl -s -X POST http://127.0.0.1:11436/api/pull -H 'Content-Type: application/json' -d '{\"name\":\"${DEEPSEEK_CODER_MODEL_ID:-huihui_ai/deepseek-v3.2-lite-abliterated:latest}\"}'; echo Pulled $DEEPSEEK_CODER_MODEL_ID"]
 
   init_qwen_vl:
     image: curlimages/curl:8.7.1
@@ -279,8 +279,8 @@ services:
     depends_on:
       - ollama_qwen
     environment:
-      - QWEN_VL_MODEL_ID=${QWEN_VL_MODEL_ID:-qwen3-vl:8b}
-    command: ["sh","-lc","until curl -sf http://127.0.0.1:11435/api/tags >/dev/null; do sleep 2; done; echo Pulling $QWEN_VL_MODEL_ID; curl -sf -X POST http://127.0.0.1:11435/api/pull -H 'Content-Type: application/json' -d '{\"name\":\"${QWEN_VL_MODEL_ID:-qwen3-vl:8b}\"}'; echo Pulled $QWEN_VL_MODEL_ID"]
+      - QWEN_VL_MODEL_ID=${QWEN_VL_MODEL_ID:-huihui_ai/qwen3-vl-abliterated:30b-a3b-Thinking-v2-q4_K_M}
+    command: ["sh","-lc","until curl -sf http://127.0.0.1:11435/api/tags >/dev/null; do sleep 2; done; echo Pulling $QWEN_VL_MODEL_ID; curl -sf -X POST http://127.0.0.1:11435/api/pull -H 'Content-Type: application/json' -d '{\"name\":\"${QWEN_VL_MODEL_ID:-huihui_ai/qwen3-vl-abliterated:30b-a3b-Thinking-v2-q4_K_M}\"}'; echo Pulled $QWEN_VL_MODEL_ID"]
 
   orchestrator:
     build:
@@ -311,11 +311,11 @@ services:
       - FILM2_MODELS=/opt/models
       - FILM2_DATA=/srv/film2
       - QWEN_BASE_URL=http://127.0.0.1:11435
-      - QWEN_MODEL_ID=${QWEN_MODEL_ID:-qwen3:30b-a3b-instruct-2507-q4_K_M}
+      - QWEN_MODEL_ID=${QWEN_MODEL_ID:-huihui_ai/qwen3-abliterated:30b-a3b-q4_K_M}
       - GLM_OLLAMA_BASE_URL=${GLM_OLLAMA_BASE_URL:-http://127.0.0.1:11433}
-      - GLM_MODEL_ID=${GLM_MODEL_ID:-glm4:9b}
+      - GLM_MODEL_ID=${GLM_MODEL_ID:-alibilge/Huihui-GLM-4.6V-Flash-abliterated:fp16}
       - DEEPSEEK_CODER_OLLAMA_BASE_URL=${DEEPSEEK_CODER_OLLAMA_BASE_URL:-http://127.0.0.1:11436}
-      - DEEPSEEK_CODER_MODEL_ID=${DEEPSEEK_CODER_MODEL_ID:-deepseek-coder-v2:lite}
+      - DEEPSEEK_CODER_MODEL_ID=${DEEPSEEK_CODER_MODEL_ID:-huihui_ai/deepseek-v3.2-lite-abliterated:latest}
       # Enable ICW + Committee + Tools by default
       - ICW_MODE=${ICW_MODE:-committee}
       - ICW_DISABLE=0
@@ -791,6 +791,20 @@ services:
       - HYVIDEO_PIPE_DTYPE=fp16
       - HYVIDEO_CPU_OFFLOAD=1
       - HYVIDEO_VAE_TILING=1
+      # SR (Tencent official 720->1080) — uses /opt/models/hunyuan populated by bootstrap
+      - HYVIDEO_SR_ENABLE=1
+      - HYVIDEO_SR_ROOT=/opt/models/hunyuan
+      - HYVIDEO_SR_TRANSFORMER_SUBFOLDER=transformer/1080p_sr_distilled
+      - HYVIDEO_SR_UPSAMPLER_SUBFOLDER=upsampler/1080p_sr_distilled
+      - HYVIDEO_SR_SCHEDULER_SUBFOLDER=scheduler
+      - HYVIDEO_SR_NUM_INFERENCE_STEPS=8
+      - HYVIDEO_SR_GUIDANCE_SCALE=1.0
+      - HYVIDEO_SR_TARGET_WIDTH=1920
+      - HYVIDEO_SR_TARGET_HEIGHT=1080
+      - HYVIDEO_SR_INTERNAL_MULTIPLE=16
+      # Attention backend (optional; service will catch errors and continue if unavailable)
+      # Recommended by Diffusers docs for A100/A800/4090: flash_hub or flash_varlen_hub
+      - HYVIDEO_ATTENTION_BACKEND=${HYVIDEO_ATTENTION_BACKEND:-}
       # share caches with film2_models volume
       - HF_HOME=/opt/models/.hf
       - TRANSFORMERS_CACHE=/opt/models/.hf

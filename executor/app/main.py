@@ -202,11 +202,11 @@ def _post_json(url: str, payload: Dict[str, Any], expected: Optional[Dict[str, A
             f"body_prefix={(body or '')[:300]!r} payload_keys={sorted(list(payload.keys()))[:64]!r}"
         )
         # Preserve the event locally (stdout/file) so it is not lost.
-        logging.error(f"[executor] _post_json payload={json.dumps(payload, ensure_ascii=False, default=str)}")
+        logging.error("[executor] _post_json payload=%s", json.dumps(payload, ensure_ascii=False, default=str))
         return {}
     except urllib.error.URLError as e:
-        logging.error(f"[executor] _post_json URLError url={url!r} err={e!r} payload_keys={sorted(list(payload.keys()))[:64]!r}")
-        logging.error(f"[executor] _post_json payload={json.dumps(payload, ensure_ascii=False, default=str)!r}")
+        logging.error("[executor] _post_json URLError url=%r err=%r payload_keys=%r", url, e, sorted(list(payload.keys()))[:64])
+        logging.error("[executor] _post_json payload=%r", json.dumps(payload, ensure_ascii=False, default=str))
         return {}
 
     parser = JSONParser()
@@ -597,7 +597,7 @@ async def run_steps(trace_id: str, conversation_id: str, steps: list[dict]):
         return merged
 
     pending = set(norm_steps.keys())
-    logging.info(f"[executor] steps_start trace_id={trace_id} steps={len(pending)}")
+    logging.info("[executor] steps_start trace_id=%s steps=%d", trace_id, len(pending))
     _post_json(ORCHESTRATOR_BASE_URL.rstrip("/") + "/logs/tools.append", {
         "t": int(time.time()*1000),
         "event": "exec_plan_start",
@@ -635,7 +635,7 @@ async def run_steps(trace_id: str, conversation_id: str, steps: list[dict]):
             }
             break
         batch_tools = [{"step_id": step_id, "tool": norm_steps[step_id].get("tool")} for step_id in runnable]
-        logging.info(f"[executor] batch_start trace_id={trace_id} runnable={batch_tools}")
+        logging.info("[executor] batch_start trace_id=%s runnable=%s", trace_id, batch_tools)
         _post_json(ORCHESTRATOR_BASE_URL.rstrip("/") + "/logs/tools.append", {
             "t": int(time.time()*1000),
             "event": "exec_batch_start",
@@ -937,7 +937,7 @@ async def run_steps(trace_id: str, conversation_id: str, steps: list[dict]):
             _post_json(ORCHESTRATOR_BASE_URL.rstrip("/") + "/logs/tools.append", step_finish_payload, expected={})
         for step_id in runnable:
             pending.remove(step_id)
-        logging.info(f"[executor] batch_finish trace_id={trace_id} runnable={batch_tools}")
+        logging.info("[executor] batch_finish trace_id=%s runnable=%s", trace_id, batch_tools)
         _post_json(ORCHESTRATOR_BASE_URL.rstrip("/") + "/logs/tools.append", {
             "t": int(time.time()*1000),
             "event": "exec_batch_finish",
@@ -945,7 +945,7 @@ async def run_steps(trace_id: str, conversation_id: str, steps: list[dict]):
             "conversation_id": conversation_id,
             "items": batch_tools,
         }, expected={})
-    logging.info(f"[executor] steps_finish trace_id={trace_id} produced_keys={sorted(list(step_outputs_by_step_id.keys()))}")
+    logging.info("[executor] steps_finish trace_id=%s produced_keys=%s", trace_id, sorted(list(step_outputs_by_step_id.keys())))
     _post_json(ORCHESTRATOR_BASE_URL.rstrip("/") + "/logs/tools.append", {
         "t": int(time.time()*1000),
         "event": "exec_plan_finish",
@@ -969,7 +969,8 @@ async def execute_http(body: Dict[str, Any]):
     if not steps:
         # No steps: synthesize an explicit invalid_plan error.
         logging.error(
-            f"[executor] invalid_plan_no_steps trace_id={trace_id} conversation_id={conversation_id} body_keys={sorted(list(body.keys())) if isinstance(body, dict) else []} body_type={type(body).__name__}"
+            "[executor] invalid_plan_no_steps trace_id=%s conversation_id=%s body_keys=%s body_type=%s",
+            trace_id, conversation_id, sorted(list(body.keys())) if isinstance(body, dict) else [], type(body).__name__
         )
         step_outputs_by_step_id = {}
         error_obj = {
@@ -983,7 +984,30 @@ async def execute_http(body: Dict[str, Any]):
             },
         }
     else:
-        step_outputs_by_step_id = await run_steps(trace_id, conversation_id, steps)
+        # NEVER break the flow - always handle errors gracefully
+        try:
+            step_outputs_by_step_id = await run_steps(trace_id, conversation_id, steps)
+        except Exception as ex:
+            exc_tb = traceback.format_exc()
+            logging.error(
+                "[executor] run_steps_exception trace_id=%s conversation_id=%s exception_type=%s exception=%r",
+                trace_id, conversation_id, type(ex).__name__, ex,
+                exc_info=True
+            )
+            # Return empty step outputs and surface the exception as an error
+            step_outputs_by_step_id = {}
+            error_obj = {
+                "code": "run_steps_exception",
+                "message": f"run_steps raised exception: {ex}",
+                "status": 500,
+                "details": {
+                    "exception": str(ex),
+                    "exception_type": type(ex).__name__,
+                    "exception_repr": repr(ex),
+                },
+                "traceback": exc_tb,
+                "stack": exc_tb,
+            }
 
     # Derive overall executor status from per-step results when we actually ran
     # a plan. Any step with a non-200 status is treated as a hard failure and
@@ -1028,17 +1052,31 @@ async def execute_http(body: Dict[str, Any]):
             human_msg = (
                 str(msg).strip()
                 if isinstance(msg, str) and msg and msg.strip()
-                else f"step {first_sid} ({tool_name or 'tool'}) failed with status {status}"
+                else "step %s (%s) failed with status %s" % (first_sid, tool_name or 'tool', status)
             )
             stk = traceback_text if isinstance(traceback_text, (str, bytes)) and traceback_text else None
             if not stk:
+                # Use traceback.format_stack() which works outside exception handlers
                 try:
-                    stk = traceback.format_exc()
+                    stk = "".join(traceback.format_stack())
                 except Exception:
+                    try:
+                        stk = traceback.format_exc()
+                    except Exception:
+                        stk = "<stack trace unavailable>"
+            # Ensure stk is a string
+            if not isinstance(stk, str):
+                if isinstance(stk, bytes):
+                    try:
+                        stk = stk.decode("utf-8", errors="replace")
+                    except Exception:
+                        stk = "<stack trace unavailable>"
+                else:
                     stk = "<stack trace unavailable>"
             status_int = int(status) if isinstance(status, int) else 422
             logging.error(
-                f"[executor] step_failed trace_id={trace_id} conversation_id={conversation_id} step_id={first_sid} tool={tool_name!r} code={code!r} message={human_msg!r} status={status_int}"
+                "[executor] step_failed trace_id=%s conversation_id=%s step_id=%s tool=%r code=%r message=%r status=%d",
+                trace_id, conversation_id, first_sid, tool_name, code, human_msg, status_int
             )
             error_obj = {
                 "code": code,

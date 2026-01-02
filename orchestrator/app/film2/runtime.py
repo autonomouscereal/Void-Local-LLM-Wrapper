@@ -47,7 +47,7 @@ def film2_trace_event(
     row = {"t": int(time.time() * 1000), **(e or {})}
     ev = str(row.get("event") or "event")
     payload = {k: v for k, v in row.items() if k != "event"}
-    log.info(f"film2.event trace_id={trace_id!r} event={ev!r} fields={_compact_fields(payload)!r}")
+    log.info("film2.event trace_id=%r event=%r fields=%r", trace_id, ev, _compact_fields(payload))
     log_fn(ev, trace_id=trace_id, **payload)
 
 

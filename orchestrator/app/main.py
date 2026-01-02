@@ -1520,7 +1520,7 @@ async def tool_run(request: Request) -> Any:
     if not isinstance(tool_name, str) or not tool_name.strip():
         tool_name = body.get("name") if isinstance(body, dict) else None
     if not isinstance(trace_id, str) or not trace_id:
-        log.error(f"tool_run: missing trace_id in request body - executor should pass trace_id from chat_completions. Continuing with empty trace_id but this is an error. tool_name={tool_name!r}")
+        log.error("tool_run: missing trace_id in request body - executor should pass trace_id from chat_completions. Continuing with empty trace_id but this is an error. tool_name=%r", tool_name)
         trace_id = ""
     if not isinstance(tool_name, str) or not tool_name.strip():
         log.error(f"tool_run: missing_tool_name - tool_name is required. Continuing with empty tool_name but this is an error. trace_id={trace_id!r}")
@@ -1558,7 +1558,7 @@ async def tool_run(request: Request) -> Any:
 
     # trace_id MUST be passed from upstream - log error if missing but continue
     if not isinstance(trace_id, str) or not trace_id:
-        log.error(f"tool_run: trace_id is empty when setting args - upstream caller must pass trace_id. Continuing but this is an error. tool_name={tool_name!r}")
+        log.error("tool_run: trace_id is empty when setting args - upstream caller must pass trace_id. Continuing but this is an error. tool_name=%r", tool_name)
     args["trace_id"] = trace_id if isinstance(trace_id, str) else ""
 
     args["conversation_id"] = conversation_id if isinstance(conversation_id, str) else ""
@@ -1910,7 +1910,7 @@ async def v1_image_generate(request: Request):
             args["steps"] = int(raw_steps)
         except Exception as exc:
             logging.getLogger(__name__).warning(
-                f"image.dispatch: bad steps={raw_steps!r}; using default={args.get('steps')!r}",
+                "image.dispatch: bad steps=%r; using default=%r", raw_steps, args.get('steps'),
                 exc_info=True,
             )
     if "cfg" in body:
@@ -1919,7 +1919,7 @@ async def v1_image_generate(request: Request):
             args["cfg"] = float(raw_cfg)
         except Exception as exc:
             logging.getLogger(__name__).warning(
-                f"image.dispatch: bad cfg={raw_cfg!r}; using default={args.get('cfg')!r}",
+                "image.dispatch: bad cfg=%r; using default=%r", raw_cfg, args.get('cfg'),
                 exc_info=True,
             )
     # Execute in-process (no /tool.run HTTP recursion)
@@ -2338,7 +2338,7 @@ def _video_draw_on(im: "Image.Image", spec: dict) -> "Image.Image":
     try:
         font = ImageFont.truetype(font_name, size)
     except (OSError, IOError) as ex:
-        logging.debug(f"video_draw_on.font_fallback: {ex}", exc_info=True)
+        logging.debug("video_draw_on.font_fallback: %s", ex, exc_info=True)
         font = ImageFont.load_default()
     x = int(spec.get("x") or im.width // 2)
     y = int(spec.get("y") or int(im.height * 0.9))
@@ -2615,7 +2615,7 @@ def _datasets_emit(job_id: str, ev: Dict[str, Any]) -> None:
         _orcjob_set_state(job_id, "running", phase=ph, progress=pr)
     except Exception as ex:
         # Emitting dataset job progress is best-effort; log failures but never raise.
-        logging.error(f"datasets_emit failed for job_id={job_id}: {ex}", exc_info=True)
+        logging.error("datasets_emit failed for job_id=%s: %s", job_id, ex, exc_info=True)
 
 
 async def _datasets_runner(job_id: str, body: Dict[str, Any]) -> None:
@@ -2625,7 +2625,7 @@ async def _datasets_runner(job_id: str, body: Dict[str, Any]) -> None:
         _datasets_start(body or {}, emit)
         _orcjob_set_state(job_id, "done", phase="done", progress=1.0)
     except Exception as ex:
-        logging.error(f"datasets_runner failed for job_id={job_id}: {ex}", exc_info=True)
+        logging.error("datasets_runner failed for job_id=%s: %s", job_id, ex, exc_info=True)
         _orcjob_set_state(job_id, "failed", phase="error", progress=1.0, error=str(ex))
 
 
@@ -2671,7 +2671,7 @@ async def _send_trace_stream_async(payload: Dict[str, Any]) -> None:
         # Teacher tap failures should not ruin the whole run - log and continue
         dt_ms = int((time.time() - t0) * 1000.0)
         _log("teacher.tap.exception", trace_id=trace_id, ms=dt_ms, error=str(ex))
-        logging.warning(f"teacher.tap failed (non-fatal): {ex}", exc_info=True)
+        logging.warning("teacher.tap failed (non-fatal): %s", ex, exc_info=True)
         # Do not raise - allow the run to continue
 
 
@@ -2794,7 +2794,7 @@ async def _tool_ws_keepalive(websocket: WebSocket) -> None:
         try:
             await websocket.send_text(json.dumps({"keepalive": True}))
         except Exception as ex:
-            logging.debug(f"ws_tool.keepalive_failed: {ex}", exc_info=True)
+            logging.debug("ws_tool.keepalive_failed: %s", ex, exc_info=True)
             break
         await asyncio.sleep(10)
 
@@ -2885,9 +2885,9 @@ from .committee_client import committee_ai_text, committee_jsonify
 
 # committee_client import policy: only import committee call + jsonify.
 # All other config is sourced directly from environment here.
-QWEN_MODEL_ID = os.getenv("QWEN_MODEL_ID", "qwen3:30b-a3b-instruct-2507-q4_K_M")
-GLM_MODEL_ID = os.getenv("GLM_MODEL_ID", "glm4:9b")
-DEEPSEEK_CODER_MODEL_ID = os.getenv("DEEPSEEK_CODER_MODEL_ID", "deepseek-coder-v2:lite")
+QWEN_MODEL_ID = os.getenv("QWEN_MODEL_ID", "huihui_ai/qwen3-abliterated:30b-a3b-q4_K_M")
+GLM_MODEL_ID = os.getenv("GLM_MODEL_ID", "alibilge/Huihui-GLM-4.6V-Flash-abliterated:fp16")
+DEEPSEEK_CODER_MODEL_ID = os.getenv("DEEPSEEK_CODER_MODEL_ID", "huihui_ai/deepseek-v3.2-lite-abliterated:latest")
 
 _DEFAULT_NUM_CTX_RAW = os.getenv("DEFAULT_NUM_CTX", "8192")
 try:
@@ -3009,7 +3009,7 @@ def _tool_error(tool_name: str, code: str, message: str, status: int = 422, **de
 async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conversation_id: str = "") -> Dict[str, Any]:
     tool_name = tool_call.get("tool_name")
     if not isinstance(tool_name, str) or not tool_name.strip():
-        log.error(f"execute_tool_call: missing tool_name in tool_call - continuing with empty tool_name but this is an error. trace_id={trace_id!r} conversation_id={conversation_id!r}")
+        log.error("execute_tool_call: missing tool_name in tool_call - continuing with empty tool_name but this is an error. trace_id=%r conversation_id=%r", trace_id, conversation_id)
         tool_name = ""
     tool_name = tool_name.strip() if isinstance(tool_name, str) else ""
     # IMPORTANT: do not use `or {}` here; falsy values (e.g. "" or 0) should
@@ -3017,7 +3017,7 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
     raw_args = tool_call.get("arguments")
     # trace_id MUST be passed as parameter from chat_completions - NO FALLBACKS
     if not trace_id:
-        log.error(f"execute_tool_call: missing trace_id parameter - trace_id must be passed from chat_completions. tool_name={tool_name!r} conversation_id={conversation_id!r}")
+        log.error("execute_tool_call: missing trace_id parameter - trace_id must be passed from chat_completions. tool_name=%r conversation_id=%r", tool_name, conversation_id)
         trace_id = ""  # Do not generate - trace_id must come from chat_completions
     if not conversation_id:
         conv_id_val = tool_call.get("conversation_id")
@@ -3032,7 +3032,7 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
     # The executor is not a callable tool; it is invoked only via
     # the external executor service (pipeline.executor_gateway).
     if tool_name == "executor":
-        log.error(f"execute_tool_call: executor tool called directly - executor must be invoked via execute_tools(), not as a tool. trace_id={trace_id!r} conversation_id={conversation_id!r}")
+        log.error("execute_tool_call: executor tool called directly - executor must be invoked via execute_tools(), not as a tool. trace_id=%r conversation_id=%r", trace_id, conversation_id)
         # Continue processing but return error result
         return {"tool_name": "executor", "error": {"code": "executor_not_callable", "message": "The executor must be invoked via execute_tools(), not as a tool.", "status": 500}}
 
@@ -4315,10 +4315,15 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
         prompt = (a.get("prompt") or "").strip()
         # trace_id MUST be passed as parameter - NO FALLBACKS, NO EXTRACTING FROM ARGS
         if not trace_id:
-            log.error(f"film2.run: missing trace_id parameter - trace_id must be passed from chat_completions. conversation_id={conversation_id!r}")
+            log.error("film2.run: missing trace_id parameter - trace_id must be passed from chat_completions. conversation_id=%r", conversation_id)
+            trace_event("film2.run.error.missing_trace_id", {"conversation_id": conversation_id, "tool_name": "film2.run"})
         # conversation_id is the conversation/client id. film_id is a separate identifier for a film run.
         if not conversation_id:
             conversation_id = a.get("conversation_id")
+            if conversation_id:
+                logging.debug("film2.run: extracted conversation_id from args trace_id=%r conversation_id=%r", trace_id, conversation_id)
+            else:
+                logging.warning("film2.run: conversation_id not provided in args or parameter trace_id=%r", trace_id)
 
         _film_id_raw = a.get("film_id")
         if isinstance(_film_id_raw, (str, int)) and str(_film_id_raw).strip():
@@ -4335,10 +4340,8 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
         width = int(a.get("width") or 1920)
         height = int(a.get("height") or 1080)
         logging.info(
-            f"film2.run:start trace_id={trace_id!r} conversation_id={conversation_id!r} film_id={a.get('film_id')!r} "
-            f"prompt_len={len(prompt or '')} duration_s={float(duration_s)} fps={int(fps)} "
-            f"size={int(width)}x{int(height)} clips={len(clips or [])} images={len(images or [])} "
-            f"interpolate={bool(do_interpolate)} scale={target_scale!r} locks={bool(isinstance(a.get('locks'), dict) and bool(a.get('locks')))}"
+            "film2.run:start trace_id=%r conversation_id=%r film_id=%r prompt_len=%d duration_s=%.2f fps=%d size=%dx%d clips=%d images=%d interpolate=%r scale=%r locks=%r",
+            trace_id, conversation_id, a.get('film_id'), len(prompt or ''), float(duration_s), int(fps), int(width), int(height), len(clips or []), len(images or []), bool(do_interpolate), target_scale, bool(isinstance(a.get('locks'), dict) and bool(a.get('locks')))
         )
         result: Dict[str, Any] = {"ids": {"film_id": film_id}, "meta": {"shots": [], "film_id": film_id}}  # ids contains external API identifiers
         if conversation_id:
@@ -4357,7 +4360,7 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
         # Character context derived from locks (if present); reused for music + hero updates.
         current_character_bundles: Dict[str, Dict[str, Any]] = await ensure_story_character_bundles(locks_arg if isinstance(locks_arg, dict) else {})
         logging.info(
-            f"film2.run:locks:bundles_loaded trace_id={trace_id!r} characters={len(current_character_bundles or {}) if isinstance(current_character_bundles, dict) else 0}"
+            "film2.run:locks:bundles_loaded trace_id=%r characters=%d", trace_id, len(current_character_bundles or {}) if isinstance(current_character_bundles, dict) else 0
         )
         # Derive character_ids once for downstream use (music + hero lock updates).
         character_ids: List[str] = []
@@ -4375,14 +4378,20 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
                 if isinstance(character_id, (str, int))
             ]
         if prompt:
-            story_obj = await _story_draft(prompt, duration_s, trace_id=trace_id)
+            try:
+                story_obj = await _story_draft(prompt, duration_s, trace_id=trace_id)
+            except Exception as ex:
+                logging.error("film2.run:story:draft failed (non-fatal) trace_id=%r ex=%r", trace_id, ex, exc_info=True)
+                trace_event("film2.story.draft_failed", {"trace_id": trace_id, "error": str(ex)})
+                story_obj = {}
+                warnings.append("story_draft_failed")
             if isinstance(story_obj, dict):
                 acts_n = len(story_obj.get("acts") or []) if isinstance(story_obj.get("acts"), list) else 0
                 chars_n = len(story_obj.get("characters") or []) if isinstance(story_obj.get("characters"), list) else 0
                 locs_n = len(story_obj.get("locations") or []) if isinstance(story_obj.get("locations"), list) else 0
                 objs_n = len(story_obj.get("objects") or []) if isinstance(story_obj.get("objects"), list) else 0
                 logging.info(
-                    f"film2.run:story:drafted trace_id={trace_id!r} acts={acts_n} characters={chars_n} locations={locs_n} objects={objs_n}"
+                    "film2.run:story:drafted trace_id=%r acts=%d characters=%d locations=%d objects=%d", trace_id, acts_n, chars_n, locs_n, objs_n
                 )
             trace_append(
                 "film2.story_draft",
@@ -4393,10 +4402,16 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
                 },
             )
             # Story engine already runs iterative audit/revise/extend until committee says it's "done".
-            scenes_from_story, shots_from_story = _story_derive(story_obj)
-            logging.info(
-                f"film2.run:story:derived trace_id={trace_id!r} scenes={len(scenes_from_story or [])} shots={len(shots_from_story or [])}"
-            )
+            try:
+                scenes_from_story, shots_from_story = _story_derive(story_obj, trace_id=trace_id)
+                logging.info(
+                    "film2.run:story:derived trace_id=%s scenes=%d shots=%d", trace_id, len(scenes_from_story or []), len(shots_from_story or [])
+                )
+            except Exception as ex:
+                logging.error("film2.run:story:derive failed (non-fatal) trace_id=%r ex=%r", trace_id, ex, exc_info=True)
+                trace_event("film2.story.derive_failed", {"trace_id": trace_id, "error": str(ex)})
+                scenes_from_story, shots_from_story = [], []
+                warnings.append("story_derive_failed")
         if warnings:
             meta_warnings = result["meta"].setdefault("warnings", [])
             if isinstance(meta_warnings, list):
@@ -4424,15 +4439,16 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
                         for ev in events:
                             if not isinstance(ev, dict):
                                 continue
-                            if ev.get("type") != "state_change":
+                            event_type = ev.get("event_type") or ev.get("type") or ""
+                            if event_type != "state_change":
                                 continue
-                            target = ev.get("target")
+                            event_target = ev.get("event_target") or ev.get("target") or ""
                             state_delta = ev.get("state_delta") if isinstance(ev.get("state_delta"), dict) else {}
                             trace_append(
                                 "film2.character_state_change",
                                 {
                                     "trace_id": trace_id,
-                                    "character_id": target,
+                                    "character_id": event_target,
                                     "event_id": ev.get("event_id"),
                                     "state_delta": state_delta,
                                     "act_id": act_id,
@@ -4463,7 +4479,7 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
             locks_arg = await _ensure_visual_locks_for_story(story_obj, locks_arg, profile_name, trace_id)
             result["meta"]["locks"] = locks_arg
             logging.info(
-                f"film2.run:locks:enriched trace_id={trace_id!r} has_locks={bool(locks_arg)} characters={len(locks_arg.get('characters') or []) if isinstance(locks_arg.get('characters'), list) else 0}"
+                "film2.run:locks:enriched trace_id=%r has_locks=%r characters=%d", trace_id, bool(locks_arg), len(locks_arg.get('characters') or []) if isinstance(locks_arg.get('characters'), list) else 0
             )
         # Precompute TTS dialogue audio when possible
         dialogue_index: Dict[str, Any] = {}
@@ -4479,7 +4495,7 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
                     character_bundles=current_character_bundles if isinstance(current_character_bundles, dict) else None,
                 )
             except Exception as ex:
-                logging.error(f"film2.run:tts:dialogue_pregen crashed (non-fatal) trace_id={trace_id!r} ex={ex!r}", exc_info=True)
+                logging.error("film2.run:tts:dialogue_pregen crashed (non-fatal) trace_id=%r ex=%r", trace_id, ex, exc_info=True)
                 warnings.append("tts_dialogue_pregen_failed")
             if dialogue_index:
                 result["meta"]["dialogue"] = dialogue_index
@@ -4496,39 +4512,49 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
                     if v.get("error"):
                         bad_lines += 1
                 logging.info(
-                    f"film2.run:tts:dialogue_pregen trace_id={trace_id!r} lines={len(dialogue_index)} ok={ok_lines} failed={bad_lines}"
+                    "film2.run:tts:dialogue_pregen trace_id=%r lines=%d ok=%d failed=%d", trace_id, len(dialogue_index), ok_lines, bad_lines
                 )
         elif story_obj and not XTTS_API_URL:
-            logging.warning(f"film2.run:tts:skipped trace_id={trace_id!r} reason=XTTS_API_URL_not_configured")
+            logging.warning("film2.run:tts:skipped trace_id=%r reason=XTTS_API_URL_not_configured", trace_id)
         # Generate simple scene and shot storyboards before hv video
         if scenes_from_story:
-            scenes_from_story = await _film2_generate_scene_storyboards(
-                scenes_from_story,
-                locks_arg,
-                profile_name,
-                trace_id,
-                execute_tool_call,
-            )
-            result["meta"]["scenes"] = scenes_from_story
+            try:
+                scenes_from_story = await _film2_generate_scene_storyboards(
+                    scenes_from_story,
+                    locks_arg,
+                    profile_name,
+                    trace_id,
+                    execute_tool_call,
+                )
+                result["meta"]["scenes"] = scenes_from_story
+            except Exception as ex:
+                logging.error("film2.run:storyboards:scenes failed (non-fatal) trace_id=%r ex=%r", trace_id, ex, exc_info=True)
+                trace_event("film2.storyboards.scenes_failed", {"trace_id": trace_id, "error": str(ex)})
+                warnings.append("storyboards_scenes_failed")
             sc_ok = 0
             for sc in scenes_from_story or []:
                 if isinstance(sc, dict) and isinstance(sc.get("storyboard"), dict) and sc.get("storyboard", {}).get("image_url"):
                     sc_ok += 1
-            logging.info(f"film2.run:storyboards:scenes trace_id={trace_id!r} ok={sc_ok}/{len(scenes_from_story or [])}")
+            logging.info("film2.run:storyboards:scenes trace_id=%r ok=%d/%d", trace_id, sc_ok, len(scenes_from_story or []))
         if shots_from_story:
-            shots_from_story = await _film2_generate_shot_storyboards(
-                shots_from_story,
-                locks_arg,
-                profile_name,
-                trace_id,
-                execute_tool_call,
-            )
-            result["meta"]["shots_from_story"] = shots_from_story
+            try:
+                shots_from_story = await _film2_generate_shot_storyboards(
+                    shots_from_story,
+                    locks_arg,
+                    profile_name,
+                    trace_id,
+                    execute_tool_call,
+                )
+                result["meta"]["shots_from_story"] = shots_from_story
+            except Exception as ex:
+                logging.error("film2.run:storyboards:shots failed (non-fatal) trace_id=%r ex=%r", trace_id, ex, exc_info=True)
+                trace_event("film2.storyboards.shots_failed", {"trace_id": trace_id, "error": str(ex)})
+                warnings.append("storyboards_shots_failed")
             sh_ok = 0
             for sh in shots_from_story or []:
                 if isinstance(sh, dict) and isinstance(sh.get("storyboard"), dict) and sh.get("storyboard", {}).get("image_url"):
                     sh_ok += 1
-            logging.info(f"film2.run:storyboards:shots trace_id={trace_id!r} ok={sh_ok}/{len(shots_from_story or [])}")
+            logging.info("film2.run:storyboards:shots trace_id=%r ok=%d/%d", trace_id, sh_ok, len(shots_from_story or []))
         # Music planning phase: optionally score the film via music.infinite.windowed.
         music_meta: Dict[str, Any] = {}
         if prompt and duration_s > 0:
@@ -4556,28 +4582,34 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
                 },
             )
             # Call the infinite/windowed engine directly to avoid nested /tool.run recursion.
-            provider = RestMusicProvider(MUSIC_API_URL)
-            manifest_music: Dict[str, Any] = {"items": []}
-            music_env = await run_music_infinite_windowed(
-                provider=provider,
-                manifest=manifest_music,
-                trace_id=trace_id,
-                conversation_id=(conversation_id if isinstance(conversation_id, str) else ""),
-                prompt=music_args.get("prompt", ""),
-                length_s=music_args.get("length_s", 60),
-                bpm=music_args.get("bpm"),
-                key=music_args.get("key"),
-                window_bars=music_args.get("window_bars", 8),
-                overlap_bars=music_args.get("overlap_bars", 1),
-                mode=music_args.get("mode", "start"),
-                lock_bundle=music_args.get("lock_bundle", {}),
-                instrumental_only=music_args.get("instrumental_only", False),
-                character_id=music_args.get("character_id"),
-                seed=music_args.get("seed"),
-                artifact_id=music_args.get("artifact_id"),
-            )
-            if isinstance(music_env, dict):
-                music_meta = music_env
+            try:
+                provider = RestMusicProvider(MUSIC_API_URL)
+                manifest_music: Dict[str, Any] = {"items": []}
+                music_env = await run_music_infinite_windowed(
+                    provider=provider,
+                    manifest=manifest_music,
+                    trace_id=trace_id,
+                    conversation_id=(conversation_id if isinstance(conversation_id, str) else ""),
+                    prompt=music_args.get("prompt", ""),
+                    length_s=music_args.get("length_s", 60),
+                    bpm=music_args.get("bpm"),
+                    key=music_args.get("key"),
+                    window_bars=music_args.get("window_bars", 8),
+                    overlap_bars=music_args.get("overlap_bars", 1),
+                    mode=music_args.get("mode", "start"),
+                    lock_bundle=music_args.get("lock_bundle", {}),
+                    instrumental_only=music_args.get("instrumental_only", False),
+                    character_id=music_args.get("character_id"),
+                    seed=music_args.get("seed"),
+                    artifact_id=music_args.get("artifact_id"),
+                )
+                if isinstance(music_env, dict):
+                    music_meta = music_env
+            except Exception as ex:
+                logging.error("film2.run:music:generation failed (non-fatal) trace_id=%r ex=%r", trace_id, ex, exc_info=True)
+                trace_event("film2.music.generation_failed", {"trace_id": trace_id, "error": str(ex)})
+                music_meta = {}
+                warnings.append("music_generation_failed")
         final_music_mix_path: str | None = None
         final_music_eval: Dict[str, Any] | None = None
         if music_meta and isinstance(result.get("meta"), dict):
@@ -4651,7 +4683,7 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
                 trace_id,
                 (len(win_list) if isinstance(win_list, list) else 0),
             )
-            logging.info(f"film2.run:prepasses_complete trace_id={trace_id!r} dur_ms={int((time.perf_counter() - t_film2) * 1000)}")
+            logging.info("film2.run:prepasses_complete trace_id=%r dur_ms=%d", trace_id, int((time.perf_counter() - t_film2) * 1000))
             # Trace cross-modal attachment for distillation and perform backing+vocals mix.
             music_meta_obj = music_meta.get("meta") if isinstance(music_meta.get("meta"), dict) else {}
             # Locate the backing audio path from the music envelope artifacts.
@@ -4730,16 +4762,22 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
                                 "start_s": float(stem.get("start_s") or 0.0),
                             }
                         )
-                    mix_env = run_music_mixdown(
-                        conversation_id=(conversation_id if isinstance(conversation_id, str) else ""),
-                        trace_id=(trace_id if isinstance(trace_id, str) else ""),
-                        stems=stems_arg,
-                        sample_rate=32000,
-                        channels=2,
-                        seed=a.get("seed"),
-                        manifest={},
-                        artifact_id=(a.get("artifact_id") if isinstance(a.get("artifact_id"), str) else None),
-                    )
+                    try:
+                        mix_env = run_music_mixdown(
+                            conversation_id=(conversation_id if isinstance(conversation_id, str) else ""),
+                            trace_id=(trace_id if isinstance(trace_id, str) else ""),
+                            stems=stems_arg,
+                            sample_rate=32000,
+                            channels=2,
+                            seed=a.get("seed"),
+                            manifest={},
+                            artifact_id=(a.get("artifact_id") if isinstance(a.get("artifact_id"), str) else None),
+                        )
+                    except Exception as ex:
+                        logging.error("film2.run:music:mixdown failed (non-fatal) trace_id=%r ex=%r", trace_id, ex, exc_info=True)
+                        trace_event("film2.music.mixdown_failed", {"trace_id": trace_id, "error": str(ex)})
+                        mix_env = {"error": {"code": "mixdown_exception", "message": str(ex)}}
+                        final_music_mix_path = backing_full_path
                     mix_artifacts = mix_env.get("artifacts") if isinstance(mix_env.get("artifacts"), list) else []
                     mix_path: str | None = None
                     for artifact in mix_artifacts:
@@ -4759,19 +4797,23 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
                                 break
                     final_music_mix_path = mix_path or backing_full_path
                     if isinstance(final_music_mix_path, str) and final_music_mix_path:
-                        final_music_eval = await compute_music_eval(
-                            track_path=final_music_mix_path,
-                            song_graph=music_branch,
-                            style_pack=music_branch.get("style_pack") if isinstance(music_branch.get("style_pack"), dict) else None,
-                            film_context={
-                                "duration_s": duration_s,
-                                "fps": fps_val,
-                                "width": width_val,
-                                "height": height_val,
-                            },
-                            trace_id=trace_id,
-                            conversation_id=conversation_id if isinstance(conversation_id, str) else None,
-                        )
+                        try:
+                            final_music_eval = await compute_music_eval(
+                                track_path=final_music_mix_path,
+                                song_graph=music_branch,
+                                style_pack=music_branch.get("style_pack") if isinstance(music_branch.get("style_pack"), dict) else None,
+                                film_context={
+                                    "duration_s": duration_s,
+                                    "fps": fps_val,
+                                    "width": width_val,
+                                    "height": height_val,
+                                },
+                                trace_id=trace_id,
+                                conversation_id=conversation_id if isinstance(conversation_id, str) else None,
+                            )
+                        except Exception as ex:
+                            logging.warning("film2.run:music:eval failed (non-fatal) trace_id=%r ex=%r", trace_id, ex, exc_info=True)
+                            final_music_eval = {}
                         inner_music_eval = final_music_eval.get("result") if isinstance(final_music_eval, dict) and isinstance(final_music_eval.get("result"), dict) else {}
                         overall_block = inner_music_eval.get("overall") if isinstance(inner_music_eval.get("overall"), dict) else {}
                         oq = float(overall_block.get("overall_quality_score") or 0.0)
@@ -4992,12 +5034,16 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
                     shot_meta["segment_results"] = segment_log
                     # Choose hero frame from the final video (not from tool results), and compute real lock metrics.
                     final_video = shot_meta.get("best_path") or shot_meta.get("final_clean_path") or shot_meta.get("upscaled_path") or shot_meta.get("interp_path") or shot_meta.get("clean_path") or src
-                    hero_record = await pick_hero_frame_from_video(
-                        str(final_video) if isinstance(final_video, str) else "",
-                        lock_bundle=locks_arg if isinstance(locks_arg, dict) else {},
-                        thresholds=thresholds_lock if isinstance(thresholds_lock, dict) else {},
-                        upload_dir=UPLOAD_DIR,
-                    )
+                    try:
+                        hero_record = await pick_hero_frame_from_video(
+                            str(final_video) if isinstance(final_video, str) else "",
+                            lock_bundle=locks_arg if isinstance(locks_arg, dict) else {},
+                            thresholds=thresholds_lock if isinstance(thresholds_lock, dict) else {},
+                            upload_dir=UPLOAD_DIR,
+                        )
+                    except Exception as ex:
+                        logging.warning("film2.run:pick_hero_frame (clips) failed (non-fatal) trace_id=%r ex=%r", trace_id, ex, exc_info=True)
+                        hero_record = None
                     if hero_record:
                         shot_meta["hero_frame"] = hero_record
                         # Shot-level artifacts for UI + distillation (hero frame image)
@@ -5104,17 +5150,25 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
                         "prompt": descr,
                         "duration_s": dur,
                     }
-                    gen_path, segment_log = await film2_generate_video(
-                        trace_id=trace_id,
-                        shot_id=str(shot_id) if isinstance(shot_id, str) else None,
-                        scene_id=str(scene_id) if isinstance(scene_id, str) else None,
-                        act_id=str(act_id) if isinstance(act_id, str) else None,
-                        hv_tool_args=hv_args,
-                        upload_dir=UPLOAD_DIR,
-                        log_fn=_log,
-                        http_tool_run=http_tool_run,
-                        artifact_video=_film2_artifact_video,
-                    )
+                    logging.debug("film2.run: calling film2_generate_video trace_id=%r shot_id=%r scene_id=%r act_id=%r", trace_id, shot_id, scene_id, act_id)
+                    try:
+                        gen_path, segment_log = await film2_generate_video(
+                            trace_id=trace_id,
+                            shot_id=str(shot_id) if isinstance(shot_id, str) else None,
+                            scene_id=str(scene_id) if isinstance(scene_id, str) else None,
+                            act_id=str(act_id) if isinstance(act_id, str) else None,
+                            hv_tool_args=hv_args,
+                            upload_dir=UPLOAD_DIR,
+                            log_fn=_log,
+                            http_tool_run=http_tool_run,
+                            artifact_video=_film2_artifact_video,
+                        )
+                        logging.debug("film2.run: film2_generate_video returned trace_id=%r gen_path=%r segment_log_len=%d", trace_id, gen_path, len(segment_log) if isinstance(segment_log, list) else 0)
+                    except Exception as ex:
+                        logging.error("film2.run:video:generation failed (non-fatal) trace_id=%r shot_id=%r ex=%r", trace_id, shot_id, ex, exc_info=True)
+                        trace_event("film2.video.generation_failed", {"trace_id": trace_id, "shot_id": shot_id, "error": str(ex)})
+                        gen_path, segment_log = None, []
+                        warnings.append(f"video_generation_failed_shot_{shot_id}")
                     if isinstance(gen_path, str) and gen_path:
                         # film2_generate_video returns the final path after post passes.
                         shot_meta["final_path"] = gen_path
@@ -5168,58 +5222,66 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
                         best_path = gen_path if isinstance(gen_path, str) and gen_path else (clean0 or gen0)
                         best_reason = "final_default"
                         if isinstance(gen0, str) and gen0 and isinstance(gen_path, str) and gen_path and gen0 != gen_path:
-                            qa_gen = await http_tool_run(
-                                "video.temporal_clip_qa",
-                                {
-                                    "src": gen0,
-                                    "conversation_id": (conversation_id if isinstance(conversation_id, str) else ""),
-                                    "trace_id": trace_id,
-                                    "film_id": film_id,
-                                    "scene_id": scene_id,
-                                    "shot_id": shot_id,
-                                    "act_id": act_id,
-                                },
-                            )
-                            qa_fin = await http_tool_run(
-                                "video.temporal_clip_qa",
-                                {
-                                    "src": gen_path,
-                                    "conversation_id": (conversation_id if isinstance(conversation_id, str) else ""),
-                                    "trace_id": trace_id,
-                                    "film_id": film_id,
-                                    "scene_id": scene_id,
-                                    "shot_id": shot_id,
-                                    "act_id": act_id,
-                                },
-                            )
-                            if isinstance(qa_gen, dict):
-                                segment_log.append(qa_gen)
-                                gqr = qa_gen.get("result") if isinstance(qa_gen.get("result"), dict) else {}
-                                if isinstance(gqr, dict):
-                                    shot_meta["temporal_qa_gen"] = gqr
-                            if isinstance(qa_fin, dict):
-                                segment_log.append(qa_fin)
-                                fqr = qa_fin.get("result") if isinstance(qa_fin.get("result"), dict) else {}
-                                if isinstance(fqr, dict):
-                                    shot_meta["temporal_qa_final"] = fqr
+                            try:
+                                qa_gen = await http_tool_run(
+                                    "video.temporal_clip_qa",
+                                    {
+                                        "src": gen0,
+                                        "conversation_id": (conversation_id if isinstance(conversation_id, str) else ""),
+                                        "trace_id": trace_id,
+                                        "film_id": film_id,
+                                        "scene_id": scene_id,
+                                        "shot_id": shot_id,
+                                        "act_id": act_id,
+                                    },
+                                )
+                                qa_fin = await http_tool_run(
+                                    "video.temporal_clip_qa",
+                                    {
+                                        "src": gen_path,
+                                        "conversation_id": (conversation_id if isinstance(conversation_id, str) else ""),
+                                        "trace_id": trace_id,
+                                        "film_id": film_id,
+                                        "scene_id": scene_id,
+                                        "shot_id": shot_id,
+                                        "act_id": act_id,
+                                    },
+                                )
+                                if isinstance(qa_gen, dict):
+                                    segment_log.append(qa_gen)
+                                    gqr = qa_gen.get("result") if isinstance(qa_gen.get("result"), dict) else {}
+                                    if isinstance(gqr, dict):
+                                        shot_meta["temporal_qa_gen"] = gqr
+                                if isinstance(qa_fin, dict):
+                                    segment_log.append(qa_fin)
+                                    fqr = qa_fin.get("result") if isinstance(qa_fin.get("result"), dict) else {}
+                                    if isinstance(fqr, dict):
+                                        shot_meta["temporal_qa_final"] = fqr
+                            except Exception as ex:
+                                logging.warning("film2.run:qa:temporal_clip_qa failed (non-fatal) trace_id=%r shot_id=%r ex=%r", trace_id, shot_id, ex, exc_info=True)
+                                qa_gen, qa_fin = {}, {}
                             temporal_qa_gen = shot_meta.get("temporal_qa_gen") if isinstance(shot_meta.get("temporal_qa_gen"), dict) else {}
                             temporal_qa_final = shot_meta.get("temporal_qa_final") if isinstance(shot_meta.get("temporal_qa_final"), dict) else {}
                             gmeta = temporal_qa_gen.get("meta") if isinstance(temporal_qa_gen, dict) else {}
                             fmeta = temporal_qa_final.get("meta") if isinstance(temporal_qa_final, dict) else {}
                             gstab = float(gmeta.get("temporal_stability")) if isinstance(gmeta.get("temporal_stability"), (int, float)) else None
                             fstab = float(fmeta.get("temporal_stability")) if isinstance(fmeta.get("temporal_stability"), (int, float)) else None
-                            best_pick = await choose_best_video_pair(
-                                base_path=gen0,
-                                processed_path=gen_path,
-                                base_temporal_stability=gstab,
-                                processed_temporal_stability=fstab,
-                                lock_bundle=locks_arg if isinstance(locks_arg, dict) else {},
-                                thresholds_lock=thresholds_lock if isinstance(thresholds_lock, dict) else {},
-                                upload_dir=UPLOAD_DIR,
-                                trace_id=trace_id,
-                                event_kind="film2.best_select_story",
-                                context={"film_id": film_id, "shot_id": shot_id},
-                            )
+                            try:
+                                best_pick = await choose_best_video_pair(
+                                    base_path=gen0,
+                                    processed_path=gen_path,
+                                    base_temporal_stability=gstab,
+                                    processed_temporal_stability=fstab,
+                                    lock_bundle=locks_arg if isinstance(locks_arg, dict) else {},
+                                    thresholds_lock=thresholds_lock if isinstance(thresholds_lock, dict) else {},
+                                    upload_dir=UPLOAD_DIR,
+                                    trace_id=trace_id,
+                                    event_kind="film2.best_select_story",
+                                    context={"film_id": film_id, "shot_id": shot_id},
+                                )
+                            except Exception as ex:
+                                logging.warning("film2.run:choose_best_video_pair failed (non-fatal) trace_id=%r shot_id=%r ex=%r", trace_id, shot_id, ex, exc_info=True)
+                                best_pick = {}
                             if isinstance(best_pick, dict):
                                 if isinstance(best_pick.get("best_path"), str) and best_pick.get("best_path"):
                                     best_path = str(best_pick.get("best_path"))
@@ -5276,37 +5338,45 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
                                 for character_id in character_ids:
                                     existing_bundle = current_character_bundles.get(character_id)
                                     if existing_bundle is not None:
-                                        updated_bundle = await _lock_update_from_hero(
-                                            character_id,
-                                            hero_abs_path,
-                                            existing_bundle,
-                                            locks_root_dir=LOCKS_ROOT_DIR,
-                                        )
-                                        current_character_bundles[character_id] = updated_bundle
-                                        hero_record.setdefault("bundle_versions", {})[character_id] = {
-                                            "schema_version": updated_bundle.get("schema_version"),
-                                        }
-                            _film2_emit_hero_traces(trace_id, film_id, conversation_id, hero_record, shot_meta)
+                                        try:
+                                            updated_bundle = await _lock_update_from_hero(
+                                                character_id,
+                                                hero_abs_path,
+                                                existing_bundle,
+                                                locks_root_dir=LOCKS_ROOT_DIR,
+                                            )
+                                            current_character_bundles[character_id] = updated_bundle
+                                            hero_record.setdefault("bundle_versions", {})[character_id] = {
+                                                "schema_version": updated_bundle.get("schema_version"),
+                                            }
+                                        except Exception as ex:
+                                            logging.warning("film2.run:_lock_update_from_hero failed (non-fatal) trace_id=%r character_id=%r ex=%r", trace_id, character_id, ex, exc_info=True)
+                            try:
+                                _film2_emit_hero_traces(trace_id, film_id, conversation_id, hero_record, shot_meta)
+                            except Exception as ex:
+                                logging.warning("film2.run:_film2_emit_hero_traces failed (non-fatal) trace_id=%r ex=%r", trace_id, ex, exc_info=True)
                     result["meta"]["shots"].append(shot_meta)
                     story_shot_index += 1
         # Image-based generation goes through Hunyuan (full-res, max quality) when story shots are unavailable.
         elif images:
-                for i, img in enumerate(images):
-                    shot_meta = {"index": i, "init_image": img}
-                    hv_args_img: Dict[str, Any] = build_hv_tool_args(
-                        prompt=prompt or "",
-                        width=width_val,
-                        height=height_val,
-                        fps=fps_val,
-                        seconds=int(duration_s),
-                        locks=locks_arg,
-                        seed=a.get("seed"),
-                        conversation_id=(conversation_id if isinstance(conversation_id, str) else ""),
-                        trace_id=trace_id,
-                        film_id=film_id,
-                        shot_id=f"shot_{i}",
-                        init_image=img,
-                    )
+            for i, img in enumerate(images):
+                shot_meta = {"index": i, "init_image": img}
+                hv_args_img: Dict[str, Any] = build_hv_tool_args(
+                    prompt=prompt or "",
+                    width=width_val,
+                    height=height_val,
+                    fps=fps_val,
+                    seconds=int(duration_s),
+                    locks=locks_arg,
+                    seed=a.get("seed"),
+                    conversation_id=(conversation_id if isinstance(conversation_id, str) else ""),
+                    trace_id=trace_id,
+                    film_id=film_id,
+                    shot_id=f"shot_{i}",
+                    init_image=img,
+                )
+                logging.debug("film2.run: calling film2_generate_video (image-based) trace_id=%r shot_index=%d", trace_id, i)
+                try:
                     gen_path, segment_log = await film2_generate_video(
                         trace_id=trace_id,
                         shot_id=f"shot_{i}",
@@ -5319,118 +5389,12 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
                         http_tool_run=http_tool_run,
                         artifact_video=_film2_artifact_video,
                     )
-                    if isinstance(gen_path, str) and gen_path:
-                        shot_meta["final_path"] = gen_path
-                    if segment_log:
-                        shot_meta["segment_results"] = segment_log
-                        versions: List[Dict[str, Any]] = []
-                        gen0 = None
-                        clean0 = None
-                        up0 = None
-                        ip0 = None
-                        for tr in segment_log:
-                            if not isinstance(tr, dict):
-                                continue
-                            tool_name = tr.get("tool_name")
-                            if not isinstance(tool_name, str) or not tool_name.strip():
-                                continue
-                            tool_name = tool_name.strip()
-                            tres = tr.get("result") if isinstance(tr.get("result"), dict) else {}
-                            pth = tres.get("path") if isinstance(tres.get("path"), str) else None
-                            if tool_name == "video.hv.t2v" and pth:
-                                gen0 = pth
-                            if tool_name == "video.cleanup" and pth:
-                                clean0 = pth
-                            if tool_name == "video.upscale" and pth:
-                                up0 = pth
-                            if tool_name == "video.interpolate" and pth:
-                                ip0 = pth
-                        if isinstance(gen0, str) and gen0:
-                            versions.append({"kind": "gen", "path": gen0})
-                            shot_meta["gen_path"] = gen0
-                        if isinstance(up0, str) and up0:
-                            versions.append({"kind": "upscale", "path": up0})
-                            shot_meta["upscaled_path"] = up0
-                        if isinstance(ip0, str) and ip0:
-                            versions.append({"kind": "interpolate", "path": ip0})
-                            shot_meta["interp_path"] = ip0
-                        if isinstance(clean0, str) and clean0:
-                            versions.append({"kind": "clean", "path": clean0})
-                            shot_meta["clean_path"] = clean0
-                        if isinstance(gen_path, str) and gen_path:
-                            versions.append({"kind": "final", "path": gen_path})
-                        best_path = gen_path if isinstance(gen_path, str) and gen_path else (clean0 or gen0)
-                        if isinstance(best_path, str) and best_path:
-                            shot_meta["best_path"] = best_path
-                            shot_meta["best_reason"] = "final_default"
-                        shot_meta["versions"] = versions
-                        hero_record = await pick_hero_frame_from_video(
-                            str(shot_meta.get("best_path") or gen_path) if isinstance((shot_meta.get("best_path") or gen_path), str) else "",
-                            lock_bundle=locks_arg if isinstance(locks_arg, dict) else {},
-                            thresholds=thresholds_lock if isinstance(thresholds_lock, dict) else {},
-                            upload_dir=UPLOAD_DIR,
-                        )
-                        if hero_record:
-                            shot_meta["hero_frame"] = hero_record
-                            hero_img = hero_record.get("image_path") if isinstance(hero_record, dict) else None
-                            if isinstance(hero_img, str) and hero_img:
-                                shot_meta.setdefault("artifacts", [])
-                                if isinstance(shot_meta.get("artifacts"), list):
-                                    # Generate unique artifact_id: trace_id + tool_name + shot_id + unique suffix
-                                    # Note: File is created by pick_hero_frame_from_video, so we derive artifact_id from the returned path
-                                    shot_id_val = shot_meta.get("shot_id") or ""
-                                    hero_artifact_id = generate_artifact_id(
-                                        trace_id=trace_id,
-                                        tool_name="film2.hero",
-                                        conversation_id=conversation_id,
-                                        suffix_data=f"{shot_id_val}:hero:{os.path.basename(hero_img)}",
-                                    )
-                                    shot_meta["artifacts"].append(build_artifact(
-                                        artifact_id=hero_artifact_id,
-                                        kind="image",
-                                        path=hero_img,
-                                        trace_id=trace_id,
-                                        conversation_id=conversation_id,
-                                        tool_name="film2.run",
-                                        shot_id=shot_id_val,
-                                    ))
-                            hero_locks = hero_record.get("locks")
-                            if isinstance(hero_locks, dict) and hero_locks:
-                                hs = hero_record.get("score")
-                                if isinstance(hs, (int, float)):
-                                    hero_locks["hero_score"] = float(hs)
-                                shot_meta.setdefault("meta", {})["locks"] = hero_locks
-                            _film2_emit_hero_traces(trace_id, film_id, conversation_id, hero_record, shot_meta)
-                    result["meta"]["shots"].append(shot_meta)
-        else:
-            # Prompt-only Hunyuan generation when no clips/images/story shots are supplied.
-            if prompt:
-                shot_meta = {"index": 0, "prompt": prompt}
-                hv_args_prompt: Dict[str, Any] = build_hv_tool_args(
-                    prompt=prompt or "",
-                    width=width_val,
-                    height=height_val,
-                    fps=fps_val,
-                    seconds=int(duration_s),
-                    locks=locks_arg,
-                    seed=a.get("seed"),
-                    conversation_id=(conversation_id if isinstance(conversation_id, str) else ""),
-                    trace_id=trace_id,
-                    film_id=film_id,
-                    shot_id="shot_0",
-                )
-                gen_path, segment_log = await film2_generate_video(
-                    trace_id=trace_id,
-                    shot_id="shot_0",
-                    scene_id=None,
-                    act_id=None,
-                    hv_tool_args=hv_args_prompt,
-                    upload_dir=UPLOAD_DIR,
-                    log_fn=_log,
-                    trace_append=trace_append,
-                    http_tool_run=http_tool_run,
-                    artifact_video=_film2_artifact_video,
-                )
+                    logging.debug("film2.run: film2_generate_video (image-based) returned trace_id=%r gen_path=%r segment_log_len=%d", trace_id, gen_path, len(segment_log) if isinstance(segment_log, list) else 0)
+                except Exception as ex:
+                    logging.error("film2.run:video:generation (image-based) failed (non-fatal) trace_id=%r shot_index=%d ex=%r", trace_id, i, ex, exc_info=True)
+                    trace_event("film2.video.generation_failed", {"trace_id": trace_id, "shot_index": i, "error": str(ex)})
+                    gen_path, segment_log = None, []
+                    warnings.append(f"video_generation_failed_image_{i}")
                 if isinstance(gen_path, str) and gen_path:
                     shot_meta["final_path"] = gen_path
                 if segment_log:
@@ -5476,12 +5440,143 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
                         shot_meta["best_path"] = best_path
                         shot_meta["best_reason"] = "final_default"
                     shot_meta["versions"] = versions
-                    hero_record = await pick_hero_frame_from_video(
-                        str(shot_meta.get("best_path") or gen_path) if isinstance((shot_meta.get("best_path") or gen_path), str) else "",
-                        lock_bundle=locks_arg if isinstance(locks_arg, dict) else {},
-                        thresholds=thresholds_lock if isinstance(thresholds_lock, dict) else {},
+                    try:
+                        hero_record = await pick_hero_frame_from_video(
+                            str(shot_meta.get("best_path") or gen_path) if isinstance((shot_meta.get("best_path") or gen_path), str) else "",
+                            lock_bundle=locks_arg if isinstance(locks_arg, dict) else {},
+                            thresholds=thresholds_lock if isinstance(thresholds_lock, dict) else {},
+                            upload_dir=UPLOAD_DIR,
+                        )
+                    except Exception as ex:
+                        logging.warning("film2.run:pick_hero_frame (image-based) failed (non-fatal) trace_id=%r shot_index=%d ex=%r", trace_id, i, ex, exc_info=True)
+                        hero_record = None
+                    if hero_record:
+                        shot_meta["hero_frame"] = hero_record
+                        hero_img = hero_record.get("image_path") if isinstance(hero_record, dict) else None
+                        if isinstance(hero_img, str) and hero_img:
+                            shot_meta.setdefault("artifacts", [])
+                            if isinstance(shot_meta.get("artifacts"), list):
+                                # Generate unique artifact_id: trace_id + tool_name + shot_id + unique suffix
+                                # Note: File is created by pick_hero_frame_from_video, so we derive artifact_id from the returned path
+                                shot_id_val = shot_meta.get("shot_id") or ""
+                                hero_artifact_id = generate_artifact_id(
+                                    trace_id=trace_id,
+                                    tool_name="film2.hero",
+                                    conversation_id=conversation_id,
+                                    suffix_data=f"{shot_id_val}:hero:{os.path.basename(hero_img)}",
+                                )
+                                shot_meta["artifacts"].append(build_artifact(
+                                    artifact_id=hero_artifact_id,
+                                    kind="image",
+                                    path=hero_img,
+                                    trace_id=trace_id,
+                                    conversation_id=conversation_id,
+                                    tool_name="film2.run",
+                                    shot_id=shot_id_val,
+                                ))
+                        hero_locks = hero_record.get("locks")
+                        if isinstance(hero_locks, dict) and hero_locks:
+                            hs = hero_record.get("score")
+                            if isinstance(hs, (int, float)):
+                                hero_locks["hero_score"] = float(hs)
+                            shot_meta.setdefault("meta", {})["locks"] = hero_locks
+                        try:
+                            _film2_emit_hero_traces(trace_id, film_id, conversation_id, hero_record, shot_meta)
+                        except Exception as ex:
+                            logging.warning("film2.run:_film2_emit_hero_traces (image-based) failed (non-fatal) trace_id=%r ex=%r", trace_id, ex, exc_info=True)
+                result["meta"]["shots"].append(shot_meta)
+        else:
+            # Prompt-only Hunyuan generation when no clips/images/story shots are supplied.
+            if prompt:
+                shot_meta = {"index": 0, "prompt": prompt}
+                hv_args_prompt: Dict[str, Any] = build_hv_tool_args(
+                    prompt=prompt or "",
+                    width=width_val,
+                    height=height_val,
+                    fps=fps_val,
+                    seconds=int(duration_s),
+                    locks=locks_arg,
+                    seed=a.get("seed"),
+                    conversation_id=(conversation_id if isinstance(conversation_id, str) else ""),
+                    trace_id=trace_id,
+                    film_id=film_id,
+                    shot_id="shot_0",
+                )
+                logging.debug("film2.run: calling film2_generate_video (prompt-only) trace_id=%r", trace_id)
+                try:
+                    gen_path, segment_log = await film2_generate_video(
+                        trace_id=trace_id,
+                        shot_id="shot_0",
+                        scene_id=None,
+                        act_id=None,
+                        hv_tool_args=hv_args_prompt,
                         upload_dir=UPLOAD_DIR,
+                        log_fn=_log,
+                        trace_append=trace_append,
+                        http_tool_run=http_tool_run,
+                        artifact_video=_film2_artifact_video,
                     )
+                    logging.debug("film2.run: film2_generate_video (prompt-only) returned trace_id=%r gen_path=%r segment_log_len=%d", trace_id, gen_path, len(segment_log) if isinstance(segment_log, list) else 0)
+                except Exception as ex:
+                    logging.error("film2.run:video:generation (prompt-only) failed (non-fatal) trace_id=%r ex=%r", trace_id, ex, exc_info=True)
+                    trace_event("film2.video.generation_failed", {"trace_id": trace_id, "shot_id": "shot_0", "error": str(ex)})
+                    gen_path, segment_log = None, []
+                    warnings.append("video_generation_failed_prompt")
+                if isinstance(gen_path, str) and gen_path:
+                    shot_meta["final_path"] = gen_path
+                if segment_log:
+                    shot_meta["segment_results"] = segment_log
+                    versions: List[Dict[str, Any]] = []
+                    gen0 = None
+                    clean0 = None
+                    up0 = None
+                    ip0 = None
+                    for tr in segment_log:
+                        if not isinstance(tr, dict):
+                            continue
+                        tool_name = tr.get("tool_name")
+                        if not isinstance(tool_name, str) or not tool_name.strip():
+                            continue
+                        tool_name = tool_name.strip()
+                        tres = tr.get("result") if isinstance(tr.get("result"), dict) else {}
+                        pth = tres.get("path") if isinstance(tres.get("path"), str) else None
+                        if tool_name == "video.hv.t2v" and pth:
+                            gen0 = pth
+                        if tool_name == "video.cleanup" and pth:
+                            clean0 = pth
+                        if tool_name == "video.upscale" and pth:
+                            up0 = pth
+                        if tool_name == "video.interpolate" and pth:
+                            ip0 = pth
+                    if isinstance(gen0, str) and gen0:
+                        versions.append({"kind": "gen", "path": gen0})
+                        shot_meta["gen_path"] = gen0
+                    if isinstance(up0, str) and up0:
+                        versions.append({"kind": "upscale", "path": up0})
+                        shot_meta["upscaled_path"] = up0
+                    if isinstance(ip0, str) and ip0:
+                        versions.append({"kind": "interpolate", "path": ip0})
+                        shot_meta["interp_path"] = ip0
+                    if isinstance(clean0, str) and clean0:
+                        versions.append({"kind": "clean", "path": clean0})
+                        shot_meta["clean_path"] = clean0
+                    if isinstance(gen_path, str) and gen_path:
+                        versions.append({"kind": "final", "path": gen_path})
+                    best_path = gen_path if isinstance(gen_path, str) and gen_path else (clean0 or gen0)
+                    if isinstance(best_path, str) and best_path:
+                        shot_meta["best_path"] = best_path
+                        shot_meta["best_reason"] = "final_default"
+                    shot_meta["versions"] = versions
+                    try:
+                        hero_record = await pick_hero_frame_from_video(
+                            str(shot_meta.get("best_path") or gen_path) if isinstance((shot_meta.get("best_path") or gen_path), str) else "",
+                            lock_bundle=locks_arg if isinstance(locks_arg, dict) else {},
+                            thresholds=thresholds_lock if isinstance(thresholds_lock, dict) else {},
+                            upload_dir=UPLOAD_DIR,
+                        )
+                    except Exception as ex:
+                        logging.warning("film2.run:pick_hero_frame (prompt-only) failed (non-fatal) trace_id=%r ex=%r", trace_id, ex, exc_info=True)
+                        hero_record = None
                     if hero_record:
                         shot_meta["hero_frame"] = hero_record
                         hero_img = hero_record.get("image_path") if isinstance(hero_record, dict) else None
@@ -5914,18 +6009,24 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
 
         assembly = None
         try:
-            assembly = _assemble_film_from_shots(
-                film_id=film_id,
-                shots=(result.get("meta", {}).get("shots") if isinstance(result.get("meta"), dict) else []) or [],
-                upload_dir=UPLOAD_DIR,
-                public_base_url=PUBLIC_BASE_URL,
-                audio_path=(final_music_mix_path if isinstance(final_music_mix_path, str) else None),
-                audio_policy=str(a.get("audio_policy") or "mix"),
-                subtitles_srt_path=subtitles_srt_path,
-                trace_id=trace_id,
-                conversation_id=conversation_id,
-                state_dir=STATE_DIR,
-            )
+            try:
+                assembly = _assemble_film_from_shots(
+                    film_id=film_id,
+                    shots=(result.get("meta", {}).get("shots") if isinstance(result.get("meta"), dict) else []) or [],
+                    upload_dir=UPLOAD_DIR,
+                    public_base_url=PUBLIC_BASE_URL,
+                    audio_path=(final_music_mix_path if isinstance(final_music_mix_path, str) else None),
+                    audio_policy=str(a.get("audio_policy") or "mix"),
+                    subtitles_srt_path=subtitles_srt_path,
+                    trace_id=trace_id,
+                    conversation_id=conversation_id,
+                    state_dir=STATE_DIR,
+                )
+            except Exception as ex:
+                logging.error("film2.run:assembly failed (non-fatal) trace_id=%r ex=%r", trace_id, ex, exc_info=True)
+                trace_event("film2.assembly_failed", {"trace_id": trace_id, "error": str(ex)})
+                assembly = {}
+                warnings.append("assembly_failed")
         except Exception as ex:
             trace_event("film2.assemble.error", {"trace_id": trace_id, "film_id": film_id, "exception": repr(ex), "stack": traceback.format_exc()})
             assembly = ToolEnvelope.failure(
@@ -6214,9 +6315,15 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
             env = _env_bump(env)
             _env_assert(env)
             env = _env_stamp(env, tool="film2.run", model="film2")
-        except Exception:
+            logging.info("film2.run: envelope built successfully trace_id=%r film_id=%r artifacts=%d", trace_id, film_id, len(env_artifacts) if isinstance(env_artifacts, list) else 0)
+            trace_event("film2.run.finish", {"trace_id": trace_id, "film_id": film_id, "conversation_id": conversation_id, "artifacts_count": len(env_artifacts) if isinstance(env_artifacts, list) else 0})
+        except Exception as ex:
             # If envelope building fails, fall back to raw result to avoid breaking tool execution.
+            logging.error("film2.run: envelope building failed, using raw result trace_id=%r film_id=%r ex=%s", trace_id, film_id, ex, exc_info=True)
+            trace_event("film2.run.envelope_build_failed", {"trace_id": trace_id, "film_id": film_id, "error": str(ex)})
             env = result
+        dur_ms = int((time.perf_counter() - t_film2) * 1000)
+        logging.info("film2.run: complete trace_id=%r film_id=%r conversation_id=%r duration_ms=%d", trace_id, film_id, conversation_id, dur_ms)
         return {"tool_name": tool_name, "result": env}
     if tool_name == "voice.register" and ALLOW_TOOL_EXECUTION:
         res = await run_voice_register(args if isinstance(args, dict) else {})
@@ -6325,7 +6432,7 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
             return {"tool_name": tool_name, "result": env}
         except Exception as ex:
             _tb = traceback.format_exc()
-            logging.error(f"tts.speak handler raised: {ex!r}", exc_info=True)
+            logging.error("tts.speak handler raised: %r", ex, exc_info=True)
             return _tool_error(tool_name, "tts_exception", str(ex), status=500, stack=_tb)
     if tool_name == "audio.sfx.compose" and ALLOW_TOOL_EXECUTION:
         manifest = {"items": []}
@@ -6397,7 +6504,7 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
             return {"tool_name": tool_name, "result": out_res}
         except Exception as ex:
             _tb = traceback.format_exc()
-            logging.error(f"audio.sfx.compose exception ex={ex!r}", exc_info=True)
+            logging.error("audio.sfx.compose exception ex=%r", ex, exc_info=True)
             return _tool_error(
                 name,
                 "audio_sfx_exception",
@@ -6542,7 +6649,7 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
         if trace_id and isinstance(a, dict) and not a.get("trace_id"):
             a["trace_id"] = trace_id
         if not trace_id:
-            log.error(f"music.infinite.windowed: missing trace_id parameter - trace_id must be passed from chat_completions. conversation_id={conversation_id!r}")
+            log.error("music.infinite.windowed: missing trace_id parameter - trace_id must be passed from chat_completions. conversation_id=%r", conversation_id)
 
         # Derive a stable character identity for music locks when possible.
         character_id = str(a.get("character_id") or "").strip()
@@ -6725,7 +6832,7 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
                                 list(vec),
                             )
                 except Exception as ex:
-                    logging.warning(f"music_rag.insert_failed: {ex}", exc_info=True)
+                    logging.warning("music_rag.insert_failed: %s", ex, exc_info=True)
 
         # Trace: standalone music.infinite.windowed finish
         # Use the trace_id we already extracted earlier (don't re-extract from args)
@@ -6790,7 +6897,7 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
             return {"tool_name": tool_name, "result": env}
         except Exception as ex:
             _tb = traceback.format_exc()
-            logging.error(f"music.variation exception ex={ex!r}", exc_info=True)
+            logging.error("music.variation exception ex=%r", ex, exc_info=True)
             return _tool_error(
                 name,
                 "music_variation_exception",
@@ -7085,7 +7192,7 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
             return {"tool_name": tool_name, "result": env}
         except Exception as ex:
             _tb = traceback.format_exc()
-            logging.error(f"music.mixdown exception ex={ex!r}", exc_info=True)
+            logging.error("music.mixdown exception ex=%r", ex, exc_info=True)
             return _tool_error(
                 name,
                 "music_mixdown_exception",
@@ -8046,7 +8153,7 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
                 if character_id:
                     await _lock_save(character_id, lock_bundle)
             except Exception as ex:
-                logging.error(f"Failed to save lock bundle after music.lyrics.align: {ex}")
+                logging.error("Failed to save lock bundle after music.lyrics.align: %s", ex)
         # Optional: if changed_line_ids are provided, map them to windows and trigger
         # per-window refinements via music.refine.window.
         refined_windows: List[str] = []
@@ -10148,7 +10255,7 @@ async def chat_completions(request: Request):
     # Ensure executor_endpoint is never empty - executor must always be called
     if not executor_endpoint or not executor_endpoint.strip():
         executor_endpoint = "http://127.0.0.1:8081"
-        logging.warning(f"executor_endpoint was empty, using default: {executor_endpoint}")
+        logging.warning("executor_endpoint was empty, using default: %s", executor_endpoint)
     
     # *****************************END INITIALIZE VARIABLES*****************************
 
@@ -10185,7 +10292,7 @@ async def chat_completions(request: Request):
     _cat_hash: str = ""
     try:
         t0 = time.time()
-        logging.debug(f"chat_completions:try t0={t0!r}")
+        logging.debug("chat_completions:try t0=%r", t0)
         # ---- NO request shaping: use original body/messages as provided ----
         # ids / mode / seed
         requested_conversation_id = (
@@ -10205,7 +10312,7 @@ async def chat_completions(request: Request):
         # trace_id: ALWAYS generate in chat_completions (never comes from request)
         # THIS IS THE ONLY PLACE trace_id SHOULD EVER BE GENERATED
         trace_id = _generate_trace_id(seed=str(conversation_id))
-        log.info(f"chat_completions: generated trace_id={trace_id!r} conversation_id={conversation_id!r}")
+        log.info("chat_completions: generated trace_id=%r conversation_id=%r", trace_id, conversation_id)
 
         # messages (verbatim)
         messages: List[Dict[str, Any]] = []
@@ -10213,7 +10320,7 @@ async def chat_completions(request: Request):
         messages_raw = body0.get("messages")
         if not isinstance(messages_raw, list):
             usage0 = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-            logging.debug(f"chat_completions:usage0={usage0!r}")
+            logging.debug("chat_completions:usage0=%r", usage0)
             response = _build_openai_envelope(
                 ok=False,
                 text="Invalid request: 'messages' must be a list.",
@@ -10223,17 +10330,17 @@ async def chat_completions(request: Request):
                 seed=0,
                 id_="orc-1",
             )
-            logging.debug(f"chat_completions:built bad_request response keys={sorted(list(response.keys())) if isinstance(response, dict) else type(response).__name__!r}")
+            logging.debug("chat_completions:built bad_request response keys=%r", sorted(list(response.keys())) if isinstance(response, dict) else type(response).__name__)
             usage = usage0
-            logging.debug(f"chat_completions:set usage={usage!r}")
+            logging.debug("chat_completions:set usage=%r", usage)
             abort_pipeline = True
-            logging.debug(f"chat_completions:set abort_pipeline={abort_pipeline!r}")
+            logging.debug("chat_completions:set abort_pipeline=%r", abort_pipeline)
             plan_text = ""
-            logging.debug(f"chat_completions:set plan_text={plan_text!r}")
+            logging.debug("chat_completions:set plan_text=%r", plan_text)
             tool_calls = []
-            logging.debug(f"chat_completions:set tool_calls_len={len(tool_calls)}")
+            logging.debug("chat_completions:set tool_calls_len=%d", len(tool_calls))
             planner_env = {}
-            logging.debug(f"chat_completions:set planner_env={planner_env!r}")
+            logging.debug("chat_completions:set planner_env=%r", planner_env)
         else:
             messages = [m for m in messages_raw if isinstance(m, dict)]
             # last user text (no normalization)
@@ -10244,7 +10351,7 @@ async def chat_completions(request: Request):
                         last_user_text = cv.strip()
                         break
             first_user_len = len((last_user_text or "")) if isinstance(last_user_text, str) else 0
-            logging.debug(f"chat_completions:first_user_len={first_user_len!r}")
+            logging.debug("chat_completions:first_user_len=%r", first_user_len)
             # High-level request trace (distillation-friendly)
             _trace_log_request(
                 STATE_DIR,
@@ -10276,17 +10383,17 @@ async def chat_completions(request: Request):
 
             try:
                 await _db_insert_run(trace_id=trace_id, mode=mode, seed=master_seed, pack_hash=pack_hash, request_json=body0)
-                logging.debug(f"chat_completions:_db_insert_run trace_id={trace_id!r}")            
+                logging.debug("chat_completions:_db_insert_run trace_id=%r", trace_id)            
             except Exception as ex:
-                log.error(f"chat_completions:_db_insert_run failed trace_id={trace_id} ex={ex}", exc_info=True)
+                log.error("chat_completions:_db_insert_run failed trace_id=%s ex=%s", trace_id, ex, exc_info=True)
             # Artifacts ledger shard (required): store step-level tool execution summaries.
             try:
                 _ledger_root = os.path.join(UPLOAD_DIR, "artifacts", "runs", trace_id)
-                logging.debug(f"chat_completions:ledger _ledger_root={_ledger_root!r}")
+                logging.debug("chat_completions:ledger _ledger_root=%r", _ledger_root)
                 _ledger_shard = _art_open_shard(_ledger_root, _ledger_name, int(ARTIFACT_SHARD_BYTES))
-                logging.debug(f"chat_completions:ledger _art_open_shard ok shard={_ledger_shard!r}")
+                logging.debug("chat_completions:ledger _art_open_shard ok shard=%r", _ledger_shard)
             except Exception as ex:
-                logging.debug(f"chat_completions:ledger.open.failed trace_id={trace_id} ex={ex}", exc_info=True)
+                logging.debug("chat_completions:ledger.open.failed trace_id=%s ex=%s", trace_id, ex, exc_info=True)
 
         # If client supplies tool results (role=tool) we include them verbatim for the planner/executors
 
@@ -10296,7 +10403,7 @@ async def chat_completions(request: Request):
 
         # 1) Planner proposes tool calls (planning lives under orchestrator/app/plan/*).
         _log("planner.call", trace_id=trace_id, mode=effective_mode)
-        logging.debug(f"chat_completions:planner.call trace_id={trace_id} effective_mode={effective_mode}")
+        logging.debug("chat_completions:planner.call trace_id=%s effective_mode=%s", trace_id, effective_mode)
         # IMPORTANT: never leave these uninitialized. If produce_tool_plan throws,
         # subsequent logging/normalization must not crash with UnboundLocalError.
         plan_text: str = ""
@@ -10305,7 +10412,7 @@ async def chat_completions(request: Request):
         try:
             # Pass tools schema to planner (planner also uses catalog, but tools param provides context)
             tools_schema = get_builtin_tools_schema()
-            logging.info(f"chat_completions:produce_tool_plan calling with tools_schema_len={len(tools_schema) if isinstance(tools_schema, list) else 0} trace_id={trace_id} mode={effective_mode}")
+            logging.info("chat_completions:produce_tool_plan calling with tools_schema_len=%d trace_id=%s mode=%s", len(tools_schema) if isinstance(tools_schema, list) else 0, trace_id, effective_mode)
             plan_text, tool_calls, planner_env = await produce_tool_plan(
                 messages=messages,
                 tools=tools_schema,
@@ -10313,9 +10420,9 @@ async def chat_completions(request: Request):
                 trace_id=trace_id,
                 mode=effective_mode,
             )
-            logging.info(f"chat_completions:produce_tool_plan returned plan_text_len={len(plan_text) if isinstance(plan_text, str) else 0} tool_calls_len={len(tool_calls) if isinstance(tool_calls, list) else 0} planner_env_ok={bool((planner_env or {}).get('ok'))}")
+            logging.info("chat_completions:produce_tool_plan returned plan_text_len=%d tool_calls_len=%d planner_env_ok=%r", len(plan_text) if isinstance(plan_text, str) else 0, len(tool_calls) if isinstance(tool_calls, list) else 0, bool((planner_env or {}).get('ok')))
         except Exception as e:
-            log.error(f"chat_completions:produce_tool_plan failed trace_id={trace_id} ex={e}", exc_info=True)
+            log.error("chat_completions:produce_tool_plan failed trace_id=%s ex=%s", trace_id, e, exc_info=True)
             # Preserve a structured envelope so downstream logic can surface a
             # meaningful error instead of crashing on undefined locals.
             planner_env = {
@@ -10330,12 +10437,12 @@ async def chat_completions(request: Request):
         tool_calls_len = len(tool_calls) if isinstance(tool_calls, list) else -1
         planner_env_keys = sorted(list(planner_env.keys())) if isinstance(planner_env, dict) else type(planner_env).__name__
         logging.debug(
-            f"chat_completions:produce_tool_plan done plan_text_len={plan_text_len} tool_calls_type={tool_calls_type} "
-            f"tool_calls_len={tool_calls_len} planner_env_keys={planner_env_keys!r}"
+            "chat_completions:produce_tool_plan done plan_text_len=%d tool_calls_type=%s tool_calls_len=%d planner_env_keys=%r",
+            plan_text_len, tool_calls_type, tool_calls_len, planner_env_keys
         )
         tool_calls = _normalize_tool_calls(tool_calls=tool_calls)
         logging.debug(
-            f"chat_completions:_normalize_tool_calls len={len(tool_calls) if isinstance(tool_calls, list) else -1}"
+            "chat_completions:_normalize_tool_calls len=%d", len(tool_calls) if isinstance(tool_calls, list) else -1
         )
         # Hardening: ensure tool arguments are objects (parse JSON strings / {"_raw": "..."}), and fill minimal defaults.
         parser_tc = JSONParser()
@@ -10356,7 +10463,7 @@ async def chat_completions(request: Request):
                         parsed_inner = parser_tc.parse(raw_inner or "", {})
                     except Exception as ex:
                         logging.warning(
-                            f"planner.tool_args._raw parse failed trace_id={trace_id} tool={tool_name}: {ex}", exc_info=True
+                            "planner.tool_args._raw parse failed trace_id=%s tool=%s: %s", trace_id, tool_name, ex, exc_info=True
                         )
                         parsed_inner = {}
                     if isinstance(parsed_inner, dict):
@@ -10382,7 +10489,7 @@ async def chat_completions(request: Request):
                     parsed = parser_tc.parse(raw_args or "", {})
                 except Exception as ex:
                     logging.warning(
-                        f"planner.tool_args parse failed trace_id={trace_id} tool={tool_name}: {ex}", exc_info=True
+                        "planner.tool_args parse failed trace_id=%s tool=%s: %s", trace_id, tool_name, ex, exc_info=True
                     )
                     parsed = {}
                 args_obj = dict(parsed) if isinstance(parsed, dict) else {"_raw": raw_args}
@@ -10426,7 +10533,7 @@ async def chat_completions(request: Request):
 
         tool_calls = hardened_tool_calls
         logging.debug(
-            f"chat_completions:tool_calls.hardened len={len(tool_calls) if isinstance(tool_calls, list) else -1}"
+            "chat_completions:tool_calls.hardened len=%d", len(tool_calls) if isinstance(tool_calls, list) else -1
         )
         try:
             # Deep planner/tool-call visibility: log the *shape* of tool args without dumping full prompts.
@@ -10445,31 +10552,31 @@ async def chat_completions(request: Request):
                 )
             _log("planner.tool_calls.normalized", trace_id=trace_id, count=len(tool_calls or []), preview=preview)
         except Exception as ex:
-            logging.warning(f"planner.tool_calls.normalized log failed trace_id={trace_id}: {ex}", exc_info=True)
+            logging.warning("planner.tool_calls.normalized log failed trace_id=%s: %s", trace_id, ex, exc_info=True)
         # Hardening: validate tools against runtime catalog (registry + builtins).
         # catalog_validate should check against ALL allowed tools, not just planner-visible ones.
         # Planner visibility only affects what tools the planner sees, not what tools can be executed.
         allowed_runtime_full = catalog_allowed(get_builtin_tools_schema)
         logging.debug(
-            f"chat_completions:catalog_allowed count={len(allowed_runtime_full) if isinstance(allowed_runtime_full, (list, set, tuple)) else -1}"
+            "chat_completions:catalog_allowed count=%d", len(allowed_runtime_full) if isinstance(allowed_runtime_full, (list, set, tuple)) else -1
         )
         # Validate against full catalog (catalog_validate is a validation/fixing step, not a blocker)
         tool_calls, unknown_tools = catalog_validate(tool_calls or [], allowed_runtime_full)
         logging.debug(
-            f"chat_completions:catalog_validate tool_calls_len={len(tool_calls or [])} unknown_tools={unknown_tools!r}"
+            "chat_completions:catalog_validate tool_calls_len=%d unknown_tools=%r", len(tool_calls or []), unknown_tools
         )
         if unknown_tools:
             _log("tools.unknown.warning", trace_id=trace_id, unknown=unknown_tools)
-            logging.warning(f"chat_completions:tools.unknown.warning unknown_tools={unknown_tools!r} (these tools will still be executed)")
+            logging.warning("chat_completions:tools.unknown.warning unknown_tools=%r (these tools will still be executed)", unknown_tools)
         _log("planner.done", trace_id=trace_id, tool_count=len(tool_calls or []), ok=bool((planner_env or {}).get("ok")))
         logging.debug(
-            f"chat_completions:planner.done tool_count={len(tool_calls or [])} ok={bool((planner_env or {}).get('ok'))}"
+            "chat_completions:planner.done tool_count=%d ok=%r", len(tool_calls or []), bool((planner_env or {}).get('ok'))
         )
         trace_event("decision", {"conversation_id": conversation_id, "trace_id": trace_id, "plan": plan_text, "tool_calls": tool_calls})
         logging.debug("chat_completions:trace_append decision done")
 
         if not isinstance(planner_env, dict) or not planner_env.get("ok"):
-            log.error(f"chat_completions:planner failed planner_env={planner_env!r} trace_id={trace_id}")
+            log.error("chat_completions:planner failed planner_env=%r trace_id=%s", planner_env, trace_id)
             usage0 = estimate_usage(messages, "")
             err_block = planner_env.get("error") if isinstance(planner_env, dict) else None
             if not isinstance(err_block, dict):
@@ -10490,7 +10597,7 @@ async def chat_completions(request: Request):
             tool_calls = []
             plan_text = ""
             _cat_hash = ""
-            log.error(f"chat_completions:planner failed - aborting pipeline trace_id={trace_id} abort_pipeline={abort_pipeline}")
+            log.error("chat_completions:planner failed - aborting pipeline trace_id=%s abort_pipeline=%r", trace_id, abort_pipeline)
         else:
             _cat_hash = compute_tools_hash(body, planner_visible_only=False, planner_visible_tools=set(PLANNER_VISIBLE_TOOLS))
         # Planner OK: continue into the full pipeline below (CO/RAG/QA/retry/compose),
@@ -10527,18 +10634,19 @@ async def chat_completions(request: Request):
 
         if (not abort_pipeline) and tool_calls:
             _log("tools.exec.start", trace_id=trace_id, count=len(tool_calls or []))
-            logging.info(f"chat_completions:tools.exec.start abort_pipeline={abort_pipeline!r} tool_calls_len={len(tool_calls or [])} executor_endpoint={executor_endpoint!r}")
+            logging.info("chat_completions:tools.exec.start abort_pipeline=%r tool_calls_len=%d executor_endpoint=%r", abort_pipeline, len(tool_calls or []), executor_endpoint)
             _inject_execution_context(tool_calls, trace_id, effective_mode, conversation_id)
-            logging.debug(f"chat_completions:_inject_execution_context done trace_id={trace_id!r} effective_mode={effective_mode!r}")
+            logging.debug("chat_completions:_inject_execution_context done trace_id=%r effective_mode=%r", trace_id, effective_mode)
             for tc in tool_calls:
                 logging.debug(
-                    f"chat_completions:tool_loop:iter tc_type={type(tc).__name__} "
-                    f"tc_keys={(sorted(list(tc.keys())) if isinstance(tc, dict) else None)!r}"
+                    "chat_completions:tool_loop:iter tc_type=%s tc_keys=%r",
+                    type(tc).__name__,
+                    (sorted(list(tc.keys())) if isinstance(tc, dict) else None)
                 )
                 tn = (tc.get("tool_name") or tc.get("name") or "tool")
-                logging.debug(f"chat_completions:tool_loop:tn={tn!r}")
+                logging.debug("chat_completions:tool_loop:tn=%r", tn)
                 raw_args = tc.get("arguments")
-                logging.debug(f"chat_completions:tool_loop:raw_args_type={type(raw_args).__name__}")
+                logging.debug("chat_completions:tool_loop:raw_args_type=%s", type(raw_args).__name__)
                 if isinstance(raw_args, dict):
                     ta = raw_args
                 elif raw_args is None:
@@ -10547,8 +10655,9 @@ async def chat_completions(request: Request):
                     # Never drop args: preserve non-dict payloads under _raw.
                     ta = {"_raw": raw_args}
                 logging.debug(
-                    f"chat_completions:tool_loop:ta_type={type(ta).__name__} "
-                    f"ta_keys={(sorted(list(ta.keys())) if isinstance(ta, dict) else None)!r}"
+                    "chat_completions:tool_loop:ta_type=%s ta_keys=%r",
+                    type(ta).__name__,
+                    (sorted(list(ta.keys())) if isinstance(ta, dict) else None)
                 )
                 # For film2.run, never rely on planner-fabricated clip/image URLs. Instead,
                 # automatically wire in real image artifacts from any prior image.dispatch
@@ -10558,11 +10667,11 @@ async def chat_completions(request: Request):
                 if tn == "film2.run":
                     logging.debug("chat_completions:tool_loop:film2.run branch entered")
                     args_film = ta if isinstance(ta, dict) else {}
-                    logging.debug(f"chat_completions:tool_loop:film2.run args_film_keys_pre={sorted(list(args_film.keys())) if isinstance(args_film, dict) else None!r}")
+                    logging.debug("chat_completions:tool_loop:film2.run args_film_keys_pre=%r", sorted(list(args_film.keys())) if isinstance(args_film, dict) else None)
                     urls_all = assets_collect_urls(tool_results or [], abs_url_fn)
-                    logging.debug(f"chat_completions:tool_loop:film2.run urls_all_len={len(urls_all or [])}")
+                    logging.debug("chat_completions:tool_loop:film2.run urls_all_len=%d", len(urls_all or []))
                     img_urls = [u for u in (urls_all or []) if isinstance(u, str) and "/artifacts/image/" in u]
-                    logging.debug(f"chat_completions:tool_loop:film2.run img_urls_len={len(img_urls or [])}")
+                    logging.debug("chat_completions:tool_loop:film2.run img_urls_len=%d", len(img_urls or []))
                     if img_urls:
                         args_film["images"] = img_urls
                         # Ensure we do not carry over any stale clip references from the planner.
@@ -10573,7 +10682,7 @@ async def chat_completions(request: Request):
                         args_film.pop("clips", None)
                     tc["arguments"] = args_film
                     ta = args_film
-                    logging.debug(f"chat_completions:tool_loop:film2.run args_film_keys_post={sorted(list(args_film.keys())) if isinstance(args_film, dict) else None!r}")
+                    logging.debug("chat_completions:tool_loop:film2.run args_film_keys_post=%r", sorted(list(args_film.keys())) if isinstance(args_film, dict) else None)
                 _log(
                     "tool.run.before",
                     trace_id=trace_id,
@@ -10581,16 +10690,16 @@ async def chat_completions(request: Request):
                     args_type=type(raw_args).__name__,
                     args_preview=_args_preview_for_log(ta),
                 )
-                logging.debug(f"chat_completions:tool_loop:before_execute tn={tn!r} executor_endpoint={executor_endpoint!r}")
+                logging.debug("chat_completions:tool_loop:before_execute tn=%r executor_endpoint=%r", tn, executor_endpoint)
                 # Execute tools via the external executor so all heavy/remote work
                 # happens in the executor container instead of the orchestrator.
                 exec_batch = [tc]
-                logging.debug(f"chat_completions:tool_loop:exec_batch_len={len(exec_batch)}")
+                logging.debug("chat_completions:tool_loop:exec_batch_len=%d", len(exec_batch))
                 try:
                     exec_res = await gateway_execute(tool_calls=exec_batch, trace_id=trace_id, conversation_id=conversation_id, executor_base_url=executor_endpoint)
                 except Exception as ex:
                     # Hardening: a single tool execution failure must not crash the whole run.
-                    logging.error(f"chat_completions:tool_loop:gateway_execute raised tool={tn!r} ex={ex}", exc_info=True)
+                    logging.error("chat_completions:tool_loop:gateway_execute raised tool=%r ex=%s", tn, ex, exc_info=True)
                     exec_res = [
                         {
                             "name": str(tn or "tool"),
@@ -10605,18 +10714,19 @@ async def chat_completions(request: Request):
                         }
                     ]
                 logging.debug(
-                    f"chat_completions:tool_loop:gateway_execute returned type={type(exec_res).__name__} "
-                    f"len={(len(exec_res) if isinstance(exec_res, list) else -1)}"
+                    "chat_completions:tool_loop:gateway_execute returned type=%s len=%d",
+                    type(exec_res).__name__,
+                    (len(exec_res) if isinstance(exec_res, list) else -1)
                 )
                 tr = exec_res[0] if isinstance(exec_res, list) and exec_res else {}
-                logging.debug(f"chat_completions:tool_loop:tr_keys={sorted(list(tr.keys())) if isinstance(tr, dict) else None!r}")
+                logging.debug("chat_completions:tool_loop:tr_keys=%r", sorted(list(tr.keys())) if isinstance(tr, dict) else None)
                 tool_name = str(tr.get("tool_name") or tr.get("name") or "tool")
                 res = (tr or {}).get("result") if isinstance((tr or {}).get("result"), dict) else {}
-                logging.debug(f"chat_completions:tool_loop:res_keys={sorted(list(res.keys())) if isinstance(res, dict) else None!r}")
+                logging.debug("chat_completions:tool_loop:res_keys=%r", sorted(list(res.keys())) if isinstance(res, dict) else None)
                 
                 # ALWAYS extract errors from both top-level and result - be transparent end-to-end
                 err_obj = (tr or {}).get("error")
-                logging.debug(f"chat_completions:tool_loop:err_obj_from_tr type={type(err_obj).__name__}")
+                logging.debug("chat_completions:tool_loop:err_obj_from_tr type=%s", type(err_obj).__name__)
                 # Also check result.error (tools can produce results AND errors simultaneously)
                 if isinstance(res, dict) and res.get("error"):
                     result_err = res.get("error")
@@ -10632,22 +10742,22 @@ async def chat_completions(request: Request):
                             }
                         else:
                             err_obj = result_err
-                        logging.debug(f"chat_completions:tool_loop:err_obj_from_res type={type(err_obj).__name__}")
+                        logging.debug("chat_completions:tool_loop:err_obj_from_res type=%s", type(err_obj).__name__)
                 
                 # ALWAYS log errors for transparency (even if tool succeeded in producing results)
                 if isinstance(err_obj, (dict, str)) and err_obj:
                     err_code = err_obj.get("code") if isinstance(err_obj, dict) else "unknown"
                     err_msg = err_obj.get("message") if isinstance(err_obj, dict) else str(err_obj)
                     logging.warning(
-                        f"chat_completions:tool_loop:tool_execution_error (may have partial results) "
-                        f"tool={tool_name!r} trace_id={trace_id!r} code={err_code!r} msg={err_msg!r}"
+                        "chat_completions:tool_loop:tool_execution_error (may have partial results) tool=%r trace_id=%r code=%r msg=%r",
+                        tool_name, trace_id, err_code, err_msg
                     )
                 # Executor does not echo args; executor_gateway attaches them back. Fall back to our input args.
                 args_echo = tr.get("args") if isinstance(tr.get("args"), dict) else {}
-                logging.debug(f"chat_completions:tool_loop:args_echo_keys={sorted(list(args_echo.keys())) if isinstance(args_echo, dict) else None!r}")
+                logging.debug("chat_completions:tool_loop:args_echo_keys=%r", sorted(list(args_echo.keys())) if isinstance(args_echo, dict) else None)
                 if not args_echo and isinstance(ta, dict):
                     args_echo = ta
-                    logging.debug(f"chat_completions:tool_loop:args_echo fallback to ta keys={sorted(list(args_echo.keys())) if isinstance(args_echo, dict) else None!r}")
+                    logging.debug("chat_completions:tool_loop:args_echo fallback to ta keys=%r", sorted(list(args_echo.keys())) if isinstance(args_echo, dict) else None)
                 _log(
                     "tool.run.after_exec",
                     trace_id=trace_id,
@@ -10659,7 +10769,7 @@ async def chat_completions(request: Request):
                     has_error=bool(isinstance(err_obj, (dict, str)) and err_obj),
                     error_code=(err_obj.get("code") if isinstance(err_obj, dict) else None),
                 )
-                logging.debug(f"chat_completions:tool_loop:after_exec ok={not isinstance(err_obj, (str, dict))}")
+                logging.debug("chat_completions:tool_loop:after_exec ok=%r", not isinstance(err_obj, (str, dict)))
                 # Normalize artifacts in result using Artifact dataclass
                 if isinstance(res, dict):
                     try:
@@ -10677,13 +10787,13 @@ async def chat_completions(request: Request):
                                     normalized_arts.append(a)
                             res["artifacts"] = normalized_arts
                     except Exception as ex:
-                        logging.debug(f"chat_completions:tool_loop:artifact_normalization_failed tool={tool_name!r} ex={ex!r}", exc_info=True)
+                        logging.debug("chat_completions:tool_loop:artifact_normalization_failed tool=%r ex=%r", tool_name, ex, exc_info=True)
                 # Required: persist tool execution metadata (teacher + ledger + db)
                 try:
                     arts_val = res.get("artifacts") if isinstance(res, dict) else None
-                    logging.debug(f"chat_completions:tool_loop:arts_val_type={type(arts_val).__name__}")
+                    logging.debug("chat_completions:tool_loop:arts_val_type=%s", type(arts_val).__name__)
                     ok_step = not isinstance(err_obj, (str, dict))
-                    logging.debug(f"chat_completions:tool_loop:ok_step={ok_step!r}")
+                    logging.debug("chat_completions:tool_loop:ok_step=%r", ok_step)
                     tool_exec_meta.append(
                         {
                             "tool_name": tool_name,
@@ -10694,7 +10804,7 @@ async def chat_completions(request: Request):
                             "artifacts": arts_val,
                         }
                     )
-                    logging.debug(f"chat_completions:tool_loop:tool_exec_meta appended len={len(tool_exec_meta)}")
+                    logging.debug("chat_completions:tool_loop:tool_exec_meta appended len=%d", len(tool_exec_meta))
                     artifact_id = None
                     if isinstance(arts_val, list) and arts_val and isinstance(arts_val[0], dict):
                         artifact_id = arts_val[0].get("artifact_id")
@@ -10708,7 +10818,7 @@ async def chat_completions(request: Request):
                         artifact_id=artifact_id,
                     )
                     if _ledger_shard is not None and _ledger_root is not None:
-                        logging.debug(f"chat_completions:tool_loop:ledger append starting _ledger_root={_ledger_root!r}")
+                        logging.debug("chat_completions:tool_loop:ledger append starting _ledger_root=%r", _ledger_root)
                         row = {
                             "t": int(time.time() * 1000),
                             "trace_id": trace_id,
@@ -10720,36 +10830,37 @@ async def chat_completions(request: Request):
                             "error": err_obj,
                             "artifacts": arts_val,
                         }
-                        logging.debug(f"chat_completions:tool_loop:ledger row_keys={sorted(list(row.keys()))!r}")
+                        logging.debug("chat_completions:tool_loop:ledger row_keys=%r", sorted(list(row.keys())))
                         _ledger_shard = _art_append_jsonl(_ledger_shard, row)
-                        logging.debug(f"chat_completions:tool_loop:ledger append done shard={_ledger_shard!r}")
+                        logging.debug("chat_completions:tool_loop:ledger append done shard=%r", _ledger_shard)
                 except Exception as ex:
                     logging.debug(
-                        f"chat_completions:tool_exec_meta.persist.failed trace_id={trace_id} tool={str(tool_name)} ex={ex}",
+                        "chat_completions:tool_exec_meta.persist.failed trace_id=%s tool=%s ex=%s",
+                        trace_id, str(tool_name), ex,
                         exc_info=True,
                     )
                 if isinstance(err_obj, (str, dict)):
                     logging.debug("chat_completions:tool_loop:error_branch entered")
                     code = (err_obj.get("code") if isinstance(err_obj, dict) else str(err_obj))
-                    logging.debug(f"chat_completions:tool_loop:error_branch code={code!r}")
+                    logging.debug("chat_completions:tool_loop:error_branch code=%r", code)
                     status = (err_obj.get("status") if isinstance(err_obj, dict) else None)
-                    logging.debug(f"chat_completions:tool_loop:error_branch status={status!r}")
+                    logging.debug("chat_completions:tool_loop:error_branch status=%r", status)
                     message = (err_obj.get("message") if isinstance(err_obj, dict) else "")
                     logging.debug(
-                        f"chat_completions:tool_loop:error_branch message_len={len(message) if isinstance(message, str) else -1}"
+                        "chat_completions:tool_loop:error_branch message_len=%d", len(message) if isinstance(message, str) else -1
                     )
                     _log("tool.run.error", trace_id=trace_id, tool=tool_name, code=(code or ""), status=status, message=(message or ""))
                     # Flip pipeline_ok to False when a critical front-door tool fails.
                     # TTS must never hard-crash the whole film/tool loop; it is best-effort unless the user explicitly requires it.
                     if tool_name in ("image.dispatch", "music.infinite.windowed", "film2.run"):
                         pipeline_ok = False
-                        logging.debug(f"chat_completions:tool_loop:pipeline_ok flipped to False due_to={tool_name!r}")
+                        logging.debug("chat_completions:tool_loop:pipeline_ok flipped to False due_to=%r", tool_name)
                 else:
                     logging.debug("chat_completions:tool_loop:success_branch entered")
                     arts_summary: List[Dict[str, Any]] = []
-                    logging.debug(f"chat_completions:tool_loop:arts_summary init len={len(arts_summary)}")
+                    logging.debug("chat_completions:tool_loop:arts_summary init len=%d", len(arts_summary))
                     arts = res.get("artifacts") if isinstance(res, dict) else None
-                    logging.debug(f"chat_completions:tool_loop:arts_type={type(arts).__name__}")
+                    logging.debug("chat_completions:tool_loop:arts_type=%s", type(arts).__name__)
                     if isinstance(arts, list):
                         for a in arts:
                             if isinstance(a, dict):
@@ -10759,17 +10870,18 @@ async def chat_completions(request: Request):
                                 if artifact_id is not None and isinstance(kind, str):
                                     arts_summary.append({"artifact_id": artifact_id, "kind": kind})
                                     logging.debug(
-                                        f"chat_completions:tool_loop:arts_summary append artifact_id={artifact_id!r} kind={kind!r} len={len(arts_summary)}"
+                                        "chat_completions:tool_loop:arts_summary append artifact_id=%r kind=%r len=%d",
+                                        artifact_id, kind, len(arts_summary)
                                     )
                     urls_this = assets_collect_urls([tr], _abs_url)
-                    logging.debug(f"chat_completions:tool_loop:urls_this_len={len(urls_this or [])}")
+                    logging.debug("chat_completions:tool_loop:urls_this_len=%d", len(urls_this or []))
                     _log("tool.run.after", trace_id=trace_id, tool=tool_name, artifacts=arts_summary, urls_count=len(urls_this or []))
                     meta = res.get("meta") if isinstance(res, dict) else {}
-                    logging.debug(f"chat_completions:tool_loop:meta_type={type(meta).__name__}")
+                    logging.debug("chat_completions:tool_loop:meta_type=%s", type(meta).__name__)
                     first_url = urls_this[0] if isinstance(urls_this, list) and urls_this else None
-                    logging.debug(f"chat_completions:tool_loop:first_url={first_url!r}")
+                    logging.debug("chat_completions:tool_loop:first_url=%r", first_url)
                     extra_results: List[Dict[str, Any]] = []
-                    logging.debug(f"chat_completions:tool_loop:extra_results init len={len(extra_results)}")
+                    logging.debug("chat_completions:tool_loop:extra_results init len=%d", len(extra_results))
                     # Optional: segment QA + committee for tool steps (tool-specific glue lives under app.quality/*).
                     try:
                         segment_runner = partial(
@@ -10811,45 +10923,47 @@ async def chat_completions(request: Request):
                             tr["result"]["error"] = res.get("error")
                     
                     tool_results.append(tr)
-                    logging.debug(f"chat_completions:tool_loop:tool_results appended len={len(tool_results)} has_error={bool(tr.get('error') if isinstance(tr, dict) else False)}")
+                    logging.debug("chat_completions:tool_loop:tool_results appended len=%d has_error=%r", len(tool_results), bool(tr.get('error') if isinstance(tr, dict) else False))
                     if extra_results:
                         tool_results.extend(extra_results)
-                        logging.debug(f"chat_completions:tool_loop:tool_results extended with extra_results len={len(tool_results)}")
+                        logging.debug("chat_completions:tool_loop:tool_results extended with extra_results len=%d", len(tool_results))
         else:
-            log.warning(f"chat_completions:tools.exec SKIPPED abort_pipeline={abort_pipeline!r} tool_calls_len={len(tool_calls or [])} trace_id={trace_id}")
+            log.warning("chat_completions:tools.exec SKIPPED abort_pipeline=%r tool_calls_len=%d trace_id=%s", abort_pipeline, len(tool_calls or []), trace_id)
 
         _log("flow.after_execute", trace_id=trace_id, tool_results_count=len(tool_results or []))
         logging.debug(
-            f"chat_completions:flow.after_execute tool_results_count={len(tool_results or [])} pipeline_ok={pipeline_ok!r}"
+            "chat_completions:flow.after_execute tool_results_count=%d pipeline_ok=%r", len(tool_results or []), pipeline_ok
         )
 
         for _tr in tool_results or []:
             logging.debug(
-                f"chat_completions:post_tool_scan:iter _tr_type={type(_tr).__name__} "
-                f"_tr_keys={(sorted(list(_tr.keys())) if isinstance(_tr, dict) else None)!r}"
+                "chat_completions:post_tool_scan:iter _tr_type=%s _tr_keys=%r",
+                type(_tr).__name__,
+                (sorted(list(_tr.keys())) if isinstance(_tr, dict) else None)
             )
             _res = (_tr or {}).get("result") or {}
             logging.debug(
-                f"chat_completions:post_tool_scan:_res_type={type(_res).__name__} "
-                f"_res_keys={(sorted(list(_res.keys())) if isinstance(_res, dict) else None)!r}"
+                "chat_completions:post_tool_scan:_res_type=%s _res_keys=%r",
+                type(_res).__name__,
+                (sorted(list(_res.keys())) if isinstance(_res, dict) else None)
             )
             if isinstance(_res, dict):
                 _meta = _res.get("meta") if isinstance(_res, dict) else {}
-                logging.debug(f"chat_completions:post_tool_scan:_meta_type={type(_meta).__name__}")
+                logging.debug("chat_completions:post_tool_scan:_meta_type=%s", type(_meta).__name__)
                 _pid = (_meta or {}).get("prompt_id")
-                logging.debug(f"chat_completions:post_tool_scan:_pid={_pid!r}")
+                logging.debug("chat_completions:post_tool_scan:_pid=%r", _pid)
                 if isinstance(_pid, str) and _pid:
                     external_ids = _res.get("ids") if isinstance(_res.get("ids"), dict) else {}
-                    logging.debug(f"chat_completions:post_tool_scan:external_ids_type={type(external_ids).__name__}")
+                    logging.debug("chat_completions:post_tool_scan:external_ids_type=%s", type(external_ids).__name__)
                     _comfy_client_id = external_ids.get("client_id") if isinstance(external_ids.get("client_id"), str) else None
-                    logging.debug(f"chat_completions:post_tool_scan:_comfy_client_id={_comfy_client_id!r}")
+                    logging.debug("chat_completions:post_tool_scan:_comfy_client_id=%r", _comfy_client_id)
                     _log("[comfy] POST /prompt", trace_id=trace_id, prompt_id=_pid, client_id=_comfy_client_id)
                     _log("comfy.submit", trace_id=trace_id, prompt_id=_pid, client_id=_comfy_client_id)
                     _log("[comfy] polling /history/" + _pid)
 
         # Post-run QA checkpoint (lightweight) — run once after all tool results are collected.
         qa_metrics = _compute_postrun_qa_metrics(tool_results)
-        logging.debug(f"chat_completions:postrun_qa qa_metrics_keys={sorted(list(qa_metrics.keys()))!r}")
+        logging.debug("chat_completions:postrun_qa qa_metrics_keys=%r", sorted(list(qa_metrics.keys())))
         _log("qa.metrics", trace_id=trace_id, tool="postrun", metrics=qa_metrics)
         _log("committee.postrun.review", trace_id=trace_id, summary=qa_metrics)
         # Committee decision with optional single revision
@@ -10862,13 +10976,14 @@ async def chat_completions(request: Request):
             state_dir=STATE_DIR,
         )
         committee_action = str((committee_outcome.get("action") or "go")).strip().lower()
-        logging.debug(f"chat_completions:committee committee_action={committee_action!r}")
+        logging.debug("chat_completions:committee committee_action=%r", committee_action)
         committee_rationale = str(committee_outcome.get("rationale") or "")
-        logging.debug(f"chat_completions:committee committee_rationale_len={len(committee_rationale)}")
+        logging.debug("chat_completions:committee committee_rationale_len=%d", len(committee_rationale))
         patch_plan = committee_outcome.get("patch_plan") or []
         logging.debug(
-            f"chat_completions:committee patch_plan_type={type(patch_plan).__name__} "
-            f"patch_plan_len={(len(patch_plan) if isinstance(patch_plan, list) else -1)}"
+            "chat_completions:committee patch_plan_type=%s patch_plan_len=%d",
+            type(patch_plan).__name__,
+            (len(patch_plan) if isinstance(patch_plan, list) else -1)
         )
         _log("committee.decision", trace_id=trace_id, action=committee_action, rationale=committee_rationale)
         _log("flow.after_committee", trace_id=trace_id, action=committee_action)
@@ -10876,10 +10991,10 @@ async def chat_completions(request: Request):
         _log("committee.decision.final", trace_id=trace_id, action=committee_action)
         # Optional one-pass revision
         if committee_action == "revise" and isinstance(patch_plan, list) and patch_plan:
-            logging.debug(f"chat_completions:committee revise branch entered patch_plan_len={len(patch_plan)}")
+            logging.debug("chat_completions:committee revise branch entered patch_plan_len=%d", len(patch_plan))
             # Filter patch plan: use full catalog (not just planner-visible) since patch_plan can include internal refinement tools like locks.*
             _allowed_patch_tools = set(catalog_allowed(get_builtin_tools_schema))
-            logging.debug(f"chat_completions:committee _allowed_patch_tools_len={len(_allowed_patch_tools)}")
+            logging.debug("chat_completions:committee _allowed_patch_tools_len=%d", len(_allowed_patch_tools))
             patch_calls = _normalize_patch_plan_to_tool_calls(
                 patch_plan,
                 planner_visible_tools=PLANNER_VISIBLE_TOOLS,
@@ -10890,13 +11005,13 @@ async def chat_completions(request: Request):
                 logging.debug("chat_completions:committee _inject_execution_context patch_calls done")
                 # Validator disabled: execute patch plan directly without pre-validation.
                 patch_validated = list(patch_calls)
-                logging.debug(f"chat_completions:committee patch_validated_len={len(patch_validated)}")
+                logging.debug("chat_completions:committee patch_validated_len=%d", len(patch_validated))
                 patch_failures: List[Dict[str, Any]] = []
-                logging.debug(f"chat_completions:committee patch_failures_len={len(patch_failures)}")
+                logging.debug("chat_completions:committee patch_failures_len=%d", len(patch_failures))
                 # Execute validated patch steps
                 patch_failure_results: List[Dict[str, Any]] = []
                 logging.debug(
-                    f"chat_completions:committee patch_failure_results init len={len(patch_failure_results)}"
+                    "chat_completions:committee patch_failure_results init len=%d", len(patch_failure_results)
                 )
                 for failure in patch_failures or []:
                     env = failure.get("envelope") if isinstance(failure.get("envelope"), dict) else {}
@@ -10912,14 +11027,14 @@ async def chat_completions(request: Request):
                         }
                     )
                     logging.debug(
-                        f"chat_completions:committee patch_failure_results append name={name_snapshot!r} len={len(patch_failure_results)}"
+                        "chat_completions:committee patch_failure_results append name=%r len=%d", name_snapshot, len(patch_failure_results)
                     )
                 exec_results: List[Dict[str, Any]] = []
-                logging.debug(f"chat_completions:committee exec_results init len={len(exec_results)}")
+                logging.debug("chat_completions:committee exec_results init len=%d", len(exec_results))
                 # Advisory-only: execute the patch plan once via the executor path.
                 exec_batch = patch_validated or patch_calls
                 logging.debug(
-                    f"chat_completions:committee exec_batch_len={(len(exec_batch) if isinstance(exec_batch, list) else -1)}"
+                    "chat_completions:committee exec_batch_len=%d", (len(exec_batch) if isinstance(exec_batch, list) else -1)
                 )
                 if exec_batch:
                     _log("exec.payload", trace_id=trace_id, steps=[{"tool": (c.get("tool_name") or "")} for c in exec_batch])
@@ -10928,7 +11043,7 @@ async def chat_completions(request: Request):
                         exec_results = await gateway_execute(tool_calls=exec_batch, trace_id=trace_id, conversation_id=conversation_id, executor_base_url=executor_endpoint)
                     except Exception as ex:
                         # Hardening: patch-plan execution is advisory; never crash the main run.
-                        logging.error(f"chat_completions:committee:gateway_execute raised ex={ex}", exc_info=True)
+                        logging.error("chat_completions:committee:gateway_execute raised ex=%s", ex, exc_info=True)
                         exec_results = [
                             {
                                 "name": "executor",
@@ -10942,12 +11057,12 @@ async def chat_completions(request: Request):
                             }
                         ]
                     logging.debug(
-                        f"chat_completions:committee gateway_execute patch exec returned len={(len(exec_results) if isinstance(exec_results, list) else -1)}"
+                        "chat_completions:committee gateway_execute patch exec returned len=%d", (len(exec_results) if isinstance(exec_results, list) else -1)
                     )
                     # Persist patch exec results (teacher + ledger + db)
                     try:
                         results_list = exec_results if isinstance(exec_results, list) else []
-                        logging.debug(f"chat_completions:committee results_list_len={len(results_list)}")
+                        logging.debug("chat_completions:committee results_list_len=%d", len(results_list))
                         for i, call in enumerate(exec_batch or []):
                             tool_name = (call or {}).get("tool_name")
                             if not isinstance(tool_name, str) or not tool_name.strip():
@@ -10966,7 +11081,7 @@ async def chat_completions(request: Request):
                                     if isinstance(cand, dict) and str(cand.get("tool_name") or "") == tool_name:
                                         tr = cand
                                         break
-                            logging.debug(f"chat_completions:committee patch_result_iter tr_keys={sorted(list(tr.keys())) if isinstance(tr, dict) else None!r}")
+                            logging.debug("chat_completions:committee patch_result_iter tr_keys=%r", sorted(list(tr.keys())) if isinstance(tr, dict) else None)
                             res_obj = tr.get("result") if isinstance(tr.get("result"), dict) else {}
                             err_obj = tr.get("error")
                             if not err_obj and isinstance(res_obj, dict):
@@ -10988,14 +11103,14 @@ async def chat_completions(request: Request):
                                                 normalized_arts.append(a)
                                         res_obj["artifacts"] = normalized_arts
                                 except Exception as ex:
-                                    logging.debug(f"chat_completions:committee patch_result_iter:artifact_normalization_failed tool={tool_name!r} ex={ex!r}", exc_info=True)
+                                    logging.debug("chat_completions:committee patch_result_iter:artifact_normalization_failed tool=%r ex=%r", tool_name, ex, exc_info=True)
                             arts_val = res_obj.get("artifacts") if isinstance(res_obj, dict) else None
                             ok_step = not isinstance(err_obj, (str, dict))
                             logging.debug(
-                                f"chat_completions:committee patch_result_iter ok_step={ok_step!r} err_type={type(err_obj).__name__}"
+                                "chat_completions:committee patch_result_iter ok_step=%r err_type=%s", ok_step, type(err_obj).__name__
                             )
                             tool_exec_meta.append({"tool_name": tool_name, "args": args_obj, "ok": bool(ok_step), "result": res_obj, "error": err_obj, "artifacts": arts_val})
-                            logging.debug(f"chat_completions:committee tool_exec_meta appended len={len(tool_exec_meta)}")
+                            logging.debug("chat_completions:committee tool_exec_meta appended len=%d", len(tool_exec_meta))
                             artifact_id = None
                             if isinstance(arts_val, list) and arts_val and isinstance(arts_val[0], dict):
                                 a0 = arts_val[0] if isinstance(arts_val[0], dict) else {}
@@ -11018,16 +11133,16 @@ async def chat_completions(request: Request):
                             exc_info=True,
                         )
                 patch_results = list(patch_failure_results) + list(exec_results or [])
-                logging.debug(f"chat_completions:committee patch_results_len={len(patch_results)}")
+                logging.debug("chat_completions:committee patch_results_len=%d", len(patch_results))
                 tool_results = (tool_results or []) + patch_results
-                logging.debug(f"chat_completions:committee tool_results_len_after_patch={len(tool_results or [])}")
+                logging.debug("chat_completions:committee tool_results_len_after_patch=%d", len(tool_results or []))
                 _log("committee.revision.executed", trace_id=trace_id, steps=len(patch_validated or []), failures=len(patch_failures or []))
                 logging.debug(
-                    f"chat_completions:committee revision executed steps={len(patch_validated or [])} failures={len(patch_failures or [])}"
+                    "chat_completions:committee revision executed steps=%d failures=%d", len(patch_validated or []), len(patch_failures or [])
                 )
                 # Recompute QA metrics after revision
                 qa_metrics = _compute_postrun_qa_metrics(tool_results)
-                logging.debug(f"chat_completions:postrev_qa qa_metrics_keys={sorted(list(qa_metrics.keys()))!r}")
+                logging.debug("chat_completions:postrev_qa qa_metrics_keys=%r", sorted(list(qa_metrics.keys())))
                 _log("qa.metrics", trace_id=trace_id, tool="postrun.revise", metrics=qa_metrics)
         # Make full tool results (including internal error stacks) available to the
         # final COMPOSE pass so the committee can explain failures and partial
@@ -11196,7 +11311,7 @@ async def chat_completions(request: Request):
                 meta_sections.append("Tool Results:\n" + json.dumps(tool_results, indent=2))
             except Exception as ex:
                 # This metadata block is non-critical; log and continue.
-                logging.warning(f"final.tool_results.meta_serialize_failed: {ex}", exc_info=True)
+                logging.warning("final.tool_results.meta_serialize_failed: %s", ex, exc_info=True)
         # Instead of verbose plan/critique footers, append a minimal Tool Results summary (IDs/errors) only
         tool_summary_lines: List[str] = []
         tool_tracebacks: List[str] = []
@@ -11224,7 +11339,7 @@ async def chat_completions(request: Request):
                                     },
                                 )
                             except Exception as ex:
-                                logging.warning(f"tool_results.parse.failed: {ex}", exc_info=True)
+                                logging.warning("tool_results.parse.failed: %s", ex, exc_info=True)
                                 res_field = {}
                         if not isinstance(res_field, dict):
                             res_field = {}
@@ -11268,7 +11383,7 @@ async def chat_completions(request: Request):
                 if errors:
                     tool_summary_lines.append("- **errors**: " + "; ".join(errors)[:800])
             except Exception as ex:
-                logging.error(f"tool_results.summary_failed: {ex}", exc_info=True)
+                logging.error("tool_results.summary_failed: %s", ex, exc_info=True)
         footer = ("\n\n### Tool Results\n" + "\n".join(tool_summary_lines)) if tool_summary_lines else ""
         if tool_tracebacks:
             # Include full tracebacks verbatim (truncated to a safe length per item)
@@ -11291,7 +11406,7 @@ async def chat_completions(request: Request):
                 content_preview=(display_content or "")[:800],
             )
         except Exception as ex:
-            logging.warning(f"final.response.checkpoint_failed: {ex}", exc_info=True)
+            logging.warning("final.response.checkpoint_failed: %s", ex, exc_info=True)
         # Provide an appendix with raw model answers to avoid any perception of truncation
         try:
             raw_q = (qwen_text or "").strip()
@@ -11309,7 +11424,7 @@ async def chat_completions(request: Request):
             if appendix_parts:
                 display_content += "".join(appendix_parts)
         except Exception as ex:
-            logging.warning(f"final.appendix.build_failed: {ex}", exc_info=True)
+            logging.warning("final.appendix.build_failed: %s", ex, exc_info=True)
         # Evaluate fallback after footer creation, but using main-only flags
         if looks_empty or looks_refusal:
             # For now, log detection without overriding the composed content.
@@ -11354,7 +11469,7 @@ async def chat_completions(request: Request):
                 try:
                     step_texts.append(json.dumps(tool_results, ensure_ascii=False))
                 except Exception as ex:
-                    logging.warning(f"final.step_texts.tool_results_serialize_failed: {ex}", exc_info=True)
+                    logging.warning("final.step_texts.tool_results_serialize_failed: %s", ex, exc_info=True)
             if isinstance(qwen_text, str) and qwen_text.strip():
                 step_texts.append(qwen_text)
             if isinstance(glm_text, str) and glm_text.strip():
@@ -11396,7 +11511,7 @@ async def chat_completions(request: Request):
             # Do not let final envelope stitching fail silently; log and fall back
             # to an empty envelope so the main /v1/chat/completions response still
             # returns a well-formed JSON body to clients.
-            logging.error(f"chat.final_env_build_failed: {ex}", exc_info=True)
+            logging.error("chat.final_env_build_failed: %s", ex, exc_info=True)
             final_env = {}
 
         # Compose final OpenAI-compatible response envelope. The ok flag reflects
@@ -11522,7 +11637,7 @@ async def chat_completions(request: Request):
 
         # response prepared; single return happens after the try/except.
     except Exception as ex:
-        logging.error(f"chat.finish: {ex}", exc_info=True)
+        logging.error("chat.finish: %s", ex, exc_info=True)
         response = _build_openai_envelope(
             ok=False,
             text="Internal error.",
@@ -11787,7 +11902,7 @@ async def http_tool_run(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
                 try:
                     error_out["status"] = int(_st_raw or 0)
                 except Exception as exc:
-                    logging.warning(f"toolrun.http.error: bad status={_st_raw!r}; defaulting to 0", exc_info=True)
+                    logging.warning("toolrun.http.error: bad status=%r; defaulting to 0", _st_raw, exc_info=True)
                     error_out["status"] = 0
             # Preserve any top-level conversation_id/trace_id so callers can join error telemetry.
             if isinstance(env.get("conversation_id"), str) and env.get("conversation_id"):
@@ -11881,7 +11996,7 @@ async def tools_append(body: Dict[str, Any], request: Request):
                 try:
                     _steps = int(_steps_raw or 0)
                 except Exception as ex:
-                    logging.warning(f"trace.append: bad steps={_steps_raw!r}; defaulting to 0", exc_info=True)
+                    logging.warning("trace.append: bad steps=%r; defaulting to 0", _steps_raw, exc_info=True)
                     _steps = 0
                 _log("exec_plan_start", trace_id=trace_id, steps=_steps)
             if row.get("event") == "exec_plan_finish":
@@ -11904,13 +12019,13 @@ async def tools_append(body: Dict[str, Any], request: Request):
                 try:
                     distilled["t"] = int(_t_raw or 0)
                 except Exception as ex:
-                    logging.warning(f"trace.append: bad t={_t_raw!r}; defaulting to 0", exc_info=True)
+                    logging.warning("trace.append: bad t=%r; defaulting to 0", _t_raw, exc_info=True)
                     distilled["t"] = 0
                 _dur_raw = row.get("duration_ms")
                 try:
                     distilled["duration_ms"] = int(_dur_raw or 0)
                 except Exception as ex:
-                    logging.warning(f"trace.append: bad duration_ms={_dur_raw!r}; defaulting to 0", exc_info=True)
+                    logging.warning("trace.append: bad duration_ms=%r; defaulting to 0", _dur_raw, exc_info=True)
                     distilled["duration_ms"] = 0
                 if isinstance(row.get("summary"), dict):
                     distilled["summary"] = row.get("summary")
@@ -11923,7 +12038,7 @@ async def tools_append(body: Dict[str, Any], request: Request):
                         try:
                             _ic = int(_ic_raw or 0)
                         except Exception as ex:
-                            logging.warning(f"trace.append: bad images_count={_ic_raw!r}; defaulting to 0", exc_info=True)
+                            logging.warning("trace.append: bad images_count=%r; defaulting to 0", _ic_raw, exc_info=True)
                             _ic = 0
                         if _ic > 0:
                             _log("artifact_summary", trace_id=trace_id, kind="image", count=_ic)
@@ -11931,7 +12046,7 @@ async def tools_append(body: Dict[str, Any], request: Request):
                         try:
                             _vc = int(_vc_raw or 0)
                         except Exception as ex:
-                            logging.warning(f"trace.append: bad videos_count={_vc_raw!r}; defaulting to 0", exc_info=True)
+                            logging.warning("trace.append: bad videos_count=%r; defaulting to 0", _vc_raw, exc_info=True)
                             _vc = 0
                         if _vc > 0:
                             _log("artifact_summary", trace_id=trace_id, kind="video", count=_vc)
@@ -11939,12 +12054,12 @@ async def tools_append(body: Dict[str, Any], request: Request):
                         try:
                             _wb = int(_wb_raw or 0)
                         except Exception as ex:
-                            logging.warning(f"trace.append: bad wav_bytes={_wb_raw!r}; defaulting to 0", exc_info=True)
+                            logging.warning("trace.append: bad wav_bytes=%r; defaulting to 0", _wb_raw, exc_info=True)
                             _wb = 0
                         if _wb > 0:
                             _log("artifact_summary", trace_id=trace_id, kind="audio", bytes=_wb)
                 except Exception as ex:
-                    logging.warning(f"artifact summary distillation failed: {ex}", exc_info=True)
+                    logging.warning("artifact summary distillation failed: %s", ex, exc_info=True)
             # Forward review WS events to connected client if present
             try:
                 app = request.app
@@ -12862,18 +12977,6 @@ async def ws_tool(websocket: WebSocket):
                             "route": "/tool.ws",
                             "error": str(_e_close2),
                             "where": "close_after_error",
-                        },
-                    )
-                try:
-                    await websocket.close(code=1000)
-                except Exception as _e_close3:
-                    _append_jsonl(
-                        os.path.join(STATE_DIR, "ws", "errors.jsonl"),
-                        {
-                            "t": int(time.time() * 1000),
-                            "route": "/tool.ws",
-                            "error": str(_e_close3),
-                            "where": "close_after_error_dup",
                         },
                     )
     except WebSocketDisconnect:

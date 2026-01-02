@@ -22,13 +22,13 @@ from .json_parser import JSONParser
 logger = logging.getLogger(__name__)
 
 QWEN_BASE_URL = os.getenv("QWEN_BASE_URL", "http://localhost:11435")
-QWEN_MODEL_ID = os.getenv("QWEN_MODEL_ID", "qwen3:30b-a3b-instruct-2507-q4_K_M")
+QWEN_MODEL_ID = os.getenv("QWEN_MODEL_ID", "huihui_ai/qwen3-abliterated:30b-a3b-q4_K_M")
 
 GLM_OLLAMA_BASE_URL = os.getenv("GLM_OLLAMA_BASE_URL", "http://localhost:11433")
-GLM_MODEL_ID = os.getenv("GLM_MODEL_ID", "glm4:9b")
+GLM_MODEL_ID = os.getenv("GLM_MODEL_ID", "alibilge/Huihui-GLM-4.6V-Flash-abliterated:fp16")
 
 DEEPSEEK_CODER_OLLAMA_BASE_URL = os.getenv("DEEPSEEK_CODER_OLLAMA_BASE_URL", "http://localhost:11436")
-DEEPSEEK_CODER_MODEL_ID = os.getenv("DEEPSEEK_CODER_MODEL_ID", "deepseek-coder-v2:lite")
+DEEPSEEK_CODER_MODEL_ID = os.getenv("DEEPSEEK_CODER_MODEL_ID", "huihui_ai/deepseek-v3.2-lite-abliterated:latest")
 
 _DEFAULT_NUM_CTX_RAW = os.getenv("DEFAULT_NUM_CTX", "8192")
 try:
