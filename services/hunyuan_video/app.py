@@ -277,27 +277,50 @@ def _load_sr_components(sr_root: str) -> Tuple[Optional[torch.nn.Module], Option
         if not os.path.isdir(sr_transformer_path):
             raise RuntimeError(f"SR transformer path does not exist: {sr_transformer_path}")
         
-        # Check for config.json and fix patch_size if it's a list instead of tuple
-        config_path = os.path.join(sr_transformer_path, "config.json")
-        if os.path.isfile(config_path):
-            try:
-                with open(config_path, "r", encoding="utf-8") as f:
-                    config_data = json.load(f)
-                # Fix patch_size if it's a list
-                if "patch_size" in config_data and isinstance(config_data["patch_size"], list):
-                    config_data["patch_size"] = tuple(config_data["patch_size"])
-                    logging.getLogger(__name__).info("SR transformer: fixed patch_size from list to tuple in config.json")
-                    # Write back the fixed config
-                    with open(config_path, "w", encoding="utf-8") as f:
-                        json.dump(config_data, f, indent=2)
-            except Exception as config_fix_ex:
-                logging.getLogger(__name__).warning("SR transformer: failed to fix config.json, will try loading anyway: %s", config_fix_ex)
-        
-        sr_transformer = HunyuanVideo15Transformer3DModel.from_pretrained(
-            sr_transformer_path,
-            torch_dtype=t_dtype,
-            local_files_only=True,
-        )
+        # Load config and fix patch_size from list to tuple (JSON doesn't support tuples)
+        # We need to fix this before the model is initialized
+        try:
+            config = HunyuanVideo15Transformer3DModel.config_class.from_pretrained(
+                sr_transformer_path,
+                local_files_only=True,
+            )
+            # Fix patch_size and patch_size_t if they are lists (JSON loads as lists, PyTorch needs tuples)
+            fixed = False
+            if hasattr(config, "patch_size") and isinstance(config.patch_size, list):
+                config.patch_size = tuple(config.patch_size)
+                fixed = True
+            if hasattr(config, "patch_size_t") and isinstance(config.patch_size_t, list):
+                config.patch_size_t = tuple(config.patch_size_t)
+                fixed = True
+            if fixed:
+                logging.getLogger(__name__).info("SR transformer: fixed patch_size from list to tuple in config")
+            
+            # Load model using the fixed config
+            sr_transformer = HunyuanVideo15Transformer3DModel.from_config(
+                config,
+                torch_dtype=t_dtype,
+            )
+            # Load weights using standard diffusers mechanism
+            from safetensors.torch import load_file as safe_load_file
+            import glob
+            weight_files = sorted(glob.glob(os.path.join(sr_transformer_path, "*.safetensors")) + glob.glob(os.path.join(sr_transformer_path, "*.bin")))
+            if weight_files:
+                state_dict = {}
+                for weight_file in weight_files:
+                    if weight_file.endswith(".safetensors"):
+                        state_dict.update(safe_load_file(weight_file))
+                    else:
+                        state_dict.update(torch.load(weight_file, map_location="cpu"))
+                missing_keys, unexpected_keys = sr_transformer.load_state_dict(state_dict, strict=False)
+                if missing_keys:
+                    logging.getLogger(__name__).debug("SR transformer: missing keys (first 10): %s", missing_keys[:10])
+                if unexpected_keys:
+                    logging.getLogger(__name__).debug("SR transformer: unexpected keys (first 10): %s", unexpected_keys[:10])
+            else:
+                raise RuntimeError(f"No weight files found in {sr_transformer_path}")
+        except Exception as load_ex:
+            logging.getLogger(__name__).error("SR transformer: failed to load with config fix: %s", load_ex, exc_info=True)
+            raise
 
         # SR scheduler - load from subfolder
         sr_scheduler_path = os.path.join(sr_root, SR_SCHEDULER_SUBFOLDER)

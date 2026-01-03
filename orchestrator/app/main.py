@@ -224,6 +224,7 @@ from .tools.progress import emit_progress, set_progress_queue, get_progress_queu
 from .tools.mcp_bridge import call_mcp_tool as _call_mcp_tool
 from .state.checkpoints import append_event as checkpoints_append_event
 from .trace_utils import emit_trace, append_jsonl_compat
+from .tracing.runtime import trace_event
 from .tracing.teacher import tap_trace as _teacher_tap_trace
 from .omni.context import build_omni_context
 from void_envelopes import merge_envelopes as stitch_merge_envelopes, stitch_openai as stitch_openai_final
@@ -4393,7 +4394,7 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
                 logging.info(
                     "film2.run:story:drafted trace_id=%r acts=%d characters=%d locations=%d objects=%d", trace_id, acts_n, chars_n, locs_n, objs_n
                 )
-            trace_append(
+            trace_event(
                 "film2.story_draft",
                 {
                     "trace_id": trace_id,
@@ -4444,7 +4445,7 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
                                 continue
                             event_target = ev.get("event_target") or ev.get("target") or ""
                             state_delta = ev.get("state_delta") if isinstance(ev.get("state_delta"), dict) else {}
-                            trace_append(
+                            trace_event(
                                 "film2.character_state_change",
                                 {
                                     "trace_id": trace_id,
@@ -4464,7 +4465,7 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
                 scene_id = shot.get("scene_id")
                 act_id = shot.get("act_id")
                 state_map = shot.get("character_states") if isinstance(shot.get("character_states"), dict) else {}
-                trace_append(
+                trace_event(
                     "film2.shot_character_state_snapshot",
                     {
                         "trace_id": trace_id,
@@ -4573,7 +4574,7 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
             if character_ids:
                 music_args["character_id"] = character_ids[0]
             # Trace: Film2 → music front-door call start
-            trace_append(
+            trace_event(
                 "film2.music.start",
                 {
                     "trace_id": trace_id,
@@ -4614,7 +4615,7 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
         final_music_eval: Dict[str, Any] | None = None
         if music_meta and isinstance(result.get("meta"), dict):
             # Trace: Film2 → music completion summary
-            trace_append(
+            trace_event(
                 "film2.music.finish",
                 {
                     "trace_id": trace_id,
@@ -4728,7 +4729,7 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
                     tts_sample_rate=22050,
                 )
                 if isinstance(stems_result, dict) and stems_result.get("error"):
-                    trace_append(
+                    trace_event(
                         "film2.music.vocal_stems_error",
                         {
                             "trace_id": trace_id,
@@ -4823,7 +4824,7 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
                         accepted = (oq >= th_music.get("overall_quality_min", 0.0) and fs >= th_music.get("fit_score_min", 0.0))
                         # Hero thresholds: stricter than acceptance
                         hero = (oq >= MUSIC_HERO_QUALITY_MIN and fs >= MUSIC_HERO_FIT_MIN)
-                        trace_append(
+                        trace_event(
                             "film2.music.final_eval",
                             {
                                 "trace_id": trace_id,
@@ -4836,7 +4837,7 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
                                 "hero": hero,
                             },
                         )
-                        trace_append(
+                        trace_event(
                             "film2.music.acceptance",
                             {
                                 "trace_id": trace_id,
@@ -4856,7 +4857,7 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
                             meta_music_block["final_eval"] = final_music_eval
                             meta_music_block["accepted"] = accepted
                             meta_music_block["hero"] = hero
-            trace_append(
+            trace_event(
                 "film2.music.attach",
                 {
                     "trace_id": trace_id,
@@ -5385,7 +5386,7 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
                         hv_tool_args=hv_args_img,
                         upload_dir=UPLOAD_DIR,
                         log_fn=_log,
-                        trace_append=trace_append,
+                        trace_append=trace_event,
                         http_tool_run=http_tool_run,
                         artifact_video=_film2_artifact_video,
                     )
@@ -5512,7 +5513,7 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
                         hv_tool_args=hv_args_prompt,
                         upload_dir=UPLOAD_DIR,
                         log_fn=_log,
-                        trace_append=trace_append,
+                        trace_append=trace_event,
                         http_tool_run=http_tool_run,
                         artifact_video=_film2_artifact_video,
                     )
@@ -5932,7 +5933,7 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
                     clip_seg["qa"]["scores"]["lipsync"] = lipsync_score
                     clip_segments[clip_id] = clip_seg
                     shot_seg["children"].append(clip_id)
-                    trace_append(
+                    trace_event(
                         "film2.segment_clip_built",
                         {
                             "trace_id": trace_id,
@@ -6172,7 +6173,7 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
                     cmeta["degraded"] = True
                     cmeta["degraded_reasons"] = degraded_reasons
                     clip["meta"] = cmeta
-                    trace_append(
+                    trace_event(
                         "film2.clip_refine_exhausted",
                         {
                             "trace_id": trace_id,
@@ -7070,7 +7071,7 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
             assert_envelope(env)
             env = stamp_env(env, "music.refine.window", env.get("meta", {}).get("model"))
             # Trace before/after metrics for training/distillation.
-            trace_append(
+            trace_event(
                 "music.window.refine",
                 {
                     "trace_id": a.get("trace_id"),
@@ -7650,7 +7651,7 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
                         if isinstance(locks_meta, dict):
                             locks_meta["music"] = music_branch
             # Trace stems adjustment usage for distillation.
-            trace_append(
+            trace_event(
                 "audio.stems.adjust",
                 {
                     "trace_id": (args.get("trace_id") if isinstance(args, dict) else None),
@@ -7808,7 +7809,7 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
                     _wf2.write(out_vf)
                 transformed_vocals = vf_path
                 # Attach VocalFix metrics to trace for distillation.
-                trace_append(
+                trace_event(
                     "audio.vocals.vocalfix",
                     {
                         "trace_id": (args.get("trace_id") if isinstance(args, dict) else None),
@@ -7885,7 +7886,7 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
                         if isinstance(locks_meta, dict):
                             locks_meta["music"] = music_branch
             # Trace vocal transform usage.
-            trace_append(
+            trace_event(
                 "audio.vocals.transform",
                 {
                     "trace_id": (args.get("trace_id") if isinstance(args, dict) else None),
@@ -8293,7 +8294,7 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
             if isinstance(meta_block, dict):
                 meta_block["refined_windows"] = refined_windows
         # Trace alignment usage for distillation.
-        trace_append(
+        trace_event(
             "music.lyrics.align",
             {
                 "trace_id": (args.get("trace_id") if isinstance(args, dict) else None),
@@ -8568,7 +8569,7 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
             ["super_gen"],
             {"objects": objs, "boxes": boxes, "signage_text": exact_text},
         )
-        trace_append(
+        trace_event(
             "image",
             {
                 "conversation_id": conversation_id,
@@ -8912,7 +8913,7 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
                 ["artifact_fix", atype],
                 {"region": region, "target_time": args.get("target_time")},
             )
-            trace_append(
+            trace_event(
                 "image",
                 {
                     "conversation_id": conversation_id,
@@ -8985,7 +8986,7 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
             url = dst.replace("/workspace", "") if dst.startswith("/workspace/") else dst
             ctx_key = conversation_id if conversation_id else "misc"
             _ctx_add(ctx_key, "video", dst, url, src, ["artifact_fix", atype], {})
-            trace_append(
+            trace_event(
                 "video",
                 {
                     "conversation_id": conversation_id,
@@ -9512,7 +9513,7 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
             conversation_id = args.get("conversation_id") if isinstance(args.get("conversation_id"), str) else ""
             ctx_key = conversation_id if conversation_id else "misc"
             _ctx_add(ctx_key, "video", npz_path, url, src or (frame_a + "," + frame_b), ["flow"], {})
-            trace_append(
+            trace_event(
                 "video",
                 {
                     "conversation_id": conversation_id,

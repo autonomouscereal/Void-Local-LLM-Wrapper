@@ -14,8 +14,14 @@ logger = logging.getLogger(__name__)
 
 _MUSIC_MODEL: Optional[MusicgenForConditionalGeneration] = None
 _MUSIC_PROCESSOR = None
-_MUSIC_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+_MUSIC_DEVICE = None  # Will be determined dynamically
+_MUSIC_DEVICE_MAP = None  # For CPU offloading / multi-GPU
 _ENGINE_LOADED = False
+
+# Minimum free GPU memory required (in GB) to use a GPU
+_MIN_GPU_MEMORY_GB = float(os.getenv("MUSIC_MIN_GPU_MEMORY_GB", "2.0"))
+# Enable CPU offloading (offload parts of model to CPU when GPU memory is tight)
+_ENABLE_CPU_OFFLOAD = os.getenv("MUSIC_CPU_OFFLOAD", "1").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _log_music_generate_state(
@@ -94,6 +100,90 @@ def _log_music_generate_state(
         logger.exception("Failed to log MusicGen generate state")
 
 
+def _find_best_gpu() -> Optional[int]:
+    """
+    Find the GPU with the most free memory across all available GPUs.
+    Returns the GPU index (0-based) or None if no suitable GPU found.
+    """
+    if not torch.cuda.is_available():
+        return None
+    
+    num_gpus = torch.cuda.device_count()
+    if num_gpus == 0:
+        return None
+    
+    best_gpu = None
+    best_free_memory = 0.0
+    
+    for gpu_idx in range(num_gpus):
+        try:
+            free_mem, total_mem = torch.cuda.mem_get_info(gpu_idx)
+            free_mem_gb = free_mem / (1024 ** 3)
+            total_mem_gb = total_mem / (1024 ** 3)
+            
+            logger.info(
+                "musicgen.gpu_check gpu=%d free_gb=%.2f total_gb=%.2f",
+                gpu_idx, free_mem_gb, total_mem_gb
+            )
+            
+            if free_mem_gb >= _MIN_GPU_MEMORY_GB and free_mem_gb > best_free_memory:
+                best_gpu = gpu_idx
+                best_free_memory = free_mem_gb
+        except Exception as e:
+            logger.warning("musicgen.gpu_check failed gpu=%d error=%s", gpu_idx, e)
+            continue
+    
+    if best_gpu is not None:
+        logger.info(
+            "musicgen.gpu_selected gpu=%d free_gb=%.2f",
+            best_gpu, best_free_memory
+        )
+    
+    return best_gpu
+
+
+def _get_device_and_map():
+    """
+    Determine the best device configuration: prefer GPU with CPU offloading fallback.
+    Returns (device_string, device_map_dict) where device_map can be None for simple single-device.
+    """
+    best_gpu = _find_best_gpu()
+    
+    if best_gpu is None:
+        logger.info("musicgen.device_selection using CPU (no suitable GPU found)")
+        return "cpu", None
+    
+    device_str = f"cuda:{best_gpu}"
+    
+    # If CPU offloading is enabled, use device_map for automatic offloading
+    if _ENABLE_CPU_OFFLOAD:
+        try:
+            # Try to get memory info to decide on offloading strategy
+            free_mem, total_mem = torch.cuda.mem_get_info(best_gpu)
+            free_mem_gb = free_mem / (1024 ** 3)
+            
+            # If free memory is less than 8GB, use CPU offloading
+            if free_mem_gb < 8.0:
+                logger.info(
+                    "musicgen.device_selection using GPU %d with CPU offloading (free_gb=%.2f)",
+                    best_gpu, free_mem_gb
+                )
+                # Use device_map="auto" to let transformers handle CPU offloading
+                return device_str, "auto"
+            else:
+                logger.info(
+                    "musicgen.device_selection using GPU %d without CPU offloading (free_gb=%.2f)",
+                    best_gpu, free_mem_gb
+                )
+                return device_str, None
+        except Exception as e:
+            logger.warning("musicgen.device_selection error checking GPU memory: %s", e)
+            return device_str, None
+    else:
+        logger.info("musicgen.device_selection using GPU %d (CPU offloading disabled)", best_gpu)
+        return device_str, None
+
+
 def _resolve_model_path(model_dir: str, model_id_env: str):
     """
     Resolve a local model path for MusicGen.
@@ -112,9 +202,13 @@ def ensure_music_engine_loaded():
     Load the primary music generation engine (MusicGen or compatible) exactly
     once into module-level globals. The model object never leaves this module.
     """
-    global _MUSIC_MODEL, _MUSIC_PROCESSOR, _MUSIC_DEVICE, _ENGINE_LOADED
+    global _MUSIC_MODEL, _MUSIC_PROCESSOR, _MUSIC_DEVICE, _MUSIC_DEVICE_MAP, _ENGINE_LOADED
     if _ENGINE_LOADED and _MUSIC_MODEL is not None and _MUSIC_PROCESSOR is not None:
         return
+    
+    # Determine device configuration
+    _MUSIC_DEVICE, _MUSIC_DEVICE_MAP = _get_device_and_map()
+    
     # Resolve either a local snapshot path or an HF repo id.
     model_dir = os.getenv("MUSIC_MODEL_DIR", "/opt/models/music")
     model_path = _resolve_model_path(model_dir, os.getenv("MUSIC_MODEL_ID", "facebook/musicgen-large"))
@@ -125,12 +219,31 @@ def ensure_music_engine_loaded():
         _MUSIC_MODEL = None
         _MUSIC_PROCESSOR = None
         return
+    
     dtype = torch.float16 if _MUSIC_DEVICE.startswith("cuda") else torch.float32
-    _MUSIC_MODEL = MusicgenForConditionalGeneration.from_pretrained(model_path, torch_dtype=dtype)
-    _MUSIC_MODEL = _MUSIC_MODEL.to(_MUSIC_DEVICE)
+    
+    # Load model with device_map if CPU offloading is enabled
+    if _MUSIC_DEVICE_MAP == "auto":
+        logger.info("musicgen.init loading with device_map=auto for CPU offloading")
+        _MUSIC_MODEL = MusicgenForConditionalGeneration.from_pretrained(
+            model_path,
+            torch_dtype=dtype,
+            device_map="auto",
+            low_cpu_mem_usage=True,
+        )
+    else:
+        _MUSIC_MODEL = MusicgenForConditionalGeneration.from_pretrained(
+            model_path,
+            torch_dtype=dtype
+        )
+        _MUSIC_MODEL = _MUSIC_MODEL.to(_MUSIC_DEVICE)
+    
     _MUSIC_PROCESSOR = AutoProcessor.from_pretrained(model_path)
     _ENGINE_LOADED = True
-    logger.info("musicgen.init model=%s device=%s dtype=%s", model_path, _MUSIC_DEVICE, dtype)
+    logger.info(
+        "musicgen.init model=%s device=%s device_map=%s dtype=%s",
+        model_path, _MUSIC_DEVICE, _MUSIC_DEVICE_MAP, dtype
+    )
 
 
 def generate_music(
@@ -162,6 +275,10 @@ def generate_music(
     # Build conditioning text; refs can be wired in later if desired.
     text = prompt.strip()
     inputs = proc(text=[text], padding=True, return_tensors="pt")
+    
+    # Move inputs to the appropriate device
+    # With device_map="auto", inputs should go to the primary device (the GPU we selected)
+    # The model will handle moving tensors between devices as needed
     inputs = {k: (v.to(device) if hasattr(v, "to") else v) for k, v in inputs.items()}
     # Crude mapping: ~50 tokens/s for small/medium configs
     max_new_tokens = max(50, int(seconds) * 50)

@@ -214,11 +214,37 @@ def eval_emotion(track_path: str):
     return {"emotion_guess": emotion, "tempo_bpm": tempo, "valence": valence, "arousal": arousal}
 
 
+def _sanitize_value(v: Any) -> Any:
+    """Recursively sanitize values to prevent corrupted float patterns like '0.0.0.0...'"""
+    if isinstance(v, str):
+        # Check for corrupted float patterns (repeated "0.0" sequences)
+        if "0.0.0.0" in v or (v.count("0.0") > 3 and len(v) > 20):
+            log.warning(f"_build_music_eval_summary: detected corrupted string value, replacing with 0.0: {v[:100]}")
+            return 0.0
+        # Try to parse as float if it looks like a number
+        try:
+            return float(v)
+        except (ValueError, TypeError):
+            return v
+    elif isinstance(v, (int, float)):
+        # Ensure valid numeric range
+        if isinstance(v, float) and (not (-1e10 <= v <= 1e10) or (v != v)):  # NaN check
+            log.warning(f"_build_music_eval_summary: invalid float value, replacing with 0.0: {v}")
+            return 0.0
+        return v
+    elif isinstance(v, dict):
+        return {k: _sanitize_value(v2) for k, v2 in v.items()}
+    elif isinstance(v, list):
+        return [_sanitize_value(item) for item in v]
+    else:
+        return v
+
+
 def _build_music_eval_summary(all_axes: Dict[str, Any], film_context: Optional[Dict[str, Any]]):
     axes_slim: Dict[str, Any] = {}
     for key, val in (all_axes or {}).items():
         if not isinstance(val, dict):
-            axes_slim[key] = val
+            axes_slim[key] = _sanitize_value(val)
             continue
         cur = dict(val)
         if key == "style":
@@ -226,8 +252,8 @@ def _build_music_eval_summary(all_axes: Dict[str, Any], film_context: Optional[D
             cur.pop("style_embed", None)
             cur.pop("per_ref_scores", None)
             cur.pop("refs", None)
-        axes_slim[key] = cur
-    payload: Dict[str, Any] = {"axes": axes_slim, "film_context": film_context or {}}
+        axes_slim[key] = _sanitize_value(cur)
+    payload: Dict[str, Any] = {"axes": axes_slim, "film_context": _sanitize_value(film_context or {})}
     return json.dumps(payload, ensure_ascii=False)
 
 
@@ -269,10 +295,27 @@ async def _call_music_eval_committee(summary: str, trace_id: str = ""):
     if isinstance(env, dict) and env.get("ok"):
         res = env.get("result") or {}
         txt = res.get("text") or ""
+        # Validate and sanitize text before passing to committee_jsonify
+        if isinstance(txt, str):
+            # Check for corrupted patterns
+            if "0.0.0.0.0" in txt or txt.count("0.0") > 10:
+                log.error(f"_call_music_eval_committee: detected corrupted response text, using default payload. text_preview={txt[:200]}")
+                return result_payload
         parsed = await committee_jsonify(raw_text=txt or "{}", expected_schema=schema, trace_id=trace_id, temperature=0.0)
         parser = JSONParser()
         coerced = parser.parse(parsed if parsed is not None else "{}", schema)
         if isinstance(coerced, dict):
+            # Final validation: ensure all float values are valid
+            for key in ("overall_quality_score", "fit_score", "originality_score", "cohesion_score"):
+                val = coerced.get(key)
+                if isinstance(val, (int, float)):
+                    coerced[key] = float(val)
+                    if not (-1e10 <= coerced[key] <= 1e10) or coerced[key] != coerced[key]:  # NaN check
+                        log.warning(f"_call_music_eval_committee: invalid {key} value {val}, setting to 0.0")
+                        coerced[key] = 0.0
+                elif not isinstance(val, (int, float)):
+                    log.warning(f"_call_music_eval_committee: {key} is not numeric: {type(val).__name__}, setting to 0.0")
+                    coerced[key] = 0.0
             result_payload = coerced
     return result_payload
 
