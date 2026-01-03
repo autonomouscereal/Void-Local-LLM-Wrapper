@@ -280,26 +280,54 @@ def _load_sr_components(sr_root: str) -> Tuple[Optional[torch.nn.Module], Option
         # Load config and fix patch_size from list to tuple (JSON doesn't support tuples)
         # We need to fix this before the model is initialized
         try:
-            config = HunyuanVideo15Transformer3DModel.config_class.from_pretrained(
-                sr_transformer_path,
-                local_files_only=True,
-            )
+            # Load config.json directly and fix patch_size values
+            config_path = os.path.join(sr_transformer_path, "config.json")
+            if not os.path.isfile(config_path):
+                raise RuntimeError(f"config.json not found at {config_path}")
+            
+            with open(config_path, "r", encoding="utf-8") as f:
+                config_dict = json.load(f)
+            
             # Fix patch_size and patch_size_t if they are lists (JSON loads as lists, PyTorch needs tuples)
             fixed = False
-            if hasattr(config, "patch_size") and isinstance(config.patch_size, list):
-                config.patch_size = tuple(config.patch_size)
+            if "patch_size" in config_dict and isinstance(config_dict["patch_size"], list):
+                config_dict["patch_size"] = tuple(config_dict["patch_size"])
                 fixed = True
-            if hasattr(config, "patch_size_t") and isinstance(config.patch_size_t, list):
-                config.patch_size_t = tuple(config.patch_size_t)
+            if "patch_size_t" in config_dict and isinstance(config_dict["patch_size_t"], list):
+                config_dict["patch_size_t"] = tuple(config_dict["patch_size_t"])
                 fixed = True
+            
             if fixed:
                 logging.getLogger(__name__).info("SR transformer: fixed patch_size from list to tuple in config")
-            
-            # Load model using the fixed config
-            sr_transformer = HunyuanVideo15Transformer3DModel.from_config(
-                config,
-                torch_dtype=t_dtype,
-            )
+                # Write fixed config to a temporary location and load from there
+                import tempfile
+                import shutil
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    # Copy all files to temp dir
+                    for item in os.listdir(sr_transformer_path):
+                        src = os.path.join(sr_transformer_path, item)
+                        dst = os.path.join(tmpdir, item)
+                        if os.path.isfile(src):
+                            shutil.copy2(src, dst)
+                        elif os.path.isdir(src):
+                            shutil.copytree(src, dst)
+                    # Write fixed config
+                    tmp_config_path = os.path.join(tmpdir, "config.json")
+                    with open(tmp_config_path, "w", encoding="utf-8") as f:
+                        json.dump(config_dict, f, indent=2)
+                    # Load model from temp dir
+                    sr_transformer = HunyuanVideo15Transformer3DModel.from_pretrained(
+                        tmpdir,
+                        torch_dtype=t_dtype,
+                        local_files_only=True,
+                    )
+            else:
+                # No fix needed, load normally
+                sr_transformer = HunyuanVideo15Transformer3DModel.from_pretrained(
+                    sr_transformer_path,
+                    torch_dtype=t_dtype,
+                    local_files_only=True,
+                )
             # Load weights using standard diffusers mechanism
             from safetensors.torch import load_file as safe_load_file
             import glob
