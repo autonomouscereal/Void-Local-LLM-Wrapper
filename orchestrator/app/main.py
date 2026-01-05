@@ -2890,11 +2890,11 @@ QWEN_MODEL_ID = os.getenv("QWEN_MODEL_ID", "huihui_ai/qwen3-abliterated:30b-a3b-
 GLM_MODEL_ID = os.getenv("GLM_MODEL_ID", "hf.co/unsloth/GLM-4.6V-Flash-GGUF:BF16")
 DEEPSEEK_CODER_MODEL_ID = os.getenv("DEEPSEEK_CODER_MODEL_ID", "huihui_ai/deepseek-v3.2-lite-abliterated:latest")
 
-_DEFAULT_NUM_CTX_RAW = os.getenv("DEFAULT_NUM_CTX", "8192")
+_DEFAULT_NUM_CTX_RAW = os.getenv("DEFAULT_NUM_CTX", "32768")
 try:
-    DEFAULT_NUM_CTX = int(str(_DEFAULT_NUM_CTX_RAW).strip() or "8192")
+    DEFAULT_NUM_CTX = int(str(_DEFAULT_NUM_CTX_RAW).strip() or "32768")
 except Exception:
-    DEFAULT_NUM_CTX = 8192
+    DEFAULT_NUM_CTX = 32768
 
 COMMITTEE_MODEL_ID = os.getenv("COMMITTEE_MODEL_ID") or f"committee:{QWEN_MODEL_ID}+{GLM_MODEL_ID}+{DEEPSEEK_CODER_MODEL_ID}"
 

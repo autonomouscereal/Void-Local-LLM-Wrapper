@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from typing import Any, Dict, List, Tuple
 
 from ..icw.tokenizer import byte_budget_for_model, bytes_len
@@ -281,11 +282,12 @@ def co_pack(envelope: Dict[str, Any]) -> Dict[str, Any]:
     tel_blocks: List[Dict[str, Any]] = list(envelope.get("tel_blocks") or [])
 
     model_caps = envelope.get("model_caps") or {}
-    ctx_limit_tokens_raw = envelope.get("ctx_limit_tokens") or model_caps.get("num_ctx") or 8192
+    _default_ctx = int(os.getenv("DEFAULT_NUM_CTX", "32768"))
+    ctx_limit_tokens_raw = envelope.get("ctx_limit_tokens") or model_caps.get("num_ctx") or _default_ctx
     try:
         ctx_limit_tokens = int(ctx_limit_tokens_raw)
     except (TypeError, ValueError):
-        ctx_limit_tokens = 8192
+        ctx_limit_tokens = _default_ctx
     total_budget_bytes = byte_budget_for_model(ctx_limit_tokens)
 
     # Pick static allocations within ranges

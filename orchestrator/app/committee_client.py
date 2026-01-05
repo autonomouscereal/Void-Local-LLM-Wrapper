@@ -48,9 +48,39 @@ def _env_int(env_var_name: str, default: int, *, min_val: int | None = None, max
     return val
 
 
-DEFAULT_NUM_CTX = _env_int("DEFAULT_NUM_CTX", 8192, min_val=1024, max_val=262144)
+DEFAULT_NUM_CTX = _env_int("DEFAULT_NUM_CTX", 32768, min_val=1024, max_val=262144)
 DEFAULT_COMMITTEE_ROUNDS = _env_int("COMMITTEE_ROUNDS", 1, min_val=1, max_val=10)
 COMMITTEE_MODEL_ID = os.getenv("COMMITTEE_MODEL_ID") or f"committee:{QWEN_MODEL_ID}+{GLM_MODEL_ID}+{DEEPSEEK_CODER_MODEL_ID}"
+
+# Model-specific ollama options
+MODEL_SPECIFIC_OPTIONS: Dict[str, Dict[str, Any]] = {
+    "huihui_ai/qwen3-abliterated:30b-a3b-q4_K_M": {
+        "temperature": 0.6,
+        "repeat_penalty": 1.15,
+        "repeat_last_n": 128,
+        "top_p": 0.95,
+        "min_p": 0.05,
+    },
+    "huihui_ai/deepseek-v3.2-lite-abliterated:latest": {
+        "temperature": 0.4,  # Middle of 0.35-0.5 range
+        "repeat_penalty": 1.12,
+        "min_p": 0.1,
+        "top_p": 0.9,
+    },
+    "hf.co/unsloth/GLM-4.6V-Flash-GGUF:BF16": {
+        "temperature": 0.8,
+        "top_p": 0.6,
+        "top_k": 2,
+        "repeat_penalty": 1.1,
+    },
+    # Also support without hf.co prefix
+    "unsloth/GLM-4.6V-Flash-GGUF:BF16": {
+        "temperature": 0.8,
+        "top_p": 0.6,
+        "top_k": 2,
+        "repeat_penalty": 1.1,
+    },
+}
 
 PARTICIPANT_MODELS = {"qwen": {"base": QWEN_BASE_URL, "model": QWEN_MODEL_ID}, "glm": {"base": GLM_OLLAMA_BASE_URL, "model": GLM_MODEL_ID}, "deepseek": {"base": DEEPSEEK_CODER_OLLAMA_BASE_URL, "model": DEEPSEEK_CODER_MODEL_ID}}
 COMMITTEE_PARTICIPANTS = [{"id": member_id, "base": cfg["base"], "model": cfg["model"]} for member_id, cfg in PARTICIPANT_MODELS.items()]
@@ -155,7 +185,15 @@ def _normalize_messages(messages: List[Dict[str, Any]]):
 def build_ollama_payload(messages: List[Dict[str, Any]], model: str, num_ctx: int, temperature: float | None = None):
     t0 = time.monotonic()
     norm_messages = _normalize_messages(messages=messages or [])
-    options: Dict[str, Any] = {"num_ctx": int(num_ctx)}
+    
+    # Start with model-specific options if available, otherwise empty dict
+    model_str = str(model)
+    options: Dict[str, Any] = dict(MODEL_SPECIFIC_OPTIONS.get(model_str, {}))
+    
+    # Always set num_ctx (overrides any model-specific value if present)
+    options["num_ctx"] = int(num_ctx)
+    
+    # Override temperature if explicitly provided
     if temperature is not None:
         options["temperature"] = float(temperature)
     payload: Dict[str, Any] = {"model": str(model), "messages": norm_messages, "stream": False, "keep_alive": "24h", "options": options}
