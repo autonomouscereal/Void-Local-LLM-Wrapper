@@ -31,7 +31,7 @@ QWEN_MODEL_ID = os.getenv("QWEN_MODEL_ID", "huihui_ai/qwen3-abliterated:30b-a3b-
 GLM_OLLAMA_BASE_URL = os.getenv("GLM_OLLAMA_BASE_URL", "http://localhost:11433")
 GLM_MODEL_ID = os.getenv("GLM_MODEL_ID", "hf.co/unsloth/GLM-4.6V-Flash-GGUF:BF16")
 DEEPSEEK_CODER_OLLAMA_BASE_URL = os.getenv("DEEPSEEK_CODER_OLLAMA_BASE_URL", "http://localhost:11436")
-DEEPSEEK_CODER_MODEL_ID = os.getenv("DEEPSEEK_CODER_OLLAMA_BASE_URL", None) and os.getenv("DEEPSEEK_CODER_MODEL_ID", "huihui-ai/DeepSeek-R1-Distill-Qwen-32B-abliterated") or os.getenv("DEEPSEEK_CODER_MODEL_ID", "huihui-ai/DeepSeek-R1-Distill-Qwen-32B-abliterated")
+DEEPSEEK_CODER_MODEL_ID = os.getenv("DEEPSEEK_CODER_OLLAMA_BASE_URL", None) and os.getenv("DEEPSEEK_CODER_MODEL_ID", "huihui_ai/deepseek-r1-abliterated:32b") or os.getenv("DEEPSEEK_CODER_MODEL_ID", "huihui_ai/deepseek-r1-abliterated:32b")
 
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/workspace/uploads")
 STATE_DIR = os.path.join(UPLOAD_DIR, "state")
@@ -61,7 +61,7 @@ MODEL_SPECIFIC_OPTIONS: Dict[str, Dict[str, Any]] = {
         "top_p": 0.95,
         "min_p": 0.05,
     },
-    "huihui-ai/DeepSeek-R1-Distill-Qwen-32B-abliterated": {
+    "huihui_ai/deepseek-r1-abliterated:32b": {
         "temperature": 0.6,
         "repeat_penalty": 1.15,
         "top_k": 2,
@@ -303,12 +303,25 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str):
                 )
             if not (200 <= status_code < 300):
                 err_text = parsed.get("error") if isinstance(parsed.get("error"), str) else raw_text
+                # Detect CLIP model loading errors specifically
+                is_clip_error = isinstance(err_text, str) and ("CLIP model" in err_text or "Failed to load CLIP" in err_text)
+                if is_clip_error:
+                    log.error(
+                        "[committee] ollama.clip_model_error trace_id=%s base=%s model=%r status=%d error=%s - CLIP model failed to load, Ollama service may need restart or model re-download",
+                        trace_id,
+                        base_url,
+                        model,
+                        status_code,
+                        err_text,
+                    )
                 emit_trace(
                     state_dir=STATE_DIR,
                     trace_id=trace_id,
                     kind="committee.ollama.http_error",
-                    payload={"trace_id": trace_id, "base_url": base_url, "status_code": status_code, "error": err_text, "raw": raw_text, "parsed": parsed},
+                    payload={"trace_id": trace_id, "base_url": base_url, "status_code": status_code, "error": err_text, "raw": raw_text, "parsed": parsed, "is_clip_error": is_clip_error},
                 )
+                error_code = "ollama_clip_error" if is_clip_error else "ollama_http_error"
+                error_message = f"ollama CLIP model loading failed (service may need restart): {err_text}" if is_clip_error else f"ollama returned HTTP {status_code}"
                 log.error(
                     "[committee] ollama.http_error trace_id=%s base=%s model=%r status=%d dur_ms=%d error=%s raw=%s",
                     trace_id,
@@ -319,7 +332,7 @@ async def call_ollama(base_url: str, payload: Dict[str, Any], trace_id: str):
                     err_text,
                     raw_text,
                 )
-                return {"ok": False, "error": {"code": "ollama_http_error", "message": f"ollama returned HTTP {status_code}", "status": status_code, "base_url": base_url, "details": {"error": err_text}}}
+                return {"ok": False, "error": {"code": error_code, "message": error_message, "status": status_code, "base_url": base_url, "details": {"error": err_text, "is_clip_error": is_clip_error}}}
             response_str = ""
             try:
                 msg = parsed.get("message") if isinstance(parsed.get("message"), dict) else {}

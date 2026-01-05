@@ -2888,7 +2888,7 @@ from .committee_client import committee_ai_text, committee_jsonify
 # All other config is sourced directly from environment here.
 QWEN_MODEL_ID = os.getenv("QWEN_MODEL_ID", "huihui_ai/qwen3-abliterated:30b-a3b-q4_K_M")
 GLM_MODEL_ID = os.getenv("GLM_MODEL_ID", "hf.co/unsloth/GLM-4.6V-Flash-GGUF:BF16")
-DEEPSEEK_CODER_MODEL_ID = os.getenv("DEEPSEEK_CODER_MODEL_ID", "huihui-ai/DeepSeek-R1-Distill-Qwen-32B-abliterated")
+DEEPSEEK_CODER_MODEL_ID = os.getenv("DEEPSEEK_CODER_MODEL_ID", "huihui_ai/deepseek-r1-abliterated:32b")
 
 _DEFAULT_NUM_CTX_RAW = os.getenv("DEFAULT_NUM_CTX", "32768")
 try:
