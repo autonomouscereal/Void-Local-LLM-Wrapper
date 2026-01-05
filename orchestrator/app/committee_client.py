@@ -31,7 +31,7 @@ QWEN_MODEL_ID = os.getenv("QWEN_MODEL_ID", "huihui_ai/qwen3-abliterated:30b-a3b-
 GLM_OLLAMA_BASE_URL = os.getenv("GLM_OLLAMA_BASE_URL", "http://localhost:11433")
 GLM_MODEL_ID = os.getenv("GLM_MODEL_ID", "hf.co/unsloth/GLM-4.6V-Flash-GGUF:BF16")
 DEEPSEEK_CODER_OLLAMA_BASE_URL = os.getenv("DEEPSEEK_CODER_OLLAMA_BASE_URL", "http://localhost:11436")
-DEEPSEEK_CODER_MODEL_ID = os.getenv("DEEPSEEK_CODER_OLLAMA_BASE_URL", None) and os.getenv("DEEPSEEK_CODER_MODEL_ID", "huihui_ai/deepseek-v3.2-lite-abliterated:latest") or os.getenv("DEEPSEEK_CODER_MODEL_ID", "huihui_ai/deepseek-v3.2-lite-abliterated:latest")
+DEEPSEEK_CODER_MODEL_ID = os.getenv("DEEPSEEK_CODER_OLLAMA_BASE_URL", None) and os.getenv("DEEPSEEK_CODER_MODEL_ID", "huihui-ai/DeepSeek-R1-Distill-Qwen-32B-abliterated") or os.getenv("DEEPSEEK_CODER_MODEL_ID", "huihui-ai/DeepSeek-R1-Distill-Qwen-32B-abliterated")
 
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/workspace/uploads")
 STATE_DIR = os.path.join(UPLOAD_DIR, "state")
@@ -61,11 +61,12 @@ MODEL_SPECIFIC_OPTIONS: Dict[str, Dict[str, Any]] = {
         "top_p": 0.95,
         "min_p": 0.05,
     },
-    "huihui_ai/deepseek-v3.2-lite-abliterated:latest": {
-        "temperature": 0.4,  # Middle of 0.35-0.5 range
-        "repeat_penalty": 1.12,
-        "min_p": 0.1,
-        "top_p": 0.9,
+    "huihui-ai/DeepSeek-R1-Distill-Qwen-32B-abliterated": {
+        "temperature": 0.6,
+        "repeat_penalty": 1.15,
+        "top_k": 2,
+        "min_p": 0.05,
+        "stop": ["<thought>", "</thought>"],
     },
     "hf.co/unsloth/GLM-4.6V-Flash-GGUF:BF16": {
         "temperature": 0.8,

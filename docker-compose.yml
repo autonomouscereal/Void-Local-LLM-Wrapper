@@ -269,8 +269,8 @@ services:
     depends_on:
       - deepseek_ollama
     environment:
-      - DEEPSEEK_CODER_MODEL_ID=${DEEPSEEK_CODER_MODEL_ID:-huihui_ai/deepseek-v3.2-lite-abliterated:latest}
-    command: ["sh","-lc","until curl -s http://127.0.0.1:11436/api/tags >/dev/null; do sleep 2; done; echo Pulling $DEEPSEEK_CODER_MODEL_ID; curl -s -X POST http://127.0.0.1:11436/api/pull -H 'Content-Type: application/json' -d '{\"name\":\"${DEEPSEEK_CODER_MODEL_ID:-huihui_ai/deepseek-v3.2-lite-abliterated:latest}\"}'; echo Pulled $DEEPSEEK_CODER_MODEL_ID"]
+      - DEEPSEEK_CODER_MODEL_ID=${DEEPSEEK_CODER_MODEL_ID:-huihui-ai/DeepSeek-R1-Distill-Qwen-32B-abliterated}
+    command: ["sh","-lc","until curl -s http://127.0.0.1:11436/api/tags >/dev/null; do sleep 2; done; echo Pulling $DEEPSEEK_CODER_MODEL_ID; curl -s -X POST http://127.0.0.1:11436/api/pull -H 'Content-Type: application/json' -d '{\"name\":\"${DEEPSEEK_CODER_MODEL_ID:-huihui-ai/DeepSeek-R1-Distill-Qwen-32B-abliterated}\"}'; echo Pulled $DEEPSEEK_CODER_MODEL_ID"]
 
   init_qwen_vl:
     image: curlimages/curl:8.7.1
@@ -315,7 +315,7 @@ services:
       - GLM_OLLAMA_BASE_URL=${GLM_OLLAMA_BASE_URL:-http://127.0.0.1:11433}
       - GLM_MODEL_ID=${GLM_MODEL_ID:-hf.co/unsloth/GLM-4.6V-Flash-GGUF:BF16}
       - DEEPSEEK_CODER_OLLAMA_BASE_URL=${DEEPSEEK_CODER_OLLAMA_BASE_URL:-http://127.0.0.1:11436}
-      - DEEPSEEK_CODER_MODEL_ID=${DEEPSEEK_CODER_MODEL_ID:-huihui_ai/deepseek-v3.2-lite-abliterated:latest}
+      - DEEPSEEK_CODER_MODEL_ID=${DEEPSEEK_CODER_MODEL_ID:-huihui-ai/DeepSeek-R1-Distill-Qwen-32B-abliterated}
       # Enable ICW + Committee + Tools by default
       - ICW_MODE=${ICW_MODE:-committee}
       - ICW_DISABLE=0

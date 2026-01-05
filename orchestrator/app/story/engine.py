@@ -704,8 +704,8 @@ You MUST match this exact structure. All field names and nesting must be identic
   * **IMPORTANT: Use state_delta to track visual/physical changes that affect character appearance:**
     - Physical changes: "left_arm": "missing" or "left_arm": "robot" (for prosthetic limbs), "right_arm": "missing", "age": 25 (for aging), "appearance": "scarred" (for injuries/scars)
     - State changes: "health": 50, "stance": "ready", "energy_level": "high"
-  * CORRECT state_delta examples: {"health": 50}, {"stance": "ready", "energy_level": "high"}, {"left_arm": "missing"}, {"age": 30, "appearance": "weathered"}, {"eruption_level": "medium"}
-  * INCORRECT state_delta examples: {"key": "health", "value": 50} (WRONG - don't use nested "key"/"value" structure), {"key": "position", "value": "mid-battle stance"} (WRONG)
+  * CORRECT state_delta examples: {{"health": 50}}, {{"stance": "ready", "energy_level": "high"}}, {{"left_arm": "missing"}}, {{"age": 30, "appearance": "weathered"}}, {{"eruption_level": "medium"}}
+  * INCORRECT state_delta examples: {{"key": "health", "value": 50}} (WRONG - don't use nested "key"/"value" structure), {{"key": "position", "value": "mid-battle stance"}} (WRONG)
   * event_target MUST be a character_id (e.g. "shadow", "charizard") OR an object_name (e.g. "Volcanic Fissure (Active)"), NOT a location_name
   * For non-state_change events: event_target is optional (can be omitted or empty string)
 - Dialogue: array of objects with line_id (string, REQUIRED - unique identifier for TTS dialogue_index mapping), speaker (string, REQUIRED - must be a character_id from characters array), dialogue_text (string)
@@ -722,7 +722,7 @@ Produce the complete story graph as a single JSON object matching the exact stru
 
 **CRITICAL REMINDERS:**
 1. **CREATE all characters, locations, and objects that appear in your story** - do not reference entities that aren't in the top-level arrays
-2. **Use state_change events to track character appearance changes** - if a character loses an arm, ages, gets injured, etc., add a state_change event with appropriate state_delta (e.g., {"left_arm": "missing"} or {"age": 45})
+2. **Use state_change events to track character appearance changes** - if a character loses an arm, ages, gets injured, etc., add a state_change event with appropriate state_delta (e.g., {{"left_arm": "missing"}} or {{"age": 45}})
 3. **Ensure continuity** - if a character's state changes (e.g., loses an arm), that change must be reflected in all subsequent beats where that character appears
 
 CRITICAL: Do NOT wrap your output in wrapper keys like 'response', 'data', 'result', 'output', 'content', or 'json'. Output the story object directly at the top level."""
