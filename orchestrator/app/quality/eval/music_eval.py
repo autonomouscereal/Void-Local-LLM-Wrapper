@@ -105,7 +105,10 @@ def eval_style(track_path: str, style_pack: Optional[Dict[str, Any]]):
             }
         track_embed = _embed_music_clap(track_path)
         raw_sim = _cos_sim(style_embed, track_embed)
-        style_score = 0.5 * (raw_sim + 1.0)
+        # Ensure raw_sim is a valid float
+        if not isinstance(raw_sim, (int, float)) or raw_sim != raw_sim:  # NaN check
+            raw_sim = 0.0
+        style_score = float(0.5 * (float(raw_sim) + 1.0))
         per_ref_scores: Dict[str, float] = {}
         refs = style_pack.get("refs") or []
         if isinstance(refs, list):
@@ -117,8 +120,9 @@ def eval_style(track_path: str, style_pack: Optional[Dict[str, Any]]):
                 if not isinstance(ref_path, str) or not isinstance(ref_embed, list):
                     continue
                 sim = _cos_sim(ref_embed, track_embed)
-                per_ref_scores[ref_path] = 0.5 * (sim + 1.0)
-        return {"style_score": style_score, "track_embed": track_embed, "per_ref_scores": per_ref_scores, "style_eval_ok": True}
+                if isinstance(sim, (int, float)) and sim == sim:  # Valid number and not NaN
+                    per_ref_scores[ref_path] = float(0.5 * (float(sim) + 1.0))
+        return {"style_score": float(style_score), "track_embed": track_embed, "per_ref_scores": per_ref_scores, "style_eval_ok": True}
     except MusicEvalError as e:
         return {
             "style_score": 0.0,
@@ -165,24 +169,24 @@ def _eval_structure_from_song_graph(track_path: str, song_graph: Dict[str, Any])
     norm_energies = [e / max_energy for e in sec_energies] if max_energy > 0.0 else [0.0] * len(sec_energies)
     diffs = [abs(ne - tgt) for ne, tgt in zip(norm_energies, targets)]
     mean_diff = sum(diffs) / float(len(diffs))
-    energy_alignment_score = 1.0 - mean_diff
-    energy_alignment_score = 0.0 if energy_alignment_score < 0.0 else 1.0 if energy_alignment_score > 1.0 else energy_alignment_score
+    energy_alignment_score = float(1.0 - mean_diff)
+    energy_alignment_score = float(0.0 if energy_alignment_score < 0.0 else 1.0 if energy_alignment_score > 1.0 else energy_alignment_score)
     mean_energy = sum(norm_energies) / float(len(norm_energies))
     var = sum((e - mean_energy) ** 2 for e in norm_energies) / float(len(norm_energies))
     if var < 0.01:
-        repetition_score = 0.3
+        repetition_score = float(0.3)
     elif var > 0.25:
-        repetition_score = 0.6
+        repetition_score = float(0.6)
     else:
-        repetition_score = 1.0
+        repetition_score = float(1.0)
     if len(norm_energies) > 1:
         jumps = [abs(norm_energies[i + 1] - norm_energies[i]) for i in range(len(norm_energies) - 1)]
         mean_jump = sum(jumps) / float(len(jumps))
-        transition_score = 1.0 - mean_jump
-        transition_score = 0.0 if transition_score < 0.0 else 1.0 if transition_score > 1.0 else transition_score
+        transition_score = float(1.0 - mean_jump)
+        transition_score = float(0.0 if transition_score < 0.0 else 1.0 if transition_score > 1.0 else transition_score)
     else:
-        transition_score = 1.0
-    return {"energy_alignment_score": energy_alignment_score, "repetition_score": repetition_score, "transition_score": transition_score}
+        transition_score = float(1.0)
+    return {"energy_alignment_score": float(energy_alignment_score), "repetition_score": float(repetition_score), "transition_score": float(transition_score)}
 
 
 def eval_structure(track_path: str, song_graph: Dict[str, Any]):
@@ -221,17 +225,29 @@ def _sanitize_value(v: Any) -> Any:
         if "0.0.0.0" in v or (v.count("0.0") > 3 and len(v) > 20):
             log.warning(f"_build_music_eval_summary: detected corrupted string value, replacing with 0.0: {v[:100]}")
             return 0.0
+        # Check for patterns like "0.0.0.0..." or repeated decimal points
+        if v.count(".") > 2 and "0.0" in v:
+            log.warning(f"_build_music_eval_summary: detected corrupted float string pattern, replacing with 0.0: {v[:100]}")
+            return 0.0
         # Try to parse as float if it looks like a number
         try:
-            return float(v)
+            parsed = float(v)
+            # Validate the parsed value is reasonable
+            if not (-1e10 <= parsed <= 1e10) or (parsed != parsed):  # NaN check
+                log.warning(f"_build_music_eval_summary: parsed float is invalid (NaN or out of range), replacing with 0.0: {v[:100]}")
+                return 0.0
+            return parsed
         except (ValueError, TypeError):
             return v
     elif isinstance(v, (int, float)):
-        # Ensure valid numeric range
+        # Ensure valid numeric range and not NaN
         if isinstance(v, float) and (not (-1e10 <= v <= 1e10) or (v != v)):  # NaN check
             log.warning(f"_build_music_eval_summary: invalid float value, replacing with 0.0: {v}")
             return 0.0
-        return v
+        # Convert int to float for consistency
+        if isinstance(v, int):
+            return float(v)
+        return float(v)
     elif isinstance(v, dict):
         return {k: _sanitize_value(v2) for k, v2 in v.items()}
     elif isinstance(v, list):
@@ -254,7 +270,26 @@ def _build_music_eval_summary(all_axes: Dict[str, Any], film_context: Optional[D
             cur.pop("refs", None)
         axes_slim[key] = _sanitize_value(cur)
     payload: Dict[str, Any] = {"axes": axes_slim, "film_context": _sanitize_value(film_context or {})}
-    return json.dumps(payload, ensure_ascii=False)
+    # Serialize to JSON
+    json_str = json.dumps(payload, ensure_ascii=False)
+    # Validate the serialized JSON doesn't contain corrupted patterns
+    if "0.0.0.0" in json_str or json_str.count("0.0") > 20:
+        log.error(f"_build_music_eval_summary: detected corrupted pattern in serialized JSON, attempting to fix. json_preview={json_str[:500]}")
+        # Try to parse and re-serialize to catch any issues
+        try:
+            parsed = json.loads(json_str)
+            # Re-sanitize the parsed data
+            sanitized = _sanitize_value(parsed)
+            json_str = json.dumps(sanitized, ensure_ascii=False)
+            # Final check
+            if "0.0.0.0" in json_str or json_str.count("0.0") > 20:
+                log.error(f"_build_music_eval_summary: corruption persists after re-sanitization, using fallback")
+                # Return a minimal valid payload
+                return json.dumps({"axes": {}, "film_context": {}}, ensure_ascii=False)
+        except Exception as ex:
+            log.error(f"_build_music_eval_summary: failed to re-parse JSON during corruption fix: {ex}")
+            return json.dumps({"axes": {}, "film_context": {}}, ensure_ascii=False)
+    return json_str
 
 
 async def _call_music_eval_committee(summary: str, trace_id: str = ""):
@@ -358,6 +393,11 @@ async def compute_music_eval(track_path: str, song_graph: Dict[str, Any], style_
         style = eval_style(track_path, style_pack)
         structure = eval_structure(track_path, song_graph)
         emotion = eval_emotion(track_path)
+        # Sanitize all axes immediately after evaluation to catch corruption early
+        technical = _sanitize_value(technical) if isinstance(technical, dict) else technical
+        style = _sanitize_value(style) if isinstance(style, dict) else style
+        structure = _sanitize_value(structure) if isinstance(structure, dict) else structure
+        emotion = _sanitize_value(emotion) if isinstance(emotion, dict) else emotion
         all_axes = {"technical": technical, "style": style, "structure": structure, "emotion": emotion}
         if _axes_are_effectively_empty(all_axes):
             aesthetic = {

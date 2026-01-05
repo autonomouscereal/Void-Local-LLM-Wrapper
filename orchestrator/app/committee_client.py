@@ -29,7 +29,7 @@ log = logging.getLogger(__name__)
 QWEN_BASE_URL = os.getenv("QWEN_BASE_URL", "http://localhost:11435")
 QWEN_MODEL_ID = os.getenv("QWEN_MODEL_ID", "huihui_ai/qwen3-abliterated:30b-a3b-q4_K_M")
 GLM_OLLAMA_BASE_URL = os.getenv("GLM_OLLAMA_BASE_URL", "http://localhost:11433")
-GLM_MODEL_ID = os.getenv("GLM_MODEL_ID", "alibilge/Huihui-GLM-4.6V-Flash-abliterated:fp16")
+GLM_MODEL_ID = os.getenv("GLM_MODEL_ID", "hf.co/unsloth/GLM-4.6V-Flash-GGUF:BF16")
 DEEPSEEK_CODER_OLLAMA_BASE_URL = os.getenv("DEEPSEEK_CODER_OLLAMA_BASE_URL", "http://localhost:11436")
 DEEPSEEK_CODER_MODEL_ID = os.getenv("DEEPSEEK_CODER_OLLAMA_BASE_URL", None) and os.getenv("DEEPSEEK_CODER_MODEL_ID", "huihui_ai/deepseek-v3.2-lite-abliterated:latest") or os.getenv("DEEPSEEK_CODER_MODEL_ID", "huihui_ai/deepseek-v3.2-lite-abliterated:latest")
 

@@ -299,10 +299,11 @@ def _load_sr_components(sr_root: str) -> Tuple[Optional[torch.nn.Module], Option
             
             if fixed:
                 logging.getLogger(__name__).info("SR transformer: fixed patch_size from list to tuple in config")
-                # Write fixed config to a temporary location and load from there
+                # Create a persistent temp directory (not auto-deleted) to hold the fixed config
                 import tempfile
                 import shutil
-                with tempfile.TemporaryDirectory() as tmpdir:
+                tmpdir = tempfile.mkdtemp(prefix="hunyuan_sr_")
+                try:
                     # Copy all files to temp dir
                     for item in os.listdir(sr_transformer_path):
                         src = os.path.join(sr_transformer_path, item)
@@ -315,12 +316,21 @@ def _load_sr_components(sr_root: str) -> Tuple[Optional[torch.nn.Module], Option
                     tmp_config_path = os.path.join(tmpdir, "config.json")
                     with open(tmp_config_path, "w", encoding="utf-8") as f:
                         json.dump(config_dict, f, indent=2)
-                    # Load model from temp dir
+                    # Load model from temp dir (from_pretrained loads weights automatically)
                     sr_transformer = HunyuanVideo15Transformer3DModel.from_pretrained(
                         tmpdir,
                         torch_dtype=t_dtype,
                         local_files_only=True,
                     )
+                    # Note: tmpdir is not deleted - it will persist for the lifetime of the process
+                    # This is acceptable as it's only created once at startup
+                except Exception:
+                    # Clean up temp dir on error
+                    try:
+                        shutil.rmtree(tmpdir)
+                    except Exception:
+                        pass
+                    raise
             else:
                 # No fix needed, load normally
                 sr_transformer = HunyuanVideo15Transformer3DModel.from_pretrained(
@@ -328,24 +338,6 @@ def _load_sr_components(sr_root: str) -> Tuple[Optional[torch.nn.Module], Option
                     torch_dtype=t_dtype,
                     local_files_only=True,
                 )
-            # Load weights using standard diffusers mechanism
-            from safetensors.torch import load_file as safe_load_file
-            import glob
-            weight_files = sorted(glob.glob(os.path.join(sr_transformer_path, "*.safetensors")) + glob.glob(os.path.join(sr_transformer_path, "*.bin")))
-            if weight_files:
-                state_dict = {}
-                for weight_file in weight_files:
-                    if weight_file.endswith(".safetensors"):
-                        state_dict.update(safe_load_file(weight_file))
-                    else:
-                        state_dict.update(torch.load(weight_file, map_location="cpu"))
-                missing_keys, unexpected_keys = sr_transformer.load_state_dict(state_dict, strict=False)
-                if missing_keys:
-                    logging.getLogger(__name__).debug("SR transformer: missing keys (first 10): %s", missing_keys[:10])
-                if unexpected_keys:
-                    logging.getLogger(__name__).debug("SR transformer: unexpected keys (first 10): %s", unexpected_keys[:10])
-            else:
-                raise RuntimeError(f"No weight files found in {sr_transformer_path}")
         except Exception as load_ex:
             logging.getLogger(__name__).error("SR transformer: failed to load with config fix: %s", load_ex, exc_info=True)
             raise
