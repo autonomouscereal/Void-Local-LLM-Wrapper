@@ -10181,7 +10181,7 @@ def _as_float(v: Any, default: float = 0.0) -> float:
 
 
 @app.post("/v1/chat/completions")
-async def chat_completions2(request: Request):
+async def chat_completions(request: Request):
     '''
     Kept mininmal for testing purposes.
     '''
