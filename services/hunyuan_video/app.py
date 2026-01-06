@@ -131,7 +131,7 @@ def _dtype_from_str(s: str):
 
 def _ensure_dirs():
     os.makedirs(UPLOAD_DIR, exist_ok=True)
-    os.makedirs(os.path.join(UPLOAD_DIR, "videos"), exist_ok=True)
+    os.makedirs(os.path.join(UPLOAD_DIR, "artifacts", "video"), exist_ok=True)
 
 
 def _pick_seed(seed: Optional[int]):
@@ -672,9 +672,9 @@ def _run_generate_dict(data: Dict[str, Any]):
     dev = _device()
     gen = torch.Generator(device=dev).manual_seed(used_seed) if dev != "cpu" else torch.Generator().manual_seed(used_seed)
 
-    job_id = data.get("job_id")
-    job = str(job_id).strip() if isinstance(job_id, str) and job_id.strip() else uuid.uuid4().hex
-    out_dir = os.path.join(UPLOAD_DIR, "videos", job)
+    trace_id = data.get("trace_id")
+    trace_id = str(trace_id).strip() if isinstance(trace_id, str) and trace_id.strip() else uuid.uuid4().hex
+    out_dir = os.path.join(UPLOAD_DIR, "artifacts", "video", trace_id)
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, "output.mp4")
 
@@ -728,8 +728,8 @@ def _run_generate_dict(data: Dict[str, Any]):
 
         log = logging.getLogger(__name__)
         log.info(
-            "generate start job_id=%s model_id=%s device=%s seed=%d prompt_len=%d frames=%s steps=%s size=%sx%s fps=%s sr_enable=%s",
-            job,
+            "generate start trace_id=%s model_id=%s device=%s seed=%d prompt_len=%d frames=%s steps=%s size=%sx%s fps=%s sr_enable=%s",
+            trace_id,
             PIPE_MODEL_ID,
             dev,
             used_seed,
@@ -846,8 +846,8 @@ def _run_generate_dict(data: Dict[str, Any]):
 
         total_ms = int((time.monotonic() - t0) * 1000.0)
         log.info(
-            "generate done job_id=%s total_ms=%d base_ms=%d decode720_ms=%d export_ms=%d final=%s out=%s",
-            job,
+            "generate done trace_id=%s total_ms=%d base_ms=%d decode720_ms=%d export_ms=%d final=%s out=%s",
+            trace_id,
             total_ms,
             dur_base_ms,
             dur_dec_ms,
@@ -856,11 +856,11 @@ def _run_generate_dict(data: Dict[str, Any]):
             out_path,
         )
 
-    url = (PUBLIC_BASE_URL.rstrip("/") + f"/uploads/videos/{job}/output.mp4") if PUBLIC_BASE_URL else None
+    url = (PUBLIC_BASE_URL.rstrip("/") + f"/uploads/artifacts/video/{trace_id}/output.mp4") if PUBLIC_BASE_URL else None
     return {
         "ok": True,
         "result": {
-            "job_id": job,
+            "trace_id": trace_id,
             "model_id": PIPE_MODEL_ID,
             "device": dev,
             "seed": used_seed,
@@ -872,7 +872,7 @@ def _run_generate_dict(data: Dict[str, Any]):
             "request_meta": request_meta,
             # Include all result fields in meta for orchestrator compatibility
             "meta": {
-                "job_id": job,
+                "trace_id": trace_id,
                 "model_id": PIPE_MODEL_ID,
                 "device": dev,
                 "seed": used_seed,

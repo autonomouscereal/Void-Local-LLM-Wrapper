@@ -188,6 +188,7 @@ services:
   ollama_qwen:
     network_mode: host
     image: ollama/ollama:latest
+    pull_policy: always
     container_name: ollama_qwen
     restart: unless-stopped
     runtime: nvidia
@@ -217,6 +218,7 @@ services:
   glm_ollama:
     network_mode: host
     image: ollama/ollama:latest
+    pull_policy: always
     container_name: glm_ollama
     restart: unless-stopped
     runtime: nvidia
@@ -236,6 +238,7 @@ services:
   deepseek_ollama:
     network_mode: host
     image: ollama/ollama:latest
+    pull_policy: always
     container_name: deepseek_ollama
     restart: unless-stopped
     runtime: nvidia

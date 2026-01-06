@@ -4,13 +4,15 @@ import base64
 import json
 import logging
 import os
+import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx  # type: ignore
 
 from ..json_parser import JSONParser
+from .assets import normalize_history_entry, extract_comfy_asset_urls
 
 BASE = (
     os.getenv("COMFYUI_BASE_URL")
@@ -21,12 +23,11 @@ BASE = (
 log = logging.getLogger(__name__)
 
 
-def comfy_submit(graph: Dict[str, Any], client_id: Optional[str] = None) -> Dict[str, Any]:
+def comfy_submit(graph: Dict[str, Any]) -> Dict[str, Any]:
     """
     Hard-blocking ComfyUI submit. No asyncio, no websockets, no retries/backoff.
     """
-    comfy_client_id = client_id or str(uuid.uuid4())
-    payload = {"prompt": graph.get("prompt") or graph, "client_id": comfy_client_id}
+    payload = {"prompt": graph.get("prompt") or graph}
     body_bytes = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     logging.info("[comfy.submit] bytes=%s", len(body_bytes))
     try:
@@ -156,4 +157,117 @@ def choose_sampler_name() -> str:
     # Legacy name retained; hard-blocking and deterministic (no object_info call).
     return "euler"
 
+
+def submit_to_comfyui_and_poll(
+    prompt: Dict[str, Any], trace_id: str = "", conversation_id: str = ""
+) -> Dict[str, Any]:
+    """
+    Submit a prompt to ComfyUI, poll until complete, and download images to the correct directory.
+    
+    Args:
+        prompt: ComfyUI workflow/prompt dict
+        trace_id: Optional trace ID for logging
+        conversation_id: Optional conversation ID for logging
+    
+    Returns:
+        Dict with:
+            - ok: bool indicating success
+            - prompt_id: str if successful
+            - saved_paths: List[str] of downloaded image paths
+            - save_dir: str path to directory where images were saved
+            - error: Dict with error info if failed
+    """
+    upload_dir = os.getenv("UPLOAD_DIR", "/workspace/uploads")
+    
+    # Submit
+    workflow_payload: Dict[str, Any] = {"prompt": prompt}
+    submit_res = comfy_submit(workflow_payload)
+    
+    if not isinstance(submit_res, dict) or (isinstance(submit_res.get("error"), dict) and submit_res.get("error")):
+        return {
+            "ok": False,
+            "error": submit_res.get("error") or {"code": "comfy_submit_failed", "message": "comfy submit failed"},
+        }
+    
+    prompt_id = submit_res.get("prompt_id") or submit_res.get("uuid") or submit_res.get("id")
+    if not isinstance(prompt_id, str) or not prompt_id:
+        return {
+            "ok": False,
+            "error": {"code": "missing_prompt_id", "message": "missing prompt_id from comfy", "detail": submit_res},
+        }
+    
+    # Poll until complete
+    log.info("[comfy.poll] trace_id=%s prompt_id=%s starting poll", trace_id, prompt_id)
+    while True:
+        hist = comfy_history(prompt_id)
+        if isinstance(hist, dict) and hist.get("error"):
+            return {
+                "ok": False,
+                "error": hist.get("error"),
+                "prompt_id": prompt_id,
+            }
+        
+        detail = normalize_history_entry(hist if isinstance(hist, dict) else {}, prompt_id)
+        if detail and comfy_is_completed(detail if isinstance(detail, dict) else {}):
+            break
+        time.sleep(0.75)
+    
+    log.info("[comfy.poll] trace_id=%s prompt_id=%s completed", trace_id, prompt_id)
+    
+    # Extract asset URLs
+    base = BASE
+    assets_list = extract_comfy_asset_urls(detail if isinstance(detail, dict) else {}, base)
+    
+    if not assets_list:
+        return {
+            "ok": True,
+            "prompt_id": prompt_id,
+            "saved_paths": [],
+            "save_dir": None,
+            "warning": "no assets found in history",
+        }
+    
+    # Download outputs into uploads/artifacts
+    artifact_group_id = str(prompt_id)
+    save_dir = os.path.join(upload_dir, "artifacts", "image", artifact_group_id)
+    os.makedirs(save_dir, exist_ok=True)
+    
+    saved_paths: List[str] = []
+    
+    with httpx.Client(timeout=None, trust_env=False) as client:
+        for it in assets_list:
+            if not isinstance(it, dict):
+                continue
+            fn = it.get("filename")
+            url = it.get("url")
+            if not isinstance(fn, str) or not fn:
+                continue
+            if not isinstance(url, str) or not url:
+                continue
+            
+            # Fetch and persist
+            try:
+                resp = client.get(url)
+                if int(getattr(resp, "status_code", 0) or 0) != 200:
+                    log.warning("[comfy.download] trace_id=%s prompt_id=%s failed to fetch %s: status=%s", 
+                              trace_id, prompt_id, url, resp.status_code)
+                    continue
+                
+                safe_fn = os.path.basename(fn)
+                dst = os.path.join(save_dir, safe_fn)
+                with open(dst, "wb") as f:
+                    f.write(resp.content)
+                saved_paths.append(dst)
+                log.debug("[comfy.download] trace_id=%s prompt_id=%s saved %s", trace_id, prompt_id, dst)
+            except Exception as ex:
+                log.warning("[comfy.download] trace_id=%s prompt_id=%s error downloading %s: %s", 
+                           trace_id, prompt_id, url, ex, exc_info=True)
+                continue
+    
+    return {
+        "ok": True,
+        "prompt_id": prompt_id,
+        "saved_paths": saved_paths,
+        "save_dir": save_dir,
+    }
 

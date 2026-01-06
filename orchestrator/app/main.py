@@ -283,6 +283,7 @@ from .tools_tts.voice_tools import run_voice_register, run_voice_train
 from .tools_music.variation import run_music_variation
 from .tools_music.mixdown import run_music_mixdown
 from .tools_music.vocals import render_vocal_stems_for_track
+from .tools_music.simple_submit import music_simple_submit
 from .artifacts.index import add_artifact as _ctx_add
 from .artifacts.shard import open_shard as _art_open_shard, append_jsonl as _art_append_jsonl, _finalize_shard as _art_finalize
 from .artifacts.shard import newest_part as _art_newest_part, list_parts as _art_list_parts
@@ -312,6 +313,7 @@ from .comfy.client_aio import (
     comfy_view as _comfy_view,
     choose_sampler_name as _choose_sampler_name,
     comfy_is_completed as _comfy_is_completed,
+    submit_to_comfyui_and_poll,
 )
 from .comfy.assets import (
     normalize_history_entry as _normalize_comfy_history_entry,
@@ -403,6 +405,7 @@ from .film2.hunyuan_video import (
     hyvideo_generate,
     normalize_generate_response,
 )
+from .film2.simple_submit import film2_simple_submit
 from .plan.song import plan_song_graph
 from .tools_music.windowed import run_music_infinite_windowed, restitch_music_from_windows
 from .tools_music.provider import RestMusicProvider
@@ -3706,7 +3709,7 @@ async def execute_tool_call(tool_call: Dict[str, Any], trace_id: str = "", conve
                             inp["height"] = int(height_int)
 
                 workflow_payload: Dict[str, Any] = {"prompt": prompt_graph}
-                submit_res = _comfy_submit(workflow_payload, client_id="wrapper-001")
+                submit_res = _comfy_submit(workflow_payload)
                 if not isinstance(submit_res, dict) or (isinstance(submit_res.get("error"), dict) and submit_res.get("error")):
                     return _tool_error(tool_name, "comfy_submit_failed", "comfy submit failed", status=502, details=submit_res)  # type: ignore[name-defined]
                 prompt_id = submit_res.get("prompt_id") or submit_res.get("uuid") or submit_res.get("id")
@@ -10177,7 +10180,7 @@ def _as_float(v: Any, default: float = 0.0) -> float:
         return float(default)
 
 
-
+@app.post("/v1/chat/completions")
 async def chat_completions2(request: Request):
     '''
     Kept mininmal for testing purposes.
@@ -10193,31 +10196,74 @@ async def chat_completions2(request: Request):
     body: Dict[str, Any] = dict(parsed_obj) if isinstance(parsed_obj, dict) else {}
     log.info(f"chat_completions:body={body}")
     log.info(f"request={request}")
-    # Extract trace_id from request headers or body if available
-    # trace_id is NEVER in request body or headers - it's generated in chat_completions only
-    # For chat_completions2 endpoint, generate a new trace_id (this is a direct API endpoint)
-    conversation_id_for_trace = str(body.get("conversation_id") or "").strip() if isinstance(body, dict) else ""
-    trace_id = _generate_trace_id(seed=conversation_id_for_trace)
-    # Preserve messages from request, ensure it's a list
-    request_messages = body.get("messages") if isinstance(body, dict) else None
-    if not isinstance(request_messages, list):
-        request_messages = []
-    # Preserve system messages from request - committee will merge them with committee prompts
-    env = await committee_ai_text(messages=request_messages, trace_id=trace_id)
-    log.debug(f"chat_completions:env={env}")
-    body_text = json.dumps(env, ensure_ascii=False)
-    body_bytes = body_text.encode("utf-8")
-    # Deterministic framing + no persistent socket reuse (helps with intermittent client-side failures).
-    headers = {
-        "Cache-Control": "no-store",
-        "Content-Type": "application/json; charset=utf-8",
-        "Content-Length": str(len(body_bytes)),
-    }
-    return Response(content=body_bytes, status_code=200, media_type="application/json", headers=headers)
+    conversation_id = str(body.get("conversation_id") or "").strip() if isinstance(body, dict) else ""
+    conversation_id = await _resolve_or_create_conversation_id(conversation_id)
+    trace_id = _generate_trace_id(seed=conversation_id)
+    request_messages = body.get("messages") if isinstance(body, dict) and isinstance(body.get("messages"), list) else []
+    system_prompt = """You are an AI assistant. You can either respond to the user or execute one of the following tools. You cannot execute multiple tools or steps. You cannot plan. Just respond in exactly the following JSON format:
+
+Example 1 (text response only):
+{"response": "Hello, how can I help you?", "tool": "", "args": {}}
+
+Example 2 (create video):
+{"response": "I'll create a video for you", "tool": "create_video", "args": {"prompt": "video details"}}
+
+Example 3 (create image):
+{"response": "I'll create an image for you", "tool": "create_image", "args": {"prompt": "image details"}}
+
+Example 4 (create song):
+{"response": "I'll create a song for you", "tool": "create_song", "args": {"prompt": "song details"}}
+
+Example 5 (create TTS):
+{"response": "I'll generate speech for you", "tool": "create_tts", "args": {"text": "tts text"}}
+
+Available tools: create_video, create_image, create_song, create_tts. Do not add extra args. Follow this structure exactly. Respond with valid JSON only, no markdown, no code fences."""
+    messages = [{"role": "system", "content": system_prompt}] + request_messages
+    llm_response = await committee_ai_text(messages=messages, trace_id=trace_id, conversation_id=conversation_id)
+    llm_text = llm_response.get("result", {}).get("content", "") if isinstance(llm_response, dict) else str(llm_response or "")
+    schema = {"response": str, "tool": str, "args": dict}
+    jsonified = await committee_jsonify(raw_text=llm_text, expected_schema=schema, trace_id=trace_id)
+    parsed = parser.parse(json.dumps(jsonified) if not isinstance(jsonified, dict) else jsonified, schema) if jsonified else {}
+    tool = (parsed.get("tool") or "").strip() if isinstance(parsed, dict) else ""
+    response_text = (parsed.get("response") or "").strip() if isinstance(parsed, dict) else ""
+    tool_result = ""
+    if tool == "create_image":
+        prompt_str = (parsed.get("args") or {}).get("prompt") if isinstance(parsed.get("args"), dict) else ""
+        if prompt_str:
+            workflow = (build_default_scene_workflow(prompt_str, [], style=None, width=1024, height=1024, steps=25, seed=0, filename_prefix="void_image") or {}).get("prompt")
+            result = submit_to_comfyui_and_poll(workflow, trace_id=trace_id, conversation_id=conversation_id)
+            if result.get("ok"):
+                tool_result = f"\n\n********\nImage created:\n- Path: {result.get('save_dir')}\n- Files: {', '.join(result.get('saved_paths', []))}\n*********"
+    elif tool == "create_video":
+        prompt_str = (parsed.get("args") or {}).get("prompt") if isinstance(parsed.get("args"), dict) else ""
+        if prompt_str:
+            result = await film2_simple_submit(prompt=prompt_str, trace_id=trace_id, conversation_id=conversation_id)
+            if result.get("ok"):
+                tool_result = f"\n\n********\nVideo created:\n- Path: {result.get('video_path')}\n- URL: {result.get('video_url')}\n*********"
+    elif tool == "create_song":
+        prompt_str = (parsed.get("args") or {}).get("prompt") if isinstance(parsed.get("args"), dict) else ""
+        if prompt_str:
+            result = await music_simple_submit(prompt=prompt_str, trace_id=trace_id, conversation_id=conversation_id)
+            if result.get("ok"):
+                tool_result = f"\n\n********\nSong created:\n- Path: {result.get('music_path')}\n- URL: {result.get('music_url')}\n*********"
+    elif tool == "create_tts":
+        text_str = (parsed.get("args") or {}).get("text") if isinstance(parsed.get("args"), dict) else ""
+        if text_str:
+            provider = _TTSProvider()
+            manifest = {"items": []}
+            result = await run_tts_speak(provider=provider, manifest=manifest, text=text_str, trace_id=trace_id, conversation_id=conversation_id)
+            if result.get("ok") or (isinstance(result, dict) and result.get("meta", {}).get("path")):
+                path = result.get("meta", {}).get("path") if isinstance(result.get("meta"), dict) else ""
+                url = result.get("meta", {}).get("url") if isinstance(result.get("meta"), dict) else ""
+                tool_result = f"\n\n********\nTTS created:\n- Path: {path}\n- URL: {url}\n*********"
+    content = response_text + tool_result
+    response = {"id": "chatcmpl-1", "object": "chat.completion", "created": int(time.time()), "model": COMMITTEE_MODEL_ID, "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}}
+    body_bytes = json.dumps(response, ensure_ascii=False).encode("utf-8")
+    return Response(content=body_bytes, status_code=200, media_type="application/json", headers={"Content-Type": "application/json; charset=utf-8"})
 
 
-@app.post("/v1/chat/completions")
-async def chat_completions(request: Request):
+
+async def chat_completions2(request: Request):
     
     
     # *****************************INITIALIZE VARIABLES*****************************
@@ -13313,7 +13359,7 @@ async def create_job(body: Dict[str, Any]):
     workflow = body.get("workflow") if isinstance(body, dict) else None
     if not workflow:
         workflow = body or {}
-    submit = _comfy_submit(workflow, client_id="wrapper-001")
+    submit = _comfy_submit(workflow)
     if submit.get("error"):
         return JSONResponse(status_code=502, content=submit)
     prompt_id = submit.get("prompt_id") or submit.get("uuid") or submit.get("id")

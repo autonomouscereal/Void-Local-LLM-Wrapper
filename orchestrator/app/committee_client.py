@@ -684,7 +684,7 @@ async def _committee_synthesis_phase(
     return synth_text, (synth_env if isinstance(synth_env, dict) else {})
 
 
-async def committee_ai_text(messages: List[Dict[str, Any]], *, trace_id: str, rounds: int | None = None, temperature: float | None = None):
+async def committee_ai_text(messages: List[Dict[str, Any]], *, trace_id: str, conversation_id: str | None = None, rounds: int | None = None, temperature: float | None = None):
     """Main committee AI text generation function with draft, critique, revision, and synthesis phases."""
     # Normalize parameters
     effective_rounds = int(rounds if rounds is not None else DEFAULT_COMMITTEE_ROUNDS)
@@ -818,7 +818,7 @@ async def committee_ai_text(messages: List[Dict[str, Any]], *, trace_id: str, ro
     return {
         "schema_version": 1,
         "trace_id": trace_id,
-        "conversation_id": "",
+        "conversation_id": conversation_id or "",
         "ok": ok,
         "result": (result_payload if ok else None),
         "error": (None if ok else {"code": "committee_no_answer", "message": "Committee did not produce a non-empty answer", "backend_errors": backend_errors}),
