@@ -316,6 +316,7 @@ def _load_base_pipe(model_id: str) -> Optional[HunyuanVideo15Pipeline]:
         
         # Use device_map="balanced" with max_memory to enable multi-GPU + CPU offloading
         # max_memory allows accelerate to automatically offload to CPU when GPUs are full
+        # This provides BOTH multi-GPU distribution AND dynamic CPU offloading during inference
         if num_gpus > 1:
             try:
                 load_kwargs["device_map"] = "balanced"
@@ -338,13 +339,13 @@ def _load_base_pipe(model_id: str) -> Optional[HunyuanVideo15Pipeline]:
                         logging.getLogger(__name__).warning("failed to query GPU %d memory, using default 40GiB: %s", i, e)
                         max_memory[i] = "40GiB"
                 
-                # Allow CPU offloading with generous limit
+                # Allow CPU offloading with generous limit - this enables dynamic CPU offloading
                 max_memory["cpu"] = "200GiB"
                 load_kwargs["max_memory"] = max_memory
                 logging.getLogger(__name__).info("loading pipeline with device_map=balanced + dynamic max_memory for multi-GPU + CPU distribution (%d GPUs)", num_gpus)
-            except Exception:
+            except Exception as e:
                 # If device_map not supported, fall back to normal loading
-                logging.getLogger(__name__).warning("device_map=balanced not supported, loading normally")
+                logging.getLogger(__name__).warning("device_map=balanced not supported, loading normally: %s", e)
         
         pipe = HunyuanVideo15Pipeline.from_pretrained(
             model_id,
@@ -576,11 +577,27 @@ def _load_sr_components(sr_root: str) -> Tuple[Optional[torch.nn.Module], Option
         sr_upsampler_path = os.path.join(sr_root, SR_UPSAMPLER_SUBFOLDER)
         if not os.path.isdir(sr_upsampler_path):
             raise RuntimeError(f"SR upsampler path does not exist: {sr_upsampler_path}")
-        sr_upsampler = AutoModel.from_pretrained(
-            sr_upsampler_path,
-            torch_dtype=p_dtype,
-            local_files_only=True,
-        )
+        try:
+            sr_upsampler = AutoModel.from_pretrained(
+                sr_upsampler_path,
+                torch_dtype=p_dtype,
+                local_files_only=True,
+            )
+        except AttributeError as e:
+            # Handle case where AutoModel can't find the model class
+            # Try loading with trust_remote_code or as a generic model
+            logging.getLogger(__name__).warning("SR upsampler: AutoModel failed, trying alternative loading: %s", e)
+            try:
+                # Try with trust_remote_code if config specifies custom class
+                sr_upsampler = AutoModel.from_pretrained(
+                    sr_upsampler_path,
+                    torch_dtype=p_dtype,
+                    local_files_only=True,
+                    trust_remote_code=True,
+                )
+            except Exception as e2:
+                logging.getLogger(__name__).error("SR upsampler: alternative loading also failed: %s", e2)
+                raise RuntimeError(f"Failed to load SR upsampler: {e2}") from e2
 
         # Attention backend on SR transformer too
         try:
@@ -1009,9 +1026,17 @@ def _run_generate_dict(data: Dict[str, Any]):
         t0 = time.monotonic()
         try:
             # Use torch.no_grad() context to reduce memory during generation
-            # For multi-GPU setups, components are already distributed across GPUs
-            # We rely on explicit memory management and torch.no_grad() to prevent OOM
+            # For multi-GPU setups with device_map="balanced" + max_memory, accelerate
+            # should automatically offload to CPU when GPUs are full, but we add
+            # additional memory management to be safe
             with torch.no_grad():
+                # Force garbage collection and clear cache one more time right before generation
+                import gc
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                
                 out = pipe(**kwargs)
             dur_base_ms = int((time.monotonic() - t0) * 1000)
         except Exception as gen_err:
