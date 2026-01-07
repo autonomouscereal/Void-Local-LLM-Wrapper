@@ -227,35 +227,31 @@ def _maybe_enable_tiling_and_offload(pipe: HunyuanVideo15Pipeline, dev: str) -> 
     # distributes components across all available GPUs and CPU dynamically during generation
     num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
     
+    # For multi-GPU: device_map="balanced" already distributes across GPUs (no CPU offload)
+    # For single GPU or if device_map wasn't used: enable CPU offload for dynamic memory management
+    # Note: device_map and enable_model_cpu_offload are mutually exclusive per diffusers docs
+    has_device_map = hasattr(pipe, "_hf_hook") or any(
+        hasattr(getattr(pipe, comp, None), "hf_device_map") 
+        for comp in ["text_encoder", "text_encoder_2", "transformer", "vae"]
+    )
+    
+    if has_device_map:
+        # Pipeline already has device_map="balanced" for multi-GPU distribution
+        logging.getLogger(__name__).info("pipeline loaded with device_map=balanced (%d GPU(s), automatic distribution active)", num_gpus)
+        return
+    
+    # No device_map: enable CPU offload for single GPU or fallback
     if DEFAULT_CPU_OFFLOAD:
-        # Check if pipeline was loaded with device_map (automatic distribution already active)
-        # If not, enable CPU offload which will use accelerate to distribute across GPUs + CPU
-        has_device_map = hasattr(pipe, "_hf_hook") or any(
-            hasattr(getattr(pipe, comp, None), "hf_device_map") 
-            for comp in ["text_encoder", "text_encoder_2", "transformer", "vae"]
-        )
-        
-        if not has_device_map:
-            # Pipeline wasn't loaded with device_map, enable CPU offload for dynamic distribution
-            if hasattr(pipe, "enable_model_cpu_offload"):
-                try:
-                    # enable_model_cpu_offload() uses accelerate to automatically distribute
-                    # components across all available GPUs and CPU dynamically during generation
-                    pipe.enable_model_cpu_offload()
-                    logging.getLogger(__name__).info("model cpu offload enabled (%d GPU(s) + CPU, dynamic distribution active)", num_gpus)
-                    return
-                except Exception as e:
-                    logging.getLogger(__name__).warning("failed to enable model cpu offload; trying sequential cpu offload\n%s", traceback.format_exc())
-                    # Try sequential CPU offload as fallback
-                    if hasattr(pipe, "enable_sequential_cpu_offload"):
-                        try:
-                            pipe.enable_sequential_cpu_offload()
-                            logging.getLogger(__name__).info("sequential cpu offload enabled (%d GPU(s) + CPU)", num_gpus)
-                            return
-                        except Exception:
-                            logging.getLogger(__name__).warning("failed to enable sequential cpu offload; will .to(device)\n%s", traceback.format_exc())
-            else:
-                # Fallback to sequential CPU offload if enable_model_cpu_offload not available
+        if hasattr(pipe, "enable_model_cpu_offload"):
+            try:
+                # enable_model_cpu_offload() uses accelerate to automatically distribute
+                # components across GPU and CPU dynamically during generation
+                pipe.enable_model_cpu_offload()
+                logging.getLogger(__name__).info("model cpu offload enabled (%d GPU(s) + CPU, dynamic distribution active)", num_gpus)
+                return
+            except Exception as e:
+                logging.getLogger(__name__).warning("failed to enable model cpu offload; trying sequential cpu offload\n%s", traceback.format_exc())
+                # Try sequential CPU offload as fallback
                 if hasattr(pipe, "enable_sequential_cpu_offload"):
                     try:
                         pipe.enable_sequential_cpu_offload()
@@ -264,9 +260,14 @@ def _maybe_enable_tiling_and_offload(pipe: HunyuanVideo15Pipeline, dev: str) -> 
                     except Exception:
                         logging.getLogger(__name__).warning("failed to enable sequential cpu offload; will .to(device)\n%s", traceback.format_exc())
         else:
-            # Pipeline already has device_map, just log that distribution is active
-            logging.getLogger(__name__).info("pipeline loaded with device_map=auto (%d GPU(s) + CPU, automatic distribution active)", num_gpus)
-            return
+            # Fallback to sequential CPU offload if enable_model_cpu_offload not available
+            if hasattr(pipe, "enable_sequential_cpu_offload"):
+                try:
+                    pipe.enable_sequential_cpu_offload()
+                    logging.getLogger(__name__).info("sequential cpu offload enabled (%d GPU(s) + CPU)", num_gpus)
+                    return
+                except Exception:
+                    logging.getLogger(__name__).warning("failed to enable sequential cpu offload; will .to(device)\n%s", traceback.format_exc())
 
     # If no CPU offload or it failed, move to device
     try:
@@ -313,15 +314,16 @@ def _load_base_pipe(model_id: str) -> Optional[HunyuanVideo15Pipeline]:
             "local_files_only": True,
         }
         
-        # Use device_map="auto" if we have multiple GPUs and CPU offload is enabled
-        # This allows accelerate to automatically distribute components across all GPUs + CPU
-        if DEFAULT_CPU_OFFLOAD and num_gpus > 1:
+        # Use device_map="balanced" if we have multiple GPUs
+        # This distributes components across all available GPUs (but doesn't include CPU offloading)
+        # Note: device_map only supports "balanced" or "cuda", not "auto"
+        if num_gpus > 1:
             try:
-                load_kwargs["device_map"] = "auto"
-                logging.getLogger(__name__).info("loading pipeline with device_map=auto for multi-GPU + CPU distribution")
+                load_kwargs["device_map"] = "balanced"
+                logging.getLogger(__name__).info("loading pipeline with device_map=balanced for multi-GPU distribution (%d GPUs)", num_gpus)
             except Exception:
                 # If device_map not supported, fall back to normal loading
-                logging.getLogger(__name__).warning("device_map=auto not supported, loading normally")
+                logging.getLogger(__name__).warning("device_map=balanced not supported, loading normally")
         
         pipe = HunyuanVideo15Pipeline.from_pretrained(
             model_id,
@@ -407,38 +409,29 @@ def _load_sr_components(sr_root: str) -> Tuple[Optional[torch.nn.Module], Option
                     for key, value in obj.items():
                         if key in ("patch_size", "patch_size_t"):
                             if isinstance(value, (list, tuple)):
-                                # Convert to tuple of ints, handling nested structures
-                                # patch_size should be a flat tuple like (1, 2, 2) for Conv3d
+                                # CRITICAL: patch_size and patch_size_t are used as SINGLE VALUES in the constructor:
+                                # HunyuanVideo15PatchEmbed((patch_size_t, patch_size, patch_size), ...)
+                                # So they must be SINGLE INTEGERS, not tuples!
+                                # If the config has [1, 1, 1], we need to extract just the first value (1)
                                 try:
-                                    # Flatten any nested structures
-                                    flattened = []
-                                    for x in value:
-                                        if isinstance(x, (list, tuple)):
-                                            # If nested, extract the actual values
-                                            for y in x:
-                                                if isinstance(y, (list, tuple)):
-                                                    flattened.extend([int(z) for z in y])
-                                                else:
-                                                    flattened.append(int(y))
+                                    # Extract the first integer value (not a tuple!)
+                                    def extract_first_int(item):
+                                        if isinstance(item, (list, tuple)):
+                                            if len(item) > 0:
+                                                return extract_first_int(item[0])
+                                            else:
+                                                return 1  # default
                                         else:
-                                            flattened.append(int(x))
+                                            return int(item)
                                     
-                                    # Ensure we have a proper flat tuple of ints
-                                    # For Conv3d, patch_size should be (t, h, w) - 3 ints
-                                    if len(flattened) >= 3:
-                                        # Take first 3 if more than 3
-                                        obj[key] = tuple(flattened[:3])
-                                    elif len(flattened) > 0:
-                                        # If less than 3, pad or use as-is
-                                        obj[key] = tuple(flattened)
-                                    else:
-                                        # Fallback: try direct conversion
-                                        obj[key] = tuple(int(x) for x in value if not isinstance(x, (list, tuple)))
-                                    
+                                    first_int = extract_first_int(value)
+                                    obj[key] = first_int
                                     fixed = True
-                                    logging.getLogger(__name__).info("converted %s from %s to %s", key, value, obj[key])
+                                    logging.getLogger(__name__).info("converted %s from %s to single int: %s", key, value, obj[key])
                                 except (ValueError, TypeError) as e:
-                                    logging.getLogger(__name__).warning("failed to convert %s to tuple of ints: %s (error: %s)", key, value, e)
+                                    logging.getLogger(__name__).warning("failed to convert %s to int: %s (error: %s), using default 1", key, value, e)
+                                    obj[key] = 1  # safe default
+                                    fixed = True
                         else:
                             fix_patch_size_recursive(value)
                 elif isinstance(obj, list):
@@ -460,44 +453,28 @@ def _load_sr_components(sr_root: str) -> Tuple[Optional[torch.nn.Module], Option
                                 for k, v in d.items():
                                     if k in ("patch_size", "patch_size_t"):
                                         if isinstance(v, (list, tuple)):
-                                            # Convert to tuple of ints, handling nested structures
-                                            # patch_size should be a flat tuple like (1, 2, 2) for Conv3d
+                                            # CRITICAL: patch_size and patch_size_t are used as SINGLE VALUES in the constructor:
+                                            # HunyuanVideo15PatchEmbed((patch_size_t, patch_size, patch_size), ...)
+                                            # So they must be SINGLE INTEGERS, not tuples!
+                                            # If the config has [1, 1, 1], we need to extract just the first value (1)
                                             try:
-                                                # First, flatten any nested structures
-                                                def flatten_to_ints(item):
+                                                # Flatten completely and take the first value as a single int
+                                                def extract_first_int(item):
                                                     if isinstance(item, (list, tuple)):
-                                                        return [flatten_to_ints(x) for x in item]
+                                                        if len(item) > 0:
+                                                            return extract_first_int(item[0])
+                                                        else:
+                                                            return 1  # default
                                                     else:
                                                         return int(item)
                                                 
-                                                # Recursively flatten
-                                                flattened = []
-                                                for x in v:
-                                                    if isinstance(x, (list, tuple)):
-                                                        # If nested, extract the actual values
-                                                        for y in x:
-                                                            if isinstance(y, (list, tuple)):
-                                                                flattened.extend([int(z) for z in y])
-                                                            else:
-                                                                flattened.append(int(y))
-                                                    else:
-                                                        flattened.append(int(x))
-                                                
-                                                # Ensure we have a proper flat tuple of ints
-                                                # For Conv3d, patch_size should be (t, h, w) - 3 ints
-                                                if len(flattened) >= 3:
-                                                    # Take first 3 if more than 3
-                                                    d[k] = tuple(flattened[:3])
-                                                elif len(flattened) > 0:
-                                                    # If less than 3, pad or use as-is
-                                                    d[k] = tuple(flattened)
-                                                else:
-                                                    # Fallback: try direct conversion
-                                                    d[k] = tuple(int(x) for x in v if not isinstance(x, (list, tuple)))
-                                                
-                                                logging.getLogger(__name__).info("converted %s from %s to %s", k, v, d[k])
+                                                # Extract the first integer value (not a tuple!)
+                                                first_int = extract_first_int(v)
+                                                d[k] = first_int
+                                                logging.getLogger(__name__).info("converted %s from %s to single int: %s", k, v, d[k])
                                             except (ValueError, TypeError) as e:
-                                                logging.getLogger(__name__).warning("failed to convert %s to tuple of ints: %s (error: %s)", k, v, e)
+                                                logging.getLogger(__name__).warning("failed to convert %s to int: %s (error: %s), using default 1", k, v, e)
+                                                d[k] = 1  # safe default
                                     else:
                                         ensure_patch_size_tuples(v)
                             elif isinstance(d, list):
