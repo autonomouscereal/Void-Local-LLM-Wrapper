@@ -140,9 +140,39 @@ def _pick_seed(seed: Optional[int]):
     return int(time.time() * 1000) ^ (uuid.uuid4().int & 0x7FFFFFFF)
 
 
+def _find_best_gpu() -> Optional[int]:
+    """Find the GPU with the most free memory."""
+    if not torch.cuda.is_available():
+        return None
+    best_gpu = None
+    best_free_memory = 0
+    num_gpus = torch.cuda.device_count()
+    for i in range(num_gpus):
+        try:
+            free_mem, total_mem = torch.cuda.mem_get_info(i)
+            if free_mem > best_free_memory:
+                best_free_memory = free_mem
+                best_gpu = i
+        except Exception:
+            continue
+    return best_gpu
+
+
 def _device():
     if torch.cuda.is_available():
-        return DEFAULT_DEVICE
+        # If DEFAULT_DEVICE is set to a specific GPU, use it
+        if DEFAULT_DEVICE.startswith("cuda:"):
+            try:
+                gpu_id = int(DEFAULT_DEVICE.split(":")[1])
+                if gpu_id < torch.cuda.device_count():
+                    return DEFAULT_DEVICE
+            except (ValueError, IndexError):
+                pass
+        # Otherwise, find the best GPU
+        best_gpu = _find_best_gpu()
+        if best_gpu is not None:
+            return f"cuda:{best_gpu}"
+        return "cuda:0"
     return "cpu"
 
 
@@ -174,15 +204,27 @@ def _maybe_enable_tiling_and_offload(pipe: HunyuanVideo15Pipeline, dev: str) -> 
         except Exception:
             logging.getLogger(__name__).warning("failed to enable vae tiling\n%s", traceback.format_exc())
 
-    # CPU offload
-    if DEFAULT_CPU_OFFLOAD and hasattr(pipe, "enable_model_cpu_offload"):
-        try:
-            pipe.enable_model_cpu_offload()
-            logging.getLogger(__name__).info("model cpu offload enabled")
-            return
-        except Exception:
-            logging.getLogger(__name__).warning("failed to enable model cpu offload; will .to(device)\n%s", traceback.format_exc())
+    # CPU offload - use sequential offload for better multi-GPU support
+    if DEFAULT_CPU_OFFLOAD:
+        # Try sequential CPU offload first (more aggressive, better for multi-GPU)
+        if hasattr(pipe, "enable_sequential_cpu_offload"):
+            try:
+                pipe.enable_sequential_cpu_offload()
+                logging.getLogger(__name__).info("sequential cpu offload enabled (multi-GPU compatible)")
+                return
+            except Exception:
+                logging.getLogger(__name__).warning("failed to enable sequential cpu offload; trying model cpu offload\n%s", traceback.format_exc())
+        
+        # Fallback to regular model CPU offload
+        if hasattr(pipe, "enable_model_cpu_offload"):
+            try:
+                pipe.enable_model_cpu_offload()
+                logging.getLogger(__name__).info("model cpu offload enabled")
+                return
+            except Exception:
+                logging.getLogger(__name__).warning("failed to enable model cpu offload; will .to(device)\n%s", traceback.format_exc())
 
+    # If no CPU offload or it failed, move to device
     try:
         pipe.to(dev)
         logging.getLogger(__name__).info("pipeline moved to device=%s", dev)
@@ -289,13 +331,22 @@ def _load_sr_components(sr_root: str) -> Tuple[Optional[torch.nn.Module], Option
                 config_dict = json.load(f)
             
             # Fix patch_size and patch_size_t if they are lists (JSON loads as lists, PyTorch needs tuples)
+            # Also check nested structures that might contain patch_size
             fixed = False
-            if "patch_size" in config_dict and isinstance(config_dict["patch_size"], list):
-                config_dict["patch_size"] = tuple(config_dict["patch_size"])
-                fixed = True
-            if "patch_size_t" in config_dict and isinstance(config_dict["patch_size_t"], list):
-                config_dict["patch_size_t"] = tuple(config_dict["patch_size_t"])
-                fixed = True
+            def fix_patch_size_recursive(obj):
+                nonlocal fixed
+                if isinstance(obj, dict):
+                    for key, value in obj.items():
+                        if key in ("patch_size", "patch_size_t") and isinstance(value, list):
+                            obj[key] = tuple(value)
+                            fixed = True
+                        else:
+                            fix_patch_size_recursive(value)
+                elif isinstance(obj, list):
+                    for item in obj:
+                        fix_patch_size_recursive(item)
+            
+            fix_patch_size_recursive(config_dict)
             
             if fixed:
                 logging.getLogger(__name__).info("SR transformer: fixed patch_size from list to tuple in config")
@@ -532,11 +583,31 @@ def _run_sr_720_to_1080(
     lr = lowres_latents
     if lr.device.type != ("cuda" if torch.cuda.is_available() else "cpu"):
         lr = lr.to(dev)
+    
+    # Move SR components to GPU if they're on CPU (for CPU offload scenario)
+    # We'll use local references to avoid modifying globals
+    sr_upsampler_local = SR_UPSAMPLER
+    sr_transformer_local = SR_TRANSFORMER
+    if DEFAULT_CPU_OFFLOAD:
+        try:
+            # Check if components are on CPU and move to GPU for inference
+            try:
+                if str(next(sr_upsampler_local.parameters()).device).startswith("cpu"):
+                    sr_upsampler_local = sr_upsampler_local.to(dev)
+            except (StopIteration, AttributeError):
+                pass
+            try:
+                if str(next(sr_transformer_local.parameters()).device).startswith("cpu"):
+                    sr_transformer_local = sr_transformer_local.to(dev)
+            except (StopIteration, AttributeError):
+                pass
+        except Exception:
+            logger.warning("failed moving SR components to GPU for inference\n%s", traceback.format_exc())
 
     # Upsample latents using Tencent upsampler model
     t0_up = time.monotonic()
     with torch.no_grad():
-        cond_latents_hr = _call_upsampler(SR_UPSAMPLER, lr)
+        cond_latents_hr = _call_upsampler(sr_upsampler_local, lr)
     logger.info(
         "SR upsampler done dur_ms=%d lr_shape=%s hr_shape=%s",
         int((time.monotonic() - t0_up) * 1000),
@@ -583,7 +654,7 @@ def _run_sr_720_to_1080(
 
     try:
         # Swap in SR transformer + scheduler
-        pipe.register_modules(transformer=SR_TRANSFORMER, scheduler=SR_SCHEDULER)
+        pipe.register_modules(transformer=sr_transformer_local, scheduler=SR_SCHEDULER)
 
         # SR wants CFG ~ 1; disable guider if possible (fastest) else set guidance_scale=1
         try:

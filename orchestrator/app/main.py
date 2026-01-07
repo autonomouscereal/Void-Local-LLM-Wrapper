@@ -10257,7 +10257,12 @@ Available tools: create_video, create_image, create_song, create_tts. Do not add
                 path = result.get("meta", {}).get("path") if isinstance(result.get("meta"), dict) else ""
                 url = result.get("meta", {}).get("url") if isinstance(result.get("meta"), dict) else ""
                 tool_result = f"\n\n********\nTTS created:\n- Path: {path}\n- URL: {url}\n*********"
-    content = response_text + tool_result
+    # Build detailed response with sections
+    full_response_section = f"\n\n******************\nFull Response\n******************\n{json.dumps(llm_response, indent=2, ensure_ascii=False) if isinstance(llm_response, dict) else str(llm_response)}"
+    parsed_section = f"\n\n******************\nParsed JSON\n******************\n{json.dumps(parsed, indent=2, ensure_ascii=False) if isinstance(parsed, dict) else str(parsed)}"
+    tool_result_section = f"\n\n******************\nTool Output\n******************\n{tool_result}" if tool_result else ""
+    
+    content = response_text + tool_result_section + parsed_section + full_response_section
     response = {"id": "chatcmpl-1", "object": "chat.completion", "created": int(time.time()), "model": COMMITTEE_MODEL_ID, "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}}
     body_bytes = json.dumps(response, ensure_ascii=False).encode("utf-8")
     return Response(content=body_bytes, status_code=200, media_type="application/json", headers={"Content-Type": "application/json; charset=utf-8"})
