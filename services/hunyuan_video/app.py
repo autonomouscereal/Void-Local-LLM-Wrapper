@@ -358,68 +358,39 @@ def _load_sr_components(sr_root: str) -> Tuple[Optional[torch.nn.Module], Option
             
             if fixed:
                 logging.getLogger(__name__).info("SR transformer: fixed patch_size from list to tuple in config")
-                # Load config and weights manually, then use from_config with fixed config
-                from diffusers.configuration_utils import ConfigMixin
-                from diffusers.models.modeling_utils import load_state_dict
+                # Monkey-patch from_config to fix patch_size before model initialization
+                original_from_config = HunyuanVideo15Transformer3DModel.from_config
                 
-                # Load config dict (this will have lists, we already fixed it in memory)
-                config, unused_kwargs = ConfigMixin._get_config_dict(
-                    sr_transformer_path,
-                    local_files_only=True,
-                )
+                def patched_from_config(config, **kwargs):
+                    # Fix patch_size in the config dict before model initialization
+                    if isinstance(config, dict):
+                        def ensure_patch_size_tuples(d):
+                            if isinstance(d, dict):
+                                for k, v in d.items():
+                                    if k in ("patch_size", "patch_size_t") and isinstance(v, list):
+                                        d[k] = tuple(v)
+                                    else:
+                                        ensure_patch_size_tuples(v)
+                            elif isinstance(d, list):
+                                for item in d:
+                                    ensure_patch_size_tuples(item)
+                        
+                        ensure_patch_size_tuples(config)
+                    
+                    return original_from_config(config, **kwargs)
                 
-                # Ensure patch_size is still tuples (in case _get_config_dict reloaded from disk)
-                def ensure_patch_size_tuples(d):
-                    if isinstance(d, dict):
-                        for k, v in d.items():
-                            if k in ("patch_size", "patch_size_t") and isinstance(v, list):
-                                d[k] = tuple(v)
-                            else:
-                                ensure_patch_size_tuples(v)
-                    elif isinstance(d, list):
-                        for item in d:
-                            ensure_patch_size_tuples(item)
-                
-                ensure_patch_size_tuples(config)
-                
-                # Create model from fixed config
-                sr_transformer = HunyuanVideo15Transformer3DModel.from_config(config, **unused_kwargs)
-                
-                # Load weights manually
-                from safetensors.torch import load_file as safe_load_file
-                from torch import load as torch_load
-                
-                model_index_path = os.path.join(sr_transformer_path, "model_index.json")
-                if os.path.exists(model_index_path):
-                    with open(model_index_path, "r") as f:
-                        model_index = json.load(f)
-                    weight_files = model_index.get("weight_map", {})
-                else:
-                    # Fallback: look for .safetensors or .bin files
-                    weight_files = {}
-                    for fname in os.listdir(sr_transformer_path):
-                        if fname.endswith((".safetensors", ".bin")):
-                            weight_files[fname] = fname
-                
-                # Load weights
-                state_dict = {}
-                for weight_file in weight_files.values():
-                    weight_path = os.path.join(sr_transformer_path, weight_file)
-                    if os.path.exists(weight_path):
-                        if weight_file.endswith(".safetensors"):
-                            state_dict.update(safe_load_file(weight_path))
-                        else:
-                            state_dict.update(torch_load(weight_path, map_location="cpu"))
-                
-                if state_dict:
-                    missing_keys, unexpected_keys = sr_transformer.load_state_dict(state_dict, strict=False)
-                    if missing_keys:
-                        logging.getLogger(__name__).warning("SR transformer: missing keys: %s", missing_keys[:10])
-                    if unexpected_keys:
-                        logging.getLogger(__name__).warning("SR transformer: unexpected keys: %s", unexpected_keys[:10])
-                
-                # Set dtype
-                sr_transformer = sr_transformer.to(dtype=t_dtype)
+                # Temporarily patch the method
+                HunyuanVideo15Transformer3DModel.from_config = staticmethod(patched_from_config)
+                try:
+                    # Load model - the patched from_config will fix patch_size
+                    sr_transformer = HunyuanVideo15Transformer3DModel.from_pretrained(
+                        sr_transformer_path,
+                        torch_dtype=t_dtype,
+                        local_files_only=True,
+                    )
+                finally:
+                    # Restore original method
+                    HunyuanVideo15Transformer3DModel.from_config = original_from_config
             else:
                 # No fix needed, load normally
                 sr_transformer = HunyuanVideo15Transformer3DModel.from_pretrained(
@@ -820,7 +791,9 @@ def _run_generate_dict(data: Dict[str, Any]):
         if isinstance(width, int) and width > 0:
             kwargs["width"] = int(width)
         if isinstance(num_frames, int) and num_frames > 0:
-            kwargs["num_frames"] = int(num_frames)
+            # Limit num_frames to reduce memory usage (145 frames is very large)
+            max_frames = int(os.getenv("HYVIDEO_MAX_FRAMES", "121"))  # Default to 121 (5s at 24fps)
+            kwargs["num_frames"] = min(int(num_frames), max_frames)
         if isinstance(num_inference_steps, int) and num_inference_steps > 0:
             kwargs["num_inference_steps"] = int(num_inference_steps)
         if isinstance(num_videos_per_prompt, int) and num_videos_per_prompt > 0:
@@ -860,11 +833,16 @@ def _run_generate_dict(data: Dict[str, Any]):
         # Clear CUDA cache before generation to free up memory
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+            # Also try to synchronize and reset peak memory stats
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
 
         # --- Stage 1: 720p generation (latents) ---
         t0 = time.monotonic()
         try:
-            out = pipe(**kwargs)
+            # Use torch.no_grad() context to reduce memory during generation
+            with torch.no_grad():
+                out = pipe(**kwargs)
             dur_base_ms = int((time.monotonic() - t0) * 1000)
         except Exception as gen_err:
             dur_base_ms = int((time.monotonic() - t0) * 1000)
