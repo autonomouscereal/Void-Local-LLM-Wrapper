@@ -10220,10 +10220,11 @@ Example 5 (create TTS):
 Available tools: create_video, create_image, create_song, create_tts. Do not add extra args. Follow this structure exactly. Respond with valid JSON only, no markdown, no code fences."""
     messages = [{"role": "system", "content": system_prompt}] + request_messages
     llm_response = await committee_ai_text(messages=messages, trace_id=trace_id, conversation_id=conversation_id)
-    llm_text = llm_response.get("result", {}).get("content", "") if isinstance(llm_response, dict) else str(llm_response or "")
+    llm_text = llm_response.get("result", {}).get("text", "") if isinstance(llm_response, dict) else str(llm_response or "")
     schema = {"response": str, "tool": str, "args": dict}
-    jsonified = await committee_jsonify(raw_text=llm_text, expected_schema=schema, trace_id=trace_id)
-    parsed = parser.parse(json.dumps(jsonified) if not isinstance(jsonified, dict) else jsonified, schema) if jsonified else {}
+    parsed = await committee_jsonify(raw_text=llm_text, expected_schema=schema, trace_id=trace_id)
+    if not isinstance(parsed, dict):
+        parsed = {}
     tool = (parsed.get("tool") or "").strip() if isinstance(parsed, dict) else ""
     response_text = (parsed.get("response") or "").strip() if isinstance(parsed, dict) else ""
     tool_result = ""
