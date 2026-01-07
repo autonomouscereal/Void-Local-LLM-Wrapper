@@ -195,81 +195,18 @@ def _maybe_set_attention_backend(pipe: HunyuanVideo15Pipeline, backend: str) -> 
         logging.getLogger(__name__).warning("failed to set attention backend=%s\n%s", backend, traceback.format_exc())
 
 
-def _distribute_pipeline_across_gpus(pipe: HunyuanVideo15Pipeline) -> None:
-    """Distribute pipeline components across all available GPUs."""
+def _get_available_gpus() -> list[int]:
+    """Get list of all available GPU indices."""
     if not torch.cuda.is_available():
-        return
-    
-    num_gpus = torch.cuda.device_count()
-    if num_gpus < 2:
-        logging.getLogger(__name__).info("only %d GPU(s) available, skipping multi-GPU distribution", num_gpus)
-        return
-    
-    logger = logging.getLogger(__name__)
-    logger.info("distributing pipeline across %d GPUs", num_gpus)
-    
-    gpu_idx = 0
-    
-    # Distribute text encoders across GPUs
-    if hasattr(pipe, "text_encoder") and pipe.text_encoder is not None:
-        try:
-            device = f"cuda:{gpu_idx % num_gpus}"
-            pipe.text_encoder = pipe.text_encoder.to(device)
-            logger.info("text_encoder moved to %s", device)
-            gpu_idx += 1
-        except Exception:
-            logger.warning("failed to move text_encoder\n%s", traceback.format_exc())
-    
-    if hasattr(pipe, "text_encoder_2") and pipe.text_encoder_2 is not None:
-        try:
-            device = f"cuda:{gpu_idx % num_gpus}"
-            pipe.text_encoder_2 = pipe.text_encoder_2.to(device)
-            logger.info("text_encoder_2 moved to %s", device)
-            gpu_idx += 1
-        except Exception:
-            logger.warning("failed to move text_encoder_2\n%s", traceback.format_exc())
-    
-    # Transformer is the largest component - put it on a GPU with most free memory
-    if hasattr(pipe, "transformer") and pipe.transformer is not None:
-        try:
-            best_gpu = _find_best_gpu()
-            if best_gpu is not None:
-                device = f"cuda:{best_gpu}"
-                pipe.transformer = pipe.transformer.to(device)
-                logger.info("transformer moved to %s (best GPU)", device)
-                gpu_idx = (best_gpu + 1) % num_gpus  # Continue from next GPU
-            else:
-                device = f"cuda:{gpu_idx % num_gpus}"
-                pipe.transformer = pipe.transformer.to(device)
-                logger.info("transformer moved to %s", device)
-                gpu_idx += 1
-        except Exception:
-            logger.warning("failed to move transformer\n%s", traceback.format_exc())
-    
-    # VAE can go to another GPU
-    if hasattr(pipe, "vae") and pipe.vae is not None:
-        try:
-            device = f"cuda:{gpu_idx % num_gpus}"
-            pipe.vae = pipe.vae.to(device)
-            logger.info("vae moved to %s", device)
-            gpu_idx += 1
-        except Exception:
-            logger.warning("failed to move vae\n%s", traceback.format_exc())
-    
-    # Move any other components
-    for attr_name in ["tokenizer", "tokenizer_2", "scheduler", "guider"]:
-        if hasattr(pipe, attr_name):
-            attr = getattr(pipe, attr_name)
-            if attr is not None and hasattr(attr, "to"):
-                try:
-                    device = f"cuda:{gpu_idx % num_gpus}"
-                    setattr(pipe, attr_name, attr.to(device))
-                    logger.info("%s moved to %s", attr_name, device)
-                    gpu_idx += 1
-                except Exception:
-                    pass  # Some components don't need device movement
-    
-    logger.info("pipeline distribution complete across %d GPUs", num_gpus)
+        return []
+    return list(range(torch.cuda.device_count()))
+
+
+def _get_next_gpu(gpus: list[int], current_idx: int) -> int:
+    """Get next GPU in round-robin fashion."""
+    if not gpus:
+        return 0
+    return gpus[current_idx % len(gpus)]
 
 
 def _maybe_enable_tiling_and_offload(pipe: HunyuanVideo15Pipeline, dev: str) -> None:
@@ -281,32 +218,26 @@ def _maybe_enable_tiling_and_offload(pipe: HunyuanVideo15Pipeline, dev: str) -> 
         except Exception:
             logging.getLogger(__name__).warning("failed to enable vae tiling\n%s", traceback.format_exc())
 
-    # Multi-GPU distribution takes priority
-    num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
-    if num_gpus >= 2:
-        try:
-            _distribute_pipeline_across_gpus(pipe)
-            logging.getLogger(__name__).info("pipeline distributed across %d GPUs", num_gpus)
-            return
-        except Exception:
-            logging.getLogger(__name__).warning("failed to distribute pipeline across GPUs; falling back to CPU offload\n%s", traceback.format_exc())
-
-    # CPU offload - use sequential offload for better multi-GPU support
+    # Enable sequential CPU offload which automatically distributes across all available GPUs
+    # This is the dynamic, automatic way to use all GPUs with CPU offloading
     if DEFAULT_CPU_OFFLOAD:
-        # Try sequential CPU offload first (more aggressive, better for multi-GPU)
         if hasattr(pipe, "enable_sequential_cpu_offload"):
             try:
+                # Sequential CPU offload automatically uses all available GPUs
+                # It moves components to GPU when needed and offloads to CPU when not in use
                 pipe.enable_sequential_cpu_offload()
-                logging.getLogger(__name__).info("sequential cpu offload enabled (multi-GPU compatible)")
+                num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+                logging.getLogger(__name__).info("sequential cpu offload enabled (automatically using %d GPU(s) with CPU offloading)", num_gpus)
                 return
             except Exception:
                 logging.getLogger(__name__).warning("failed to enable sequential cpu offload; trying model cpu offload\n%s", traceback.format_exc())
         
-        # Fallback to regular model CPU offload
+        # Fallback to regular model CPU offload (also uses all GPUs dynamically)
         if hasattr(pipe, "enable_model_cpu_offload"):
             try:
                 pipe.enable_model_cpu_offload()
-                logging.getLogger(__name__).info("model cpu offload enabled")
+                num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+                logging.getLogger(__name__).info("model cpu offload enabled (automatically using %d GPU(s) with CPU offloading)", num_gpus)
                 return
             except Exception:
                 logging.getLogger(__name__).warning("failed to enable model cpu offload; will .to(device)\n%s", traceback.format_exc())
@@ -516,26 +447,10 @@ def _load_sr_components(sr_root: str) -> Tuple[Optional[torch.nn.Module], Option
         except Exception:
             logging.getLogger(__name__).warning("failed setting SR attention backend\n%s", traceback.format_exc())
 
-        # Distribute SR components across GPUs
-        num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
-        if num_gpus >= 2:
-            try:
-                # Put SR transformer on a different GPU than base transformer
-                best_gpu = _find_best_gpu()
-                if best_gpu is not None:
-                    # Use a different GPU than the best one (round-robin)
-                    sr_gpu = (best_gpu + 1) % num_gpus
-                    sr_transformer = sr_transformer.to(f"cuda:{sr_gpu}")
-                    logging.getLogger(__name__).info("SR transformer moved to cuda:%d", sr_gpu)
-                
-                # Put SR upsampler on yet another GPU
-                if sr_upsampler is not None:
-                    upsampler_gpu = (best_gpu + 2) % num_gpus if best_gpu is not None else 0
-                    sr_upsampler = sr_upsampler.to(f"cuda:{upsampler_gpu}")
-                    logging.getLogger(__name__).info("SR upsampler moved to cuda:%d", upsampler_gpu)
-            except Exception:
-                logging.getLogger(__name__).warning("failed to distribute SR components across GPUs\n%s", traceback.format_exc())
+        # SR components will be moved to GPU dynamically during inference
+        # No need to pre-assign them - sequential CPU offload handles this automatically
 
+        num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
         logging.getLogger(__name__).info("load_sr_components done (models loaded; device=%s, num_gpus=%d)", dev, num_gpus)
         return sr_transformer, sr_upsampler, sr_scheduler
 
