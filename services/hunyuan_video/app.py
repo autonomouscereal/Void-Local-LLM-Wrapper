@@ -319,15 +319,29 @@ def _load_base_pipe(model_id: str) -> Optional[HunyuanVideo15Pipeline]:
         if num_gpus > 1:
             try:
                 load_kwargs["device_map"] = "balanced"
-                # Set max_memory for each GPU and CPU to enable automatic CPU offloading
-                # When GPUs fill up, accelerate will automatically offload to CPU
+                # Dynamically set max_memory for each GPU based on actual VRAM capacity
+                # Leave ~10% headroom per GPU for system overhead
                 max_memory = {}
                 for i in range(num_gpus):
-                    # Set reasonable limits per GPU (leave some headroom)
-                    max_memory[i] = "40GiB"  # Leave ~4GB headroom per GPU
-                max_memory["cpu"] = "200GiB"  # Allow CPU offloading
+                    try:
+                        # Get actual GPU memory in bytes
+                        total_mem_bytes, _ = torch.cuda.mem_get_info(i)
+                        total_mem_gb = total_mem_bytes / (1024 ** 3)
+                        # Leave 10% headroom (or minimum 2GB, whichever is larger)
+                        headroom_gb = max(total_mem_gb * 0.1, 2.0)
+                        max_mem_gb = total_mem_gb - headroom_gb
+                        # Convert to GiB string for accelerate
+                        max_memory[i] = f"{max_mem_gb:.1f}GiB"
+                        logging.getLogger(__name__).info("GPU %d: total=%.1fGB, max_memory=%.1fGB (%.1fGB headroom)", i, total_mem_gb, max_mem_gb, headroom_gb)
+                    except Exception as e:
+                        # Fallback if we can't query GPU memory
+                        logging.getLogger(__name__).warning("failed to query GPU %d memory, using default 40GiB: %s", i, e)
+                        max_memory[i] = "40GiB"
+                
+                # Allow CPU offloading with generous limit
+                max_memory["cpu"] = "200GiB"
                 load_kwargs["max_memory"] = max_memory
-                logging.getLogger(__name__).info("loading pipeline with device_map=balanced + max_memory for multi-GPU + CPU distribution (%d GPUs)", num_gpus)
+                logging.getLogger(__name__).info("loading pipeline with device_map=balanced + dynamic max_memory for multi-GPU + CPU distribution (%d GPUs)", num_gpus)
             except Exception:
                 # If device_map not supported, fall back to normal loading
                 logging.getLogger(__name__).warning("device_map=balanced not supported, loading normally")
