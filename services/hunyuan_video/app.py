@@ -314,13 +314,20 @@ def _load_base_pipe(model_id: str) -> Optional[HunyuanVideo15Pipeline]:
             "local_files_only": True,
         }
         
-        # Use device_map="balanced" if we have multiple GPUs
-        # This distributes components across all available GPUs (but doesn't include CPU offloading)
-        # Note: device_map only supports "balanced" or "cuda", not "auto"
+        # Use device_map="balanced" with max_memory to enable multi-GPU + CPU offloading
+        # max_memory allows accelerate to automatically offload to CPU when GPUs are full
         if num_gpus > 1:
             try:
                 load_kwargs["device_map"] = "balanced"
-                logging.getLogger(__name__).info("loading pipeline with device_map=balanced for multi-GPU distribution (%d GPUs)", num_gpus)
+                # Set max_memory for each GPU and CPU to enable automatic CPU offloading
+                # When GPUs fill up, accelerate will automatically offload to CPU
+                max_memory = {}
+                for i in range(num_gpus):
+                    # Set reasonable limits per GPU (leave some headroom)
+                    max_memory[i] = "40GiB"  # Leave ~4GB headroom per GPU
+                max_memory["cpu"] = "200GiB"  # Allow CPU offloading
+                load_kwargs["max_memory"] = max_memory
+                logging.getLogger(__name__).info("loading pipeline with device_map=balanced + max_memory for multi-GPU + CPU distribution (%d GPUs)", num_gpus)
             except Exception:
                 # If device_map not supported, fall back to normal loading
                 logging.getLogger(__name__).warning("device_map=balanced not supported, loading normally")
@@ -432,6 +439,24 @@ def _load_sr_components(sr_root: str) -> Tuple[Optional[torch.nn.Module], Option
                                     logging.getLogger(__name__).warning("failed to convert %s to int: %s (error: %s), using default 1", key, value, e)
                                     obj[key] = 1  # safe default
                                     fixed = True
+                        elif key == "qk_norm" and isinstance(value, bool):
+                            # Fix qk_norm: if it's True/False, convert based on qk_norm_type
+                            # The error says it should be None or a string like 'rms_norm', not True
+                            qk_norm_type = obj.get("qk_norm_type", "rms")
+                            if value is True and qk_norm_type:
+                                # Map qk_norm_type to the correct qk_norm value
+                                if qk_norm_type == "rms":
+                                    obj[key] = "rms_norm"
+                                elif qk_norm_type in ("layer_norm", "fp32_layer_norm"):
+                                    obj[key] = qk_norm_type
+                                else:
+                                    obj[key] = None  # Default to None if unknown
+                                fixed = True
+                                logging.getLogger(__name__).info("converted qk_norm from %s to %s (based on qk_norm_type=%s)", value, obj[key], qk_norm_type)
+                            elif value is False:
+                                obj[key] = None
+                                fixed = True
+                                logging.getLogger(__name__).info("converted qk_norm from False to None")
                         else:
                             fix_patch_size_recursive(value)
                 elif isinstance(obj, list):
@@ -475,6 +500,22 @@ def _load_sr_components(sr_root: str) -> Tuple[Optional[torch.nn.Module], Option
                                             except (ValueError, TypeError) as e:
                                                 logging.getLogger(__name__).warning("failed to convert %s to int: %s (error: %s), using default 1", k, v, e)
                                                 d[k] = 1  # safe default
+                                    elif k == "qk_norm" and isinstance(v, bool):
+                                        # Fix qk_norm: if it's True/False, convert based on qk_norm_type
+                                        # The error says it should be None or a string like 'rms_norm', not True
+                                        qk_norm_type = d.get("qk_norm_type", "rms")
+                                        if v is True and qk_norm_type:
+                                            # Map qk_norm_type to the correct qk_norm value
+                                            if qk_norm_type == "rms":
+                                                d[k] = "rms_norm"
+                                            elif qk_norm_type in ("layer_norm", "fp32_layer_norm"):
+                                                d[k] = qk_norm_type
+                                            else:
+                                                d[k] = None  # Default to None if unknown
+                                            logging.getLogger(__name__).info("converted qk_norm from %s to %s (based on qk_norm_type=%s)", v, d[k], qk_norm_type)
+                                        elif v is False:
+                                            d[k] = None
+                                            logging.getLogger(__name__).info("converted qk_norm from False to None")
                                     else:
                                         ensure_patch_size_tuples(v)
                             elif isinstance(d, list):
