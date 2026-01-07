@@ -272,6 +272,14 @@ def _load_base_pipe(model_id: str) -> Optional[HunyuanVideo15Pipeline]:
         if t_dtype != p_dtype and hasattr(pipe, "transformer"):
             pipe.transformer = pipe.transformer.to(dtype=t_dtype)
 
+        # Enable gradient checkpointing if available to reduce memory usage
+        if hasattr(pipe, "transformer") and hasattr(pipe.transformer, "enable_gradient_checkpointing"):
+            try:
+                pipe.transformer.enable_gradient_checkpointing()
+                logging.getLogger(__name__).info("gradient checkpointing enabled for transformer")
+            except Exception:
+                logging.getLogger(__name__).warning("failed to enable gradient checkpointing\n%s", traceback.format_exc())
+
         _maybe_set_attention_backend(pipe, DEFAULT_ATTENTION_BACKEND)
         _maybe_enable_tiling_and_offload(pipe, dev)
 
@@ -350,38 +358,68 @@ def _load_sr_components(sr_root: str) -> Tuple[Optional[torch.nn.Module], Option
             
             if fixed:
                 logging.getLogger(__name__).info("SR transformer: fixed patch_size from list to tuple in config")
-                # Create a persistent temp directory (not auto-deleted) to hold the fixed config
-                import tempfile
-                import shutil
-                tmpdir = tempfile.mkdtemp(prefix="hunyuan_sr_")
-                try:
-                    # Copy all files to temp dir
-                    for item in os.listdir(sr_transformer_path):
-                        src = os.path.join(sr_transformer_path, item)
-                        dst = os.path.join(tmpdir, item)
-                        if os.path.isfile(src):
-                            shutil.copy2(src, dst)
-                        elif os.path.isdir(src):
-                            shutil.copytree(src, dst)
-                    # Write fixed config
-                    tmp_config_path = os.path.join(tmpdir, "config.json")
-                    with open(tmp_config_path, "w", encoding="utf-8") as f:
-                        json.dump(config_dict, f, indent=2)
-                    # Load model from temp dir (from_pretrained loads weights automatically)
-                    sr_transformer = HunyuanVideo15Transformer3DModel.from_pretrained(
-                        tmpdir,
-                        torch_dtype=t_dtype,
-                        local_files_only=True,
-                    )
-                    # Note: tmpdir is not deleted - it will persist for the lifetime of the process
-                    # This is acceptable as it's only created once at startup
-                except Exception:
-                    # Clean up temp dir on error
-                    try:
-                        shutil.rmtree(tmpdir)
-                    except Exception:
-                        pass
-                    raise
+                # Load config and weights manually, then use from_config with fixed config
+                from diffusers.configuration_utils import ConfigMixin
+                from diffusers.models.modeling_utils import load_state_dict
+                
+                # Load config dict (this will have lists, we already fixed it in memory)
+                config, unused_kwargs = ConfigMixin._get_config_dict(
+                    sr_transformer_path,
+                    local_files_only=True,
+                )
+                
+                # Ensure patch_size is still tuples (in case _get_config_dict reloaded from disk)
+                def ensure_patch_size_tuples(d):
+                    if isinstance(d, dict):
+                        for k, v in d.items():
+                            if k in ("patch_size", "patch_size_t") and isinstance(v, list):
+                                d[k] = tuple(v)
+                            else:
+                                ensure_patch_size_tuples(v)
+                    elif isinstance(d, list):
+                        for item in d:
+                            ensure_patch_size_tuples(item)
+                
+                ensure_patch_size_tuples(config)
+                
+                # Create model from fixed config
+                sr_transformer = HunyuanVideo15Transformer3DModel.from_config(config, **unused_kwargs)
+                
+                # Load weights manually
+                from safetensors.torch import load_file as safe_load_file
+                from torch import load as torch_load
+                
+                model_index_path = os.path.join(sr_transformer_path, "model_index.json")
+                if os.path.exists(model_index_path):
+                    with open(model_index_path, "r") as f:
+                        model_index = json.load(f)
+                    weight_files = model_index.get("weight_map", {})
+                else:
+                    # Fallback: look for .safetensors or .bin files
+                    weight_files = {}
+                    for fname in os.listdir(sr_transformer_path):
+                        if fname.endswith((".safetensors", ".bin")):
+                            weight_files[fname] = fname
+                
+                # Load weights
+                state_dict = {}
+                for weight_file in weight_files.values():
+                    weight_path = os.path.join(sr_transformer_path, weight_file)
+                    if os.path.exists(weight_path):
+                        if weight_file.endswith(".safetensors"):
+                            state_dict.update(safe_load_file(weight_path))
+                        else:
+                            state_dict.update(torch_load(weight_path, map_location="cpu"))
+                
+                if state_dict:
+                    missing_keys, unexpected_keys = sr_transformer.load_state_dict(state_dict, strict=False)
+                    if missing_keys:
+                        logging.getLogger(__name__).warning("SR transformer: missing keys: %s", missing_keys[:10])
+                    if unexpected_keys:
+                        logging.getLogger(__name__).warning("SR transformer: unexpected keys: %s", unexpected_keys[:10])
+                
+                # Set dtype
+                sr_transformer = sr_transformer.to(dtype=t_dtype)
             else:
                 # No fix needed, load normally
                 sr_transformer = HunyuanVideo15Transformer3DModel.from_pretrained(
@@ -771,6 +809,10 @@ def _run_generate_dict(data: Dict[str, Any]):
             "output_type": "latent",   # we need latents for SR conditioning
             "return_dict": True,
         }
+        
+        # Clear CUDA cache before generation to free up memory
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         if isinstance(negative_prompt, str) and negative_prompt.strip():
             kwargs["negative_prompt"] = negative_prompt.strip()
         if isinstance(height, int) and height > 0:
@@ -814,6 +856,10 @@ def _run_generate_dict(data: Dict[str, Any]):
         )
         if request_meta:
             log.info("generate request_meta keys=%s", sorted(list(request_meta.keys()))[:64])
+
+        # Clear CUDA cache before generation to free up memory
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         # --- Stage 1: 720p generation (latents) ---
         t0 = time.monotonic()
