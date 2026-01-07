@@ -808,6 +808,8 @@ services:
       # Attention backend (optional; service will catch errors and continue if unavailable)
       # Recommended by Diffusers docs for A100/A800/4090: flash_hub or flash_varlen_hub
       - HYVIDEO_ATTENTION_BACKEND=${HYVIDEO_ATTENTION_BACKEND:-}
+      # PyTorch memory management for multi-GPU and dynamic offloading
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
       # share caches with film2_models volume
       - HF_HOME=/opt/models/.hf
       - TRANSFORMERS_CACHE=/opt/models/.hf

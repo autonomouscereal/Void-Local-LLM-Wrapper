@@ -27,6 +27,11 @@ from diffusers.utils import export_to_video
 
 from void_json.json_parser import JSONParser
 
+# Set PyTorch CUDA memory allocator config for better multi-GPU memory management
+# This helps with fragmentation and allows dynamic offloading across GPUs
+if not os.getenv("PYTORCH_CUDA_ALLOC_CONF"):
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -209,6 +214,45 @@ def _get_next_gpu(gpus: list[int], current_idx: int) -> int:
     return gpus[current_idx % len(gpus)]
 
 
+def _distribute_components_dynamically(pipe: HunyuanVideo15Pipeline) -> None:
+    """Dynamically distribute pipeline components across all available GPUs and CPU."""
+    if not torch.cuda.is_available():
+        return
+    
+    num_gpus = torch.cuda.device_count()
+    if num_gpus < 2:
+        return
+    
+    logger = logging.getLogger(__name__)
+    logger.info("dynamically distributing pipeline components across %d GPUs + CPU", num_gpus)
+    
+    # Get list of all GPU devices
+    gpu_devices = [f"cuda:{i}" for i in range(num_gpus)]
+    device_cycle = 0
+    
+    # Distribute components round-robin across GPUs, with CPU as fallback
+    components_to_distribute = []
+    
+    if hasattr(pipe, "text_encoder") and pipe.text_encoder is not None:
+        components_to_distribute.append(("text_encoder", pipe.text_encoder))
+    if hasattr(pipe, "text_encoder_2") and pipe.text_encoder_2 is not None:
+        components_to_distribute.append(("text_encoder_2", pipe.text_encoder_2))
+    if hasattr(pipe, "transformer") and pipe.transformer is not None:
+        components_to_distribute.append(("transformer", pipe.transformer))
+    if hasattr(pipe, "vae") and pipe.vae is not None:
+        components_to_distribute.append(("vae", pipe.vae))
+    
+    for comp_name, comp in components_to_distribute:
+        try:
+            target_device = gpu_devices[device_cycle % num_gpus]
+            comp = comp.to(target_device)
+            setattr(pipe, comp_name, comp)
+            logger.info("%s moved to %s", comp_name, target_device)
+            device_cycle += 1
+        except Exception:
+            logger.warning("failed to move %s to GPU\n%s", comp_name, traceback.format_exc())
+
+
 def _maybe_enable_tiling_and_offload(pipe: HunyuanVideo15Pipeline, dev: str) -> None:
     # VAE tiling
     if DEFAULT_VAE_TILING and hasattr(pipe, "vae") and hasattr(pipe.vae, "enable_tiling"):
@@ -218,31 +262,51 @@ def _maybe_enable_tiling_and_offload(pipe: HunyuanVideo15Pipeline, dev: str) -> 
         except Exception:
             logging.getLogger(__name__).warning("failed to enable vae tiling\n%s", traceback.format_exc())
 
-    # Enable sequential CPU offload which automatically distributes across all available GPUs
-    # This is the dynamic, automatic way to use all GPUs with CPU offloading
+    # Multi-GPU + CPU offloading strategy:
+    # 1. Distribute components across all GPUs first (for static distribution)
+    # 2. Enable CPU offload for dynamic memory management during generation
+    #    (this will offload intermediate tensors to CPU/other GPUs as memory grows)
+    num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    
+    if DEFAULT_CPU_OFFLOAD and num_gpus >= 2:
+        # Distribute components across GPUs first for static multi-GPU usage
+        try:
+            _distribute_components_dynamically(pipe)
+        except Exception:
+            logging.getLogger(__name__).warning("failed to distribute components; continuing with CPU offload only\n%s", traceback.format_exc())
+    
+    # Enable CPU offload for dynamic memory management during generation
+    # This handles intermediate tensors that grow during video generation
     if DEFAULT_CPU_OFFLOAD:
-        if hasattr(pipe, "enable_sequential_cpu_offload"):
-            try:
-                # Sequential CPU offload automatically uses all available GPUs
-                # It moves components to GPU when needed and offloads to CPU when not in use
-                pipe.enable_sequential_cpu_offload()
-                num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
-                logging.getLogger(__name__).info("sequential cpu offload enabled (automatically using %d GPU(s) with CPU offloading)", num_gpus)
-                return
-            except Exception:
-                logging.getLogger(__name__).warning("failed to enable sequential cpu offload; trying model cpu offload\n%s", traceback.format_exc())
-        
-        # Fallback to regular model CPU offload (also uses all GPUs dynamically)
         if hasattr(pipe, "enable_model_cpu_offload"):
             try:
+                # enable_model_cpu_offload will manage dynamic offloading during generation
+                # It works with the distributed components to offload to CPU/other GPUs when memory is tight
                 pipe.enable_model_cpu_offload()
-                num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
-                logging.getLogger(__name__).info("model cpu offload enabled (automatically using %d GPU(s) with CPU offloading)", num_gpus)
+                logging.getLogger(__name__).info("model cpu offload enabled (%d GPU(s) + CPU, dynamic offloading during generation for intermediate tensors)", num_gpus)
                 return
             except Exception:
-                logging.getLogger(__name__).warning("failed to enable model cpu offload; will .to(device)\n%s", traceback.format_exc())
+                logging.getLogger(__name__).warning("failed to enable model cpu offload; trying sequential cpu offload\n%s", traceback.format_exc())
+        
+        # Fallback to sequential CPU offload
+        if hasattr(pipe, "enable_sequential_cpu_offload"):
+            try:
+                pipe.enable_sequential_cpu_offload()
+                logging.getLogger(__name__).info("sequential cpu offload enabled (%d GPU(s) + CPU, dynamic offloading during generation)", num_gpus)
+                return
+            except Exception:
+                logging.getLogger(__name__).warning("failed to enable sequential cpu offload; will .to(device)\n%s", traceback.format_exc())
 
-    # If no CPU offload or it failed, move to device
+    # If no CPU offload or it failed, distribute components and move to device
+    num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    if num_gpus >= 2:
+        try:
+            _distribute_components_dynamically(pipe)
+            logging.getLogger(__name__).info("pipeline components distributed across %d GPUs", num_gpus)
+            return
+        except Exception:
+            logging.getLogger(__name__).warning("failed to distribute components; moving to single device\n%s", traceback.format_exc())
+    
     try:
         pipe.to(dev)
         logging.getLogger(__name__).info("pipeline moved to device=%s", dev)
@@ -363,9 +427,24 @@ def _load_sr_components(sr_root: str) -> Tuple[Optional[torch.nn.Module], Option
                 nonlocal fixed
                 if isinstance(obj, dict):
                     for key, value in obj.items():
-                        if key in ("patch_size", "patch_size_t") and isinstance(value, list):
-                            obj[key] = tuple(value)
-                            fixed = True
+                        if key in ("patch_size", "patch_size_t"):
+                            if isinstance(value, (list, tuple)):
+                                # Flatten and convert to tuple of ints
+                                # Handle nested structures like [[1,2,2]] or ((1,2,2),)
+                                try:
+                                    flattened = []
+                                    for x in value:
+                                        if isinstance(x, (list, tuple)):
+                                            # If nested, flatten it
+                                            flattened.extend([int(y) for y in x])
+                                        else:
+                                            flattened.append(int(x))
+                                    # Ensure we have a proper tuple of ints (not nested)
+                                    obj[key] = tuple(flattened) if len(flattened) > 0 else tuple(int(x) for x in value)
+                                    fixed = True
+                                    logging.getLogger(__name__).debug("converted %s from %s to %s", key, type(value).__name__, obj[key])
+                                except (ValueError, TypeError) as e:
+                                    logging.getLogger(__name__).warning("failed to convert %s to tuple of ints: %s (error: %s)", key, value, e)
                         else:
                             fix_patch_size_recursive(value)
                 elif isinstance(obj, list):
@@ -385,8 +464,26 @@ def _load_sr_components(sr_root: str) -> Tuple[Optional[torch.nn.Module], Option
                         def ensure_patch_size_tuples(d):
                             if isinstance(d, dict):
                                 for k, v in d.items():
-                                    if k in ("patch_size", "patch_size_t") and isinstance(v, list):
-                                        d[k] = tuple(v)
+                                    if k in ("patch_size", "patch_size_t"):
+                                        if isinstance(v, (list, tuple)):
+                                            # Flatten and convert to tuple of ints
+                                            # Handle nested structures like [[1,2,2]] or ((1,2,2),)
+                                            try:
+                                                flattened = []
+                                                for x in v:
+                                                    if isinstance(x, (list, tuple)):
+                                                        # If nested, take the first element or flatten
+                                                        if len(x) > 0:
+                                                            flattened.extend([int(y) for y in x])
+                                                        else:
+                                                            flattened.append(int(x) if not isinstance(x, (list, tuple)) else int(x[0]))
+                                                    else:
+                                                        flattened.append(int(x))
+                                                # Ensure we have a proper tuple of ints (not nested)
+                                                d[k] = tuple(flattened) if len(flattened) > 0 else tuple(int(x) for x in v)
+                                                logging.getLogger(__name__).debug("converted %s from %s to %s", k, type(v).__name__, d[k])
+                                            except (ValueError, TypeError) as e:
+                                                logging.getLogger(__name__).warning("failed to convert %s to tuple of ints: %s (error: %s)", k, v, e)
                                     else:
                                         ensure_patch_size_tuples(v)
                             elif isinstance(d, list):
@@ -850,17 +947,23 @@ def _run_generate_dict(data: Dict[str, Any]):
         if request_meta:
             log.info("generate request_meta keys=%s", sorted(list(request_meta.keys()))[:64])
 
-        # Clear CUDA cache before generation to free up memory
+        # Clear CUDA cache before generation to free up memory across all GPUs
         if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            # Also try to synchronize and reset peak memory stats
-            torch.cuda.synchronize()
-            torch.cuda.reset_peak_memory_stats()
+            num_gpus = torch.cuda.device_count()
+            for gpu_id in range(num_gpus):
+                try:
+                    with torch.cuda.device(gpu_id):
+                        torch.cuda.empty_cache()
+                        torch.cuda.synchronize()
+                        torch.cuda.reset_peak_memory_stats()
+                except Exception:
+                    pass
 
         # --- Stage 1: 720p generation (latents) ---
         t0 = time.monotonic()
         try:
             # Use torch.no_grad() context to reduce memory during generation
+            # Model CPU offload will automatically manage memory across GPUs and CPU
             with torch.no_grad():
                 out = pipe(**kwargs)
             dur_base_ms = int((time.monotonic() - t0) * 1000)
