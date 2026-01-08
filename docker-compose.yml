@@ -915,6 +915,43 @@ services:
       - void_artifacts:/workspace/uploads
       - void_logs:/workspace/logs
 
+  valkey:
+    image: valkey/valkey:8
+    container_name: valkey
+    restart: unless-stopped
+    network_mode: host
+    command:
+      - valkey-server
+      - "--port"
+      - "${VALKEY_PORT:-6380}"
+      - "--save"
+      - ""
+      - "--appendonly"
+      - "no"
+
+  searxng:
+    build:
+      context: ./services/searxng
+      dockerfile: Dockerfile
+    container_name: searxng
+    restart: unless-stopped
+    network_mode: host
+    depends_on:
+      - valkey
+    environment:
+      # CRITICAL for host networking: make SearXNG listen on your host port
+      - BIND_ADDRESS=0.0.0.0:${SEARXNG_PORT:-8090}
+
+      # Settings file
+      - SEARXNG_SETTINGS_PATH=/etc/searxng/settings.yml
+
+      # Helps SearXNG generate correct absolute URLs
+      - SEARXNG_BASE_URL=http://localhost:${SEARXNG_PORT:-8090}
+
+      - FORCE_OWNERSHIP=false
+    volumes:
+      - ./services/searxng/settings.yml:/etc/searxng/settings.yml
+
 volumes:
   ollama_qwen_data: {}
   ollama_glm_data: {}

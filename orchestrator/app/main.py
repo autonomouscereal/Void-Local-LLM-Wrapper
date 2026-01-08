@@ -10217,7 +10217,10 @@ Example 4 (create song):
 Example 5 (create TTS):
 {"response": "I'll generate speech for you", "tool": "create_tts", "args": {"text": "tts text"}}
 
-Available tools: create_video, create_image, create_song, create_tts. Do not add extra args. Follow this structure exactly. Respond with valid JSON only, no markdown, no code fences."""
+Example 6 (web search):
+{"response": "I'll search the web for you", "tool": "searxng_search", "args": {"search_string": "search query"}}
+
+Available tools: create_video, create_image, create_song, create_tts, searxng_search. Do not add extra args. Follow this structure exactly. Respond with valid JSON only, no markdown, no code fences."""
     messages = [{"role": "system", "content": system_prompt}] + request_messages
     llm_response = await committee_ai_text(messages=messages, trace_id=trace_id, conversation_id=conversation_id)
     llm_text = llm_response.get("result", {}).get("text", "") if isinstance(llm_response, dict) else str(llm_response or "")
@@ -10257,6 +10260,18 @@ Available tools: create_video, create_image, create_song, create_tts. Do not add
                 path = result.get("meta", {}).get("path") if isinstance(result.get("meta"), dict) else ""
                 url = result.get("meta", {}).get("url") if isinstance(result.get("meta"), dict) else ""
                 tool_result = f"\n\n********\nTTS created:\n- Path: {path}\n- URL: {url}\n*********"
+    elif tool == "searxng_search":
+        search_string = (parsed.get("args") or {}).get("search_string") if isinstance(parsed.get("args"), dict) else ""
+        if search_string:
+            from .searxng import searxng_search
+            data = searxng_search(query=search_string)
+            results = data.get("results", [])[:10]
+            lines = []
+            for it in results:
+                lines.append(f"- {it.get('title','')}")
+                lines.append(it.get('content','') or it.get('snippet',''))
+                lines.append(it.get('url','') or it.get('link',''))
+            tool_result = f"\n\n********\nSearch results:\n{chr(10).join(lines)}\n*********"
     # Build detailed response with sections
     full_response_section = f"\n\n******************\nFull Response\n******************\n{json.dumps(llm_response, indent=2, ensure_ascii=False) if isinstance(llm_response, dict) else str(llm_response)}"
     parsed_section = f"\n\n******************\nParsed JSON\n******************\n{json.dumps(parsed, indent=2, ensure_ascii=False) if isinstance(parsed, dict) else str(parsed)}"

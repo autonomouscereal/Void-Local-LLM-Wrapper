@@ -1,28 +1,33 @@
-FROM pytorch/pytorch:2.7.1-cuda11.8-cudnn9-runtime
+# Devel image is required to compile SageAttention and SGL-Kernel
+FROM pytorch/pytorch:2.7.1-cuda11.8-cudnn9-devel
 
-ARG PIP_EXTRA_INDEX_URL
-ENV PIP_EXTRA_INDEX_URL=${PIP_EXTRA_INDEX_URL}
 ENV PYTHONUNBUFFERED=1
-
 WORKDIR /app
 
-RUN python -m pip install -U pip
+# System dependencies for compilation and video handling
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git ffmpeg ca-certificates build-essential libgl1-mesa-glx \
+    && rm -rf /var/lib/apt/lists/*
 
-# Repo-root build context: copy the hunyuan_video service requirements from its subdir.
+# Install merged requirements
 COPY services/hunyuan_video/requirements.txt /app/requirements.txt
-# All pins live in requirements.txt (policy). Torch wheels come from the cu118 index.
-RUN python -m pip install --extra-index-url "${PIP_EXTRA_INDEX_URL}" -r /app/requirements.txt
+RUN python -m pip install -U pip && \
+    python -m pip install --no-cache-dir -r /app/requirements.txt
 
-# Copy shared packages so the service can return canonical ToolEnvelopes + use JSONParser
-COPY void_envelopes /app/void_envelopes
+# Clone the specific HunyuanVideo-1.5 repository
+ARG HUNYUAN_REPO_URL=https://github.com/Tencent-Hunyuan/HunyuanVideo-1.5.git
+ARG HUNYUAN_REPO_REF=main
+RUN git clone --depth=1 --branch "${HUNYUAN_REPO_REF}" "${HUNYUAN_REPO_URL}" /opt/hunyuan15_src
+
+# Set up environment paths
+ENV HYVIDEO_PORT=8094
+ENV HYVIDEO_CODE_PATH=/opt/hunyuan15_src
+ENV PYTHONPATH="${PYTHONPATH}:/opt/hunyuan15_src"
+ENV FILM2_MODELS=/opt/models
+
+# Shared packages and service code
 COPY void_json /app/void_json
-
-# Service code
 COPY services/hunyuan_video/app.py /app/app.py
 
-ENV HYVIDEO_PORT=8094
 EXPOSE 8094
-
 CMD ["python","-u","/app/app.py"]
-
-

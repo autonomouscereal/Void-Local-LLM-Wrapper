@@ -1,0 +1,53 @@
+use_default_settings: true
+
+server:
+  # Keep this aligned with SEARXNG_BASE_URL
+  base_url: false
+  secret_key: "CHANGE_ME_TO_A_LONG_RANDOM_VALUE"
+  limiter: false
+
+search:
+  safe_search: 1
+  autocomplete: "duckduckgo"
+  formats:
+    - html
+    - json
+
+# With host networking, Valkey is reachable via localhost on the host.
+# Match this to VALKEY_PORT in compose.
+valkey:
+  url: "redis://127.0.0.1:6380/0"
+
+engines:
+  - name: google
+    disabled: false
+    weight: 1.0
+
+  - name: brave
+    disabled: false
+    weight: 1.0
+
+  - name: duckduckgo
+    disabled: false
+    weight: 1.0
+
+  - name: mojeek
+    disabled: false
+    weight: 1.0
+
+  - name: yandex
+    disabled: false
+    weight: 1.0
+
+  # Optional diversity adds:
+  - name: startpage
+    disabled: false
+    weight: 0.9
+
+  - name: qwant
+    disabled: false
+    weight: 0.8
+
+  - name: bing
+    disabled: false
+    weight: 0.8

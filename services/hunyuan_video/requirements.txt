@@ -1,15 +1,40 @@
+# --- Strict Hardware & Framework Pins ---
+--extra-index-url download.pytorch.org
 torch==2.7.1+cu118
 torchaudio==2.7.1+cu118
+torchvision>=0.21.0
+
+# --- HunyuanVideo 1.5 Core & Attention Libraries ---
+sageattention               # Optimized attention for 2026
+angelslim==0.2.2            # Model compression/quantization
+sgl-kernel                  # FP8 GEMM kernels for transformer
+flex-block-attn             # Sparse attention support
+accelerate==1.12.0
 diffusers==0.36.0
 transformers==4.57.3
-accelerate==1.12.0
-safetensors
-numpy==1.26.4
-pillow
-imageio
-imageio-ffmpeg
+safetensors>=0.5.3
+peft==0.17.0
+einops==0.8.0
+
+# --- Server & API ---
 fastapi
 uvicorn[standard]
+openai==2.8.0
 
+# --- Multimodal & Video Processing ---
+qwen-vl-utils==0.0.8
+imageio==2.37.0
+imageio-ffmpeg==0.6.0
+pillow==11.3.0
+numpy==1.26.4
+omegaconf>=2.3.0
+modelscope
 
-
+# --- Utilities ---
+tqdm==4.67.1
+loguru==0.7.3
+huggingface-hub==0.34.0
+huggingface_hub[cli]
+psutil
+wheel
+setuptools
