@@ -59,16 +59,14 @@ _PIPE_LOCK = torch.multiprocessing.Lock()
 def _ensure_dirs():
     os.makedirs(os.path.join(UPLOAD_DIR, "artifacts", "video"), exist_ok=True)
 
-def _load_pipeline() -> Any:
-    t0 = time.monotonic()
-    
-    # 1. EXHAUSTIVE mock args to satisfy Hunyuan 1.5 internal parsers
+def get_exhaustive_args(task_mode="t2v", image_path=None) -> argparse.Namespace:
+    """Returns a Namespace containing EVERY attribute required by Hunyuan 1.5."""
     args = argparse.Namespace()
     
     # --- Generation / Sampling Params ---
     args.prompt = ""
     args.video_length = FRAMES
-    args.total_steps = STEPS            # FIX: The current attribute crash
+    args.total_steps = STEPS
     args.infer_steps = STEPS
     args.fps = FPS
     args.num_videos = 1
@@ -102,7 +100,7 @@ def _load_pipeline() -> Any:
     
     # --- Path & Logic Params ---
     args.resolution = "720p"
-    args.image_path = None
+    args.image_path = image_path
     args.sr = ENABLE_SR
     args.model_path = MODEL_PATH
     args.checkpoint_path = None
@@ -113,22 +111,28 @@ def _load_pipeline() -> Any:
     args.offloading = ENABLE_OFFLOADING
     args.group_offloading = ENABLE_GROUP_OFFLOADING
     args.overlap_group_offloading = ENABLE_OVERLAP_OFFLOADING
-    args.sp = 1 # Sequence Parallelism
+    args.sp = 1 
+    
+    return args
 
-    # 2. Parallelism Guard
+def _load_pipeline() -> Any:
+    t0 = time.monotonic()
+    
+    # 1. Parallelism Guard
     WORLD_SIZE = torch.cuda.device_count()
     if not dist.is_initialized():
         initialize_parallel_state(sp=1)
 
-    # 3. Initialize Infer State (Hunyuan 1.5 Core)
-    # This function uses almost every arg above to build tiles and buffers
+    # 2. Get full args for initialization
+    args = get_exhaustive_args(task_mode="t2v")
     infer_state = initialize_infer_state(args)
     
-    # 4. Device placement from 1.5 official logic
+    # 3. Device placement logic
     device = torch.device('cpu') if args.offloading else torch.device('cuda')
     transformer_init_device = torch.device('cpu') if args.group_offloading else device
 
-    # 5. Create Pipeline
+    # 4. Create Pipeline
+    # Note: 1.5 create_pipeline internally handles loading 720p_t2v and 720p_i2v folders
     pipe = HunyuanVideo_1_5_Pipeline.create_pipeline(
         pretrained_model_name_or_path=args.model_path,
         transformer_version="720p_t2v",
@@ -136,9 +140,10 @@ def _load_pipeline() -> Any:
         transformer_dtype=torch.bfloat16,
         device=device,
         transformer_init_device=transformer_init_device,
+        use_safetensors=True
     )
 
-    # 6. Apply Optimizations
+    # 5. Apply Optimizations
     pipe.apply_infer_optimization(
         infer_state=infer_state,
         enable_offloading=args.offloading,
@@ -160,10 +165,15 @@ async def generate(req: Request):
     body = (await req.body()).decode("utf-8")
     data = JSONParser().parse(body, {})
     prompt = data.get("prompt")
+    image_path = data.get("image_path") 
     
     if not prompt:
         return JSONResponse(status_code=422, content={"error": "Prompt required"})
 
+    # Check for I2V vs T2V
+    is_i2v = bool(image_path and os.path.exists(image_path))
+    task_mode = "i2v" if is_i2v else "t2v"
+    
     trace_id = data.get("trace_id", uuid.uuid4().hex)
     out_dir = os.path.join(UPLOAD_DIR, "artifacts", "video", trace_id)
     os.makedirs(out_dir, exist_ok=True)
@@ -172,8 +182,13 @@ async def generate(req: Request):
     t0 = time.monotonic()
     with _PIPE_LOCK:
         try:
+            # We must pass the exhaustive args for every call to satisfy internal lookups
+            # especially for the tile-based attention buffers in 1.5
+            current_args = get_exhaustive_args(task_mode=task_mode, image_path=image_path if is_i2v else None)
+            
             PIPE(
                 prompt=prompt.strip(),
+                image_path=current_args.image_path,
                 height=HEIGHT,
                 width=WIDTH,
                 video_length=FRAMES,
@@ -185,12 +200,13 @@ async def generate(req: Request):
                 use_sage_attn=True
             )
         except Exception as e:
-            log.error(f"Trace: {trace_id} | Error: {e}")
+            log.error(f"Trace: {trace_id} | Task: {task_mode} | Error: {e}")
             return JSONResponse(status_code=500, content={"error": str(e)})
 
     return {
         "ok": True,
         "trace_id": trace_id,
+        "task": task_mode,
         "output_url": f"{PUBLIC_BASE_URL}/uploads/artifacts/video/{trace_id}/output.mp4",
         "resolution": "1920x1080" if ENABLE_SR else "1280x720",
         "dur_ms": int((time.monotonic() - t0) * 1000)

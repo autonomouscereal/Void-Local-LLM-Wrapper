@@ -61,6 +61,8 @@ HF_MODELS: list[tuple[str, str, list[str] | None]] = [
     # Official Tencent SR assets for 720->1080.
     # NOTE: allow_patterns prevents downloading the entire Tencent repo.
     (HUNYUAN15_TENCENT, "hunyuan", [
+        "transformer/720p_t2v/*",          # For Text-to-Video
+        "transformer/720p_i2v/*",          # For Image-to-Video (Added)
         "transformer/1080p_sr_distilled/*",
         "upsampler/1080p_sr_distilled/*",
         "scheduler/*",
