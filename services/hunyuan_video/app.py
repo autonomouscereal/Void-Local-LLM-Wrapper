@@ -62,33 +62,48 @@ _PIPE_LOCK = torch.multiprocessing.Lock()
 def _ensure_dirs():
     os.makedirs(os.path.join(UPLOAD_DIR, "artifacts", "video"), exist_ok=True)
 
+
 def _load_pipeline() -> Any:
     t0 = time.monotonic()
     
-    # Mock args specifically for Hunyuan 1.5's initialize_infer_state
+    # Create the mock args object with all required 1.5 attributes
     args = argparse.Namespace()
+    
+    # 1. Attention & Caching Fixes
     args.use_sageattn = True
     args.sparse_attn = False
-    args.sage_blocks_range = "0-53"  
-    args.no_cache_block_id = ""      # FIX: Use empty string instead of None
+    args.sage_blocks_range = "0-53"  # Standard for 8.3B model
+    
+    # FIX: Use "54" (out-of-bounds) instead of "" or None to satisfy parse_range
+    args.no_cache_block_id = "54"    
+    
+    # 2. Resolution and Model Flags
     args.resolution = "720p"
     args.dtype = "bf16"
-    args.offloading = ENABLE_OFFLOADING
-    args.group_offloading = ENABLE_GROUP_OFFLOADING
-    args.overlap_group_offloading = ENABLE_OVERLAP_OFFLOADING
     args.cfg_distilled = True
     args.enable_step_distill = False
     args.image_path = None
     args.sr = ENABLE_SR
     args.model_path = MODEL_PATH
 
-    # Initialize state
+    # 3. Offloading & Performance
+    args.offloading = ENABLE_OFFLOADING
+    args.group_offloading = ENABLE_GROUP_OFFLOADING
+    args.overlap_group_offloading = ENABLE_OVERLAP_OFFLOADING
+    
+    # REQUIRED: Initialize parallel state based on your GPU count
+    # sp must be a divisor of world_size; typically set to total GPUs
+    WORLD_SIZE = torch.cuda.device_count()
+    initialize_parallel_state(sp=WORLD_SIZE)
+
+    # Initialize state (must capture the returned infer_state)
     infer_state = initialize_infer_state(args)
     
-    # Logic from generate.py: Force CPU init if offloading/group-offloading to save VRAM
+    # Device placement logic from generate.py
     device = torch.device('cpu') if args.offloading else torch.device('cuda')
     transformer_init_device = torch.device('cpu') if args.group_offloading else device
 
+    # Create the pipeline using the 1.5 factory
     pipe = HunyuanVideo_1_5_Pipeline.create_pipeline(
         pretrained_model_name_or_path=args.model_path,
         transformer_version="720p_t2v",
@@ -98,7 +113,7 @@ def _load_pipeline() -> Any:
         transformer_init_device=transformer_init_device,
     )
 
-    # Multi-GPU + CPU Offload optimization
+    # Apply optimizations
     pipe.apply_infer_optimization(
         infer_state=infer_state,
         enable_offloading=args.offloading,
@@ -106,8 +121,9 @@ def _load_pipeline() -> Any:
         overlap_group_offloading=args.overlap_group_offloading,
     )
 
-    log.info(f"Hunyuan 1.5 loaded on {WORLD_SIZE} GPUs with group offloading. Time: {int(time.monotonic()-t0)}s")
+    log.info(f"Hunyuan 1.5 loaded on {WORLD_SIZE} GPUs. Time: {int(time.monotonic()-t0)}s")
     return pipe
+
 
 @APP.on_event("startup")
 def _startup():
