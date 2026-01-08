@@ -67,53 +67,52 @@ def _ensure_dirs():
 def _load_pipeline() -> Any:
     t0 = time.monotonic()
     
-    # 1. Create the mock args object with ALL required 1.5 attributes
+    # 1. Create the mock args object with ALL attributes required by 1.5
     args = argparse.Namespace()
     
-    # Missing attribute that caused the current crash
-    args.enable_torch_compile = False  # Set to False for stability on CUDA 11.8
+    # Flags required by initialize_infer_state (Fixes current AttributeError)
+    args.enable_cache = False           # The missing attribute
+    args.enable_torch_compile = False
+    args.use_fp8_gemm = False
+    args.quant_type = "none"
+    args.enable_step_distill = False
     
-    # Essential Performance & Attention Flags
+    # Attention & Caching Logic (Critical for 2026 kernels)
     args.use_sageattn = True
     args.sparse_attn = False
-    args.sage_blocks_range = "0-53"
-    args.no_cache_block_id = "54"    # Fixed to prevent int conversion error
-    args.resolution = "720p"
+    args.sage_blocks_range = "0-53"     # Range for 8.3B model
+    args.no_cache_block_id = "54"       # Out-of-bounds index string to satisfy parser
     
-    # Precision and Distillation Flags (Standard 1.5 defaults)
+    # Path & Model Logic
+    args.resolution = "720p"
     args.dtype = "bf16"
     args.cfg_distilled = True
-    args.enable_step_distill = False
-    args.quant_type = "none"         # Required for sgl_kernel/fp8 checks
-    args.use_fp8_gemm = False        # Required for CUDA 11.8 compatibility
-    
-    # Path & Mode Flags
-    args.image_path = None           # Default to T2V
-    args.sr = ENABLE_SR              # Super-resolution flag
+    args.image_path = None              # T2V default
+    args.sr = ENABLE_SR                 # Enables 1080p upscale path
     args.model_path = MODEL_PATH
-    args.checkpoint_path = None      # Required by some 1.5 init paths
-    args.lora_path = None            # Required by some 1.5 init paths
+    args.checkpoint_path = None
+    args.lora_path = None
 
     # Offloading Configuration
     args.offloading = ENABLE_OFFLOADING
     args.group_offloading = ENABLE_GROUP_OFFLOADING
     args.overlap_group_offloading = ENABLE_OVERLAP_OFFLOADING
     
-    # 2. Parallelism Initialization
-    # Must be done BEFORE initialize_infer_state for multi-GPU communication
+    # 2. Initialize Parallel State for Multi-GPU
     WORLD_SIZE = torch.cuda.device_count()
     if not dist.is_initialized():
-        initialize_parallel_state(sp=1)
+        # sp (Sequence Parallel) must be a divisor of WORLD_SIZE
+        initialize_parallel_state(sp=WORLD_SIZE)
 
-    # 3. Initialize State
-    # This now has all attributes required by hyvideo/commons/infer_state.py
+    # 3. Initialize Infer State (Hunyuan 1.5 Core)
     infer_state = initialize_infer_state(args)
     
-    # 4. Determine Initialization Devices (Logic from generate.py)
+    # 4. Device Placement (Logic from 1.5 generate.py)
+    # Init on CPU if offloading to prevent VRAM spikes on GPU 0
     device = torch.device('cpu') if args.offloading else torch.device('cuda')
     transformer_init_device = torch.device('cpu') if args.group_offloading else device
 
-    # 5. Create Pipeline
+    # 5. Create Pipeline via 1.5 Factory
     pipe = HunyuanVideo_1_5_Pipeline.create_pipeline(
         pretrained_model_name_or_path=args.model_path,
         transformer_version="720p_t2v",
@@ -123,7 +122,7 @@ def _load_pipeline() -> Any:
         transformer_init_device=transformer_init_device,
     )
 
-    # 6. Apply Optimizations
+    # 6. Apply Multi-GPU & CPU Offload optimizations
     pipe.apply_infer_optimization(
         infer_state=infer_state,
         enable_offloading=args.offloading,
@@ -131,7 +130,7 @@ def _load_pipeline() -> Any:
         overlap_group_offloading=args.overlap_group_offloading,
     )
 
-    log.info(f"Hunyuan 1.5 Pipeline fully initialized on {WORLD_SIZE} GPUs. Time: {int(time.monotonic()-t0)}s")
+    log.info(f"Hunyuan 1.5 service optimized for 2026. Loaded on {WORLD_SIZE} GPUs. Time: {int(time.monotonic()-t0)}s")
     return pipe
 
 
