@@ -8,7 +8,6 @@ torchvision>=0.21.0
 sageattention               # Optimized attention for 2026
 angelslim==0.2.2            # Model compression/quantization
 sgl-kernel                  # FP8 GEMM kernels for transformer
-flex-block-attn             # Sparse attention support
 accelerate==1.12.0
 diffusers==0.36.0
 transformers==4.57.3

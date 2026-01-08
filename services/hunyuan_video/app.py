@@ -65,25 +65,22 @@ def _ensure_dirs():
     os.makedirs(os.path.join(UPLOAD_DIR, "artifacts", "video"), exist_ok=True)
 
 def _load_pipeline():
-    t0 = time.monotonic()
     initialize_infer_state()
     
-    # 2026 Multi-GPU Implementation: 
-    # Use device_map="auto" to balance across all visible GPUs.
-    # enable_offloading=True triggers the CPU fallback for text encoders and VAE.
+    # Force SageAttention to prevent the pipeline from defaulting 
+    # to the missing flex-block-attn kernels.
     pipe = HunyuanVideo_1_5_Pipeline.create_pipeline(
         pretrained_model_name_or_path=MODEL_PATH,
         transformer_version="720p_t2v",
-        device_map="auto",             # Enables Multi-GPU distribution
-        enable_offloading=ENABLE_OFFLOADING, 
-        enable_group_offloading=True,
+        device_map="auto",
+        enable_offloading=ENABLE_OFFLOADING,
         transformer_dtype=torch.bfloat16,
-        # 1.5 uses a dedicated SR (Super Resolution) path
-        use_sr_module=ENABLE_SR 
+        use_sr_module=ENABLE_SR,
+        # Explicitly set attention to Sage to bypass FlexBlock requirement
+        attention_mode="sage" 
     )
-
-    log.info(f"Pipeline Loaded: Multi-GPU Auto-Distribute Enabled. Time: {int(time.monotonic()-t0)}s")
     return pipe
+
 
 @APP.on_event("startup")
 def _startup():
