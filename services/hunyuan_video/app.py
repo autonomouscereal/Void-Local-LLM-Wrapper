@@ -119,21 +119,32 @@ def get_exhaustive_args(task_mode="t2v", image_path=None) -> argparse.Namespace:
     return args
 
 def _load_pipeline() -> Any:
-    # --- Glyph Checkpoint Self-Heal ---
+    # --- Glyph Checkpoint & Assets Self-Heal ---
     glyph_root = os.path.join(MODEL_PATH, "text_encoder", "Glyph-SDXL-v2")
-    glyph_ckpt_dir = os.path.join(glyph_root, "checkpoints")
-    glyph_target = os.path.join(glyph_ckpt_dir, "byt5_model.pt")
+    assets_dir = os.path.join(glyph_root, "assets")
+    checkpoints_dir = os.path.join(glyph_root, "checkpoints")
     
-    if not os.path.exists(glyph_target):
-        log.info("Repairing Glyph checkpoint structure...")
-        os.makedirs(glyph_ckpt_dir, exist_ok=True)
-        # Search for downloaded safetensor/bin and rename to expected filename
-        for f in ["model.safetensors", "pytorch_model.bin"]:
+    # 1. Fix Checkpoints
+    os.makedirs(checkpoints_dir, exist_ok=True)
+    target_ckpt = os.path.join(checkpoints_dir, "byt5_model.pt")
+    if not os.path.exists(target_ckpt):
+        for f in ["model.safetensors", "pytorch_model.bin", "byt5_model.bin"]:
             src = os.path.join(glyph_root, f)
             if os.path.exists(src):
-                shutil.move(src, glyph_target)
-                log.info(f"Successfully renamed {f} -> byt5_model.pt")
+                shutil.move(src, target_ckpt)
+                log.info(f"Fixed: Renamed {f} -> byt5_model.pt")
                 break
+
+    # 2. Fix Assets (Moving them if they downloaded to the wrong depth)
+    os.makedirs(assets_dir, exist_ok=True)
+    for asset_file in ["multilingual_10-lang_idx.json", "color_idx.json"]:
+        src_path = os.path.join(glyph_root, asset_file)
+        dst_path = os.path.join(assets_dir, asset_file)
+        if os.path.exists(src_path) and not os.path.exists(dst_path):
+            shutil.move(src_path, dst_path)
+            log.info(f"Fixed: Moved {asset_file} to assets folder")
+
+    # ... Now continue with initialize_parallel_state and initialize_infer_state ...
     # --- End Repair ---
     t0 = time.monotonic()
     

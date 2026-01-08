@@ -73,6 +73,13 @@ HF_MODELS: list[tuple[str, str, list[str] | None]] = [
         "model_index.json",
         "*.json",
     ]),
+    
+    # 1. Download the weights (ModelScope or HF)
+    ("AI-ModelScope/Glyph-SDXL-v2", "hunyuan/text_encoder/Glyph-SDXL-v2", None),
+    
+    # 2. Download the REQUIRED assets (multilingual_10-lang_idx.json, color_idx.json, etc.)
+    # These are often separate or in a different branch in some repos
+    ("LPDoctor/Glyph-SDXL-v2", "hunyuan/text_encoder/Glyph-SDXL-v2", ["assets/*"]),
     # NEW: Download the base ByT5 weights for the Glyph processor
     ("google/byt5-small", "hunyuan/text_encoder/byt5-small", None),
     # NEW: Download the Glyph-SDXL-v2 weights (requires specific restructuring)
