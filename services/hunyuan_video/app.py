@@ -10,8 +10,6 @@ from typing import Any, Dict, Optional
 # 2026 Optimization Kernels
 import sageattention
 import angelslim
-import sgl_kernel
-import flex_block_attn
 
 import torch
 from fastapi import FastAPI, Request
@@ -67,19 +65,17 @@ def _ensure_dirs():
 def _load_pipeline():
     initialize_infer_state()
     
-    # Force SageAttention to prevent the pipeline from defaulting 
-    # to the missing flex-block-attn kernels.
     pipe = HunyuanVideo_1_5_Pipeline.create_pipeline(
         pretrained_model_name_or_path=MODEL_PATH,
         transformer_version="720p_t2v",
-        device_map="auto",
-        enable_offloading=ENABLE_OFFLOADING,
-        transformer_dtype=torch.bfloat16,
+        device_map="auto",             # Still use for multi-GPU
+        enable_offloading=True,        # Vital for 24GB cards on 11.8
+        transformer_dtype=torch.bfloat16, # Use BF16 for 11.8 compatibility
         use_sr_module=ENABLE_SR,
-        # Explicitly set attention to Sage to bypass FlexBlock requirement
-        attention_mode="sage" 
+        attention_mode="sage"          # Force Sage over Flex
     )
     return pipe
+
 
 
 @APP.on_event("startup")
