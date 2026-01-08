@@ -55,6 +55,7 @@ HUNYUAN15_TENCENT = "tencent/HunyuanVideo-1.5"
 VERSIONED_KEYS = {
     "hunyuan",           # SR subset from Tencent repo
     "hunyuan_diffusers", # 720p T2V diffusers weights
+    "hunyuan/text_encoder/Glyph-SDXL-v2", # Force re-verify this specific folder
 }
 
 HF_MODELS: list[tuple[str, str, list[str] | None]] = [
@@ -79,7 +80,7 @@ HF_MODELS: list[tuple[str, str, list[str] | None]] = [
     
     # 2. Download the REQUIRED assets (multilingual_10-lang_idx.json, color_idx.json, etc.)
     # These are often separate or in a different branch in some repos
-    ("LPDoctor/Glyph-SDXL-v2", "hunyuan/text_encoder/Glyph-SDXL-v2", ["assets/*"]),
+    ("LPDoctor/Glyph-SDXL-v2", "hunyuan/text_encoder/Glyph-SDXL-v2", ["assets/*", "*.json", "checkpoints/*"]),
     # NEW: Download the base ByT5 weights for the Glyph processor
     ("google/byt5-small", "hunyuan/text_encoder/byt5-small", None),
     # NEW: Download the Glyph-SDXL-v2 weights (requires specific restructuring)
