@@ -17,6 +17,9 @@ from void_json.json_parser import JSONParser
 import sageattention
 import angelslim
 
+
+import shutil
+
 # ---------------------------
 # Config & Environment
 # ---------------------------
@@ -116,6 +119,22 @@ def get_exhaustive_args(task_mode="t2v", image_path=None) -> argparse.Namespace:
     return args
 
 def _load_pipeline() -> Any:
+    # --- Glyph Checkpoint Self-Heal ---
+    glyph_root = os.path.join(MODEL_PATH, "text_encoder", "Glyph-SDXL-v2")
+    glyph_ckpt_dir = os.path.join(glyph_root, "checkpoints")
+    glyph_target = os.path.join(glyph_ckpt_dir, "byt5_model.pt")
+    
+    if not os.path.exists(glyph_target):
+        log.info("Repairing Glyph checkpoint structure...")
+        os.makedirs(glyph_ckpt_dir, exist_ok=True)
+        # Search for downloaded safetensor/bin and rename to expected filename
+        for f in ["model.safetensors", "pytorch_model.bin"]:
+            src = os.path.join(glyph_root, f)
+            if os.path.exists(src):
+                shutil.move(src, glyph_target)
+                log.info(f"Successfully renamed {f} -> byt5_model.pt")
+                break
+    # --- End Repair ---
     t0 = time.monotonic()
     
     # 1. Parallelism Guard
