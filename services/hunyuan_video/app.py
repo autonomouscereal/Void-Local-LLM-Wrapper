@@ -1,31 +1,40 @@
 from __future__ import annotations
+
 import os
 import sys
 import time
 import uuid
 import logging
 import argparse
-from typing import Any, Dict, Optional
+import shutil
+from typing import Any, Optional, Dict
 
 import torch
-import torch.distributed as dist
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+
 from void_json.json_parser import JSONParser
 
-# 2026 Optimization Kernels
-import sageattention
-import angelslim
+# Optional perf libs (do not hard-fail if missing)
+try:
+    import sageattention  # noqa: F401
+except Exception:
+    sageattention = None
 
-
-import shutil
+try:
+    import angelslim  # noqa: F401
+except Exception:
+    angelslim = None
 
 # ---------------------------
-# Config & Environment
+# Logging
 # ---------------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 log = logging.getLogger("hunyuan_1.5_service")
 
+# ---------------------------
+# Config & Environment
+# ---------------------------
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/workspace/uploads").strip()
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip()
 MODELS_DIR = os.getenv("FILM2_MODELS", "/opt/models").strip()
@@ -33,40 +42,82 @@ MODEL_PATH = os.getenv("HYVIDEO_MODEL_PATH", os.path.join(MODELS_DIR, "hunyuan")
 CODE_PATH = os.getenv("HYVIDEO_CODE_PATH", "/opt/hunyuan15_src").strip()
 PORT = int(os.getenv("HYVIDEO_PORT", "8094"))
 
-# Offload & Multi-GPU Constants
 ENABLE_OFFLOADING = os.getenv("HYVIDEO_OFFLOADING", "1") == "1"
 ENABLE_GROUP_OFFLOADING = os.getenv("HYVIDEO_GROUP_OFFLOADING", "1") == "1"
-ENABLE_OVERLAP_OFFLOADING = True 
+ENABLE_OVERLAP_OFFLOADING = os.getenv("HYVIDEO_OVERLAP_GROUP_OFFLOADING", "1") == "1"
 ENABLE_SR = os.getenv("HYVIDEO_SR_ENABLE", "1") == "1"
 
 # Defaults
 WIDTH, HEIGHT, FRAMES, STEPS, FPS = 1280, 720, 129, 50, 24
 
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128"
+# Recommended allocator setting for fragmentation
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True,max_split_size_mb:128")
 
+# ---------------------------
+# Torch load compatibility shim (PyTorch 2.6+ weights_only default)
+# and safetensors fallback for "torch.load" calls inside Tencent repo.
+# ---------------------------
+try:
+    from safetensors.torch import load_file as safetensors_load_file
+except Exception:
+    safetensors_load_file = None
+
+_torch_load_orig = torch.load
+
+def _torch_load_compat(f, *args, **kwargs):
+    path = f if isinstance(f, str) else getattr(f, "name", None)
+    if isinstance(path, str) and os.path.isfile(path):
+        # If extension is safetensors, load via safetensors
+        if path.endswith(".safetensors") and safetensors_load_file is not None:
+            device = kwargs.get("map_location", "cpu")
+            return safetensors_load_file(path, device=device)
+
+        # If file is named .pt/.bin but is actually safetensors, try safetensors first
+        if safetensors_load_file is not None:
+            try:
+                with open(path, "rb") as fh:
+                    head = fh.read(64)
+                # heuristic: safetensors header often contains b"safetensors" early
+                if b"safetensors" in head.lower():
+                    device = kwargs.get("map_location", "cpu")
+                    return safetensors_load_file(path, device=device)
+            except Exception:
+                pass
+
+    # Force old behavior for torch checkpoints
+    if "weights_only" not in kwargs:
+        kwargs["weights_only"] = False
+
+    return _torch_load_orig(f, *args, **kwargs)
+
+torch.load = _torch_load_compat
+
+# ---------------------------
+# Import Tencent repo code
+# ---------------------------
 if CODE_PATH and os.path.isdir(CODE_PATH) and CODE_PATH not in sys.path:
     sys.path.insert(0, CODE_PATH)
 
 try:
     from hyvideo.pipelines.hunyuan_video_pipeline import HunyuanVideo_1_5_Pipeline
     from hyvideo.commons.infer_state import initialize_infer_state
-    from hyvideo.commons.parallel_states import initialize_parallel_state
 except Exception as e:
-    log.error("Failed to import Hunyuan 1.5 core: %s", e)
+    log.error("Failed to import Hunyuan 1.5 core from CODE_PATH=%s: %s", CODE_PATH, e)
     raise
 
 APP = FastAPI(title="HunyuanVideo-1.5 Service")
 PIPE: Optional[Any] = None
 _PIPE_LOCK = torch.multiprocessing.Lock()
 
+
 def _ensure_dirs():
     os.makedirs(os.path.join(UPLOAD_DIR, "artifacts", "video"), exist_ok=True)
 
-def get_exhaustive_args(task_mode="t2v", image_path=None) -> argparse.Namespace:
-    """Returns a Namespace containing EVERY attribute required by Hunyuan 1.5."""
+
+def get_exhaustive_args(task_mode: str = "t2v", image_path: Optional[str] = None) -> argparse.Namespace:
+    """Returns a Namespace containing every attribute the Tencent repo expects in infer_state."""
     args = argparse.Namespace()
-    
-    # --- Generation / Sampling Params ---
+
     args.prompt = ""
     args.video_length = FRAMES
     args.total_steps = STEPS
@@ -78,30 +129,26 @@ def get_exhaustive_args(task_mode="t2v", image_path=None) -> argparse.Namespace:
     args.cfg_scale = 1.0
     args.embedded_cfg_scale = 6.0
     args.denoise_type = "flow"
-    
-    # --- Attention & Performance Params ---
+
     args.use_sageattn = True
     args.sparse_attn = False
     args.sage_blocks_range = "0-53"
     args.no_cache_block_id = "54"
     args.enable_torch_compile = False
-    
-    # --- Caching System Params ---
+
     args.enable_cache = False
     args.cache_type = "standard"
     args.cache_device = "cuda"
     args.cache_start_step = 0
     args.cache_end_step = STEPS
-    args.cache_step_interval = 1 
-    
-    # --- Precision, Quantization & Distillation ---
+    args.cache_step_interval = 1
+
     args.dtype = "bf16"
     args.use_fp8_gemm = False
     args.quant_type = "none"
     args.cfg_distilled = True
     args.enable_step_distill = False
-    
-    # --- Path & Logic Params ---
+
     args.resolution = "720p"
     args.image_path = image_path
     args.sr = ENABLE_SR
@@ -110,59 +157,75 @@ def get_exhaustive_args(task_mode="t2v", image_path=None) -> argparse.Namespace:
     args.lora_path = None
     args.save_path = "output.mp4"
 
-    # --- Offloading & Distribution ---
     args.offloading = ENABLE_OFFLOADING
     args.group_offloading = ENABLE_GROUP_OFFLOADING
     args.overlap_group_offloading = ENABLE_OVERLAP_OFFLOADING
-    args.sp = 1 
-    
+
+    # Sequence parallel setting (keep 1 for single-process service)
+    args.sp = 1
+
     return args
 
-def _load_pipeline() -> Any:
-    # --- Glyph Checkpoint & Assets Self-Heal ---
+
+def _repair_glyph_layout_non_destructive():
+    """
+    Fix expected glyph layout WITHOUT renaming/moving the originals.
+    This prevents you from feeding safetensors bytes into torch.load via wrong rename.
+    """
     glyph_root = os.path.join(MODEL_PATH, "text_encoder", "Glyph-SDXL-v2")
     assets_dir = os.path.join(glyph_root, "assets")
     checkpoints_dir = os.path.join(glyph_root, "checkpoints")
-    
-    # 1. Fix Checkpoints
-    os.makedirs(checkpoints_dir, exist_ok=True)
-    target_ckpt = os.path.join(checkpoints_dir, "byt5_model.pt")
-    if not os.path.exists(target_ckpt):
-        for f in ["model.safetensors", "pytorch_model.bin", "byt5_model.bin"]:
-            src = os.path.join(glyph_root, f)
-            if os.path.exists(src):
-                shutil.move(src, target_ckpt)
-                log.info(f"Fixed: Renamed {f} -> byt5_model.pt")
-                break
 
-    # 2. Fix Assets (Moving them if they downloaded to the wrong depth)
+    if not os.path.isdir(glyph_root):
+        log.warning("glyph_root missing: %s", glyph_root)
+        return
+
     os.makedirs(assets_dir, exist_ok=True)
+    os.makedirs(checkpoints_dir, exist_ok=True)
+
+    # Copy assets into assets/ if they are at root
     for asset_file in ["multilingual_10-lang_idx.json", "color_idx.json"]:
         src_path = os.path.join(glyph_root, asset_file)
         dst_path = os.path.join(assets_dir, asset_file)
         if os.path.exists(src_path) and not os.path.exists(dst_path):
-            shutil.move(src_path, dst_path)
-            log.info(f"Fixed: Moved {asset_file} to assets folder")
+            try:
+                shutil.copy2(src_path, dst_path)
+                log.info("Glyph fix: copied %s -> assets/", asset_file)
+            except Exception as e:
+                log.warning("Glyph fix: failed copying %s: %s", asset_file, e)
 
-    # ... Now continue with initialize_parallel_state and initialize_infer_state ...
-    # --- End Repair ---
+    # Ensure a checkpoint exists at checkpoints/byt5_model.pt by COPYING a candidate
+    target_ckpt = os.path.join(checkpoints_dir, "byt5_model.pt")
+    if not os.path.exists(target_ckpt):
+        candidates = [
+            os.path.join(glyph_root, "pytorch_model.bin"),     # torch
+            os.path.join(glyph_root, "pytorch_model.pt"),      # torch
+            os.path.join(glyph_root, "byt5_model.pt"),         # torch
+            os.path.join(glyph_root, "model.safetensors"),     # safetensors
+            os.path.join(glyph_root, "pytorch_model.safetensors"),
+        ]
+        for src in candidates:
+            if os.path.exists(src) and os.path.getsize(src) > 0:
+                try:
+                    shutil.copy2(src, target_ckpt)
+                    log.info("Glyph fix: copied %s -> checkpoints/byt5_model.pt", os.path.basename(src))
+                    break
+                except Exception as e:
+                    log.warning("Glyph fix: failed copying %s: %s", src, e)
+
+
+def _load_pipeline() -> Any:
     t0 = time.monotonic()
-    
-    # 1. Parallelism Guard
-    WORLD_SIZE = torch.cuda.device_count()
-    if not dist.is_initialized():
-        initialize_parallel_state(sp=1)
 
-    # 2. Get full args for initialization
+    # Non-destructive glyph layout repair before pipeline loads
+    _repair_glyph_layout_non_destructive()
+
     args = get_exhaustive_args(task_mode="t2v")
     infer_state = initialize_infer_state(args)
-    
-    # 3. Device placement logic
-    device = torch.device('cpu') if args.offloading else torch.device('cuda')
-    transformer_init_device = torch.device('cpu') if args.group_offloading else device
 
-    # 4. Create Pipeline
-    # Note: 1.5 create_pipeline internally handles loading 720p_t2v and 720p_i2v folders
+    device = torch.device("cpu") if args.offloading else torch.device("cuda")
+    transformer_init_device = torch.device("cpu") if args.group_offloading else device
+
     pipe = HunyuanVideo_1_5_Pipeline.create_pipeline(
         pretrained_model_name_or_path=args.model_path,
         transformer_version="720p_t2v",
@@ -170,10 +233,10 @@ def _load_pipeline() -> Any:
         transformer_dtype=torch.bfloat16,
         device=device,
         transformer_init_device=transformer_init_device,
-        use_safetensors=True
+        use_safetensors=True,
     )
 
-    # 5. Apply Optimizations
+    # Apply Tencent optimizations
     pipe.apply_infer_optimization(
         infer_state=infer_state,
         enable_offloading=args.offloading,
@@ -181,8 +244,17 @@ def _load_pipeline() -> Any:
         overlap_group_offloading=args.overlap_group_offloading,
     )
 
-    log.info(f"Hunyuan 1.5 fully loaded. SR={ENABLE_SR}. GPUs={WORLD_SIZE}. Time: {int(time.monotonic()-t0)}s")
+    log.info(
+        "Hunyuan 1.5 loaded. SR=%s offloading=%s group_offloading=%s overlap=%s GPUs=%d dur_s=%d",
+        ENABLE_SR,
+        ENABLE_OFFLOADING,
+        ENABLE_GROUP_OFFLOADING,
+        ENABLE_OVERLAP_OFFLOADING,
+        torch.cuda.device_count() if torch.cuda.is_available() else 0,
+        int(time.monotonic() - t0),
+    )
     return pipe
+
 
 @APP.on_event("startup")
 def _startup():
@@ -190,35 +262,39 @@ def _startup():
     _ensure_dirs()
     PIPE = _load_pipeline()
 
+
 @APP.post("/v1/video/generate")
 async def generate(req: Request):
-    body = (await req.body()).decode("utf-8")
-    data = JSONParser().parse(body, {})
-    prompt = data.get("prompt")
-    image_path = data.get("image_path") 
-    
-    if not prompt:
-        return JSONResponse(status_code=422, content={"error": "Prompt required"})
+    body_txt = (await req.body()).decode("utf-8", errors="replace")
+    data = JSONParser().parse(body_txt, {}) if body_txt.strip() else {}
+    if not isinstance(data, dict):
+        return JSONResponse(status_code=400, content={"ok": False, "error": "invalid_json"})
 
-    # Check for I2V vs T2V
-    is_i2v = bool(image_path and os.path.exists(image_path))
+    prompt = data.get("prompt")
+    image_path = data.get("image_path")
+
+    if not isinstance(prompt, str) or not prompt.strip():
+        return JSONResponse(status_code=422, content={"ok": False, "error": "prompt_required"})
+
+    is_i2v = isinstance(image_path, str) and image_path.strip() and os.path.exists(image_path.strip())
     task_mode = "i2v" if is_i2v else "t2v"
-    
-    trace_id = data.get("trace_id", uuid.uuid4().hex)
+
+    trace_id = data.get("trace_id")
+    trace_id = trace_id.strip() if isinstance(trace_id, str) and trace_id.strip() else uuid.uuid4().hex
+
     out_dir = os.path.join(UPLOAD_DIR, "artifacts", "video", trace_id)
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, "output.mp4")
 
+    if PIPE is None:
+        return JSONResponse(status_code=500, content={"ok": False, "error": "pipe_not_ready"})
+
     t0 = time.monotonic()
     with _PIPE_LOCK:
         try:
-            # We must pass the exhaustive args for every call to satisfy internal lookups
-            # especially for the tile-based attention buffers in 1.5
-            current_args = get_exhaustive_args(task_mode=task_mode, image_path=image_path if is_i2v else None)
-            
             PIPE(
                 prompt=prompt.strip(),
-                image_path=current_args.image_path,
+                image_path=image_path.strip() if is_i2v else None,
                 height=HEIGHT,
                 width=WIDTH,
                 video_length=FRAMES,
@@ -227,20 +303,25 @@ async def generate(req: Request):
                 save_path=out_path,
                 enable_sr=ENABLE_SR,
                 sr_max_batch_size=1,
-                use_sage_attn=True
+                use_sage_attn=True,
             )
         except Exception as e:
-            log.error(f"Trace: {trace_id} | Task: {task_mode} | Error: {e}")
-            return JSONResponse(status_code=500, content={"error": str(e)})
+            log.error("Trace=%s task=%s error=%s", trace_id, task_mode, e, exc_info=True)
+            return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
+
+    dur_ms = int((time.monotonic() - t0) * 1000)
+    url = f"{PUBLIC_BASE_URL}/uploads/artifacts/video/{trace_id}/output.mp4" if PUBLIC_BASE_URL else None
 
     return {
         "ok": True,
         "trace_id": trace_id,
         "task": task_mode,
-        "output_url": f"{PUBLIC_BASE_URL}/uploads/artifacts/video/{trace_id}/output.mp4",
+        "output_path": out_path,
+        "output_url": url,
         "resolution": "1920x1080" if ENABLE_SR else "1280x720",
-        "dur_ms": int((time.monotonic() - t0) * 1000)
+        "dur_ms": dur_ms,
     }
+
 
 if __name__ == "__main__":
     import uvicorn
