@@ -29,6 +29,13 @@ MODEL_PATH = os.getenv("HYVIDEO_MODEL_PATH", os.path.join(MODELS_DIR, "hunyuan")
 CODE_PATH = os.getenv("HYVIDEO_CODE_PATH", "/opt/hunyuan15_src").strip()
 PORT = int(os.getenv("HYVIDEO_PORT", "8094"))
 
+# Force enable for maximum VRAM savings and multi-GPU stability
+ENABLE_GROUP_OFFLOADING = os.getenv("HYVIDEO_GROUP_OFFLOADING", "1").strip().lower() in ("1", "true", "yes", "on")
+
+# Additionally, consider enabling 'overlap_group_offloading' for a 2026 performance boost
+ENABLE_OVERLAP_OFFLOADING = True # Speeds up inference by overlapping data transfer with computation
+
+
 # Defaults for 720p base generation
 WIDTH = 1280
 HEIGHT = 720
@@ -62,19 +69,60 @@ _PIPE_LOCK = torch.multiprocessing.Lock()
 def _ensure_dirs():
     os.makedirs(os.path.join(UPLOAD_DIR, "artifacts", "video"), exist_ok=True)
 
-def _load_pipeline():
-    initialize_infer_state()
+import argparse
+
+
+def _load_pipeline() -> Any:
+    t0 = time.monotonic()
     
-    pipe = HunyuanVideo_1_5_Pipeline.create_pipeline(
-        pretrained_model_name_or_path=MODEL_PATH,
-        transformer_version="720p_t2v",
-        device_map="auto",             # Still use for multi-GPU
-        enable_offloading=True,        # Vital for 24GB cards on 11.8
-        transformer_dtype=torch.bfloat16, # Use BF16 for 11.8 compatibility
-        use_sr_module=ENABLE_SR,
-        attention_mode="sage"          # Force Sage over Flex
+    # 1. Initialize global inference state
+    # This function returns the state object needed for optimizations
+    args = argparse.Namespace(
+        resolution="720p",
+        sparse_attn=False,
+        use_sageattn=True,
     )
+    # CAPTURE the returned infer_state
+    infer_state = initialize_infer_state(args)
+    
+    # 2. Determine device placement based on offloading settings
+    # For CUDA 11.8 multi-GPU setups, init the pipeline on CPU to avoid OOM
+    # then let device_map distribute it.
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+
+    # 3. Create the pipeline
+    # use_sr_module=True is required here to load the native upscaler weights
+    pipe = HunyuanVideo_1_5_Pipeline.create_pipeline(
+        pretrained_model_name_or_path = MODEL_PATH,
+        transformer_version = "720p_t2v",
+        enable_offloading = bool(ENABLE_OFFLOADING),
+        enable_group_offloading = bool(ENABLE_GROUP_OFFLOADING),
+        device = device,
+        transformer_dtype = torch.bfloat16,
+        attention_mode = "sage"  # Required for CUDA 11.8 SM75 compatibility
+    )
+
+    # 4. Apply Multi-GPU & CPU Optimization
+    # This uses the captured infer_state to manage the VRAM/RAM overlap
+    pipe.apply_infer_optimization(
+        infer_state=infer_state,
+        enable_offloading=bool(ENABLE_OFFLOADING),
+        enable_group_offloading=bool(ENABLE_GROUP_OFFLOADING),
+        overlap_group_offloading=ENABLE_OVERLAP_OFFLOADING
+    )
+
+    # 5. Apply optimizations to the SR (Upscale) pipeline specifically
+    if ENABLE_SR and hasattr(pipe, 'sr_pipeline'):
+        pipe.sr_pipeline.apply_infer_optimization(
+            infer_state=infer_state,
+            enable_offloading=bool(ENABLE_OFFLOADING),
+            enable_group_offloading=bool(ENABLE_GROUP_OFFLOADING),
+            overlap_group_offloading=ENABLE_OVERLAP_OFFLOADING
+        )
+
+    log.info("pipeline loaded dur_ms=%d", int((time.monotonic() - t0) * 1000))
     return pipe
+
 
 
 
