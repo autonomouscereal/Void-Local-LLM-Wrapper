@@ -71,57 +71,64 @@ def _ensure_dirs():
 
 import argparse
 
-
 def _load_pipeline() -> Any:
     t0 = time.monotonic()
     
-    # 1. Initialize global inference state
-    # This function returns the state object needed for optimizations
-    args = argparse.Namespace(
-        resolution="720p",
-        sparse_attn=False,
-        use_sageattn=True,
-    )
-    # CAPTURE the returned infer_state
+    # Create the mock args object with ALL required 1.5 attributes
+    args = argparse.Namespace()
+    
+    # 1. Essential Performance/Attention Flags
+    args.use_sageattn = True
+    args.sparse_attn = False
+    args.sage_blocks_range = "0-53"  # The missing attribute causing your crash
+    args.no_cache_block_id = None    # Required for the internal caching logic
+    args.resolution = "720p"         # Used for transformer versioning
+    
+    # 2. Precision and Offloading Flags
+    args.dtype = "bf16"
+    args.offloading = ENABLE_OFFLOADING
+    args.group_offloading = ENABLE_GROUP_OFFLOADING
+    args.overlap_group_offloading = ENABLE_OVERLAP_OFFLOADING
+    
+    # 3. Model Logic Flags
+    args.cfg_distilled = True        # Default for 1.5
+    args.enable_step_distill = False
+    args.image_path = None           # Default to T2V mode
+    args.sr = ENABLE_SR              # Super-resolution flag
+    args.model_path = MODEL_PATH
+
+    # Initialize the state (This returns the object needed for apply_infer_optimization)
+    # The code you provided calls: infer_state = initialize_infer_state(args)
     infer_state = initialize_infer_state(args)
     
-    # 2. Determine device placement based on offloading settings
-    # For CUDA 11.8 multi-GPU setups, init the pipeline on CPU to avoid OOM
-    # then let device_map distribute it.
-    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    # Determine devices as per generate.py logic
+    # If offloading is on, they init on CPU to save VRAM
+    device = torch.device('cpu') if args.offloading else torch.device('cuda')
+    transformer_init_device = torch.device('cpu') if args.group_offloading else device
 
-    # 3. Create the pipeline
-    # use_sr_module=True is required here to load the native upscaler weights
+    # Create the pipeline using the 1.5 Factory
+    # Note: 'create_sr_pipeline' is the arg name in the code you provided
     pipe = HunyuanVideo_1_5_Pipeline.create_pipeline(
-        pretrained_model_name_or_path = MODEL_PATH,
-        transformer_version = "720p_t2v",
-        enable_offloading = bool(ENABLE_OFFLOADING),
-        enable_group_offloading = bool(ENABLE_GROUP_OFFLOADING),
-        device = device,
-        transformer_dtype = torch.bfloat16,
-        attention_mode = "sage"  # Required for CUDA 11.8 SM75 compatibility
+        pretrained_model_name_or_path=args.model_path,
+        transformer_version="720p_t2v",
+        create_sr_pipeline=args.sr,
+        transformer_dtype=torch.bfloat16,
+        device=device,
+        transformer_init_device=transformer_init_device,
     )
 
-    # 4. Apply Multi-GPU & CPU Optimization
-    # This uses the captured infer_state to manage the VRAM/RAM overlap
+    # Apply the optimizations using the infer_state we just created
     pipe.apply_infer_optimization(
         infer_state=infer_state,
-        enable_offloading=bool(ENABLE_OFFLOADING),
-        enable_group_offloading=bool(ENABLE_GROUP_OFFLOADING),
-        overlap_group_offloading=ENABLE_OVERLAP_OFFLOADING
+        enable_offloading=args.offloading,
+        enable_group_offloading=args.group_offloading,
+        overlap_group_offloading=args.overlap_group_offloading,
     )
 
-    # 5. Apply optimizations to the SR (Upscale) pipeline specifically
-    if ENABLE_SR and hasattr(pipe, 'sr_pipeline'):
-        pipe.sr_pipeline.apply_infer_optimization(
-            infer_state=infer_state,
-            enable_offloading=bool(ENABLE_OFFLOADING),
-            enable_group_offloading=bool(ENABLE_GROUP_OFFLOADING),
-            overlap_group_offloading=ENABLE_OVERLAP_OFFLOADING
-        )
-
-    log.info("pipeline loaded dur_ms=%d", int((time.monotonic() - t0) * 1000))
+    log.info("Hunyuan 1.5 Pipeline & SR optimized and loaded. dur_ms=%d", 
+             int((time.monotonic() - t0) * 1000))
     return pipe
+
 
 
 
