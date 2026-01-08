@@ -91,6 +91,7 @@ def _load_pipeline() -> Any:
     args.cache_device = "cuda"
     args.cache_start_step = 0
     args.cache_end_step = STEPS
+    args.cache_step_interval = 1 
     
     # --- Precision, Quantization & Distillation ---
     args.dtype = "bf16"
