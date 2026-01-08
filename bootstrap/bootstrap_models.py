@@ -59,9 +59,7 @@ VERSIONED_KEYS = {
 }
 
 HF_MODELS: list[tuple[str, str, list[str] | None]] = [
-    # Official Tencent SR assets for 720->1080.
-    # NOTE: allow_patterns prevents downloading the entire Tencent repo.
-    # Updated HF_MODELS patterns in bootstrap script
+    # 1. Official Tencent Core (T2V, I2V, SR, Schedulers, VAE, and basic Text Encoders)
     (HUNYUAN15_TENCENT, "hunyuan", [
         "transformer/720p_t2v/*",
         "transformer/720p_i2v/*",
@@ -69,24 +67,20 @@ HF_MODELS: list[tuple[str, str, list[str] | None]] = [
         "upsampler/1080p_sr_distilled/*",
         "scheduler/*",
         "vae/*",
-        "text_encoder/llm/*",           # Standard LLM encoder
-        "text_encoder/clip_l/*",         # Standard CLIP encoder
+        "text_encoder/llm/*",
+        "text_encoder/clip_l/*",
         "model_index.json",
         "*.json",
     ]),
     
-    # 1. Download the weights (ModelScope or HF)
-    ("AI-ModelScope/Glyph-SDXL-v2", "hunyuan/text_encoder/Glyph-SDXL-v2", None),
-    
-    # 2. Download the REQUIRED assets (multilingual_10-lang_idx.json, color_idx.json, etc.)
-    # These are often separate or in a different branch in some repos
-    ("LPDoctor/Glyph-SDXL-v2", "hunyuan/text_encoder/Glyph-SDXL-v2", ["assets/*", "*.json", "checkpoints/*"]),
-    # NEW: Download the base ByT5 weights for the Glyph processor
-    ("google/byt5-small", "hunyuan/text_encoder/byt5-small", None),
-    # NEW: Download the Glyph-SDXL-v2 weights (requires specific restructuring)
-    ("AI-ModelScope/Glyph-SDXL-v2", "hunyuan/text_encoder/Glyph-SDXL-v2", None),
+    # 2. Glyph Encoder (Bilingual support). 
+    # Use the multimodalart repo ONLY. It is public and has all assets.
+    ("multimodalart/glyph-sdxl-v2-byt5-small", "hunyuan/text_encoder/Glyph-SDXL-v2", None),
 
-    # Diffusers-format 720p T2V checkpoint (what the service loads as HYVIDEO_MODEL_ID).
+    # 3. Base ByT5 weights (required by the glyph processor)
+    ("google/byt5-small", "hunyuan/text_encoder/byt5-small", None),
+
+    # 4. Rest of your mandatory models...
     (HUNYUAN15_DIFFUSERS_720P_T2V, "hunyuan_diffusers", None),
     ("Lightricks/LTX-Video",                  "ltx_video",      None),
     ("InstantX/InstantID",                    "instantid",      None),
@@ -98,12 +92,8 @@ HF_MODELS: list[tuple[str, str, list[str] | None]] = [
     ("laion/clap-htsat-unfused",              "clap",           None),
     ("Salesforce/blip2-flan-t5-xl",           "blip2",          None),
     ("openai/whisper-large-v3",               "whisper",        None),
-    # Audio composition/variation (optional pre-warm)
-    ("facebook/musicgen-large",                "musicgen-large", None),
-    ("facebook/musicgen-melody",               "musicgen-melody", None),
-    ("facebook/audiogen-medium",               "audiogen-medium", None),
-    ("cvssp/audioldm2-large",                  "audioldm2-large", None),
 ]
+
 
 # Never append external/custom music engines dynamically in bootstrap; when used
 # they are handled as local artifacts outside this manifest.
