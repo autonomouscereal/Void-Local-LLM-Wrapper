@@ -53,7 +53,7 @@ except Exception as e:
 # REQUIRED for Multi-GPU: Initialize parallel state based on available GPUs
 # This sets up the communication backend for the model layers
 WORLD_SIZE = torch.cuda.device_count()
-initialize_parallel_state(sp=WORLD_SIZE)
+initialize_parallel_state(sp=1)
 
 APP = FastAPI(title="HunyuanVideo-1.5 Service")
 PIPE: Optional[Any] = None
