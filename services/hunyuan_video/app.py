@@ -51,7 +51,7 @@ except Exception as e:
     raise
 
 # REQUIRED for Multi-GPU: Initialize parallel state based on available GPUs
-# This sets up the communication backend for the model layers
+# This sets up the communication backend for the model layers,
 WORLD_SIZE = torch.cuda.device_count()
 initialize_parallel_state(sp=1)
 
