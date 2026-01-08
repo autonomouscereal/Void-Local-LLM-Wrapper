@@ -60,16 +60,24 @@ VERSIONED_KEYS = {
 HF_MODELS: list[tuple[str, str, list[str] | None]] = [
     # Official Tencent SR assets for 720->1080.
     # NOTE: allow_patterns prevents downloading the entire Tencent repo.
+    # Updated HF_MODELS patterns in bootstrap script
     (HUNYUAN15_TENCENT, "hunyuan", [
-        "transformer/720p_t2v/*",          # For Text-to-Video
-        "transformer/720p_i2v/*",          # For Image-to-Video (Added)
+        "transformer/720p_t2v/*",
+        "transformer/720p_i2v/*",
         "transformer/1080p_sr_distilled/*",
         "upsampler/1080p_sr_distilled/*",
         "scheduler/*",
         "vae/*",
+        "text_encoder/llm/*",           # Standard LLM encoder
+        "text_encoder/clip_l/*",         # Standard CLIP encoder
         "model_index.json",
         "*.json",
     ]),
+    # NEW: Download the base ByT5 weights for the Glyph processor
+    ("google/byt5-small", "hunyuan/text_encoder/byt5-small", None),
+    # NEW: Download the Glyph-SDXL-v2 weights (requires specific restructuring)
+    ("AI-ModelScope/Glyph-SDXL-v2", "hunyuan/text_encoder/Glyph-SDXL-v2", None),
+
     # Diffusers-format 720p T2V checkpoint (what the service loads as HYVIDEO_MODEL_ID).
     (HUNYUAN15_DIFFUSERS_720P_T2V, "hunyuan_diffusers", None),
     ("Lightricks/LTX-Video",                  "ltx_video",      None),
