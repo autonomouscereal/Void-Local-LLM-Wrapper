@@ -7,14 +7,15 @@ import logging
 import argparse
 from typing import Any, Dict, Optional
 
-# 2026 Optimization Kernels
-import sageattention
-import angelslim
 import torch
 import torch.distributed as dist
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from void_json.json_parser import JSONParser
+
+# 2026 Optimization Kernels
+import sageattention
+import angelslim
 
 # ---------------------------
 # Config & Environment
@@ -29,7 +30,6 @@ MODEL_PATH = os.getenv("HYVIDEO_MODEL_PATH", os.path.join(MODELS_DIR, "hunyuan")
 CODE_PATH = os.getenv("HYVIDEO_CODE_PATH", "/opt/hunyuan15_src").strip()
 PORT = int(os.getenv("HYVIDEO_PORT", "8094"))
 
-# Offload & Multi-GPU Logic
 ENABLE_OFFLOADING = os.getenv("HYVIDEO_OFFLOADING", "1") == "1"
 ENABLE_GROUP_OFFLOADING = os.getenv("HYVIDEO_GROUP_OFFLOADING", "1") == "1"
 ENABLE_OVERLAP_OFFLOADING = True 
@@ -61,28 +61,32 @@ def _ensure_dirs():
 def _load_pipeline() -> Any:
     t0 = time.monotonic()
     
-    # 1. Create the mock args object with ALL attributes required by 1.5
+    # 1. Create a COMPLETE mock args object based on Hunyuan 1.5 generate.py requirements
     args = argparse.Namespace()
     
-    # --- Required by initialize_infer_state ---
+    # --- Attention Config ---
+    args.use_sageattn = True
+    args.sparse_attn = False
+    args.sage_blocks_range = "0-53"
+    args.no_cache_block_id = "54"       # Valid string index to avoid parser error
+    
+    # --- Caching System Config (Fixes current AttributeError) ---
     args.enable_cache = False
-    args.cache_type = "standard"        # FIX: The attribute missing in your error
-    args.cache_device = "cuda"          # Required for cache config
+    args.cache_type = "standard"
+    args.cache_device = "cuda"
+    args.cache_start_step = 0
+    args.cache_end_step = 50
+    
+    # --- Performance & Distillation Flags ---
     args.enable_torch_compile = False
     args.use_fp8_gemm = False
     args.quant_type = "none"
+    args.cfg_distilled = True
     args.enable_step_distill = False
     
-    # --- Attention & Caching Logic ---
-    args.use_sageattn = True
-    args.sparse_attn = False
-    args.sage_blocks_range = "0-53"     # Full range for 8.3B model
-    args.no_cache_block_id = "54"       # Valid index string to avoid parser crash
-    
-    # --- Path & Model Logic ---
+    # --- Model & Path Config ---
     args.resolution = "720p"
     args.dtype = "bf16"
-    args.cfg_distilled = True
     args.image_path = None
     args.sr = ENABLE_SR
     args.model_path = MODEL_PATH
@@ -94,16 +98,16 @@ def _load_pipeline() -> Any:
     args.group_offloading = ENABLE_GROUP_OFFLOADING
     args.overlap_group_offloading = ENABLE_OVERLAP_OFFLOADING
     
-    # 2. Initialize Parallel State for Multi-GPU
+    # 2. Multi-GPU Parallelism Initializaton
     WORLD_SIZE = torch.cuda.device_count()
     if not dist.is_initialized():
-        # sp=1 is standard for single-process inference distribution
+        # sp must be 1 for single-process distribution via create_pipeline
         initialize_parallel_state(sp=1)
 
     # 3. Initialize Infer State (Hunyuan 1.5 Core)
     infer_state = initialize_infer_state(args)
     
-    # 4. Device Placement (Logic from 1.5 generate.py)
+    # 4. Device Placement logic (Logic from generate.py)
     device = torch.device('cpu') if args.offloading else torch.device('cuda')
     transformer_init_device = torch.device('cpu') if args.group_offloading else device
 
@@ -125,7 +129,7 @@ def _load_pipeline() -> Any:
         overlap_group_offloading=args.overlap_group_offloading,
     )
 
-    log.info(f"Hunyuan 1.5 service optimized for 2026. Loaded on {WORLD_SIZE} GPUs. Time: {int(time.monotonic()-t0)}s")
+    log.info(f"Hunyuan 1.5 pipeline initialized. Mode: 720p{' + 1080p SR' if ENABLE_SR else ''}. Time: {int(time.monotonic()-t0)}s")
     return pipe
 
 @APP.on_event("startup")
@@ -151,7 +155,7 @@ async def generate(req: Request):
     t0 = time.monotonic()
     with _PIPE_LOCK:
         try:
-            # HunyuanVideo 1.5 call
+            # 1.5 Inference Call
             PIPE(
                 prompt=prompt.strip(),
                 height=HEIGHT,
@@ -160,20 +164,21 @@ async def generate(req: Request):
                 infer_steps=STEPS,
                 fps=FPS,
                 save_path=out_path,
-                enable_sr=ENABLE_SR,        # 1080p Upscale
-                sr_max_batch_size=1,        # Prevents OOM during upscale
+                enable_sr=ENABLE_SR,        # Native 1080p Super-Resolution
+                sr_max_batch_size=1,        # 2026 stability flag for VRAM overhead
                 use_sage_attn=True
             )
         except Exception as e:
             log.error(f"Trace: {trace_id} | Error: {e}")
             return JSONResponse(status_code=500, content={"error": str(e)})
 
+    dur_ms = int((time.monotonic() - t0) * 1000)
     return {
         "ok": True,
         "trace_id": trace_id,
         "output_url": f"{PUBLIC_BASE_URL}/uploads/artifacts/video/{trace_id}/output.mp4",
         "resolution": "1920x1080" if ENABLE_SR else "1280x720",
-        "dur_ms": int((time.monotonic() - t0) * 1000)
+        "dur_ms": dur_ms
     }
 
 if __name__ == "__main__":
