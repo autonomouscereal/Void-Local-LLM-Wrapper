@@ -15,6 +15,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from void_json.json_parser import JSONParser
 
+import torch.distributed as dist  # <--- Add this import
 # ---------------------------
 # Config & Environment
 # ---------------------------
@@ -66,44 +67,53 @@ def _ensure_dirs():
 def _load_pipeline() -> Any:
     t0 = time.monotonic()
     
-    # Create the mock args object with all required 1.5 attributes
+    # 1. Create the mock args object with ALL required 1.5 attributes
     args = argparse.Namespace()
     
-    # 1. Attention & Caching Fixes
+    # Missing attribute that caused the current crash
+    args.enable_torch_compile = False  # Set to False for stability on CUDA 11.8
+    
+    # Essential Performance & Attention Flags
     args.use_sageattn = True
     args.sparse_attn = False
-    args.sage_blocks_range = "0-53"  # Standard for 8.3B model
-    
-    # FIX: Use "54" (out-of-bounds) instead of "" or None to satisfy parse_range
-    args.no_cache_block_id = "54"    
-    
-    # 2. Resolution and Model Flags
+    args.sage_blocks_range = "0-53"
+    args.no_cache_block_id = "54"    # Fixed to prevent int conversion error
     args.resolution = "720p"
+    
+    # Precision and Distillation Flags (Standard 1.5 defaults)
     args.dtype = "bf16"
     args.cfg_distilled = True
     args.enable_step_distill = False
-    args.image_path = None
-    args.sr = ENABLE_SR
+    args.quant_type = "none"         # Required for sgl_kernel/fp8 checks
+    args.use_fp8_gemm = False        # Required for CUDA 11.8 compatibility
+    
+    # Path & Mode Flags
+    args.image_path = None           # Default to T2V
+    args.sr = ENABLE_SR              # Super-resolution flag
     args.model_path = MODEL_PATH
+    args.checkpoint_path = None      # Required by some 1.5 init paths
+    args.lora_path = None            # Required by some 1.5 init paths
 
-    # 3. Offloading & Performance
+    # Offloading Configuration
     args.offloading = ENABLE_OFFLOADING
     args.group_offloading = ENABLE_GROUP_OFFLOADING
     args.overlap_group_offloading = ENABLE_OVERLAP_OFFLOADING
     
-    # REQUIRED: Initialize parallel state based on your GPU count
-    # sp must be a divisor of world_size; typically set to total GPUs
+    # 2. Parallelism Initialization
+    # Must be done BEFORE initialize_infer_state for multi-GPU communication
     WORLD_SIZE = torch.cuda.device_count()
-    initialize_parallel_state(sp=1)
+    if not dist.is_initialized():
+        initialize_parallel_state(sp=1)
 
-    # Initialize state (must capture the returned infer_state)
+    # 3. Initialize State
+    # This now has all attributes required by hyvideo/commons/infer_state.py
     infer_state = initialize_infer_state(args)
     
-    # Device placement logic from generate.py
+    # 4. Determine Initialization Devices (Logic from generate.py)
     device = torch.device('cpu') if args.offloading else torch.device('cuda')
     transformer_init_device = torch.device('cpu') if args.group_offloading else device
 
-    # Create the pipeline using the 1.5 factory
+    # 5. Create Pipeline
     pipe = HunyuanVideo_1_5_Pipeline.create_pipeline(
         pretrained_model_name_or_path=args.model_path,
         transformer_version="720p_t2v",
@@ -113,7 +123,7 @@ def _load_pipeline() -> Any:
         transformer_init_device=transformer_init_device,
     )
 
-    # Apply optimizations
+    # 6. Apply Optimizations
     pipe.apply_infer_optimization(
         infer_state=infer_state,
         enable_offloading=args.offloading,
@@ -121,7 +131,7 @@ def _load_pipeline() -> Any:
         overlap_group_offloading=args.overlap_group_offloading,
     )
 
-    log.info(f"Hunyuan 1.5 loaded on {WORLD_SIZE} GPUs. Time: {int(time.monotonic()-t0)}s")
+    log.info(f"Hunyuan 1.5 Pipeline fully initialized on {WORLD_SIZE} GPUs. Time: {int(time.monotonic()-t0)}s")
     return pipe
 
 
