@@ -94,7 +94,7 @@ def _load_pipeline() -> Any:
     # REQUIRED: Initialize parallel state based on your GPU count
     # sp must be a divisor of world_size; typically set to total GPUs
     WORLD_SIZE = torch.cuda.device_count()
-    initialize_parallel_state(sp=WORLD_SIZE)
+    initialize_parallel_state(sp=1)
 
     # Initialize state (must capture the returned infer_state)
     infer_state = initialize_infer_state(args)
