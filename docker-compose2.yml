@@ -3,48 +3,9 @@ x-build-args:
   PIP_EXTRA_INDEX_URL: https://download.pytorch.org/whl/cu118
 
 services:
-  ai_vols_init:
-    image: alpine:3.20
-    container_name: ai_vols_init
-    restart: "no"
-    command:
-      - sh
-      - -lc
-      - |
-        set -e
-        mkdir -p /ai-vols/models/film2
-        mkdir -p /ai-vols/models/comfyui
-        mkdir -p /ai-vols/models/hf_cache
-        mkdir -p /ai-vols/models/torch_cache
-        mkdir -p /ai-vols/models/tts_cache
-        mkdir -p /ai-vols/models/demucs_cache
-        mkdir -p /ai-vols/models/ollama/qwen
-        mkdir -p /ai-vols/models/ollama/glm
-        mkdir -p /ai-vols/models/ollama/deepseek
-        mkdir -p /ai-vols/models/rvc_models
-        mkdir -p /ai-vols/models/rvc_assets
-
-        mkdir -p /ai-vols/training_data/film2
-        mkdir -p /ai-vols/training_data/rvc
-
-        mkdir -p /ai-vols/artifacts
-        mkdir -p /ai-vols/artifacts/images
-        mkdir -p /ai-vols/artifacts/videos
-        mkdir -p /ai-vols/artifacts/audio
-        mkdir -p /ai-vols/artifacts/tmp
-        mkdir -p /ai-vols/artifacts/manifests
-        mkdir -p /ai-vols/artifacts/logs
-
-        echo "[ai_vols_init] ✅ ensured directory layout under /mnt/ai-vols"
-    volumes:
-      - /mnt/ai-vols:/ai-vols
-
   film2_bootstrap:
     image: python:3.11-slim
     container_name: film2_bootstrap
-    depends_on:
-      ai_vols_init:
-        condition: service_completed_successfully
     command: ["/bin/bash","-lc","/bin/bash /bootstrap/bootstrap_models.sh"]
     environment:
       - FILM2_MODELS=/opt/models
@@ -59,10 +20,13 @@ services:
       - MUSIC_ENGINE_TARBALL_URL=${MUSIC_ENGINE_TARBALL_URL:-}
       - HUGGINGFACE_TOKEN=${HUGGINGFACE_TOKEN:-}
     volumes:
-      - /mnt/ai-vols/models/film2:/opt/models
+      - film2_models:/opt/models
       - ./bootstrap:/bootstrap:ro
-      - /mnt/ai-vols/artifacts:/workspace/uploads
+      - void_artifacts:/workspace/uploads
     restart: "no"
+
+
+    
 
   rvc_python:
     build:
@@ -74,8 +38,7 @@ services:
     devices:
       - "nvidia.com/gpu=all"
     depends_on:
-      film2_bootstrap:
-        condition: service_completed_successfully
+      - film2_bootstrap
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
@@ -83,9 +46,11 @@ services:
       - LOG_DIR=/workspace/logs
       - LOG_LEVEL=${RVC_LOG_LEVEL:-DEBUG}
     volumes:
-      - /mnt/ai-vols/models/rvc_models:/srv/rvc_models
-      - /mnt/ai-vols/models/film2:/opt/models:ro
-      - /mnt/ai-vols/artifacts:/workspace/uploads
+      # RVC models live here; one subdir per model (trained voice models)
+      - rvc_models:/srv/rvc_models
+      # Access to Titan pretrained weights from bootstrap (read-only)
+      - film2_models:/opt/models:ro
+      - void_artifacts:/workspace/uploads
       - void_logs:/workspace/logs
     network_mode: host
     expose:
@@ -101,8 +66,7 @@ services:
     devices:
       - "nvidia.com/gpu=all"
     depends_on:
-      film2_bootstrap:
-        condition: service_completed_successfully
+      - film2_bootstrap
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
@@ -112,14 +76,19 @@ services:
       - RVC_TRAIN_DATA_ROOT=/srv/data
       - RVC_MODELS_ROOT=/srv/rvc_models
       - RVC_WEBUI_ROOT=/srv/rvc_webui
+      # Default voices: do not require env vars. Point both male/female defaults
+      # to the base Titan checkpoint (/srv/rvc_models/TITAN/TITAN.pth).
       - RVC_DEFAULT_MALE_VOICE_ID=${RVC_DEFAULT_MALE_VOICE_ID:-TITAN}
       - RVC_DEFAULT_FEMALE_VOICE_ID=${RVC_DEFAULT_FEMALE_VOICE_ID:-TITAN}
     volumes:
-      - /mnt/ai-vols/models/film2:/opt/models:ro
-      - /mnt/ai-vols/models/rvc_models:/srv/rvc_models
-      - /mnt/ai-vols/training_data/rvc:/srv/data
+      # Titan pretrain is already on the server; mount it read-only
+      - film2_models:/opt/models:ro
+      # Shared RVC models (same volume as rvc_python uses)
+      - rvc_models:/srv/rvc_models
+      # Training data + logs
+      - rvc_train_data:/srv/data
       - rvc_logs:/srv/logs
-      - /mnt/ai-vols/artifacts:/workspace/uploads
+      - void_artifacts:/workspace/uploads
       - void_logs:/workspace/logs
     network_mode: host
     expose:
@@ -127,6 +96,8 @@ services:
 
   rvc:
     build:
+      # Build from repo root so we can COPY shared packages like `void_envelopes/`
+      # and `void_json/` into the image (rvc does not mount the whole repo at runtime).
       context: .
       dockerfile: services/rvc/Dockerfile
     container_name: rvc_service
@@ -141,14 +112,18 @@ services:
       - NVIDIA_VISIBLE_DEVICES=${MUSIC_GPU:-all}
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - PYTHONUNBUFFERED=1
+      # RVC uses the shared model volume populated by bootstrap (rvc_titan under /opt/models).
       - RVC_MODEL_ROOT=/opt/models/rvc_titan
       - RVC_REGISTRY_PATH=/rvc/assets/registry.json
       - RVC_VOICES_ROOT=/rvc/assets/voices
       - RVC_ENGINE_BASE=http://127.0.0.1:5050
       - RVC_TRAINER_BASE=http://127.0.0.1:7070
       - RVC_MODELS_ROOT=/srv/rvc_models
+      # Default voices: do not require env vars. Point both male/female defaults
+      # to the base Titan checkpoint (/srv/rvc_models/TITAN/TITAN.pth).
       - RVC_DEFAULT_MALE_VOICE_ID=${RVC_DEFAULT_MALE_VOICE_ID:-TITAN}
       - RVC_DEFAULT_FEMALE_VOICE_ID=${RVC_DEFAULT_FEMALE_VOICE_ID:-TITAN}
+      # Service URLs for mining
       - DEMUCS_API_URL=http://127.0.0.1:9101
       - WHISPER_API_URL=http://127.0.0.1:7861
       - VOCALFIX_API_URL=http://127.0.0.1:7866
@@ -158,15 +133,22 @@ services:
     expose:
       - "7863"
     volumes:
-      - /mnt/ai-vols/models/film2:/opt/models:ro
-      - /mnt/ai-vols/models/rvc_assets:/rvc/assets
-      - /mnt/ai-vols/models/rvc_models:/srv/rvc_models
-      - /mnt/ai-vols/training_data/rvc:/srv/data
-      - /mnt/ai-vols/artifacts:/workspace/uploads
+      # Shared FILM2 model volume; bootstrap deposits blaise-tk/TITAN under /opt/models/rvc_titan
+      - film2_models:/opt/models:ro
+      # Persist RVC registry and voices
+      - rvc_assets:/rvc/assets
+      # Shared RVC models (same volume as rvc_python and rvc_trainer use)
+      - rvc_models:/srv/rvc_models
+      # Training data access
+      - rvc_train_data:/srv/data
+      - void_artifacts:/workspace/uploads
       - void_logs:/workspace/logs
+    
 
   vocalfix:
     build:
+      # Build from repo root so we can COPY shared packages like `void_envelopes/`
+      # into the image (vocalfix does not mount the whole repo at runtime).
       context: .
       dockerfile: services/vocalfix/Dockerfile
     container_name: vocalfix_service
@@ -182,9 +164,11 @@ services:
     expose:
       - "7864"
     volumes:
-      - /mnt/ai-vols/artifacts:/workspace/uploads
+      - void_artifacts:/workspace/uploads
       - void_logs:/workspace/logs
-
+    
+    
+      
   pgvector:
     network_mode: host
     image: pgvector/pgvector:0.7.4-pg16
@@ -195,11 +179,12 @@ services:
       - POSTGRES_USER=rag
       - POSTGRES_PASSWORD=ragpass
       - LOG_DIR=/workspace/logs
+    # host networking: no ports mapping needed
     volumes:
       - pgvector_data:/var/lib/postgresql/data
-      - /mnt/ai-vols/artifacts:/workspace/uploads
+      - void_artifacts:/workspace/uploads
       - void_logs:/workspace/logs
-
+    
   ollama_qwen:
     network_mode: host
     image: ollama/ollama:latest
@@ -209,14 +194,16 @@ services:
     runtime: nvidia
     devices:
       - "nvidia.com/gpu=all"
+    # host networking: no ports mapping needed
     environment:
       - OLLAMA_HOST=0.0.0.0:11435
       - OLLAMA_KEEP_ALIVE=24h
       - NVIDIA_VISIBLE_DEVICES=${OLLAMA_QWEN_GPU:-all}
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     volumes:
-      - /mnt/ai-vols/models/ollama/qwen:/root/.ollama
-      - /mnt/ai-vols/artifacts:/workspace/uploads
+      - ollama_qwen_data:/root/.ollama
+      - void_artifacts:/workspace/uploads
+    
 
   init_qwen:
     image: curlimages/curl:8.7.1
@@ -237,14 +224,16 @@ services:
     runtime: nvidia
     devices:
       - "nvidia.com/gpu=all"
+    # host networking: no ports mapping needed
     environment:
       - OLLAMA_HOST=0.0.0.0:11433
       - OLLAMA_KEEP_ALIVE=24h
       - NVIDIA_VISIBLE_DEVICES=${OLLAMA_GLM_GPU:-all}
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     volumes:
-      - /mnt/ai-vols/models/ollama/glm:/root/.ollama
-      - /mnt/ai-vols/artifacts:/workspace/uploads
+      - ollama_glm_data:/root/.ollama
+      - void_artifacts:/workspace/uploads
+
 
   deepseek_ollama:
     network_mode: host
@@ -255,14 +244,15 @@ services:
     runtime: nvidia
     devices:
       - "nvidia.com/gpu=all"
+    # host networking: no ports mapping needed
     environment:
       - OLLAMA_HOST=0.0.0.0:11436
       - OLLAMA_KEEP_ALIVE=24h
       - NVIDIA_VISIBLE_DEVICES=${OLLAMA_DEEPSEEK_GPU:-all}
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     volumes:
-      - /mnt/ai-vols/models/ollama/deepseek:/root/.ollama
-      - /mnt/ai-vols/artifacts:/workspace/uploads
+      - ollama_deepseek_data:/root/.ollama
+      - void_artifacts:/workspace/uploads
 
   init_glm:
     image: curlimages/curl:8.7.1
@@ -273,6 +263,7 @@ services:
     environment:
       - GLM_MODEL_ID=${GLM_MODEL_ID:-hf.co/unsloth/GLM-4.6V-Flash-GGUF:BF16}
     command: ["sh","-lc","until curl -s http://127.0.0.1:11433/api/tags >/dev/null; do sleep 2; done; echo Pulling $GLM_MODEL_ID; curl -s -X POST http://127.0.0.1:11433/api/pull -H 'Content-Type: application/json' -d '{\"name\":\"${GLM_MODEL_ID:-hf.co/unsloth/GLM-4.6V-Flash-GGUF:BF16}\"}'; echo Pulled $GLM_MODEL_ID"]
+
 
   init_deepseek:
     image: curlimages/curl:8.7.1
@@ -303,28 +294,32 @@ services:
     container_name: void_orchestrator
     restart: unless-stopped
     network_mode: host
-    depends_on:
-      ai_vols_init:
-        condition: service_completed_successfully
+    
+    # IMPORTANT (policy): Workpath/imports are FIXED.
+    # - Do NOT set PYTHONPATH here.
+    # - Do NOT use uvicorn --app-dir or change the module path.
+    # - The app must be imported as 'app.*' from /app inside the image.
+    # - Changing workpath/module path is FORBIDDEN.
     environment:
       - PYTHONUNBUFFERED=1
+      # Logging defaults: keep stdout readable in normal operation; override as needed.
       - ORCH_LOG_LEVEL=${ORCH_LOG_LEVEL:-DEBUG}
       - ORCH_THIRD_PARTY_LOG_LEVEL=${ORCH_THIRD_PARTY_LOG_LEVEL:-WARNING}
+      # Route third-party warnings to a separate file on the void log volume.
       - ORCH_THIRD_PARTY_LOG_TO_FILE=${ORCH_THIRD_PARTY_LOG_TO_FILE:-1}
       - ORCH_THIRD_PARTY_FILE_LEVEL=${ORCH_THIRD_PARTY_FILE_LEVEL:-WARNING}
+      # Numba JIT/logging defaults (librosa and other deps may import numba indirectly).
       - NUMBA_LOG_LEVEL=${NUMBA_LOG_LEVEL:-WARNING}
       - NUMBA_DEBUG=${NUMBA_DEBUG:-0}
       - FILM2_MODELS=/opt/models
       - FILM2_DATA=/srv/film2
-      - ORCH_LOG_DIR=/workspace/logs
-      - UPLOAD_DIR=/workspace/uploads
-      # (rest unchanged...)
       - QWEN_BASE_URL=http://127.0.0.1:11435
       - QWEN_MODEL_ID=${QWEN_MODEL_ID:-huihui_ai/qwen3-abliterated:30b-a3b-q4_K_M}
       - GLM_OLLAMA_BASE_URL=${GLM_OLLAMA_BASE_URL:-http://127.0.0.1:11433}
       - GLM_MODEL_ID=${GLM_MODEL_ID:-hf.co/unsloth/GLM-4.6V-Flash-GGUF:BF16}
       - DEEPSEEK_CODER_OLLAMA_BASE_URL=${DEEPSEEK_CODER_OLLAMA_BASE_URL:-http://127.0.0.1:11436}
       - DEEPSEEK_CODER_MODEL_ID=${DEEPSEEK_CODER_MODEL_ID:-huihui_ai/deepseek-r1-abliterated:32b}
+      # Enable ICW + Committee + Tools by default
       - ICW_MODE=${ICW_MODE:-committee}
       - ICW_DISABLE=0
       - AUTO_EXECUTE_TOOLS=${AUTO_EXECUTE_TOOLS:-true}
@@ -341,11 +336,14 @@ services:
       - SERPAPI_API_KEY
       - EXECUTOR_BASE_URL=http://127.0.0.1:8081
       - PLANNER_MODEL=${PLANNER_MODEL:-qwen3}
+      # Audio/vocal services are required parts of the pipeline; these must be set.
       - RVC_API_URL=${RVC_API_URL:-http://127.0.0.1:7863}
       - VOCAL_FIXER_API_URL=${VOCAL_FIXER_API_URL:-http://127.0.0.1:7864}
+      - MCP_HTTP_BRIDGE_URL
       - ASSEMBLER_API_URL=http://127.0.0.1:9095
       - DRT_API_URL=http://127.0.0.1:8086
       - HYVIDEO_API_URL=http://127.0.0.1:8094
+      - ORCH_LOG_DIR=/workspace/logs
       - POSTGRES_HOST=127.0.0.1
       - POSTGRES_PORT=5432
       - POSTGRES_DB=ragdb
@@ -363,6 +361,7 @@ services:
       - COMFYUI_REPLICAS=${COMFYUI_REPLICAS:-1}
       - SCENE_SUBMIT_CONCURRENCY=${SCENE_SUBMIT_CONCURRENCY:-4}
       - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-}
+      - UPLOAD_DIR=/workspace/uploads
       - VLM_API_URL=http://127.0.0.1:8050
       - OCR_API_URL=http://127.0.0.1:8070
       - AESTHETIC_HEAD_PATH=/opt/models/aesthetic/laion_v2_linear_L14.pt
@@ -371,13 +370,18 @@ services:
       - VFI_API_URL=${VFI_API_URL:-http://127.0.0.1:8098}
       - UPSCALE_API_URL=${UPSCALE_API_URL:-http://127.0.0.1:8099}
       - INSIGHTFACE_HOME=/models/insightface
+    # Run the canonical orchestrator application
+    # Force the pure-Python HTTP/1.1 stack (h11) to avoid intermittent connection issues
+    # that can occur with alternative HTTP protocol implementations under long-held requests.
+    # Run via python so we can enable faulthandler (-X faulthandler) to get
+    # useful output even on hard crashes during multi-worker startup.
     command: ["python","-X","faulthandler","-m","uvicorn","app.main:app","--host","0.0.0.0","--port","8000","--log-level","info","--access-log","--use-colors","--http","h11","--loop","asyncio","--workers","4"]
     volumes:
       - ./:/workspace
-      - /mnt/ai-vols/artifacts:/workspace/uploads
+      - void_artifacts:/workspace/uploads
       - void_logs:/workspace/logs
-      - /mnt/ai-vols/models/film2:/opt/models
-      - /mnt/ai-vols/training_data/film2:/srv/film2
+      - film2_models:/opt/models
+      - film2_data:/srv/film2
       - ./assets/comfyui/input:/comfyui/input
       - ./assets/insightface:/models/insightface
 
@@ -391,8 +395,7 @@ services:
     devices:
       - "nvidia.com/gpu=all"
     depends_on:
-      film2_bootstrap:
-        condition: service_completed_successfully
+      - film2_bootstrap
     environment:
       - PYTHONUNBUFFERED=1
       - LOG_DIR=/workspace/logs
@@ -403,11 +406,14 @@ services:
     expose:
       - "7860"
     volumes:
-      - /mnt/ai-vols/artifacts:/workspace/uploads
+      - void_artifacts:/workspace/uploads
       - void_logs:/workspace/logs
+
 
   xtts:
     build:
+      # Build from repo root so we can COPY shared packages like `void_json/`
+      # into the image (xtts does not mount the whole repo at runtime).
       context: .
       dockerfile: services/xtts/Dockerfile
       args:
@@ -418,30 +424,36 @@ services:
     devices:
       - "nvidia.com/gpu=all"
     depends_on:
-      film2_bootstrap:
-        condition: service_completed_successfully
+      - film2_bootstrap
+    # Run on host network so orchestrator and host can reach it at http://127.0.0.1:8020
     network_mode: host
     environment:
       - XTTS_MODEL_NAME=tts_models/multilingual/multi-dataset/xtts_v2
       - LOG_DIR=/workspace/logs
+      # Persistent per-voice model map; lives on tts_cache volume.
+      # Normally you don't need to override this.
       - XTTS_VOICE_MODEL_MAP_PATH=/root/.local/share/tts/voice_model_map.json
       - COQUI_TOS_AGREED=1
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      
       - HF_HOME=/models/hf
       - TRANSFORMERS_CACHE=/models/hf
       - TORCH_HOME=/models/torch
     expose:
       - "8020"
     shm_size: "1g"
+    
     volumes:
-      - /mnt/ai-vols/models/hf_cache:/models/hf
-      - /mnt/ai-vols/models/torch_cache:/models/torch
-      - /mnt/ai-vols/models/tts_cache:/root/.local/share/tts
-      - /mnt/ai-vols/artifacts:/workspace/uploads
+      - hf_cache:/models/hf
+      - torch_cache:/models/torch
+      # Persist XTTS cache and voice_model_map.json on a named volume.
+      - tts_cache:/root/.local/share/tts
+      - void_artifacts:/workspace/uploads
       - void_logs:/workspace/logs
-      - /mnt/ai-vols/models/film2:/opt/models:ro
-      - /mnt/ai-vols/training_data/film2:/srv/film2
+      - film2_models:/opt/models:ro
+      - film2_data:/srv/film2
+    
 
   whisper:
     build:
@@ -461,11 +473,13 @@ services:
     expose:
       - "9090"
     volumes:
-      - /mnt/ai-vols/artifacts:/workspace/uploads
+      - void_artifacts:/workspace/uploads
       - void_logs:/workspace/logs
 
   faceid:
     build:
+      # Build from repo root so we can COPY shared packages like `void_envelopes/`
+      # and `void_json/` into the image (faceid does not mount the whole repo at runtime).
       context: .
       dockerfile: services/faceid/Dockerfile
     container_name: faceid_service
@@ -480,8 +494,9 @@ services:
     expose:
       - "7000"
     volumes:
-      - /mnt/ai-vols/models/comfyui:/opt/models
-      - /mnt/ai-vols/artifacts:/workspace/uploads
+      # Share the same antelopev2 ONNX pack used by ComfyUI/InstantID.
+      - comfyui_models:/opt/models
+      - void_artifacts:/workspace/uploads
       - void_logs:/workspace/logs
 
   vision_repair:
@@ -494,8 +509,7 @@ services:
     devices:
       - "nvidia.com/gpu=all"
     depends_on:
-      film2_bootstrap:
-        condition: service_completed_successfully
+      - film2_bootstrap
     environment:
       - NVIDIA_VISIBLE_DEVICES=${VISION_REPAIR_GPU:-all}
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
@@ -504,7 +518,7 @@ services:
     expose:
       - "8095"
     volumes:
-      - /mnt/ai-vols/artifacts:/workspace/uploads
+      - void_artifacts:/workspace/uploads
       - void_logs:/workspace/logs
 
   comfyui:
@@ -527,12 +541,18 @@ services:
       - "8188"
     shm_size: "1g"
     volumes:
-      - /mnt/ai-vols/models/comfyui:/comfyui/models
+      - comfyui_models:/comfyui/models
       - ./assets/comfyui/models/upscale:/comfyui/models/upscale
       - ./assets/comfyui/input:/comfyui/input
-      - /mnt/ai-vols/artifacts:/comfyui/output
+      # Share void_artifacts with orchestrator/executor so Comfy outputs are visible under /uploads
+      - void_artifacts:/comfyui/output
       - void_logs:/workspace/logs
+    # For GPU deployments, create additional comfyui-* services and set COMFYUI_API_URLS accordingly
 
+  # Optional additional ComfyUI replicas for dynamic distribution
+  # After enabling, set COMFYUI_API_URLS to include all endpoints, e.g.:
+  # COMFYUI_API_URLS=http://comfyui:8188,http://comfyui-1:8188,http://comfyui-2:8188
+  # And access from host via the mapped ports below for debugging
   comfyui-1:
     build:
       context: ./services/comfyui
@@ -553,10 +573,11 @@ services:
     expose:
       - "8188"
     volumes:
-      - /mnt/ai-vols/models/comfyui:/comfyui/models
+      - comfyui_models:/comfyui/models
       - ./assets/comfyui/models/upscale:/comfyui/models/upscale
       - ./assets/comfyui/input:/comfyui/input
-      - /mnt/ai-vols/artifacts:/comfyui/output
+      # Share void_artifacts with orchestrator/executor so Comfy outputs are visible under /uploads
+      - void_artifacts:/comfyui/output
       - void_logs:/workspace/logs
 
   comfyui-2:
@@ -579,10 +600,11 @@ services:
     expose:
       - "8188"
     volumes:
-      - /mnt/ai-vols/models/comfyui:/comfyui/models
+      - comfyui_models:/comfyui/models
       - ./assets/comfyui/models/upscale:/comfyui/models/upscale
       - ./assets/comfyui/input:/comfyui/input
-      - /mnt/ai-vols/artifacts:/comfyui/output
+      # Share void_artifacts with orchestrator/executor so Comfy outputs are visible under /uploads
+      - void_artifacts:/comfyui/output
       - void_logs:/workspace/logs
 
   comfyui_init:
@@ -591,19 +613,18 @@ services:
       dockerfile: Dockerfile
     container_name: comfyui_init
     network_mode: host
-    depends_on:
-      ai_vols_init:
-        condition: service_completed_successfully
     environment:
       - HUGGINGFACE_TOKEN=${HUGGINGFACE_TOKEN:-}
       - COMFYUI_REPLICAS=${COMFYUI_REPLICAS:-1}
       - COMFYUI_GPU_DEVICES=${COMFYUI_GPU_DEVICES:-}
       - LOG_DIR=/workspace/logs
     volumes:
-      - /mnt/ai-vols/models/comfyui:/comfyui/models
-      - /mnt/ai-vols/artifacts:/workspace/uploads
+      - comfyui_models:/comfyui/models
+      # Do not mount host or named custom_nodes to avoid resurrecting Real-ESRGAN
+      - void_artifacts:/workspace/uploads
       - void_logs:/workspace/logs
     command: ["python", "/app/init_assets.py"]
+
 
   demucs:
     build:
@@ -617,8 +638,7 @@ services:
     devices:
       - "nvidia.com/gpu=all"
     depends_on:
-      film2_bootstrap:
-        condition: service_completed_successfully
+      - film2_bootstrap
     environment:
       - NVIDIA_VISIBLE_DEVICES=${MUSIC_GPU:-all}
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
@@ -626,13 +646,16 @@ services:
       - LOG_DIR=/workspace/logs
     expose:
       - "9101"
+    
     volumes:
-      - /mnt/ai-vols/models/torch_cache:/models/torch
-      - /mnt/ai-vols/models/demucs_cache:/root/.cache/demucs
-      - /mnt/ai-vols/models/film2:/opt/models:ro
-      - /mnt/ai-vols/training_data/film2:/srv/film2
-      - /mnt/ai-vols/artifacts:/workspace/uploads
+      - torch_cache:/models/torch
+      - demucs_cache:/root/.cache/demucs
+      - film2_models:/opt/models:ro
+      - film2_data:/srv/film2
+      - void_artifacts:/workspace/uploads
       - void_logs:/workspace/logs
+
+  
 
   vlm:
     build:
@@ -646,25 +669,27 @@ services:
     devices:
       - "nvidia.com/gpu=all"
     depends_on:
-      film2_bootstrap:
-        condition: service_completed_successfully
+      - film2_bootstrap
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - LOG_DIR=/workspace/logs
+      
       - HF_HOME=/models/hf
       - TRANSFORMERS_CACHE=/models/hf
       - TORCH_HOME=/models/torch
     expose:
       - "8050"
     shm_size: "1g"
+    
     volumes:
-      - /mnt/ai-vols/models/hf_cache:/models/hf
-      - /mnt/ai-vols/models/torch_cache:/models/torch
-      - /mnt/ai-vols/models/film2:/opt/models:ro
-      - /mnt/ai-vols/training_data/film2:/srv/film2
-      - /mnt/ai-vols/artifacts:/workspace/uploads
+      - hf_cache:/models/hf
+      - torch_cache:/models/torch
+      - film2_models:/opt/models:ro
+      - film2_data:/srv/film2
+      - void_artifacts:/workspace/uploads
       - void_logs:/workspace/logs
+    
 
   ocr:
     build:
@@ -675,10 +700,11 @@ services:
     expose:
       - "8070"
     volumes:
-      - /mnt/ai-vols/artifacts:/workspace/uploads
+      - void_artifacts:/workspace/uploads
       - void_logs:/workspace/logs
 
   executor:
+    
     build:
       context: .
       dockerfile: executor/Dockerfile
@@ -694,11 +720,13 @@ services:
       - ORCHESTRATOR_BASE_URL=http://127.0.0.1:8000
     volumes:
       - ./:/workspace
-      - /mnt/ai-vols/artifacts:/workspace/uploads
+      - void_artifacts:/workspace/uploads
       - void_logs:/workspace/logs
 
   drt:
     build:
+      # Build from repo root so we can COPY shared packages like `void_json/`
+      # into the image (drt does not mount the whole repo at runtime).
       context: .
       dockerfile: services/drt/Dockerfile
     container_name: deep_research_tool
@@ -714,11 +742,13 @@ services:
       - "8086"
     volumes:
       - ./:/workspace
-      - /mnt/ai-vols/artifacts:/workspace/uploads
+      - void_artifacts:/workspace/uploads
       - void_logs:/workspace/logs
 
   ablation:
     build:
+      # Build from repo root so we can COPY shared packages like `void_json/`
+      # into the image (ablation does not mount the whole repo at runtime).
       context: .
       dockerfile: services/ablation/Dockerfile
     container_name: ablation_layer
@@ -732,11 +762,13 @@ services:
       - "8096"
     volumes:
       - ./:/workspace
-      - /mnt/ai-vols/artifacts:/workspace/uploads
+      - void_artifacts:/workspace/uploads
       - void_logs:/workspace/logs
 
   hunyuan_video:
     build:
+      # Build from repo root so we can COPY shared packages like `void_envelopes/`
+      # and `void_json/` into the image (hunyuan_video does not mount the whole repo at runtime).
       context: .
       dockerfile: services/hunyuan_video/Dockerfile
       args:
@@ -747,8 +779,7 @@ services:
     devices:
       - "nvidia.com/gpu=all"
     depends_on:
-      film2_bootstrap:
-        condition: service_completed_successfully
+      - film2_bootstrap
     environment:
       - NVIDIA_VISIBLE_DEVICES=${VIDEO_GPU:-all}
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
@@ -756,12 +787,14 @@ services:
       - LOG_DIR=/workspace/logs
       - UPLOAD_DIR=/workspace/uploads
       - HYVIDEO_PORT=8094
+      # OFFLINE ONLY: use the pre-downloaded local model directory from bootstrap
       - HYVIDEO_MODEL_ID=/opt/models/hunyuan_diffusers
       - HYVIDEO_DEVICE=cuda:0
       - HYVIDEO_TRANSFORMER_DTYPE=bf16
       - HYVIDEO_PIPE_DTYPE=fp16
       - HYVIDEO_CPU_OFFLOAD=1
       - HYVIDEO_VAE_TILING=1
+      # SR (Tencent official 720->1080) — uses /opt/models/hunyuan populated by bootstrap
       - HYVIDEO_SR_ENABLE=1
       - HYVIDEO_SR_ROOT=/opt/models/hunyuan
       - HYVIDEO_SR_TRANSFORMER_SUBFOLDER=transformer/1080p_sr_distilled
@@ -772,8 +805,12 @@ services:
       - HYVIDEO_SR_TARGET_WIDTH=1920
       - HYVIDEO_SR_TARGET_HEIGHT=1080
       - HYVIDEO_SR_INTERNAL_MULTIPLE=16
+      # Attention backend (optional; service will catch errors and continue if unavailable)
+      # Recommended by Diffusers docs for A100/A800/4090: flash_hub or flash_varlen_hub
       - HYVIDEO_ATTENTION_BACKEND=${HYVIDEO_ATTENTION_BACKEND:-}
+      # PyTorch memory management for multi-GPU and dynamic offloading
       - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+      # share caches with film2_models volume
       - HF_HOME=/opt/models/.hf
       - TRANSFORMERS_CACHE=/opt/models/.hf
       - TORCH_HOME=/opt/models/.torch
@@ -783,9 +820,9 @@ services:
       - "8094"
     shm_size: "2g"
     volumes:
-      - /mnt/ai-vols/models/film2:/opt/models
-      - /mnt/ai-vols/training_data/film2:/srv/film2
-      - /mnt/ai-vols/artifacts:/workspace/uploads
+      - film2_models:/opt/models
+      - film2_data:/srv/film2
+      - void_artifacts:/workspace/uploads
       - void_logs:/workspace/logs
 
   rife_vfi:
@@ -800,8 +837,7 @@ services:
     devices:
       - "nvidia.com/gpu=all"
     depends_on:
-      film2_bootstrap:
-        condition: service_completed_successfully
+      - film2_bootstrap
     environment:
       - NVIDIA_VISIBLE_DEVICES=${VFI_GPU:-all}
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
@@ -818,8 +854,8 @@ services:
       - "8098"
     shm_size: "2g"
     volumes:
-      - /mnt/ai-vols/models/film2:/opt/models:ro
-      - /mnt/ai-vols/artifacts:/workspace/uploads
+      - film2_models:/opt/models:ro
+      - void_artifacts:/workspace/uploads
       - void_logs:/workspace/logs
 
   upscale:
@@ -834,8 +870,7 @@ services:
     devices:
       - "nvidia.com/gpu=all"
     depends_on:
-      film2_bootstrap:
-        condition: service_completed_successfully
+      - film2_bootstrap
     environment:
       - NVIDIA_VISIBLE_DEVICES=${UPSCALE_GPU:-all}
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
@@ -856,8 +891,8 @@ services:
       - "8099"
     shm_size: "2g"
     volumes:
-      - /mnt/ai-vols/models/film2:/opt/models:ro
-      - /mnt/ai-vols/artifacts:/workspace/uploads
+      - film2_models:/opt/models:ro
+      - void_artifacts:/workspace/uploads
       - void_logs:/workspace/logs
 
   chatui:
@@ -875,8 +910,9 @@ services:
       - POSTGRES_DB=ragdb
       - POSTGRES_USER=rag
       - POSTGRES_PASSWORD=ragpass
+    # host networking exposes 3000 directly; no ports mapping needed
     volumes:
-      - /mnt/ai-vols/artifacts:/workspace/uploads
+      - void_artifacts:/workspace/uploads
       - void_logs:/workspace/logs
 
   valkey:
@@ -903,14 +939,38 @@ services:
     depends_on:
       - valkey
     environment:
+      # CRITICAL for host networking: make SearXNG listen on your host port
       - BIND_ADDRESS=0.0.0.0:${SEARXNG_PORT:-8090}
+
+      # Settings file
       - SEARXNG_SETTINGS_PATH=/etc/searxng/settings.yml
+
+      # Helps SearXNG generate correct absolute URLs
       - SEARXNG_BASE_URL=http://localhost:${SEARXNG_PORT:-8090}
+
       - FORCE_OWNERSHIP=false
     volumes:
       - ./services/searxng/settings.yml:/etc/searxng/settings.yml
 
 volumes:
+  ollama_qwen_data: {}
+  ollama_glm_data: {}
+  ollama_deepseek_data: {}
   pgvector_data: {}
+  comfyui_models: {}
+  comfyui_custom_nodes: {}
+  hf_cache: {}
+  torch_cache: {}
+  tts_cache: {}
+  demucs_cache: {}
+  film2_models: {}
+  film2_data: {}
+  comfyui_input: {}
+  void_artifacts: {}
   void_logs: {}
+  rvc_models: {}
+  rvc_assets: {}
+  rvc_train_data: {}
   rvc_logs: {}
+
+
