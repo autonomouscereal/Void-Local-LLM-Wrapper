@@ -3,7 +3,6 @@ x-build-args:
   PIP_EXTRA_INDEX_URL: https://download.pytorch.org/whl/cu118
 
 services:
-  services:
   ai_vols_init:
     image: alpine:3.20
     container_name: ai_vols_init
