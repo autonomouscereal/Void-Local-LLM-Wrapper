@@ -3,55 +3,57 @@ x-build-args:
   PIP_EXTRA_INDEX_URL: https://download.pytorch.org/whl/cu118
 
 services:
+  services:
   ai_vols_init:
-  image: alpine:3.20
-  container_name: ai_vols_init
-  restart: "no"
-  command:
-    - sh
-    - -lc
-    - |
-      set -e
+    image: alpine:3.20
+    container_name: ai_vols_init
+    restart: "no"
+    command:
+      - sh
+      - -lc
+      - |
+        set -e
 
-      ensure_dir() {
-        p="$1"
-        if [ -e "$p" ] && [ ! -d "$p" ]; then
-          echo "[ai_vols_init] ERROR: path exists but is not a directory: $p" >&2
-          ls -la "$p" >&2 || true
-          exit 2
-        fi
-        mkdir -p "$p"
-      }
+        ensure_dir() {
+          p="$1"
+          if [ -e "$p" ] && [ ! -d "$p" ]; then
+            echo "[ai_vols_init] ERROR: path exists but is not a directory: $p" >&2
+            ls -la "$p" >&2 || true
+            exit 2
+          fi
+          mkdir -p "$p"
+        }
 
-      # Models
-      ensure_dir /ai-vols/models/film2
-      ensure_dir /ai-vols/models/comfyui
-      ensure_dir /ai-vols/models/hf_cache
-      ensure_dir /ai-vols/models/torch_cache
-      ensure_dir /ai-vols/models/tts_cache
-      ensure_dir /ai-vols/models/demucs_cache
-      ensure_dir /ai-vols/models/ollama/qwen
-      ensure_dir /ai-vols/models/ollama/glm
-      ensure_dir /ai-vols/models/ollama/deepseek
-      ensure_dir /ai-vols/models/rvc_models
-      ensure_dir /ai-vols/models/rvc_assets
+        # Models
+        ensure_dir /ai-vols/models/film2
+        ensure_dir /ai-vols/models/comfyui
+        ensure_dir /ai-vols/models/hf_cache
+        ensure_dir /ai-vols/models/torch_cache
+        ensure_dir /ai-vols/models/tts_cache
+        ensure_dir /ai-vols/models/demucs_cache
+        ensure_dir /ai-vols/models/ollama/qwen
+        ensure_dir /ai-vols/models/ollama/glm
+        ensure_dir /ai-vols/models/ollama/deepseek
+        ensure_dir /ai-vols/models/rvc_models
+        ensure_dir /ai-vols/models/rvc_assets
 
-      # Training data
-      ensure_dir /ai-vols/training_data/film2
-      ensure_dir /ai-vols/training_data/rvc
+        # Training data
+        ensure_dir /ai-vols/training_data/film2
+        ensure_dir /ai-vols/training_data/rvc
 
-      # Artifacts
-      ensure_dir /ai-vols/artifacts
-      ensure_dir /ai-vols/artifacts/images
-      ensure_dir /ai-vols/artifacts/videos
-      ensure_dir /ai-vols/artifacts/audio
-      ensure_dir /ai-vols/artifacts/tmp
-      ensure_dir /ai-vols/artifacts/manifests
-      ensure_dir /ai-vols/artifacts/logs
+        # Artifacts
+        ensure_dir /ai-vols/artifacts
+        ensure_dir /ai-vols/artifacts/images
+        ensure_dir /ai-vols/artifacts/videos
+        ensure_dir /ai-vols/artifacts/audio
+        ensure_dir /ai-vols/artifacts/tmp
+        ensure_dir /ai-vols/artifacts/manifests
+        ensure_dir /ai-vols/artifacts/logs
 
-      echo "[ai_vols_init] ✅ ensured directory layout under /mnt/ai-vols"
-  volumes:
-    - /mnt/ai-vols:/ai-vols
+        echo "[ai_vols_init] ✅ ensured directory layout under /ai-vols"
+    volumes:
+      - /mnt/ai-vols:/ai-vols
+
 
 
   film2_bootstrap:
@@ -478,36 +480,29 @@ services:
     volumes:
       - /mnt/ai-vols/artifacts:/workspace/uploads
       - void_logs:/workspace/logs
-
+      
   faceid:
     build:
       context: .
       dockerfile: services/faceid/Dockerfile
     container_name: faceid_service
     restart: unless-stopped
-
     runtime: nvidia
     devices:
       - "nvidia.com/gpu=all"
-
     # Match the rest of your stack so ORCH can hit 127.0.0.1:7000
     network_mode: host
-
     # Fix the temp-descriptor / writer/reader shared-memory crashes
     shm_size: "1g"
     ipc: host
-
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - LOG_DIR=/workspace/logs
-
       # Optional but helps if anything tries to use /tmp inside the container
       - TMPDIR=/workspace/uploads/tmp
-
       # If your faceid code honors this, it avoids surprise paths
       - INSIGHTFACE_HOME=/models/insightface
-
     volumes:
       # If your faceid expects insightface packs in a specific place,
       # mount to THAT place. Otherwise keep /opt/models.
