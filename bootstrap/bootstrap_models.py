@@ -161,16 +161,10 @@ def _rm_tree(path: str) -> None:
         raise RuntimeError(f"refusing to delete unsafe path: {path!r}")
     shutil.rmtree(path, ignore_errors=True)
 
-
 def snapshot(repo_id: str, local_key: str, allow_patterns: list[str] | None = None) -> None:
     from huggingface_hub import snapshot_download
 
     tgt = os.path.join(MODELS_DIR, local_key)
-
-    # Guard: skip invalid repo ids
-    if not isinstance(repo_id, str) or "=" in repo_id or repo_id.strip().startswith(("/", "./", "../")):
-        log("skip-invalid-repo-id", repo_id, "->", tgt)
-        return
 
     # Versioned behavior: mismatch => delete + redownload
     if local_key in VERSIONED_KEYS and os.path.isdir(tgt) and os.listdir(tgt):
@@ -192,25 +186,31 @@ def snapshot(repo_id: str, local_key: str, allow_patterns: list[str] | None = No
             log("exists", local_key, "->", tgt)
             return
 
-    log("START-HF", repo_id, "->", tgt)
-    os.makedirs(tgt, exist_ok=True)
+    # Download to container-local cache to avoid .lock files on the bind mount
+    cache_dir = "/tmp/hf_cache"
+    os.makedirs(cache_dir, exist_ok=True)
+
+    log("START-HF", repo_id, "->", tgt, "(download via cache:", cache_dir, ")")
     STATUS.setdefault("hf", {})[local_key] = {"repo": repo_id, "state": "downloading"}
     write_status()
 
     kw: dict[str, Any] = dict(
         repo_id=repo_id,
-        local_dir=tgt,
-        local_dir_use_symlinks=False,
+        cache_dir=cache_dir,
         max_workers=HF_MAX_WORKERS,
     )
-
     if allow_patterns:
         kw["allow_patterns"] = allow_patterns
-
     if HF_TOKEN:
         kw["token"] = HF_TOKEN
 
-    snapshot_download(**kw)
+    src = snapshot_download(**kw)  # returns the cached snapshot directory
+
+    # Copy snapshot into target dir (no locks needed here; it's just file copies)
+    if os.path.isdir(tgt):
+        _rm_tree(tgt)
+    os.makedirs(tgt, exist_ok=True)
+    subprocess.check_call(["bash", "-lc", f"cp -a '{src}/.' '{tgt}/'"])
 
     STATUS["hf"][local_key]["state"] = "done"
     write_status()
@@ -219,6 +219,7 @@ def snapshot(repo_id: str, local_key: str, allow_patterns: list[str] | None = No
         _write_meta(tgt, _meta_expected(repo_id, allow_patterns))
 
     log("DONE-HF", repo_id, "->", tgt)
+
 
 
 def git_clone(url: str, local_key: str) -> None:
