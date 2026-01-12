@@ -11,63 +11,84 @@ services:
       - sh
       - -lc
       - |
-        set -eu
-        set -x
+        set -e
 
-        ensure_dir() {
-          p="${1-}"
-          if [ -z "$p" ]; then
-            echo "[ai_vols_init] ERROR: ensure_dir called with empty path" >&2
-            exit 2
-          fi
-          case "$p" in
-            /*) ;;
-            *)
-              echo "[ai_vols_init] ERROR: ensure_dir path must be absolute: '$p'" >&2
-              exit 2
-              ;;
-          esac
-          if [ -e "$p" ] && [ ! -d "$p" ]; then
-            echo "[ai_vols_init] ERROR: path exists but is not a directory: $p" >&2
-            ls -la "$p" >&2 || true
-            exit 2
-          fi
-          mkdir -p -- "$p"
-        }
+        # MODELS
+        if [ -e /ai-vols/models ] && [ ! -d /ai-vols/models ]; then echo "ERROR: /ai-vols/models exists but not a dir" >&2; exit 2; fi
+        mkdir -p /ai-vols/models
 
-        # quick sanity
-        echo "[ai_vols_init] /ai-vols listing:"
-        ls -la /ai-vols || true
+        if [ -e /ai-vols/models/film2 ] && [ ! -d /ai-vols/models/film2 ]; then echo "ERROR: /ai-vols/models/film2 exists but not a dir" >&2; exit 2; fi
+        mkdir -p /ai-vols/models/film2
 
-        # Models
-        ensure_dir /ai-vols/models/film2
-        ensure_dir /ai-vols/models/comfyui
-        ensure_dir /ai-vols/models/hf_cache
-        ensure_dir /ai-vols/models/torch_cache
-        ensure_dir /ai-vols/models/tts_cache
-        ensure_dir /ai-vols/models/demucs_cache
-        ensure_dir /ai-vols/models/ollama/qwen
-        ensure_dir /ai-vols/models/ollama/glm
-        ensure_dir /ai-vols/models/ollama/deepseek
-        ensure_dir /ai-vols/models/rvc_models
-        ensure_dir /ai-vols/models/rvc_assets
+        if [ -e /ai-vols/models/comfyui ] && [ ! -d /ai-vols/models/comfyui ]; then echo "ERROR: /ai-vols/models/comfyui exists but not a dir" >&2; exit 2; fi
+        mkdir -p /ai-vols/models/comfyui
 
-        # Training data
-        ensure_dir /ai-vols/training_data/film2
-        ensure_dir /ai-vols/training_data/rvc
+        if [ -e /ai-vols/models/hf_cache ] && [ ! -d /ai-vols/models/hf_cache ]; then echo "ERROR: /ai-vols/models/hf_cache exists but not a dir" >&2; exit 2; fi
+        mkdir -p /ai-vols/models/hf_cache
 
-        # Artifacts
-        ensure_dir /ai-vols/artifacts
-        ensure_dir /ai-vols/artifacts/images
-        ensure_dir /ai-vols/artifacts/videos
-        ensure_dir /ai-vols/artifacts/audio
-        ensure_dir /ai-vols/artifacts/tmp
-        ensure_dir /ai-vols/artifacts/manifests
-        ensure_dir /ai-vols/artifacts/logs
+        if [ -e /ai-vols/models/torch_cache ] && [ ! -d /ai-vols/models/torch_cache ]; then echo "ERROR: /ai-vols/models/torch_cache exists but not a dir" >&2; exit 2; fi
+        mkdir -p /ai-vols/models/torch_cache
 
-        echo "[ai_vols_init] ✅ ensured directory layout under /ai-vols"
+        if [ -e /ai-vols/models/tts_cache ] && [ ! -d /ai-vols/models/tts_cache ]; then echo "ERROR: /ai-vols/models/tts_cache exists but not a dir" >&2; exit 2; fi
+        mkdir -p /ai-vols/models/tts_cache
+
+        if [ -e /ai-vols/models/demucs_cache ] && [ ! -d /ai-vols/models/demucs_cache ]; then echo "ERROR: /ai-vols/models/demucs_cache exists but not a dir" >&2; exit 2; fi
+        mkdir -p /ai-vols/models/demucs_cache
+
+        if [ -e /ai-vols/models/ollama ] && [ ! -d /ai-vols/models/ollama ]; then echo "ERROR: /ai-vols/models/ollama exists but not a dir" >&2; exit 2; fi
+        mkdir -p /ai-vols/models/ollama
+
+        if [ -e /ai-vols/models/ollama/qwen ] && [ ! -d /ai-vols/models/ollama/qwen ]; then echo "ERROR: /ai-vols/models/ollama/qwen exists but not a dir" >&2; exit 2; fi
+        mkdir -p /ai-vols/models/ollama/qwen
+
+        if [ -e /ai-vols/models/ollama/glm ] && [ ! -d /ai-vols/models/ollama/glm ]; then echo "ERROR: /ai-vols/models/ollama/glm exists but not a dir" >&2; exit 2; fi
+        mkdir -p /ai-vols/models/ollama/glm
+
+        if [ -e /ai-vols/models/ollama/deepseek ] && [ ! -d /ai-vols/models/ollama/deepseek ]; then echo "ERROR: /ai-vols/models/ollama/deepseek exists but not a dir" >&2; exit 2; fi
+        mkdir -p /ai-vols/models/ollama/deepseek
+
+        if [ -e /ai-vols/models/rvc_models ] && [ ! -d /ai-vols/models/rvc_models ]; then echo "ERROR: /ai-vols/models/rvc_models exists but not a dir" >&2; exit 2; fi
+        mkdir -p /ai-vols/models/rvc_models
+
+        if [ -e /ai-vols/models/rvc_assets ] && [ ! -d /ai-vols/models/rvc_assets ]; then echo "ERROR: /ai-vols/models/rvc_assets exists but not a dir" >&2; exit 2; fi
+        mkdir -p /ai-vols/models/rvc_assets
+
+        # TRAINING DATA
+        if [ -e /ai-vols/training_data ] && [ ! -d /ai-vols/training_data ]; then echo "ERROR: /ai-vols/training_data exists but not a dir" >&2; exit 2; fi
+        mkdir -p /ai-vols/training_data
+
+        if [ -e /ai-vols/training_data/film2 ] && [ ! -d /ai-vols/training_data/film2 ]; then echo "ERROR: /ai-vols/training_data/film2 exists but not a dir" >&2; exit 2; fi
+        mkdir -p /ai-vols/training_data/film2
+
+        if [ -e /ai-vols/training_data/rvc ] && [ ! -d /ai-vols/training_data/rvc ]; then echo "ERROR: /ai-vols/training_data/rvc exists but not a dir" >&2; exit 2; fi
+        mkdir -p /ai-vols/training_data/rvc
+
+        # ARTIFACTS
+        if [ -e /ai-vols/artifacts ] && [ ! -d /ai-vols/artifacts ]; then echo "ERROR: /ai-vols/artifacts exists but not a dir" >&2; exit 2; fi
+        mkdir -p /ai-vols/artifacts
+
+        if [ -e /ai-vols/artifacts/images ] && [ ! -d /ai-vols/artifacts/images ]; then echo "ERROR: /ai-vols/artifacts/images exists but not a dir" >&2; exit 2; fi
+        mkdir -p /ai-vols/artifacts/images
+
+        if [ -e /ai-vols/artifacts/videos ] && [ ! -d /ai-vols/artifacts/videos ]; then echo "ERROR: /ai-vols/artifacts/videos exists but not a dir" >&2; exit 2; fi
+        mkdir -p /ai-vols/artifacts/videos
+
+        if [ -e /ai-vols/artifacts/audio ] && [ ! -d /ai-vols/artifacts/audio ]; then echo "ERROR: /ai-vols/artifacts/audio exists but not a dir" >&2; exit 2; fi
+        mkdir -p /ai-vols/artifacts/audio
+
+        if [ -e /ai-vols/artifacts/tmp ] && [ ! -d /ai-vols/artifacts/tmp ]; then echo "ERROR: /ai-vols/artifacts/tmp exists but not a dir" >&2; exit 2; fi
+        mkdir -p /ai-vols/artifacts/tmp
+
+        if [ -e /ai-vols/artifacts/manifests ] && [ ! -d /ai-vols/artifacts/manifests ]; then echo "ERROR: /ai-vols/artifacts/manifests exists but not a dir" >&2; exit 2; fi
+        mkdir -p /ai-vols/artifacts/manifests
+
+        if [ -e /ai-vols/artifacts/logs ] && [ ! -d /ai-vols/artifacts/logs ]; then echo "ERROR: /ai-vols/artifacts/logs exists but not a dir" >&2; exit 2; fi
+        mkdir -p /ai-vols/artifacts/logs
+
+        echo "[ai_vols_init] OK"
     volumes:
       - /mnt/ai-vols:/ai-vols
+
 
 
 
