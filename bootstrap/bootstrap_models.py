@@ -210,7 +210,7 @@ def snapshot(repo_id: str, local_key: str, allow_patterns: list[str] | None = No
     if os.path.isdir(tgt):
         _rm_tree(tgt)
     os.makedirs(tgt, exist_ok=True)
-    subprocess.check_call(["bash", "-lc", f"cp -a '{src}/.' '{tgt}/'"])
+    subprocess.check_call(["bash", "-lc", f"cp -rL '{src}/.' '{tgt}/'"])
 
     STATUS["hf"][local_key]["state"] = "done"
     write_status()
