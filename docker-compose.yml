@@ -96,9 +96,6 @@ services:
   film2_bootstrap:
     image: python:3.11-slim
     container_name: film2_bootstrap
-    depends_on:
-      ai_vols_init:
-        condition: service_completed_successfully
     command: ["/bin/bash","-lc","/bin/bash /bootstrap/bootstrap_models.sh"]
     environment:
       - FILM2_MODELS=/opt/models
