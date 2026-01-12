@@ -1,6 +1,6 @@
-x-build-args:
-  &cu118_args
+x-build-args: &cu118_args
   PIP_EXTRA_INDEX_URL: https://download.pytorch.org/whl/cu118
+
 
 services:
   ai_vols_init:
@@ -11,17 +11,33 @@ services:
       - sh
       - -lc
       - |
-        set -e
+        set -eu
+        set -x
 
         ensure_dir() {
-          p="$1"
+          p="${1-}"
+          if [ -z "$p" ]; then
+            echo "[ai_vols_init] ERROR: ensure_dir called with empty path" >&2
+            exit 2
+          fi
+          case "$p" in
+            /*) ;;
+            *)
+              echo "[ai_vols_init] ERROR: ensure_dir path must be absolute: '$p'" >&2
+              exit 2
+              ;;
+          esac
           if [ -e "$p" ] && [ ! -d "$p" ]; then
             echo "[ai_vols_init] ERROR: path exists but is not a directory: $p" >&2
             ls -la "$p" >&2 || true
             exit 2
           fi
-          mkdir -p "$p"
+          mkdir -p -- "$p"
         }
+
+        # quick sanity
+        echo "[ai_vols_init] /ai-vols listing:"
+        ls -la /ai-vols || true
 
         # Models
         ensure_dir /ai-vols/models/film2
@@ -52,6 +68,7 @@ services:
         echo "[ai_vols_init] ✅ ensured directory layout under /ai-vols"
     volumes:
       - /mnt/ai-vols:/ai-vols
+
 
 
 
