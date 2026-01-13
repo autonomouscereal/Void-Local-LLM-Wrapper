@@ -166,59 +166,29 @@ def snapshot(repo_id: str, local_key: str, allow_patterns: list[str] | None = No
 
     tgt = os.path.join(MODELS_DIR, local_key)
 
-    # Versioned behavior: mismatch => delete + redownload
-    if local_key in VERSIONED_KEYS and os.path.isdir(tgt) and os.listdir(tgt):
-        expected = _meta_expected(repo_id, allow_patterns)
-        meta = _read_meta(tgt)
-        if meta != expected:
-            log("VERSION-MISMATCH", local_key)
-            log("  expected:", expected)
-            log("  found   :", meta)
-            log("  deleting:", tgt)
-            _rm_tree(tgt)
-        else:
-            log("exists", local_key, "->", tgt, "(version ok)")
-            return
+    # (keep your existing version-mismatch delete logic)
 
-    # Non-versioned behavior: if non-empty, skip
-    if local_key not in VERSIONED_KEYS:
-        if os.path.isdir(tgt) and os.listdir(tgt):
-            log("exists", local_key, "->", tgt)
-            return
+    log("START-HF", repo_id, "->", tgt)
 
-    # Download to container-local cache to avoid .lock files on the bind mount
-    cache_dir = "/tmp/hf_cache"
-    os.makedirs(cache_dir, exist_ok=True)
-
-    log("START-HF", repo_id, "->", tgt, "(download via cache:", cache_dir, ")")
-    STATUS.setdefault("hf", {})[local_key] = {"repo": repo_id, "state": "downloading"}
-    write_status()
+    os.makedirs(tgt, exist_ok=True)
 
     kw: dict[str, Any] = dict(
         repo_id=repo_id,
-        cache_dir=cache_dir,
+        local_dir=tgt,                 # <-- FINAL TARGET
+        cache_dir="/tmp/hf_cache",      # <-- LOCKS/CACHE OFF THE MOUNT
+        local_dir_use_symlinks=False,   # <-- REAL FILES, NO SYMLINK TREE
         max_workers=HF_MAX_WORKERS,
     )
+
     if allow_patterns:
         kw["allow_patterns"] = allow_patterns
     if HF_TOKEN:
         kw["token"] = HF_TOKEN
 
-    src = snapshot_download(**kw)  # returns the cached snapshot directory
-
-    # Copy snapshot into target dir (no locks needed here; it's just file copies)
-    if os.path.isdir(tgt):
-        _rm_tree(tgt)
-    os.makedirs(tgt, exist_ok=True)
-    subprocess.check_call(["bash", "-lc", f"cp -rL '{src}/.' '{tgt}/'"])
-
-    STATUS["hf"][local_key]["state"] = "done"
-    write_status()
-
-    if local_key in VERSIONED_KEYS:
-        _write_meta(tgt, _meta_expected(repo_id, allow_patterns))
+    snapshot_download(**kw)
 
     log("DONE-HF", repo_id, "->", tgt)
+
 
 
 
